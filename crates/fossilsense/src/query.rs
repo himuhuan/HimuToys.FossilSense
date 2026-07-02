@@ -17,7 +17,10 @@ mod text;
 
 pub use definitions::rank_definitions_into_candidates_with_scope;
 pub use lsp_kinds::{lsp_completion_kind_from_parser, lsp_kind_from_parser, lsp_symbol_kind};
-pub use signatures::{call_context_at, CallContext};
+pub use signatures::{
+    call_context_at, rank_function_signature_candidates, signature_parts, CallContext,
+    ParameterSpan, RankedSignatureCandidate, SignatureParts, SIGNATURE_HELP_LIMIT,
+};
 use text::is_boundary;
 pub use text::{
     byte_offset_at, completion_prefix_at, completion_word_score, is_member_completion_context,

@@ -1,4 +1,11 @@
+use std::collections::HashMap;
+
 use super::byte_offset_at;
+use crate::model::DefinitionCandidate;
+use crate::reachability::ReachScope;
+use crate::store::SymbolRecord;
+
+pub const SIGNATURE_HELP_LIMIT: usize = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallContext {
@@ -16,6 +23,12 @@ pub struct ParameterSpan {
 pub struct SignatureParts {
     pub label: String,
     pub parameters: Vec<ParameterSpan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RankedSignatureCandidate {
+    pub candidate: DefinitionCandidate,
+    pub signature: String,
 }
 
 pub fn call_context_at(text: &str, line: u32, character: u32) -> Option<CallContext> {
@@ -87,6 +100,52 @@ pub fn signature_parts(signature: &str) -> SignatureParts {
         };
     };
     SignatureParts { label, parameters }
+}
+
+pub fn rank_function_signature_candidates(
+    records: Vec<SymbolRecord>,
+    current_rel_path: &str,
+    scope: Option<&ReachScope>,
+    limit: usize,
+) -> Vec<RankedSignatureCandidate> {
+    let functions: Vec<SymbolRecord> = records
+        .into_iter()
+        .filter(|record| record.kind == "function")
+        .collect();
+    let signatures: HashMap<(String, u32, u32, String), String> = functions
+        .iter()
+        .map(|record| {
+            (
+                (
+                    record.path.clone(),
+                    record.start_line,
+                    record.start_col,
+                    record.role.clone(),
+                ),
+                record.signature.clone(),
+            )
+        })
+        .collect();
+
+    crate::query::rank_definitions_into_candidates_with_scope(functions, current_rel_path, scope)
+        .into_iter()
+        .filter_map(|candidate| {
+            let key = (
+                candidate.path.clone(),
+                candidate.range.start_line,
+                candidate.range.start_col,
+                candidate.role.clone(),
+            );
+            signatures
+                .get(&key)
+                .cloned()
+                .map(|signature| RankedSignatureCandidate {
+                    candidate,
+                    signature,
+                })
+        })
+        .take(limit)
+        .collect()
 }
 
 fn identifier_before(bytes: &[u8], open_paren: usize) -> Option<String> {
@@ -192,6 +251,30 @@ fn push_trimmed_span(label: &str, start: usize, end: usize, spans: &mut Vec<Para
 mod tests {
     use super::*;
 
+    fn symbol_record(
+        name: &str,
+        kind: &str,
+        role: &str,
+        path: &str,
+        signature: &str,
+    ) -> crate::store::SymbolRecord {
+        crate::store::SymbolRecord {
+            id: 0,
+            name: name.to_string(),
+            kind: kind.to_string(),
+            role: role.to_string(),
+            path: path.to_string(),
+            start_line: 1,
+            start_col: 0,
+            end_line: 1,
+            end_col: 0,
+            signature: signature.to_string(),
+            guard: None,
+            source: "workspace".to_string(),
+            directly_included: false,
+        }
+    }
+
     #[test]
     fn call_context_after_open_paren_is_first_argument() {
         let text = "int main(void) {\n  foo(\n}\n";
@@ -267,5 +350,46 @@ mod tests {
         let parts = signature_parts("int broken(int a, ");
         assert_eq!(parts.label, "int broken(int a, ");
         assert!(parts.parameters.is_empty());
+    }
+
+    #[test]
+    fn signature_candidates_keep_only_functions_and_preserve_signature() {
+        let records = vec![
+            symbol_record("foo", "macro", "definition", "inc/foo.h", "#define foo(x) (x)"),
+            symbol_record("foo", "function", "declaration", "inc/foo.h", "int foo(int x);"),
+        ];
+        let ranked = rank_function_signature_candidates(records, "src/main.c", None, 10);
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].signature, "int foo(int x);");
+        assert_eq!(ranked[0].candidate.kind, "function");
+    }
+
+    #[test]
+    fn signature_candidates_use_reachability_tier_order() {
+        let records = vec![
+            symbol_record("foo", "function", "definition", "other/foo.c", "int foo(float x)"),
+            symbol_record("foo", "function", "declaration", "inc/foo.h", "int foo(int x);"),
+        ];
+        let reach = crate::reachability::ReachScope {
+            files: ["src/main.c".to_string(), "inc/foo.h".to_string()]
+                .into_iter()
+                .collect(),
+            open: false,
+            reason: None,
+        };
+        let ranked = rank_function_signature_candidates(records, "src/main.c", Some(&reach), 10);
+        assert_eq!(ranked[0].candidate.path, "inc/foo.h");
+        assert_eq!(ranked[0].candidate.tier, crate::model::ScopeTier::Reachable);
+        assert_eq!(ranked[0].signature, "int foo(int x);");
+    }
+
+    #[test]
+    fn signature_candidates_cap_results_after_ranking() {
+        let records = vec![
+            symbol_record("foo", "function", "definition", "a.c", "int foo(int a)"),
+            symbol_record("foo", "function", "definition", "b.c", "int foo(int b)"),
+        ];
+        let ranked = rank_function_signature_candidates(records, "main.c", None, 1);
+        assert_eq!(ranked.len(), 1);
     }
 }
