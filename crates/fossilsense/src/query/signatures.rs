@@ -1,13 +1,11 @@
 use super::byte_offset_at;
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallContext {
     pub name: String,
     pub active_argument: u32,
 }
 
-#[allow(dead_code)]
 pub fn call_context_at(text: &str, line: u32, character: u32) -> Option<CallContext> {
     let offset = byte_offset_at(text, line, character).min(text.len());
     let bytes = text.as_bytes();
@@ -15,6 +13,7 @@ pub fn call_context_at(text: &str, line: u32, character: u32) -> Option<CallCont
     let mut paren_depth = 0i32;
     let mut bracket_depth = 0i32;
     let mut brace_depth = 0i32;
+    let mut angle_depth = 0i32;
     let mut active_argument = 0u32;
 
     while i > 0 {
@@ -26,7 +25,12 @@ pub fn call_context_at(text: &str, line: u32, character: u32) -> Option<CallCont
             b'[' if bracket_depth > 0 => bracket_depth -= 1,
             b'}' => brace_depth += 1,
             b'{' if brace_depth > 0 => brace_depth -= 1,
+            b'>' => angle_depth += 1,
+            b'<' if angle_depth > 0 => angle_depth -= 1,
             b',' if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => {
+                if angle_depth > 0 {
+                    return None;
+                }
                 active_argument += 1;
             }
             b'(' if bracket_depth == 0 && brace_depth == 0 => {
@@ -45,7 +49,6 @@ pub fn call_context_at(text: &str, line: u32, character: u32) -> Option<CallCont
     None
 }
 
-#[allow(dead_code)]
 fn identifier_before(bytes: &[u8], open_paren: usize) -> Option<String> {
     let mut end = open_paren;
     while end > 0 && bytes[end - 1].is_ascii_whitespace() {
@@ -61,17 +64,14 @@ fn identifier_before(bytes: &[u8], open_paren: usize) -> Option<String> {
     std::str::from_utf8(&bytes[start..end]).ok().map(str::to_string)
 }
 
-#[allow(dead_code)]
 fn is_ident_start(byte: u8) -> bool {
     byte.is_ascii_alphabetic() || byte == b'_'
 }
 
-#[allow(dead_code)]
 fn is_ident_continue(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
-#[allow(dead_code)]
 fn is_control_keyword(name: &str) -> bool {
     matches!(
         name,
@@ -111,5 +111,16 @@ mod tests {
     fn call_context_rejects_control_keywords() {
         let text = "void f(void) {\n  if (ready, \n}\n";
         assert!(call_context_at(text, 1, 13).is_none());
+    }
+
+    #[test]
+    fn call_context_rejects_template_like_argument_commas() {
+        let text = "void f(void) {\n  foo(std::pair<int, int>{}, \n}\n";
+        let line = 1;
+        let character = text.lines().nth(1).expect("line").chars().count() as u32;
+        assert!(
+            call_context_at(text, line, character).is_none(),
+            "unsupported template-like shapes must degrade to None"
+        );
     }
 }
