@@ -392,14 +392,7 @@ mod tests {
 
     #[test]
     fn goto_with_scope_orders_current_reachable_external_unknown() {
-        let mut external = record_ext(
-            "foo",
-            "function",
-            "definition",
-            "C:/sdk/foo.h",
-            3,
-            true,
-        );
+        let mut external = record_ext("foo", "function", "definition", "C:/sdk/foo.h", 3, true);
         external.directly_included = true;
         let candidates = vec![
             record("foo", "function", "definition", "other/foo.c", 20),

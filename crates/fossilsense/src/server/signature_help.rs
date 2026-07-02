@@ -20,10 +20,13 @@ impl Backend {
         let Some((_version, text)) = self.document_snapshot(&uri).await else {
             return Ok(None);
         };
-        let Some(call) =
-            query::call_context_at(&text, position.position.line, position.position.character)
-        else {
-            return Ok(None);
+        let call: query::CallContext = match query::call_context_at(
+            &text,
+            position.position.line,
+            position.position.character,
+        ) {
+            Some(call) => call,
+            None => return Ok(None),
         };
         let Some(root) = self.root_for_uri(&uri).await else {
             return Ok(None);
@@ -76,9 +79,9 @@ pub(super) fn signature_information_for(
     ranked: &query::RankedSignatureCandidate,
     active_argument: u32,
 ) -> SignatureInformation {
-    let parts = query::signature_parts(&ranked.signature);
-    let parameters: Vec<ParameterInformation> = parts
-        .parameters
+    let parts: query::SignatureParts = query::signature_parts(&ranked.signature);
+    let spans: &[query::ParameterSpan] = &parts.parameters;
+    let parameters: Vec<ParameterInformation> = spans
         .iter()
         .map(|span| ParameterInformation {
             label: ParameterLabel::LabelOffsets([

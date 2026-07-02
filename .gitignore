@@ -1,5 +1,7 @@
 /target/
-samples/
+/samples/*
+!/samples/mini-c/
+!/samples/mini-c/**
 node_modules/
 dist/
 out/
