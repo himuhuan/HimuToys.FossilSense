@@ -12,10 +12,13 @@ use crate::resolver::{self, ResolveContext};
 
 mod definitions;
 mod lsp_kinds;
+mod signatures;
 mod text;
 
 pub use definitions::rank_definitions_into_candidates_with_scope;
 pub use lsp_kinds::{lsp_completion_kind_from_parser, lsp_kind_from_parser, lsp_symbol_kind};
+#[allow(unused_imports)]
+pub use signatures::{call_context_at, CallContext};
 use text::is_boundary;
 pub use text::{
     byte_offset_at, completion_prefix_at, completion_word_score, is_member_completion_context,
