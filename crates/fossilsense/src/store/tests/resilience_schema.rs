@@ -1,0 +1,187 @@
+use super::*;
+
+#[test]
+fn corrupted_db_errors_on_query_not_panic() {
+    // SQLite defers validation; open_readonly may succeed even on garbage,
+    // but the first SQL query must fail gracefully (no panic).
+    let dir = tempdir().expect("tempdir");
+    let bad_db = dir.path().join("corrupt.sqlite");
+    std::fs::write(&bad_db, b"\x00\xFF\x00\xFF\xDE\xAD\xBE\xEF").expect("write");
+    // Open may or may not succeed — if it does, querying must fail.
+    if let Ok(store) = IndexStore::open_readonly(&bad_db) {
+        let result = store.load_symbol_names();
+        assert!(result.is_err(), "query on garbage DB must return Err");
+    }
+    // If open fails, that's also fine — we just verify no panic.
+}
+
+#[test]
+fn empty_db_file_errors_on_query_not_panic() {
+    let dir = tempdir().expect("tempdir");
+    let empty_db = dir.path().join("empty.sqlite");
+    std::fs::write(&empty_db, b"").expect("write");
+    if let Ok(store) = IndexStore::open_readonly(&empty_db) {
+        let result = store.load_symbol_names();
+        assert!(result.is_err(), "query on empty file must return Err");
+    }
+}
+
+#[test]
+fn open_readonly_on_missing_file_returns_error_not_panic() {
+    let dir = tempdir().expect("tempdir");
+    let missing = dir.path().join("nonexistent.sqlite");
+    assert!(!missing.exists());
+    let result = IndexStore::open_readonly(&missing);
+    assert!(result.is_err(), "missing file must return Err, not panic");
+}
+
+// --- Phase 5: schema v7, SQL include invalidation, batch ops -----------
+
+#[test]
+fn schema_v7_includes_have_normalized_metadata() {
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+
+    let mut store = IndexStore::open(&db, dir.path()).expect("store");
+    upsert_source(
+        &mut store,
+        "src/main.c",
+        "#include \"util.h\"\n#include <sys/types.h>\n#define MACRO_INC(x) <x>\n",
+    );
+
+    // Verify the schema version is 7.
+    let version: String = store
+        .conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("version");
+    assert_eq!(version, "7", "schema version must be 7");
+
+    // Verify includes columns exist and are populated.
+    let mut stmt = store
+        .conn
+        .prepare("SELECT target_text, target_form, target_normalized, target_basename FROM includes ORDER BY line")
+        .expect("prepare");
+    let rows: Vec<(String, String, String, String)> = stmt
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .expect("query")
+        .map(|r| r.expect("row"))
+        .collect();
+
+    // Quote include: form="quote", normalized="util.h", basename="util.h"
+    let quote_row = &rows[0];
+    assert_eq!(quote_row.0, "\"util.h\"");
+    assert_eq!(quote_row.1, "quote");
+    assert_eq!(quote_row.2, "util.h");
+    assert_eq!(quote_row.3, "util.h");
+
+    // Angle include: form="angle", normalized="sys/types.h", basename="types.h"
+    let angle_row = &rows[1];
+    assert_eq!(angle_row.0, "<sys/types.h>");
+    assert_eq!(angle_row.1, "angle");
+    assert_eq!(angle_row.2, "sys/types.h");
+    assert_eq!(angle_row.3, "types.h");
+
+    // The third include is a macro definition, not an #include directive.
+    // The parser only produces include rows for `#include` lines, so we get
+    // 2 includes (not 3). The macro line is parsed as a symbol, not an include.
+    assert_eq!(rows.len(), 2, "only #include lines produce include rows");
+
+    // Existing `includes_with_file_ids` still returns raw target_text for
+    // edge rebuild (old API unchanged).
+    let raw = store.includes_with_file_ids(None).expect("raw");
+    assert_eq!(raw.len(), 2);
+    assert!(raw.iter().any(|(_, t)| t == "\"util.h\""));
+}
+
+#[test]
+fn schema_v7_migrate_by_drop_clears_old_data() {
+    // Simulate an older schema by opening v6, inserting data, then opening
+    // with v7 — the old tables should be dropped and recreated.
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+
+    // First, create a v6 store and insert data.
+    {
+        // Write a v6 schema version into the db by manually setting the meta.
+        // We use IndexStore::open which will migrate to v7, so instead
+        // we open a raw connection to seed v6 state.
+        let conn = rusqlite::Connection::open(&db).expect("conn");
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('schema_version', '6')",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL UNIQUE,
+                extension TEXT NOT NULL, size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL,
+                hash TEXT NOT NULL, indexed_at INTEGER NOT NULL, status TEXT NOT NULL,
+                error TEXT, source TEXT NOT NULL DEFAULT 'workspace',
+                directly_included INTEGER NOT NULL DEFAULT 0,
+                unresolved_includes INTEGER NOT NULL DEFAULT 0,
+                ambiguous_includes INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS includes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                line INTEGER NOT NULL, target_text TEXT NOT NULL
+            );
+            INSERT INTO files (path, extension, size, mtime_ns, hash, indexed_at, status)
+            VALUES ('old.c', 'c', 100, 1, 'abc', 1, 'ok');
+            INSERT INTO includes (file_id, line, target_text) VALUES (1, 1, '\"old.h\"');",
+        )
+        .unwrap();
+    }
+
+    // Open with v7: migrate-by-drop clears old tables.
+    let store = IndexStore::open(&db, dir.path()).expect("store");
+
+    // Old data is gone; new schema has the three extra columns.
+    let count: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM includes", [], |row| row.get(0))
+        .expect("count");
+    assert_eq!(count, 0, "old includes rows dropped by migration");
+
+    // Insert a file row first (needed for FK), then verify new columns exist.
+    store
+        .conn
+        .execute(
+            "INSERT INTO files (path, extension, size, mtime_ns, hash, indexed_at, status)
+             VALUES ('test.h', 'h', 100, 1, 'abc', 1, 'ok')",
+            [],
+        )
+        .expect("insert file");
+    store
+        .conn
+        .execute(
+            "INSERT INTO includes (file_id, line, target_text, target_form, target_normalized, target_basename)
+             VALUES (1, 1, '\"test.h\"', 'quote', 'test.h', 'test.h')",
+            [],
+        )
+        .expect("insert into v7");
+
+    let (form, norm, bn): (String, String, String) = store
+        .conn
+        .query_row(
+            "SELECT target_form, target_normalized, target_basename FROM includes LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("read v7 cols");
+    assert_eq!(form, "quote");
+    assert_eq!(norm, "test.h");
+    assert_eq!(bn, "test.h");
+}

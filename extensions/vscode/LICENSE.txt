@@ -1,0 +1,4 @@
+UNLICENSED
+
+This package is private/internal. All rights reserved by HimuToys unless a
+separate license is provided in writing.

@@ -1,0 +1,123 @@
+use super::*;
+
+#[test]
+fn sql_affected_include_sources_finds_by_basename() {
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+    let mut store = IndexStore::open(&db, dir.path()).expect("store");
+
+    // a.c includes "util.h"; b.c includes <stdio.h>.
+    upsert_source(
+        &mut store,
+        "src/a.c",
+        "#include \"util.h\"\nint a(void){return 0;}\n",
+    );
+    upsert_source(
+        &mut store,
+        "src/b.c",
+        "#include <stdio.h>\nint b(void){return 0;}\n",
+    );
+
+    let affected = store
+        .affected_include_sources(
+            &["inc/util.h".to_string()], // changed path
+            &Default::default(),
+            &[],
+        )
+        .expect("affected");
+
+    // a.c should be in the list because its include basename "util.h" matches.
+    assert!(
+        affected.contains(&"src/a.c".to_string()),
+        "a.c should be found by basename match: {affected:?}"
+    );
+    // b.c should NOT be affected (different basename).
+    assert!(
+        !affected.contains(&"src/b.c".to_string()),
+        "b.c should not be affected"
+    );
+}
+
+#[test]
+fn sql_affected_include_sources_finds_by_normalized_target() {
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+    let mut store = IndexStore::open(&db, dir.path()).expect("store");
+
+    upsert_source(
+        &mut store,
+        "src/a.c",
+        "#include \"inc/util.h\"\nint a(void){return 0;}\n",
+    );
+
+    let affected = store
+        .affected_include_sources(
+            &["inc/util.h".to_string()], // exact normalized match
+            &Default::default(),
+            &[],
+        )
+        .expect("affected");
+
+    assert!(
+        affected.contains(&"src/a.c".to_string()),
+        "a.c should be found by normalized target: {affected:?}"
+    );
+}
+
+#[test]
+fn batch_delete_missing_files_anti_join() {
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+    let mut store = IndexStore::open(&db, dir.path()).expect("store");
+
+    upsert_source(&mut store, "keep.c", "int keep(void){return 0;}\n");
+    upsert_source(&mut store, "remove.c", "int remove(void){return 0;}\n");
+
+    let mut seen = HashSet::new();
+    seen.insert("keep.c".to_string());
+    let deleted = store.delete_missing_files(&seen).expect("delete");
+    assert_eq!(deleted, 1, "one file should be deleted");
+
+    let names = store.load_symbol_names().expect("names");
+    assert!(names.iter().any(|(_, n, _)| n == "keep"));
+    assert!(!names.iter().any(|(_, n, _)| n == "remove"));
+}
+
+#[test]
+fn batch_symbols_by_ids_preserves_order_and_omits_missing() {
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+    let mut store = IndexStore::open(&db, dir.path()).expect("store");
+
+    upsert_source(&mut store, "a.c", "int first(void){return 1;}\n");
+    upsert_source(&mut store, "b.c", "int second(void){return 2;}\n");
+    upsert_source(&mut store, "c.c", "int third(void){return 3;}\n");
+
+    let all = store.load_symbol_names().expect("names");
+    let ids: Vec<i64> = all.iter().map(|(id, _, _)| *id).collect();
+    assert!(ids.len() >= 3, "expected at least 3 symbols");
+
+    // Query in reverse order with a non-existent id and a duplicate mixed in.
+    let query_ids = vec![ids[2], 99999, ids[0], ids[2], ids[1]];
+    let records = store.symbols_by_ids(&query_ids).expect("by ids");
+    assert_eq!(records.len(), 4, "missing id 99999 should be omitted");
+    assert_eq!(records[0].id, ids[2], "order preserved: third first");
+    assert_eq!(records[1].id, ids[0], "order preserved: first second");
+    assert_eq!(records[2].id, ids[2], "duplicate id preserved");
+    assert_eq!(records[3].id, ids[1], "order preserved: second last");
+}
+
+#[test]
+fn wal_checkpoint_after_full_rebuild() {
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+    let mut store = IndexStore::open(&db, dir.path()).expect("store");
+
+    store.begin_full_rebuild_load().expect("begin");
+    upsert_source(&mut store, "a.c", "int x(void){return 0;}\n");
+    store.finish_full_rebuild_load().expect("finish");
+
+    // No error = WAL checkpoint succeeded. Verify store is still readable.
+    let reader = IndexStore::open_readonly(&db).expect("readonly");
+    assert!(reader.load_symbol_names().expect("names").len() > 0);
+}

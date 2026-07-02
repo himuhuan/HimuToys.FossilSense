@@ -1,0 +1,496 @@
+import * as fs from 'fs';
+import * as vscode from 'vscode';
+import {
+  ExecuteCommandRequest,
+  LanguageClient,
+  LanguageClientOptions,
+  ServerOptions,
+  Trace,
+} from 'vscode-languageclient/node';
+import { normalizeIncludeScopingMode, normalizeOnOffAuto } from './config';
+import { resolveServerPathFromCandidates } from './serverPath';
+import {
+  DegradedCapabilities,
+  degradedCapabilityWarning,
+  statusTooltip,
+} from './status';
+import { mutualExclusionMessage } from './conflicts';
+
+const REFRESH_INDEX_COMMAND = 'fossilsense.refreshIndex';
+const REFRESH_INDEX_LSP_COMMAND = 'fossilsense.lsp.refreshIndex';
+const REBUILD_INDEX_COMMAND = 'fossilsense.rebuildIndex';
+const REBUILD_INDEX_LSP_COMMAND = 'fossilsense.lsp.rebuildIndex';
+const GROUPED_REFERENCES_COMMAND = 'fossilsense.findReferencesGrouped';
+const GROUPED_REFERENCES_LSP_COMMAND = 'fossilsense.lsp.groupedReferences';
+
+// One role-labeled reference hit returned by the grouped-references command.
+interface GroupedReferenceItem {
+  location: {
+    uri: string;
+    range: {
+      start: { line: number; character: number };
+      end: { line: number; character: number };
+    };
+  };
+  role: string;
+}
+
+const CONFLICT_EXTENSIONS = [
+  { id: 'llvm-vs-code-extensions.vscode-clangd', name: 'clangd' },
+  { id: 'ms-vscode.cpptools', name: 'Microsoft C/C++' },
+  { id: 'ccls-project.ccls', name: 'ccls' },
+];
+
+let client: LanguageClient | undefined;
+let statusBar: vscode.StatusBarItem;
+let output: vscode.OutputChannel;
+let configWarning: string | undefined;
+let capabilityWarning: string | undefined;
+let currentIndexStartedWithWarning = false;
+let mutualExclusionWarningShown = false;
+
+interface IndexStatus {
+  state: 'indexing' | 'ready' | 'failed';
+  workspace: string;
+  phase?: string;
+  processedFiles: number;
+  totalFiles: number;
+  indexedFiles: number;
+  skippedFiles: number;
+  symbols: number;
+  elapsedMs: number;
+  discoverMs: number;
+  parseMs: number;
+  writeMs: number;
+  checkMs: number;
+  includeEdgeMs: number;
+  nameTableMs: number;
+  reachGraphMs: number;
+  degradedCapabilities?: DegradedCapabilities;
+  message?: string;
+}
+
+export function activate(context: vscode.ExtensionContext): void {
+  output = vscode.window.createOutputChannel('FossilSense');
+  statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
+  statusBar.command = 'fossilsense.startServer';
+  setStatus('stopped');
+  statusBar.show();
+
+  context.subscriptions.push(
+    output,
+    statusBar,
+    vscode.commands.registerCommand('fossilsense.startServer', () => startServer(context)),
+    vscode.commands.registerCommand('fossilsense.stopServer', () => stopServer()),
+    vscode.commands.registerCommand(REFRESH_INDEX_COMMAND, () => refreshIndex()),
+    vscode.commands.registerCommand(REBUILD_INDEX_COMMAND, () => rebuildIndex()),
+    vscode.commands.registerCommand(GROUPED_REFERENCES_COMMAND, () => findReferencesGrouped()),
+    // These settings are sent via initializationOptions or control startup, so
+    // changing them requires a restart to take effect.
+    vscode.workspace.onDidChangeConfiguration(async (event) => {
+      if (event.affectsConfiguration('fossilsense.mode')) {
+        output.appendLine('fossilsense.mode changed; restarting server.');
+        await stopServer();
+        await startServer(context);
+        return;
+      }
+      if (
+        client &&
+        (event.affectsConfiguration('fossilsense.includePaths') ||
+          event.affectsConfiguration('fossilsense.completion.mode') ||
+          event.affectsConfiguration('fossilsense.semanticColoring.mode') ||
+          event.affectsConfiguration('fossilsense.includeScoping.mode') ||
+          event.affectsConfiguration('fossilsense.debug.candidateReasons') ||
+          event.affectsConfiguration('fossilsense.trace.server'))
+      ) {
+        output.appendLine('FossilSense configuration changed; restarting server.');
+        await stopServer();
+        await startServer(context);
+      }
+    }),
+  );
+
+  // Auto-start when a workspace is open; the manual command stays as a fallback.
+  if (vscode.workspace.workspaceFolders?.length) {
+    void startServer(context);
+  }
+}
+
+export async function deactivate(): Promise<void> {
+  await stopServer();
+}
+
+async function startServer(context: vscode.ExtensionContext): Promise<void> {
+  if (client) {
+    output.appendLine('FossilSense server is already running.');
+    return;
+  }
+
+  const fossilsenseMode = fossilsenseModeFromConfig();
+  if (fossilsenseMode === 'off') {
+    setStatus('disabled');
+    output.appendLine('FossilSense is disabled by fossilsense.mode=off.');
+    void vscode.window.showInformationMessage(
+      'FossilSense is disabled by fossilsense.mode=off. Change the setting to start it.',
+    );
+    return;
+  }
+
+  const workspaceFolders = vscode.workspace.workspaceFolders;
+  const firstWorkspaceFolder = workspaceFolders?.[0];
+  if (!firstWorkspaceFolder) {
+    void vscode.window.showWarningMessage('Open a workspace folder before starting FossilSense.');
+    return;
+  }
+
+  const serverPath = resolveServerPath(context);
+  if (!serverPath) {
+    setStatus('scan failed');
+    void vscode.window.showErrorMessage(
+      'FossilSense server binary was not found. Run `cargo build` or set `fossilsense.serverPath`.',
+    );
+    return;
+  }
+
+  setStatus('starting');
+  output.appendLine(`Starting FossilSense server: ${serverPath}`);
+  output.appendLine(
+    `Workspaces: ${workspaceFolders.map((folder) => folder.uri.fsPath).join('; ')}`,
+  );
+
+  const serverOptions: ServerOptions = {
+    command: serverPath,
+    args: ['lsp'],
+    options: {
+      cwd: firstWorkspaceFolder.uri.fsPath,
+    },
+  };
+
+  const fileEvents = [
+    vscode.workspace.createFileSystemWatcher('**/*.{c,h,cpp,hpp,cc,hh,cxx,hxx,inl}'),
+    ...workspaceFolders.map((folder) =>
+      vscode.workspace.createFileSystemWatcher(
+        new vscode.RelativePattern(folder, 'fossilsense.json'),
+      ),
+    ),
+  ];
+
+  const conflictingExtensions = detectedCppLanguageServers();
+
+  const completionMode = completionModeFromConfig();
+  const semanticColoringMode = semanticColoringModeFromConfig();
+
+  const clientOptions: LanguageClientOptions = {
+    documentSelector: [
+      { scheme: 'file', language: 'c' },
+      { scheme: 'file', language: 'cpp' },
+    ],
+    outputChannel: output,
+    synchronize: {
+      fileEvents,
+    },
+    initializationOptions: {
+      fossilsense: {
+        completion: {
+          mode: completionMode,
+        },
+        semanticColoring: {
+          mode: semanticColoringMode,
+        },
+        includeScoping: {
+          mode: includeScopingModeFromConfig(),
+        },
+        includePaths: includePathsFromConfig(),
+        debug: {
+          candidateReasons: debugCandidateReasonsFromConfig(),
+          perfLogs: perfLogsFromConfig(),
+        },
+      },
+    },
+  };
+
+  client = new LanguageClient('fossilsense', 'FossilSense', serverOptions, clientOptions);
+  client.setTrace(traceFromConfig());
+  client.onNotification('fossilsense/indexStatus', (status: IndexStatus) => {
+    handleIndexStatus(status);
+  });
+
+  try {
+    await client.start();
+    setStatus('ready');
+    if (fossilsenseMode === 'auto' && conflictingExtensions.length > 0) {
+      void showMutualExclusionWarning(conflictingExtensions);
+    }
+  } catch (error) {
+    client = undefined;
+    setStatus('scan failed');
+    output.appendLine(`Failed to start FossilSense: ${String(error)}`);
+    void vscode.window.showErrorMessage(`Failed to start FossilSense: ${String(error)}`);
+  }
+}
+
+async function stopServer(): Promise<void> {
+  const current = client;
+  client = undefined;
+  configWarning = undefined;
+  currentIndexStartedWithWarning = false;
+
+  if (current) {
+    await current.stop();
+  }
+
+  setStatus('stopped');
+}
+
+async function refreshIndex(): Promise<void> {
+  if (!client) {
+    void vscode.window.showWarningMessage('FossilSense server is not running. Start it first.');
+    return;
+  }
+
+  output.appendLine('Refreshing index (incremental)...');
+  setStatus('refreshing...');
+  await client.sendRequest(ExecuteCommandRequest.type, {
+    command: REFRESH_INDEX_LSP_COMMAND,
+    arguments: [],
+  });
+}
+
+async function rebuildIndex(): Promise<void> {
+  if (!client) {
+    void vscode.window.showWarningMessage('FossilSense server is not running. Start it first.');
+    return;
+  }
+
+  output.appendLine('Full rebuild index (force)...');
+  setStatus('full rebuild...');
+  await client.sendRequest(ExecuteCommandRequest.type, {
+    command: REBUILD_INDEX_LSP_COMMAND,
+    arguments: [],
+  });
+}
+
+// Role-grouped find-references. The standard References panel (textDocument/
+// references) returns plain Locations in role-grouped order but cannot show a
+// per-item role; this command asks the server for the same hits *with* their
+// best-effort syntactic role and presents them grouped and labeled in a
+// QuickPick. Roles are syntactic guesses, not resolved bindings.
+async function findReferencesGrouped(): Promise<void> {
+  if (!client) {
+    void vscode.window.showWarningMessage('FossilSense server is not running. Start it first.');
+    return;
+  }
+  const editor = vscode.window.activeTextEditor;
+  if (!editor) {
+    void vscode.window.showInformationMessage('Open a C/C++ file and place the cursor on an identifier.');
+    return;
+  }
+  const { document, selection } = editor;
+  const position = selection.active;
+
+  const items = (await client.sendRequest(ExecuteCommandRequest.type, {
+    command: GROUPED_REFERENCES_LSP_COMMAND,
+    arguments: [
+      {
+        uri: document.uri.toString(),
+        line: position.line,
+        character: position.character,
+      },
+    ],
+  })) as GroupedReferenceItem[] | null;
+
+  if (!items || items.length === 0) {
+    void vscode.window.showInformationMessage('FossilSense: no references found.');
+    return;
+  }
+
+  // Build a QuickPick with a separator per role group; items already arrive in
+  // role-grouped order from the server, so a role change starts a new section.
+  const picks: (vscode.QuickPickItem & { item?: GroupedReferenceItem })[] = [];
+  let currentRole: string | undefined;
+  for (const item of items) {
+    if (item.role !== currentRole) {
+      currentRole = item.role;
+      picks.push({ label: item.role, kind: vscode.QuickPickItemKind.Separator });
+    }
+    const rel = vscode.workspace.asRelativePath(vscode.Uri.parse(item.location.uri));
+    const line = item.location.range.start.line + 1;
+    picks.push({ label: `${rel}:${line}`, description: item.role, item });
+  }
+
+  const chosen = await vscode.window.showQuickPick(picks, {
+    placeHolder: `FossilSense references (${items.length}), grouped by role`,
+    matchOnDescription: true,
+  });
+  if (!chosen?.item) {
+    return;
+  }
+  const target = chosen.item.location;
+  const uri = vscode.Uri.parse(target.uri);
+  const range = new vscode.Range(
+    target.range.start.line,
+    target.range.start.character,
+    target.range.end.line,
+    target.range.end.character,
+  );
+  await vscode.window.showTextDocument(uri, { selection: range });
+}
+
+function resolveServerPath(context: vscode.ExtensionContext): string | undefined {
+  const configured = vscode.workspace
+    .getConfiguration('fossilsense')
+    .get<string>('serverPath', '')
+    .trim();
+  return resolveServerPathFromCandidates({
+    platform: process.platform,
+    configuredPath: configured,
+    extensionPath: context.extensionPath,
+    exists: fs.existsSync,
+  });
+}
+
+function includePathsFromConfig(): string[] {
+  return vscode.workspace
+    .getConfiguration('fossilsense')
+    .get<string[]>('includePaths', [])
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+}
+
+function debugCandidateReasonsFromConfig(): boolean {
+  return vscode.workspace
+    .getConfiguration('fossilsense')
+    .get<boolean>('debug.candidateReasons', false);
+}
+
+function fossilsenseModeFromConfig(): string {
+  const setting = vscode.workspace
+    .getConfiguration('fossilsense')
+    .get<string>('mode', 'auto');
+  return normalizeOnOffAuto(setting);
+}
+
+// Limited include-reachability scoping. Unlike completion/coloring there is no
+// conflict deference: scoping only narrows FossilSense's own output, so it is
+// either auto (on) or off.
+function includeScopingModeFromConfig(): string {
+  const setting = vscode.workspace
+    .getConfiguration('fossilsense')
+    .get<string>('includeScoping.mode', 'auto');
+  return normalizeIncludeScopingMode(setting);
+}
+
+function traceFromConfig(): Trace {
+  const value = vscode.workspace
+    .getConfiguration('fossilsense')
+    .get<string>('trace.server', 'off');
+
+  switch (value) {
+    case 'messages':
+      return Trace.Messages;
+    case 'verbose':
+      return Trace.Verbose;
+    default:
+      return Trace.Off;
+  }
+}
+
+function perfLogsFromConfig(): boolean {
+  return vscode.workspace
+    .getConfiguration('fossilsense')
+    .get<string>('trace.server', 'off') === 'verbose';
+}
+
+function completionModeFromConfig(): string {
+  const setting = vscode.workspace
+    .getConfiguration('fossilsense')
+    .get<string>('completion.mode', 'auto');
+
+  return normalizeOnOffAuto(setting);
+}
+
+function semanticColoringModeFromConfig(): string {
+  const setting = vscode.workspace
+    .getConfiguration('fossilsense')
+    .get<string>('semanticColoring.mode', 'auto');
+
+  return normalizeOnOffAuto(setting);
+}
+
+function detectedCppLanguageServers(): string[] {
+  return CONFLICT_EXTENSIONS.filter((extension) => {
+    return vscode.extensions.getExtension(extension.id) !== undefined;
+  }).map((extension) => extension.name);
+}
+
+async function showMutualExclusionWarning(conflictingExtensions: string[]): Promise<void> {
+  if (mutualExclusionWarningShown) {
+    return;
+  }
+  mutualExclusionWarningShown = true;
+
+  const msg = mutualExclusionMessage(conflictingExtensions);
+  output.appendLine(`Mutual-exclusion notice: ${msg}`);
+
+  const stop = 'Stop FossilSense';
+  const settings = 'Open Settings';
+  const selected = await vscode.window.showWarningMessage(msg, stop, settings);
+  if (selected === stop) {
+    await stopServer();
+  } else if (selected === settings) {
+    await vscode.commands.executeCommand('workbench.action.openSettings', 'fossilsense.mode');
+  }
+}
+
+function handleIndexStatus(status: IndexStatus): void {
+  switch (status.state) {
+    case 'indexing':
+      if (status.message) {
+        configWarning = status.message;
+        currentIndexStartedWithWarning = true;
+        output.appendLine(`Config warning: ${status.message}`);
+      } else if (status.processedFiles === 0 && !currentIndexStartedWithWarning) {
+        configWarning = undefined;
+        capabilityWarning = undefined;
+      } else if (status.processedFiles === 0) {
+        currentIndexStartedWithWarning = false;
+      }
+      setStatus(indexingStatusText(status));
+      break;
+    case 'ready':
+      capabilityWarning = degradedCapabilityWarning(status.degradedCapabilities);
+      setStatus('ready');
+      output.appendLine(
+        `Index ready: ${status.workspace}; files=${status.totalFiles}, indexed=${status.indexedFiles}, skipped=${status.skippedFiles}, symbols=${status.symbols}, elapsed=${status.elapsedMs}ms (discover=${status.discoverMs}ms, check=${status.checkMs}ms, parse=${status.parseMs}ms, write=${status.writeMs}ms, include_edge=${status.includeEdgeMs}ms, name_table=${status.nameTableMs}ms, reach_graph=${status.reachGraphMs}ms)${capabilityWarning ? `; degraded=${capabilityWarning}` : ''}`,
+      );
+      break;
+    case 'failed':
+      capabilityWarning = undefined;
+      setStatus('failed');
+      output.appendLine(`Index failed: ${status.workspace}; ${status.message ?? 'unknown error'}`);
+      break;
+  }
+}
+
+function indexingStatusText(status: IndexStatus): string {
+  const phase = status.phase ?? 'indexing';
+  if (phase === 'discovering') {
+    return 'discovering...';
+  }
+  if (phase === 'finalizing') {
+    return 'finalizing...';
+  }
+  if (status.totalFiles === 0) {
+    return `${phase}...`;
+  }
+  return `${phase} ${status.processedFiles}/${status.totalFiles}`;
+}
+
+function setStatus(state: string): void {
+  const warningSuffix = configWarning || capabilityWarning ? ' [!]' : '';
+  statusBar.text = `FossilSense: ${state}${warningSuffix}`;
+  statusBar.tooltip = statusTooltip(configWarning, capabilityWarning);
+  statusBar.backgroundColor = configWarning || capabilityWarning
+    ? new vscode.ThemeColor('statusBarItem.warningBackground')
+    : undefined;
+}

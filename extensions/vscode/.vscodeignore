@@ -1,0 +1,12 @@
+# Keep the VSIX small and self-contained: ship out/extension.js + bin/ only.
+.vscode/**
+.gitignore
+src/**
+scripts/**
+node_modules/**
+out/**/*.map
+out/test/**
+tsconfig.json
+pnpm-lock.yaml
+**/*.ts
+*.vsix

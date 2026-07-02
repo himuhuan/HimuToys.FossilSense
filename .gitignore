@@ -1,0 +1,8 @@
+/target/
+samples/
+node_modules/
+dist/
+out/
+extensions/vscode/bin/
+*.vsix
+*.log
