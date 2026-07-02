@@ -33,44 +33,98 @@ pub struct RankedSignatureCandidate {
 pub fn call_context_at(text: &str, line: u32, character: u32) -> Option<CallContext> {
     let offset = byte_offset_at(text, line, character).min(text.len());
     let bytes = text.as_bytes();
-    let mut i = offset;
-    let mut paren_depth = 0i32;
-    let mut bracket_depth = 0i32;
-    let mut brace_depth = 0i32;
-    let mut angle_depth = 0i32;
-    let mut active_argument = 0u32;
+    let mut stack = Vec::new();
+    let mut state = LexState::Code;
+    let mut i = 0usize;
 
-    while i > 0 {
-        i -= 1;
-        match bytes[i] {
-            b')' => paren_depth += 1,
-            b'(' if paren_depth > 0 => paren_depth -= 1,
-            b']' => bracket_depth += 1,
-            b'[' if bracket_depth > 0 => bracket_depth -= 1,
-            b'}' => brace_depth += 1,
-            b'{' if brace_depth > 0 => brace_depth -= 1,
-            b'>' => angle_depth += 1,
-            b'<' if angle_depth > 0 => angle_depth -= 1,
-            b',' if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => {
-                if angle_depth > 0 {
-                    return None;
+    while i < offset {
+        let byte = bytes[i];
+        match state {
+            LexState::Code => match byte {
+                b'/' if i + 1 < offset && bytes[i + 1] == b'/' => {
+                    state = LexState::LineComment;
+                    i += 2;
+                    continue;
                 }
-                active_argument += 1;
-            }
-            b'(' if bracket_depth == 0 && brace_depth == 0 => {
-                let name = identifier_before(bytes, i)?;
-                if is_control_keyword(&name) {
-                    return None;
+                b'/' if i + 1 < offset && bytes[i + 1] == b'*' => {
+                    state = LexState::BlockComment;
+                    i += 2;
+                    continue;
                 }
-                return Some(CallContext {
-                    name,
-                    active_argument,
-                });
+                b'"' => state = LexState::String { escaped: false },
+                b'\'' => state = LexState::Char { escaped: false },
+                b'(' => {
+                    let name = identifier_before(bytes, i).filter(|name| !is_control_keyword(name));
+                    stack.push(DelimFrame::Paren {
+                        name,
+                        active_argument: 0,
+                    });
+                }
+                b')' => pop_matching(&mut stack, FrameKind::Paren),
+                b'[' => stack.push(DelimFrame::Bracket),
+                b']' => pop_matching(&mut stack, FrameKind::Bracket),
+                b'{' => stack.push(DelimFrame::Brace),
+                b'}' => pop_matching(&mut stack, FrameKind::Brace),
+                b'<' if looks_like_template_start(bytes, i) => {
+                    stack.push(DelimFrame::Angle);
+                }
+                b'>' => pop_matching(&mut stack, FrameKind::Angle),
+                b',' => {
+                    if stack.iter().any(|frame| matches!(frame, DelimFrame::Angle)) {
+                        return None;
+                    }
+                    if let Some(DelimFrame::Paren {
+                        name: Some(_),
+                        active_argument,
+                    }) = stack.last_mut()
+                    {
+                        *active_argument += 1;
+                    }
+                }
+                _ => {}
+            },
+            LexState::String { escaped } => {
+                state = match (escaped, byte) {
+                    (true, _) => LexState::String { escaped: false },
+                    (false, b'\\') => LexState::String { escaped: true },
+                    (false, b'"') => LexState::Code,
+                    _ => LexState::String { escaped: false },
+                };
             }
-            _ => {}
+            LexState::Char { escaped } => {
+                state = match (escaped, byte) {
+                    (true, _) => LexState::Char { escaped: false },
+                    (false, b'\\') => LexState::Char { escaped: true },
+                    (false, b'\'') => LexState::Code,
+                    _ => LexState::Char { escaped: false },
+                };
+            }
+            LexState::LineComment => {
+                if byte == b'\n' {
+                    state = LexState::Code;
+                }
+            }
+            LexState::BlockComment => {
+                if byte == b'*' && i + 1 < offset && bytes[i + 1] == b'/' {
+                    state = LexState::Code;
+                    i += 2;
+                    continue;
+                }
+            }
         }
+        i += 1;
     }
-    None
+
+    stack.iter().rev().find_map(|frame| match frame {
+        DelimFrame::Paren {
+            name: Some(name),
+            active_argument,
+        } => Some(CallContext {
+            name: name.clone(),
+            active_argument: *active_argument,
+        }),
+        _ => None,
+    })
 }
 
 pub fn signature_parts(signature: &str) -> SignatureParts {
@@ -85,6 +139,25 @@ pub fn signature_parts(signature: &str) -> SignatureParts {
             parameters: Vec::new(),
         };
     };
+    signature_parts_from_bounds(label, open, close)
+}
+
+pub fn signature_parts_for_name(signature: &str, name: &str) -> SignatureParts {
+    let label = signature
+        .trim_end()
+        .strip_suffix('{')
+        .map(|without_brace| without_brace.trim_end().to_string())
+        .unwrap_or_else(|| signature.to_string());
+    let Some((open, close)) = parameter_list_bounds_for_name(&label, name) else {
+        return SignatureParts {
+            label,
+            parameters: Vec::new(),
+        };
+    };
+    signature_parts_from_bounds(label, open, close)
+}
+
+fn signature_parts_from_bounds(label: String, open: usize, close: usize) -> SignatureParts {
     let inner = &label[open + 1..close];
     if inner.trim().is_empty() || inner.trim() == "void" {
         return SignatureParts {
@@ -157,9 +230,88 @@ fn is_control_keyword(name: &str) -> bool {
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LexState {
+    Code,
+    String { escaped: bool },
+    Char { escaped: bool },
+    LineComment,
+    BlockComment,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DelimFrame {
+    Paren {
+        name: Option<String>,
+        active_argument: u32,
+    },
+    Bracket,
+    Brace,
+    Angle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameKind {
+    Paren,
+    Bracket,
+    Brace,
+    Angle,
+}
+
+fn pop_matching(stack: &mut Vec<DelimFrame>, kind: FrameKind) {
+    if stack.last().is_some_and(|frame| frame.kind() == kind) {
+        stack.pop();
+    }
+}
+
+impl DelimFrame {
+    fn kind(&self) -> FrameKind {
+        match self {
+            DelimFrame::Paren { .. } => FrameKind::Paren,
+            DelimFrame::Bracket => FrameKind::Bracket,
+            DelimFrame::Brace => FrameKind::Brace,
+            DelimFrame::Angle => FrameKind::Angle,
+        }
+    }
+}
+
+fn looks_like_template_start(bytes: &[u8], open_angle: usize) -> bool {
+    previous_non_ws(bytes, open_angle).is_some_and(is_ident_continue)
+}
+
 fn parameter_list_bounds(label: &str) -> Option<(usize, usize)> {
     let bytes = label.as_bytes();
-    let open = bytes.iter().position(|byte| *byte == b'(')?;
+    let open = bytes
+        .iter()
+        .position(|byte| *byte == b'(')
+        .filter(|open| is_plain_function_name_before(bytes, *open))?;
+    matching_close_paren(bytes, open).map(|close| (open, close))
+}
+
+fn parameter_list_bounds_for_name(label: &str, name: &str) -> Option<(usize, usize)> {
+    if name.is_empty() {
+        return None;
+    }
+    let bytes = label.as_bytes();
+    for (idx, _) in label.match_indices(name) {
+        let end = idx + name.len();
+        let before_boundary = idx == 0 || !is_ident_continue(bytes[idx - 1]);
+        let after_boundary = end == bytes.len() || !is_ident_continue(bytes[end]);
+        if !before_boundary || !after_boundary || is_function_pointer_declarator_name(bytes, idx) {
+            continue;
+        }
+        let open = skip_ascii_whitespace(bytes, end);
+        if bytes.get(open) != Some(&b'(') {
+            continue;
+        }
+        if let Some(close) = matching_close_paren(bytes, open) {
+            return Some((open, close));
+        }
+    }
+    None
+}
+
+fn matching_close_paren(bytes: &[u8], open: usize) -> Option<usize> {
     let mut depth = 0i32;
     for (idx, byte) in bytes.iter().enumerate().skip(open) {
         match *byte {
@@ -167,13 +319,63 @@ fn parameter_list_bounds(label: &str) -> Option<(usize, usize)> {
             b')' => {
                 depth -= 1;
                 if depth == 0 {
-                    return Some((open, idx));
+                    return Some(idx);
                 }
             }
             _ => {}
         }
     }
     None
+}
+
+fn is_plain_function_name_before(bytes: &[u8], open_paren: usize) -> bool {
+    if open_paren == 0 || !is_ident_continue(bytes[open_paren - 1]) {
+        return false;
+    }
+    let Some(name_start) = identifier_start_before(bytes, open_paren) else {
+        return false;
+    };
+    !is_function_pointer_declarator_name(bytes, name_start)
+}
+
+fn identifier_start_before(bytes: &[u8], open_paren: usize) -> Option<usize> {
+    let mut end = open_paren;
+    while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    let mut start = end;
+    while start > 0 && is_ident_continue(bytes[start - 1]) {
+        start -= 1;
+    }
+    if start == end || !is_ident_start(bytes[start]) {
+        return None;
+    }
+    Some(start)
+}
+
+fn is_function_pointer_declarator_name(bytes: &[u8], name_start: usize) -> bool {
+    let Some(pointer_idx) = previous_non_ws_index(bytes, name_start) else {
+        return false;
+    };
+    matches!(bytes[pointer_idx], b'*' | b'&') && previous_non_ws(bytes, pointer_idx) == Some(b'(')
+}
+
+fn previous_non_ws(bytes: &[u8], before: usize) -> Option<u8> {
+    previous_non_ws_index(bytes, before).map(|idx| bytes[idx])
+}
+
+fn previous_non_ws_index(bytes: &[u8], before: usize) -> Option<usize> {
+    bytes
+        .get(..before)?
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+}
+
+fn skip_ascii_whitespace(bytes: &[u8], mut idx: usize) -> usize {
+    while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+        idx += 1;
+    }
+    idx
 }
 
 fn split_parameter_spans(label: &str, start: usize, end: usize) -> Option<Vec<ParameterSpan>> {
@@ -307,6 +509,16 @@ mod tests {
     }
 
     #[test]
+    fn call_context_ignores_commas_inside_string_literals() {
+        let text = "void f(void) {\n  log_message(\"a,b\", \n}\n";
+        let line = 1;
+        let character = text.lines().nth(1).expect("line").chars().count() as u32;
+        let ctx = call_context_at(text, line, character).expect("call context");
+        assert_eq!(ctx.name, "log_message");
+        assert_eq!(ctx.active_argument, 1);
+    }
+
+    #[test]
     fn signature_parts_extracts_simple_parameters() {
         let parts = signature_parts("int foo(int a, const char *name)");
         assert_eq!(parts.label, "int foo(int a, const char *name)");
@@ -333,6 +545,35 @@ mod tests {
             .map(|span| &parts.label[span.start as usize..span.end as usize])
             .collect();
         assert_eq!(labels, vec!["int (*cb)(int, int)", "int flags"]);
+    }
+
+    #[test]
+    fn signature_parts_do_not_fabricate_parameters_for_function_pointer_return() {
+        let parts = signature_parts("int (*factory(void))(int);");
+        assert_eq!(parts.label, "int (*factory(void))(int);");
+        assert!(parts.parameters.is_empty());
+    }
+
+    #[test]
+    fn signature_parts_extracts_pointer_return_parameters() {
+        let parts = signature_parts_for_name("char *dup_string(const char *s)", "dup_string");
+        let labels: Vec<&str> = parts
+            .parameters
+            .iter()
+            .map(|span| &parts.label[span.start as usize..span.end as usize])
+            .collect();
+        assert_eq!(labels, vec!["const char *s"]);
+    }
+
+    #[test]
+    fn signature_parts_for_name_skips_prefix_attributes() {
+        let parts = signature_parts_for_name("__attribute__((nonnull(1))) int foo(int x)", "foo");
+        let labels: Vec<&str> = parts
+            .parameters
+            .iter()
+            .map(|span| &parts.label[span.start as usize..span.end as usize])
+            .collect();
+        assert_eq!(labels, vec!["int x"]);
     }
 
     #[test]

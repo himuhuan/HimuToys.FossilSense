@@ -18,8 +18,8 @@ mod text;
 pub use definitions::rank_definitions_into_candidates_with_scope;
 pub use lsp_kinds::{lsp_completion_kind_from_parser, lsp_kind_from_parser, lsp_symbol_kind};
 pub use signatures::{
-    call_context_at, rank_function_signature_candidates, signature_parts, CallContext,
-    ParameterSpan, RankedSignatureCandidate, SignatureParts, SIGNATURE_HELP_LIMIT,
+    call_context_at, rank_function_signature_candidates, signature_parts, signature_parts_for_name,
+    CallContext, ParameterSpan, RankedSignatureCandidate, SignatureParts, SIGNATURE_HELP_LIMIT,
 };
 use text::is_boundary;
 pub use text::{

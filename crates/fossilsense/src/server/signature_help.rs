@@ -59,27 +59,35 @@ impl Backend {
         .await;
 
         match self.unwrap_query("signature help", result).await {
-            Some(signatures) if !signatures.is_empty() => {
-                let active_parameter = signatures
-                    .iter()
-                    .any(|signature| signature.active_parameter.is_some())
-                    .then_some(active_argument);
-                Ok(Some(SignatureHelp {
-                    signatures,
-                    active_signature: Some(0),
-                    active_parameter,
-                }))
-            }
+            Some(signatures) => Ok(signature_help_from_signatures(signatures)),
             _ => Ok(None),
         }
     }
+}
+
+fn signature_help_from_signatures(signatures: Vec<SignatureInformation>) -> Option<SignatureHelp> {
+    if signatures.is_empty() {
+        return None;
+    }
+    let active_parameter = signatures
+        .first()
+        .and_then(|signature| signature.active_parameter);
+    Some(SignatureHelp {
+        signatures,
+        active_signature: Some(0),
+        active_parameter,
+    })
 }
 
 pub(super) fn signature_information_for(
     ranked: &query::RankedSignatureCandidate,
     active_argument: u32,
 ) -> SignatureInformation {
-    let parts: query::SignatureParts = query::signature_parts(&ranked.signature);
+    let parts: query::SignatureParts = if ranked.candidate.name.is_empty() {
+        query::signature_parts(&ranked.signature)
+    } else {
+        query::signature_parts_for_name(&ranked.signature, &ranked.candidate.name)
+    };
     let spans: &[query::ParameterSpan] = &parts.parameters;
     let parameters: Vec<ParameterInformation> = spans
         .iter()
@@ -130,11 +138,19 @@ mod tests {
         signature: &str,
         tier: crate::model::ScopeTier,
     ) -> crate::query::RankedSignatureCandidate {
+        candidate_named("foo", signature, tier)
+    }
+
+    fn candidate_named(
+        name: &str,
+        signature: &str,
+        tier: crate::model::ScopeTier,
+    ) -> crate::query::RankedSignatureCandidate {
         let (confidence, reason) = crate::resolver::confidence_reason_for(tier, true, None);
         crate::query::RankedSignatureCandidate {
             signature: signature.to_string(),
             candidate: crate::model::DefinitionCandidate {
-                name: "foo".to_string(),
+                name: name.to_string(),
                 kind: "function".to_string(),
                 role: "definition".to_string(),
                 path: "inc/foo.h".to_string(),
@@ -189,6 +205,43 @@ mod tests {
             &candidate("int foo(int a)", crate::model::ScopeTier::Global),
             3,
         );
+        assert_eq!(info.active_parameter, None);
+    }
+
+    #[test]
+    fn signature_help_active_parameter_uses_active_signature_only() {
+        let signatures = vec![
+            signature_information_for(
+                &candidate("int foo(int a)", crate::model::ScopeTier::Current),
+                2,
+            ),
+            signature_information_for(
+                &candidate(
+                    "int foo(int a, int b, int c)",
+                    crate::model::ScopeTier::Global,
+                ),
+                2,
+            ),
+        ];
+        let help = signature_help_from_signatures(signatures).expect("signature help");
+        assert_eq!(help.active_signature, Some(0));
+        assert_eq!(help.active_parameter, None);
+        assert_eq!(help.signatures[0].active_parameter, None);
+        assert_eq!(help.signatures[1].active_parameter, Some(2));
+    }
+
+    #[test]
+    fn signature_information_does_not_label_function_pointer_return_parameters() {
+        let info = signature_information_for(
+            &candidate_named(
+                "factory",
+                "int (*factory(void))(int);",
+                crate::model::ScopeTier::Reachable,
+            ),
+            0,
+        );
+        assert_eq!(info.label, "int (*factory(void))(int);");
+        assert!(info.parameters.is_none());
         assert_eq!(info.active_parameter, None);
     }
 
