@@ -391,6 +391,59 @@ mod tests {
     }
 
     #[test]
+    fn goto_with_scope_orders_current_reachable_external_unknown() {
+        let mut external = record_ext(
+            "foo",
+            "function",
+            "definition",
+            "C:/sdk/foo.h",
+            3,
+            true,
+        );
+        external.directly_included = true;
+        let candidates = vec![
+            record("foo", "function", "definition", "other/foo.c", 20),
+            external,
+            record("foo", "function", "definition", "inc/foo.h", 7),
+            record("foo", "function", "definition", "src/main.c", 30),
+        ];
+        let scope = crate::reachability::ReachScope {
+            files: ["src/main.c".to_string(), "inc/foo.h".to_string()]
+                .into_iter()
+                .collect(),
+            open: true,
+            reason: Some(crate::reachability::OpenReason::AmbiguousInclude),
+        };
+        let ranked =
+            rank_definitions_into_candidates_with_scope(candidates, "src/main.c", Some(&scope));
+        let paths: Vec<&str> = ranked
+            .iter()
+            .map(|candidate| candidate.path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            vec!["src/main.c", "inc/foo.h", "C:/sdk/foo.h", "other/foo.c"]
+        );
+        assert_eq!(ranked[3].tier, crate::model::ScopeTier::Unknown);
+        assert_eq!(ranked[3].confidence, ResolutionConfidence::Ambiguous);
+    }
+
+    #[test]
+    fn goto_open_unresolved_scope_uses_fallback_for_unknown_candidates() {
+        let candidates = vec![record("foo", "function", "definition", "other/foo.c", 20)];
+        let scope = crate::reachability::ReachScope {
+            files: HashSet::new(),
+            open: true,
+            reason: Some(crate::reachability::OpenReason::UnresolvedInclude),
+        };
+        let ranked =
+            rank_definitions_into_candidates_with_scope(candidates, "src/main.c", Some(&scope));
+        assert_eq!(ranked[0].tier, crate::model::ScopeTier::Unknown);
+        assert_eq!(ranked[0].confidence, ResolutionConfidence::Fallback);
+        assert_eq!(ranked[0].reason, ResolutionReason::GlobalFallback);
+    }
+
+    #[test]
     fn confidence_reason_for_current_file_exact() {
         assert_eq!(
             crate::resolver::confidence_reason_for(crate::model::ScopeTier::Current, true, None),
