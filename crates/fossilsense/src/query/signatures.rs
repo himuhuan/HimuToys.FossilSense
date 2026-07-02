@@ -6,6 +6,18 @@ pub struct CallContext {
     pub active_argument: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParameterSpan {
+    pub start: u32,
+    pub end: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignatureParts {
+    pub label: String,
+    pub parameters: Vec<ParameterSpan>,
+}
+
 pub fn call_context_at(text: &str, line: u32, character: u32) -> Option<CallContext> {
     let offset = byte_offset_at(text, line, character).min(text.len());
     let bytes = text.as_bytes();
@@ -49,6 +61,34 @@ pub fn call_context_at(text: &str, line: u32, character: u32) -> Option<CallCont
     None
 }
 
+pub fn signature_parts(signature: &str) -> SignatureParts {
+    let label = signature
+        .trim_end()
+        .strip_suffix('{')
+        .map(|without_brace| without_brace.trim_end().to_string())
+        .unwrap_or_else(|| signature.to_string());
+    let Some((open, close)) = parameter_list_bounds(&label) else {
+        return SignatureParts {
+            label,
+            parameters: Vec::new(),
+        };
+    };
+    let inner = &label[open + 1..close];
+    if inner.trim().is_empty() || inner.trim() == "void" {
+        return SignatureParts {
+            label,
+            parameters: Vec::new(),
+        };
+    }
+    let Some(parameters) = split_parameter_spans(&label, open + 1, close) else {
+        return SignatureParts {
+            label,
+            parameters: Vec::new(),
+        };
+    };
+    SignatureParts { label, parameters }
+}
+
 fn identifier_before(bytes: &[u8], open_paren: usize) -> Option<String> {
     let mut end = open_paren;
     while end > 0 && bytes[end - 1].is_ascii_whitespace() {
@@ -77,6 +117,75 @@ fn is_control_keyword(name: &str) -> bool {
         name,
         "if" | "for" | "while" | "switch" | "return" | "sizeof" | "defined"
     )
+}
+
+fn parameter_list_bounds(label: &str) -> Option<(usize, usize)> {
+    let bytes = label.as_bytes();
+    let open = bytes.iter().position(|byte| *byte == b'(')?;
+    let mut depth = 0i32;
+    for (idx, byte) in bytes.iter().enumerate().skip(open) {
+        match *byte {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((open, idx));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_parameter_spans(label: &str, start: usize, end: usize) -> Option<Vec<ParameterSpan>> {
+    let bytes = label.as_bytes();
+    let mut spans = Vec::new();
+    let mut part_start = start;
+    let mut paren = 0i32;
+    let mut bracket = 0i32;
+    let mut brace = 0i32;
+    for (idx, byte) in bytes.iter().enumerate().take(end).skip(start) {
+        match *byte {
+            b'(' => paren += 1,
+            b')' => paren -= 1,
+            b'[' => bracket += 1,
+            b']' => bracket -= 1,
+            b'{' => brace += 1,
+            b'}' => brace -= 1,
+            b',' if paren == 0 && bracket == 0 && brace == 0 => {
+                push_trimmed_span(label, part_start, idx, &mut spans);
+                part_start = idx + 1;
+            }
+            _ => {}
+        }
+        if paren < 0 || bracket < 0 || brace < 0 {
+            return None;
+        }
+    }
+    if paren != 0 || bracket != 0 || brace != 0 {
+        return None;
+    }
+    push_trimmed_span(label, part_start, end, &mut spans);
+    Some(spans)
+}
+
+fn push_trimmed_span(label: &str, start: usize, end: usize, spans: &mut Vec<ParameterSpan>) {
+    let mut s = start;
+    let mut e = end;
+    let bytes = label.as_bytes();
+    while s < e && bytes[s].is_ascii_whitespace() {
+        s += 1;
+    }
+    while e > s && bytes[e - 1].is_ascii_whitespace() {
+        e -= 1;
+    }
+    if s < e {
+        spans.push(ParameterSpan {
+            start: s as u32,
+            end: e as u32,
+        });
+    }
 }
 
 #[cfg(test)]
@@ -122,5 +231,41 @@ mod tests {
             call_context_at(text, line, character).is_none(),
             "unsupported template-like shapes must degrade to None"
         );
+    }
+
+    #[test]
+    fn signature_parts_extracts_simple_parameters() {
+        let parts = signature_parts("int foo(int a, const char *name)");
+        assert_eq!(parts.label, "int foo(int a, const char *name)");
+        let labels: Vec<&str> = parts
+            .parameters
+            .iter()
+            .map(|span| &parts.label[span.start as usize..span.end as usize])
+            .collect();
+        assert_eq!(labels, vec!["int a", "const char *name"]);
+    }
+
+    #[test]
+    fn signature_parts_keeps_void_parameter_list_empty() {
+        let parts = signature_parts("void reset(void)");
+        assert!(parts.parameters.is_empty());
+    }
+
+    #[test]
+    fn signature_parts_ignores_nested_commas() {
+        let parts = signature_parts("void visit(int (*cb)(int, int), int flags)");
+        let labels: Vec<&str> = parts
+            .parameters
+            .iter()
+            .map(|span| &parts.label[span.start as usize..span.end as usize])
+            .collect();
+        assert_eq!(labels, vec!["int (*cb)(int, int)", "int flags"]);
+    }
+
+    #[test]
+    fn malformed_signature_returns_whole_label_without_parameters() {
+        let parts = signature_parts("int broken(int a, ");
+        assert_eq!(parts.label, "int broken(int a, ");
+        assert!(parts.parameters.is_empty());
     }
 }
