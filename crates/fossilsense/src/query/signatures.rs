@@ -1,7 +1,7 @@
 use super::byte_offset_at;
-use crate::model::{CandidateRange, DefinitionCandidate};
+use super::definitions::rank_definition_records_with_scope;
+use crate::model::DefinitionCandidate;
 use crate::reachability::ReachScope;
-use crate::resolver::{self, ResolveContext};
 use crate::store::SymbolRecord;
 
 pub const SIGNATURE_HELP_LIMIT: usize = 10;
@@ -107,97 +107,22 @@ pub fn rank_function_signature_candidates(
     scope: Option<&ReachScope>,
     limit: usize,
 ) -> Vec<RankedSignatureCandidate> {
-    let ctx = ResolveContext {
-        current_path: Some(current_rel_path),
-        reach: scope,
-    };
-    let mut keyed: Vec<(i32, String, u32, usize, SymbolRecord)> = records
+    let functions = records
         .into_iter()
         .filter(|record| record.kind == "function")
-        .enumerate()
-        .map(|(original_index, record)| {
-            let tier = resolver::scope_tier(
-                &record.path,
-                record.source == "external",
-                record.directly_included,
-                Some(&ctx),
-            );
-            let base_match = function_definition_base_match(&record);
-            let locality = resolver::locality(&record.path, Some(current_rel_path));
-            let score = resolver::pack_score(tier, base_match, locality);
-            (
-                score,
-                record.path.clone(),
-                record.start_line,
-                original_index,
-                record,
-            )
-        })
         .collect();
-    keyed.sort_by(|a, b| {
-        b.0.cmp(&a.0)
-            .then_with(|| a.1.cmp(&b.1))
-            .then(a.2.cmp(&b.2))
-            .then(a.3.cmp(&b.3))
-    });
 
-    keyed.into_iter()
-        .map(|(_, _, _, _, record)| {
-            let tier = resolver::scope_tier(
-                &record.path,
-                record.source == "external",
-                record.directly_included,
-                Some(&ctx),
-            );
-            let (confidence, reason) =
-                resolver::confidence_reason_for(tier, true, scope.and_then(|reach| reach.reason));
-            let signature = record.signature.clone();
-            let base_match = function_definition_base_match(&record);
-            let candidate = DefinitionCandidate {
-                name: record.name,
-                kind: record.kind,
-                role: record.role,
-                path: record.path,
-                range: CandidateRange {
-                    start_line: record.start_line,
-                    start_col: record.start_col,
-                    end_line: record.end_line,
-                    end_col: record.end_col,
-                },
-                source: record.source,
-                tier,
-                base_match,
-                confidence,
-                reason,
-            };
+    rank_definition_records_with_scope(functions, current_rel_path, scope)
+        .into_iter()
+        .take(limit)
+        .map(|ranked| {
+            let signature = ranked.record.signature;
             RankedSignatureCandidate {
-                candidate,
+                candidate: ranked.candidate,
                 signature,
             }
         })
-        .take(limit)
         .collect()
-}
-
-fn function_definition_base_match(record: &SymbolRecord) -> i32 {
-    let mut score = 0;
-    if record.role == "definition" {
-        score += 1000;
-    }
-    if record.kind == "function" && is_source_ext(&record.path) {
-        score += 100;
-    }
-    score
-}
-
-fn is_source_ext(path: &str) -> bool {
-    match path.rsplit_once('.') {
-        Some((_, ext)) => matches!(
-            ext.to_ascii_lowercase().as_str(),
-            "c" | "cc" | "cpp" | "cxx"
-        ),
-        None => false,
-    }
 }
 
 fn identifier_before(bytes: &[u8], open_paren: usize) -> Option<String> {
@@ -212,7 +137,9 @@ fn identifier_before(bytes: &[u8], open_paren: usize) -> Option<String> {
     if start == end || !is_ident_start(bytes[start]) {
         return None;
     }
-    std::str::from_utf8(&bytes[start..end]).ok().map(str::to_string)
+    std::str::from_utf8(&bytes[start..end])
+        .ok()
+        .map(str::to_string)
 }
 
 fn is_ident_start(byte: u8) -> bool {
@@ -418,8 +345,20 @@ mod tests {
     #[test]
     fn signature_candidates_keep_only_functions_and_preserve_signature() {
         let records = vec![
-            symbol_record("foo", "macro", "definition", "inc/foo.h", "#define foo(x) (x)"),
-            symbol_record("foo", "function", "declaration", "inc/foo.h", "int foo(int x);"),
+            symbol_record(
+                "foo",
+                "macro",
+                "definition",
+                "inc/foo.h",
+                "#define foo(x) (x)",
+            ),
+            symbol_record(
+                "foo",
+                "function",
+                "declaration",
+                "inc/foo.h",
+                "int foo(int x);",
+            ),
         ];
         let ranked = rank_function_signature_candidates(records, "src/main.c", None, 10);
         assert_eq!(ranked.len(), 1);
@@ -430,8 +369,20 @@ mod tests {
     #[test]
     fn signature_candidates_use_reachability_tier_order() {
         let records = vec![
-            symbol_record("foo", "function", "definition", "other/foo.c", "int foo(float x)"),
-            symbol_record("foo", "function", "declaration", "inc/foo.h", "int foo(int x);"),
+            symbol_record(
+                "foo",
+                "function",
+                "definition",
+                "other/foo.c",
+                "int foo(float x)",
+            ),
+            symbol_record(
+                "foo",
+                "function",
+                "declaration",
+                "inc/foo.h",
+                "int foo(int x);",
+            ),
         ];
         let reach = crate::reachability::ReachScope {
             files: ["src/main.c".to_string(), "inc/foo.h".to_string()]
@@ -477,7 +428,10 @@ mod tests {
             ),
         ];
         let ranked = rank_function_signature_candidates(records, "src/main.c", None, 10);
-        let signatures: Vec<&str> = ranked.iter().map(|candidate| candidate.signature.as_str()).collect();
+        let signatures: Vec<&str> = ranked
+            .iter()
+            .map(|candidate| candidate.signature.as_str())
+            .collect();
         assert_eq!(ranked.len(), 2);
         assert_eq!(signatures, vec!["int foo(int x)", "int foo(float x)"]);
     }
