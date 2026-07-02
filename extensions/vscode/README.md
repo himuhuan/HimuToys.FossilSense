@@ -28,7 +28,14 @@ extension's `bin/` folder.
   disk I/O. Candidates outside the current file carry a best-effort scope tag in
   the item detail (`reachable` / `external` / `global` / `ambiguous`) with the full
   tier/confidence/reason in the item documentation; current-file candidates are
-  left unlabeled. Not a semantic service — no signature help or overload resolution.
+  left unlabeled. These are ranked candidates, not semantic bindings or overload
+  resolution.
+- Best-effort Signature Help: inside simple function calls, shows exact-name
+  indexed function signatures ranked by the same include reachability tiers as
+  Go to Definition. Candidates are hints, not overload resolution; there is no
+  argument type matching, template or namespace lookup, function-like macro
+  expansion, or function-pointer target inference. Unsupported call shapes or
+  unsplittable signatures degrade to empty or whole-signature results.
 - Limited Include Analysis (`fossilsense.includePaths`): point at external header
   directories (e.g. a MinGW/TDM-GCC or SDK include tree) to get header-path completion
   inside `#include "…"`/`<…>`, jump-to-header on an include line (ranked candidate list
