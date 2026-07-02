@@ -1,8 +1,7 @@
-use std::collections::HashMap;
-
 use super::byte_offset_at;
-use crate::model::DefinitionCandidate;
+use crate::model::{CandidateRange, DefinitionCandidate};
 use crate::reachability::ReachScope;
+use crate::resolver::{self, ResolveContext};
 use crate::store::SymbolRecord;
 
 pub const SIGNATURE_HELP_LIMIT: usize = 10;
@@ -108,44 +107,97 @@ pub fn rank_function_signature_candidates(
     scope: Option<&ReachScope>,
     limit: usize,
 ) -> Vec<RankedSignatureCandidate> {
-    let functions: Vec<SymbolRecord> = records
+    let ctx = ResolveContext {
+        current_path: Some(current_rel_path),
+        reach: scope,
+    };
+    let mut keyed: Vec<(i32, String, u32, usize, SymbolRecord)> = records
         .into_iter()
         .filter(|record| record.kind == "function")
-        .collect();
-    let signatures: HashMap<(String, u32, u32, String), String> = functions
-        .iter()
-        .map(|record| {
+        .enumerate()
+        .map(|(original_index, record)| {
+            let tier = resolver::scope_tier(
+                &record.path,
+                record.source == "external",
+                record.directly_included,
+                Some(&ctx),
+            );
+            let base_match = function_definition_base_match(&record);
+            let locality = resolver::locality(&record.path, Some(current_rel_path));
+            let score = resolver::pack_score(tier, base_match, locality);
             (
-                (
-                    record.path.clone(),
-                    record.start_line,
-                    record.start_col,
-                    record.role.clone(),
-                ),
-                record.signature.clone(),
+                score,
+                record.path.clone(),
+                record.start_line,
+                original_index,
+                record,
             )
         })
         .collect();
+    keyed.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then(a.2.cmp(&b.2))
+            .then(a.3.cmp(&b.3))
+    });
 
-    crate::query::rank_definitions_into_candidates_with_scope(functions, current_rel_path, scope)
-        .into_iter()
-        .filter_map(|candidate| {
-            let key = (
-                candidate.path.clone(),
-                candidate.range.start_line,
-                candidate.range.start_col,
-                candidate.role.clone(),
+    keyed.into_iter()
+        .map(|(_, _, _, _, record)| {
+            let tier = resolver::scope_tier(
+                &record.path,
+                record.source == "external",
+                record.directly_included,
+                Some(&ctx),
             );
-            signatures
-                .get(&key)
-                .cloned()
-                .map(|signature| RankedSignatureCandidate {
-                    candidate,
-                    signature,
-                })
+            let (confidence, reason) =
+                resolver::confidence_reason_for(tier, true, scope.and_then(|reach| reach.reason));
+            let signature = record.signature.clone();
+            let base_match = function_definition_base_match(&record);
+            let candidate = DefinitionCandidate {
+                name: record.name,
+                kind: record.kind,
+                role: record.role,
+                path: record.path,
+                range: CandidateRange {
+                    start_line: record.start_line,
+                    start_col: record.start_col,
+                    end_line: record.end_line,
+                    end_col: record.end_col,
+                },
+                source: record.source,
+                tier,
+                base_match,
+                confidence,
+                reason,
+            };
+            RankedSignatureCandidate {
+                candidate,
+                signature,
+            }
         })
         .take(limit)
         .collect()
+}
+
+fn function_definition_base_match(record: &SymbolRecord) -> i32 {
+    let mut score = 0;
+    if record.role == "definition" {
+        score += 1000;
+    }
+    if record.kind == "function" && is_source_ext(&record.path) {
+        score += 100;
+    }
+    score
+}
+
+fn is_source_ext(path: &str) -> bool {
+    match path.rsplit_once('.') {
+        Some((_, ext)) => matches!(
+            ext.to_ascii_lowercase().as_str(),
+            "c" | "cc" | "cpp" | "cxx"
+        ),
+        None => false,
+    }
 }
 
 fn identifier_before(bytes: &[u8], open_paren: usize) -> Option<String> {
@@ -258,8 +310,19 @@ mod tests {
         path: &str,
         signature: &str,
     ) -> crate::store::SymbolRecord {
+        symbol_record_with_id(0, name, kind, role, path, signature)
+    }
+
+    fn symbol_record_with_id(
+        id: i64,
+        name: &str,
+        kind: &str,
+        role: &str,
+        path: &str,
+        signature: &str,
+    ) -> crate::store::SymbolRecord {
         crate::store::SymbolRecord {
-            id: 0,
+            id,
             name: name.to_string(),
             kind: kind.to_string(),
             role: role.to_string(),
@@ -391,5 +454,31 @@ mod tests {
         ];
         let ranked = rank_function_signature_candidates(records, "main.c", None, 1);
         assert_eq!(ranked.len(), 1);
+    }
+
+    #[test]
+    fn signature_candidates_preserve_distinct_signatures_for_colliding_location_keys() {
+        let records = vec![
+            symbol_record_with_id(
+                1,
+                "foo",
+                "function",
+                "definition",
+                "inc/foo.h",
+                "int foo(int x)",
+            ),
+            symbol_record_with_id(
+                2,
+                "foo",
+                "function",
+                "definition",
+                "inc/foo.h",
+                "int foo(float x)",
+            ),
+        ];
+        let ranked = rank_function_signature_candidates(records, "src/main.c", None, 10);
+        let signatures: Vec<&str> = ranked.iter().map(|candidate| candidate.signature.as_str()).collect();
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(signatures, vec!["int foo(int x)", "int foo(float x)"]);
     }
 }
