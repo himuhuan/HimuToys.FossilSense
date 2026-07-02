@@ -17,9 +17,10 @@ use tower_lsp::lsp_types::{
     SaveOptions, SemanticTokenType, SemanticTokens, SemanticTokensFullOptions,
     SemanticTokensLegend, SemanticTokensOptions, SemanticTokensParams, SemanticTokensRangeParams,
     SemanticTokensRangeResult, SemanticTokensResult, SemanticTokensServerCapabilities,
-    ServerCapabilities, ServerInfo, SymbolInformation, TextDocumentSyncCapability,
-    TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, Url,
-    WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities, WorkspaceSymbolParams,
+    ServerCapabilities, ServerInfo, SignatureHelp, SignatureHelpParams, SymbolInformation,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
+    TextDocumentSyncSaveOptions, Url, WorkspaceFoldersServerCapabilities,
+    WorkspaceServerCapabilities, WorkspaceSymbolParams,
 };
 use tower_lsp::{async_trait, Client, LanguageServer, LspService, Server};
 
@@ -41,6 +42,7 @@ mod lsp_adapters;
 mod member_completion;
 mod options;
 mod semantic_tokens;
+mod signature_help;
 mod state;
 
 use include_completion::{
@@ -60,7 +62,7 @@ use options::{
     candidate_reason_log_lines, completion_trigger_characters, empty_completion_list,
     member_completion_is_incomplete, parse_completion_mode, parse_debug_candidate_reasons,
     parse_debug_perf_logs, parse_include_paths, parse_include_scoping_enabled,
-    parse_semantic_coloring_mode,
+    parse_semantic_coloring_mode, signature_help_options,
 };
 
 type NameTables = Arc<Mutex<HashMap<PathBuf, Arc<NameTable>>>>;

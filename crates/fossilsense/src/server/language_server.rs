@@ -86,6 +86,7 @@ impl LanguageServer for Backend {
                 workspace_symbol_provider: Some(OneOf::Left(true)),
                 document_symbol_provider: Some(OneOf::Left(true)),
                 completion_provider,
+                signature_help_provider: Some(signature_help_options()),
                 semantic_tokens_provider,
                 execute_command_provider: Some(tower_lsp::lsp_types::ExecuteCommandOptions {
                     commands: vec![
@@ -753,6 +754,13 @@ impl LanguageServer for Backend {
             }
             _ => Ok(Some(empty_completion_list(true))),
         }
+    }
+
+    async fn signature_help(
+        &self,
+        params: SignatureHelpParams,
+    ) -> LspResult<Option<SignatureHelp>> {
+        self.provide_signature_help(params).await
     }
 
     async fn semantic_tokens_full(
