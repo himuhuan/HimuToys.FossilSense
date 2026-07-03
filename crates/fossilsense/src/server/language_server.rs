@@ -629,24 +629,31 @@ impl LanguageServer for Backend {
                 // They remain useful for not-yet-indexed names, but same-name
                 // indexed symbols keep their semantic kind/detail.
                 for word in local_words.iter() {
+                    // The token under the cursor is already the user's input,
+                    // not a reusable completion candidate. Returning it as an
+                    // exact local word makes the editor prefer `prin` over an
+                    // indexed semantic candidate such as `printf`.
+                    if word == &prefix {
+                        continue;
+                    }
                     let Some(word_score) =
                         query::completion_word_score(&prefix, word, locality_bonus)
                     else {
                         continue;
                     };
-                    let tier = ScopeTier::Current;
-                    // Current tier ignores the open reason and is left unlabeled
-                    // (the common case is not cluttered), so no detail/documentation.
+                    let tier = ScopeTier::Global;
+                    // Raw local words are fallback text suggestions, not
+                    // current-file definitions. Keep their un-packed text score
+                    // so indexed symbols retain resolver-tier priority.
                     let (confidence, _reason) =
                         crate::resolver::confidence_reason_for(tier, false, None);
-                    let packed = crate::resolver::pack_score(tier, word_score, 0);
-                    let sort_text = format!("{:08}", 100_000_000 - packed);
+                    let sort_text = format!("{:08}", 100_000_000 - word_score);
                     let mut exact_indexed = Vec::new();
                     for (_, table) in &tables {
                         exact_indexed.extend(exact_indexed_completion_candidates_for_local_word(
                             table.as_ref(),
                             word,
-                            packed,
+                            word_score,
                             scope.as_ref(),
                             open_reason,
                             limit,
@@ -660,7 +667,7 @@ impl LanguageServer for Backend {
                         name: word.clone(),
                         tier,
                         confidence,
-                        score: packed,
+                        score: word_score,
                         item: CompletionItem {
                             label: word.clone(),
                             kind: Some(CompletionItemKind::TEXT),

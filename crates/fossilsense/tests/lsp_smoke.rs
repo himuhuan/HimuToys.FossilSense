@@ -333,6 +333,106 @@ fn lsp_smoke_completion_definition_and_references() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn lsp_completion_prefers_indexed_printf_over_typed_word_prefix() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path();
+    std::fs::create_dir_all(root.join("src"))?;
+    let external = tempfile::tempdir()?;
+    std::fs::write(
+        external.path().join("stdio.h"),
+        "int printf(const char *fmt);\n",
+    )?;
+
+    let main_source = "#include <stdio.h>\nint main(void) {\n    prin\n}\n";
+    std::fs::write(root.join("src/main.c"), main_source)?;
+
+    let root_uri = file_uri(root)?;
+    let main_uri = file_uri(&root.join("src/main.c"))?;
+    let include_path = external.path().to_string_lossy().replace('\\', "/");
+
+    let mut lsp = LspProcess::start()?;
+    let init_id = lsp.request(
+        "initialize",
+        json!({
+            "processId": null,
+            "rootUri": root_uri,
+            "workspaceFolders": [{
+                "uri": root_uri,
+                "name": "printf-completion"
+            }],
+            "capabilities": {},
+            "initializationOptions": {
+                "fossilsense": {
+                    "completion": { "mode": "on" },
+                    "semanticColoring": { "mode": "on" },
+                    "includeScoping": { "mode": "auto" },
+                    "includePaths": [include_path],
+                    "debug": {
+                        "candidateReasons": false,
+                        "perfLogs": false
+                    }
+                }
+            }
+        }),
+    )?;
+    let initialized = lsp.wait_response(init_id, Duration::from_secs(10))?;
+    assert_eq!(
+        initialized
+            .get("serverInfo")
+            .and_then(|info| info.get("name"))
+            .and_then(Value::as_str),
+        Some("FossilSense")
+    );
+
+    lsp.notify("initialized", json!({}))?;
+    let ready = lsp.wait_index_ready(Duration::from_secs(30))?;
+    assert_eq!(ready.get("state").and_then(Value::as_str), Some("ready"));
+
+    lsp.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": main_uri,
+                "languageId": "c",
+                "version": 1,
+                "text": main_source
+            }
+        }),
+    )?;
+
+    let completion_id = lsp.request(
+        "textDocument/completion",
+        json!({
+            "textDocument": { "uri": main_uri },
+            "position": { "line": 2, "character": 8 },
+            "context": { "triggerKind": 1 }
+        }),
+    )?;
+    let completion = lsp.wait_response(completion_id, Duration::from_secs(10))?;
+    let items = completion
+        .get("items")
+        .and_then(Value::as_array)
+        .context("completion response missing items")?;
+    let labels: Vec<&str> = items
+        .iter()
+        .filter_map(|item| item.get("label").and_then(Value::as_str))
+        .collect();
+
+    assert_eq!(
+        labels.first().copied(),
+        Some("printf"),
+        "indexed printf should rank before the typed word prefix, got {completion}"
+    );
+    assert!(
+        !labels.contains(&"prin"),
+        "the in-progress prefix should not be returned as a local word candidate, got {completion}"
+    );
+
+    lsp.shutdown()?;
+    Ok(())
+}
+
 fn contains_uri(value: &Value, needle: &str) -> bool {
     match value {
         Value::String(s) => s.contains(needle),

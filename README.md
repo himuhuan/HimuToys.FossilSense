@@ -99,10 +99,13 @@ files. It is **not** a semantic language service. Specifically:
 
 - Completion candidates come from the indexed symbol table (functions, macros, types,
   enum constants, global variables) and identifier words found in the currently
-  open file. Candidates outside the current file carry a best-effort scope tag in the
-  item detail (`reachable` / `external` / `global` / `ambiguous`) with the full
-  tier/confidence/reason in the item documentation; current-file candidates are
-  unlabeled. The tag is presentation only — it never changes ranking.
+  open file. The token currently being typed is not echoed back as a word candidate;
+  raw current-file words are fallback text items and do not receive current-file scope
+  priority over reachable or external indexed symbols. Indexed candidates outside the
+  current file carry a best-effort scope tag in the item detail (`reachable` /
+  `external` / `global` / `ambiguous`) with the full tier/confidence/reason in the
+  item documentation; indexed current-file candidates are unlabeled. The tag is
+  presentation only — it never changes ranking.
 - **Member completion (`.`/`->`) is degraded and C-oriented.** When the cursor follows
   a member operator, FossilSense returns struct/union **fields only** (never functions
   or macros). It tries to resolve the receiver's record type from a simple declaration
