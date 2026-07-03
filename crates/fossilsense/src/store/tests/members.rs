@@ -186,7 +186,7 @@ fn member_fallback_prefix_only_capped_and_short_prefix_empty() {
     // Pipeline test for the member-completion fallback (D4): when the
     // receiver cannot be resolved, `fallback_field_candidates` returns
     // prefix-only matches (SQL LIKE 'prefix%'), capped at the limit. The
-    // `complete_members` gate (`prefix.len() >= MIN_PREFIX_LEN`) prevents
+    // `complete_members` gate (`prefix.len() >= MEMBER_COMPLETION_MIN_PREFIX_LEN`) prevents
     // the fallback from running on a sub-2-char prefix, returning an empty
     // incomplete list instead.
     let dir = tempdir().expect("tempdir");
@@ -216,7 +216,7 @@ fn member_fallback_prefix_only_capped_and_short_prefix_empty() {
     // The complete_members len < 2 gate: a 1-char prefix would produce
     // candidates via fallback_field_candidates, but the server logic returns
     // an empty incomplete list instead. Verify the gate condition directly.
-    let min_prefix = crate::query::MIN_PREFIX_LEN;
+    let min_prefix = crate::query::MEMBER_COMPLETION_MIN_PREFIX_LEN;
     assert_eq!(min_prefix, 2);
     assert!(
         "w".len() < min_prefix,

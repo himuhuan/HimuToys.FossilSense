@@ -36,7 +36,7 @@ impl Backend {
         let text_owned = text.to_string();
         let roots = self.workspace_roots.lock().await.clone();
         let limit = query::COMPLETION_LIMIT;
-        let min_prefix = query::MIN_PREFIX_LEN;
+        let min_prefix = query::MEMBER_COMPLETION_MIN_PREFIX_LEN;
 
         // Member completion uses the same repository-relative current path and
         // open-scope semantics as normal completion/coloring. A closed scope can

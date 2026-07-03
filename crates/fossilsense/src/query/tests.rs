@@ -340,8 +340,8 @@ fn name_table_replaces_entries_for_dirty_paths() {
 }
 
 #[test]
-fn min_prefix_len_is_two() {
-    assert_eq!(MIN_PREFIX_LEN, 2);
+fn identifier_completion_starts_at_one_character() {
+    assert_eq!(MIN_PREFIX_LEN, 1);
 }
 
 #[test]

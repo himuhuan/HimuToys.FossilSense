@@ -285,7 +285,7 @@ fn lsp_smoke_completion_definition_and_references() -> Result<()> {
         "textDocument/completion",
         json!({
             "textDocument": { "uri": main_uri },
-            "position": { "line": 2, "character": 7 },
+            "position": { "line": 2, "character": 5 },
             "context": { "triggerKind": 1 }
         }),
     )?;

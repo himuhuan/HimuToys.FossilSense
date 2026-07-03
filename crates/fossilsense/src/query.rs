@@ -616,7 +616,8 @@ fn subsequence_match(needle: &[u8], orig: &[u8], lower: &[u8]) -> Option<bool> {
 
 pub const COMPLETION_LIMIT: usize = 100;
 pub const COMPLETION_LOCALITY_BONUS: i32 = 50;
-pub const MIN_PREFIX_LEN: usize = 2;
+pub const MIN_PREFIX_LEN: usize = 1;
+pub const MEMBER_COMPLETION_MIN_PREFIX_LEN: usize = 2;
 
 /// Prefix lengths below this value use a tightened recall threshold
 /// (`SHORT_PREFIX_MIN_SCORE`); at this length and above the full fuzzy tier
