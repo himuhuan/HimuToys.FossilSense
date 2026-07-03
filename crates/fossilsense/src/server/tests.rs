@@ -1,13 +1,13 @@
 use super::include_completion::IncludeCompletionTable;
 use super::{
-    grouped_reference_items, local_words_for_cache, rebuild_include_table,
-    rebuild_indexed_file_list,
+    dedup_completion_candidates, grouped_reference_items, local_words_for_cache,
+    rebuild_include_table, rebuild_indexed_file_list,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::tempdir;
-use tower_lsp::lsp_types::Url;
+use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind, Url};
 
 #[tokio::test]
 async fn local_word_cache_is_keyed_by_document_version() {
@@ -230,6 +230,71 @@ fn local_word_does_not_outrank_reachable_indexed_candidate() {
         external_score,
         local_best.unwrap()
     );
+}
+
+#[test]
+fn completion_dedup_keeps_indexed_kind_over_same_name_local_word() {
+    use crate::model::{ResolutionConfidence, ScopeTier};
+
+    let indexed = super::CompletionCandidate {
+        name: "hello_value".to_string(),
+        tier: ScopeTier::Reachable,
+        confidence: ResolutionConfidence::Reachable,
+        score: 30_000,
+        item: CompletionItem {
+            label: "hello_value".to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            ..Default::default()
+        },
+        source: super::CompletionCandidateSource::Indexed,
+    };
+    let local = super::CompletionCandidate {
+        name: "hello_value".to_string(),
+        tier: ScopeTier::Current,
+        confidence: ResolutionConfidence::Heuristic,
+        score: 40_000,
+        item: CompletionItem {
+            label: "hello_value".to_string(),
+            kind: Some(CompletionItemKind::TEXT),
+            ..Default::default()
+        },
+        source: super::CompletionCandidateSource::LocalWord,
+    };
+
+    let deduped = dedup_completion_candidates(vec![indexed, local]);
+    assert_eq!(deduped.len(), 1);
+    assert_eq!(deduped[0].item.kind, Some(CompletionItemKind::FUNCTION));
+}
+
+#[test]
+fn local_word_exact_index_match_uses_semantic_completion_kind() {
+    let table = crate::query::NameTable::build_with_paths(vec![(
+        1,
+        "api_target_function".to_string(),
+        false,
+        "inc/target.h".to_string(),
+        "function".to_string(),
+        false,
+    )]);
+    let local_score = crate::resolver::pack_score(
+        crate::model::ScopeTier::Current,
+        crate::query::COMPLETION_LOCALITY_BONUS + 550,
+        0,
+    );
+
+    let candidates = super::exact_indexed_completion_candidates_for_local_word(
+        &table,
+        "api_target_function",
+        local_score,
+        None,
+        None,
+        10,
+    );
+
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].name, "api_target_function");
+    assert_eq!(candidates[0].score, local_score);
+    assert_eq!(candidates[0].item.kind, Some(CompletionItemKind::FUNCTION));
 }
 
 // --- R7: watcher/debounce IndexScheduleState machine tests ---------------

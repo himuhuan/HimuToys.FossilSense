@@ -2,8 +2,8 @@
 use std::collections::HashSet;
 
 use crate::model::{CandidateRange, DefinitionCandidate};
-#[cfg(test)]
-use crate::resolver;
+use crate::reachability::ReachScope;
+use crate::resolver::{self, ResolveContext};
 use crate::store::SymbolRecord;
 
 /// Definition-preference `base_match` for a [`SymbolRecord`]: definition >
@@ -144,37 +144,43 @@ pub fn rank_definitions_into_candidates(
         .collect()
 }
 
-/// Build `Vec<DefinitionCandidate>` from the records using the full
-/// [`ReachScope`](crate::reachability::ReachScope) (including `open`) for tier
-/// resolution. This is the preferred entry point for the LSP goto path: an open
-/// scope routes not-proven-reachable workspace candidates to `Unknown` (rather
-/// than `Global`), preserving the R1 "open scope does not bury unreachable"
-/// softening as a tier.
-pub fn rank_definitions_into_candidates_with_scope(
+pub(super) struct RankedDefinitionRecord {
+    pub candidate: DefinitionCandidate,
+    pub record: SymbolRecord,
+}
+
+/// Build ranked definition candidates while preserving the source
+/// [`SymbolRecord`]. Shared by goto-definition and signature help so both
+/// features consume the same with-scope ranking, base-match policy, and
+/// resolver tie-breakers.
+pub(super) fn rank_definition_records_with_scope(
     candidates: Vec<SymbolRecord>,
     current_rel_path: &str,
-    scope: Option<&crate::reachability::ReachScope>,
-) -> Vec<DefinitionCandidate> {
+    scope: Option<&ReachScope>,
+) -> Vec<RankedDefinitionRecord> {
     // Build the resolver context and pre-compute (tier, base_match, locality)
     // per record so we can sort via the resolver comparator.
-    let ctx = crate::resolver::ResolveContext {
+    let ctx = ResolveContext {
         current_path: Some(current_rel_path),
         reach: scope,
     };
-    let mut keyed: Vec<(i32, String, u32, SymbolRecord, crate::model::ScopeTier)> = candidates
+    let mut keyed: Vec<(i32, String, u32, SymbolRecord, crate::model::ScopeTier, i32)> = candidates
         .into_iter()
         .map(|record| {
             let external = record.source == "external";
-            let tier = crate::resolver::scope_tier(
-                &record.path,
-                external,
-                record.directly_included,
-                Some(&ctx),
-            );
+            let tier =
+                resolver::scope_tier(&record.path, external, record.directly_included, Some(&ctx));
             let base = definition_base_match(&record);
-            let loc = crate::resolver::locality(&record.path, Some(current_rel_path));
-            let score = crate::resolver::pack_score(tier, base, loc);
-            (score, record.path.clone(), record.start_line, record, tier)
+            let loc = resolver::locality(&record.path, Some(current_rel_path));
+            let score = resolver::pack_score(tier, base, loc);
+            (
+                score,
+                record.path.clone(),
+                record.start_line,
+                record,
+                tier,
+                base,
+            )
         })
         .collect();
     keyed.sort_by(|a, b| {
@@ -184,31 +190,52 @@ pub fn rank_definitions_into_candidates_with_scope(
     });
     keyed
         .into_iter()
-        .map(|(_, _, _, record, tier)| {
-            // Scope-bearing goto path: pass the open scope's first cause so an
-            // `Unknown`-tier candidate under an ambiguous include surfaces
-            // `Ambiguous` rather than a plain `Fallback`.
+        .map(|(_, _, _, record, tier, base_match)| {
+            // Pass the open scope's first cause so an `Unknown`-tier candidate
+            // under an ambiguous include surfaces `Ambiguous` rather than a
+            // plain `Fallback`.
             let (confidence, reason) =
-                crate::resolver::confidence_reason_for(tier, true, scope.and_then(|s| s.reason));
-            let base_match = definition_base_match(&record);
-            DefinitionCandidate {
-                name: record.name,
-                kind: record.kind,
-                role: record.role,
-                path: record.path,
+                resolver::confidence_reason_for(tier, true, scope.and_then(|s| s.reason));
+            let candidate = DefinitionCandidate {
+                name: record.name.clone(),
+                kind: record.kind.clone(),
+                role: record.role.clone(),
+                path: record.path.clone(),
                 range: CandidateRange {
                     start_line: record.start_line,
                     start_col: record.start_col,
                     end_line: record.end_line,
                     end_col: record.end_col,
                 },
-                source: record.source,
+                source: record.source.clone(),
                 tier,
                 base_match,
                 confidence,
                 reason,
-            }
+            };
+            RankedDefinitionRecord { candidate, record }
         })
+        .collect()
+}
+
+/// Build `Vec<DefinitionCandidate>` from the records using the full
+/// [`ReachScope`] (including `open`) for tier resolution. This is the preferred
+/// entry point for the LSP goto path: an open scope routes not-proven-reachable
+/// workspace candidates to `Unknown` (rather than `Global`), preserving the R1
+/// "open scope does not bury unreachable" softening as a tier.
+pub fn rank_definitions_into_candidates_with_scope(
+    candidates: Vec<SymbolRecord>,
+    current_rel_path: &str,
+    scope: Option<&ReachScope>,
+) -> Vec<DefinitionCandidate> {
+    rank_definition_records_with_scope(candidates, current_rel_path, scope)
+        .into_iter()
+        .map(
+            |RankedDefinitionRecord {
+                 candidate,
+                 record: _record,
+             }| candidate,
+        )
         .collect()
 }
 
@@ -361,6 +388,52 @@ mod tests {
 
     fn reachable_set(paths: &[&str]) -> HashSet<String> {
         paths.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn goto_with_scope_orders_current_reachable_external_unknown() {
+        let mut external = record_ext("foo", "function", "definition", "C:/sdk/foo.h", 3, true);
+        external.directly_included = true;
+        let candidates = vec![
+            record("foo", "function", "definition", "other/foo.c", 20),
+            external,
+            record("foo", "function", "definition", "inc/foo.h", 7),
+            record("foo", "function", "definition", "src/main.c", 30),
+        ];
+        let scope = crate::reachability::ReachScope {
+            files: ["src/main.c".to_string(), "inc/foo.h".to_string()]
+                .into_iter()
+                .collect(),
+            open: true,
+            reason: Some(crate::reachability::OpenReason::AmbiguousInclude),
+        };
+        let ranked =
+            rank_definitions_into_candidates_with_scope(candidates, "src/main.c", Some(&scope));
+        let paths: Vec<&str> = ranked
+            .iter()
+            .map(|candidate| candidate.path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            vec!["src/main.c", "inc/foo.h", "C:/sdk/foo.h", "other/foo.c"]
+        );
+        assert_eq!(ranked[3].tier, crate::model::ScopeTier::Unknown);
+        assert_eq!(ranked[3].confidence, ResolutionConfidence::Ambiguous);
+    }
+
+    #[test]
+    fn goto_open_unresolved_scope_uses_fallback_for_unknown_candidates() {
+        let candidates = vec![record("foo", "function", "definition", "other/foo.c", 20)];
+        let scope = crate::reachability::ReachScope {
+            files: HashSet::new(),
+            open: true,
+            reason: Some(crate::reachability::OpenReason::UnresolvedInclude),
+        };
+        let ranked =
+            rank_definitions_into_candidates_with_scope(candidates, "src/main.c", Some(&scope));
+        assert_eq!(ranked[0].tier, crate::model::ScopeTier::Unknown);
+        assert_eq!(ranked[0].confidence, ResolutionConfidence::Fallback);
+        assert_eq!(ranked[0].reason, ResolutionReason::GlobalFallback);
     }
 
     #[test]

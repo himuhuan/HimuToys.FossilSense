@@ -12,10 +12,15 @@ use crate::resolver::{self, ResolveContext};
 
 mod definitions;
 mod lsp_kinds;
+mod signatures;
 mod text;
 
 pub use definitions::rank_definitions_into_candidates_with_scope;
 pub use lsp_kinds::{lsp_completion_kind_from_parser, lsp_kind_from_parser, lsp_symbol_kind};
+pub use signatures::{
+    call_context_at, rank_function_signature_candidates, signature_parts, signature_parts_for_name,
+    CallContext, ParameterSpan, RankedSignatureCandidate, SignatureParts, SIGNATURE_HELP_LIMIT,
+};
 use text::is_boundary;
 pub use text::{
     byte_offset_at, completion_prefix_at, completion_word_score, is_member_completion_context,
@@ -202,6 +207,31 @@ impl NameTable {
             }
         }
         out
+    }
+
+    pub fn exact_name_hits_scoped(
+        &self,
+        name: &str,
+        limit: usize,
+        scope: Option<&CompletionScope>,
+    ) -> Vec<RankedNameHit> {
+        if name.is_empty() || limit == 0 {
+            return Vec::new();
+        }
+        let needle = name.to_ascii_lowercase();
+        let start = self
+            .sorted
+            .partition_point(|&i| self.entries[i].lower.as_str() < needle.as_str());
+        let mut indices = Vec::new();
+        for &i in &self.sorted[start..] {
+            match self.entries[i].lower.as_str().cmp(needle.as_str()) {
+                std::cmp::Ordering::Equal => indices.push(i),
+                std::cmp::Ordering::Greater => break,
+                std::cmp::Ordering::Less => {}
+            }
+        }
+        let ctx_owned: Option<ResolveContext<'_>> = scope.map(|s| s.resolve_context());
+        self.rank_indices(&needle, limit, ctx_owned.as_ref(), &indices)
     }
 
     pub fn len(&self) -> usize {
@@ -586,7 +616,8 @@ fn subsequence_match(needle: &[u8], orig: &[u8], lower: &[u8]) -> Option<bool> {
 
 pub const COMPLETION_LIMIT: usize = 100;
 pub const COMPLETION_LOCALITY_BONUS: i32 = 50;
-pub const MIN_PREFIX_LEN: usize = 2;
+pub const MIN_PREFIX_LEN: usize = 1;
+pub const MEMBER_COMPLETION_MIN_PREFIX_LEN: usize = 2;
 
 /// Prefix lengths below this value use a tightened recall threshold
 /// (`SHORT_PREFIX_MIN_SCORE`); at this length and above the full fuzzy tier

@@ -11,7 +11,8 @@ FossilSense is a best-effort C/C++ navigation and analysis engine for large Wind
 Current baseline capabilities: workspace symbol search, document outline, ranked
 go-to-definition candidates, **role-grouped find-all-references** (text candidates
 grouped by best-effort syntactic role), **lightweight completion**
-(including degraded `.`/`->` member completion), **degraded semantic coloring**
+(including degraded `.`/`->` member completion), **best-effort signature help /
+parameter hints** for indexed functions, **degraded semantic coloring**
 (macros, types, and enum constants), **limited `#include` analysis** (header-path
 completion, jump-to-header, and indexing of external reference headers), optional
 workspace scope configuration via `fossilsense.json`, manual incremental refresh /
@@ -111,9 +112,17 @@ files. It is **not** a semantic language service. Specifically:
   `a.b.`, or an unknown variable), it falls back to a prefix-filtered list of all field
   names. It never infers expression types, so it may occasionally offer the wrong
   record's fields — a candidate list, not a precise one.
-- There is still **no** signature help, parameter hints, overload resolution,
-  include-path completion, snippet expansion, or auto-import. C++-specific member
-  access (scoped enums, static members, nested types) is not special-cased.
+- **Signature help / parameter hints are best-effort.** When the cursor is inside
+  a simple function call, FossilSense finds exact-name indexed function
+  declaration/definition candidates, ranks them with the same include
+  reachability tiers used by Go to Definition, and shows stored signatures with
+  the active argument index when the parameter list can be split conservatively.
+  It does not perform overload resolution, argument type matching, template or
+  namespace lookup, function-like macro expansion, or function-pointer target
+  inference. When a signature is too complex to split safely, the whole stored
+  signature is shown without fabricated parameter labels.
+- Snippet expansion, auto-import, and C++-specific member access (scoped enums,
+  static members, nested types) are not special-cased.
 - Local-variable scope is not tracked for ordinary completion; words from the current
   file are a flat bag of identifiers, filtered only for C/C++ keywords.
 

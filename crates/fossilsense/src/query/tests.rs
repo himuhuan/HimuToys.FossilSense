@@ -340,8 +340,8 @@ fn name_table_replaces_entries_for_dirty_paths() {
 }
 
 #[test]
-fn min_prefix_len_is_two() {
-    assert_eq!(MIN_PREFIX_LEN, 2);
+fn identifier_completion_starts_at_one_character() {
+    assert_eq!(MIN_PREFIX_LEN, 1);
 }
 
 #[test]
@@ -619,6 +619,43 @@ fn completion_is_truncated_at_limit() {
         hits.len() < 30,
         "10 of 30 matching symbols truncated, confirming isIncomplete semantics"
     );
+}
+
+#[test]
+fn exact_name_lookup_recovers_symbol_truncated_from_dense_prefix() {
+    let mut names = Vec::new();
+    for i in 0..150 {
+        names.push((
+            i,
+            format!("api_common_{i:03}"),
+            false,
+            format!("inc/api_{i:03}.h"),
+            "function".to_string(),
+            false,
+        ));
+    }
+    names.push((
+        1000,
+        "api_target_function".to_string(),
+        false,
+        "inc/target.h".to_string(),
+        "function".to_string(),
+        false,
+    ));
+    let table = NameTable::build_with_paths(names);
+
+    let prefix_hits = table.search_ranked_scoped("api", 100, None);
+    assert!(
+        prefix_hits
+            .iter()
+            .all(|hit| hit.name != "api_target_function"),
+        "dense prefix top-N should reproduce the truncation observed by completion"
+    );
+
+    let exact_hits = table.exact_name_hits_scoped("api_target_function", 10, None);
+    assert_eq!(exact_hits.len(), 1);
+    assert_eq!(exact_hits[0].name, "api_target_function");
+    assert_eq!(exact_hits[0].kind, ParserKind::Function);
 }
 
 #[test]

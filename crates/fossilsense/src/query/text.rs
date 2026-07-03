@@ -302,6 +302,10 @@ mod tests {
     fn local_word_short_prefix_rejects_plain_substring() {
         let bonus = super::super::COMPLETION_LOCALITY_BONUS;
 
+        assert!(
+            completion_word_score("l", "lerp3u16", bonus).is_some(),
+            "single-char prefix should keep the initial completion session alive"
+        );
         assert!(completion_word_score("fo", "Foobar", bonus).is_some());
         assert!(
             completion_word_score("ba", "FooBar", bonus).is_some(),

@@ -17,9 +17,10 @@ use tower_lsp::lsp_types::{
     SaveOptions, SemanticTokenType, SemanticTokens, SemanticTokensFullOptions,
     SemanticTokensLegend, SemanticTokensOptions, SemanticTokensParams, SemanticTokensRangeParams,
     SemanticTokensRangeResult, SemanticTokensResult, SemanticTokensServerCapabilities,
-    ServerCapabilities, ServerInfo, SymbolInformation, TextDocumentSyncCapability,
-    TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, Url,
-    WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities, WorkspaceSymbolParams,
+    ServerCapabilities, ServerInfo, SignatureHelp, SignatureHelpParams, SymbolInformation,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
+    TextDocumentSyncSaveOptions, Url, WorkspaceFoldersServerCapabilities,
+    WorkspaceServerCapabilities, WorkspaceSymbolParams,
 };
 use tower_lsp::{async_trait, Client, LanguageServer, LspService, Server};
 
@@ -32,6 +33,7 @@ use crate::pathing;
 use crate::query::{self, NameTable};
 use crate::reachability::{self, ReachGraph};
 use crate::references;
+use crate::resolver;
 use crate::store::IndexStore;
 
 mod include_completion;
@@ -41,6 +43,7 @@ mod lsp_adapters;
 mod member_completion;
 mod options;
 mod semantic_tokens;
+mod signature_help;
 mod state;
 
 use include_completion::{
@@ -60,7 +63,7 @@ use options::{
     candidate_reason_log_lines, completion_trigger_characters, empty_completion_list,
     member_completion_is_incomplete, parse_completion_mode, parse_debug_candidate_reasons,
     parse_debug_perf_logs, parse_include_paths, parse_include_scoping_enabled,
-    parse_semantic_coloring_mode,
+    parse_semantic_coloring_mode, signature_help_options,
 };
 
 type NameTables = Arc<Mutex<HashMap<PathBuf, Arc<NameTable>>>>;
@@ -71,6 +74,112 @@ type IndexGenerations = Arc<Mutex<HashMap<PathBuf, state::WorkspaceGeneration>>>
 type LocalWordEntry = (i32, Arc<HashSet<String>>);
 type LocalWordCache = Arc<Mutex<HashMap<Url, LocalWordEntry>>>;
 type IndexSchedule = Arc<Mutex<IndexScheduleState>>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompletionCandidateSource {
+    Indexed,
+    LocalWord,
+}
+
+#[derive(Debug)]
+struct CompletionCandidate {
+    name: String,
+    tier: model::ScopeTier,
+    confidence: model::ResolutionConfidence,
+    score: i32,
+    item: CompletionItem,
+    source: CompletionCandidateSource,
+}
+
+fn dedup_completion_candidates(candidates: Vec<CompletionCandidate>) -> Vec<CompletionCandidate> {
+    let mut best_by_name: HashMap<String, usize> = HashMap::new();
+    let mut survivors: Vec<Option<CompletionCandidate>> =
+        candidates.into_iter().map(Some).collect();
+    for i in 0..survivors.len() {
+        let Some((name, tier, confidence)) = survivors[i]
+            .as_ref()
+            .map(|candidate| (candidate.name.clone(), candidate.tier, candidate.confidence))
+        else {
+            continue;
+        };
+        let key = (tier, confidence);
+        match best_by_name.get(&name) {
+            None => {
+                best_by_name.insert(name, i);
+            }
+            Some(&prev_i) => {
+                let (prev_tier, prev_conf, prev_score, prev_source) = {
+                    let prev = survivors[prev_i].as_ref().expect("survivor present");
+                    (prev.tier, prev.confidence, prev.score, prev.source)
+                };
+                let current = survivors[i].as_ref().expect("survivor present");
+                if completion_candidate_beats(
+                    current.source,
+                    key,
+                    current.score,
+                    prev_source,
+                    (prev_tier, prev_conf),
+                    prev_score,
+                ) {
+                    survivors[prev_i] = None;
+                    best_by_name.insert(name, i);
+                } else {
+                    survivors[i] = None;
+                }
+            }
+        }
+    }
+    survivors.into_iter().flatten().collect()
+}
+
+fn completion_candidate_beats(
+    source: CompletionCandidateSource,
+    key: (model::ScopeTier, model::ResolutionConfidence),
+    score: i32,
+    prev_source: CompletionCandidateSource,
+    prev_key: (model::ScopeTier, model::ResolutionConfidence),
+    prev_score: i32,
+) -> bool {
+    match (source, prev_source) {
+        (CompletionCandidateSource::Indexed, CompletionCandidateSource::LocalWord) => true,
+        (CompletionCandidateSource::LocalWord, CompletionCandidateSource::Indexed) => false,
+        _ => key > prev_key || (key == prev_key && score > prev_score),
+    }
+}
+
+fn exact_indexed_completion_candidates_for_local_word(
+    table: &NameTable,
+    word: &str,
+    local_score: i32,
+    scope: Option<&query::CompletionScope>,
+    open_reason: Option<reachability::OpenReason>,
+    limit: usize,
+) -> Vec<CompletionCandidate> {
+    table
+        .exact_name_hits_scoped(word, limit, scope)
+        .into_iter()
+        .map(|hit| {
+            let (confidence, reason) =
+                resolver::confidence_reason_for(hit.tier, false, open_reason);
+            let label = model::completion_scope_label(hit.tier, confidence, reason);
+            CompletionCandidate {
+                name: hit.name.clone(),
+                tier: hit.tier,
+                confidence,
+                score: local_score,
+                item: CompletionItem {
+                    label: hit.name,
+                    kind: Some(query::lsp_completion_kind_from_parser(hit.kind)),
+                    sort_text: Some(format!("{:08}", 100_000_000 - local_score)),
+                    detail: label.as_ref().map(|l| l.detail.to_string()),
+                    documentation: label.map(|l| Documentation::String(l.documentation)),
+                    ..Default::default()
+                },
+                source: CompletionCandidateSource::Indexed,
+            }
+        })
+        .collect()
+}
 
 const REFRESH_INDEX_COMMAND: &str = "fossilsense.refreshIndex";
 const REFRESH_INDEX_LSP_COMMAND: &str = "fossilsense.lsp.refreshIndex";

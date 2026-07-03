@@ -1,4 +1,6 @@
-use tower_lsp::lsp_types::{CompletionList, CompletionResponse, InitializeParams};
+use tower_lsp::lsp_types::{
+    CompletionList, CompletionResponse, InitializeParams, SignatureHelpOptions,
+};
 
 use crate::model;
 
@@ -72,6 +74,14 @@ pub(super) fn completion_trigger_characters() -> Vec<String> {
     chars.push("<".to_string());
     chars.push("/".to_string());
     chars
+}
+
+pub(super) fn signature_help_options() -> SignatureHelpOptions {
+    SignatureHelpOptions {
+        trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
+        retrigger_characters: Some(vec![",".to_string()]),
+        ..Default::default()
+    }
 }
 
 pub(super) fn empty_completion_list(is_incomplete: bool) -> CompletionResponse {
@@ -337,6 +347,16 @@ mod tests {
         assert!(chars.contains(&"<".to_string()));
         assert!(chars.contains(&"/".to_string()));
         assert!(!chars.contains(&"0".to_string()));
+    }
+
+    #[test]
+    fn signature_help_options_trigger_on_paren_and_comma() {
+        let options = signature_help_options();
+        assert_eq!(
+            options.trigger_characters,
+            Some(vec!["(".to_string(), ",".to_string()])
+        );
+        assert_eq!(options.retrigger_characters, Some(vec![",".to_string()]));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 {
   "name": "fossilsense-vscode",
   "displayName": "FossilSense",
-  "description": "FossilSense C/C++ best-effort navigation: symbols, outlines, ranked definitions, role-grouped references, and lightweight completion.",
+  "description": "FossilSense C/C++ best-effort navigation: symbols, outlines, ranked definitions, signature help, role-grouped references, and lightweight completion.",
   "version": "1.0.2",
   "private": true,
   "license": "UNLICENSED",

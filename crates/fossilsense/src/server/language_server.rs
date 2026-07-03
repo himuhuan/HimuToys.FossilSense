@@ -86,6 +86,7 @@ impl LanguageServer for Backend {
                 workspace_symbol_provider: Some(OneOf::Left(true)),
                 document_symbol_provider: Some(OneOf::Left(true)),
                 completion_provider,
+                signature_help_provider: Some(signature_help_options()),
                 semantic_tokens_provider,
                 execute_command_provider: Some(tower_lsp::lsp_types::ExecuteCommandOptions {
                     commands: vec![
@@ -572,7 +573,7 @@ impl LanguageServer for Backend {
 
         let result = tokio::task::spawn_blocking(
             move || -> Result<(Vec<CompletionItem>, Vec<Vec<usize>>)> {
-                use crate::model::{ResolutionConfidence, ScopeTier};
+                use crate::model::ScopeTier;
                 // First cause of the open scope (if any). An `Unknown`-tier
                 // candidate under an ambiguous include surfaces `Ambiguous`
                 // (and the `ambiguous` label) instead of a plain `Fallback`.
@@ -581,13 +582,7 @@ impl LanguageServer for Backend {
                 // `(tier, confidence)` dedup key (kept separate so the dedup
                 // can compare without re-deriving the tier), the packed sort
                 // key, and the LSP item.
-                let mut candidates: Vec<(
-                    String,
-                    ScopeTier,
-                    ResolutionConfidence,
-                    i32,
-                    CompletionItem,
-                )> = Vec::new();
+                let mut candidates: Vec<CompletionCandidate> = Vec::new();
                 let mut new_pools: Vec<Vec<usize>> = Vec::with_capacity(tables.len());
 
                 // Collect indexed symbol candidates from all workspace roots. The
@@ -611,12 +606,12 @@ impl LanguageServer for Backend {
                         // candidates stay unlabeled. The label is derived from
                         // the same (tier, confidence, reason) used to rank.
                         let label = model::completion_scope_label(hit.tier, confidence, reason);
-                        candidates.push((
-                            hit.name.clone(),
-                            hit.tier,
+                        candidates.push(CompletionCandidate {
+                            name: hit.name.clone(),
+                            tier: hit.tier,
                             confidence,
-                            hit.score,
-                            CompletionItem {
+                            score: hit.score,
+                            item: CompletionItem {
                                 label: hit.name,
                                 kind: Some(kind),
                                 sort_text: Some(sort_text),
@@ -625,13 +620,14 @@ impl LanguageServer for Backend {
                                     .map(|l| Documentation::String(l.documentation)),
                                 ..Default::default()
                             },
-                        ));
+                            source: CompletionCandidateSource::Indexed,
+                        });
                     }
                 }
 
-                // Add current-file word candidates. These are tier `Current`
-                // (the word is in the file the user is editing), so they pack
-                // above every indexed symbol regardless of fuzzy quality.
+                // Add current-file word candidates as fallback-only items.
+                // They remain useful for not-yet-indexed names, but same-name
+                // indexed symbols keep their semantic kind/detail.
                 for word in local_words.iter() {
                     let Some(word_score) =
                         query::completion_word_score(&prefix, word, locality_bonus)
@@ -645,64 +641,42 @@ impl LanguageServer for Backend {
                         crate::resolver::confidence_reason_for(tier, false, None);
                     let packed = crate::resolver::pack_score(tier, word_score, 0);
                     let sort_text = format!("{:08}", 100_000_000 - packed);
-                    candidates.push((
-                        word.clone(),
+                    let mut exact_indexed = Vec::new();
+                    for (_, table) in &tables {
+                        exact_indexed.extend(exact_indexed_completion_candidates_for_local_word(
+                            table.as_ref(),
+                            word,
+                            packed,
+                            scope.as_ref(),
+                            open_reason,
+                            limit,
+                        ));
+                    }
+                    if !exact_indexed.is_empty() {
+                        candidates.extend(exact_indexed);
+                        continue;
+                    }
+                    candidates.push(CompletionCandidate {
+                        name: word.clone(),
                         tier,
                         confidence,
-                        packed,
-                        CompletionItem {
+                        score: packed,
+                        item: CompletionItem {
                             label: word.clone(),
                             kind: Some(CompletionItemKind::TEXT),
                             sort_text: Some(sort_text),
                             ..Default::default()
                         },
-                    ));
-                }
-
-                // Same-name dedup keeps the higher `(tier, confidence)`, not
-                // the first-seen candidate. A lower-tier candidate cannot
-                // displace a higher-tier one of the same name. Survivors keep
-                // their input order; the final sort below reorders by score.
-                let mut best_by_name: std::collections::HashMap<String, usize> =
-                    std::collections::HashMap::new();
-                let mut survivors: Vec<
-                    Option<(String, ScopeTier, ResolutionConfidence, i32, CompletionItem)>,
-                > = candidates.into_iter().map(Some).collect();
-                for i in 0..survivors.len() {
-                    // Clone the dedup key out of the entry before any mutable
-                    // borrow of `survivors` below.
-                    let Some((name, tier, confidence)) = survivors[i]
-                        .as_ref()
-                        .map(|(n, t, c, _, _)| (n.clone(), *t, *c))
-                    else {
-                        continue;
-                    };
-                    let key = (tier, confidence);
-                    match best_by_name.get(&name) {
-                        None => {
-                            best_by_name.insert(name, i);
-                        }
-                        Some(&prev_i) => {
-                            let (prev_tier, prev_conf) = {
-                                let prev = survivors[prev_i].as_ref().expect("survivor present");
-                                (prev.1, prev.2)
-                            };
-                            if key > (prev_tier, prev_conf) {
-                                survivors[prev_i] = None;
-                                best_by_name.insert(name, i);
-                            } else {
-                                survivors[i] = None;
-                            }
-                        }
-                    }
+                        source: CompletionCandidateSource::LocalWord,
+                    });
                 }
 
                 // Sort by packed score descending, then name for stability.
-                let mut kept: Vec<(i32, String, CompletionItem)> = survivors
-                    .into_iter()
-                    .flatten()
-                    .map(|(name, _, _, score, item)| (score, name, item))
-                    .collect();
+                let mut kept: Vec<(i32, String, CompletionItem)> =
+                    dedup_completion_candidates(candidates)
+                        .into_iter()
+                        .map(|candidate| (candidate.score, candidate.name, candidate.item))
+                        .collect();
                 kept.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
 
                 let items: Vec<CompletionItem> = kept
@@ -753,6 +727,13 @@ impl LanguageServer for Backend {
             }
             _ => Ok(Some(empty_completion_list(true))),
         }
+    }
+
+    async fn signature_help(
+        &self,
+        params: SignatureHelpParams,
+    ) -> LspResult<Option<SignatureHelp>> {
+        self.provide_signature_help(params).await
     }
 
     async fn semantic_tokens_full(
