@@ -641,6 +641,21 @@ impl LanguageServer for Backend {
                         crate::resolver::confidence_reason_for(tier, false, None);
                     let packed = crate::resolver::pack_score(tier, word_score, 0);
                     let sort_text = format!("{:08}", 100_000_000 - packed);
+                    let mut exact_indexed = Vec::new();
+                    for (_, table) in &tables {
+                        exact_indexed.extend(exact_indexed_completion_candidates_for_local_word(
+                            table.as_ref(),
+                            word,
+                            packed,
+                            scope.as_ref(),
+                            open_reason,
+                            limit,
+                        ));
+                    }
+                    if !exact_indexed.is_empty() {
+                        candidates.extend(exact_indexed);
+                        continue;
+                    }
                     candidates.push(CompletionCandidate {
                         name: word.clone(),
                         tier,

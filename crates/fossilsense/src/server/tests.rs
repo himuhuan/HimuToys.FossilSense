@@ -266,6 +266,37 @@ fn completion_dedup_keeps_indexed_kind_over_same_name_local_word() {
     assert_eq!(deduped[0].item.kind, Some(CompletionItemKind::FUNCTION));
 }
 
+#[test]
+fn local_word_exact_index_match_uses_semantic_completion_kind() {
+    let table = crate::query::NameTable::build_with_paths(vec![(
+        1,
+        "api_target_function".to_string(),
+        false,
+        "inc/target.h".to_string(),
+        "function".to_string(),
+        false,
+    )]);
+    let local_score = crate::resolver::pack_score(
+        crate::model::ScopeTier::Current,
+        crate::query::COMPLETION_LOCALITY_BONUS + 550,
+        0,
+    );
+
+    let candidates = super::exact_indexed_completion_candidates_for_local_word(
+        &table,
+        "api_target_function",
+        local_score,
+        None,
+        None,
+        10,
+    );
+
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].name, "api_target_function");
+    assert_eq!(candidates[0].score, local_score);
+    assert_eq!(candidates[0].item.kind, Some(CompletionItemKind::FUNCTION));
+}
+
 // --- R7: watcher/debounce IndexScheduleState machine tests ---------------
 
 use super::IndexScheduleState;

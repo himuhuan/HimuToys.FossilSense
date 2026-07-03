@@ -209,6 +209,31 @@ impl NameTable {
         out
     }
 
+    pub fn exact_name_hits_scoped(
+        &self,
+        name: &str,
+        limit: usize,
+        scope: Option<&CompletionScope>,
+    ) -> Vec<RankedNameHit> {
+        if name.is_empty() || limit == 0 {
+            return Vec::new();
+        }
+        let needle = name.to_ascii_lowercase();
+        let start = self
+            .sorted
+            .partition_point(|&i| self.entries[i].lower.as_str() < needle.as_str());
+        let mut indices = Vec::new();
+        for &i in &self.sorted[start..] {
+            match self.entries[i].lower.as_str().cmp(needle.as_str()) {
+                std::cmp::Ordering::Equal => indices.push(i),
+                std::cmp::Ordering::Greater => break,
+                std::cmp::Ordering::Less => {}
+            }
+        }
+        let ctx_owned: Option<ResolveContext<'_>> = scope.map(|s| s.resolve_context());
+        self.rank_indices(&needle, limit, ctx_owned.as_ref(), &indices)
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }
