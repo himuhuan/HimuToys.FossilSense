@@ -1,13 +1,13 @@
 use super::include_completion::IncludeCompletionTable;
 use super::{
-    grouped_reference_items, local_words_for_cache, rebuild_include_table,
-    rebuild_indexed_file_list,
+    dedup_completion_candidates, grouped_reference_items, local_words_for_cache,
+    rebuild_include_table, rebuild_indexed_file_list,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::tempdir;
-use tower_lsp::lsp_types::Url;
+use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind, Url};
 
 #[tokio::test]
 async fn local_word_cache_is_keyed_by_document_version() {
@@ -230,6 +230,40 @@ fn local_word_does_not_outrank_reachable_indexed_candidate() {
         external_score,
         local_best.unwrap()
     );
+}
+
+#[test]
+fn completion_dedup_keeps_indexed_kind_over_same_name_local_word() {
+    use crate::model::{ResolutionConfidence, ScopeTier};
+
+    let indexed = super::CompletionCandidate {
+        name: "hello_value".to_string(),
+        tier: ScopeTier::Reachable,
+        confidence: ResolutionConfidence::Reachable,
+        score: 30_000,
+        item: CompletionItem {
+            label: "hello_value".to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            ..Default::default()
+        },
+        source: super::CompletionCandidateSource::Indexed,
+    };
+    let local = super::CompletionCandidate {
+        name: "hello_value".to_string(),
+        tier: ScopeTier::Current,
+        confidence: ResolutionConfidence::Heuristic,
+        score: 40_000,
+        item: CompletionItem {
+            label: "hello_value".to_string(),
+            kind: Some(CompletionItemKind::TEXT),
+            ..Default::default()
+        },
+        source: super::CompletionCandidateSource::LocalWord,
+    };
+
+    let deduped = dedup_completion_candidates(vec![indexed, local]);
+    assert_eq!(deduped.len(), 1);
+    assert_eq!(deduped[0].item.kind, Some(CompletionItemKind::FUNCTION));
 }
 
 // --- R7: watcher/debounce IndexScheduleState machine tests ---------------

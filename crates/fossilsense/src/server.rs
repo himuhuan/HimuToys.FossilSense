@@ -74,6 +74,74 @@ type LocalWordEntry = (i32, Arc<HashSet<String>>);
 type LocalWordCache = Arc<Mutex<HashMap<Url, LocalWordEntry>>>;
 type IndexSchedule = Arc<Mutex<IndexScheduleState>>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompletionCandidateSource {
+    Indexed,
+    LocalWord,
+}
+
+#[derive(Debug)]
+struct CompletionCandidate {
+    name: String,
+    tier: model::ScopeTier,
+    confidence: model::ResolutionConfidence,
+    score: i32,
+    item: CompletionItem,
+    source: CompletionCandidateSource,
+}
+
+fn dedup_completion_candidates(candidates: Vec<CompletionCandidate>) -> Vec<CompletionCandidate> {
+    let mut best_by_name: HashMap<String, usize> = HashMap::new();
+    let mut survivors: Vec<Option<CompletionCandidate>> =
+        candidates.into_iter().map(Some).collect();
+    for i in 0..survivors.len() {
+        let Some((name, tier, confidence)) = survivors[i]
+            .as_ref()
+            .map(|candidate| (candidate.name.clone(), candidate.tier, candidate.confidence))
+        else {
+            continue;
+        };
+        let key = (tier, confidence);
+        match best_by_name.get(&name) {
+            None => {
+                best_by_name.insert(name, i);
+            }
+            Some(&prev_i) => {
+                let (prev_tier, prev_conf, prev_source) = {
+                    let prev = survivors[prev_i].as_ref().expect("survivor present");
+                    (prev.tier, prev.confidence, prev.source)
+                };
+                let current_source = survivors[i].as_ref().expect("survivor present").source;
+                if completion_candidate_beats(
+                    current_source,
+                    key,
+                    prev_source,
+                    (prev_tier, prev_conf),
+                ) {
+                    survivors[prev_i] = None;
+                    best_by_name.insert(name, i);
+                } else {
+                    survivors[i] = None;
+                }
+            }
+        }
+    }
+    survivors.into_iter().flatten().collect()
+}
+
+fn completion_candidate_beats(
+    source: CompletionCandidateSource,
+    key: (model::ScopeTier, model::ResolutionConfidence),
+    prev_source: CompletionCandidateSource,
+    prev_key: (model::ScopeTier, model::ResolutionConfidence),
+) -> bool {
+    match (source, prev_source) {
+        (CompletionCandidateSource::Indexed, CompletionCandidateSource::LocalWord) => true,
+        (CompletionCandidateSource::LocalWord, CompletionCandidateSource::Indexed) => false,
+        _ => key > prev_key,
+    }
+}
+
 const REFRESH_INDEX_COMMAND: &str = "fossilsense.refreshIndex";
 const REFRESH_INDEX_LSP_COMMAND: &str = "fossilsense.lsp.refreshIndex";
 const REBUILD_INDEX_COMMAND: &str = "fossilsense.rebuildIndex";

@@ -58,6 +58,7 @@ pub fn call_context_at(text: &str, line: u32, character: u32) -> Option<CallCont
                     stack.push(DelimFrame::Paren {
                         name,
                         active_argument: 0,
+                        unsupported_template_argument: false,
                     });
                 }
                 b')' => pop_matching(&mut stack, FrameKind::Paren),
@@ -65,17 +66,30 @@ pub fn call_context_at(text: &str, line: u32, character: u32) -> Option<CallCont
                 b']' => pop_matching(&mut stack, FrameKind::Bracket),
                 b'{' => stack.push(DelimFrame::Brace),
                 b'}' => pop_matching(&mut stack, FrameKind::Brace),
-                b'<' if looks_like_template_start(bytes, i) => {
+                b'<' if looks_like_template_start(bytes, i, offset) => {
                     stack.push(DelimFrame::Angle);
                 }
                 b'>' => pop_matching(&mut stack, FrameKind::Angle),
                 b',' => {
                     if stack.iter().any(|frame| matches!(frame, DelimFrame::Angle)) {
-                        return None;
+                        if let Some(DelimFrame::Paren {
+                            name: Some(_),
+                            unsupported_template_argument,
+                            ..
+                        }) = stack
+                            .iter_mut()
+                            .rev()
+                            .find(|frame| matches!(frame, DelimFrame::Paren { name: Some(_), .. }))
+                        {
+                            *unsupported_template_argument = true;
+                        }
+                        i += 1;
+                        continue;
                     }
                     if let Some(DelimFrame::Paren {
                         name: Some(_),
                         active_argument,
+                        ..
                     }) = stack.last_mut()
                     {
                         *active_argument += 1;
@@ -119,9 +133,10 @@ pub fn call_context_at(text: &str, line: u32, character: u32) -> Option<CallCont
         DelimFrame::Paren {
             name: Some(name),
             active_argument,
+            unsupported_template_argument,
         } => Some(CallContext {
             name: name.clone(),
-            active_argument: *active_argument,
+            active_argument: (!unsupported_template_argument).then_some(*active_argument)?,
         }),
         _ => None,
     })
@@ -244,6 +259,7 @@ enum DelimFrame {
     Paren {
         name: Option<String>,
         active_argument: u32,
+        unsupported_template_argument: bool,
     },
     Bracket,
     Brace,
@@ -275,8 +291,35 @@ impl DelimFrame {
     }
 }
 
-fn looks_like_template_start(bytes: &[u8], open_angle: usize) -> bool {
-    previous_non_ws(bytes, open_angle).is_some_and(is_ident_continue)
+fn looks_like_template_start(bytes: &[u8], open_angle: usize, limit: usize) -> bool {
+    if !template_name_before_angle(bytes, open_angle) {
+        return false;
+    }
+    let mut depth = 0i32;
+    for (idx, byte) in bytes.iter().enumerate().take(limit).skip(open_angle) {
+        match *byte {
+            b'<' => depth += 1,
+            b'>' => {
+                depth -= 1;
+                if depth == 0 {
+                    return idx > open_angle + 1;
+                }
+            }
+            b';' | b'\n' | b')' | b']' | b'}' if depth == 1 => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn template_name_before_angle(bytes: &[u8], open_angle: usize) -> bool {
+    let Some(name_start) = identifier_start_before(bytes, open_angle) else {
+        return false;
+    };
+    let angle_touches_name = open_angle > 0 && is_ident_continue(bytes[open_angle - 1]);
+    let namespace_qualified =
+        name_start >= 2 && bytes.get(name_start - 2..name_start) == Some(b"::");
+    angle_touches_name || namespace_qualified
 }
 
 fn parameter_list_bounds(label: &str) -> Option<(usize, usize)> {
@@ -506,6 +549,16 @@ mod tests {
             call_context_at(text, line, character).is_none(),
             "unsupported template-like shapes must degrade to None"
         );
+    }
+
+    #[test]
+    fn call_context_allows_commas_after_less_than_expression() {
+        let text = "void f(void) {\n  if (idx < limit) {}\n  foo(first, \n}\n";
+        let line = 2;
+        let character = text.lines().nth(2).expect("line").chars().count() as u32;
+        let ctx = call_context_at(text, line, character).expect("call context");
+        assert_eq!(ctx.name, "foo");
+        assert_eq!(ctx.active_argument, 1);
     }
 
     #[test]
