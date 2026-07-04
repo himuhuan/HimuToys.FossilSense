@@ -22,7 +22,6 @@ pub use hover::{
     hover_markdown_for_candidate, leading_comment_markdown, rank_hover_candidates,
     RankedHoverCandidate, HOVER_CANDIDATE_LIMIT,
 };
-#[allow(unused_imports)]
 pub use local_completion::{local_completion_candidates, LocalCompletionCandidate};
 pub use lsp_kinds::{lsp_completion_kind_from_parser, lsp_kind_from_parser, lsp_symbol_kind};
 pub use signatures::{
