@@ -1,280 +1,265 @@
 # FossilSense
 
-FossilSense is a best-effort C/C++ navigation and analysis engine for large Windows workspaces where full IntelliSense or `compile_commands.json` is unavailable.
+FossilSense 是一个面向大型 Windows C/C++ 工作区的 **best-effort 代码导航与分析工具**。它解决的不是“如何替代 clangd / IntelliSense”，而是在很多真实旧工程里，编译模型本身就很难建立：
 
-## Version facts
+- 没有可靠的 `compile_commands.json`。
+- 仓库很大，构建链复杂，宏和平台分支很多。
+- SDK、固件、内核、老代码、vendored 第三方代码混在一起。
+- 用户真正需要的是先能跳转、搜索、补全和理解代码，而不是先修完整构建系统。
 
-- Rust engine crate: `crates/fossilsense/Cargo.toml` (`1.1.0` at this snapshot).
-- VS Code package / VSIX: `extensions/vscode/package.json` (`1.1.0` at this snapshot).
-- The VSIX version is the installable extension package version. It bundles the Rust engine binary built from this workspace; v1.1.0 aligns the Rust engine and VS Code package versions.
+因此 FossilSense 的基本假设是：**没有可靠编译环境是基本盘，不是降级场景**。
 
-Current baseline capabilities: workspace symbol search, document outline, ranked
-go-to-definition candidates, **role-grouped find-all-references** (text candidates
-grouped by best-effort syntactic role), **lightweight completion**
-(including degraded `.`/`->` member completion), **best-effort signature help /
-parameter hints** for indexed functions, **best-effort rich hover** with ranked
-candidate evidence and leading Doxygen / ordinary comment rendering, **degraded
-semantic coloring** (macros, types, and enum constants), **limited `#include`
-analysis** (header-path completion, jump-to-header, and indexing of external reference headers), optional
-workspace scope configuration via `fossilsense.json`, manual incremental refresh /
-full rebuild commands, debounced/coalesced reindex scheduling, CLI/LSP timing
-metrics, and self-contained VSIX packaging.
+它不会把文本匹配或启发式结果伪装成编译级语义绑定。FossilSense 提供的是带有 `tier`、`confidence`、`reason` 的候选结果：当前文件、include 可达文件、外部头文件、全局 fallback、歧义 include 等状态都应该被显式表达出来。
 
-- a Rust `fossilsense` binary with `scan`, `index`, and `lsp` modes
-- a VS Code extension that starts the local language server
-- a tiny C sample workspace for end-to-end checks
-- a persistent SQLite symbol index with incremental rebuilds
-- workspace scope configuration via `fossilsense.json`
-- manual incremental refresh and full rebuild commands
-- debounced/coalesced LSP reindex scheduling
-- CLI/LSP index timing metrics for release checks
-- lightweight text/index-level completion with active C/C++ provider conflict reporting
-- degraded `.`/`->` member completion: a current-file receiver-type guess narrows
-  to the record's fields, with a global field fallback (pure-C oriented)
-- best-effort Markdown hover: exact-name indexed candidates ranked by the same
-  resolver as Go to Definition, plus nearby leading Doxygen / ordinary comments
-  when they can be recovered cheaply
-- degraded semantic coloring of macros, types, and enum constants
-- limited `#include` analysis: header-path completion inside `#include "…"`/`<…>`,
-  jump-to-header on an include line (candidate list when ambiguous), and indexing of
-  external reference headers from `includePaths` (searchable but ranked after workspace)
+当前版本事实：
 
-## Include analysis (`includePaths`)
+- Rust engine crate：`crates/fossilsense/Cargo.toml`，版本 `1.1.0`。
+- VS Code 扩展 / VSIX：`extensions/vscode/package.json`，版本 `1.1.0`。
+- VSIX 是可安装交付物，会把 Rust 原生二进制一起打进扩展包。
 
-Point FossilSense at one or more **external** header reference directories (e.g. a
-MinGW/TDM-GCC or SDK include tree) to get `#include` path completion, jump-to-header,
-and degraded symbol coverage of those headers. Set it as a VS Code array setting
-`fossilsense.includePaths`, or as `includePaths` in `fossilsense.json`.
+## 产品定位
 
-- **What it does**: file-name/sub-path completion inside `#include` delimiters (quote
-  vs angle affects ranking only); go-to-definition on an `#include` line opens the
-  resolved header (multiple matches return a ranked candidate list); external header
-  symbols become searchable/completable but rank **after** workspace symbols. Headers
-  directly `#include`d by a workspace file (the "first layer") also feed semantic
-  coloring; transitively-included ones do not.
-- **What it does not do**: no preprocessor, no `#if`/conditional evaluation, no macro
-  expansion to pick a winning include, no transitive include graph, no auto-detection
-  of system include paths (you point at them explicitly).
-- **Never an error**: missing/invalid/duplicate paths are skipped with a note. Because
-  FossilSense never compiles, mismatched-platform headers (e.g. MinGW headers while
-  targeting Linux) are inert reference text — they cannot cause an error. Oversized
-  roots degrade to path-resolution-only (no symbols) rather than stalling.
-- Distinct from scope `include` below, which selects *workspace* subtrees.
+在 C/C++ 项目里，精确语言服务通常依赖编译参数。没有 include path、宏定义、目标平台、编译选项时，工具很难知道一个名字到底绑定到哪个声明。
 
-## Configuration (`fossilsense.json`)
+FossilSense 选择的路线是另一种：它不要求先拿到完整编译模型，而是先建立一个可容错的索引层。这个索引层基于 tree-sitter 和词法 fallback 收集符号、引用候选、include 关系、record / field / alias 等信息，然后在查询时根据当前文件、include 可达性和路径局部性排序。
 
-Place an optional `fossilsense.json` at the workspace root to control which files
-enter the index and reference search. All fields are optional; missing files or
-malformed JSON fall back to defaults with a visible warning.
+这意味着 FossilSense 更像是大型 C/C++ 仓库里的“SourceInsight 风格导航工具”，而不是一个完整 C++ 语义分析器。它适合用在以下场景：
+
+- 嵌入式、固件、驱动、内核、交叉编译项目。
+- 老仓库或内部仓库，构建脚本复杂到很难被编辑器复用。
+- Windows 工作区，代码量很大，但用户希望打开后立刻可用。
+- clangd / IntelliSense 当前能工作得很好时，FossilSense 不是更好的选择。
+
+> **候选不是绑定**
+>
+> FossilSense 的跳转、补全、引用、hover 和着色都属于 best-effort candidate。它会尽量把候选排序得有用，但不会声称自己完成了编译器级名称解析。这里的关键是把“不确定性”暴露出来，而不是藏起来。
+
+## 架构
+
+FossilSense 由一个 VS Code 扩展和一个 Rust 原生二进制组成：
+
+```text
+VS Code 扩展 (TypeScript, extensions/vscode)
+        |
+        | LSP over stdio
+        v
+fossilsense 单一 Rust 原生二进制 (crates/fossilsense)
+  - CLI: scan / index
+  - LSP: lsp
+```
+
+VS Code 扩展负责启动 server、桥接配置、注册命令和显示状态。真正的扫描、解析、索引、SQLite 存储、查询和 LSP 服务都在 Rust 二进制里完成。
+
+二进制查找顺序：
+
+1. `fossilsense.serverPath`
+2. 扩展内置 `bin/`
+3. 仓库 `target/release` 或 `target/debug`
+
+这种结构的结果是，VSIX 可以做到自包含安装：用户不需要额外装 ctags、cscope、clangd 或 Rust 工具链。
+
+## 当前能力
+
+FossilSense 当前主要提供以下能力：
+
+- **工作区符号**：从持久 SQLite 索引中查询函数、宏、类型、枚举常量、全局变量等候选。
+- **文档大纲**：对当前 C/C++ 文件提供结构化符号视图。
+- **跳转定义候选**：按 current / reachable / external / global 等 scope tier 排序。
+- **Find All References**：基于 whole-word 文本命中，再用语法角色分组为 definition / declaration / call / write / type / read。
+- **轻量补全**：基于索引和当前文件词表，支持前缀、短前缀降噪、截断后持续 re-query。
+- **成员补全**：对 `.` / `->` 做 C-oriented 的 degraded field completion。
+- **Signature Help**：在简单函数调用中展示索引到的函数签名候选。
+- **Rich Hover**：展示候选签名、路径、tier / confidence / reason，以及可恢复的 Doxygen 或普通前置注释。
+- **语义着色**：只给宏、类型、枚举常量做有限着色，其它内容交给 TextMate。
+- **include 分析**：支持 `#include` 路径补全、跳转头文件、有限 include 可达性排序。
+- **外部头文件索引**：通过 `fossilsense.includePaths` 指向 SDK / toolchain include 目录。
+- **增量索引**：文件事件合并、debounce、手动 refresh、full rebuild。
+- **CLI 检查**：`scan` / `index` 可用于无编辑器调试和发布验证。
+
+这些能力都遵循同一个原则：能给候选就给候选，能标注不确定性就标注不确定性；解析失败或配置缺口应该降级，而不是让整个工具不可用。
+
+## Include 与可达性
+
+对于大仓库而言，单纯全局名字匹配很容易产生噪声。FossilSense 因此引入了有限的 include 可达性分析。
+
+当 `a.c` include 了 `foo.h`，而 `foo.h` 又能解析到工作区内唯一文件时，FossilSense 可以把 `foo.h` 里的定义看作对 `a.c` 更可信。补全和跳转会优先显示这类 reachable candidate。
+
+但 include 在 C/C++ 里本身可能是不确定的：
+
+- include 路径可能解析不到。
+- suffix 匹配可能命中多个同名头。
+- 遍历 include 图可能达到深度或节点上限。
+- 条件编译和宏展开没有被执行。
+
+在这种情况下，FossilSense 会把 scope 标成 open，并通过 `OpenReason` 暴露原因。补全会继续给候选，但不会假装 include 图已经闭合。
+
+`fossilsense.includeScoping.mode` 控制这套逻辑：
+
+| 值 | 行为 |
+|---|---|
+| `"auto"` | 默认。根据 include 可达集收窄着色和排序；不确定时回退到更开放行为。 |
+| `"off"` | 关闭 include scoping，回到全局索引行为。 |
+
+> **着色与补全的差异**
+>
+> 着色更保守。若可达性不确定，宁可不把某个名字着成“已证明可达”。补全则更偏向召回，会继续给候选，只是在排序和标签上表达可信度。
+
+## 外部头文件(`includePaths`)
+
+`fossilsense.includePaths` 用来告诉 FossilSense：哪些目录是外部参考头文件，例如 MinGW、TDM-GCC、SDK 或厂商库 include 目录。
+
+它和 `fossilsense.json` 里的 `include` 不是一个概念：
+
+- `include` / `exclude` 用来选择工作区内哪些文件进入索引。
+- `includePaths` 用来指向工作区外的头文件参考目录。
+
+外部头文件的作用是提供 `#include` 路径补全、跳转头文件和有限符号候选。外部符号可搜索、可补全，但一般排在工作区符号之后。被工作区文件直接 include 的第一层外部头也可以参与语义着色；传递 include 的外部头只作为导航参考。
+
+FossilSense 不编译外部头，因此错平台头文件不会造成编译错误。目录缺失、重复、不可访问或过大时，会 warning 后跳过或降级为仅路径解析。
+
+## 配置(`fossilsense.json`)
+
+可以在工作区根目录放一个可选的 `fossilsense.json`：
 
 ```json
 {
   "include": ["src/", "include/"],
   "exclude": ["src/generated/"],
-  "extensions": ["c", "h", "cpp", "hpp"]
+  "extensions": ["c", "h", "cpp", "hpp"],
+  "includePaths": ["C:/TDM-GCC-64/x86_64-w64-mingw32/include"]
 }
 ```
 
-| Field | Type | Default | Description |
+所有字段都是可选的。没有配置文件时，默认扫描整个仓库里的常见 C/C++ 源文件。
+
+| 字段 | 类型 | 默认值 | 含义 |
 |---|---|---|---|
-| `include` | `string[]` | `[]` (all repo) | Subtree prefixes to limit scanning. Non-empty = only files under these directories. |
-| `exclude` | `string[]` | `[]` | Directory prefixes to exclude, applied on top of `.gitignore` and built-in excludes. |
-| `extensions` | `string[]` | `["c","h","cpp","hpp","cc","hh","cxx","hxx","inl"]` | File extensions to include. Leading `.` is stripped and comparison is case-insensitive. Providing this field replaces the default set. |
-| `includePaths` | `string[]` | `[]` | **Absolute** external header reference directories (see *Include analysis* above). Distinct from `include`. Merged with the VS Code `fossilsense.includePaths` setting; invalid entries are skipped. |
+| `include` | `string[]` | `[]` | 限定工作区扫描子树。非空时只扫描这些目录。 |
+| `exclude` | `string[]` | `[]` | 排除目录，叠加 `.gitignore` 和内置排除规则。 |
+| `extensions` | `string[]` | `["c","h","cpp","hpp","cc","hh","cxx","hxx","inl"]` | 进入索引的文件扩展名。 |
+| `includePaths` | `string[]` | `[]` | 外部头文件参考目录，要求绝对路径。 |
 
-- Paths are repository-relative, `/`-separated, case-insensitive (ASCII).
-- `include`/`exclude` use segment-boundary prefix matching: `"src"` matches `src/a.c` but NOT `src_gen/b.c`.
-- If `fossilsense.json` is deleted, the next reindex restores full-repo scope.
-- Configuration changes (create/edit/delete) trigger automatic reindexing.
+路径按仓库相对路径处理，统一使用 `/`。`include` / `exclude` 使用 segment-boundary 前缀匹配，因此 `"src"` 会匹配 `src/a.c`，但不会匹配 `src_gen/b.c`。
 
-## Commands
+配置文件新增、修改或删除后，会触发自动 reindex。坏 JSON 或字段类型错误会回退默认值，并在输出面板 / 状态栏中提示。
 
-| Command | Description |
+## VS Code 命令
+
+| 命令 | 说明 |
 |---|---|
-| `FossilSense: Start Server` | Start the language server manually. |
-| `FossilSense: Stop Server` | Stop the language server. |
-| `FossilSense: Refresh Index` | Incrementally refresh the index, skipping unchanged files. |
-| `FossilSense: Full Rebuild Index` | Force a full rescan and reindex (respects `fossilsense.json` scope). |
+| `FossilSense: Start Server` | 手动启动 language server。 |
+| `FossilSense: Stop Server` | 停止 language server。 |
+| `FossilSense: Refresh Index` | 增量刷新索引，跳过未变化文件。 |
+| `FossilSense: Full Rebuild Index` | 强制全量重新扫描和索引。 |
+| `FossilSense: Find References (Grouped by Role)` | 按语法角色查看引用候选。 |
 
-## Completion
+状态栏会显示索引阶段：
 
-FossilSense provides lightweight, index-based and text-based completion for C/C++
-files. It is **not** a semantic language service. Specifically:
+```text
+discovering -> checking -> parsing -> indexing -> finalizing -> ready
+```
 
-- Completion candidates come from the indexed symbol table (functions, macros, types,
-  enum constants, global variables) and identifier words found in the currently
-  open file. The token currently being typed is not echoed back as a word candidate;
-  raw current-file words are fallback text items and do not receive current-file scope
-  priority over reachable or external indexed symbols. Indexed candidates outside the
-  current file carry a best-effort scope tag in the item detail (`reachable` /
-  `external` / `global` / `ambiguous`) with the full tier/confidence/reason in the
-  item documentation; indexed current-file candidates are unlabeled. The tag is
-  presentation only — it never changes ranking.
-- **Member completion (`.`/`->`) is degraded and C-oriented.** When the cursor follows
-  a member operator, FossilSense returns struct/union **fields only** (never functions
-  or macros). It tries to resolve the receiver's record type from a simple declaration
-  in the current file (`struct Foo *p; p->`), then lists that record's fields — pulled
-  from the global index, so cross-file definitions resolve even behind a forward
-  declaration. When the receiver can't be resolved (a call result `get()->`, a chain
-  `a.b.`, or an unknown variable), it falls back to a prefix-filtered list of all field
-  names. It never infers expression types, so it may occasionally offer the wrong
-  record's fields — a candidate list, not a precise one.
-- **Signature help / parameter hints are best-effort.** When the cursor is inside
-  a simple function call, FossilSense finds exact-name indexed function
-  declaration/definition candidates, ranks them with the same include
-  reachability tiers used by Go to Definition, and shows stored signatures with
-  the active argument index when the parameter list can be split conservatively.
-  It does not perform overload resolution, argument type matching, template or
-  namespace lookup, function-like macro expansion, or function-pointer target
-  inference. When a signature is too complex to split safely, the whole stored
-  signature is shown without fabricated parameter labels.
-- Snippet expansion, auto-import, and C++-specific member access (scoped enums,
-  static members, nested types) are not special-cased.
-- Local-variable scope is not tracked for ordinary completion; words from the current
-  file are a flat bag of identifiers, filtered only for C/C++ keywords.
+失败时状态为 `failed`。当配置回退或存在 warning 时，状态栏会显示提示标记。
 
-## Hover
+## 补全
 
-FossilSense provides best-effort Markdown hover for indexed C/C++ identifiers.
-Hover is useful when a large workspace lacks a working compiler model, but it is
-still a candidate display, not a semantic binding:
+FossilSense 的补全是 index-level / text-level 的，不是完整语义补全。
 
-- The identifier under the cursor is looked up by exact name in the FossilSense
-  index, then ranked with the same include-reachability tiers used by Go to
-  Definition. The hover names the candidate kind/role, path, tier, confidence,
-  and reason so current, reachable, external, ambiguous, and global-fallback
-  results are visible.
-- The hover shows the stored signature in a C code block. When a leading
-  comment is immediately attached to the candidate, FossilSense renders common
-  Doxygen commands such as `@brief`, `@param`, `@return`, `@retval`, `@note`,
-  and `@warning` as readable Markdown. Ordinary contiguous `//` and `/* ... */`
-  comments are rendered as prose.
-- Messy or nonstandard comments degrade to plain readable text. If the candidate
-  file cannot be read, the signature and ranking evidence still appear.
-- It does not perform type-aware binding, overload resolution, template or
-  namespace lookup, macro expansion, expression-type hover, or field/member
-  hover. clangd or full IntelliSense remain the better source when a precise
-  compiler model is available.
+主标识符补全来自两类数据：
 
-The `fossilsense.mode` setting controls the whole FossilSense server:
+- 索引里的函数、宏、类型、枚举常量、全局变量等符号。
+- 当前打开文件里的 identifier word。
 
-| Value | Behavior |
-|---|---|
-| `"auto"` (default) | Starts FossilSense and shows a one-time mutual-exclusion warning when clangd, Microsoft C/C++, or ccls is detected. FossilSense does not silently disable individual providers. |
-| `"on"` | Starts FossilSense without the mutual-exclusion warning. |
-| `"off"` | Does not start FossilSense. |
+补全结果始终标记为 `isIncomplete = true`。这意味着 VS Code 会随着每次输入重新请求完整前缀，避免 top-N 截断后长名字永远回不来的问题。
 
-The `fossilsense.completion.mode` setting controls only FossilSense completion:
+短前缀会更保守：
 
-| Value | Behavior |
-|---|---|
-| `"auto"` (default) | Enables completion. C/C++ language-server conflicts are reported by `fossilsense.mode`, not handled by silently disabling completion. |
-| `"on"` | Enables completion. |
-| `"off"` | Never provides completion; other FossilSense features remain active. |
+- 前缀长度 `< 3` 时，只接受 exact、prefix 和词边界子串，避免噪声长尾。
+- 前缀长度 `>= 3` 时，恢复更完整的 fuzzy recall。
 
-When another C/C++ language server is detected, FossilSense shows a single warning
-with actions to stop FossilSense or open settings. Choose one primary C/C++ provider
-for a workspace to avoid duplicate completion/navigation results.
+非当前文件的索引候选会在 detail / documentation 中标注 `reachable`、`external`、`global`、`ambiguous` 等信息。当前文件候选不额外标注，避免 UI 噪声。
 
-## Semantic Coloring
+## 成员补全(`.` / `->`)
 
-FossilSense adds a deliberately narrow, text/index-level semantic colorer for C/C++.
-It exists to correct the identifier classes TextMate most reliably gets wrong —
-**macros**, **types**, and **enum constants** — and nothing else:
+成员补全是一个明确降级的能力，目前偏向 C 的 struct / union field 场景。
 
-- Only known macros, known type names (typedef / struct / enum / union / class), and
-  known enum constants are colored. Functions, variables, parameters, **struct/union
-  fields**, locals, and any unrecognized identifier are left untouched for the editor's
-  TextMate grammar. (Enum constants fit this model because, in C, they are unscoped
-  global identifiers — a name match is high-confidence, just like a macro. Fields do
-  not: a bare name matching a field would too often be a local, so they are not colored.)
-- Classification combines the current file's tree-sitter definitions (which win) with
-  the global symbol index. When a name has several meanings in the index, the most
-  frequently defined colorable kind is chosen as a **best guess**; an exact tie is
-  left uncolored. This means a wrapper macro that shadows a real function, or a name
-  that is both a macro and an enum constant, may occasionally be mis-colored — an
-  accepted trade-off, not a bug.
-- Coloring uses the standard `macro`, `type`, and `enumMember` LSP token types with no
-  modifiers, so it follows your theme with zero extra configuration. There is **no**
-  inactive-region (`#if 0`) graying, scope-aware inference, or per-position type analysis.
-- Tokens are computed only for open/visible files and recomputed as you edit.
+当光标位于 `p->` 或 `x.` 后面时，FossilSense 会尝试从当前文件里的简单声明推断 receiver 的 record 类型，例如：
 
-The `fossilsense.semanticColoring.mode` setting controls when coloring is active:
+```c
+struct Foo *p;
+p->
+```
 
-| Value | Behavior |
-|---|---|
-| `"auto"` (default) | Enables coloring. C/C++ language-server conflicts are reported by `fossilsense.mode`, not handled by silently disabling coloring. |
-| `"on"` | Enables coloring. |
-| `"off"` | Never provides semantic coloring; other FossilSense features remain active. |
+如果能猜到 `Foo`，则从索引中查找 `Foo` 的字段，即使字段定义在其它文件里也可以作为候选。若猜不到 receiver 类型，则回退到全局字段名前缀候选。
 
-Semantic coloring follows the whole-server mutual-exclusion notice from
-`fossilsense.mode`; it is no longer auto-disabled independently.
+它不做完整表达式类型推断，因此以下场景不会被精确支持：
+
+- `get()->`
+- `a.b.`
+- 继承、模板、命名空间、访问控制。
+- C++ 静态成员、重载、表达式结果类型。
+
+这类结果仍然是 candidate，不是类型系统结论。
+
+## Hover 与 Signature Help
+
+Hover 的目标是让用户快速看到“这个名字有哪些可信候选”。它会展示：
+
+- 候选类型和路径。
+- stored signature。
+- `tier`、`confidence`、`reason`。
+- 紧贴候选前面的 Doxygen 或普通注释，能恢复就渲染为 Markdown。
+
+Signature Help 也遵循同样原则：在简单函数调用中按 exact-name 找函数声明 / 定义候选，并根据 include reachability 排序。它不会做 overload resolution、参数类型匹配、模板推导、命名空间解析、函数式宏展开或函数指针目标推断。
+
+如果签名太复杂，参数无法安全切分，则显示整体签名，不伪造参数标签。
 
 ## Find All References
 
-Find-all-references is a best-effort **text candidate** search with syntactic-role
-grouping — not resolved semantic references. Discovery is a case-sensitive whole-word
-search; each hit is then classified with a best-effort syntactic role
-(definition / declaration / call / write / type / read; unparseable hits fall back to
-read) and results are ordered by role (definitions and declarations first). The
-standard References panel renders **locations only** and carries no per-item role
-label; run **FossilSense: Find References (Grouped by Role)** to see the hits grouped
-and labeled by role. The grouped QuickPick hides `:line` suffixes by default to
-reduce label noise; set `fossilsense.references.showRanges` to `true` to show
-line suffixes while keeping the same exact navigation range. Results are capped
-at 2000 matches.
+FossilSense 的引用查找是 **text candidate search**，不是语义引用解析。
 
-For Go to Definition, enabling `fossilsense.debug.candidateReasons` logs each
-candidate's scope tier, confidence, and reason to the output panel — a debug aid that
-never changes which definitions are returned.
+它先对光标下的 identifier 做区分大小写的 whole-word 搜索，再对命中位置做 best-effort 语法角色分类：
 
-## Coexistence With C/C++ Tooling
+- definition
+- declaration
+- call
+- write
+- type
+- read
 
-FossilSense is a best-effort navigation engine, not a replacement for a semantic
-compiler model. It can be installed alongside Microsoft C/C++, clangd, and CMake
-Tools, but only one C/C++ language provider should be primary in a workspace:
+普通 VS Code References 面板只显示位置，不显示角色。若要看角色分组，使用 `FossilSense: Find References (Grouped by Role)`。
 
-- Keep clangd/IntelliSense enabled when they work; they remain the better source
-  for diagnostics, type-aware completion, precise hover, semantic references, and
-  exact overload resolution.
-- Use FossilSense when `compile_commands.json` is missing, stale, or too costly
-  for a large Windows workspace. Its providers are intentionally limited to
-  workspace symbols, document symbols, ranked definition candidates, best-effort
-  hover/signature candidates, and role-grouped text-candidate references (not
-  resolved semantic references).
-- Duplicate or different results are expected. FossilSense does not claim
-  semantic precision; it returns stable text/index candidates that are useful
-  when full IntelliSense cannot build the project.
-- If another extension's provider is preferred for a specific workspace, leave
-  FossilSense installed but stop its server with `FossilSense: Stop Server` or set
-  `fossilsense.mode` to `"off"` for that workspace.
+结果默认最多返回 2000 条。解析失败的文件会把角色降级为 `read`，而不是中断整个引用搜索。
 
-## Performance Notes
+## 语义着色
 
-- Source/config file events are scope-filtered, debounced, and coalesced before
-  reindexing. Saves rely on the file watcher, avoiding a duplicate save+watcher
-  index request for the same edit.
-- Manual `FossilSense: Refresh Index` and ordinary file events incrementally
-  refresh the index. `FossilSense: Full Rebuild Index` and `fossilsense index
-  --force` force a full parse of in-scope files.
-- Incremental checks use cheap metadata first and only read/hash file contents
-  for files that need parsing; stored file metadata is fetched in batched
-  lookups instead of one query per file. Parser concurrency is bounded by
-  default (8 workers, clamped to available CPU parallelism); set
-  `FOSSILSENSE_PARSE_THREADS` to override the worker count for diagnostics.
-- Parser worker threads run with enlarged stacks so deeply nested C/C++ files
-  parse without overflowing, and the per-file index walk collects fields, enum
-  constants, and typedef aliases in a single iterative pass over the syntax tree.
-- Full rebuilds use a bulk-load path: SQLite lookup indexes are dropped up front,
-  symbols are imported in batched transactions, then the indexes are rebuilt once
-  at the end instead of being maintained row by row.
-- `include` entries prune traversal when possible. For example, an include of
-  `["src/core/"]` keeps ancestors such as `src/` but does not descend unrelated
-  top-level directories.
-- CLI `index` prints `elapsed_ms`, `discover_ms`, `parse_ms`, and `write_ms`;
-  the VS Code output panel logs the same metrics when indexing completes.
+FossilSense 的语义着色范围故意很窄，只处理 TextMate 最容易分错、而索引又相对能判断的几类名字：
 
-## Build & Check
+- 宏。
+- typedef / struct / enum / union / class 类型名。
+- 枚举常量。
+
+函数、变量、参数、局部变量、struct / union 字段都不着色，交给编辑器原有语法高亮。
+
+如果一个名字在索引中有多种含义，FossilSense 会选择最常见的可着色 kind；完全平票时不着色。这意味着某些 wrapper macro 或同名符号可能会被误着色，这是可接受的 best-effort 取舍。
+
+## 与其它 C/C++ 工具共存
+
+FossilSense 可以和 clangd、Microsoft C/C++、CMake Tools 同时安装，但一个工作区最好只有一个主要 C/C++ language provider。
+
+`fossilsense.mode` 控制整体 server：
+
+| 值 | 行为 |
+|---|---|
+| `"auto"` | 默认。启动 FossilSense，并在检测到 clangd / cpptools / ccls 时给一次互斥提示。 |
+| `"on"` | 启动 FossilSense，但不显示互斥提示。 |
+| `"off"` | 不启动 FossilSense。 |
+
+如果 clangd 或 IntelliSense 已经能正确建立项目模型，它们仍然是更精确的工具。FossilSense 更适合无法稳定建立编译模型的工作区。
+
+## 构建与检查
+
+仓库根目录：
 
 ```powershell
 cargo build
@@ -282,26 +267,21 @@ cargo test
 cargo run -p fossilsense -- scan samples/mini-c
 cargo run -p fossilsense -- index samples/mini-c --db target/release-check-mini.sqlite --force
 cargo run -p fossilsense -- index samples/mini-c --db target/release-check-mini.sqlite
+```
+
+VS Code 扩展：
+
+```powershell
 cd extensions/vscode
 pnpm install
 pnpm compile
-pnpm run package
 ```
 
-To run the extension, open this repository in VS Code, press `F5`, open `samples/mini-c` in the Extension Development Host, and run `FossilSense: Start Server`.
-The status bar reports indexing phases (`discovering`, `checking`, `parsing`,
-`indexing`, `finalizing`), then `ready` or `failed` from the language server's
-`fossilsense/indexStatus` notification, and shows `[!]` with a warning tooltip
-when `fossilsense.json` falls back to defaults.
+运行扩展开发宿主时，打开本仓库，按 `F5`，再在 Extension Development Host 中打开 `samples/mini-c`，执行 `FossilSense: Start Server`。
 
-For local release benchmarking, run the same `index --force` and incremental
-`index` commands against `example/HimuOS` when that private sample is available.
-Record file count, symbol count, and the four timing fields in the release report.
+## 打包 VSIX
 
-## Packaging a VSIX
-
-Releases ship an installable, self-contained `.vsix` for hands-on testing
-(see `CLAUDE.md` for the delivery contract). To build one:
+每个对外发布版本都必须产出可直接安装的 `.vsix`。这是 FossilSense 的硬性交付物。
 
 ```powershell
 cd extensions/vscode
@@ -309,6 +289,35 @@ pnpm install
 pnpm run package
 ```
 
-This builds the release engine, bundles it into the extension, and emits
-`dist/fossilsense-vscode-<version>_BUILD<YYYYMMDD_HHMMSS>.vsix` at the repo root. Install it via VS Code →
-Extensions → `...` → *Install from VSIX*, or `code --install-extension dist/<name>.vsix`.
+`pnpm run package` 会执行以下动作：
+
+1. `cargo build --release -p fossilsense`
+2. 复制 `target/release/fossilsense(.exe)` 到 `extensions/vscode/bin/`
+3. 编译扩展入口 `out/extension.js`
+4. 通过 `vsce package --no-dependencies` 生成 VSIX
+
+产物位于仓库根目录 `dist/`：
+
+```text
+dist/fossilsense-vscode-<version>_BUILD<YYYYMMDD_HHMMSS>.vsix
+```
+
+安装方式：
+
+```powershell
+code --install-extension dist/<name>.vsix
+```
+
+或在 VS Code 扩展面板中选择 `... -> Install from VSIX`。
+
+## 当前不做
+
+这些限制不是遗漏，而是当前产品边界：
+
+- 不自写 C/C++ 解析器。
+- 不捆绑 GPL 的 ctags。
+- 不在 VS Code 扩展宿主里跑索引。
+- 不把 best-effort 名字候选伪装成精确语义绑定。
+- 不实现完整 C++ 语义，包括继承、重载、模板、命名空间、访问控制等。
+
+本质上，FossilSense 选择的是另一条工程路线：在编译模型缺失时，先提供稳定、可解释、可降级的导航能力。它不追求“像编译器一样正确”，而是追求在复杂旧工程里打开就能开始工作，并且让用户知道每个结果为什么排在这里。
