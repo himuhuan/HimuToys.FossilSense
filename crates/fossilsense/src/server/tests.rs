@@ -1,7 +1,7 @@
 use super::include_completion::IncludeCompletionTable;
 use super::{
-    dedup_completion_candidates, grouped_reference_items, local_words_for_cache,
-    rebuild_include_table, rebuild_indexed_file_list,
+    completion_items_for_local_bindings, dedup_completion_candidates, grouped_reference_items,
+    local_words_for_cache, rebuild_include_table, rebuild_indexed_file_list,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -264,6 +264,78 @@ fn completion_dedup_keeps_indexed_kind_over_same_name_local_word() {
     let deduped = dedup_completion_candidates(vec![indexed, local]);
     assert_eq!(deduped.len(), 1);
     assert_eq!(deduped[0].item.kind, Some(CompletionItemKind::FUNCTION));
+}
+
+#[test]
+fn completion_dedup_keeps_local_binding_over_same_name_indexed_and_local_word() {
+    use crate::model::{ResolutionConfidence, ScopeTier};
+
+    let indexed = super::CompletionCandidate {
+        name: "count".to_string(),
+        tier: ScopeTier::Reachable,
+        confidence: ResolutionConfidence::Reachable,
+        score: 30_000,
+        item: CompletionItem {
+            label: "count".to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            ..Default::default()
+        },
+        source: super::CompletionCandidateSource::Indexed,
+    };
+    let local_binding = super::CompletionCandidate {
+        name: "count".to_string(),
+        tier: ScopeTier::Current,
+        confidence: ResolutionConfidence::Heuristic,
+        score: 40_000,
+        item: CompletionItem {
+            label: "count".to_string(),
+            kind: Some(CompletionItemKind::VARIABLE),
+            detail: Some("parameter: int".to_string()),
+            ..Default::default()
+        },
+        source: super::CompletionCandidateSource::LocalBinding,
+    };
+    let local_word = super::CompletionCandidate {
+        name: "count".to_string(),
+        tier: ScopeTier::Global,
+        confidence: ResolutionConfidence::Fallback,
+        score: 1_000,
+        item: CompletionItem {
+            label: "count".to_string(),
+            kind: Some(CompletionItemKind::TEXT),
+            ..Default::default()
+        },
+        source: super::CompletionCandidateSource::LocalWord,
+    };
+
+    let deduped = dedup_completion_candidates(vec![indexed, local_word, local_binding]);
+    assert_eq!(deduped.len(), 1);
+    assert_eq!(
+        deduped[0].source,
+        super::CompletionCandidateSource::LocalBinding
+    );
+    assert_eq!(deduped[0].item.kind, Some(CompletionItemKind::VARIABLE));
+}
+
+#[test]
+fn local_binding_candidates_render_variable_kind_and_detail() {
+    let hits = vec![crate::query::LocalCompletionCandidate {
+        name: "cursor_limit".to_string(),
+        kind: crate::parser::LocalBindingKind::LocalVariable,
+        detail: "local: int".to_string(),
+        score: 42_000,
+        decl_start_byte: 10,
+    }];
+
+    let candidates = completion_items_for_local_bindings(hits);
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].name, "cursor_limit");
+    assert_eq!(
+        candidates[0].source,
+        super::CompletionCandidateSource::LocalBinding
+    );
+    assert_eq!(candidates[0].item.kind, Some(CompletionItemKind::VARIABLE));
+    assert_eq!(candidates[0].item.detail.as_deref(), Some("local: int"));
 }
 
 #[test]

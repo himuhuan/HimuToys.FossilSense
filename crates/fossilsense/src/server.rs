@@ -79,6 +79,8 @@ type IndexSchedule = Arc<Mutex<IndexScheduleState>>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CompletionCandidateSource {
     Indexed,
+    #[allow(dead_code)]
+    LocalBinding,
     LocalWord,
 }
 
@@ -141,11 +143,40 @@ fn completion_candidate_beats(
     prev_key: (model::ScopeTier, model::ResolutionConfidence),
     prev_score: i32,
 ) -> bool {
-    match (source, prev_source) {
-        (CompletionCandidateSource::Indexed, CompletionCandidateSource::LocalWord) => true,
-        (CompletionCandidateSource::LocalWord, CompletionCandidateSource::Indexed) => false,
-        _ => key > prev_key || (key == prev_key && score > prev_score),
+    let rank = completion_source_rank(source);
+    let prev_rank = completion_source_rank(prev_source);
+    rank > prev_rank
+        || (rank == prev_rank && (key > prev_key || (key == prev_key && score > prev_score)))
+}
+
+fn completion_source_rank(source: CompletionCandidateSource) -> u8 {
+    match source {
+        CompletionCandidateSource::LocalBinding => 3,
+        CompletionCandidateSource::Indexed => 2,
+        CompletionCandidateSource::LocalWord => 1,
     }
+}
+
+#[allow(dead_code)]
+fn completion_items_for_local_bindings(
+    hits: Vec<query::LocalCompletionCandidate>,
+) -> Vec<CompletionCandidate> {
+    hits.into_iter()
+        .map(|hit| CompletionCandidate {
+            name: hit.name.clone(),
+            tier: model::ScopeTier::Current,
+            confidence: model::ResolutionConfidence::Heuristic,
+            score: hit.score,
+            item: CompletionItem {
+                label: hit.name,
+                kind: Some(CompletionItemKind::VARIABLE),
+                detail: Some(hit.detail),
+                sort_text: Some(format!("{:08}", 100_000_000 - hit.score)),
+                ..Default::default()
+            },
+            source: CompletionCandidateSource::LocalBinding,
+        })
+        .collect()
 }
 
 fn exact_indexed_completion_candidates_for_local_word(
