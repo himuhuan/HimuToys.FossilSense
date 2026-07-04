@@ -25,6 +25,11 @@ extension's `bin/` folder.
   exact-name candidate display, not type-aware semantic binding; unsupported or
   unreadable comment sources degrade to signature-only hover.
 - Lightweight Completion: index-based and current-file word completion for C/C++.
+  When the cursor is inside a detected function body, ordinary identifier
+  completion also adds best-effort current-function parameters and local
+  variables declared before the cursor from the open document snapshot. These
+  structured local candidates are distinct from raw current-file word fallback;
+  unsupported parse shapes degrade to the existing indexed and word completion.
   The list is always marked `isIncomplete` so the editor re-queries with the full
   current prefix on every keystroke — longer-named symbols that fell outside the
   truncated top-N re-enter the window as you keep typing, and an empty first batch
