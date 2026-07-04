@@ -84,6 +84,9 @@ pub struct FileSemanticIndex {
     /// Record-typed local/parameter declarations for positional receiver
     /// inference (AST-derived). Request-time data; not persisted.
     pub local_declarations: Vec<LocalDeclaration>,
+    /// Current-function parameters and local variables for request-time
+    /// identifier completion (AST-derived). Request-time data; not persisted.
+    pub local_bindings: Vec<LocalBinding>,
     pub diagnostics: ParseDiagnostics,
 }
 
@@ -123,6 +126,22 @@ pub struct LocalDeclaration {
     pub name: String,
     pub record_type: String,
     pub decl_start_byte: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalBindingKind {
+    Parameter,
+    LocalVariable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalBinding {
+    pub name: String,
+    pub kind: LocalBindingKind,
+    pub type_text: Option<String>,
+    pub decl_start_byte: usize,
+    pub function_start_byte: usize,
+    pub function_end_byte: usize,
 }
 
 /// Coloring's macro/type/enum definition name sets, projected from an already
@@ -431,6 +450,7 @@ pub fn parse_with_handle(
         fields: ast.fields,
         aliases: ast.aliases,
         local_declarations: ast.local_declarations,
+        local_bindings: ast.local_bindings,
         diagnostics: ParseDiagnostics {
             parse_error_count: ast.parse_error_count,
             fallback_used: false,
@@ -479,6 +499,7 @@ fn lexical_fallback(symbols: Vec<Symbol>, includes: Vec<Include>) -> FileSemanti
         fields: Vec::new(),
         aliases: Vec::new(),
         local_declarations: Vec::new(),
+        local_bindings: Vec::new(),
         diagnostics: ParseDiagnostics {
             parse_error_count: 0,
             fallback_used: true,

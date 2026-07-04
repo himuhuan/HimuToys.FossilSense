@@ -351,6 +351,43 @@ fn infers_receiver_record_for_local_param_and_file_scope() {
     assert_eq!(infer_in("a.c", local, "missing", off), None);
 }
 
+#[test]
+fn local_bindings_collect_parameters_and_locals_in_function() {
+    let src = "int f(int count, struct Foo *foo) {\n    int cursor_limit = count;\n    char *name;\n    return cursor_limit;\n}\n";
+    let index = parse(Path::new("a.c"), src);
+    let names: Vec<(&str, super::LocalBindingKind)> = index
+        .local_bindings
+        .iter()
+        .map(|binding| (binding.name.as_str(), binding.kind))
+        .collect();
+    assert!(names.contains(&("count", super::LocalBindingKind::Parameter)));
+    assert!(names.contains(&("foo", super::LocalBindingKind::Parameter)));
+    assert!(names.contains(&("cursor_limit", super::LocalBindingKind::LocalVariable)));
+    assert!(names.contains(&("name", super::LocalBindingKind::LocalVariable)));
+    assert!(index
+        .local_bindings
+        .iter()
+        .all(|binding| binding.function_start_byte < binding.function_end_byte));
+}
+
+#[test]
+fn local_bindings_ignore_file_scope_declarations() {
+    let src = "int global_value;\nvoid f(void) {\n    int local_value;\n}\n";
+    let index = parse(Path::new("a.c"), src);
+    assert!(index.local_bindings.iter().any(|b| b.name == "local_value"));
+    assert!(index
+        .local_bindings
+        .iter()
+        .all(|b| b.name != "global_value"));
+}
+
+#[test]
+fn local_bindings_are_empty_on_lexical_fallback() {
+    let src = "#define Z 1\n";
+    let index = parse(Path::new("a.unknown"), src);
+    assert!(index.local_bindings.is_empty());
+}
+
 fn occurrence_lines(occurrences: &[Occurrence], name: &str) -> Vec<u32> {
     occurrences
         .iter()

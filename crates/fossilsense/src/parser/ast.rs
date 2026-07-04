@@ -1,7 +1,8 @@
 use super::lexical::{compact_whitespace, make_symbol};
 use super::{
-    AliasTarget, FieldDef, LocalDeclaration, Occurrence, ParseFacts, RecordConfidence, RecordDef,
-    RecordKind, Symbol, SymbolKind, SymbolRole, SyntacticRole, TypeAlias,
+    AliasTarget, FieldDef, LocalBinding, LocalBindingKind, LocalDeclaration, Occurrence,
+    ParseFacts, RecordConfidence, RecordDef, RecordKind, Symbol, SymbolKind, SymbolRole,
+    SyntacticRole, TypeAlias,
 };
 
 pub(super) struct AstIndex {
@@ -12,6 +13,7 @@ pub(super) struct AstIndex {
     pub(super) aliases: Vec<TypeAlias>,
     pub(super) records: Vec<RecordDef>,
     pub(super) local_declarations: Vec<LocalDeclaration>,
+    pub(super) local_bindings: Vec<LocalBinding>,
 }
 
 /// Collect AST-only index data in one iterative pass. This keeps indexing fast
@@ -30,6 +32,7 @@ pub(super) fn collect_ast_index(
         aliases: Vec::new(),
         records: Vec::new(),
         local_declarations: Vec::new(),
+        local_bindings: Vec::new(),
     };
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
@@ -43,6 +46,10 @@ pub(super) fn collect_ast_index(
             if let Some(occ) = occurrence_at(node, source, line_starts) {
                 out.occurrences.push(occ);
             }
+        }
+
+        if facts.contains(ParseFacts::LOCAL_DECLS) && node.kind() == "function_definition" {
+            collect_function_local_bindings(node, source, &mut out.local_bindings);
         }
 
         // Record + field collection. Gated by either bit since both are
@@ -221,6 +228,116 @@ pub fn infer_receiver_record(
         .filter(|decl| decl.name == receiver_name && decl.decl_start_byte < byte_offset)
         .max_by_key(|decl| decl.decl_start_byte)
         .map(|decl| decl.record_type.clone())
+}
+
+fn collect_function_local_bindings(
+    function: tree_sitter::Node<'_>,
+    source: &str,
+    out: &mut Vec<LocalBinding>,
+) {
+    let function_start_byte = function.start_byte();
+    let function_end_byte = function.end_byte();
+
+    if let Some(declarator) = function.child_by_field_name("declarator") {
+        collect_parameter_bindings(
+            declarator,
+            source,
+            function_start_byte,
+            function_end_byte,
+            out,
+        );
+    }
+
+    if let Some(body) = function.child_by_field_name("body") {
+        collect_local_variable_bindings(body, source, function_start_byte, function_end_byte, out);
+    }
+}
+
+fn collect_parameter_bindings(
+    root: tree_sitter::Node<'_>,
+    source: &str,
+    function_start_byte: usize,
+    function_end_byte: usize,
+    out: &mut Vec<LocalBinding>,
+) {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "parameter_declaration" {
+            push_binding_declarators(
+                node,
+                source,
+                LocalBindingKind::Parameter,
+                function_start_byte,
+                function_end_byte,
+                out,
+            );
+            continue;
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+}
+
+fn collect_local_variable_bindings(
+    body: tree_sitter::Node<'_>,
+    source: &str,
+    function_start_byte: usize,
+    function_end_byte: usize,
+    out: &mut Vec<LocalBinding>,
+) {
+    let mut stack = vec![body];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "declaration" {
+            push_binding_declarators(
+                node,
+                source,
+                LocalBindingKind::LocalVariable,
+                function_start_byte,
+                function_end_byte,
+                out,
+            );
+            continue;
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+}
+
+fn push_binding_declarators(
+    declaration: tree_sitter::Node<'_>,
+    source: &str,
+    kind: LocalBindingKind,
+    function_start_byte: usize,
+    function_end_byte: usize,
+    out: &mut Vec<LocalBinding>,
+) {
+    let type_text = binding_type_text(declaration, source);
+    let mut cursor = declaration.walk();
+    for declarator in declaration.children_by_field_name("declarator", &mut cursor) {
+        if let Some((id_node, name)) = declarator_identifier(declarator, source) {
+            out.push(LocalBinding {
+                name: name.to_string(),
+                kind,
+                type_text: type_text.clone(),
+                decl_start_byte: id_node.start_byte(),
+                function_start_byte,
+                function_end_byte,
+            });
+        }
+    }
+}
+
+fn binding_type_text(node: tree_sitter::Node<'_>, source: &str) -> Option<String> {
+    node.child_by_field_name("type")
+        .and_then(|type_node| type_node.utf8_text(source.as_bytes()).ok())
+        .map(compact_whitespace)
+        .filter(|text| !text.is_empty())
 }
 
 /// Build an `Occurrence` from an `identifier` / `type_identifier` node. Tree-sitter
