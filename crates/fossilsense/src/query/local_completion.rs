@@ -148,6 +148,22 @@ mod tests {
     }
 
     #[test]
+    fn parsed_local_completion_requires_cursor_inside_function_body() {
+        let text = "int f(int count, int cou) {\n    cou\n}\n";
+        let parsed = crate::parser::parse(std::path::Path::new("a.c"), text);
+
+        let signature_hits =
+            local_completion_candidates(&parsed.local_bindings, text, 0, 24, "cou", 10);
+        assert!(
+            signature_hits.is_empty(),
+            "local bindings must not activate while editing the function signature"
+        );
+
+        let body_hits = local_completion_candidates(&parsed.local_bindings, text, 1, 7, "cou", 10);
+        assert!(body_hits.iter().any(|hit| hit.name == "count"));
+    }
+
+    #[test]
     fn local_completion_preserves_short_prefix_noise_gate() {
         let text = "void f(void) {\n    int Foobar;\n    int FooBar;\n    ba\n}\n";
         let bindings = vec![

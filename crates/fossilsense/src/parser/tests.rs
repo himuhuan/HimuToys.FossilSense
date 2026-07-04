@@ -382,9 +382,9 @@ fn local_bindings_ignore_file_scope_declarations() {
 }
 
 #[test]
-fn local_bindings_are_empty_on_lexical_fallback() {
+fn local_bindings_are_empty_without_function_definition() {
     let src = "#define Z 1\n";
-    let index = parse(Path::new("a.unknown"), src);
+    let index = parse(Path::new("a.c"), src);
     assert!(index.local_bindings.is_empty());
 }
 

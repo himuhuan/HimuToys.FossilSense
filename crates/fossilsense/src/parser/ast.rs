@@ -235,8 +235,11 @@ fn collect_function_local_bindings(
     source: &str,
     out: &mut Vec<LocalBinding>,
 ) {
-    let function_start_byte = function.start_byte();
-    let function_end_byte = function.end_byte();
+    let Some(body) = function.child_by_field_name("body") else {
+        return;
+    };
+    let function_start_byte = body.start_byte();
+    let function_end_byte = body.end_byte();
 
     if let Some(declarator) = function.child_by_field_name("declarator") {
         collect_parameter_bindings(
@@ -248,9 +251,7 @@ fn collect_function_local_bindings(
         );
     }
 
-    if let Some(body) = function.child_by_field_name("body") {
-        collect_local_variable_bindings(body, source, function_start_byte, function_end_byte, out);
-    }
+    collect_local_variable_bindings(body, source, function_start_byte, function_end_byte, out);
 }
 
 fn collect_parameter_bindings(
