@@ -340,7 +340,8 @@ fn lsp_smoke_completion_definition_and_references() -> Result<()> {
     assert!(
         hover_value.contains("void helper(void);")
             && hover_value.contains("Helps the smoke test.")
-            && hover_value.contains("tier: `reachable`"),
+            && hover_value.contains("// In defs.h")
+            && hover_value.contains("tier: reachable"),
         "hover should include signature, comment, and ranking evidence, got {hover}"
     );
 

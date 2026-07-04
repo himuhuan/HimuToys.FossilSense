@@ -35,10 +35,10 @@ fn open_readonly_on_missing_file_returns_error_not_panic() {
     assert!(result.is_err(), "missing file must return Err, not panic");
 }
 
-// --- Phase 5: schema v7, SQL include invalidation, batch ops -----------
+// --- Phase 5: SQL include invalidation, batch ops ----------------------
 
 #[test]
-fn schema_v7_includes_have_normalized_metadata() {
+fn current_schema_includes_have_normalized_metadata() {
     let dir = tempdir().expect("tempdir");
     let db = dir.path().join("index.sqlite");
 
@@ -49,7 +49,7 @@ fn schema_v7_includes_have_normalized_metadata() {
         "#include \"util.h\"\n#include <sys/types.h>\n#define MACRO_INC(x) <x>\n",
     );
 
-    // Verify the schema version is 7.
+    // Verify the schema version is current.
     let version: String = store
         .conn
         .query_row(
@@ -58,7 +58,11 @@ fn schema_v7_includes_have_normalized_metadata() {
             |row| row.get(0),
         )
         .expect("version");
-    assert_eq!(version, "7", "schema version must be 7");
+    assert_eq!(
+        version,
+        crate::store::schema::SCHEMA_VERSION.to_string(),
+        "schema version must be current"
+    );
 
     // Verify includes columns exist and are populated.
     let mut stmt = store
@@ -100,16 +104,16 @@ fn schema_v7_includes_have_normalized_metadata() {
 }
 
 #[test]
-fn schema_v7_migrate_by_drop_clears_old_data() {
+fn current_schema_migrate_by_drop_clears_old_data() {
     // Simulate an older schema by opening v6, inserting data, then opening
-    // with v7 — the old tables should be dropped and recreated.
+    // with the current schema — the old tables should be dropped and recreated.
     let dir = tempdir().expect("tempdir");
     let db = dir.path().join("index.sqlite");
 
     // First, create a v6 store and insert data.
     {
         // Write a v6 schema version into the db by manually setting the meta.
-        // We use IndexStore::open which will migrate to v7, so instead
+        // We use IndexStore::open which will migrate to current, so instead
         // we open a raw connection to seed v6 state.
         let conn = rusqlite::Connection::open(&db).expect("conn");
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
@@ -145,10 +149,10 @@ fn schema_v7_migrate_by_drop_clears_old_data() {
         .unwrap();
     }
 
-    // Open with v7: migrate-by-drop clears old tables.
+    // Open with current schema: migrate-by-drop clears old tables.
     let store = IndexStore::open(&db, dir.path()).expect("store");
 
-    // Old data is gone; new schema has the three extra columns.
+    // Old data is gone; current schema has the three extra columns.
     let count: i64 = store
         .conn
         .query_row("SELECT COUNT(*) FROM includes", [], |row| row.get(0))
@@ -171,7 +175,7 @@ fn schema_v7_migrate_by_drop_clears_old_data() {
              VALUES (1, 1, '\"test.h\"', 'quote', 'test.h', 'test.h')",
             [],
         )
-        .expect("insert into v7");
+        .expect("insert into current schema");
 
     let (form, norm, bn): (String, String, String) = store
         .conn
@@ -180,7 +184,7 @@ fn schema_v7_migrate_by_drop_clears_old_data() {
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
-        .expect("read v7 cols");
+        .expect("read current columns");
     assert_eq!(form, "quote");
     assert_eq!(norm, "test.h");
     assert_eq!(bn, "test.h");

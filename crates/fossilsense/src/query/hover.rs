@@ -7,6 +7,7 @@ use super::definitions::rank_definition_records_with_scope;
 pub const HOVER_CANDIDATE_LIMIT: usize = 4;
 const COMMENT_LINE_LIMIT: usize = 48;
 const COMMENT_CHAR_LIMIT: usize = 2_000;
+const ORDINARY_COMMENT_LINE_LIMIT: usize = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RankedHoverCandidate {
@@ -35,23 +36,30 @@ pub fn rank_hover_candidates(
 pub fn leading_comment_markdown(source: &str, symbol_start_line: u32) -> Option<String> {
     let lines: Vec<&str> = source.lines().collect();
     let cursor = (symbol_start_line as usize).min(lines.len());
-    if cursor == 0 {
-        return None;
-    }
 
-    let previous = lines[cursor - 1].trim_start();
-    let raw_lines = if is_line_comment(previous) {
-        collect_line_comment_group(&lines, cursor - 1)
-    } else if is_block_comment_boundary(previous) {
-        collect_block_comment_group(&lines, cursor - 1)
-    } else {
+    let inline_block = collect_inline_block_comment_on_symbol_line(&lines, cursor);
+    let raw_lines = if !inline_block.is_empty() {
+        inline_block
+    } else if cursor == 0 {
         Vec::new()
+    } else {
+        let previous = lines[cursor - 1].trim_start();
+        if is_line_comment(previous) {
+            collect_line_comment_group(&lines, cursor - 1)
+        } else if is_block_comment_boundary(previous) {
+            collect_block_comment_group(&lines, cursor - 1)
+        } else {
+            Vec::new()
+        }
     };
     if raw_lines.is_empty() {
         return None;
     }
 
     let cleaned = clean_comment_lines(&raw_lines);
+    if !should_attach_comment_block(&raw_lines, &cleaned) {
+        return None;
+    }
     render_comment_markdown(&cleaned)
 }
 
@@ -60,35 +68,143 @@ pub fn hover_markdown_for_candidate(
     comment_markdown: Option<&str>,
 ) -> String {
     let mut out = String::new();
-    if !ranked.signature.trim().is_empty() {
-        out.push_str("```c\n");
-        out.push_str(&sanitize_markdown(&ranked.signature));
-        out.push_str("\n```\n\n");
-    } else {
-        out.push_str("```c\n");
-        out.push_str(&ranked.candidate.name);
-        out.push_str("\n```\n\n");
-    }
+    let signature_comment = leading_signature_comment_markdown(&ranked.signature);
+    let comment_markdown = comment_markdown.or(signature_comment.as_deref());
 
     if let Some(comment) = comment_markdown.filter(|s| !s.trim().is_empty()) {
         out.push_str(comment.trim());
         out.push_str("\n\n");
     }
 
+    out.push_str("```c\n");
+    let guard = ranked
+        .guard
+        .as_deref()
+        .filter(|guard| !guard.trim().is_empty())
+        .filter(|guard| should_render_guard_wrapper(guard));
+    if let Some(guard) = guard {
+        out.push_str(&sanitize_markdown(guard.trim()));
+        out.push('\n');
+    }
+    out.push_str(&format!("// In {}\n", ranked.candidate.path));
+    out.push_str(&sanitize_markdown(&display_signature(
+        &ranked.signature,
+        &ranked.candidate.name,
+    )));
+    out.push('\n');
+    if let Some(guard) = guard {
+        out.push_str("#endif // ^^ ");
+        out.push_str(&sanitize_markdown(&guard_closing_label(guard)));
+        out.push_str(" ^^\n");
+    }
+    out.push_str("```\n\n");
+
     out.push_str(&format!(
-        "**FossilSense candidate:** {} {} in `{}`  \n",
-        ranked.candidate.kind, ranked.candidate.role, ranked.candidate.path
-    ));
-    out.push_str(&format!(
-        "tier: `{}` | confidence: `{}` | reason: `{}`",
+        "<small><span style=\"color: var(--vscode-descriptionForeground);\"><em>tier: {} | confidence: {} | reason: {}</em></span></small>",
         ranked.candidate.tier.as_str(),
         ranked.candidate.confidence.as_str(),
         ranked.candidate.reason.as_str()
     ));
-    if let Some(guard) = &ranked.guard {
-        out.push_str(&format!("  \nguard: `{}`", sanitize_markdown(guard)));
-    }
     out
+}
+
+fn display_signature(signature: &str, fallback_name: &str) -> String {
+    let stripped = strip_leading_signature_comments(signature).trim();
+    if stripped.is_empty() {
+        fallback_name.to_string()
+    } else {
+        stripped.to_string()
+    }
+}
+
+fn strip_leading_signature_comments(signature: &str) -> &str {
+    let mut rest = signature.trim_start();
+    loop {
+        if rest.starts_with("/*") {
+            let Some(end) = rest.find("*/") else {
+                return "";
+            };
+            rest = rest[end + 2..].trim_start();
+            continue;
+        }
+        if rest.starts_with("//") {
+            let Some(end) = rest.find('\n') else {
+                return "";
+            };
+            rest = rest[end + 1..].trim_start();
+            continue;
+        }
+        return rest;
+    }
+}
+
+fn leading_signature_comment_markdown(signature: &str) -> Option<String> {
+    let comment = leading_signature_comment(signature)?;
+    let raw_lines: Vec<String> = comment.lines().map(|line| line.to_string()).collect();
+    let cleaned = clean_comment_lines(&raw_lines);
+    if !should_attach_comment_block(&raw_lines, &cleaned) {
+        return None;
+    }
+    render_comment_markdown(&cleaned)
+}
+
+fn leading_signature_comment(signature: &str) -> Option<String> {
+    let trimmed = signature.trim_start();
+    if trimmed.starts_with("/*") {
+        let end = trimmed.find("*/")? + 2;
+        return Some(trimmed[..end].to_string());
+    }
+    if trimmed.starts_with("//") {
+        let lines: Vec<&str> = trimmed
+            .lines()
+            .take_while(|line| is_line_comment(line.trim_start()))
+            .collect();
+        if !lines.is_empty() {
+            return Some(lines.join("\n"));
+        }
+    }
+    None
+}
+
+fn should_render_guard_wrapper(guard: &str) -> bool {
+    !is_header_guard_label(&guard_closing_label(guard))
+}
+
+fn is_header_guard_label(label: &str) -> bool {
+    let label = label.trim();
+    label.ends_with("_H")
+}
+
+fn guard_closing_label(guard: &str) -> String {
+    let trimmed = guard.trim();
+    for prefix in ["#ifndef", "#ifdef", "#define"] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            if let Some(token) = rest.split_whitespace().next() {
+                return clean_guard_token(token);
+            }
+        }
+    }
+    if let Some(token) = defined_guard_token(trimmed) {
+        return token;
+    }
+    trimmed.to_string()
+}
+
+fn defined_guard_token(value: &str) -> Option<String> {
+    let index = value.find("defined")?;
+    let after = value[index + "defined".len()..].trim_start();
+    if let Some(rest) = after.strip_prefix('(') {
+        let end = rest.find(')')?;
+        return Some(clean_guard_token(&rest[..end]));
+    }
+    after.split_whitespace().next().map(clean_guard_token)
+}
+
+fn clean_guard_token(token: &str) -> String {
+    token
+        .trim()
+        .trim_matches(|c: char| c == '(' || c == ')' || c == '!')
+        .to_string()
 }
 
 fn collect_line_comment_group(lines: &[&str], start: usize) -> Vec<String> {
@@ -129,6 +245,38 @@ fn collect_block_comment_group(lines: &[&str], end: usize) -> Vec<String> {
         .collect()
 }
 
+fn collect_inline_block_comment_on_symbol_line(lines: &[&str], symbol_line: usize) -> Vec<String> {
+    let Some(line) = lines.get(symbol_line) else {
+        return Vec::new();
+    };
+    let trimmed = line.trim_start();
+    if !is_block_comment_boundary(trimmed) || !trimmed.contains("*/") {
+        return Vec::new();
+    }
+
+    let mut first = symbol_line;
+    while first > 0 && !lines[first].trim_start().starts_with("/*") {
+        if !is_block_comment_scan_line(lines[first]) {
+            return Vec::new();
+        }
+        first -= 1;
+    }
+    if !lines[first].trim_start().starts_with("/*") {
+        return Vec::new();
+    }
+
+    let mut out: Vec<String> = lines[first..=symbol_line]
+        .iter()
+        .map(|line| (*line).to_string())
+        .collect();
+    if let Some(last) = out.last_mut() {
+        if let Some(close) = last.find("*/") {
+            last.truncate(close + 2);
+        }
+    }
+    out
+}
+
 fn clean_comment_lines(raw_lines: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     for raw in raw_lines.iter().take(COMMENT_LINE_LIMIT) {
@@ -141,7 +289,7 @@ fn clean_comment_lines(raw_lines: &[String]) -> Vec<String> {
             line = strip_block_markers(&line);
         }
         let line = line.trim().to_string();
-        out.push(sanitize_markdown(&line));
+        out.push(line);
     }
     trim_empty_edges(out)
 }
@@ -162,114 +310,12 @@ fn strip_block_markers(line: &str) -> String {
 }
 
 fn render_comment_markdown(lines: &[String]) -> Option<String> {
-    let mut prose = Vec::new();
-    let mut params = Vec::new();
-    let mut returns = Vec::new();
-    let mut retvals = Vec::new();
-    let mut notes = Vec::new();
-    let mut warnings = Vec::new();
-
-    for line in lines {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Some(rest) = command_rest(trimmed, "brief") {
-            push_limited(&mut prose, rest);
-        } else if let Some(rest) = command_rest(trimmed, "param") {
-            let (name, body) = split_name_body(rest);
-            params.push(format!("- `{}`{}", name, body_suffix(body)));
-        } else if let Some(rest) =
-            command_rest(trimmed, "return").or_else(|| command_rest(trimmed, "returns"))
-        {
-            push_limited(&mut returns, rest);
-        } else if let Some(rest) = command_rest(trimmed, "retval") {
-            let (name, body) = split_name_body(rest);
-            retvals.push(format!("- `{}`{}", name, body_suffix(body)));
-        } else if let Some(rest) = command_rest(trimmed, "note") {
-            push_limited(&mut notes, rest);
-        } else if let Some(rest) = command_rest(trimmed, "warning") {
-            push_limited(&mut warnings, rest);
-        } else if let Some(stripped) = strip_unknown_command(trimmed) {
-            push_limited(&mut prose, stripped);
-        } else {
-            push_limited(&mut prose, trimmed);
-        }
-    }
-
-    let mut sections = Vec::new();
-    if !prose.is_empty() {
-        sections.push(prose.join("\n"));
-    }
-    if !params.is_empty() {
-        sections.push(format!("**Parameters**\n{}", params.join("\n")));
-    }
-    if !returns.is_empty() {
-        sections.push(format!("**Returns:** {}", returns.join(" ")));
-    }
-    if !retvals.is_empty() {
-        sections.push(format!("**Return values**\n{}", retvals.join("\n")));
-    }
-    for note in notes {
-        sections.push(format!("> **Note:** {}", note));
-    }
-    for warning in warnings {
-        sections.push(format!("> **Warning:** {}", warning));
-    }
-
-    let rendered = sections.join("\n\n");
+    let rendered = lines
+        .iter()
+        .map(|line| highlight_doc_tags(&sanitize_markdown(line)))
+        .collect::<Vec<_>>()
+        .join("\n");
     (!rendered.trim().is_empty()).then(|| rendered.chars().take(COMMENT_CHAR_LIMIT).collect())
-}
-
-fn command_rest<'a>(line: &'a str, command: &str) -> Option<&'a str> {
-    for prefix in ['@', '\\'] {
-        let marker = format!("{prefix}{command}");
-        if let Some(rest) = line.strip_prefix(&marker) {
-            if rest.is_empty() || rest.starts_with(char::is_whitespace) {
-                return Some(rest.trim());
-            }
-            if command == "param" && rest.starts_with('[') {
-                if let Some(close) = rest.find(']') {
-                    let after = &rest[close + 1..];
-                    if after.is_empty() || after.starts_with(char::is_whitespace) {
-                        return Some(after.trim());
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-fn strip_unknown_command(line: &str) -> Option<&str> {
-    let first = line.as_bytes().first().copied()?;
-    if first != b'@' && first != b'\\' {
-        return None;
-    }
-    Some(line[1..].trim())
-}
-
-fn split_name_body(rest: &str) -> (&str, &str) {
-    let trimmed = rest.trim();
-    match trimmed.split_once(char::is_whitespace) {
-        Some((name, body)) => (name, body.trim()),
-        None => (trimmed, ""),
-    }
-}
-
-fn body_suffix(body: &str) -> String {
-    if body.is_empty() {
-        String::new()
-    } else {
-        format!(" - {body}")
-    }
-}
-
-fn push_limited(out: &mut Vec<String>, value: &str) {
-    let value = value.trim();
-    if !value.is_empty() {
-        out.push(value.to_string());
-    }
 }
 
 fn trim_empty_edges(mut lines: Vec<String>) -> Vec<String> {
@@ -284,6 +330,140 @@ fn trim_empty_edges(mut lines: Vec<String>) -> Vec<String> {
 
 fn sanitize_markdown(value: &str) -> String {
     value.replace("```", "'''")
+}
+
+fn should_attach_comment_block(raw_lines: &[String], cleaned: &[String]) -> bool {
+    if cleaned.is_empty() || is_file_header_comment(cleaned) {
+        return false;
+    }
+
+    if is_doc_comment_block(raw_lines) {
+        return true;
+    }
+
+    cleaned
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .count()
+        <= ORDINARY_COMMENT_LINE_LIMIT
+}
+
+fn is_doc_comment_block(raw_lines: &[String]) -> bool {
+    raw_lines
+        .iter()
+        .find(|line| !line.trim().is_empty())
+        .is_some_and(|line| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with("///")
+                || trimmed.starts_with("//!")
+                || trimmed.starts_with("/**")
+                || trimmed.starts_with("/*!")
+        })
+}
+
+fn is_file_header_comment(lines: &[String]) -> bool {
+    lines.iter().any(|line| {
+        let lower = line.trim().to_ascii_lowercase();
+        lower.starts_with("@file")
+            || lower.starts_with("\\file")
+            || lower.contains("spdx-license-identifier")
+            || lower.contains("copyright")
+            || lower.starts_with("license:")
+            || lower.starts_with("project:")
+            || lower.starts_with("module:")
+            || lower.starts_with("author:")
+    })
+}
+
+fn highlight_doc_tags(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some((start, end)) = next_doc_tag(rest) {
+        out.push_str(&rest[..start]);
+        out.push('`');
+        out.push_str(&rest[start..end].replace('`', "'"));
+        out.push('`');
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn next_doc_tag(value: &str) -> Option<(usize, usize)> {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'@' | b'\\' if is_doxygen_tag_start(value, index) => {
+                return Some((index, doxygen_tag_end(value, index + 1)));
+            }
+            b'<' => {
+                if let Some(end) = xml_tag_end(value, index) {
+                    return Some((index, end));
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+fn is_doxygen_tag_start(value: &str, index: usize) -> bool {
+    let Some(next) = value.as_bytes().get(index + 1).copied() else {
+        return false;
+    };
+    if !is_ident_start(next) {
+        return false;
+    }
+    if index == 0 {
+        return true;
+    }
+    let previous = value.as_bytes()[index - 1];
+    !is_ident_continue(previous) && previous != b'.'
+}
+
+fn doxygen_tag_end(value: &str, mut index: usize) -> usize {
+    let bytes = value.as_bytes();
+    while index < bytes.len() && is_ident_continue(bytes[index]) {
+        index += 1;
+    }
+    if bytes.get(index) == Some(&b'[') {
+        let mut close = index + 1;
+        while close < bytes.len() && bytes[close] != b']' && !bytes[close].is_ascii_whitespace() {
+            close += 1;
+        }
+        if bytes.get(close) == Some(&b']') {
+            index = close + 1;
+        }
+    }
+    index
+}
+
+fn xml_tag_end(value: &str, index: usize) -> Option<usize> {
+    let bytes = value.as_bytes();
+    let mut cursor = index + 1;
+    if bytes.get(cursor) == Some(&b'/') {
+        cursor += 1;
+    }
+    if !bytes.get(cursor).copied().is_some_and(is_ident_start) {
+        return None;
+    }
+    while cursor < bytes.len() && bytes[cursor] != b'>' {
+        if bytes[cursor] == b'<' {
+            return None;
+        }
+        cursor += 1;
+    }
+    (cursor < bytes.len()).then_some(cursor + 1)
+}
+
+fn is_ident_start(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte == b'_'
+}
+
+fn is_ident_continue(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
 fn is_line_comment(line: &str) -> bool {
@@ -388,13 +568,13 @@ mod tests {
     }
 
     #[test]
-    fn doxygen_comment_renders_markdown_sections() {
+    fn doxygen_comment_preserves_lines_and_highlights_tags() {
         let source = "/**\n * @brief Adds two values.\n * @param lhs left side\n * @param rhs right side\n * @return the sum\n */\nint add(int lhs, int rhs);\n";
         let markdown = leading_comment_markdown(source, 6).expect("comment");
-        assert!(markdown.contains("Adds two values."));
-        assert!(markdown.contains("**Parameters**"));
-        assert!(markdown.contains("- `lhs` - left side"));
-        assert!(markdown.contains("**Returns:** the sum"));
+        assert_eq!(
+            markdown,
+            "`@brief` Adds two values.\n`@param` lhs left side\n`@param` rhs right side\n`@return` the sum"
+        );
         assert!(!markdown.contains("*/"));
     }
 
@@ -409,9 +589,21 @@ mod tests {
     fn messy_comment_degrades_to_readable_text() {
         let source = "/* ***\n * @weird custom tag is kept readable\n * warning without marker\n */\nint odd(void);\n";
         let markdown = leading_comment_markdown(source, 4).expect("comment");
-        assert!(markdown.contains("weird custom tag is kept readable"));
+        assert!(markdown.contains("`@weird` custom tag is kept readable"));
         assert!(markdown.contains("warning without marker"));
         assert!(!markdown.contains("/*"));
+    }
+
+    #[test]
+    fn file_header_comment_does_not_attach_to_first_symbol() {
+        let source = "/*\n * Copyright 2026 Example Corp.\n * Project: boot firmware\n * License: internal use only\n */\nint first_symbol(void);\n";
+        assert!(leading_comment_markdown(source, 5).is_none());
+    }
+
+    #[test]
+    fn doxygen_file_comment_does_not_attach_to_first_symbol() {
+        let source = "/**\n * @file driver.h\n * @brief Shared driver declarations.\n */\nint first_symbol(void);\n";
+        assert!(leading_comment_markdown(source, 4).is_none());
     }
 
     #[test]
@@ -435,13 +627,37 @@ mod tests {
     }
 
     #[test]
+    fn inline_leading_block_comment_on_symbol_line_still_attaches() {
+        let source = "/** Test to see if a format is supported. */ bool test_fmt(void);\n";
+        let markdown = leading_comment_markdown(source, 0).expect("comment");
+        assert_eq!(markdown, "Test to see if a format is supported.");
+    }
+
+    #[test]
+    fn closing_block_comment_on_symbol_line_still_attaches() {
+        let source = "/**\n * Test to see if a format is supported.\n */ bool test_fmt(void);\n";
+        let markdown = leading_comment_markdown(source, 2).expect("comment");
+        assert_eq!(markdown, "Test to see if a format is supported.");
+    }
+
+    #[test]
     fn doxygen_param_direction_renders_as_parameter() {
         let source = "/**\n * @brief Copies bytes.\n * @param[in] src source bytes\n * @param[out] dst destination bytes\n */\nvoid copy(void *dst, const void *src);\n";
         let markdown = leading_comment_markdown(source, 5).expect("comment");
-        assert!(markdown.contains("**Parameters**"));
-        assert!(markdown.contains("- `src` - source bytes"));
-        assert!(markdown.contains("- `dst` - destination bytes"));
-        assert!(!markdown.contains("param[in]"));
+        assert!(markdown.contains("`@brief` Copies bytes."));
+        assert!(markdown.contains("`@param[in]` src source bytes"));
+        assert!(markdown.contains("`@param[out]` dst destination bytes"));
+        assert!(!markdown.contains("**Parameters**"));
+    }
+
+    #[test]
+    fn multiline_comment_keeps_line_breaks_and_highlights_common_tags() {
+        let source = "/**\n * @brief First line.\n *\n * Second line with <summary>tag</summary> and \\return marker.\n */\nint current;\n";
+        let markdown = leading_comment_markdown(source, 5).expect("comment");
+        assert_eq!(
+            markdown,
+            "`@brief` First line.\n\nSecond line with `<summary>`tag`</summary>` and `\\return` marker."
+        );
     }
 
     #[test]
@@ -467,10 +683,97 @@ mod tests {
         )
         .remove(0);
         let markdown = hover_markdown_for_candidate(&ranked, Some("Does work."));
-        assert!(markdown.contains("```c\nint foo(int x)\n```"));
+        assert!(markdown.contains("```c\n// In src/foo.c\nint foo(int x)\n```"));
         assert!(markdown.contains("Does work."));
-        assert!(markdown.contains("tier: `global`"));
+        assert!(markdown.contains("tier: global"));
         assert!(!markdown.contains(":43"));
         assert!(!markdown.contains("start_line"));
+    }
+
+    #[test]
+    fn hover_markdown_renders_quiet_source_header_and_metadata() {
+        let ranked = rank_hover_candidates(
+            vec![symbol_record(
+                "ff_sws_lut3d_test_fmt",
+                "function",
+                "definition",
+                "libswscale/lut3d.c",
+                12,
+                "bool ff_sws_lut3d_test_fmt(enum AVPixelFormat fmt, int output)",
+            )],
+            "libswscale/lut3d.c",
+            None,
+            1,
+        )
+        .remove(0);
+
+        let markdown = hover_markdown_for_candidate(&ranked, None);
+
+        assert!(markdown.contains(
+            "```c\n// In libswscale/lut3d.c\nbool ff_sws_lut3d_test_fmt(enum AVPixelFormat fmt, int output)\n```"
+        ));
+        assert!(markdown.contains(
+            "<small><span style=\"color: var(--vscode-descriptionForeground);\"><em>tier: current | confidence: exact | reason: current_file</em></span></small>"
+        ));
+        assert!(!markdown.contains("FossilSense candidate"));
+        assert!(!markdown.contains("function definition in"));
+    }
+
+    #[test]
+    fn hover_markdown_splits_signature_comment_and_omits_header_guard_wrapper() {
+        let mut ranked = rank_hover_candidates(
+            vec![symbol_record(
+                "ff_sws_lut3d_test_fmt",
+                "function",
+                "declaration",
+                "libswscale/lut3d.h",
+                5,
+                "/** * Test to see if a given format is supported by the 3DLUT input/output code. */ bool ff_sws_lut3d_test_fmt(enum AVPixelFormat fmt, int output);",
+            )],
+            "libswscale/lut3d.c",
+            None,
+            1,
+        )
+        .remove(0);
+        ranked.guard = Some("#ifndef SWSCALE_LUT3D_H".to_string());
+
+        let markdown = hover_markdown_for_candidate(&ranked, None);
+
+        assert!(markdown.starts_with(
+            "Test to see if a given format is supported by the 3DLUT input/output code.\n\n"
+        ));
+        assert!(markdown.contains(
+            "```c\n// In libswscale/lut3d.h\nbool ff_sws_lut3d_test_fmt(enum AVPixelFormat fmt, int output);\n```"
+        ));
+        assert!(!markdown.contains("#ifndef SWSCALE_LUT3D_H"));
+        assert!(!markdown.contains("#endif // ^^ SWSCALE_LUT3D_H ^^"));
+        assert!(!markdown.contains("/**"));
+        assert!(!markdown.contains("*/ bool"));
+        assert!(!markdown.contains("guard:"));
+    }
+
+    #[test]
+    fn hover_markdown_keeps_non_header_guard_wrapper() {
+        let mut ranked = rank_hover_candidates(
+            vec![symbol_record(
+                "platform_init",
+                "function",
+                "declaration",
+                "include/platform.h",
+                8,
+                "void platform_init(void);",
+            )],
+            "src/main.c",
+            None,
+            1,
+        )
+        .remove(0);
+        ranked.guard = Some("#ifdef CONFIG_PLATFORM_INIT".to_string());
+
+        let markdown = hover_markdown_for_candidate(&ranked, None);
+
+        assert!(markdown.contains(
+            "```c\n#ifdef CONFIG_PLATFORM_INIT\n// In include/platform.h\nvoid platform_init(void);\n#endif // ^^ CONFIG_PLATFORM_INIT ^^\n```"
+        ));
     }
 }

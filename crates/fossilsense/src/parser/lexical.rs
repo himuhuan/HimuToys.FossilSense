@@ -16,8 +16,10 @@ pub(super) fn extract_symbols_and_includes(
     let mut guard_stack = Vec::new();
     let mut brace_depth = 0isize;
     let mut statement = PendingStatement::default();
+    let mut in_leading_block_comment = false;
 
     for (line_index, line) in source.lines().enumerate() {
+        let line = strip_leading_comments(line, &mut in_leading_block_comment);
         let trimmed = line.trim();
         let top_level = brace_depth == 0;
 
@@ -26,7 +28,7 @@ pub(super) fn extract_symbols_and_includes(
         }
 
         if let Some(symbol) = capture_macro(
-            line,
+            &line,
             line_index,
             line_starts,
             source,
@@ -36,7 +38,7 @@ pub(super) fn extract_symbols_and_includes(
         }
 
         if top_level && !trimmed.starts_with('#') && !trimmed.is_empty() {
-            statement.push(line, line_index);
+            statement.push(&line, line_index);
             if statement.is_complete() {
                 symbols.extend(capture_statement_symbols(
                     &statement,
@@ -51,13 +53,40 @@ pub(super) fn extract_symbols_and_includes(
         }
 
         update_guard_stack(trimmed, &mut guard_stack);
-        brace_depth += brace_delta(line);
+        brace_depth += brace_delta(&line);
         if brace_depth < 0 {
             brace_depth = 0;
         }
     }
 
     (symbols, includes)
+}
+
+fn strip_leading_comments(line: &str, in_block_comment: &mut bool) -> String {
+    let mut rest = line;
+    loop {
+        let trimmed = rest.trim_start();
+        if *in_block_comment {
+            if let Some(end) = trimmed.find("*/") {
+                *in_block_comment = false;
+                rest = &trimmed[end + 2..];
+                continue;
+            }
+            return String::new();
+        }
+        if trimmed.starts_with("//") {
+            return String::new();
+        }
+        if trimmed.starts_with("/*") {
+            if let Some(end) = trimmed.find("*/") {
+                rest = &trimmed[end + 2..];
+                continue;
+            }
+            *in_block_comment = true;
+            return String::new();
+        }
+        return rest.to_string();
+    }
 }
 
 fn capture_include(trimmed: &str, line: usize) -> Option<Include> {

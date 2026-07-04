@@ -426,6 +426,20 @@ int main(void) {
 }
 
 #[test]
+fn leading_comments_do_not_pollute_symbol_signature_or_start_line() {
+    let source = "#define VALUE 1\n/// @brief Helps the smoke test.\nvoid helper(void);\n";
+    let index = parse(Path::new("defs.h"), source);
+    let symbol = index
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "helper")
+        .expect("helper symbol");
+
+    assert_eq!(symbol.start_line, 2);
+    assert_eq!(symbol.signature, "void helper(void);");
+}
+
+#[test]
 fn coloring_collects_macro_definition_and_usages() {
     let source = r#"#define FOO 1
 int main(void) {
