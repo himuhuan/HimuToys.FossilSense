@@ -16,7 +16,14 @@ extension's `bin/` folder.
   standard panel shows locations only; for visible per-hit role labels run the
   **FossilSense: Find References (Grouped by Role)** command, which lists the same
   hits grouped and labeled by role (definition / declaration / call / write / type
-  / read). Roles are syntactic guesses, not resolved bindings.
+  / read). The grouped QuickPick hides `:line` suffixes by default; enable
+  `fossilsense.references.showRanges` to show them. Roles are syntactic guesses,
+  not resolved bindings.
+- Rich Hover: hovering an indexed identifier shows a Markdown candidate view with
+  the stored signature, candidate tier/confidence/reason, and immediately leading
+  Doxygen or ordinary comments when they can be recovered. This is a ranked
+  exact-name candidate display, not type-aware semantic binding; unsupported or
+  unreadable comment sources degrade to signature-only hover.
 - Lightweight Completion: index-based and current-file word completion for C/C++.
   The list is always marked `isIncomplete` so the editor re-queries with the full
   current prefix on every keystroke — longer-named symbols that fell outside the
@@ -78,8 +85,9 @@ occurrences inside comments or string literals. Each hit is then classified with
 best-effort syntactic role (definition / declaration / call / write / type / read;
 unparseable hits fall back to read) and the results are ordered by role. The standard
 References panel renders locations only — it carries no per-item role label — so use the
-**FossilSense: Find References (Grouped by Role)** command to see the roles. Results are
-capped at 2000 matches; if capped, a message is logged to the output panel.
+**FossilSense: Find References (Grouped by Role)** command to see the roles. The grouped
+QuickPick keeps labels quiet by default and still navigates to the full returned range.
+Results are capped at 2000 matches; if capped, a message is logged to the output panel.
 
 ## Configuration (`fossilsense.json`)
 
@@ -122,6 +130,9 @@ because FossilSense returns ranked text/index candidates.
   types, and enum constants: `"auto"` (default, enabled), `"on"` (enabled), `"off"`
   (never enabled). C/C++ language-server conflicts are reported by `fossilsense.mode`,
   not handled by silently disabling coloring.
+- `fossilsense.references.showRanges` - when `true`, the grouped references QuickPick
+  shows `:line` suffixes in row labels. Default `false` keeps labels focused on
+  relative paths; selecting a row still navigates to the exact returned range.
 - `fossilsense.debug.candidateReasons` - when `true`, **Go to Definition** logs each
   candidate's scope tier, confidence, and reason to the FossilSense output panel so you
   can see why candidates ranked as they did. A best-effort debug aid that never changes

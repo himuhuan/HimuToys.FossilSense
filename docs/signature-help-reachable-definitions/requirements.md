@@ -1,6 +1,6 @@
 # Signature Help Reachable Definitions Requirements
 
-Status: current
+Status: implemented
 Date: 2026-07-02
 Feature brief name: signature-help-reachable-definitions
 

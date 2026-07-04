@@ -11,11 +11,16 @@ use crate::reachability::ReachScope;
 use crate::resolver::{self, ResolveContext};
 
 mod definitions;
+mod hover;
 mod lsp_kinds;
 mod signatures;
 mod text;
 
 pub use definitions::rank_definitions_into_candidates_with_scope;
+pub use hover::{
+    hover_markdown_for_candidate, leading_comment_markdown, rank_hover_candidates,
+    RankedHoverCandidate, HOVER_CANDIDATE_LIMIT,
+};
 pub use lsp_kinds::{lsp_completion_kind_from_parser, lsp_kind_from_parser, lsp_symbol_kind};
 pub use signatures::{
     call_context_at, rank_function_signature_candidates, signature_parts, signature_parts_for_name,

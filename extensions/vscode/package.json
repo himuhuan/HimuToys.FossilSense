@@ -1,8 +1,8 @@
 {
   "name": "fossilsense-vscode",
   "displayName": "FossilSense",
-  "description": "FossilSense C/C++ best-effort navigation: symbols, outlines, ranked definitions, signature help, role-grouped references, and lightweight completion.",
-  "version": "1.0.2",
+  "description": "FossilSense C/C++ best-effort navigation: symbols, outlines, rich hover, ranked definitions, signature help, role-grouped references, and lightweight completion.",
+  "version": "1.1.0",
   "private": true,
   "license": "UNLICENSED",
   "publisher": "himutoys",
@@ -87,6 +87,11 @@
           "default": "auto",
           "markdownDescription": "Limited `#include` reachability scoping. When 'auto' (default), coloring and completion are narrowed to symbols reachable from the current file's resolved include graph: coloring hard-gates to reachable definitions (uncertain files fall back to whole-index behavior), and completion ranks reachable candidates first without dropping any. 'off' reverts both to whole-index behavior. This trades a little recall for far less cross-file noise in large workspaces; it never errors."
         },
+        "fossilsense.references.showRanges": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Show `:line` suffixes in the **Find References (Grouped by Role)** QuickPick. Off by default to keep labels focused on relative paths; selection still navigates to the full returned range."
+        },
         "fossilsense.includePaths": {
           "type": "array",
           "items": {
@@ -115,7 +120,7 @@
   },
   "scripts": {
     "compile": "tsc -p ./",
-    "test": "pnpm run compile && node out/test/config.test.js && node out/test/status.test.js && node out/test/serverPath.test.js && node out/test/conflicts.test.js",
+    "test": "pnpm run compile && node out/test/config.test.js && node out/test/status.test.js && node out/test/serverPath.test.js && node out/test/conflicts.test.js && node out/test/referencesView.test.js",
     "watch": "tsc -watch -p ./",
     "package": "node scripts/package.mjs"
   },

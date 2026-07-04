@@ -4,17 +4,18 @@ FossilSense is a best-effort C/C++ navigation and analysis engine for large Wind
 
 ## Version facts
 
-- Rust engine crate: `crates/fossilsense/Cargo.toml` (`1.0.0` at this snapshot).
-- VS Code package / VSIX: `extensions/vscode/package.json` (`1.0.2` at this snapshot).
-- The VSIX version is the installable extension package version. It bundles the Rust engine binary built from this workspace; the two version numbers are intentionally tracked separately until the release process changes them together.
+- Rust engine crate: `crates/fossilsense/Cargo.toml` (`1.1.0` at this snapshot).
+- VS Code package / VSIX: `extensions/vscode/package.json` (`1.1.0` at this snapshot).
+- The VSIX version is the installable extension package version. It bundles the Rust engine binary built from this workspace; v1.1.0 aligns the Rust engine and VS Code package versions.
 
 Current baseline capabilities: workspace symbol search, document outline, ranked
 go-to-definition candidates, **role-grouped find-all-references** (text candidates
 grouped by best-effort syntactic role), **lightweight completion**
 (including degraded `.`/`->` member completion), **best-effort signature help /
-parameter hints** for indexed functions, **degraded semantic coloring**
-(macros, types, and enum constants), **limited `#include` analysis** (header-path
-completion, jump-to-header, and indexing of external reference headers), optional
+parameter hints** for indexed functions, **best-effort rich hover** with ranked
+candidate evidence and leading Doxygen / ordinary comment rendering, **degraded
+semantic coloring** (macros, types, and enum constants), **limited `#include`
+analysis** (header-path completion, jump-to-header, and indexing of external reference headers), optional
 workspace scope configuration via `fossilsense.json`, manual incremental refresh /
 full rebuild commands, debounced/coalesced reindex scheduling, CLI/LSP timing
 metrics, and self-contained VSIX packaging.
@@ -30,6 +31,9 @@ metrics, and self-contained VSIX packaging.
 - lightweight text/index-level completion with active C/C++ provider conflict reporting
 - degraded `.`/`->` member completion: a current-file receiver-type guess narrows
   to the record's fields, with a global field fallback (pure-C oriented)
+- best-effort Markdown hover: exact-name indexed candidates ranked by the same
+  resolver as Go to Definition, plus nearby leading Doxygen / ordinary comments
+  when they can be recovered cheaply
 - degraded semantic coloring of macros, types, and enum constants
 - limited `#include` analysis: header-path completion inside `#include "…"`/`<…>`,
   jump-to-header on an include line (candidate list when ambiguous), and indexing of
@@ -129,6 +133,29 @@ files. It is **not** a semantic language service. Specifically:
 - Local-variable scope is not tracked for ordinary completion; words from the current
   file are a flat bag of identifiers, filtered only for C/C++ keywords.
 
+## Hover
+
+FossilSense provides best-effort Markdown hover for indexed C/C++ identifiers.
+Hover is useful when a large workspace lacks a working compiler model, but it is
+still a candidate display, not a semantic binding:
+
+- The identifier under the cursor is looked up by exact name in the FossilSense
+  index, then ranked with the same include-reachability tiers used by Go to
+  Definition. The hover names the candidate kind/role, path, tier, confidence,
+  and reason so current, reachable, external, ambiguous, and global-fallback
+  results are visible.
+- The hover shows the stored signature in a C code block. When a leading
+  comment is immediately attached to the candidate, FossilSense renders common
+  Doxygen commands such as `@brief`, `@param`, `@return`, `@retval`, `@note`,
+  and `@warning` as readable Markdown. Ordinary contiguous `//` and `/* ... */`
+  comments are rendered as prose.
+- Messy or nonstandard comments degrade to plain readable text. If the candidate
+  file cannot be read, the signature and ranking evidence still appear.
+- It does not perform type-aware binding, overload resolution, template or
+  namespace lookup, macro expansion, expression-type hover, or field/member
+  hover. clangd or full IntelliSense remain the better source when a precise
+  compiler model is available.
+
 The `fossilsense.mode` setting controls the whole FossilSense server:
 
 | Value | Behavior |
@@ -192,7 +219,10 @@ search; each hit is then classified with a best-effort syntactic role
 read) and results are ordered by role (definitions and declarations first). The
 standard References panel renders **locations only** and carries no per-item role
 label; run **FossilSense: Find References (Grouped by Role)** to see the hits grouped
-and labeled by role. Results are capped at 2000 matches.
+and labeled by role. The grouped QuickPick hides `:line` suffixes by default to
+reduce label noise; set `fossilsense.references.showRanges` to `true` to show
+line suffixes while keeping the same exact navigation range. Results are capped
+at 2000 matches.
 
 For Go to Definition, enabling `fossilsense.debug.candidateReasons` logs each
 candidate's scope tier, confidence, and reason to the output panel — a debug aid that
@@ -205,12 +235,13 @@ compiler model. It can be installed alongside Microsoft C/C++, clangd, and CMake
 Tools, but only one C/C++ language provider should be primary in a workspace:
 
 - Keep clangd/IntelliSense enabled when they work; they remain the better source
-  for diagnostics, completion, hover, semantic references, and exact overload
-  resolution.
+  for diagnostics, type-aware completion, precise hover, semantic references, and
+  exact overload resolution.
 - Use FossilSense when `compile_commands.json` is missing, stale, or too costly
   for a large Windows workspace. Its providers are intentionally limited to
-  workspace symbols, document symbols, ranked definition candidates, and
-  role-grouped text-candidate references (not resolved semantic references).
+  workspace symbols, document symbols, ranked definition candidates, best-effort
+  hover/signature candidates, and role-grouped text-candidate references (not
+  resolved semantic references).
 - Duplicate or different results are expected. FossilSense does not claim
   semantic precision; it returns stable text/index candidates that are useful
   when full IntelliSense cannot build the project.
@@ -279,5 +310,5 @@ pnpm run package
 ```
 
 This builds the release engine, bundles it into the extension, and emits
-`dist/fossilsense-vscode-<version>.vsix` at the repo root. Install it via VS Code →
+`dist/fossilsense-vscode-<version>_BUILD<YYYYMMDD_HHMMSS>.vsix` at the repo root. Install it via VS Code →
 Extensions → `...` → *Install from VSIX*, or `code --install-extension dist/<name>.vsix`.

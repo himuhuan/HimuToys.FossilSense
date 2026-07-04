@@ -85,6 +85,7 @@ impl LanguageServer for Backend {
                 references_provider: Some(OneOf::Left(true)),
                 workspace_symbol_provider: Some(OneOf::Left(true)),
                 document_symbol_provider: Some(OneOf::Left(true)),
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
                 completion_provider,
                 signature_help_provider: Some(signature_help_options()),
                 semantic_tokens_provider,
@@ -741,6 +742,10 @@ impl LanguageServer for Backend {
         params: SignatureHelpParams,
     ) -> LspResult<Option<SignatureHelp>> {
         self.provide_signature_help(params).await
+    }
+
+    async fn hover(&self, params: HoverParams) -> LspResult<Option<Hover>> {
+        self.provide_hover(params).await
     }
 
     async fn semantic_tokens_full(

@@ -216,7 +216,10 @@ impl Drop for LspProcess {
 fn lsp_smoke_completion_definition_and_references() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let root = temp.path();
-    std::fs::write(root.join("defs.h"), "#define VALUE 1\nvoid helper(void);\n")?;
+    std::fs::write(
+        root.join("defs.h"),
+        "#define VALUE 1\n/// @brief Helps the smoke test.\nvoid helper(void);\n",
+    )?;
     let main_source =
         "#include \"defs.h\"\nint main(void) {\n    helper();\n    return VALUE;\n}\n";
     std::fs::write(root.join("main.c"), main_source)?;
@@ -256,6 +259,13 @@ fn lsp_smoke_completion_definition_and_references() -> Result<()> {
             .and_then(|info| info.get("name"))
             .and_then(Value::as_str),
         Some("FossilSense")
+    );
+    assert_eq!(
+        initialized
+            .get("capabilities")
+            .and_then(|capabilities| capabilities.get("hoverProvider"))
+            .and_then(Value::as_bool),
+        Some(true)
     );
 
     lsp.notify("initialized", json!({}))?;
@@ -312,6 +322,26 @@ fn lsp_smoke_completion_definition_and_references() -> Result<()> {
     assert!(
         contains_uri(&definition, "defs.h"),
         "definition should include defs.h, got {definition}"
+    );
+
+    let hover_id = lsp.request(
+        "textDocument/hover",
+        json!({
+            "textDocument": { "uri": main_uri },
+            "position": { "line": 2, "character": 7 }
+        }),
+    )?;
+    let hover = lsp.wait_response(hover_id, Duration::from_secs(10))?;
+    let hover_value = hover
+        .get("contents")
+        .and_then(|contents| contents.get("value"))
+        .and_then(Value::as_str)
+        .context("hover response missing markdown value")?;
+    assert!(
+        hover_value.contains("void helper(void);")
+            && hover_value.contains("Helps the smoke test.")
+            && hover_value.contains("tier: `reachable`"),
+        "hover should include signature, comment, and ranking evidence, got {hover}"
     );
 
     let references_id = lsp.request(

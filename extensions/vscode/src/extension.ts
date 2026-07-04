@@ -15,6 +15,7 @@ import {
   statusTooltip,
 } from './status';
 import { mutualExclusionMessage } from './conflicts';
+import { GroupedReferenceItem, groupedReferencePickRows } from './referencesView';
 
 const REFRESH_INDEX_COMMAND = 'fossilsense.refreshIndex';
 const REFRESH_INDEX_LSP_COMMAND = 'fossilsense.lsp.refreshIndex';
@@ -22,18 +23,6 @@ const REBUILD_INDEX_COMMAND = 'fossilsense.rebuildIndex';
 const REBUILD_INDEX_LSP_COMMAND = 'fossilsense.lsp.rebuildIndex';
 const GROUPED_REFERENCES_COMMAND = 'fossilsense.findReferencesGrouped';
 const GROUPED_REFERENCES_LSP_COMMAND = 'fossilsense.lsp.groupedReferences';
-
-// One role-labeled reference hit returned by the grouped-references command.
-interface GroupedReferenceItem {
-  location: {
-    uri: string;
-    range: {
-      start: { line: number; character: number };
-      end: { line: number; character: number };
-    };
-  };
-  role: string;
-}
 
 const CONFLICT_EXTENSIONS = [
   { id: 'llvm-vs-code-extensions.vscode-clangd', name: 'clangd' },
@@ -306,17 +295,16 @@ async function findReferencesGrouped(): Promise<void> {
 
   // Build a QuickPick with a separator per role group; items already arrive in
   // role-grouped order from the server, so a role change starts a new section.
-  const picks: (vscode.QuickPickItem & { item?: GroupedReferenceItem })[] = [];
-  let currentRole: string | undefined;
-  for (const item of items) {
-    if (item.role !== currentRole) {
-      currentRole = item.role;
-      picks.push({ label: item.role, kind: vscode.QuickPickItemKind.Separator });
+  const picks = groupedReferencePickRows(
+    items,
+    showReferenceRangesFromConfig(),
+    (uri) => vscode.workspace.asRelativePath(vscode.Uri.parse(uri)),
+  ).map((row): vscode.QuickPickItem & { item?: GroupedReferenceItem } => {
+    if (row.kind === 'separator') {
+      return { label: row.label, kind: vscode.QuickPickItemKind.Separator };
     }
-    const rel = vscode.workspace.asRelativePath(vscode.Uri.parse(item.location.uri));
-    const line = item.location.range.start.line + 1;
-    picks.push({ label: `${rel}:${line}`, description: item.role, item });
-  }
+    return { label: row.label, description: row.description, item: row.item };
+  });
 
   const chosen = await vscode.window.showQuickPick(picks, {
     placeHolder: `FossilSense references (${items.length}), grouped by role`,
@@ -361,6 +349,12 @@ function debugCandidateReasonsFromConfig(): boolean {
   return vscode.workspace
     .getConfiguration('fossilsense')
     .get<boolean>('debug.candidateReasons', false);
+}
+
+function showReferenceRangesFromConfig(): boolean {
+  return vscode.workspace
+    .getConfiguration('fossilsense')
+    .get<boolean>('references.showRanges', false);
 }
 
 function fossilsenseModeFromConfig(): string {

@@ -1,5 +1,7 @@
 # Signature Help Reachable Definitions 实现计划
 
+Status: implemented
+
 > **给代理执行者：** 必须使用 `himupowers:subagent-driven-development`（推荐）或 `himupowers:executing-plans` 逐任务执行本计划。
 > 需求文档：`docs/signature-help-reachable-definitions/requirements.md`
 
