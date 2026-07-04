@@ -79,7 +79,6 @@ type IndexSchedule = Arc<Mutex<IndexScheduleState>>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CompletionCandidateSource {
     Indexed,
-    #[allow(dead_code)]
     LocalBinding,
     LocalWord,
 }
@@ -157,7 +156,6 @@ fn completion_source_rank(source: CompletionCandidateSource) -> u8 {
     }
 }
 
-#[allow(dead_code)]
 fn completion_items_for_local_bindings(
     hits: Vec<query::LocalCompletionCandidate>,
 ) -> Vec<CompletionCandidate> {

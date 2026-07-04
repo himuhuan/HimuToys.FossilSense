@@ -498,6 +498,27 @@ impl LanguageServer for Backend {
             return Ok(Some(empty_completion_list(true)));
         }
 
+        let parsed_document = match uri_to_path(&uri) {
+            Some(path) => {
+                self.get_or_parse_document(&uri, &path, version, &text)
+                    .await
+            }
+            None => None,
+        };
+        let local_binding_hits = parsed_document
+            .as_ref()
+            .map(|index| {
+                query::local_completion_candidates(
+                    &index.local_bindings,
+                    &text,
+                    position.line,
+                    position.character,
+                    &prefix,
+                    query::COMPLETION_LIMIT,
+                )
+            })
+            .unwrap_or_default();
+
         let local_words = self.local_words_for(&uri, version, &text).await;
 
         let (tables, table_generations): (
@@ -625,6 +646,8 @@ impl LanguageServer for Backend {
                         });
                     }
                 }
+
+                candidates.extend(completion_items_for_local_bindings(local_binding_hits));
 
                 // Add current-file word candidates as fallback-only items.
                 // They remain useful for not-yet-indexed names, but same-name

@@ -5,9 +5,61 @@ use super::{
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex as StdMutex};
 use tempfile::tempdir;
-use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind, Url};
+use tower_lsp::lsp_types::{
+    CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse, Position,
+    TextDocumentIdentifier, TextDocumentPositionParams, Url,
+};
+use tower_lsp::{LanguageServer as _, LspService};
+
+fn test_backend_service() -> LspService<super::Backend> {
+    let (service, _) = LspService::new(|client| super::Backend {
+        client,
+        workspace_roots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+        index_schedule: Arc::new(tokio::sync::Mutex::new(IndexScheduleState::default())),
+        open_docs: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        live_parse_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+        name_tables: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        reach_graphs: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        include_tables: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        indexed_file_lists: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        index_generations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        external_include_dir_cache: Arc::new(StdMutex::new(HashMap::new())),
+        local_word_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        include_paths: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+        completion_enabled: AtomicBool::new(true),
+        semantic_coloring_enabled: AtomicBool::new(true),
+        scoping_enabled: AtomicBool::new(true),
+        debug_candidate_reasons: AtomicBool::new(false),
+        perf_logging_enabled: AtomicBool::new(false),
+        reference_role_cache: Arc::new(crate::references::ReferenceRoleCache::new()),
+        reference_search_cache: Arc::new(crate::references::ReferenceSearchCache::new()),
+        completion_memo: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        config_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+    });
+    service
+}
+
+fn completion_params(uri: Url, line: u32, character: u32) -> CompletionParams {
+    CompletionParams {
+        text_document_position: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri },
+            position: Position::new(line, character),
+        },
+        work_done_progress_params: Default::default(),
+        partial_result_params: Default::default(),
+        context: None,
+    }
+}
+
+fn completion_items(response: CompletionResponse) -> Vec<CompletionItem> {
+    match response {
+        CompletionResponse::Array(items) => items,
+        CompletionResponse::List(list) => list.items,
+    }
+}
 
 #[tokio::test]
 async fn local_word_cache_is_keyed_by_document_version() {
@@ -336,6 +388,38 @@ fn local_binding_candidates_render_variable_kind_and_detail() {
     );
     assert_eq!(candidates[0].item.kind, Some(CompletionItemKind::VARIABLE));
     assert_eq!(candidates[0].item.detail.as_deref(), Some("local: int"));
+}
+
+#[tokio::test]
+async fn local_binding_pipeline_uses_open_document_bindings_before_local_words() {
+    let src = "int f(int count) {\n    int cursor_limit;\n    cur\n}\n";
+    let dir = tempdir().expect("tempdir");
+    let uri = Url::from_file_path(dir.path().join("a.c")).expect("file uri");
+    let service = test_backend_service();
+    service
+        .inner()
+        .open_docs
+        .lock()
+        .await
+        .insert(uri.clone(), (1, src.to_string()));
+
+    let response = service
+        .inner()
+        .completion(completion_params(uri, 2, 7))
+        .await
+        .expect("completion request")
+        .expect("completion response");
+    if let CompletionResponse::List(list) = &response {
+        assert!(list.is_incomplete);
+    }
+    let items = completion_items(response);
+    let cursor = items
+        .iter()
+        .find(|item| item.label == "cursor_limit")
+        .expect("cursor_limit completion");
+
+    assert_eq!(cursor.kind, Some(CompletionItemKind::VARIABLE));
+    assert_eq!(cursor.detail.as_deref(), Some("local: int"));
 }
 
 #[test]
