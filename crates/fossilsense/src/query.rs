@@ -12,6 +12,7 @@ use crate::resolver::{self, ResolveContext};
 
 mod definitions;
 mod hover;
+mod local_completion;
 mod lsp_kinds;
 mod signatures;
 mod text;
@@ -21,6 +22,8 @@ pub use hover::{
     hover_markdown_for_candidate, leading_comment_markdown, rank_hover_candidates,
     RankedHoverCandidate, HOVER_CANDIDATE_LIMIT,
 };
+#[allow(unused_imports)]
+pub use local_completion::{local_completion_candidates, LocalCompletionCandidate};
 pub use lsp_kinds::{lsp_completion_kind_from_parser, lsp_kind_from_parser, lsp_symbol_kind};
 pub use signatures::{
     call_context_at, rank_function_signature_candidates, signature_parts, signature_parts_for_name,
