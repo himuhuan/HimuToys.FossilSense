@@ -363,6 +363,7 @@ fn occurrence_at(
     });
     Some(Occurrence {
         name: text.to_string(),
+        start_byte,
         line: start.row as u32,
         start_col: byte_to_utf16_col(source, line_start, start_byte) as u32,
         length: utf16_units(text),

@@ -330,6 +330,7 @@ pub struct Include {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Occurrence {
     pub name: String,
+    pub start_byte: usize,
     pub line: u32,
     pub start_col: u32,
     pub length: u32,

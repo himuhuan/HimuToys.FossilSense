@@ -103,7 +103,7 @@ fossilsense 单一 Rust 原生二进制 (crates/fossilsense)
 | 符号 | 工作区符号、文档大纲、跳转定义候选 |
 | 引用 | 符号级查找，按句法角色分类；提供 grouped references 命令 |
 | 补全 | 标识符、include 路径、有限成员补全 |
-| 着色 | 宏、类型、枚举量；角色门控；成员字段不着色 |
+| 着色 | 宏、类型、枚举量、当前函数参数和局部变量；角色门控；成员字段不着色 |
 | include | 有限解析、跳转、可达性收窄 |
 | 外部头 | 通过 `fossilsense.includePaths` 索引和补全 |
 | 冲突扩展 | 检测 clangd / cpptools / ccls 并提示二选一 |

@@ -43,13 +43,15 @@ impl LanguageServer for Backend {
             Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
                 SemanticTokensOptions {
                     // Legend order defines the token-type indices used when
-                    // encoding (macro = 0, type = 1, enumMember = 2); no
-                    // modifiers are declared.
+                    // encoding (macro = 0, type = 1, enumMember = 2,
+                    // parameter = 3, variable = 4); no modifiers are declared.
                     legend: SemanticTokensLegend {
                         token_types: vec![
                             SemanticTokenType::MACRO,
                             SemanticTokenType::TYPE,
                             SemanticTokenType::ENUM_MEMBER,
+                            SemanticTokenType::PARAMETER,
+                            SemanticTokenType::VARIABLE,
                         ],
                         token_modifiers: vec![],
                     },

@@ -68,10 +68,11 @@ extension's `bin/` folder.
   rather than dumping the whole index's fields. C-oriented; it never infers expression
   types, so it may list the wrong record's fields. Runs under
   `fossilsense.completion.mode`.
-- Degraded Semantic Coloring: colors only known macros, types (typedef / struct /
-  enum / union / class), and enum constants. Everything else — including struct/union
-  fields — is left to the editor's TextMate grammar. Multi-meaning names are colored by
-  a best guess and may occasionally be mis-colored. Runs under
+- Degraded Semantic Coloring: colors known macros, types (typedef / struct /
+  enum / union / class), enum constants, and best-effort current-function
+  parameters/local variables from the open document snapshot. Everything else —
+  including struct/union fields — is left to the editor's TextMate grammar.
+  Multi-meaning names are colored by a best guess and may occasionally be mis-colored. Runs under
   `fossilsense.semanticColoring.mode`.
 - Workspace scope configuration: optional root-level `fossilsense.json` controls
   `include`, `exclude`, and `extensions` for both indexing and reference search.
