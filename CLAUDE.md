@@ -121,6 +121,17 @@ fossilsense 单一 Rust 原生二进制 (crates/fossilsense)
 | 召回 | exact / prefix 档通过 sorted-by-lower 前缀索引二分 |
 | 排序 | 可叠加目录局部性偏移，但绝不过滤 |
 
+v1.2.0 Phase 0-1 约定：
+
+| 项 | 规则 |
+|---|---|
+| pipeline | 普通标识符补全候选必须经过 `completion` 核心模块的兼容 pipeline 合并、去重、排序和截断 |
+| 兼容排序 | 当前阶段继续使用 strict resolver-packed score；不得悄悄启用 soft scope prior |
+| metrics | verbose/perf 日志只输出分阶段耗时、候选来源计数、dedup/returned 数量和 shadow rank 摘要 |
+| 隐私 | 默认 debug/perf summary 不输出候选名、源码片段或用户代码内容 |
+| shadow | shadow ranking 只作后续 ranker 对比基础；当前 displayed ranking 不受 shadow 结果影响 |
+| 后置能力 | intent classifier、多通道召回、include recent/sibling ranking、member method schema、local history、ML/telemetry 均不属于 Phase 0-1 |
+
 短前缀：
 
 | 前缀长度 | 规则 |

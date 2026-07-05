@@ -1,4 +1,5 @@
 mod coloring;
+mod completion;
 mod completion_words;
 mod config;
 mod includes;

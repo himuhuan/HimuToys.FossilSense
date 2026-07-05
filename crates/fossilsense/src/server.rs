@@ -24,6 +24,7 @@ use tower_lsp::lsp_types::{
 };
 use tower_lsp::{async_trait, Client, LanguageServer, LspService, Server};
 
+use crate::completion::{self, CandidateEvidence, CandidateSource};
 use crate::completion_words;
 use crate::config::WorkspaceConfig;
 use crate::includes::{self, IncludeForm};
@@ -76,103 +77,29 @@ type LocalWordEntry = (i32, Arc<HashSet<String>>);
 type LocalWordCache = Arc<Mutex<HashMap<Url, LocalWordEntry>>>;
 type IndexSchedule = Arc<Mutex<IndexScheduleState>>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CompletionCandidateSource {
-    Indexed,
-    LocalBinding,
-    LocalWord,
-}
-
-#[derive(Debug)]
-struct CompletionCandidate {
-    name: String,
-    tier: model::ScopeTier,
-    confidence: model::ResolutionConfidence,
-    score: i32,
-    item: CompletionItem,
-    source: CompletionCandidateSource,
-}
-
-fn dedup_completion_candidates(candidates: Vec<CompletionCandidate>) -> Vec<CompletionCandidate> {
-    let mut best_by_name: HashMap<String, usize> = HashMap::new();
-    let mut survivors: Vec<Option<CompletionCandidate>> =
-        candidates.into_iter().map(Some).collect();
-    for i in 0..survivors.len() {
-        let Some((name, tier, confidence)) = survivors[i]
-            .as_ref()
-            .map(|candidate| (candidate.name.clone(), candidate.tier, candidate.confidence))
-        else {
-            continue;
-        };
-        let key = (tier, confidence);
-        match best_by_name.get(&name) {
-            None => {
-                best_by_name.insert(name, i);
-            }
-            Some(&prev_i) => {
-                let (prev_tier, prev_conf, prev_score, prev_source) = {
-                    let prev = survivors[prev_i].as_ref().expect("survivor present");
-                    (prev.tier, prev.confidence, prev.score, prev.source)
-                };
-                let current = survivors[i].as_ref().expect("survivor present");
-                if completion_candidate_beats(
-                    current.source,
-                    key,
-                    current.score,
-                    prev_source,
-                    (prev_tier, prev_conf),
-                    prev_score,
-                ) {
-                    survivors[prev_i] = None;
-                    best_by_name.insert(name, i);
-                } else {
-                    survivors[i] = None;
-                }
-            }
-        }
-    }
-    survivors.into_iter().flatten().collect()
-}
-
-fn completion_candidate_beats(
-    source: CompletionCandidateSource,
-    key: (model::ScopeTier, model::ResolutionConfidence),
-    score: i32,
-    prev_source: CompletionCandidateSource,
-    prev_key: (model::ScopeTier, model::ResolutionConfidence),
-    prev_score: i32,
-) -> bool {
-    let rank = completion_source_rank(source);
-    let prev_rank = completion_source_rank(prev_source);
-    rank > prev_rank
-        || (rank == prev_rank && (key > prev_key || (key == prev_key && score > prev_score)))
-}
-
-fn completion_source_rank(source: CompletionCandidateSource) -> u8 {
-    match source {
-        CompletionCandidateSource::LocalBinding => 3,
-        CompletionCandidateSource::Indexed => 2,
-        CompletionCandidateSource::LocalWord => 1,
-    }
-}
+type CompletionCandidate = completion::PipelineCandidate<CompletionItem>;
 
 fn completion_items_for_local_bindings(
     hits: Vec<query::LocalCompletionCandidate>,
 ) -> Vec<CompletionCandidate> {
     hits.into_iter()
-        .map(|hit| CompletionCandidate {
-            name: hit.name.clone(),
-            tier: model::ScopeTier::Current,
-            confidence: model::ResolutionConfidence::Heuristic,
-            score: hit.score,
-            item: CompletionItem {
-                label: hit.name,
-                kind: Some(CompletionItemKind::VARIABLE),
-                detail: Some(hit.detail),
-                sort_text: Some(format!("{:08}", 100_000_000 - hit.score)),
-                ..Default::default()
-            },
-            source: CompletionCandidateSource::LocalBinding,
+        .map(|hit| {
+            CompletionCandidate::new(
+                hit.name.clone(),
+                CandidateEvidence::new(
+                    CandidateSource::LocalBinding,
+                    model::ScopeTier::Current,
+                    model::ResolutionConfidence::Heuristic,
+                    hit.score,
+                ),
+                CompletionItem {
+                    label: hit.name,
+                    kind: Some(CompletionItemKind::VARIABLE),
+                    detail: Some(hit.detail),
+                    sort_text: Some(format!("{:08}", 100_000_000 - hit.score)),
+                    ..Default::default()
+                },
+            )
         })
         .collect()
 }
@@ -192,12 +119,10 @@ fn exact_indexed_completion_candidates_for_local_word(
             let (confidence, reason) =
                 resolver::confidence_reason_for(hit.tier, false, open_reason);
             let label = model::completion_scope_label(hit.tier, confidence, reason);
-            CompletionCandidate {
-                name: hit.name.clone(),
-                tier: hit.tier,
-                confidence,
-                score: local_score,
-                item: CompletionItem {
+            CompletionCandidate::new(
+                hit.name.clone(),
+                CandidateEvidence::new(CandidateSource::Indexed, hit.tier, confidence, local_score),
+                CompletionItem {
                     label: hit.name,
                     kind: Some(query::lsp_completion_kind_from_parser(hit.kind)),
                     sort_text: Some(format!("{:08}", 100_000_000 - local_score)),
@@ -205,8 +130,7 @@ fn exact_indexed_completion_candidates_for_local_word(
                     documentation: label.map(|l| Documentation::String(l.documentation)),
                     ..Default::default()
                 },
-                source: CompletionCandidateSource::Indexed,
-            }
+            )
         })
         .collect()
 }

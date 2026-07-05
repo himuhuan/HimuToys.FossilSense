@@ -44,6 +44,12 @@ extension's `bin/` folder.
   `external` / `global` / `ambiguous`) with the full tier/confidence/reason in the
   item documentation; indexed current-file candidates are left unlabeled. These are
   ranked candidates, not semantic bindings or overload resolution.
+  In v1.2.0, ordinary identifier completion also goes through the Phase 0-1 smart
+  completion groundwork: a compatibility pipeline for merge/dedup/rank/truncate,
+  structured source-count metrics, timing breakdowns, and a shadow-rank comparison
+  hook for future rankers. Displayed ranking remains compatibility-mode in this
+  release slice; soft scope prior, intent classification, ML ranking, local history,
+  and method-member completion are not enabled.
 - Best-effort Signature Help: inside simple function calls, shows exact-name
   indexed function signatures ranked by the same include reachability tiers as
   Go to Definition. Candidates are hints, not overload resolution; there is no

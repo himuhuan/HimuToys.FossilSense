@@ -473,6 +473,7 @@ impl LanguageServer for Backend {
             return Ok(None);
         }
 
+        let ordinary_started = tokio::time::Instant::now();
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
 
@@ -594,10 +595,19 @@ impl LanguageServer for Backend {
             }
         };
         let memo_prefix = prefix.clone();
+        let context_ms = ordinary_started.elapsed().as_millis();
 
         let result = tokio::task::spawn_blocking(
-            move || -> Result<(Vec<CompletionItem>, Vec<Vec<usize>>)> {
+            move || -> Result<(
+                Vec<CompletionItem>,
+                Vec<Vec<usize>>,
+                crate::completion::CompletionPipelineMetrics,
+                u128,
+                u128,
+                u128,
+            )> {
                 use crate::model::ScopeTier;
+                let recall_started = std::time::Instant::now();
                 // First cause of the open scope (if any). An `Unknown`-tier
                 // candidate under an ambiguous include surfaces `Ambiguous`
                 // (and the `ambiguous` label) instead of a plain `Fallback`.
@@ -630,12 +640,15 @@ impl LanguageServer for Backend {
                         // candidates stay unlabeled. The label is derived from
                         // the same (tier, confidence, reason) used to rank.
                         let label = model::completion_scope_label(hit.tier, confidence, reason);
-                        candidates.push(CompletionCandidate {
-                            name: hit.name.clone(),
-                            tier: hit.tier,
-                            confidence,
-                            score: hit.score,
-                            item: CompletionItem {
+                        candidates.push(CompletionCandidate::new(
+                            hit.name.clone(),
+                            crate::completion::CandidateEvidence::new(
+                                crate::completion::CandidateSource::Indexed,
+                                hit.tier,
+                                confidence,
+                                hit.score,
+                            ),
+                            CompletionItem {
                                 label: hit.name,
                                 kind: Some(kind),
                                 sort_text: Some(sort_text),
@@ -644,8 +657,7 @@ impl LanguageServer for Backend {
                                     .map(|l| Documentation::String(l.documentation)),
                                 ..Default::default()
                             },
-                            source: CompletionCandidateSource::Indexed,
-                        });
+                        ));
                     }
                 }
 
@@ -689,36 +701,37 @@ impl LanguageServer for Backend {
                         candidates.extend(exact_indexed);
                         continue;
                     }
-                    candidates.push(CompletionCandidate {
-                        name: word.clone(),
-                        tier,
-                        confidence,
-                        score: word_score,
-                        item: CompletionItem {
+                    candidates.push(CompletionCandidate::new(
+                        word.clone(),
+                        crate::completion::CandidateEvidence::new(
+                            crate::completion::CandidateSource::LocalWord,
+                            tier,
+                            confidence,
+                            word_score,
+                        ),
+                        CompletionItem {
                             label: word.clone(),
                             kind: Some(CompletionItemKind::TEXT),
                             sort_text: Some(sort_text),
                             ..Default::default()
                         },
-                        source: CompletionCandidateSource::LocalWord,
-                    });
+                    ));
                 }
 
-                // Sort by packed score descending, then name for stability.
-                let mut kept: Vec<(i32, String, CompletionItem)> =
-                    dedup_completion_candidates(candidates)
-                        .into_iter()
-                        .map(|candidate| (candidate.score, candidate.name, candidate.item))
-                        .collect();
-                kept.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+                let recall_ms = recall_started.elapsed().as_millis();
+                let merge_rank_started = std::time::Instant::now();
+                let output = crate::completion::run_compatible_pipeline(candidates, limit);
+                let merge_rank_ms = merge_rank_started.elapsed().as_millis();
 
-                let items: Vec<CompletionItem> = kept
+                let render_started = std::time::Instant::now();
+                let items: Vec<CompletionItem> = output
+                    .items
                     .into_iter()
-                    .take(limit)
-                    .map(|(_, _, item)| item)
+                    .map(|candidate| candidate.payload)
                     .collect();
+                let render_ms = render_started.elapsed().as_millis();
 
-                Ok((items, new_pools))
+                Ok((items, new_pools, output.metrics, recall_ms, merge_rank_ms, render_ms))
             },
         )
         .await;
@@ -729,17 +742,24 @@ impl LanguageServer for Backend {
         // every keystroke. This lets longer-named symbols re-enter the
         // truncation window as the user keeps typing, and prevents an empty
         // first batch from sticking as a "complete" no-match list.
-        self.perf_log(|| {
-            format!(
-                "[perf] completion total={}ms prefix=\"{}\" hit={}",
-                completion_started.elapsed().as_millis(),
-                memo_prefix,
-                hit_kind,
-            )
-        })
-        .await;
         match self.unwrap_query("completion", result).await {
-            Some((items, new_pools)) => {
+            Some((items, new_pools, metrics, recall_ms, merge_rank_ms, render_ms)) => {
+                let timings = crate::completion::CompletionStageTimings {
+                    total_ms: completion_started.elapsed().as_millis(),
+                    context_ms,
+                    recall_ms,
+                    merge_rank_ms,
+                    render_ms,
+                };
+                self.perf_log(|| {
+                    crate::completion::completion_perf_summary(
+                        &memo_prefix,
+                        hit_kind,
+                        &timings,
+                        &metrics,
+                    )
+                })
+                .await;
                 // Record this prefix's pools for the next (extending) keystroke.
                 self.completion_memo.lock().await.insert(
                     uri,
