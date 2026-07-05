@@ -150,6 +150,8 @@ pub(super) fn apply_file_updates_inner(
             }
 
             let mut record_key_to_id = std::collections::HashMap::new();
+            let mut record_name_to_ids: std::collections::HashMap<String, Vec<i64>> =
+                std::collections::HashMap::new();
             for record in &index.records {
                 record_stmt.execute(params![
                     file_id,
@@ -168,10 +170,32 @@ pub(super) fn apply_file_updates_inner(
                 ])?;
                 let record_id = tx.last_insert_rowid();
                 record_key_to_id.insert(record.record_key.clone(), record_id);
+                let mut names = vec![record.display_name.as_str()];
+                if let Some(tag) = record.tag_name.as_deref() {
+                    names.push(tag);
+                }
+                if let Some(typedef) = record.typedef_name.as_deref() {
+                    names.push(typedef);
+                }
+                names.sort_unstable();
+                names.dedup();
+                for name in names {
+                    let ids = record_name_to_ids.entry(name.to_string()).or_default();
+                    if !ids.contains(&record_id) {
+                        ids.push(record_id);
+                    }
+                }
             }
 
             for member in &index.members {
-                let record_id = record_key_to_id.get(&member.record_key).copied();
+                let record_id = record_key_to_id
+                    .get(&member.record_key)
+                    .copied()
+                    .or_else(|| {
+                        let owner = member.record_key.strip_prefix("owner:")?;
+                        let ids = record_name_to_ids.get(owner)?;
+                        (ids.len() == 1).then_some(ids[0])
+                    });
                 if let Some(rid) = record_id {
                     member_stmt.execute(params![
                         rid,

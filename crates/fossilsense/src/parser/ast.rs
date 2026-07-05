@@ -54,7 +54,13 @@ pub(super) fn collect_ast_index(
             collect_function_local_bindings(node, source, &mut out.local_bindings);
         }
 
-        // Record + field collection. Gated by either bit since both are
+        if facts.contains(ParseFacts::FIELDS)
+            && matches!(node.kind(), "function_definition" | "declaration")
+        {
+            collect_out_of_class_method_member(node, source, line_starts, &mut out.members);
+        }
+
+        // Record + member collection. Gated by either bit since both are
         // extracted from the same struct/union/class body.
         if facts.intersects(ParseFacts::RECORDS | ParseFacts::FIELDS)
             && matches!(
@@ -125,7 +131,7 @@ pub(super) fn collect_ast_index(
                         signature,
                     });
 
-                    collect_body_fields(
+                    collect_body_members(
                         body,
                         &record_key,
                         source,
@@ -455,7 +461,7 @@ fn binding_role(node: tree_sitter::Node<'_>) -> Option<SyntacticRole> {
     }
 }
 
-fn collect_body_fields(
+fn collect_body_members(
     body: tree_sitter::Node<'_>,
     record_key: &str,
     source: &str,
@@ -478,7 +484,7 @@ fn collect_body_fields(
             if let Some(type_node) = child.child_by_field_name("type") {
                 if matches!(type_node.kind(), "struct_specifier" | "union_specifier") {
                     if let Some(inner) = type_node.child_by_field_name("body") {
-                        collect_body_fields(
+                        collect_body_members(
                             inner,
                             record_key,
                             source,
@@ -495,46 +501,212 @@ fn collect_body_fields(
         let signature = compact_whitespace(child.utf8_text(source.as_bytes()).unwrap_or_default());
         for decl in declarators {
             if let Some((id_node, name)) = declarator_identifier(decl, source) {
-                let start_pos = id_node.start_position();
-                let end_pos = id_node.end_position();
-                let start_byte = id_node.start_byte();
-                let end_byte = id_node.end_byte();
-                let start_line = start_pos.row;
-                let end_line = end_pos.row;
+                let kind = method_member_kind(child, decl, source);
+                if kind == MemberKind::Field {
+                    let start_pos = id_node.start_position();
+                    let end_pos = id_node.end_position();
+                    let start_byte = id_node.start_byte();
+                    let end_byte = id_node.end_byte();
+                    let start_line = start_pos.row;
+                    let end_line = end_pos.row;
 
-                let start_line_byte = line_starts.get(start_line).copied().unwrap_or(0);
-                let start_col = byte_to_utf16_col(source, start_line_byte, start_byte);
+                    let start_line_byte = line_starts.get(start_line).copied().unwrap_or(0);
+                    let start_col = byte_to_utf16_col(source, start_line_byte, start_byte);
 
-                let end_line_byte = line_starts.get(end_line).copied().unwrap_or(0);
-                let end_col = byte_to_utf16_col(source, end_line_byte, end_byte);
+                    let end_line_byte = line_starts.get(end_line).copied().unwrap_or(0);
+                    let end_col = byte_to_utf16_col(source, end_line_byte, end_byte);
 
-                fields.push(FieldDef {
-                    record_key: record_key.to_string(),
-                    name: name.to_string(),
-                    start_byte,
-                    end_byte,
-                    start_line,
-                    start_col,
-                    end_line,
-                    end_col,
-                    signature: signature.clone(),
-                });
-                members.push(MemberDef {
-                    record_key: record_key.to_string(),
-                    name: name.to_string(),
-                    kind: MemberKind::Field,
-                    confidence: MemberConfidence::InBody,
-                    start_byte,
-                    end_byte,
-                    start_line,
-                    start_col,
-                    end_line,
-                    end_col,
-                    signature: signature.clone(),
-                });
+                    fields.push(FieldDef {
+                        record_key: record_key.to_string(),
+                        name: name.to_string(),
+                        start_byte,
+                        end_byte,
+                        start_line,
+                        start_col,
+                        end_line,
+                        end_col,
+                        signature: signature.clone(),
+                    });
+                }
+                push_member(
+                    members,
+                    record_key.to_string(),
+                    name.to_string(),
+                    id_node,
+                    kind,
+                    MemberConfidence::InBody,
+                    signature.clone(),
+                    source,
+                    line_starts,
+                );
             }
         }
     }
+}
+
+fn method_member_kind(
+    declaration: tree_sitter::Node<'_>,
+    declarator: tree_sitter::Node<'_>,
+    source: &str,
+) -> MemberKind {
+    if !declarator_contains_kind(declarator, "function_declarator") {
+        return MemberKind::Field;
+    }
+    let signature = declaration
+        .utf8_text(source.as_bytes())
+        .map(compact_whitespace)
+        .unwrap_or_default();
+    let has_static_child = direct_child_text(declaration, "storage_class_specifier", source)
+        .as_deref()
+        == Some("static");
+    if signature.starts_with("static ") || has_static_child {
+        MemberKind::StaticMethod
+    } else {
+        MemberKind::Method
+    }
+}
+
+fn direct_child_text(node: tree_sitter::Node<'_>, kind: &str, source: &str) -> Option<String> {
+    let mut cursor = node.walk();
+    let text = node
+        .children(&mut cursor)
+        .find(|child| child.kind() == kind)
+        .and_then(|child| child.utf8_text(source.as_bytes()).ok())
+        .map(compact_whitespace);
+    text
+}
+
+fn declarator_contains_kind(node: tree_sitter::Node<'_>, kind: &str) -> bool {
+    if node.kind() == kind {
+        return true;
+    }
+    let mut cursor = node.walk();
+    let found = node
+        .children(&mut cursor)
+        .any(|child| declarator_contains_kind(child, kind));
+    found
+}
+
+fn collect_out_of_class_method_member(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    line_starts: &[usize],
+    members: &mut Vec<MemberDef>,
+) {
+    let Some(declarator) = node.child_by_field_name("declarator") else {
+        return;
+    };
+    if !declarator_contains_kind(declarator, "function_declarator") {
+        return;
+    }
+    let Some((owner, method, method_byte)) =
+        simple_owner_method_from_declarator(declarator, source)
+    else {
+        return;
+    };
+    let signature = function_like_signature(node, source);
+    push_member_at_byte(
+        members,
+        format!("owner:{owner}"),
+        method,
+        method_byte,
+        MemberKind::Method,
+        MemberConfidence::OutOfClassOwner,
+        signature,
+        source,
+        line_starts,
+    );
+}
+
+fn simple_owner_method_from_declarator(
+    declarator: tree_sitter::Node<'_>,
+    source: &str,
+) -> Option<(String, String, usize)> {
+    let text = declarator.utf8_text(source.as_bytes()).ok()?;
+    let before_params = text.split_once('(')?.0.trim();
+    if before_params.contains('<') || before_params.contains('>') {
+        return None;
+    }
+    let parts: Vec<&str> = before_params.split("::").collect();
+    if parts.len() != 2 || !is_identifier(parts[0]) || !is_identifier(parts[1]) {
+        return None;
+    }
+    let owner = parts[0].to_string();
+    let method = parts[1].to_string();
+    let method_relative = text.find(&format!("::{method}"))? + 2;
+    Some((owner, method, declarator.start_byte() + method_relative))
+}
+
+fn function_like_signature(node: tree_sitter::Node<'_>, source: &str) -> String {
+    let end = node
+        .child_by_field_name("body")
+        .map(|body| body.start_byte())
+        .unwrap_or_else(|| node.end_byte());
+    compact_whitespace(source.get(node.start_byte()..end).unwrap_or_default())
+}
+
+fn is_identifier(text: &str) -> bool {
+    let mut chars = text.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn push_member(
+    members: &mut Vec<MemberDef>,
+    record_key: String,
+    name: String,
+    id_node: tree_sitter::Node<'_>,
+    kind: MemberKind,
+    confidence: MemberConfidence,
+    signature: String,
+    source: &str,
+    line_starts: &[usize],
+) {
+    push_member_at_byte(
+        members,
+        record_key,
+        name,
+        id_node.start_byte(),
+        kind,
+        confidence,
+        signature,
+        source,
+        line_starts,
+    );
+}
+
+fn push_member_at_byte(
+    members: &mut Vec<MemberDef>,
+    record_key: String,
+    name: String,
+    start_byte: usize,
+    kind: MemberKind,
+    confidence: MemberConfidence,
+    signature: String,
+    source: &str,
+    line_starts: &[usize],
+) {
+    let end_byte = start_byte + name.len();
+    let start_line = line_starts.partition_point(|line_start| *line_start <= start_byte) - 1;
+    let end_line = line_starts.partition_point(|line_start| *line_start <= end_byte) - 1;
+    let start_line_byte = line_starts.get(start_line).copied().unwrap_or(0);
+    let end_line_byte = line_starts.get(end_line).copied().unwrap_or(0);
+    members.push(MemberDef {
+        record_key,
+        name,
+        kind,
+        confidence,
+        start_byte,
+        end_byte,
+        start_line,
+        start_col: byte_to_utf16_col(source, start_line_byte, start_byte),
+        end_line,
+        end_col: byte_to_utf16_col(source, end_line_byte, end_byte),
+        signature,
+    });
 }
 
 fn parent_typedef_name(node: tree_sitter::Node<'_>, source: &str) -> Option<String> {

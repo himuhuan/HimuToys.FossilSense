@@ -72,6 +72,37 @@ fn struct_fields_are_persisted_as_field_members() {
 }
 
 #[test]
+fn out_of_class_method_owner_is_persisted_when_owner_is_unique_in_file() {
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+    let mut store = IndexStore::open(&db, dir.path()).expect("store");
+    upsert_source(
+        &mut store,
+        "widget.cpp",
+        "class Widget { void resize(); };\nvoid Widget::resize() {}\n",
+    );
+
+    let reader = IndexStore::open_readonly(&db).expect("reader");
+    let records = reader
+        .resolve_record_candidates(&["Widget"], None)
+        .expect("records");
+    let members = reader
+        .members_for_records(&[records[0].id], None, None)
+        .expect("members");
+
+    assert!(members.iter().any(|member| {
+        member.name == "resize"
+            && member.kind == crate::parser::MemberKind::Method
+            && member.confidence == crate::parser::MemberConfidence::InBody
+    }));
+    assert!(members.iter().any(|member| {
+        member.name == "resize"
+            && member.kind == crate::parser::MemberKind::Method
+            && member.confidence == crate::parser::MemberConfidence::OutOfClassOwner
+    }));
+}
+
+#[test]
 fn field_candidates_honor_prefix_and_cap() {
     let dir = tempdir().expect("tempdir");
     let db = dir.path().join("index.sqlite");

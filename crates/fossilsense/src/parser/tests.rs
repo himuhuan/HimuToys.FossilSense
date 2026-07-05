@@ -1,8 +1,8 @@
 use std::path::Path;
 
 use super::{
-    infer_receiver_record, parse, parse_with_handle, FileSemanticIndex, Occurrence, ParseFacts,
-    ParserHandle, SymbolKind, SymbolRole, SyntacticRole,
+    infer_receiver_record, parse, parse_with_handle, FileSemanticIndex, MemberConfidence,
+    MemberKind, Occurrence, ParseFacts, ParserHandle, SymbolKind, SymbolRole, SyntacticRole,
 };
 
 /// Role of the (single) occurrence of `name` in a parsed buffer.
@@ -142,6 +142,68 @@ fn extracts_named_struct_fields() {
     let index = parse(Path::new("p.c"), "struct Point { int x; int y; };\n");
     assert_eq!(field_containers(&index, "x"), vec!["Point".to_string()]);
     assert_eq!(field_containers(&index, "y"), vec!["Point".to_string()]);
+}
+
+#[test]
+fn parses_class_body_methods_as_members() {
+    let source = r#"
+        class Widget {
+        public:
+            int width;
+            void resize(int w);
+            static int count();
+        };
+    "#;
+    let index = parse(Path::new("widget.cpp"), source);
+
+    assert!(index
+        .members
+        .iter()
+        .any(|member| member.name == "width" && member.kind == MemberKind::Field));
+    assert!(index
+        .members
+        .iter()
+        .any(|member| member.name == "resize" && member.kind == MemberKind::Method));
+    assert!(index
+        .members
+        .iter()
+        .any(|member| member.name == "count" && member.kind == MemberKind::StaticMethod));
+}
+
+#[test]
+fn method_member_signature_uses_declaration_text() {
+    let source = "struct Widget { void resize(int width); };";
+    let index = parse(Path::new("widget.hpp"), source);
+    let method = index
+        .members
+        .iter()
+        .find(|member| member.name == "resize")
+        .expect("method");
+
+    assert_eq!(method.kind, MemberKind::Method);
+    assert!(method.signature.contains("void resize(int width)"));
+    assert_eq!(method.confidence, MemberConfidence::InBody);
+}
+
+#[test]
+fn parses_simple_out_of_class_method_owner_as_lower_confidence() {
+    let source = r#"
+        class Widget { void resize(); };
+        void Widget::resize() {}
+    "#;
+    let index = parse(Path::new("widget.cpp"), source);
+    let matches: Vec<_> = index
+        .members
+        .iter()
+        .filter(|member| member.name == "resize")
+        .collect();
+
+    assert!(matches
+        .iter()
+        .any(|member| member.confidence == MemberConfidence::InBody));
+    assert!(matches
+        .iter()
+        .any(|member| member.confidence == MemberConfidence::OutOfClassOwner));
 }
 
 #[test]
