@@ -4,6 +4,7 @@ use super::{
     rebuild_include_table, rebuild_indexed_file_list,
 };
 use std::collections::HashMap;
+use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -73,6 +74,52 @@ fn text_and_position(marked: &str) -> (String, u32, u32) {
         .map(|ch| ch.len_utf16() as u32)
         .sum();
     (text, line, character)
+}
+
+fn write_workspace_file(root: &std::path::Path, rel: &str, text: &str) {
+    let path = root.join(rel);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("mkdir");
+    }
+    fs::write(path, text).expect("write file");
+}
+
+async fn indexed_backend_with_open_doc(
+    indexed_files: &[(&str, &str)],
+    open_rel: &str,
+    marked_open_text: &str,
+) -> (tempfile::TempDir, LspService<super::Backend>, Url, u32, u32) {
+    let dir = tempdir().expect("tempdir");
+    for (rel, text) in indexed_files {
+        write_workspace_file(dir.path(), rel, text);
+    }
+    let (open_text, line, character) = text_and_position(marked_open_text);
+    write_workspace_file(dir.path(), open_rel, &open_text);
+    crate::indexer::index_workspace(
+        dir.path(),
+        crate::indexer::IndexOptions {
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("index");
+
+    let uri = Url::from_file_path(dir.path().join(open_rel)).expect("file uri");
+    let service = test_backend_service();
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(dir.path().to_path_buf());
+    service
+        .inner()
+        .open_docs
+        .lock()
+        .await
+        .insert(uri.clone(), (1, open_text));
+    (dir, service, uri, line, character)
 }
 
 #[tokio::test]
@@ -190,6 +237,52 @@ fn grouped_reference_items_preserve_role_and_order() {
     // Definition group first; each item carries its role label for the client.
     assert_eq!(items[0].role, "definition");
     assert_eq!(items[1].role, "read");
+}
+
+#[tokio::test]
+async fn member_completion_returns_fields_and_methods_for_resolved_receiver() {
+    let (_dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[(
+            "widget.hpp",
+            "struct Widget { int width; void resize(); };\n",
+        )],
+        "main.cpp",
+        "#include \"widget.hpp\"\nvoid f(Widget *w) { w->/*cursor*/ }\n",
+    )
+    .await;
+
+    let response = service
+        .inner()
+        .completion(completion_params(uri, line, character))
+        .await
+        .expect("completion request")
+        .expect("completion response");
+    let items = completion_items(response);
+
+    assert!(items
+        .iter()
+        .any(|item| item.label == "resize" && item.kind == Some(CompletionItemKind::METHOD)));
+    assert!(items
+        .iter()
+        .any(|item| item.label == "width" && item.kind == Some(CompletionItemKind::FIELD)));
+}
+
+#[tokio::test]
+async fn member_fallback_still_blocks_one_character_prefix() {
+    let (_dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[("widget.hpp", "struct Widget { int width; void wipe(); };\n")],
+        "main.cpp",
+        "void f(void) { make_widget()->w/*cursor*/ }\n",
+    )
+    .await;
+
+    let response = service
+        .inner()
+        .completion(completion_params(uri, line, character))
+        .await
+        .expect("completion request")
+        .expect("completion response");
+    assert!(completion_items(response).is_empty());
 }
 
 // --- R7: completion memo validity (generation + prefix extension check) ---

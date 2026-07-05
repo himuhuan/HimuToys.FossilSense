@@ -151,6 +151,7 @@ impl IndexStore {
     /// of any owning record under `ctx`. Tier-then-frequency ranked, capped at
     /// `limit`. This is a best-effort candidate set across record identities,
     /// not a claim that the names share one owner.
+    #[allow(dead_code)]
     pub fn fallback_field_candidates(
         &self,
         prefix: &str,
@@ -621,6 +622,7 @@ impl IndexStore {
             .collect())
     }
 
+    #[allow(dead_code)]
     pub fn fields_for_records(&self, record_ids: &[i64]) -> Result<Vec<String>> {
         let mut names: Vec<String> = self
             .members_for_records(record_ids, None, None)?
