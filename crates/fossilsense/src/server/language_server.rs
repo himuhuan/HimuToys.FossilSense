@@ -487,7 +487,7 @@ impl LanguageServer for Backend {
         if let Some((form, partial)) =
             includes::include_completion_context(line_text, position.character)
         {
-            return self.complete_include(&uri, form, partial).await;
+            return self.complete_include(&uri, form, partial, &text).await;
         }
 
         if query::is_member_completion_context(line_text, position.character) {

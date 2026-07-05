@@ -6,7 +6,7 @@ use anyhow::Result;
 use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind, Location, Position, Range, Url};
 
 use crate::config::WorkspaceConfig;
-use crate::includes::IncludeForm;
+use crate::includes::{self, IncludeForm};
 use crate::pathing;
 use crate::store::IndexStore;
 
@@ -15,17 +15,65 @@ pub(super) type ExternalIncludeDirCache = Arc<StdMutex<HashMap<String, CachedDir
 #[derive(Debug, Clone, Default)]
 pub(super) struct IncludeCompletionTable {
     workspace_paths: Vec<String>,
+    basename_counts: HashMap<String, usize>,
+    incoming_by_src_dir: HashMap<String, HashSet<String>>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct IncludeCompletionMetrics {
+    pub recent: usize,
+    pub sibling: usize,
+    pub basename: usize,
+    pub depth_penalty: usize,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct IncludeRankingSignals {
+    recent: bool,
+    sibling: bool,
+    basename: bool,
+    depth_penalty: bool,
 }
 
 impl IncludeCompletionTable {
-    pub(super) fn build(mut workspace_paths: Vec<String>) -> Self {
+    #[allow(dead_code)]
+    pub(super) fn build(workspace_paths: Vec<String>) -> Self {
+        Self::build_with_edges(workspace_paths, Vec::new())
+    }
+
+    pub(super) fn build_with_edges(
+        mut workspace_paths: Vec<String>,
+        include_edges: Vec<(String, String)>,
+    ) -> Self {
         workspace_paths.sort();
         workspace_paths.dedup();
-        Self { workspace_paths }
+        let mut basename_counts = HashMap::new();
+        for path in &workspace_paths {
+            if let Some(name) = path.rsplit('/').next() {
+                *basename_counts
+                    .entry(name.to_ascii_lowercase())
+                    .or_insert(0) += 1;
+            }
+        }
+        let mut incoming_by_src_dir: HashMap<String, HashSet<String>> = HashMap::new();
+        for (src, dst) in include_edges {
+            let src_dir = parent_slash(&src).unwrap_or_default();
+            incoming_by_src_dir.entry(src_dir).or_default().insert(dst);
+        }
+        Self {
+            workspace_paths,
+            basename_counts,
+            incoming_by_src_dir,
+        }
     }
 
     pub(super) fn len(&self) -> usize {
         self.workspace_paths.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn edge_count(&self) -> usize {
+        self.incoming_by_src_dir.values().map(HashSet::len).sum()
     }
 
     fn collect_candidates(
@@ -34,14 +82,118 @@ impl IncludeCompletionTable {
         seg_lower: &str,
         seg: &str,
         base_score: i32,
+        current_rel_dir: Option<&str>,
+        evidence: Option<&CurrentIncludeEvidence>,
+        metrics: &mut IncludeCompletionMetrics,
         seen: &mut HashSet<String>,
         scored: &mut Vec<(i32, String, CompletionItem)>,
     ) {
         for path in &self.workspace_paths {
-            for (name, is_dir) in indexed_workspace_include_candidates(path, dir_part, seg_lower) {
-                push_include_candidate(name, is_dir, base_score, seg, seen, scored);
+            for candidate in indexed_workspace_include_candidates(path, dir_part, seg_lower) {
+                let (boost, signals) = self.ranking_boost(
+                    &candidate.rel_path,
+                    &candidate.name,
+                    current_rel_dir,
+                    evidence,
+                );
+                if signals.recent {
+                    metrics.recent += 1;
+                }
+                if signals.sibling {
+                    metrics.sibling += 1;
+                }
+                if signals.basename {
+                    metrics.basename += 1;
+                }
+                if signals.depth_penalty {
+                    metrics.depth_penalty += 1;
+                }
+                let score = base_score + boost;
+                push_include_candidate(candidate.name, candidate.is_dir, score, seg, seen, scored);
             }
         }
+    }
+
+    fn ranking_boost(
+        &self,
+        rel_path: &str,
+        label: &str,
+        current_rel_dir: Option<&str>,
+        evidence: Option<&CurrentIncludeEvidence>,
+    ) -> (i32, IncludeRankingSignals) {
+        let mut boost = 0;
+        let mut signals = IncludeRankingSignals::default();
+        if current_rel_dir.is_some_and(|dir| parent_slash(rel_path).as_deref() == Some(dir)) {
+            boost += 35;
+        }
+        if let Some(evidence) = evidence {
+            let rel_lower = rel_path.to_ascii_lowercase();
+            let label_lower = label.to_ascii_lowercase();
+            if evidence.recent_targets.contains(&rel_lower)
+                || evidence.recent_basenames.contains(&label_lower)
+            {
+                boost += 30;
+                signals.recent = true;
+            }
+            if evidence
+                .source_dir
+                .as_ref()
+                .and_then(|dir| self.incoming_by_src_dir.get(dir))
+                .is_some_and(|targets| targets.contains(rel_path))
+            {
+                boost += 25;
+                signals.sibling = true;
+            }
+        }
+        let frequency = self
+            .basename_counts
+            .get(&label.to_ascii_lowercase())
+            .copied()
+            .unwrap_or(0)
+            .min(20) as i32;
+        boost += frequency;
+        signals.basename = frequency > 0;
+        let depth_penalty = (rel_path.matches('/').count() as i32 * 3).min(20);
+        boost -= depth_penalty;
+        signals.depth_penalty = depth_penalty > 0;
+        (boost, signals)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(super) struct CurrentIncludeEvidence {
+    source_dir: Option<String>,
+    recent_targets: HashSet<String>,
+    recent_basenames: HashSet<String>,
+}
+
+impl CurrentIncludeEvidence {
+    pub(super) fn from_text(text: &str, current_rel_path: Option<&str>) -> Self {
+        let source_dir = current_rel_path.and_then(parent_slash);
+        let mut evidence = Self {
+            source_dir,
+            recent_targets: HashSet::new(),
+            recent_basenames: HashSet::new(),
+        };
+        for line in text.lines() {
+            let Some((_form, target)) = includes::parse_include_line(line) else {
+                continue;
+            };
+            let target = target.replace('\\', "/");
+            let target_lower = target.to_ascii_lowercase();
+            evidence.recent_targets.insert(target_lower.clone());
+            if let Some(dir) = &evidence.source_dir {
+                if !target.contains('/') {
+                    evidence
+                        .recent_targets
+                        .insert(format!("{dir}/{target}").to_ascii_lowercase());
+                }
+            }
+            if let Some(name) = target.rsplit('/').next() {
+                evidence.recent_basenames.insert(name.to_ascii_lowercase());
+            }
+        }
+        evidence
     }
 }
 
@@ -186,6 +338,7 @@ pub(super) fn collect_include_candidates(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub(super) fn collect_include_candidates_with_table(
     form: IncludeForm,
     dir_part: &str,
@@ -198,6 +351,38 @@ pub(super) fn collect_include_candidates_with_table(
     external_cache: Option<&ExternalIncludeDirCache>,
     limit: usize,
 ) -> Vec<CompletionItem> {
+    collect_include_candidates_with_table_and_evidence(
+        form,
+        dir_part,
+        seg,
+        current_dir,
+        workspace_root,
+        include_roots,
+        db_path,
+        include_table,
+        external_cache,
+        None,
+        None,
+        limit,
+    )
+    .0
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn collect_include_candidates_with_table_and_evidence(
+    form: IncludeForm,
+    dir_part: &str,
+    seg: &str,
+    current_dir: Option<&Path>,
+    workspace_root: Option<&Path>,
+    include_roots: &[String],
+    db_path: Option<&Path>,
+    include_table: Option<&IncludeCompletionTable>,
+    external_cache: Option<&ExternalIncludeDirCache>,
+    current_rel_dir: Option<&str>,
+    evidence: Option<&CurrentIncludeEvidence>,
+    limit: usize,
+) -> (Vec<CompletionItem>, IncludeCompletionMetrics) {
     let cur = current_dir.map(|p| p.to_path_buf());
     let ws = workspace_root.map(|p| p.to_path_buf());
     let roots: Vec<PathBuf> = include_roots.iter().map(PathBuf::from).collect();
@@ -206,6 +391,7 @@ pub(super) fn collect_include_candidates_with_table(
     let seg_lower = seg.to_ascii_lowercase();
     let mut seen: HashSet<String> = HashSet::new();
     let mut scored: Vec<(i32, String, CompletionItem)> = Vec::new();
+    let mut metrics = IncludeCompletionMetrics::default();
 
     match form {
         IncludeForm::Quote => {
@@ -238,6 +424,9 @@ pub(super) fn collect_include_candidates_with_table(
                 &seg_lower,
                 seg,
                 250,
+                current_rel_dir,
+                evidence,
+                &mut metrics,
                 &mut seen,
                 &mut scored,
             );
@@ -285,6 +474,9 @@ pub(super) fn collect_include_candidates_with_table(
                 &seg_lower,
                 seg,
                 250,
+                current_rel_dir,
+                evidence,
+                &mut metrics,
                 &mut seen,
                 &mut scored,
             );
@@ -303,11 +495,12 @@ pub(super) fn collect_include_candidates_with_table(
     }
 
     scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-    scored
+    let items = scored
         .into_iter()
         .take(limit)
         .map(|(_, _, it)| it)
-        .collect()
+        .collect();
+    (items, metrics)
 }
 
 fn collect_disk_include_candidates(
@@ -416,11 +609,24 @@ fn collect_workspace_include_candidates(
     seg_lower: &str,
     seg: &str,
     base_score: i32,
+    current_rel_dir: Option<&str>,
+    evidence: Option<&CurrentIncludeEvidence>,
+    metrics: &mut IncludeCompletionMetrics,
     seen: &mut HashSet<String>,
     scored: &mut Vec<(i32, String, CompletionItem)>,
 ) {
     if let Some(table) = include_table {
-        table.collect_candidates(dir_part, seg_lower, seg, base_score, seen, scored);
+        table.collect_candidates(
+            dir_part,
+            seg_lower,
+            seg,
+            base_score,
+            current_rel_dir,
+            evidence,
+            metrics,
+            seen,
+            scored,
+        );
         return;
     }
 
@@ -434,24 +640,42 @@ fn collect_workspace_include_candidates(
         return;
     };
     for path in paths {
-        for (name, is_dir) in indexed_workspace_include_candidates(&path, dir_part, seg_lower) {
-            push_include_candidate(name, is_dir, base_score, seg, seen, scored);
+        for candidate in indexed_workspace_include_candidates(&path, dir_part, seg_lower) {
+            push_include_candidate(
+                candidate.name,
+                candidate.is_dir,
+                base_score,
+                seg,
+                seen,
+                scored,
+            );
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct IndexedIncludeCandidate {
+    name: String,
+    is_dir: bool,
+    rel_path: String,
 }
 
 fn indexed_workspace_include_candidates(
     rel_path: &str,
     dir_part: &str,
     seg_lower: &str,
-) -> Vec<(String, bool)> {
+) -> Vec<IndexedIncludeCandidate> {
     let rel = rel_path.replace('\\', "/");
     let mut out = Vec::new();
 
     if dir_part.is_empty() {
         if let Some((first, _)) = rel.split_once('/') {
             if !first.is_empty() && first.to_ascii_lowercase().starts_with(seg_lower) {
-                out.push((first.to_string(), true));
+                out.push(IndexedIncludeCandidate {
+                    name: first.to_string(),
+                    is_dir: true,
+                    rel_path: first.to_string(),
+                });
             }
         }
         if let Some(name) = rel.rsplit('/').next() {
@@ -459,7 +683,11 @@ fn indexed_workspace_include_candidates(
                 && name.to_ascii_lowercase().starts_with(seg_lower)
                 && looks_like_header(name)
             {
-                out.push((name.to_string(), false));
+                out.push(IndexedIncludeCandidate {
+                    name: name.to_string(),
+                    is_dir: false,
+                    rel_path: rel.clone(),
+                });
             }
         }
         return out;
@@ -480,9 +708,67 @@ fn indexed_workspace_include_candidates(
         && name.to_ascii_lowercase().starts_with(seg_lower)
         && (is_dir || looks_like_header(name))
     {
-        out.push((name.to_string(), is_dir));
+        let candidate_path = if is_dir {
+            format!(
+                "{}/{}",
+                dir_part.trim_end_matches('/'),
+                name.trim_matches('/')
+            )
+        } else {
+            rel.clone()
+        };
+        out.push(IndexedIncludeCandidate {
+            name: name.to_string(),
+            is_dir,
+            rel_path: candidate_path,
+        });
     }
     out
+}
+
+fn parent_slash(path: &str) -> Option<String> {
+    path.rsplit_once('/')
+        .map(|(parent, _)| parent.to_string())
+        .filter(|parent| !parent.is_empty())
+}
+
+#[cfg(test)]
+fn collect_include_candidates_ranked_for_test(
+    form: IncludeForm,
+    dir_part: &str,
+    seg: &str,
+    current_rel_dir: Option<&str>,
+    include_table: Option<&IncludeCompletionTable>,
+    evidence: Option<&CurrentIncludeEvidence>,
+    limit: usize,
+) -> Vec<CompletionItem> {
+    let seg_lower = seg.to_ascii_lowercase();
+    let mut seen = HashSet::new();
+    let mut scored = Vec::new();
+    let mut metrics = IncludeCompletionMetrics::default();
+    let base_score = match form {
+        IncludeForm::Quote => 250,
+        IncludeForm::Angle => 250,
+    };
+    if let Some(table) = include_table {
+        table.collect_candidates(
+            dir_part,
+            &seg_lower,
+            seg,
+            base_score,
+            current_rel_dir,
+            evidence,
+            &mut metrics,
+            &mut seen,
+            &mut scored,
+        );
+    }
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    scored
+        .into_iter()
+        .take(limit)
+        .map(|(_, _, it)| it)
+        .collect()
 }
 
 fn push_include_candidate(
@@ -770,6 +1056,111 @@ mod tests {
         assert!(deep
             .iter()
             .any(|i| i.label == "deep.h" && i.kind == Some(CompletionItemKind::FILE)));
+    }
+
+    #[test]
+    fn quote_include_prefers_same_directory_and_sibling_patterns() {
+        let table = IncludeCompletionTable::build_with_edges(
+            vec![
+                "src/driver/main.c".to_string(),
+                "src/driver/main.h".to_string(),
+                "src/driver/config.h".to_string(),
+                "vendor/config.h".to_string(),
+            ],
+            vec![(
+                "src/driver/main.c".to_string(),
+                "src/driver/config.h".to_string(),
+            )],
+        );
+        let evidence =
+            CurrentIncludeEvidence::from_text("#include \"config.h\"\n", Some("src/driver/main.c"));
+
+        let items = collect_include_candidates_ranked_for_test(
+            IncludeForm::Quote,
+            "",
+            "con",
+            Some("src/driver"),
+            Some(&table),
+            Some(&evidence),
+            20,
+        );
+
+        assert_eq!(items[0].label, "config.h");
+    }
+
+    #[test]
+    fn basename_frequency_breaks_workspace_ties_without_overriding_form_priority() {
+        let table = IncludeCompletionTable::build_with_edges(
+            vec![
+                "src/a/common.h".to_string(),
+                "src/b/common.h".to_string(),
+                "src/c/common.h".to_string(),
+                "src/driver/config.h".to_string(),
+            ],
+            Vec::new(),
+        );
+
+        let items = collect_include_candidates_ranked_for_test(
+            IncludeForm::Quote,
+            "",
+            "c",
+            None,
+            Some(&table),
+            None,
+            20,
+        );
+
+        assert_eq!(items[0].label, "common.h");
+        assert!(items.iter().any(|item| item.label == "config.h"));
+    }
+
+    #[test]
+    fn path_depth_penalty_prefers_shallow_comparable_headers() {
+        let table = IncludeCompletionTable::build_with_edges(
+            vec![
+                "include/api.h".to_string(),
+                "include/detail/internal/api.h".to_string(),
+            ],
+            Vec::new(),
+        );
+
+        let items = collect_include_candidates_ranked_for_test(
+            IncludeForm::Quote,
+            "include/",
+            "api",
+            None,
+            Some(&table),
+            None,
+            20,
+        );
+
+        assert_eq!(items[0].label, "api.h");
+    }
+
+    #[test]
+    fn angle_include_keeps_external_root_base_priority() {
+        let root = tempdir().expect("root");
+        fs::write(root.path().join("config.h"), "x").expect("external");
+        let root_str = root.path().to_string_lossy().replace('\\', "/");
+        let table = IncludeCompletionTable::build_with_edges(
+            vec!["src/driver/config.h".to_string()],
+            Vec::new(),
+        );
+
+        let items = collect_include_candidates_with_table(
+            IncludeForm::Angle,
+            "",
+            "con",
+            None,
+            None,
+            &[root_str],
+            None,
+            Some(&table),
+            None,
+            20,
+        );
+
+        assert_eq!(items[0].label, "config.h");
     }
 
     #[test]

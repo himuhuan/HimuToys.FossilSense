@@ -206,7 +206,10 @@ pub(in crate::server) async fn rebuild_include_table(
     let built = tokio::task::spawn_blocking(move || -> Result<IncludeCompletionTable> {
         let db_path = pathing::default_index_path(&build_root)?;
         let store = IndexStore::open_readonly(&db_path)?;
-        Ok(IncludeCompletionTable::build(store.workspace_file_paths()?))
+        Ok(IncludeCompletionTable::build_with_edges(
+            store.workspace_file_paths()?,
+            store.load_include_edge_paths()?,
+        ))
     })
     .await;
 

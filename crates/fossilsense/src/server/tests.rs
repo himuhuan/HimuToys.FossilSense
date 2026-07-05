@@ -111,6 +111,37 @@ async fn failed_include_table_rebuild_clears_stale_cache() {
 }
 
 #[tokio::test]
+async fn include_table_rebuild_carries_include_edges_for_ranking() {
+    let root = tempdir().expect("root");
+    let root_path = root.path().to_path_buf();
+    std::fs::write(root.path().join("a.c"), "#include \"b.h\"\n").expect("a");
+    std::fs::write(root.path().join("b.h"), "int b;\n").expect("b");
+    crate::indexer::index_workspace(
+        root.path(),
+        crate::indexer::IndexOptions {
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("index");
+
+    let include_tables: super::IncludeTables = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let count = rebuild_include_table(&include_tables, root_path.clone())
+        .await
+        .expect("rebuild include table");
+    let table = include_tables
+        .lock()
+        .await
+        .get(&root_path)
+        .cloned()
+        .expect("table");
+
+    assert_eq!(count, 2);
+    assert_eq!(table.edge_count(), 1);
+}
+
+#[tokio::test]
 async fn failed_reference_file_list_rebuild_clears_stale_cache() {
     let root = tempdir().expect("root");
     let root_path = root.path().to_path_buf();

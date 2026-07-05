@@ -49,8 +49,9 @@ mod signature_help;
 mod state;
 
 use include_completion::{
-    collect_include_candidates_with_table, configured_include_paths, location_at_file_start,
-    resolve_include_paths, ExternalIncludeDirCache, IncludeCompletionTable,
+    collect_include_candidates_with_table_and_evidence, configured_include_paths,
+    location_at_file_start, resolve_include_paths, CurrentIncludeEvidence, ExternalIncludeDirCache,
+    IncludeCompletionTable,
 };
 #[cfg(test)]
 use indexing::{
@@ -397,11 +398,18 @@ impl Backend {
         uri: &Url,
         form: IncludeForm,
         partial: String,
+        text: &str,
     ) -> LspResult<Option<CompletionResponse>> {
         let (dir_part, seg) = includes::split_partial(&partial);
         let current_dir = uri_to_path(uri).and_then(|p| p.parent().map(|d| d.to_path_buf()));
         let client_include_roots = self.include_paths.lock().await.clone();
         let workspace_root = self.root_for_uri(uri).await;
+        let current_rel_path = workspace_root.as_ref().and_then(|root| {
+            uri_to_path(uri).and_then(|path| pathing::relative_slash_path(root, &path).ok())
+        });
+        let current_rel_dir = current_rel_path
+            .as_deref()
+            .and_then(|path| path.rsplit_once('/').map(|(dir, _)| dir.to_string()));
         let include_table = match &workspace_root {
             Some(root) => self.include_tables.lock().await.get(root).cloned(),
             None => None,
@@ -413,38 +421,56 @@ impl Backend {
             .and_then(|root| pathing::default_index_path(root).ok());
         let external_cache = self.external_include_dir_cache.clone();
         let limit = query::COMPLETION_LIMIT;
+        let text = text.to_string();
 
         let started = tokio::time::Instant::now();
         let hit_memory = include_table.is_some();
         let hit_db = db_path.as_ref().is_some_and(|path| path.exists());
-        let result = tokio::task::spawn_blocking(move || -> Result<Vec<CompletionItem>> {
-            Ok(collect_include_candidates_with_table(
-                form,
-                &dir_part,
-                &seg,
-                current_dir.as_deref(),
-                workspace_root.as_deref(),
-                &include_roots,
-                db_path.as_deref(),
-                include_table.as_deref(),
-                Some(&external_cache),
-                limit,
-            ))
-        })
+        let result = tokio::task::spawn_blocking(
+            move || -> Result<(Vec<CompletionItem>, include_completion::IncludeCompletionMetrics)> {
+                let evidence =
+                    CurrentIncludeEvidence::from_text(&text, current_rel_path.as_deref());
+                Ok(collect_include_candidates_with_table_and_evidence(
+                    form,
+                    &dir_part,
+                    &seg,
+                    current_dir.as_deref(),
+                    workspace_root.as_deref(),
+                    &include_roots,
+                    db_path.as_deref(),
+                    include_table.as_deref(),
+                    Some(&external_cache),
+                    current_rel_dir.as_deref(),
+                    Some(&evidence),
+                    limit,
+                ))
+            },
+        )
         .await;
         let total_ms = started.elapsed().as_millis();
+        let metrics = result
+            .as_ref()
+            .ok()
+            .and_then(|inner| inner.as_ref().ok().map(|(_, metrics)| *metrics))
+            .unwrap_or_default();
         self.perf_log(|| {
             format!(
-                "[perf] include_completion total={}ms workspace_table={} workspace_index={}",
+                "[perf] include_completion total={}ms workspace_table={} workspace_index={} recent={} sibling={} basename={} depth_penalty={}",
                 total_ms,
                 if hit_memory { "memory" } else { "unavailable" },
-                if hit_db { "available" } else { "unavailable" }
+                if hit_db { "available" } else { "unavailable" },
+                metrics.recent,
+                metrics.sibling,
+                metrics.basename,
+                metrics.depth_penalty,
             )
         })
         .await;
 
         match self.unwrap_query("include completion", result).await {
-            Some(items) if !items.is_empty() => Ok(Some(CompletionResponse::Array(items))),
+            Some((items, _metrics)) if !items.is_empty() => {
+                Ok(Some(CompletionResponse::Array(items)))
+            }
             // Stay incomplete so the editor re-queries as the path is typed.
             _ => Ok(Some(empty_completion_list(true))),
         }
