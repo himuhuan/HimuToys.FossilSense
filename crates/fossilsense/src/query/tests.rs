@@ -419,6 +419,14 @@ fn identifier_completion_starts_at_one_character() {
 }
 
 #[test]
+fn normalized_receiver_record_hint_strips_only_digits_and_underscores() {
+    assert_eq!(normalized_receiver_record_hint("widget"), "widget");
+    assert_eq!(normalized_receiver_record_hint("_widget"), "widget");
+    assert_eq!(normalized_receiver_record_hint("2Widget"), "widget");
+    assert_eq!(normalized_receiver_record_hint("pWidget"), "pwidget");
+}
+
+#[test]
 fn short_prefix_keeps_exact_prefix_boundary_substr_only() {
     // At len < 3, only exact (1000), prefix (800), and word-boundary-
     // substring (650) hits survive; plain substrings (500) and all

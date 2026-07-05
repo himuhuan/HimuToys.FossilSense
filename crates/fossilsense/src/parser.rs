@@ -273,7 +273,7 @@ pub struct FieldDef {
     pub signature: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MemberKind {
     Field,
     Method,
@@ -292,7 +292,7 @@ impl MemberKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MemberConfidence {
     InBody,
     OutOfClassOwner,

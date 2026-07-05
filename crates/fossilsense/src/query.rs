@@ -855,6 +855,13 @@ pub const COMPLETION_LOCALITY_BONUS: i32 = 50;
 pub const MIN_PREFIX_LEN: usize = 1;
 pub const MEMBER_COMPLETION_MIN_PREFIX_LEN: usize = 2;
 
+#[allow(dead_code)]
+pub fn normalized_receiver_record_hint(receiver_name: &str) -> String {
+    receiver_name
+        .trim_start_matches(|ch: char| ch == '_' || ch.is_ascii_digit())
+        .to_ascii_lowercase()
+}
+
 /// Prefix lengths below this value use a tightened recall threshold
 /// (`SHORT_PREFIX_MIN_SCORE`); at this length and above the full fuzzy tier
 /// set (including subsequence / camelCase-initials matches) is restored.

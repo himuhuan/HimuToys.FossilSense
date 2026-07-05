@@ -27,6 +27,30 @@ fn member_confidence_from_str(confidence: &str) -> crate::parser::MemberConfiden
     }
 }
 
+fn member_kind_rank(kind: crate::parser::MemberKind) -> i32 {
+    match kind {
+        crate::parser::MemberKind::Field => 0,
+        crate::parser::MemberKind::Method => 1,
+        crate::parser::MemberKind::StaticMethod => 2,
+        crate::parser::MemberKind::NestedType => 3,
+    }
+}
+
+fn member_prefix_quality(name: &str, prefix: Option<&str>) -> i32 {
+    let Some(prefix) = prefix else {
+        return 0;
+    };
+    let name = name.to_ascii_lowercase();
+    let prefix = prefix.to_ascii_lowercase();
+    if name == prefix {
+        2
+    } else if name.starts_with(&prefix) {
+        1
+    } else {
+        0
+    }
+}
+
 impl IndexStore {
     /// Load every symbol id + name (+ external flag) for building the in-memory
     /// fuzzy name table.
@@ -453,14 +477,14 @@ impl IndexStore {
         &self,
         record_ids: &[i64],
         prefix: Option<&str>,
-        _ctx: Option<&crate::resolver::ResolveContext<'_>>,
+        ctx: Option<&crate::resolver::ResolveContext<'_>>,
     ) -> Result<Vec<MemberCandidate>> {
         if record_ids.is_empty() {
             return Ok(Vec::new());
         }
         let placeholders = vec!["?"; record_ids.len()].join(",");
         let mut sql = format!(
-            "SELECT m.name, m.kind, m.signature, m.confidence, f.path \
+            "SELECT m.name, m.kind, m.signature, m.confidence, f.path, f.source, f.directly_included \
              FROM members m \
              JOIN record_defs r ON r.id = m.record_id \
              JOIN files f ON f.id = r.file_id \
@@ -479,20 +503,122 @@ impl IndexStore {
         let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
             let kind_str: String = row.get(1)?;
             let confidence_str: String = row.get(3)?;
+            let path: String = row.get(4)?;
+            let source_str: String = row.get(5)?;
+            let directly_included: i64 = row.get(6)?;
             Ok(MemberCandidate {
                 name: row.get(0)?,
                 kind: member_kind_from_str(&kind_str),
                 signature: row.get(2)?,
-                tier: crate::model::ScopeTier::Global,
+                tier: crate::resolver::scope_tier(
+                    &path,
+                    source_str == "external",
+                    directly_included != 0,
+                    ctx,
+                ),
                 confidence: member_confidence_from_str(&confidence_str),
-                owner_path: row.get(4)?,
+                owner_path: path,
             })
         })?;
         let mut members = Vec::new();
         for row in rows {
             members.push(row?);
         }
+        members.sort_by(|a, b| {
+            b.tier
+                .rank()
+                .cmp(&a.tier.rank())
+                .then_with(|| member_kind_rank(a.kind).cmp(&member_kind_rank(b.kind)))
+                .then_with(|| {
+                    member_prefix_quality(&b.name, prefix)
+                        .cmp(&member_prefix_quality(&a.name, prefix))
+                })
+                .then_with(|| a.signature.cmp(&b.signature))
+                .then_with(|| a.name.cmp(&b.name))
+        });
         Ok(members)
+    }
+
+    #[allow(dead_code)]
+    pub fn fallback_member_candidates(
+        &self,
+        prefix: &str,
+        limit: usize,
+        ctx: Option<&crate::resolver::ResolveContext<'_>>,
+    ) -> Result<Vec<MemberCandidate>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let pattern = format!("{}%", prefix.replace('%', "\\%").replace('_', "\\_"));
+        let mut stmt = self.conn.prepare(
+            "SELECT m.name, m.kind, m.confidence, m.signature, f.path, f.source, f.directly_included \
+             FROM members m \
+             JOIN record_defs r ON r.id = m.record_id \
+             JOIN files f ON f.id = r.file_id \
+             WHERE m.name LIKE ?1 ESCAPE '\\' COLLATE NOCASE",
+        )?;
+        let rows = stmt.query_map([pattern], |row| {
+            let kind_str: String = row.get(1)?;
+            let confidence_str: String = row.get(2)?;
+            let path: String = row.get(4)?;
+            let source_str: String = row.get(5)?;
+            let directly_included: i64 = row.get(6)?;
+            Ok(MemberCandidate {
+                name: row.get(0)?,
+                kind: member_kind_from_str(&kind_str),
+                signature: row.get(3)?,
+                tier: crate::resolver::scope_tier(
+                    &path,
+                    source_str == "external",
+                    directly_included != 0,
+                    ctx,
+                ),
+                confidence: member_confidence_from_str(&confidence_str),
+                owner_path: path,
+            })
+        })?;
+
+        struct MemberMeta {
+            candidate: MemberCandidate,
+            freq: usize,
+        }
+
+        let mut by_member: HashMap<(String, crate::parser::MemberKind), MemberMeta> =
+            HashMap::new();
+        for row in rows {
+            let candidate = row?;
+            let key = (candidate.name.to_ascii_lowercase(), candidate.kind);
+            let entry = by_member.entry(key).or_insert(MemberMeta {
+                candidate: candidate.clone(),
+                freq: 0,
+            });
+            entry.freq += 1;
+            if candidate.tier.rank() > entry.candidate.tier.rank()
+                || (candidate.tier == entry.candidate.tier
+                    && candidate.signature < entry.candidate.signature)
+            {
+                entry.candidate = candidate;
+            }
+        }
+
+        let mut sorted: Vec<MemberMeta> = by_member.into_values().collect();
+        sorted.sort_by(|a, b| {
+            b.candidate
+                .tier
+                .rank()
+                .cmp(&a.candidate.tier.rank())
+                .then_with(|| b.freq.cmp(&a.freq))
+                .then_with(|| {
+                    member_kind_rank(a.candidate.kind).cmp(&member_kind_rank(b.candidate.kind))
+                })
+                .then_with(|| a.candidate.name.cmp(&b.candidate.name))
+                .then_with(|| a.candidate.signature.cmp(&b.candidate.signature))
+        });
+        Ok(sorted
+            .into_iter()
+            .take(limit)
+            .map(|meta| meta.candidate)
+            .collect())
     }
 
     pub fn fields_for_records(&self, record_ids: &[i64]) -> Result<Vec<String>> {
