@@ -1,6 +1,6 @@
 # Smart Completion Phase 4-6 Requirements
 
-Status: approved-planned
+Status: implemented-and-verified
 Date: 2026-07-05
 Feature brief name: smart-completion-phase4-6
 
@@ -145,33 +145,33 @@ This would create cleaner long-term files such as `context.rs`, `recall.rs`, `ra
 
 | Requirement | Sources | Scenarios | Design decisions | Plan tasks | Test/validation | Status |
 |---|---|---|---|---|---|---|
-| FR1 | UR1, eval Phase 4 | SC1-SC5 | D1, D3 | Task 1 | `cargo test -p fossilsense completion::tests::intent_ -- --nocapture` | 已计划 |
-| FR2 | UR2, eval Phase 4 | SC1 | D3, D4 | Task 2 | `cargo test -p fossilsense completion::tests -- --nocapture` | 已计划 |
-| FR3 | UR3, eval Phase 4 | SC2 | D3, D4 | Task 2 | `cargo test -p fossilsense completion::tests -- --nocapture` | 已计划 |
-| FR4 | UR4, eval Phase 4 | SC3 | D3, D4 | Task 2 | `cargo test -p fossilsense completion::tests -- --nocapture` | 已计划 |
-| FR5 | UR5, eval Phase 4 | SC4 | D3, D4 | Task 2 | `cargo test -p fossilsense completion::tests -- --nocapture` | 已计划 |
-| FR6 | UR6, eval Phase 4 | SC5 | D3, D4 | Task 2 | `cargo test -p fossilsense completion::tests -- --nocapture` | 已计划 |
-| FR7 | UR1, UX risk section | SC1-SC5 | D3 | Task 1, Task 2 | `cargo test -p fossilsense completion::tests -- --nocapture` | 已计划 |
-| FR8 | UR1-UR6, Phase 2-3 architecture | SC1-SC5 | D1, D4 | Task 2 | `cargo test -p fossilsense completion::tests -- --nocapture` | 已计划 |
-| FR9 | UR7, eval Phase 5 | SC6, SC7 | D5 | Task 3 | `cargo test -p fossilsense query::tests -- --nocapture` | 已计划 |
-| FR10 | UR7, current `NameTable` facts | SC6 | D5, D6 | Task 3 | `cargo test -p fossilsense query::tests -- --nocapture` | 已计划 |
-| FR11 | UR8, memo rules | SC6, SC7 | D5, D6 | Task 3 | `cargo test -p fossilsense server::tests -- --nocapture` | 已计划 |
-| FR12 | UR11, `CLAUDE.md` short-prefix rules | SC7 | D5, D6 | Task 3 | `cargo test -p fossilsense query::tests -- --nocapture` | 已计划 |
-| FR13 | UR8, large-workspace rule | SC6, SC7 | D5 | Task 3 | `cargo test -p fossilsense query::tests -- --nocapture` | 已计划 |
-| FR14 | UR9, UR10, eval Phase 6 | SC8, SC9 | D7 | Task 4 | `cargo test -p fossilsense server::include_completion::tests -- --nocapture` | 已计划 |
-| FR15 | UR10, include table generation facts | SC8-SC10 | D7 | Task 4 | `cargo test -p fossilsense server::tests -- --nocapture` | 已计划 |
-| FR16 | UR11, privacy rules | SC10 | D8 | Task 2, Task 3, Task 4, Task 5 | `cargo test -p fossilsense completion::tests -- --nocapture`; `cargo test -p fossilsense server::include_completion::tests -- --nocapture` | 已计划 |
-| FR17 | UR11, current server routing | SC8, SC9 | D2 | Task 4, Task 6 | `cargo test -p fossilsense server::tests -- --nocapture` | 已计划 |
-| FR18 | docs consistency rules | SC1-SC10 | D1-D8 | Task 5, Task 6 | `rg -n "Phase 4-6|intent|multi-channel|include recent|sibling" README.md CLAUDE.md extensions/vscode/README.md` | 已计划 |
-| NFR1 | `CLAUDE.md` candidate-not-binding rule | SC1-SC10 | D3, D8 | Task 5 | Documentation wording review plus `rg -n "binding|best-effort|intent" README.md CLAUDE.md extensions/vscode/README.md` | 已计划 |
-| NFR2 | `CLAUDE.md` hot path rule | SC1-SC10 | D5, D6, D7 | Task 3, Task 4, Task 6 | Code review plus `cargo test -p fossilsense query::tests -- --nocapture`; `cargo test -p fossilsense server::include_completion::tests -- --nocapture` | 已计划 |
-| NFR3 | UX stability risk | SC1-SC10 | D4, D5 | Task 2, Task 3 | `cargo test -p fossilsense completion::tests -- --nocapture`; `cargo test -p fossilsense query::tests -- --nocapture` | 已计划 |
-| NFR4 | UR8 | SC6, SC7, SC10 | D5 | Task 3, Task 4, Task 6 | Perf summary review plus `cargo test -p fossilsense` | 已计划 |
-| NFR5 | privacy rules | SC10 | D8 | Task 2, Task 4, Task 5 | Source-safe summary tests and docs grep | 已计划 |
-| NFR6 | maintainability rules | SC1-SC10 | D1, D4, D7 | Task 1-4 | Pure logic tests: `completion::tests`, `query::tests`, `server::include_completion::tests` | 已计划 |
-| NFR7 | compatibility rules | SC7-SC9 | D2, D6, D7 | Task 6 | `cargo test -p fossilsense` | 已计划 |
-| NFR8 | `CLAUDE.md` model rules | SC1-SC10 | D3, D4, D6 | Task 1-5 | Code review for reused model vocabulary plus docs grep | 已计划 |
-| NFR9 | docs consistency rules | SC1-SC10 | D8 | Task 5, Task 6 | `rg -n "intent classifier|multi-channel recall|include recent|Phase 4-6" README.md CLAUDE.md extensions/vscode/README.md` | 已计划 |
+| FR1 | UR1, eval Phase 4 | SC1-SC5 | D1, D3 | Task 1 | `cargo test -p fossilsense completion::tests::intent_ -- --nocapture` | 已验证 |
+| FR2 | UR2, eval Phase 4 | SC1 | D3, D4 | Task 2 | `cargo test -p fossilsense completion::tests -- --nocapture` | 已验证 |
+| FR3 | UR3, eval Phase 4 | SC2 | D3, D4 | Task 2 | `cargo test -p fossilsense completion::tests -- --nocapture` | 已验证 |
+| FR4 | UR4, eval Phase 4 | SC3 | D3, D4 | Task 2 | `cargo test -p fossilsense completion::tests -- --nocapture` | 已验证 |
+| FR5 | UR5, eval Phase 4 | SC4 | D3, D4 | Task 2 | `cargo test -p fossilsense completion::tests -- --nocapture` | 已验证 |
+| FR6 | UR6, eval Phase 4 | SC5 | D3, D4 | Task 2 | `cargo test -p fossilsense completion::tests -- --nocapture` | 已验证 |
+| FR7 | UR1, UX risk section | SC1-SC5 | D3 | Task 1, Task 2 | `cargo test -p fossilsense completion::tests -- --nocapture` | 已验证 |
+| FR8 | UR1-UR6, Phase 2-3 architecture | SC1-SC5 | D1, D4 | Task 2 | `cargo test -p fossilsense completion::tests -- --nocapture` | 已验证 |
+| FR9 | UR7, eval Phase 5 | SC6, SC7 | D5 | Task 3 | `cargo test -p fossilsense query::tests -- --nocapture` | 已验证 |
+| FR10 | UR7, current `NameTable` facts | SC6 | D5, D6 | Task 3 | `cargo test -p fossilsense query::tests -- --nocapture` | 已验证 |
+| FR11 | UR8, memo rules | SC6, SC7 | D5, D6 | Task 3 | `cargo test -p fossilsense server::tests -- --nocapture` | 已验证 |
+| FR12 | UR11, `CLAUDE.md` short-prefix rules | SC7 | D5, D6 | Task 3 | `cargo test -p fossilsense query::tests -- --nocapture` | 已验证 |
+| FR13 | UR8, large-workspace rule | SC6, SC7 | D5 | Task 3 | `cargo test -p fossilsense query::tests -- --nocapture` | 已验证 |
+| FR14 | UR9, UR10, eval Phase 6 | SC8, SC9 | D7 | Task 4 | `cargo test -p fossilsense server::include_completion::tests -- --nocapture` | 已验证 |
+| FR15 | UR10, include table generation facts | SC8-SC10 | D7 | Task 4 | `cargo test -p fossilsense server::tests -- --nocapture` | 已验证 |
+| FR16 | UR11, privacy rules | SC10 | D8 | Task 2, Task 3, Task 4, Task 5 | `cargo test -p fossilsense completion::tests -- --nocapture`; `cargo test -p fossilsense server::include_completion::tests -- --nocapture` | 已验证 |
+| FR17 | UR11, current server routing | SC8, SC9 | D2 | Task 4, Task 6 | `cargo test -p fossilsense server::tests -- --nocapture` | 已验证 |
+| FR18 | docs consistency rules | SC1-SC10 | D1-D8 | Task 5, Task 6 | `rg -n "Phase 4-6|intent|multi-channel|include recent|sibling" README.md CLAUDE.md extensions/vscode/README.md` | 已验证 |
+| NFR1 | `CLAUDE.md` candidate-not-binding rule | SC1-SC10 | D3, D8 | Task 5 | Documentation wording review plus `rg -n "binding|best-effort|intent" README.md CLAUDE.md extensions/vscode/README.md` | 已验证 |
+| NFR2 | `CLAUDE.md` hot path rule | SC1-SC10 | D5, D6, D7 | Task 3, Task 4, Task 6 | Code review plus `cargo test -p fossilsense query::tests -- --nocapture`; `cargo test -p fossilsense server::include_completion::tests -- --nocapture` | 已验证 |
+| NFR3 | UX stability risk | SC1-SC10 | D4, D5 | Task 2, Task 3 | `cargo test -p fossilsense completion::tests -- --nocapture`; `cargo test -p fossilsense query::tests -- --nocapture` | 已验证 |
+| NFR4 | UR8 | SC6, SC7, SC10 | D5 | Task 3, Task 4, Task 6 | Perf summary review plus `cargo test -p fossilsense` | 已验证 |
+| NFR5 | privacy rules | SC10 | D8 | Task 2, Task 4, Task 5 | Source-safe summary tests and docs grep | 已验证 |
+| NFR6 | maintainability rules | SC1-SC10 | D1, D4, D7 | Task 1-4 | Pure logic tests: `completion::tests`, `query::tests`, `server::include_completion::tests` | 已验证 |
+| NFR7 | compatibility rules | SC7-SC9 | D2, D6, D7 | Task 6 | `cargo test -p fossilsense` | 已验证 |
+| NFR8 | `CLAUDE.md` model rules | SC1-SC10 | D3, D4, D6 | Task 1-5 | Code review for reused model vocabulary plus docs grep | 已验证 |
+| NFR9 | docs consistency rules | SC1-SC10 | D8 | Task 5, Task 6 | `rg -n "intent classifier|multi-channel recall|include recent|Phase 4-6" README.md CLAUDE.md extensions/vscode/README.md` | 已验证 |
 
 ## 9. 风险与缓解
 
@@ -193,3 +193,4 @@ This would create cleaner long-term files such as `context.rs`, `recall.rs`, `ra
 - 2026-07-05: User selected `smart-completion-phase4-6` as the feature brief name.
 - 2026-07-05: User approved the design scope: lightweight intent classifier, multi-channel recall quotas, and include completion ranking enhancement; member methods, local history, telemetry, ML, and auto include insertion excluded from this phase.
 - 2026-07-05: User approved `docs/smart-completion-phase4-6/requirements.md` as the implementation basis and requested continuing into the implementation plan.
+- 2026-07-05: Implementation verified with targeted Rust tests, full `cargo test -p fossilsense`, mini-c index smoke, VS Code extension compile, and VSIX package smoke. Generated VSIX: `dist/fossilsense-vscode-1.2.0_BUILD20260705_152610.vsix`.

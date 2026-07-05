@@ -14,7 +14,7 @@
 - Task 3 completed: bounded multi-channel `NameTable` recall and source-safe recall metrics implemented and committed as `b6e801b`.
 - Task 4 completed: include completion ranking evidence and edge-aware include table rebuild implemented and committed as `1d94106`.
 - Task 5 completed in working tree: README, extension README, `CLAUDE.md`, requirements, and this plan synchronized for Phase 4-6 wording.
-- Task 6 pending: full verification, package smoke, final requirements status update, and verification record.
+- Task 6 completed in working tree: full verification and package smoke passed; generated `dist/fossilsense-vscode-1.2.0_BUILD20260705_152610.vsix`; final requirements status and verification record updated.
 
 ## 全局约束
 
@@ -811,3 +811,16 @@ If all implementation and docs verification pass, update `docs/smart-completion-
 git add docs/smart-completion-phase4-6/requirements.md docs/smart-completion-phase4-6/plans/2026-07-05--implementation-plan.md
 git commit -m "test: verify smart completion phase 4-6"
 ```
+
+## Executed verification, 2026-07-05
+
+- `cargo test -p fossilsense completion::tests -- --nocapture`: passed, 39 targeted tests passed.
+- `cargo test -p fossilsense query::tests -- --nocapture`: passed, 31 targeted tests passed.
+- `cargo test -p fossilsense server::include_completion::tests -- --nocapture`: passed, 15 targeted tests passed.
+- `cargo test -p fossilsense server::tests -- --nocapture`: passed, 34 targeted tests passed.
+- `cargo test -p fossilsense`: passed, 448 unit tests and 2 LSP smoke tests passed.
+- `cargo run -p fossilsense -- index samples/mini-c --db target/smart-completion-phase4-6-mini.sqlite --force`: passed, indexed 2 files and 13 symbols.
+- `pnpm run compile` in `extensions/vscode`: passed.
+- `pnpm run package` in `extensions/vscode`: passed, generated `dist/fossilsense-vscode-1.2.0_BUILD20260705_152610.vsix`.
+
+No failed verification commands in this run. The generated VSIX includes the bundled `extension/bin/fossilsense.exe`.
