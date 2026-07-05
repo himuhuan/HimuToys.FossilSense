@@ -35,19 +35,36 @@ pub(super) fn extract_symbols_and_includes(
             symbols.push(symbol);
         }
 
+        let delta = brace_delta(line);
         if top_level && !trimmed.starts_with('#') && !trimmed.is_empty() {
             statement.push(line, line_index);
             if statement.is_complete() {
-                symbols.extend(capture_statement_symbols(
-                    &statement,
-                    line_starts,
-                    source,
-                    current_guard(&guard_stack),
-                ));
-                statement.clear();
+                if !statement.pending_typedef {
+                    symbols.extend(capture_statement_symbols(
+                        &statement,
+                        line_starts,
+                        source,
+                        current_guard(&guard_stack),
+                    ));
+                    statement.clear();
+                }
             }
         } else if !top_level {
-            statement.clear();
+            if statement.pending_typedef {
+                statement.push(line, line_index);
+                let trimmed_line = line.trim();
+                if brace_depth + delta == 0 && trimmed_line.ends_with(';') {
+                    symbols.extend(capture_statement_symbols(
+                        &statement,
+                        line_starts,
+                        source,
+                        current_guard(&guard_stack),
+                    ));
+                    statement.clear();
+                }
+            } else {
+                statement.clear();
+            }
         }
 
         update_guard_stack(trimmed, &mut guard_stack);
@@ -353,6 +370,7 @@ struct PendingStatement {
     start_line: usize,
     end_line: usize,
     active: bool,
+    pending_typedef: bool,
 }
 
 impl PendingStatement {
@@ -364,6 +382,18 @@ impl PendingStatement {
         self.end_line = line_index;
         self.text.push_str(line);
         self.text.push('\n');
+        let trimmed_text = self.text.trim();
+        let line_trimmed = line.trim();
+        if !line_trimmed.ends_with(';') {
+            if trimmed_text.starts_with("typedef ")
+                || trimmed_text.starts_with("struct ")
+                || trimmed_text.starts_with("union ")
+                || trimmed_text.starts_with("enum ")
+                || trimmed_text.starts_with("class ")
+            {
+                self.pending_typedef = true;
+            }
+        }
     }
 
     fn is_complete(&self) -> bool {
@@ -374,6 +404,7 @@ impl PendingStatement {
     fn clear(&mut self) {
         self.text.clear();
         self.active = false;
+        self.pending_typedef = false;
     }
 }
 
