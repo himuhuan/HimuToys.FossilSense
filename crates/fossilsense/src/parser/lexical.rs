@@ -126,7 +126,10 @@ fn capture_statement_symbols(
         return symbols;
     }
 
-    if let Some(symbol) = capture_typedef(statement, &compact, line_starts, source, guard.clone()) {
+    // Capture typedef first so we can exclude its name from tag type captures
+    let typedef_symbol = capture_typedef(statement, &compact, line_starts, source, guard.clone());
+    let typedef_name = typedef_symbol.as_ref().map(|s| s.name.clone());
+    if let Some(symbol) = typedef_symbol {
         symbols.push(symbol);
     }
 
@@ -136,6 +139,7 @@ fn capture_statement_symbols(
         line_starts,
         source,
         guard.clone(),
+        typedef_name.as_deref(),
     ));
 
     // Enum constants are extracted from the AST (`collect_enum_constants`), which
@@ -212,10 +216,18 @@ fn capture_tag_types(
     line_starts: &[usize],
     source: &str,
     guard: Option<String>,
+    skip_name: Option<&str>,
 ) -> Vec<Symbol> {
     tag_type_regex()
         .captures_iter(compact)
         .filter_map(|captures| captures.get(2).map(|name| name.as_str()))
+        .filter(|name| {
+            if let Some(skip) = skip_name {
+                *name != skip
+            } else {
+                true
+            }
+        })
         .map(|name| {
             make_symbol(
                 name,
