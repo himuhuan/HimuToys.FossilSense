@@ -10,8 +10,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex as StdMutex};
 use tempfile::tempdir;
 use tower_lsp::lsp_types::{
-    CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse, Position,
-    TextDocumentIdentifier, TextDocumentPositionParams, Url,
+    CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse, ExecuteCommandParams,
+    Position, TextDocumentIdentifier, TextDocumentPositionParams, Url,
 };
 use tower_lsp::{LanguageServer as _, LspService};
 
@@ -33,6 +33,10 @@ fn test_backend_service() -> LspService<super::Backend> {
         completion_enabled: AtomicBool::new(true),
         semantic_coloring_enabled: AtomicBool::new(true),
         scoping_enabled: AtomicBool::new(true),
+        completion_history_mode: Arc::new(tokio::sync::Mutex::new(
+            crate::completion_history::CompletionHistoryMode::Auto,
+        )),
+        completion_history: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         debug_candidate_reasons: AtomicBool::new(false),
         perf_logging_enabled: AtomicBool::new(false),
         reference_role_cache: Arc::new(crate::references::ReferenceRoleCache::new()),
@@ -283,6 +287,88 @@ async fn member_fallback_still_blocks_one_character_prefix() {
         .expect("completion request")
         .expect("completion response");
     assert!(completion_items(response).is_empty());
+}
+
+#[tokio::test]
+async fn execute_command_records_completion_accept_when_history_enabled() {
+    let service = test_backend_service();
+    let dir = tempdir().expect("tempdir");
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(dir.path().to_path_buf());
+    service
+        .inner()
+        .set_completion_history_mode_for_test(crate::completion_history::CompletionHistoryMode::On)
+        .await;
+
+    service
+        .inner()
+        .execute_command(ExecuteCommandParams {
+            command: super::COMPLETION_ACCEPTED_LSP_COMMAND.to_string(),
+            arguments: vec![serde_json::json!({
+                "workspaceHash": "test",
+                "candidateHash": "abc",
+                "kind": "function",
+                "intent": "call_target",
+                "prefixBucket": "pr"
+            })],
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .expect("command");
+
+    assert_eq!(
+        service
+            .inner()
+            .history_snapshot_for_test("test")
+            .await
+            .total_accepts(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn execute_command_ignores_completion_accept_when_history_disabled() {
+    let service = test_backend_service();
+    let dir = tempdir().expect("tempdir");
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(dir.path().to_path_buf());
+    service
+        .inner()
+        .set_completion_history_mode_for_test(crate::completion_history::CompletionHistoryMode::Off)
+        .await;
+
+    service
+        .inner()
+        .execute_command(ExecuteCommandParams {
+            command: super::COMPLETION_ACCEPTED_LSP_COMMAND.to_string(),
+            arguments: vec![serde_json::json!({
+                "workspaceHash": "test",
+                "candidateHash": "abc",
+                "kind": "function",
+                "intent": "call_target",
+                "prefixBucket": "pr"
+            })],
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .expect("command");
+
+    assert_eq!(
+        service
+            .inner()
+            .history_snapshot_for_test("test")
+            .await
+            .total_accepts(),
+        0
+    );
 }
 
 // --- R7: completion memo validity (generation + prefix extension check) ---

@@ -17,6 +17,7 @@ impl LanguageServer for Backend {
         let completion_mode = parse_completion_mode(&params);
         self.completion_enabled
             .store(completion_mode.is_enabled(), Ordering::Relaxed);
+        *self.completion_history_mode.lock().await = parse_completion_history_mode(&params);
 
         let completion_provider = if self.completion_enabled.load(Ordering::Relaxed) {
             Some(CompletionOptions {
@@ -96,6 +97,8 @@ impl LanguageServer for Backend {
                         REFRESH_INDEX_LSP_COMMAND.to_string(),
                         REBUILD_INDEX_LSP_COMMAND.to_string(),
                         GROUPED_REFERENCES_LSP_COMMAND.to_string(),
+                        COMPLETION_ACCEPTED_LSP_COMMAND.to_string(),
+                        CLEAR_COMPLETION_HISTORY_LSP_COMMAND.to_string(),
                     ],
                     ..Default::default()
                 }),
@@ -990,6 +993,38 @@ impl LanguageServer for Backend {
                 }
                 None => Ok(None),
             }
+        } else if params.command == COMPLETION_ACCEPTED_LSP_COMMAND {
+            if let Some(event) = completion_accept_event_from_arg(params.arguments.first()) {
+                if self.record_completion_accept(event).await.is_err() {
+                    self.client
+                        .log_message(
+                            MessageType::ERROR,
+                            "FossilSense completion history record failed",
+                        )
+                        .await;
+                }
+            }
+            Ok(None)
+        } else if params.command == CLEAR_COMPLETION_HISTORY_LSP_COMMAND {
+            match self.clear_completion_history().await {
+                Ok(removed) => {
+                    self.client
+                        .log_message(
+                            MessageType::INFO,
+                            format!("FossilSense completion history cleared entries={removed}"),
+                        )
+                        .await;
+                }
+                Err(_) => {
+                    self.client
+                        .log_message(
+                            MessageType::ERROR,
+                            "FossilSense completion history clear failed",
+                        )
+                        .await;
+                }
+            }
+            Ok(None)
         } else {
             Ok(None)
         }

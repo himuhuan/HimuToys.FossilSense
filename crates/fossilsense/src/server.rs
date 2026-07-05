@@ -25,6 +25,11 @@ use tower_lsp::lsp_types::{
 use tower_lsp::{async_trait, Client, LanguageServer, LspService, Server};
 
 use crate::completion::{self, CandidateEvidence, CandidateSource, CompletionCandidateKind};
+#[cfg(test)]
+use crate::completion_history::CompletionHistorySnapshot;
+use crate::completion_history::{
+    CompletionAcceptEvent, CompletionHistoryMode, CompletionHistoryStore,
+};
 use crate::completion_words;
 use crate::config::WorkspaceConfig;
 use crate::includes::{self, IncludeForm};
@@ -64,9 +69,9 @@ use lsp_adapters::{
 };
 use options::{
     candidate_reason_log_lines, completion_trigger_characters, empty_completion_list,
-    member_completion_is_incomplete, parse_completion_mode, parse_debug_candidate_reasons,
-    parse_debug_perf_logs, parse_include_paths, parse_include_scoping_enabled,
-    parse_semantic_coloring_mode, signature_help_options,
+    member_completion_is_incomplete, parse_completion_history_mode, parse_completion_mode,
+    parse_debug_candidate_reasons, parse_debug_perf_logs, parse_include_paths,
+    parse_include_scoping_enabled, parse_semantic_coloring_mode, signature_help_options,
 };
 
 type NameTables = Arc<Mutex<HashMap<PathBuf, Arc<NameTable>>>>;
@@ -243,6 +248,9 @@ const REFRESH_INDEX_COMMAND: &str = "fossilsense.refreshIndex";
 const REFRESH_INDEX_LSP_COMMAND: &str = "fossilsense.lsp.refreshIndex";
 const REBUILD_INDEX_COMMAND: &str = "fossilsense.rebuildIndex";
 const REBUILD_INDEX_LSP_COMMAND: &str = "fossilsense.lsp.rebuildIndex";
+pub(super) const COMPLETION_ACCEPTED_LSP_COMMAND: &str = "fossilsense.lsp.completionAccepted";
+pub(super) const CLEAR_COMPLETION_HISTORY_LSP_COMMAND: &str =
+    "fossilsense.lsp.clearCompletionHistory";
 /// Client command for role-grouped find-references: takes one argument object
 /// `{ uri, line, character }` and returns the role-labeled hits the standard
 /// `textDocument/references` cannot carry over the wire.
@@ -270,6 +278,8 @@ pub async fn run_stdio() -> Result<()> {
         completion_enabled: AtomicBool::new(true),
         semantic_coloring_enabled: AtomicBool::new(true),
         scoping_enabled: AtomicBool::new(true),
+        completion_history_mode: Arc::new(Mutex::new(CompletionHistoryMode::Auto)),
+        completion_history: Arc::new(Mutex::new(HashMap::new())),
         debug_candidate_reasons: AtomicBool::new(false),
         perf_logging_enabled: AtomicBool::new(false),
         reference_role_cache: Arc::new(references::ReferenceRoleCache::new()),
@@ -322,6 +332,12 @@ struct Backend {
     /// Whether limited include-reachability scoping is enabled. When off, both
     /// coloring and completion fall back to whole-index (unscoped) behavior.
     scoping_enabled: AtomicBool,
+    /// Local-only accepted-completion history mode. `auto` and `on` both record
+    /// anonymous positive feedback; `off` keeps deterministic v1.2.0 ranking.
+    completion_history_mode: Arc<Mutex<CompletionHistoryMode>>,
+    /// Workspace-local completion history stores, keyed by their cache file
+    /// path so multi-root workspaces remain separate on disk.
+    completion_history: Arc<Mutex<HashMap<PathBuf, CompletionHistoryStore>>>,
     /// Whether goto-definition logs each candidate's scope reasoning
     /// (tier/confidence/reason) to the output panel. Off by default; gated by
     /// `fossilsense.debug.candidateReasons`. A debug aid, not a user contract.
@@ -610,6 +626,101 @@ impl Backend {
         )
         .await;
     }
+
+    async fn record_completion_accept(&self, event: CompletionAcceptEvent) -> Result<()> {
+        if !self.completion_history_mode.lock().await.is_enabled() {
+            return Ok(());
+        }
+
+        let Some(root) = self.workspace_roots.lock().await.first().cloned() else {
+            return Ok(());
+        };
+        let history_path = pathing::default_completion_history_path(&root)?;
+        let mut stores = self.completion_history.lock().await;
+        if !stores.contains_key(&history_path) {
+            stores.insert(
+                history_path.clone(),
+                CompletionHistoryStore::open(&history_path)?,
+            );
+        }
+        if let Some(store) = stores.get_mut(&history_path) {
+            store.record_accept(event)?;
+        }
+        Ok(())
+    }
+
+    async fn clear_completion_history(&self) -> Result<usize> {
+        let roots = self.workspace_roots.lock().await.clone();
+        let mut stores = self.completion_history.lock().await;
+        let mut removed = 0usize;
+
+        if roots.is_empty() {
+            for store in stores.values_mut() {
+                removed += store.clear_all()?;
+            }
+            return Ok(removed);
+        }
+
+        for root in roots {
+            let history_path = pathing::default_completion_history_path(&root)?;
+            if !stores.contains_key(&history_path) {
+                stores.insert(
+                    history_path.clone(),
+                    CompletionHistoryStore::open(&history_path)?,
+                );
+            }
+            if let Some(store) = stores.get_mut(&history_path) {
+                removed += store.clear_all()?;
+            }
+        }
+        Ok(removed)
+    }
+
+    #[cfg(test)]
+    async fn set_completion_history_mode_for_test(&self, mode: CompletionHistoryMode) {
+        *self.completion_history_mode.lock().await = mode;
+    }
+
+    #[cfg(test)]
+    async fn history_snapshot_for_test(&self, workspace_hash: &str) -> CompletionHistorySnapshot {
+        let stores = self.completion_history.lock().await;
+        let mut snapshot = CompletionHistorySnapshot::default();
+        for store in stores.values() {
+            snapshot.append_from(store.snapshot(workspace_hash));
+        }
+        snapshot
+    }
+}
+
+fn completion_accept_event_from_arg(arg: Option<&Value>) -> Option<CompletionAcceptEvent> {
+    let arg = arg?;
+    let workspace_hash = non_empty_string_field(arg, "workspaceHash")?;
+    let candidate_hash = non_empty_string_field(arg, "candidateHash")?;
+    let kind = non_empty_string_field(arg, "kind")?;
+    let intent = non_empty_string_field(arg, "intent")?;
+    let prefix_bucket = arg
+        .get("prefixBucket")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    Some(CompletionAcceptEvent {
+        workspace_hash,
+        candidate_hash,
+        kind,
+        intent,
+        prefix_bucket,
+        accepted_at: crate::completion_history::now_unix_secs(),
+    })
+}
+
+fn non_empty_string_field(value: &Value, field: &str) -> Option<String> {
+    value
+        .get(field)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
 }
 
 fn query_error_log_line(what: &str, kind: &str, detail: &str) -> String {
