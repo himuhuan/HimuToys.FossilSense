@@ -39,20 +39,6 @@ pub fn lsp_completion_kind(kind: &str) -> LspCompletionItemKind {
     }
 }
 
-/// Direct enum -> LSP completion-item-kind mapping for the completion hot path.
-/// Avoids a string round-trip when `RankedNameHit.kind` is already the parsed
-/// `SymbolKind` cached in the in-memory `NameTable`.
-pub fn lsp_completion_kind_from_parser(kind: ParserKind) -> LspCompletionItemKind {
-    match kind {
-        ParserKind::Function => LspCompletionItemKind::FUNCTION,
-        ParserKind::Macro => LspCompletionItemKind::CONSTANT,
-        ParserKind::Type => LspCompletionItemKind::STRUCT,
-        ParserKind::EnumConstant => LspCompletionItemKind::ENUM_MEMBER,
-        ParserKind::GlobalVariable => LspCompletionItemKind::VARIABLE,
-        ParserKind::Field => LspCompletionItemKind::FIELD,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

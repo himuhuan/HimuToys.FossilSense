@@ -384,7 +384,7 @@ dependencies = [
 
 [[package]]
 name = "fossilsense"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "anyhow",
  "bitflags 2.13.0",

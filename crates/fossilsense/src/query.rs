@@ -27,7 +27,7 @@ pub use hover::{
     RankedHoverCandidate, HOVER_CANDIDATE_LIMIT,
 };
 pub use local_completion::{local_completion_candidates, LocalCompletionCandidate};
-pub use lsp_kinds::{lsp_completion_kind_from_parser, lsp_kind_from_parser, lsp_symbol_kind};
+pub use lsp_kinds::{lsp_kind_from_parser, lsp_symbol_kind};
 pub use signatures::{
     call_context_at, rank_function_signature_candidates, signature_parts, signature_parts_for_name,
     CallContext, ParameterSpan, RankedSignatureCandidate, SignatureParts, SIGNATURE_HELP_LIMIT,

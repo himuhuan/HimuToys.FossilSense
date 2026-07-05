@@ -3,6 +3,8 @@ use std::collections::{HashMap, HashSet};
 use crate::completion_history::{candidate_hash_key, CompletionHistorySnapshot};
 use crate::model::{ResolutionConfidence, ScopeTier};
 
+pub(crate) mod ordinary_service;
+
 #[allow(dead_code)]
 const SOURCE_LOCAL_BINDING: i32 = 12_000;
 #[allow(dead_code)]

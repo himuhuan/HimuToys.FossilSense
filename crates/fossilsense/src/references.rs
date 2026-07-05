@@ -227,6 +227,27 @@ impl ReferenceSearchCache {
         inner.order.clear();
     }
 
+    #[cfg(test)]
+    pub fn len_for_test(&self) -> usize {
+        self.inner
+            .lock()
+            .map(|inner| inner.entries.len())
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub fn put_empty_for_test(&self, root: &str, identifier: &str, generation: u64) {
+        self.put(
+            SearchCacheKey {
+                root: root.to_string(),
+                identifier: identifier.to_string(),
+                generation,
+            },
+            Vec::new(),
+            false,
+        );
+    }
+
     fn get(&self, key: &SearchCacheKey) -> Option<(Vec<ReferenceHit>, bool)> {
         let inner = self.inner.lock().ok()?;
         inner

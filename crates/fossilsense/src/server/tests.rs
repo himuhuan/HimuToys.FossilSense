@@ -1,17 +1,17 @@
 use super::include_completion::IncludeCompletionTable;
 use super::{
-    completion_items_for_local_bindings, grouped_reference_items, local_words_for_cache,
-    rebuild_include_table, rebuild_indexed_file_list,
+    grouped_reference_items, local_words_for_cache, rebuild_include_table,
+    rebuild_indexed_file_list,
 };
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use tempfile::tempdir;
 use tower_lsp::lsp_types::{
-    CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse, ExecuteCommandParams,
-    Position, TextDocumentIdentifier, TextDocumentPositionParams, Url,
+    CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse, Documentation,
+    ExecuteCommandParams, Position, TextDocumentIdentifier, TextDocumentPositionParams, Url,
 };
 use tower_lsp::{LanguageServer as _, LspService};
 
@@ -20,15 +20,11 @@ fn test_backend_service() -> LspService<super::Backend> {
         client,
         workspace_roots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         index_schedule: Arc::new(tokio::sync::Mutex::new(IndexScheduleState::default())),
-        open_docs: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-        live_parse_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-        name_tables: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-        reach_graphs: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-        include_tables: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-        indexed_file_lists: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-        index_generations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        session: super::WorkspaceSession::new(
+            super::DocumentStore::default(),
+            super::CacheLedger::default(),
+        ),
         external_include_dir_cache: Arc::new(StdMutex::new(HashMap::new())),
-        local_word_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         include_paths: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         completion_enabled: AtomicBool::new(true),
         semantic_coloring_enabled: AtomicBool::new(true),
@@ -39,9 +35,6 @@ fn test_backend_service() -> LspService<super::Backend> {
         completion_history: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         debug_candidate_reasons: AtomicBool::new(false),
         perf_logging_enabled: AtomicBool::new(false),
-        reference_role_cache: Arc::new(crate::references::ReferenceRoleCache::new()),
-        reference_search_cache: Arc::new(crate::references::ReferenceSearchCache::new()),
-        completion_memo: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         config_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
     });
     service
@@ -66,6 +59,13 @@ fn completion_items(response: CompletionResponse) -> Vec<CompletionItem> {
     }
 }
 
+fn completion_response_is_incomplete(response: &CompletionResponse) -> bool {
+    match response {
+        CompletionResponse::Array(_) => false,
+        CompletionResponse::List(list) => list.is_incomplete,
+    }
+}
+
 fn text_and_position(marked: &str) -> (String, u32, u32) {
     let marker = "/*cursor*/";
     let cursor_byte = marked.find(marker).expect("cursor marker");
@@ -86,6 +86,19 @@ fn write_workspace_file(root: &std::path::Path, rel: &str, text: &str) {
         fs::create_dir_all(parent).expect("mkdir");
     }
     fs::write(path, text).expect("write file");
+}
+
+async fn open_test_document(
+    service: &LspService<super::Backend>,
+    uri: Url,
+    version: i32,
+    text: String,
+) {
+    service
+        .inner()
+        .session
+        .open_document(uri, version, text)
+        .await;
 }
 
 async fn indexed_backend_with_open_doc(
@@ -117,12 +130,7 @@ async fn indexed_backend_with_open_doc(
         .lock()
         .await
         .push(dir.path().to_path_buf());
-    service
-        .inner()
-        .open_docs
-        .lock()
-        .await
-        .insert(uri.clone(), (1, open_text));
+    open_test_document(&service, uri.clone(), 1, open_text).await;
     (dir, service, uri, line, character)
 }
 
@@ -140,6 +148,283 @@ async fn local_word_cache_is_keyed_by_document_version() {
     let third = local_words_for_cache(&cache, &uri, 2, "int changed_word;").await;
     assert!(!Arc::ptr_eq(&second, &third));
     assert!(third.iter().any(|word| word == "changed_word"));
+}
+
+#[tokio::test]
+async fn workspace_session_change_invalidates_live_document_caches() {
+    let documents = super::DocumentStore::default();
+    let cache = super::CacheLedger::default();
+    let session = super::WorkspaceSession::new(documents.clone(), cache.clone());
+    let root = tempdir().expect("root");
+    let path = root.path().join("src/main.c");
+    let uri = Url::from_file_path(&path).expect("uri");
+
+    documents
+        .open_document(uri.clone(), 1, "int cached_word;\n".to_string())
+        .await;
+    let words = documents
+        .local_words_for(&uri, 1, "int cached_word;\n")
+        .await;
+    assert!(words.contains("cached_word"));
+    let parsed = Arc::new(crate::parser::parse(&path, "int cached_word;\n"));
+    documents
+        .store_live_parse_for_test(uri.clone(), 1, parsed)
+        .await;
+    cache
+        .record_completion_memo(uri.clone(), "ca".to_string(), 7, vec![vec![0usize, 1usize]])
+        .await;
+    cache.mark_reference_search_cache_for_test("root", "cached_word", 7);
+
+    session
+        .change_document(uri.clone(), 2, "int changed_word;\n".to_string())
+        .await;
+
+    let snapshot = documents.snapshot(&uri).await.expect("open document");
+    assert_eq!(snapshot.version, 2);
+    assert!(snapshot.text.contains("changed_word"));
+    assert!(
+        documents.live_parse_for_test(&uri).await.is_none(),
+        "did_change must clear the live parse cache for the edited document"
+    );
+    assert!(
+        documents
+            .local_word_cache_entry_for_test(&uri)
+            .await
+            .is_none(),
+        "did_change must invalidate local words so completion sees the new text"
+    );
+    assert!(
+        cache.completion_memo_for_test(&uri).await.is_none(),
+        "did_change must clear per-document completion narrowing state"
+    );
+    assert_eq!(
+        cache.reference_search_cache_len_for_test(),
+        0,
+        "document changes must clear complete reference search results"
+    );
+}
+
+#[tokio::test]
+async fn workspace_session_close_clears_live_only_state_not_indexed_workspace_data() {
+    let documents = super::DocumentStore::default();
+    let cache = super::CacheLedger::default();
+    let session = super::WorkspaceSession::new(documents.clone(), cache.clone());
+    let root = tempdir().expect("root");
+    let root_path = root.path().to_path_buf();
+    let file_path = root.path().join("src/main.c");
+    let uri = Url::from_file_path(&file_path).expect("uri");
+
+    documents
+        .open_document(uri.clone(), 1, "int indexed_symbol;\n".to_string())
+        .await;
+    documents
+        .store_live_parse_for_test(
+            uri.clone(),
+            1,
+            Arc::new(crate::parser::parse(&file_path, "int indexed_symbol;\n")),
+        )
+        .await;
+    let _ = documents
+        .local_words_for(&uri, 1, "int indexed_symbol;\n")
+        .await;
+    cache
+        .set_name_table_for_test(
+            root_path.clone(),
+            Arc::new(crate::query::NameTable::build(vec![(
+                1,
+                "indexed_symbol".to_string(),
+                false,
+            )])),
+        )
+        .await;
+    cache
+        .set_indexed_file_list_for_test(
+            root_path.clone(),
+            Arc::new(vec![("src/main.c".to_string(), file_path.clone())]),
+        )
+        .await;
+
+    session.close_document(&uri).await;
+
+    assert!(documents.snapshot(&uri).await.is_none());
+    assert!(documents.live_parse_for_test(&uri).await.is_none());
+    assert!(documents
+        .local_word_cache_entry_for_test(&uri)
+        .await
+        .is_none());
+    assert!(
+        cache.name_table(&root_path).await.is_some(),
+        "closing an editor buffer must not delete indexed symbol data"
+    );
+    assert!(
+        cache.indexed_file_list(&root_path).await.is_some(),
+        "closing an editor buffer must not delete indexed reference scope"
+    );
+}
+
+#[tokio::test]
+async fn cache_ledger_publishes_full_and_dirty_read_models_with_generations() {
+    let root = tempdir().expect("root");
+    let root_path = root.path().to_path_buf();
+    write_workspace_file(root.path(), "src/main.c", "int alpha_symbol;\n");
+    crate::indexer::index_workspace(
+        root.path(),
+        crate::indexer::IndexOptions {
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("initial index");
+
+    let service = test_backend_service();
+    let full = service
+        .inner()
+        .session
+        .cache
+        .publish_full_index(&service.inner().client, root_path.clone())
+        .await
+        .expect("publish full");
+    assert_eq!(full.symbol_count, 1);
+    assert_eq!(full.reference_file_count, 1);
+    let full_snapshot = service
+        .inner()
+        .session
+        .snapshot_for_root(root_path.clone())
+        .await;
+    assert!(full_snapshot.name_table.is_some());
+    assert!(full_snapshot.reach_graph.is_some());
+    assert!(full_snapshot.include_table.is_some());
+    assert!(full_snapshot.indexed_files.is_some());
+    assert_ne!(full_snapshot.generation.as_u64(), 0);
+
+    write_workspace_file(
+        root.path(),
+        "src/main.c",
+        "int beta_symbol;\nint gamma_symbol;\n",
+    );
+    crate::indexer::index_dirty_files(
+        root.path(),
+        vec![crate::indexer::DirtyFileChange {
+            absolute_path: root.path().join("src/main.c"),
+            kind: crate::indexer::DirtyFileKind::Upsert,
+        }],
+        crate::indexer::IndexOptions {
+            force: false,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("dirty index");
+    let dirty = service
+        .inner()
+        .session
+        .cache
+        .publish_dirty_index(
+            &service.inner().client,
+            root_path.clone(),
+            &["src/main.c".to_string()],
+            &[],
+        )
+        .await
+        .expect("publish dirty");
+    assert_eq!(dirty.symbol_count, 2);
+    let dirty_snapshot = service.inner().session.snapshot_for_root(root_path).await;
+    assert_ne!(full_snapshot.generation, dirty_snapshot.generation);
+    assert_eq!(dirty_snapshot.name_table.as_ref().expect("table").len(), 2);
+}
+
+#[tokio::test]
+async fn cache_ledger_completion_memo_reuses_prefix_only_with_same_generation() {
+    let cache = super::CacheLedger::default();
+    let uri = Url::parse("file:///tmp/memo.c").expect("uri");
+
+    cache
+        .record_completion_memo(uri.clone(), "fo".to_string(), 42, vec![vec![1, 2, 3]])
+        .await;
+
+    let reused = cache.completion_memo_pools(&uri, 42, "foo", 1).await;
+    assert_eq!(reused.hit_kind, "pool");
+    assert_eq!(reused.prior_pools, vec![Some(vec![1, 2, 3])]);
+
+    let hot = cache.completion_memo_pools(&uri, 42, "fo", 1).await;
+    assert_eq!(hot.hit_kind, "hot");
+
+    let stale = cache.completion_memo_pools(&uri, 43, "foo", 1).await;
+    assert_eq!(stale.hit_kind, "cold");
+    assert_eq!(stale.prior_pools, vec![None]);
+}
+
+#[tokio::test]
+async fn cache_ledger_clears_reference_search_cache_after_document_and_index_changes() {
+    let documents = super::DocumentStore::default();
+    let cache = super::CacheLedger::default();
+    let session = super::WorkspaceSession::new(documents, cache.clone());
+    let uri = Url::parse("file:///tmp/references.c").expect("uri");
+
+    cache.mark_reference_search_cache_for_test("root", "needle", 1);
+    assert_eq!(cache.reference_search_cache_len_for_test(), 1);
+    session
+        .change_document(uri, 2, "int needle;\n".to_string())
+        .await;
+    assert_eq!(cache.reference_search_cache_len_for_test(), 0);
+
+    cache.mark_reference_search_cache_for_test("root", "needle", 2);
+    assert_eq!(cache.reference_search_cache_len_for_test(), 1);
+    cache.invalidate_after_index_change();
+    assert_eq!(cache.reference_search_cache_len_for_test(), 0);
+}
+
+#[tokio::test]
+async fn reach_scope_uses_captured_workspace_snapshot_graph() {
+    let service = test_backend_service();
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().to_path_buf();
+    let uri = Url::from_file_path(root.join("main.c")).expect("file uri");
+    let captured_graph = Arc::new(StdRwLock::new(crate::reachability::ReachGraph::new(
+        vec![("main.c".to_string(), "captured.h".to_string())],
+        vec![],
+        vec![],
+    )));
+    let snapshot = super::WorkspaceSnapshot {
+        root: root.clone(),
+        generation: super::state::WorkspaceGeneration::missing(),
+        settings: super::WorkspaceSnapshotSettings {
+            scoping_enabled: true,
+            ..Default::default()
+        },
+        name_table: None,
+        reach_graph: Some(captured_graph),
+        include_table: None,
+        indexed_files: None,
+    };
+
+    service
+        .inner()
+        .session
+        .cache
+        .reach_graphs
+        .lock()
+        .await
+        .insert(
+            root,
+            Arc::new(StdRwLock::new(crate::reachability::ReachGraph::new(
+                vec![("main.c".to_string(), "ledger.h".to_string())],
+                vec![],
+                vec![],
+            ))),
+        );
+
+    let (_rel, scope) = service
+        .inner()
+        .reach_scope_from_snapshot(&uri, &snapshot)
+        .expect("scope from captured snapshot");
+
+    assert!(scope.files.contains("captured.h"));
+    assert!(
+        !scope.files.contains("ledger.h"),
+        "request scope must come from the already captured snapshot"
+    );
 }
 
 #[tokio::test]
@@ -282,16 +567,23 @@ async fn member_completion_does_not_leak_global_owner_when_reachable_owner_lacks
         "#include \"reachable.hpp\"\nvoid f(W *w) { w->he/*cursor*/ }\n",
     )
     .await;
-    service.inner().reach_graphs.lock().await.insert(
-        dir.path().to_path_buf(),
-        Arc::new(std::sync::RwLock::new(
-            crate::reachability::ReachGraph::new(
-                vec![("main.cpp".to_string(), "reachable.hpp".to_string())],
-                vec![],
-                vec![],
-            ),
-        )),
-    );
+    service
+        .inner()
+        .session
+        .cache
+        .reach_graphs
+        .lock()
+        .await
+        .insert(
+            dir.path().to_path_buf(),
+            Arc::new(std::sync::RwLock::new(
+                crate::reachability::ReachGraph::new(
+                    vec![("main.cpp".to_string(), "reachable.hpp".to_string())],
+                    vec![],
+                    vec![],
+                ),
+            )),
+        );
 
     let response = service
         .inner()
@@ -568,12 +860,7 @@ async fn ordinary_completion_items_attach_history_accept_command_when_enabled() 
         .lock()
         .await
         .push(dir.path().to_path_buf());
-    service
-        .inner()
-        .open_docs
-        .lock()
-        .await
-        .insert(uri.clone(), (1, src));
+    open_test_document(&service, uri.clone(), 1, src).await;
     service
         .inner()
         .set_completion_history_mode_for_test(crate::completion_history::CompletionHistoryMode::On)
@@ -640,12 +927,7 @@ async fn ordinary_completion_does_not_open_history_store_on_completion_hot_path(
         .lock()
         .await
         .push(dir.path().to_path_buf());
-    service
-        .inner()
-        .open_docs
-        .lock()
-        .await
-        .insert(uri.clone(), (1, src));
+    open_test_document(&service, uri.clone(), 1, src).await;
     service
         .inner()
         .set_completion_history_mode_for_test(crate::completion_history::CompletionHistoryMode::On)
@@ -661,6 +943,219 @@ async fn ordinary_completion_does_not_open_history_store_on_completion_hot_path(
     assert!(
         service.inner().completion_history.lock().await.is_empty(),
         "ordinary completion should use only already-loaded in-memory history"
+    );
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PresentedCompletion {
+    label: String,
+    kind: Option<CompletionItemKind>,
+    detail: Option<String>,
+    documentation: Option<String>,
+    sort_text: Option<String>,
+    has_history_command: bool,
+}
+
+fn presented_completion(item: &CompletionItem) -> PresentedCompletion {
+    PresentedCompletion {
+        label: item.label.clone(),
+        kind: item.kind,
+        detail: item.detail.clone(),
+        documentation: item.documentation.as_ref().map(|doc| match doc {
+            Documentation::String(text) => text.clone(),
+            Documentation::MarkupContent(markup) => markup.value.clone(),
+        }),
+        sort_text: item.sort_text.clone(),
+        has_history_command: item.command.is_some(),
+    }
+}
+
+#[tokio::test]
+async fn ordinary_completion_compat_fixture_captures_presented_boundary_output() {
+    let (src, line, character) = text_and_position(
+        "#include \"reachable.h\"\n\
+         #define fs_overlay_macro 1\n\
+         typedef int fs_overlay_type;\n\
+         int fixture(int fs_param) {\n\
+             int fs_local_value;\n\
+             fs_text_word();\n\
+             fs/*cursor*/\n\
+         }\n",
+    );
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().to_path_buf();
+    write_workspace_file(dir.path(), "src/main.c", &src);
+    write_workspace_file(dir.path(), "reachable.h", "int fs_reachable_index(void);\n");
+
+    let uri = Url::from_file_path(root.join("src/main.c")).expect("file uri");
+    let service = test_backend_service();
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(root.clone());
+    service
+        .inner()
+        .session
+        .cache
+        .name_tables
+        .lock()
+        .await
+        .insert(
+            root.clone(),
+            Arc::new(crate::query::NameTable::build_with_paths(vec![
+                (
+                    1,
+                    "fs_reachable_index".to_string(),
+                    false,
+                    "reachable.h".to_string(),
+                    "function".to_string(),
+                    false,
+                ),
+                (
+                    2,
+                    "fs_external_index".to_string(),
+                    true,
+                    "sdk/external.h".to_string(),
+                    "type".to_string(),
+                    true,
+                ),
+                (
+                    3,
+                    "fs_unknown_index".to_string(),
+                    false,
+                    "ambiguous/unknown.h".to_string(),
+                    "enum_constant".to_string(),
+                    false,
+                ),
+                (
+                    4,
+                    "fs_global_index".to_string(),
+                    false,
+                    "global.c".to_string(),
+                    "macro".to_string(),
+                    false,
+                ),
+            ])),
+        );
+    service
+        .inner()
+        .session
+        .cache
+        .reach_graphs
+        .lock()
+        .await
+        .insert(
+            root.clone(),
+            Arc::new(std::sync::RwLock::new(
+                crate::reachability::ReachGraph::new(
+                    vec![("src/main.c".to_string(), "reachable.h".to_string())],
+                    vec![],
+                    vec!["src/main.c".to_string()],
+                ),
+            )),
+        );
+    open_test_document(&service, uri.clone(), 1, src).await;
+    service
+        .inner()
+        .set_completion_history_mode_for_test(crate::completion_history::CompletionHistoryMode::On)
+        .await;
+
+    let response = service
+        .inner()
+        .completion(completion_params(uri, line, character))
+        .await
+        .expect("completion request")
+        .expect("completion response");
+    assert!(completion_response_is_incomplete(&response));
+    let items = completion_items(response);
+    let presented: Vec<_> = items.iter().take(9).map(presented_completion).collect();
+
+    assert_eq!(
+        presented,
+        vec![
+            PresentedCompletion {
+                label: "fs_param".to_string(),
+                kind: Some(CompletionItemKind::VARIABLE),
+                detail: Some("parameter: int".to_string()),
+                documentation: None,
+                sort_text: Some("00000000".to_string()),
+                has_history_command: true,
+            },
+            PresentedCompletion {
+                label: "fs_local_value".to_string(),
+                kind: Some(CompletionItemKind::VARIABLE),
+                detail: Some("local: int".to_string()),
+                documentation: None,
+                sort_text: Some("00000001".to_string()),
+                has_history_command: true,
+            },
+            PresentedCompletion {
+                label: "fs_overlay_type".to_string(),
+                kind: Some(CompletionItemKind::STRUCT),
+                detail: Some("current".to_string()),
+                documentation: None,
+                sort_text: Some("00000002".to_string()),
+                has_history_command: true,
+            },
+            PresentedCompletion {
+                label: "fs_overlay_macro".to_string(),
+                kind: Some(CompletionItemKind::CONSTANT),
+                detail: Some("current".to_string()),
+                documentation: None,
+                sort_text: Some("00000003".to_string()),
+                has_history_command: true,
+            },
+            PresentedCompletion {
+                label: "fs_reachable_index".to_string(),
+                kind: Some(CompletionItemKind::FUNCTION),
+                detail: Some("reachable".to_string()),
+                documentation: Some(
+                    "FossilSense: reachable candidate (reachable, reachable_include)".to_string(),
+                ),
+                sort_text: Some("00000004".to_string()),
+                has_history_command: true,
+            },
+            PresentedCompletion {
+                label: "fs_external_index".to_string(),
+                kind: Some(CompletionItemKind::STRUCT),
+                detail: Some("external".to_string()),
+                documentation: Some(
+                    "FossilSense: external candidate (heuristic, external_first_layer)".to_string(),
+                ),
+                sort_text: Some("00000005".to_string()),
+                has_history_command: true,
+            },
+            PresentedCompletion {
+                label: "fs_global_index".to_string(),
+                kind: Some(CompletionItemKind::CONSTANT),
+                detail: Some("ambiguous".to_string()),
+                documentation: Some(
+                    "FossilSense: unknown candidate (ambiguous, global_fallback)".to_string(),
+                ),
+                sort_text: Some("00000006".to_string()),
+                has_history_command: true,
+            },
+            PresentedCompletion {
+                label: "fs_unknown_index".to_string(),
+                kind: Some(CompletionItemKind::ENUM_MEMBER),
+                detail: Some("ambiguous".to_string()),
+                documentation: Some(
+                    "FossilSense: unknown candidate (ambiguous, global_fallback)".to_string(),
+                ),
+                sort_text: Some("00000007".to_string()),
+                has_history_command: true,
+            },
+            PresentedCompletion {
+                label: "fs_text_word".to_string(),
+                kind: Some(CompletionItemKind::TEXT),
+                detail: Some("text".to_string()),
+                documentation: None,
+                sort_text: Some("00000008".to_string()),
+                has_history_command: true,
+            },
+        ]
     );
 }
 
@@ -846,7 +1341,7 @@ fn local_word_does_not_outrank_reachable_indexed_candidate() {
 fn completion_dedup_keeps_indexed_kind_over_same_name_local_word() {
     use crate::model::{ResolutionConfidence, ScopeTier};
 
-    let indexed = super::CompletionCandidate::new(
+    let indexed = crate::completion::PipelineCandidate::new(
         "hello_value",
         crate::completion::CandidateEvidence::new(
             crate::completion::CandidateSource::Indexed,
@@ -860,7 +1355,7 @@ fn completion_dedup_keeps_indexed_kind_over_same_name_local_word() {
             ..Default::default()
         },
     );
-    let local = super::CompletionCandidate::new(
+    let local = crate::completion::PipelineCandidate::new(
         "hello_value",
         crate::completion::CandidateEvidence::new(
             crate::completion::CandidateSource::LocalWord,
@@ -884,7 +1379,7 @@ fn completion_dedup_keeps_indexed_kind_over_same_name_local_word() {
 fn completion_dedup_keeps_local_binding_over_same_name_indexed_and_local_word() {
     use crate::model::{ResolutionConfidence, ScopeTier};
 
-    let indexed = super::CompletionCandidate::new(
+    let indexed = crate::completion::PipelineCandidate::new(
         "count",
         crate::completion::CandidateEvidence::new(
             crate::completion::CandidateSource::Indexed,
@@ -898,7 +1393,7 @@ fn completion_dedup_keeps_local_binding_over_same_name_indexed_and_local_word() 
             ..Default::default()
         },
     );
-    let local_binding = super::CompletionCandidate::new(
+    let local_binding = crate::completion::PipelineCandidate::new(
         "count",
         crate::completion::CandidateEvidence::new(
             crate::completion::CandidateSource::LocalBinding,
@@ -913,7 +1408,7 @@ fn completion_dedup_keeps_local_binding_over_same_name_indexed_and_local_word() 
             ..Default::default()
         },
     );
-    let local_word = super::CompletionCandidate::new(
+    let local_word = crate::completion::PipelineCandidate::new(
         "count",
         crate::completion::CandidateEvidence::new(
             crate::completion::CandidateSource::LocalWord,
@@ -939,49 +1434,6 @@ fn completion_dedup_keeps_local_binding_over_same_name_indexed_and_local_word() 
     assert_eq!(deduped[0].payload.kind, Some(CompletionItemKind::VARIABLE));
 }
 
-#[test]
-fn local_binding_candidates_render_variable_kind_and_detail() {
-    let hits = vec![crate::query::LocalCompletionCandidate {
-        name: "cursor_limit".to_string(),
-        kind: crate::parser::LocalBindingKind::LocalVariable,
-        detail: "local: int".to_string(),
-        score: 42_000,
-        match_score: 550,
-        decl_start_byte: 10,
-    }];
-
-    let candidates = completion_items_for_local_bindings(hits);
-    assert_eq!(candidates.len(), 1);
-    assert_eq!(candidates[0].name, "cursor_limit");
-    assert_eq!(
-        candidates[0].evidence.source,
-        crate::completion::CandidateSource::LocalBinding
-    );
-    assert_eq!(
-        candidates[0].payload.kind,
-        Some(CompletionItemKind::VARIABLE)
-    );
-    assert_eq!(candidates[0].payload.detail.as_deref(), Some("local: int"));
-}
-
-#[test]
-fn local_binding_evidence_uses_raw_match_not_packed_score() {
-    let packed_score = crate::resolver::pack_score(crate::model::ScopeTier::Current, 550, 0);
-    let hits = vec![crate::query::LocalCompletionCandidate {
-        name: "cursor_limit".to_string(),
-        kind: crate::parser::LocalBindingKind::LocalVariable,
-        detail: "local: int".to_string(),
-        score: packed_score,
-        match_score: 550,
-        decl_start_byte: 10,
-    }];
-
-    let candidates = completion_items_for_local_bindings(hits);
-
-    assert_eq!(candidates[0].evidence.score, packed_score);
-    assert_eq!(candidates[0].evidence.match_score, 550);
-}
-
 #[tokio::test]
 async fn ordinary_completion_uses_unsaved_current_file_overlay() {
     let (src, line, character) = text_and_position(
@@ -992,12 +1444,7 @@ async fn ordinary_completion_uses_unsaved_current_file_overlay() {
     let dir = tempdir().expect("tempdir");
     let uri = Url::from_file_path(dir.path().join("a.c")).expect("file uri");
     let service = test_backend_service();
-    service
-        .inner()
-        .open_docs
-        .lock()
-        .await
-        .insert(uri.clone(), (1, src));
+    open_test_document(&service, uri.clone(), 1, src).await;
 
     let response = service
         .inner()
@@ -1029,12 +1476,7 @@ async fn current_file_text_overlay_renders_text_kind() {
     let dir = tempdir().expect("tempdir");
     let uri = Url::from_file_path(dir.path().join("a.c")).expect("file uri");
     let service = test_backend_service();
-    service
-        .inner()
-        .open_docs
-        .lock()
-        .await
-        .insert(uri.clone(), (1, src));
+    open_test_document(&service, uri.clone(), 1, src).await;
 
     let response = service
         .inner()
@@ -1090,16 +1532,18 @@ async fn text_overlay_still_allows_exact_indexed_semantic_recovery() {
         "function".to_string(),
         false,
     ));
-    service.inner().name_tables.lock().await.insert(
-        root,
-        Arc::new(crate::query::NameTable::build_with_paths(names)),
-    );
     service
         .inner()
-        .open_docs
+        .session
+        .cache
+        .name_tables
         .lock()
         .await
-        .insert(uri.clone(), (1, src));
+        .insert(
+            root,
+            Arc::new(crate::query::NameTable::build_with_paths(names)),
+        );
+    open_test_document(&service, uri.clone(), 1, src).await;
 
     let response = service
         .inner()
@@ -1136,47 +1580,13 @@ fn final_rank_sort_text_matches_pipeline_order() {
     assert_eq!(items[1].sort_text.as_deref(), Some("00000001"));
 }
 
-#[test]
-fn indexed_candidate_evidence_uses_base_match_not_packed_score() {
-    use crate::model::ScopeTier;
-
-    let candidates = super::completion_items_for_indexed_hits(
-        vec![crate::query::RankedNameHit {
-            id: 1,
-            score: crate::resolver::pack_score(ScopeTier::Reachable, 800, 42),
-            tier: ScopeTier::Reachable,
-            base_match: 800,
-            name_len: "api_target".len(),
-            name: "api_target".to_string(),
-            kind: crate::parser::SymbolKind::Function,
-        }],
-        None,
-    );
-
-    assert_eq!(candidates.len(), 1);
-    assert_eq!(candidates[0].evidence.match_score, 800);
-    assert_ne!(
-        candidates[0].evidence.match_score,
-        candidates[0].evidence.score
-    );
-    assert_eq!(
-        candidates[0].payload.kind,
-        Some(CompletionItemKind::FUNCTION)
-    );
-}
-
 #[tokio::test]
 async fn local_binding_pipeline_uses_open_document_bindings_before_local_words() {
     let src = "int f(int count) {\n    int cursor_limit;\n    cur\n}\n";
     let dir = tempdir().expect("tempdir");
     let uri = Url::from_file_path(dir.path().join("a.c")).expect("file uri");
     let service = test_backend_service();
-    service
-        .inner()
-        .open_docs
-        .lock()
-        .await
-        .insert(uri.clone(), (1, src.to_string()));
+    open_test_document(&service, uri.clone(), 1, src.to_string()).await;
 
     let response = service
         .inner()
@@ -1195,40 +1605,6 @@ async fn local_binding_pipeline_uses_open_document_bindings_before_local_words()
 
     assert_eq!(cursor.kind, Some(CompletionItemKind::VARIABLE));
     assert_eq!(cursor.detail.as_deref(), Some("local: int"));
-}
-
-#[test]
-fn local_word_exact_index_match_uses_semantic_completion_kind() {
-    let table = crate::query::NameTable::build_with_paths(vec![(
-        1,
-        "api_target_function".to_string(),
-        false,
-        "inc/target.h".to_string(),
-        "function".to_string(),
-        false,
-    )]);
-    let local_score = crate::resolver::pack_score(
-        crate::model::ScopeTier::Current,
-        crate::query::COMPLETION_LOCALITY_BONUS + 550,
-        0,
-    );
-
-    let candidates = super::exact_indexed_completion_candidates_for_local_word(
-        &table,
-        "api_target_function",
-        local_score,
-        None,
-        None,
-        10,
-    );
-
-    assert_eq!(candidates.len(), 1);
-    assert_eq!(candidates[0].name, "api_target_function");
-    assert_eq!(candidates[0].evidence.score, local_score);
-    assert_eq!(
-        candidates[0].payload.kind,
-        Some(CompletionItemKind::FUNCTION)
-    );
 }
 
 // --- R7: watcher/debounce IndexScheduleState machine tests ---------------

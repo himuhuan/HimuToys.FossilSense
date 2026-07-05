@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 
 use anyhow::Result;
 use serde_json::Value;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
 use tower_lsp::jsonrpc::Result as LspResult;
 use tower_lsp::lsp_types::{
     Command, CompletionItem, CompletionItemKind, CompletionList, CompletionOptions,
@@ -24,21 +24,22 @@ use tower_lsp::lsp_types::{
 };
 use tower_lsp::{async_trait, Client, LanguageServer, LspService, Server};
 
-use crate::completion::{self, CandidateEvidence, CandidateSource, CompletionCandidateKind};
-use crate::completion_history::{
-    candidate_hash, candidate_hash_key, candidate_hash_key_from_hex, CompletionAcceptEvent,
-    CompletionHistoryMode, CompletionHistorySnapshot, CompletionHistoryStore,
+use crate::completion::ordinary_service::{
+    OrdinaryCompletionInput, OrdinaryCompletionItem, OrdinaryCompletionKind,
+    OrdinaryCompletionNameTable,
 };
-use crate::completion_words;
+use crate::completion::{self, CandidateEvidence};
+use crate::completion_history::{
+    candidate_hash, candidate_hash_key_from_hex, CompletionAcceptEvent, CompletionHistoryMode,
+    CompletionHistorySnapshot, CompletionHistoryStore,
+};
 use crate::config::WorkspaceConfig;
 use crate::includes::{self, IncludeForm};
-use crate::model;
 use crate::parser::{self, FileSemanticIndex};
 use crate::pathing;
 use crate::query::{self, NameTable};
 use crate::reachability::{self, ReachGraph};
 use crate::references;
-use crate::resolver;
 use crate::store::IndexStore;
 
 mod hover;
@@ -51,6 +52,7 @@ mod options;
 mod semantic_tokens;
 mod signature_help;
 mod state;
+mod workspace;
 
 use include_completion::{
     collect_include_candidates_with_table_and_evidence, configured_include_paths,
@@ -72,6 +74,10 @@ use options::{
     parse_debug_candidate_reasons, parse_debug_perf_logs, parse_include_paths,
     parse_include_scoping_enabled, parse_semantic_coloring_mode, signature_help_options,
 };
+use workspace::{
+    CacheLedger, CachePublishReport, DocumentStore, WorkspaceSession, WorkspaceSnapshot,
+    WorkspaceSnapshotSettings,
+};
 
 type NameTables = Arc<Mutex<HashMap<PathBuf, Arc<NameTable>>>>;
 type ReachGraphs = Arc<Mutex<HashMap<PathBuf, Arc<StdRwLock<ReachGraph>>>>>;
@@ -82,176 +88,32 @@ type LocalWordEntry = (i32, Arc<HashSet<String>>);
 type LocalWordCache = Arc<Mutex<HashMap<Url, LocalWordEntry>>>;
 type IndexSchedule = Arc<Mutex<IndexScheduleState>>;
 
-type CompletionCandidate = completion::PipelineCandidate<CompletionItem>;
-
-fn completion_candidate_kind_from_parser(kind: parser::SymbolKind) -> CompletionCandidateKind {
-    match kind {
-        parser::SymbolKind::Function => CompletionCandidateKind::Function,
-        parser::SymbolKind::Macro => CompletionCandidateKind::Macro,
-        parser::SymbolKind::Type => CompletionCandidateKind::Type,
-        parser::SymbolKind::EnumConstant => CompletionCandidateKind::EnumConstant,
-        parser::SymbolKind::GlobalVariable | parser::SymbolKind::Field => {
-            CompletionCandidateKind::Variable
-        }
-    }
-}
-
-fn completion_items_for_local_bindings(
-    hits: Vec<query::LocalCompletionCandidate>,
-) -> Vec<CompletionCandidate> {
-    hits.into_iter()
-        .map(|hit| {
-            let mut evidence = CandidateEvidence::new(
-                CandidateSource::LocalBinding,
-                model::ScopeTier::Current,
-                model::ResolutionConfidence::Heuristic,
-                hit.score,
-            );
-            evidence.match_score = hit.match_score;
-            evidence.kind = CompletionCandidateKind::Variable;
-            set_completion_history_key(&mut evidence, &hit.name);
-            CompletionCandidate::new(
-                hit.name.clone(),
-                evidence,
-                CompletionItem {
-                    label: hit.name,
-                    kind: Some(CompletionItemKind::VARIABLE),
-                    detail: Some(hit.detail),
-                    sort_text: Some(format!("{:08}", 100_000_000 - hit.score)),
-                    ..Default::default()
-                },
-            )
-        })
-        .collect()
-}
-
-fn completion_items_for_current_file_overlay(
-    hits: Vec<query::CurrentFileOverlayCandidate>,
-) -> Vec<CompletionCandidate> {
-    hits.into_iter()
-        .map(|hit| {
-            let is_text = !hit.semantic || hit.detail.as_deref() == Some("text");
-            let source = if is_text {
-                CandidateSource::LocalWord
-            } else {
-                CandidateSource::CurrentFileOverlay
-            };
-            let tier = if is_text {
-                model::ScopeTier::Global
-            } else {
-                model::ScopeTier::Current
-            };
-            let confidence = if is_text {
-                model::ResolutionConfidence::Fallback
-            } else {
-                model::ResolutionConfidence::Heuristic
-            };
-            let kind = if is_text {
-                CompletionItemKind::TEXT
-            } else {
-                query::lsp_completion_kind_from_parser(hit.kind)
-            };
-            let mut evidence = CandidateEvidence::new(source, tier, confidence, hit.match_score);
-            evidence.match_score = hit.match_score;
-            evidence.proximity_score = hit.proximity_score;
-            evidence.kind = if is_text {
-                CompletionCandidateKind::Text
-            } else {
-                completion_candidate_kind_from_parser(hit.kind)
-            };
-            set_completion_history_key(&mut evidence, &hit.name);
-
-            CompletionCandidate::new(
-                hit.name.clone(),
-                evidence,
-                CompletionItem {
-                    label: hit.name,
-                    kind: Some(kind),
-                    detail: hit.detail,
-                    ..Default::default()
-                },
-            )
-        })
-        .collect()
-}
-
-fn completion_items_for_indexed_hits(
-    hits: Vec<query::RankedNameHit>,
-    open_reason: Option<reachability::OpenReason>,
-) -> Vec<CompletionCandidate> {
-    hits.into_iter()
-        .map(|hit| {
-            let (confidence, reason) =
-                resolver::confidence_reason_for(hit.tier, false, open_reason);
-            let label = model::completion_scope_label(hit.tier, confidence, reason);
-            let mut evidence =
-                CandidateEvidence::new(CandidateSource::Indexed, hit.tier, confidence, hit.score);
-            evidence.match_score = hit.base_match;
-            evidence.kind = completion_candidate_kind_from_parser(hit.kind);
-            set_completion_history_key(&mut evidence, &hit.name);
-            CompletionCandidate::new(
-                hit.name.clone(),
-                evidence,
-                CompletionItem {
-                    label: hit.name,
-                    kind: Some(query::lsp_completion_kind_from_parser(hit.kind)),
-                    sort_text: Some(format!("{:08}", 100_000_000 - hit.score)),
-                    detail: label.as_ref().map(|l| l.detail.to_string()),
-                    documentation: label.map(|l| Documentation::String(l.documentation)),
-                    ..Default::default()
-                },
-            )
-        })
-        .collect()
-}
-
 fn apply_final_completion_sort_text(items: &mut [CompletionItem]) {
     for (index, item) in items.iter_mut().enumerate() {
         item.sort_text = Some(format!("{index:08}"));
     }
 }
 
-fn exact_indexed_completion_candidates_for_local_word(
-    table: &NameTable,
-    word: &str,
-    local_score: i32,
-    scope: Option<&query::CompletionScope>,
-    open_reason: Option<reachability::OpenReason>,
-    limit: usize,
-) -> Vec<CompletionCandidate> {
-    table
-        .exact_name_hits_scoped(word, limit, scope)
-        .into_iter()
-        .map(|hit| {
-            let (confidence, reason) =
-                resolver::confidence_reason_for(hit.tier, false, open_reason);
-            let label = model::completion_scope_label(hit.tier, confidence, reason);
-            let mut evidence =
-                CandidateEvidence::new(CandidateSource::Indexed, hit.tier, confidence, local_score);
-            evidence.match_score = hit.base_match;
-            evidence.kind = completion_candidate_kind_from_parser(hit.kind);
-            set_completion_history_key(&mut evidence, &hit.name);
-            CompletionCandidate::new(
-                hit.name.clone(),
-                evidence,
-                CompletionItem {
-                    label: hit.name,
-                    kind: Some(query::lsp_completion_kind_from_parser(hit.kind)),
-                    sort_text: Some(format!("{:08}", 100_000_000 - local_score)),
-                    detail: label.as_ref().map(|l| l.detail.to_string()),
-                    documentation: label.map(|l| Documentation::String(l.documentation)),
-                    ..Default::default()
-                },
-            )
-        })
-        .collect()
+fn ordinary_completion_item_to_lsp(item: OrdinaryCompletionItem) -> CompletionItem {
+    CompletionItem {
+        label: item.label,
+        kind: Some(ordinary_completion_kind_to_lsp(item.kind)),
+        detail: item.detail,
+        documentation: item.documentation.map(Documentation::String),
+        sort_text: item.initial_sort_text,
+        ..Default::default()
+    }
 }
 
-fn set_completion_history_key(evidence: &mut CandidateEvidence, label: &str) {
-    evidence.history_key = Some(candidate_hash_key(
-        label,
-        evidence.kind.as_history_kind_str(),
-    ));
+fn ordinary_completion_kind_to_lsp(kind: OrdinaryCompletionKind) -> CompletionItemKind {
+    match kind {
+        OrdinaryCompletionKind::Text => CompletionItemKind::TEXT,
+        OrdinaryCompletionKind::Function => CompletionItemKind::FUNCTION,
+        OrdinaryCompletionKind::Macro => CompletionItemKind::CONSTANT,
+        OrdinaryCompletionKind::Type => CompletionItemKind::STRUCT,
+        OrdinaryCompletionKind::Variable => CompletionItemKind::VARIABLE,
+        OrdinaryCompletionKind::EnumConstant => CompletionItemKind::ENUM_MEMBER,
+    }
 }
 
 const REFRESH_INDEX_COMMAND: &str = "fossilsense.refreshIndex";
@@ -275,15 +137,8 @@ pub async fn run_stdio() -> Result<()> {
         client,
         workspace_roots: Arc::new(Mutex::new(Vec::new())),
         index_schedule: Arc::new(Mutex::new(IndexScheduleState::default())),
-        open_docs: Arc::new(Mutex::new(HashMap::new())),
-        live_parse_cache: Arc::new(RwLock::new(HashMap::new())),
-        name_tables: Arc::new(Mutex::new(HashMap::new())),
-        reach_graphs: Arc::new(Mutex::new(HashMap::new())),
-        include_tables: Arc::new(Mutex::new(HashMap::new())),
-        indexed_file_lists: Arc::new(Mutex::new(HashMap::new())),
-        index_generations: Arc::new(Mutex::new(HashMap::new())),
+        session: WorkspaceSession::new(DocumentStore::default(), CacheLedger::default()),
         external_include_dir_cache: Arc::new(StdMutex::new(HashMap::new())),
-        local_word_cache: Arc::new(Mutex::new(HashMap::new())),
         include_paths: Arc::new(Mutex::new(Vec::new())),
         completion_enabled: AtomicBool::new(true),
         semantic_coloring_enabled: AtomicBool::new(true),
@@ -292,9 +147,6 @@ pub async fn run_stdio() -> Result<()> {
         completion_history: Arc::new(Mutex::new(HashMap::new())),
         debug_candidate_reasons: AtomicBool::new(false),
         perf_logging_enabled: AtomicBool::new(false),
-        reference_role_cache: Arc::new(references::ReferenceRoleCache::new()),
-        reference_search_cache: Arc::new(references::ReferenceSearchCache::new()),
-        completion_memo: Arc::new(Mutex::new(HashMap::new())),
         config_cache: Arc::new(Mutex::new(HashMap::new())),
     });
 
@@ -306,32 +158,10 @@ struct Backend {
     client: Client,
     workspace_roots: Arc<Mutex<Vec<PathBuf>>>,
     index_schedule: IndexSchedule,
-    /// Full text of currently-open buffers (FULL text sync), with LSP version
-    /// for cache-invalidation bookkeeping.
-    open_docs: Arc<Mutex<HashMap<Url, (i32, String)>>>,
-    /// Live-document parse cache: keyed by `(Url, version)`, stores the full
-    /// `FileSemanticIndex` for each open document version so that semantic
-    /// tokens, member completion, and document symbols avoid repeated parses.
-    live_parse_cache: Arc<RwLock<HashMap<Url, (i32, Arc<FileSemanticIndex>)>>>,
-    /// In-memory fuzzy symbol name table per workspace root.
-    name_tables: NameTables,
-    /// In-memory `#include` reachability graph per workspace root, rebuilt after
-    /// each index pass alongside the name table.
-    reach_graphs: ReachGraphs,
-    /// In-memory include completion table per workspace root. This mirrors the
-    /// indexed workspace file list so include completion does not scan SQLite on
-    /// each keystroke.
-    include_tables: IncludeTables,
-    /// Indexed workspace files per root, reused by references discovery.
-    indexed_file_lists: IndexedFileLists,
-    /// Unified generation token per root for derived index state and dependent
-    /// request caches.
-    index_generations: IndexGenerations,
+    /// Facade for live documents, read models, cache invalidation, and request snapshots.
+    session: WorkspaceSession,
     /// Directory-listing cache for configured external include roots.
     external_include_dir_cache: ExternalIncludeDirCache,
-    /// Local identifier words extracted from open documents, keyed by URI and
-    /// LSP version.
-    local_word_cache: LocalWordCache,
     /// External include reference directories (normalized) forwarded from the
     /// client; used for indexing, include-path completion, and jump-to-header.
     include_paths: Arc<Mutex<Vec<String>>>,
@@ -355,16 +185,6 @@ struct Backend {
     /// Whether `[perf]` request/index timings are sent to the output panel.
     /// Off by default; enabled by `RUST_LOG` debug/trace or client init options.
     perf_logging_enabled: AtomicBool,
-    /// Fingerprint-keyed cache of per-file reference-role classifications, so
-    /// repeated find-references queries do not re-parse unchanged files.
-    reference_role_cache: Arc<references::ReferenceRoleCache>,
-    /// Complete reference-search result cache shared by standard references and
-    /// the grouped-references command. Cleared when open or watched files change.
-    reference_search_cache: Arc<references::ReferenceSearchCache>,
-    /// Per-document completion narrowing memo: the last prefix and the candidate
-    /// pool each workspace table produced for it, reused when the next prefix
-    /// extends it and the tables are unchanged.
-    completion_memo: Arc<Mutex<HashMap<Url, state::CompletionMemo>>>,
     /// Cache for `WorkspaceConfig` per workspace root. Avoids re-reading and
     /// re-parsing `fossilsense.json` on every `did_change_watched_files` event.
     /// Invalidated when `fossilsense.json` itself changes (which triggers
@@ -437,7 +257,11 @@ impl Backend {
             .as_deref()
             .and_then(|path| path.rsplit_once('/').map(|(dir, _)| dir.to_string()));
         let include_table = match &workspace_root {
-            Some(root) => self.include_tables.lock().await.get(root).cloned(),
+            Some(root) => {
+                self.workspace_snapshot_for_root(root.clone())
+                    .await
+                    .include_table
+            }
             None => None,
         };
         let include_roots =
@@ -511,8 +335,8 @@ impl Backend {
     /// Version + text of an open buffer, read under one lock so live-parse cache
     /// entries cannot pair an old text snapshot with a newer LSP version.
     async fn document_snapshot(&self, uri: &Url) -> Option<(i32, String)> {
-        if let Some((version, text)) = self.open_docs.lock().await.get(uri) {
-            return Some((*version, text.clone()));
+        if let Some(snapshot) = self.session.documents.snapshot(uri).await {
+            return Some((snapshot.version, snapshot.text));
         }
         uri_to_path(uri)
             .and_then(|path| std::fs::read_to_string(path).ok())
@@ -520,7 +344,10 @@ impl Backend {
     }
 
     async fn local_words_for(&self, uri: &Url, version: i32, text: &str) -> Arc<HashSet<String>> {
-        local_words_for_cache(&self.local_word_cache, uri, version, text).await
+        self.session
+            .documents
+            .local_words_for(uri, version, text)
+            .await
     }
 
     /// Return a parsed `FileSemanticIndex` for an open document, using an
@@ -546,15 +373,10 @@ impl Backend {
         }
 
         // Fast path: cached entry with matching version.
-        {
-            let cache = self.live_parse_cache.read().await;
-            if let Some((v, cached)) = cache.get(uri) {
-                if *v == version {
-                    self.perf_log(|| format!("[perf] live_parse_cache hit {uri} (v{version})"))
-                        .await;
-                    return Some(cached.clone());
-                }
-            }
+        if let Some(cached) = self.session.documents.cached_live_parse(uri, version).await {
+            self.perf_log(|| format!("[perf] live_parse_cache hit {uri} (v{version})"))
+                .await;
+            return Some(cached);
         }
 
         // Cache miss: parse on the blocking thread-pool and store.
@@ -567,10 +389,10 @@ impl Backend {
                 .await
                 .ok()?;
 
-        self.live_parse_cache
-            .write()
-            .await
-            .insert(uri.clone(), (version, index.clone()));
+        self.session
+            .documents
+            .store_live_parse(uri.clone(), version, index.clone())
+            .await;
         Some(index)
     }
 
@@ -583,11 +405,43 @@ impl Backend {
             return None;
         }
         let root = self.root_for_uri(uri).await?;
+        let snapshot = self.workspace_snapshot_for_root(root).await;
+        self.reach_scope_from_snapshot(uri, &snapshot)
+    }
+
+    fn reach_scope_from_snapshot(
+        &self,
+        uri: &Url,
+        snapshot: &WorkspaceSnapshot,
+    ) -> Option<(String, Arc<reachability::ReachScope>)> {
         let path = uri_to_path(uri)?;
-        let rel = pathing::relative_slash_path(&root, &path).ok()?;
-        let graph = self.reach_graphs.lock().await.get(&root).cloned()?;
+        if !snapshot.settings.scoping_enabled {
+            return None;
+        }
+        let rel = pathing::relative_slash_path(&snapshot.root, &path).ok()?;
+        let graph = snapshot.reach_graph.clone()?;
         let scope = graph.read().ok()?.reachable(&rel);
         Some((rel, scope))
+    }
+
+    fn snapshot_settings(&self) -> WorkspaceSnapshotSettings {
+        WorkspaceSnapshotSettings {
+            completion_enabled: self.completion_enabled.load(Ordering::Relaxed),
+            semantic_coloring_enabled: self.semantic_coloring_enabled.load(Ordering::Relaxed),
+            scoping_enabled: self.scoping_enabled.load(Ordering::Relaxed),
+            perf_logging_enabled: self.perf_logging_enabled.load(Ordering::Relaxed),
+        }
+    }
+
+    async fn workspace_snapshot_for_root(&self, root: PathBuf) -> WorkspaceSnapshot {
+        self.session
+            .snapshot_for_root_with_settings(root, self.snapshot_settings())
+            .await
+    }
+
+    async fn workspace_snapshot_for_uri(&self, uri: &Url) -> Option<WorkspaceSnapshot> {
+        let root = self.root_for_uri(uri).await?;
+        Some(self.workspace_snapshot_for_root(root).await)
     }
 
     /// Workspace root containing `uri`, falling back to the first root.
@@ -631,7 +485,7 @@ impl Backend {
     async fn perf_log(&self, build_message: impl FnOnce() -> String) {
         emit_perf_log(
             &self.client,
-            self.perf_logging_enabled.load(Ordering::Relaxed),
+            self.snapshot_settings().perf_logging_enabled,
             build_message,
         )
         .await;
@@ -849,6 +703,7 @@ async fn emit_perf_log(client: &Client, enabled: bool, build_message: impl FnOnc
     }
 }
 
+#[cfg(test)]
 async fn local_words_for_cache(
     cache: &LocalWordCache,
     uri: &Url,
@@ -864,7 +719,7 @@ async fn local_words_for_cache(
         }
     }
 
-    let words = Arc::new(completion_words::extract_words(text));
+    let words = Arc::new(crate::completion_words::extract_words(text));
     cache
         .lock()
         .await

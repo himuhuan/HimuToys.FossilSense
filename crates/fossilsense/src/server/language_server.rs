@@ -128,10 +128,13 @@ impl LanguageServer for Backend {
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let uri = params.text_document.uri.clone();
-        self.open_docs.lock().await.insert(
-            uri.clone(),
-            (params.text_document.version, params.text_document.text),
-        );
+        self.session
+            .open_document(
+                uri.clone(),
+                params.text_document.version,
+                params.text_document.text,
+            )
+            .await;
         self.client
             .log_message(MessageType::LOG, format!("opened {uri}"))
             .await;
@@ -140,43 +143,18 @@ impl LanguageServer for Backend {
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         // FULL text sync: the final change carries the entire document.
         if let Some(change) = params.content_changes.into_iter().next_back() {
-            self.open_docs.lock().await.insert(
-                params.text_document.uri.clone(),
-                (params.text_document.version, change.text),
-            );
-            self.live_parse_cache
-                .write()
+            self.session
+                .change_document(
+                    params.text_document.uri.clone(),
+                    params.text_document.version,
+                    change.text,
+                )
                 .await
-                .remove(&params.text_document.uri);
-            self.local_word_cache
-                .lock()
-                .await
-                .remove(&params.text_document.uri);
-            self.completion_memo
-                .lock()
-                .await
-                .remove(&params.text_document.uri);
-            self.reference_search_cache.clear();
         }
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
-        self.open_docs
-            .lock()
-            .await
-            .remove(&params.text_document.uri);
-        self.live_parse_cache
-            .write()
-            .await
-            .remove(&params.text_document.uri);
-        self.local_word_cache
-            .lock()
-            .await
-            .remove(&params.text_document.uri);
-        self.completion_memo
-            .lock()
-            .await
-            .remove(&params.text_document.uri);
+        self.session.close_document(&params.text_document.uri).await;
     }
 
     async fn goto_definition(
@@ -293,23 +271,14 @@ impl LanguageServer for Backend {
 
         let client = self.client.clone();
         let search_word = word.clone();
-        let role_cache = self.reference_role_cache.clone();
-        let search_cache = self.reference_search_cache.clone();
-        let (indexed_generation, indexed_files) = {
-            let generation = self
-                .index_generations
-                .lock()
-                .await
-                .get(&root)
-                .copied()
-                .unwrap_or_else(state::WorkspaceGeneration::missing)
-                .as_u64();
-            let indexed_file_lists = self.indexed_file_lists.lock().await;
-            (
-                generation,
-                indexed_file_lists.get(&root).map(|files| (**files).clone()),
-            )
-        };
+        let role_cache = self.session.cache.reference_role_cache.clone();
+        let search_cache = self.session.cache.reference_search_cache.clone();
+        let snapshot = self.workspace_snapshot_for_root(root.clone()).await;
+        let indexed_generation = snapshot.generation.as_u64();
+        let indexed_files = snapshot
+            .indexed_files
+            .as_ref()
+            .map(|files| (**files).clone());
         let result = tokio::task::spawn_blocking(
             move || -> Result<(Vec<Location>, bool, references::ReferencesTiming)> {
                 let (mut hits, truncated, timing) =
@@ -374,11 +343,14 @@ impl LanguageServer for Backend {
     ) -> LspResult<Option<Vec<SymbolInformation>>> {
         let tables: Vec<(PathBuf, Arc<NameTable>)> = {
             let roots = self.workspace_roots.lock().await.clone();
-            let name_tables = self.name_tables.lock().await;
-            roots
-                .into_iter()
-                .filter_map(|root| name_tables.get(&root).cloned().map(|table| (root, table)))
-                .collect()
+            let mut tables = Vec::new();
+            for root in roots {
+                let snapshot = self.workspace_snapshot_for_root(root.clone()).await;
+                if let Some(table) = snapshot.name_table {
+                    tables.push((snapshot.root, table));
+                }
+            }
+            tables
         };
         if tables.is_empty() {
             return Ok(None);
@@ -473,7 +445,8 @@ impl LanguageServer for Backend {
     }
 
     async fn completion(&self, params: CompletionParams) -> LspResult<Option<CompletionResponse>> {
-        if !self.completion_enabled.load(Ordering::Relaxed) {
+        let request_settings = self.snapshot_settings();
+        if !request_settings.completion_enabled {
             return Ok(None);
         }
 
@@ -535,64 +508,35 @@ impl LanguageServer for Backend {
             }
             None => None,
         };
-        let local_binding_hits = parsed_document
-            .as_ref()
-            .map(|index| {
-                query::local_completion_candidates(
-                    &index.local_bindings,
-                    &text,
-                    position.line,
-                    position.character,
-                    &prefix,
-                    query::COMPLETION_LIMIT,
-                )
-            })
-            .unwrap_or_default();
-        let current_file_overlay_hits = parsed_document
-            .as_ref()
-            .map(|index| {
-                query::current_file_overlay_candidates(
-                    index,
-                    &text,
-                    position.line,
-                    position.character,
-                    &prefix,
-                    query::COMPLETION_LIMIT,
-                )
-            })
-            .unwrap_or_default();
-
         let local_words = self.local_words_for(&uri, version, &text).await;
 
-        let (tables, table_generations): (
-            Vec<(PathBuf, Arc<NameTable>)>,
-            Vec<(PathBuf, state::WorkspaceGeneration)>,
-        ) = {
+        let snapshots = {
             let roots = self.workspace_roots.lock().await.clone();
-            let name_tables = self.name_tables.lock().await;
-            let index_generations = self.index_generations.lock().await;
-            let mut tables = Vec::new();
-            let mut generations = Vec::new();
+            let mut snapshots = Vec::with_capacity(roots.len());
             for root in roots {
-                if let Some(table) = name_tables.get(&root).cloned() {
-                    let generation = index_generations
-                        .get(&root)
-                        .copied()
-                        .unwrap_or_else(state::WorkspaceGeneration::missing);
-                    generations.push((root.clone(), generation));
-                    tables.push((root, table));
-                }
+                snapshots.push(self.workspace_snapshot_for_root(root).await);
             }
-            (tables, generations)
+            snapshots
         };
+        let mut tables = Vec::new();
+        let mut table_generations = Vec::new();
+        for snapshot in &snapshots {
+            if let Some(table) = snapshot.name_table.clone() {
+                table_generations.push((snapshot.root.clone(), snapshot.generation));
+                tables.push(OrdinaryCompletionNameTable { table });
+            }
+        }
 
         // Limited include-reachability scope: re-ranks candidates by their
         // `ScopeTier` (current / reachable / first-layer external / unknown /
         // global) via the shared resolver. None => whole-index ranking (scoping
         // off, no graph yet, or unresolvable path).
-        let scope = self
-            .reach_scope_for(&uri)
+        let current_snapshot = self
+            .root_for_uri(&uri)
             .await
+            .and_then(|root| snapshots.iter().find(|snapshot| snapshot.root == root));
+        let scope = current_snapshot
+            .and_then(|snapshot| self.reach_scope_from_snapshot(&uri, snapshot))
             .map(|(rel, reach)| query::CompletionScope {
                 current_path: Some(rel),
                 reach: (*reach).clone(),
@@ -607,190 +551,37 @@ impl LanguageServer for Backend {
         // to a full scan.
         let completion_generation = state::combine_workspace_generations(&table_generations);
         let completion_started = tokio::time::Instant::now();
-        let (prior_pools, hit_kind): (Vec<Option<Vec<usize>>>, &str) = {
-            let memo = self.completion_memo.lock().await;
-            match memo.get(&uri) {
-                Some(m)
-                    if state::completion_memo_is_valid(
-                        m.generation,
-                        completion_generation,
-                        &m.prefix,
-                        &prefix,
-                    ) && prefix == m.prefix =>
-                {
-                    (m.pools.iter().cloned().map(Some).collect(), "hot")
-                }
-                Some(m)
-                    if state::completion_memo_is_valid(
-                        m.generation,
-                        completion_generation,
-                        &m.prefix,
-                        &prefix,
-                    ) =>
-                {
-                    (m.pools.iter().cloned().map(Some).collect(), "pool")
-                }
-                Some(_) => (vec![None; tables.len()], "cold"),
-                _ => (vec![None; tables.len()], "cold"),
-            }
-        };
+        let memo_lookup = self
+            .session
+            .cache
+            .completion_memo_pools(&uri, completion_generation, &prefix, tables.len())
+            .await;
+        let prior_pools = memo_lookup.prior_pools;
+        let hit_kind = memo_lookup.hit_kind;
         let memo_prefix = prefix.clone();
-        let command_workspace_hash = history_workspace_hash.clone();
-        let command_prefix_bucket = history_prefix_bucket.clone();
         let context_ms = ordinary_started.elapsed().as_millis();
 
-        let result = tokio::task::spawn_blocking(
-            move || -> Result<(
-                Vec<CompletionItem>,
-                Vec<Vec<usize>>,
-                crate::completion::CompletionPipelineMetrics,
-                u128,
-                u128,
-                u128,
-            )> {
-                use crate::model::ScopeTier;
-                let recall_started = std::time::Instant::now();
-                // First cause of the open scope (if any). An `Unknown`-tier
-                // candidate under an ambiguous include surfaces `Ambiguous`
-                // (and the `ambiguous` label) instead of a plain `Fallback`.
-                let open_reason = scope.as_ref().and_then(|s| s.reach.reason);
-                // Each candidate carries its name (for dedup/sort), the
-                // `(tier, confidence)` dedup key (kept separate so the dedup
-                // can compare without re-deriving the tier), the packed sort
-                // key, and the LSP item.
-                let mut candidates: Vec<CompletionCandidate> = Vec::new();
-                let mut new_pools: Vec<Vec<usize>> = Vec::with_capacity(tables.len());
-                let mut recall_channels = query::CompletionRecallMetrics::default();
+        let service_input = OrdinaryCompletionInput {
+            prefix: prefix.clone(),
+            text,
+            line: position.line,
+            character: position.character,
+            parsed_document,
+            local_words,
+            tables,
+            scope,
+            prior_pools,
+            intent,
+            history_enabled,
+            history: history_snapshot,
+            prefix_bucket: history_prefix_bucket.clone(),
+            limit,
+            locality_bonus,
+        };
 
-                // Collect indexed symbol candidates from all workspace roots. The
-                // symbol `kind` is cached in the in-memory NameTable, so the hot
-                // path no longer opens a read-only SQLite store per keystroke.
-                let quotas = query::CompletionRecallQuotas::default_for_completion_limit(limit);
-                for (idx, (_root, table)) in tables.iter().enumerate() {
-                    let prior = prior_pools.get(idx).and_then(|p| p.as_deref());
-                    let (hits, pool, metrics) = table.search_completion_recall_pooled(
-                        &prefix,
-                        quotas,
-                        scope.as_ref(),
-                        prior,
-                    );
-                    recall_channels.merge_from(metrics);
-                    new_pools.push(pool);
-                    candidates.extend(completion_items_for_indexed_hits(hits, open_reason));
-                }
-
-                candidates.extend(completion_items_for_local_bindings(local_binding_hits));
-                let current_file_text_overlay_names: HashSet<String> = current_file_overlay_hits
-                    .iter()
-                    .filter(|hit| !hit.semantic || hit.detail.as_deref() == Some("text"))
-                    .map(|hit| hit.name.clone())
-                    .collect();
-                candidates.extend(completion_items_for_current_file_overlay(
-                    current_file_overlay_hits,
-                ));
-
-                // Add current-file word candidates as fallback-only items.
-                // They remain useful for not-yet-indexed names, but same-name
-                // indexed symbols keep their semantic kind/detail.
-                for word in local_words.iter() {
-                    // The token under the cursor is already the user's input,
-                    // not a reusable completion candidate. Returning it as an
-                    // exact local word makes the editor prefer `prin` over an
-                    // indexed semantic candidate such as `printf`.
-                    if word == &prefix {
-                        continue;
-                    }
-                    let Some(word_score) =
-                        query::completion_word_score(&prefix, word, locality_bonus)
-                    else {
-                        continue;
-                    };
-                    let tier = ScopeTier::Global;
-                    // Raw local words are fallback text suggestions, not
-                    // current-file definitions. Keep their un-packed text score
-                    // so indexed symbols retain resolver-tier priority.
-                    let (confidence, _reason) =
-                        crate::resolver::confidence_reason_for(tier, false, None);
-                    let sort_text = format!("{:08}", 100_000_000 - word_score);
-                    let mut exact_indexed = Vec::new();
-                    for (_, table) in &tables {
-                        exact_indexed.extend(exact_indexed_completion_candidates_for_local_word(
-                            table.as_ref(),
-                            word,
-                            word_score,
-                            scope.as_ref(),
-                            open_reason,
-                            limit,
-                        ));
-                    }
-                    if !exact_indexed.is_empty() {
-                        candidates.extend(exact_indexed);
-                        continue;
-                    }
-                    if current_file_text_overlay_names.contains(word.as_str()) {
-                        continue;
-                    }
-                    let mut evidence = crate::completion::CandidateEvidence::new(
-                        crate::completion::CandidateSource::LocalWord,
-                        tier,
-                        confidence,
-                        word_score,
-                    );
-                    evidence.kind = crate::completion::CompletionCandidateKind::Text;
-                    set_completion_history_key(&mut evidence, word);
-                    candidates.push(CompletionCandidate::new(
-                        word.clone(),
-                        evidence,
-                        CompletionItem {
-                            label: word.clone(),
-                            kind: Some(CompletionItemKind::TEXT),
-                            sort_text: Some(sort_text),
-                            ..Default::default()
-                        },
-                    ));
-                }
-
-                let recall_ms = recall_started.elapsed().as_millis();
-                let merge_rank_started = std::time::Instant::now();
-                let mut output = crate::completion::run_evidence_aware_pipeline_with_context(
-                    candidates,
-                    limit,
-                    crate::completion::CompletionRankContext {
-                        intent,
-                        history_enabled,
-                        history: history_snapshot,
-                        prefix_bucket: history_prefix_bucket,
-                    },
-                );
-                output.metrics.recall_channels = recall_channels;
-                let merge_rank_ms = merge_rank_started.elapsed().as_millis();
-
-                let render_started = std::time::Instant::now();
-                let mut items: Vec<CompletionItem> = output
-                    .items
-                    .into_iter()
-                    .map(|candidate| {
-                        let mut item = candidate.payload;
-                        if history_enabled {
-                            if let Some(workspace_hash) = command_workspace_hash.as_deref() {
-                                attach_completion_history_accept_command(
-                                    &mut item,
-                                    candidate.evidence,
-                                    workspace_hash,
-                                    intent.kind,
-                                    &command_prefix_bucket,
-                                );
-                            }
-                        }
-                        item
-                    })
-                    .collect();
-                apply_final_completion_sort_text(&mut items);
-                let render_ms = render_started.elapsed().as_millis();
-
-                Ok((items, new_pools, output.metrics, recall_ms, merge_rank_ms, render_ms))
-            },
-        )
+        let result = tokio::task::spawn_blocking(move || -> Result<_> {
+            Ok(crate::completion::ordinary_service::complete_ordinary_identifier(service_input))
+        })
         .await;
 
         // The list is always incomplete: results are truncated to
@@ -800,14 +591,38 @@ impl LanguageServer for Backend {
         // truncation window as the user keeps typing, and prevents an empty
         // first batch from sticking as a "complete" no-match list.
         match self.unwrap_query("completion", result).await {
-            Some((items, new_pools, metrics, recall_ms, merge_rank_ms, render_ms)) => {
+            Some(output) => {
+                let render_started = std::time::Instant::now();
+                let mut items: Vec<CompletionItem> = output
+                    .items
+                    .into_iter()
+                    .map(|ordinary_item| {
+                        let evidence = ordinary_item.evidence;
+                        let mut item = ordinary_completion_item_to_lsp(ordinary_item);
+                        if history_enabled {
+                            if let Some(workspace_hash) = history_workspace_hash.as_deref() {
+                                attach_completion_history_accept_command(
+                                    &mut item,
+                                    evidence,
+                                    workspace_hash,
+                                    intent.kind,
+                                    &history_prefix_bucket,
+                                );
+                            }
+                        }
+                        item
+                    })
+                    .collect();
+                apply_final_completion_sort_text(&mut items);
+                let render_ms = render_started.elapsed().as_millis();
                 let timings = crate::completion::CompletionStageTimings {
                     total_ms: completion_started.elapsed().as_millis(),
                     context_ms,
-                    recall_ms,
-                    merge_rank_ms,
+                    recall_ms: output.recall_ms,
+                    merge_rank_ms: output.merge_rank_ms,
                     render_ms,
                 };
+                let metrics = output.metrics;
                 self.perf_log(|| {
                     crate::completion::completion_perf_summary(
                         &memo_prefix,
@@ -818,14 +633,15 @@ impl LanguageServer for Backend {
                 })
                 .await;
                 // Record this prefix's pools for the next (extending) keystroke.
-                self.completion_memo.lock().await.insert(
-                    uri,
-                    state::CompletionMemo {
-                        prefix: memo_prefix,
-                        generation: completion_generation,
-                        pools: new_pools,
-                    },
-                );
+                self.session
+                    .cache
+                    .record_completion_memo(
+                        uri,
+                        memo_prefix,
+                        completion_generation,
+                        output.new_pools,
+                    )
+                    .await;
                 if items.is_empty() {
                     Ok(Some(empty_completion_list(true)))
                 } else {
@@ -908,7 +724,7 @@ impl LanguageServer for Backend {
         let relevant_changes = dirty_changes.len() + usize::from(needs_full);
         let dirty_count = dirty_changes.len();
         if relevant_changes > 0 {
-            self.reference_search_cache.clear();
+            self.session.cache.invalidate_references();
         }
         self.client
             .log_message(
@@ -930,7 +746,7 @@ impl LanguageServer for Backend {
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
-        self.reference_search_cache.clear();
+        self.session.cache.invalidate_references();
         self.client
             .log_message(
                 MessageType::LOG,
@@ -984,23 +800,14 @@ impl LanguageServer for Backend {
             let Some(root) = self.root_for_uri(&uri).await else {
                 return Ok(None);
             };
-            let role_cache = self.reference_role_cache.clone();
-            let search_cache = self.reference_search_cache.clone();
-            let (indexed_generation, indexed_files) = {
-                let generation = self
-                    .index_generations
-                    .lock()
-                    .await
-                    .get(&root)
-                    .copied()
-                    .unwrap_or_else(state::WorkspaceGeneration::missing)
-                    .as_u64();
-                let indexed_file_lists = self.indexed_file_lists.lock().await;
-                (
-                    generation,
-                    indexed_file_lists.get(&root).map(|files| (**files).clone()),
-                )
-            };
+            let role_cache = self.session.cache.reference_role_cache.clone();
+            let search_cache = self.session.cache.reference_search_cache.clone();
+            let snapshot = self.workspace_snapshot_for_root(root.clone()).await;
+            let indexed_generation = snapshot.generation.as_u64();
+            let indexed_files = snapshot
+                .indexed_files
+                .as_ref()
+                .map(|files| (**files).clone());
             let result = tokio::task::spawn_blocking(
                 move || -> Result<(Vec<GroupedReferenceItem>, bool, references::ReferencesTiming)> {
                     // Reuses the full search-result cache shared with standard

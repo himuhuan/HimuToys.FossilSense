@@ -1,4 +1,9 @@
 use super::*;
+use crate::server::workspace::{ReadModelSnapshots, WorkspaceReadModels};
+use crate::server::{
+    state, CacheLedger, CachePublishReport, IncludeTables, IndexGenerations, IndexedFileLists,
+    NameTables, ReachGraphs,
+};
 
 /// Rebuild the in-memory fuzzy name table for `root` from its SQLite index.
 pub(super) async fn rebuild_name_table(name_tables: &NameTables, root: PathBuf) -> Result<usize> {
@@ -271,6 +276,7 @@ pub(in crate::server) async fn rebuild_indexed_file_list(
 
 pub(super) async fn refresh_workspace_generation(
     index_generations: &IndexGenerations,
+    read_model_snapshots: &ReadModelSnapshots,
     name_tables: &NameTables,
     reach_graphs: &ReachGraphs,
     include_tables: &IncludeTables,
@@ -285,12 +291,152 @@ pub(super) async fn refresh_workspace_generation(
     let generation = state::workspace_generation_for_parts(
         &root,
         state::WorkspaceGenerationParts {
-            name_table: name_table.map(|table| Arc::as_ptr(&table) as usize),
-            reach_graph: reach_graph.map(|graph| Arc::as_ptr(&graph) as usize),
-            include_table: include_table.map(|table| Arc::as_ptr(&table) as usize),
-            indexed_file_list: indexed_file_list.map(|files| Arc::as_ptr(&files) as usize),
+            name_table: name_table.as_ref().map(|table| Arc::as_ptr(table) as usize),
+            reach_graph: reach_graph
+                .as_ref()
+                .map(|graph| Arc::as_ptr(graph) as usize),
+            include_table: include_table
+                .as_ref()
+                .map(|table| Arc::as_ptr(table) as usize),
+            indexed_file_list: indexed_file_list
+                .as_ref()
+                .map(|files| Arc::as_ptr(files) as usize),
         },
     );
-    index_generations.lock().await.insert(root, generation);
+    index_generations
+        .lock()
+        .await
+        .insert(root.clone(), generation);
+    read_model_snapshots.lock().await.insert(
+        root,
+        WorkspaceReadModels {
+            generation,
+            name_table,
+            reach_graph,
+            include_table,
+            indexed_files: indexed_file_list,
+        },
+    );
     generation
+}
+
+impl CacheLedger {
+    pub(in crate::server) async fn publish_full_index(
+        &self,
+        client: &Client,
+        root: PathBuf,
+    ) -> Result<CachePublishReport> {
+        let nt_started = tokio::time::Instant::now();
+        let symbol_count = rebuild_name_table(&self.name_tables, root.clone()).await?;
+        let name_table_ms = nt_started.elapsed().as_millis();
+        let rg_started = tokio::time::Instant::now();
+        let mut degraded = DegradedCapabilities::default();
+        degraded.reach_graph = !rebuild_reach_graph(client, &self.reach_graphs, root.clone()).await;
+        let mut include_table_error = None;
+        let include_count = match rebuild_include_table(&self.include_tables, root.clone()).await {
+            Ok(count) => count,
+            Err(err) => {
+                degraded.include_table = true;
+                include_table_error = Some(format!("{err:#}"));
+                0
+            }
+        };
+        let mut reference_file_list_error = None;
+        let reference_file_count =
+            match rebuild_indexed_file_list(&self.indexed_file_lists, root.clone()).await {
+                Ok(count) => count,
+                Err(err) => {
+                    degraded.reference_file_list = true;
+                    reference_file_list_error = Some(format!("{err:#}"));
+                    0
+                }
+            };
+        let reach_graph_ms = rg_started.elapsed().as_millis();
+        let generation = refresh_workspace_generation(
+            &self.index_generations,
+            &self.read_model_snapshots,
+            &self.name_tables,
+            &self.reach_graphs,
+            &self.include_tables,
+            &self.indexed_file_lists,
+            root,
+        )
+        .await;
+        self.invalidate_after_index_change();
+        Ok(CachePublishReport {
+            symbol_count,
+            include_count,
+            reference_file_count,
+            name_table_ms,
+            reach_graph_ms,
+            degraded,
+            generation,
+            include_table_error,
+            reference_file_list_error,
+        })
+    }
+
+    pub(in crate::server) async fn publish_dirty_index(
+        &self,
+        client: &Client,
+        root: PathBuf,
+        rel_paths: &[String],
+        include_edge_sources_rebuilt: &[String],
+    ) -> Result<CachePublishReport> {
+        let nt_started = tokio::time::Instant::now();
+        let symbol_count =
+            update_name_table_paths(&self.name_tables, root.clone(), rel_paths).await?;
+        let name_table_ms = nt_started.elapsed().as_millis();
+        let rg_started = tokio::time::Instant::now();
+        let mut degraded = DegradedCapabilities::default();
+        degraded.reach_graph = !refresh_reach_graph_incremental(
+            client,
+            &self.reach_graphs,
+            root.clone(),
+            include_edge_sources_rebuilt,
+        )
+        .await;
+        let mut include_table_error = None;
+        let include_count = match rebuild_include_table(&self.include_tables, root.clone()).await {
+            Ok(count) => count,
+            Err(err) => {
+                degraded.include_table = true;
+                include_table_error = Some(format!("{err:#}"));
+                0
+            }
+        };
+        let mut reference_file_list_error = None;
+        let reference_file_count =
+            match rebuild_indexed_file_list(&self.indexed_file_lists, root.clone()).await {
+                Ok(count) => count,
+                Err(err) => {
+                    degraded.reference_file_list = true;
+                    reference_file_list_error = Some(format!("{err:#}"));
+                    0
+                }
+            };
+        let reach_graph_ms = rg_started.elapsed().as_millis();
+        let generation = refresh_workspace_generation(
+            &self.index_generations,
+            &self.read_model_snapshots,
+            &self.name_tables,
+            &self.reach_graphs,
+            &self.include_tables,
+            &self.indexed_file_lists,
+            root,
+        )
+        .await;
+        self.invalidate_after_index_change();
+        Ok(CachePublishReport {
+            symbol_count,
+            include_count,
+            reference_file_count,
+            name_table_ms,
+            reach_graph_ms,
+            degraded,
+            generation,
+            include_table_error,
+            reference_file_list_error,
+        })
+    }
 }

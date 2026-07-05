@@ -9,8 +9,8 @@ use tower_lsp::lsp_types::{FileChangeType, FileEvent, MessageType};
 use tower_lsp::Client;
 
 use super::{
-    emit_perf_log, state, uri_to_path, Backend, IncludeCompletionTable, IncludeTables,
-    IndexGenerations, IndexSchedule, IndexedFileLists, NameTables, ReachGraphs,
+    emit_perf_log, uri_to_path, Backend, CacheLedger, CachePublishReport, IncludeCompletionTable,
+    IndexSchedule,
 };
 use crate::indexer::{self, IndexOptions};
 use crate::pathing;
@@ -22,11 +22,9 @@ use crate::store::IndexStore;
 mod cache;
 mod watch;
 
-pub(super) use cache::{ready_cache_message, rebuild_include_table, rebuild_indexed_file_list};
-use cache::{
-    rebuild_name_table, rebuild_reach_graph, refresh_reach_graph_incremental,
-    refresh_workspace_generation, update_name_table_paths,
-};
+pub(super) use cache::ready_cache_message;
+#[cfg(test)]
+pub(super) use cache::{rebuild_include_table, rebuild_indexed_file_list};
 pub(super) use watch::watched_change_in_scope;
 
 const INDEX_DEBOUNCE: Duration = Duration::from_millis(350);
@@ -67,16 +65,12 @@ impl Notification for IndexStatusNotification {
 
 impl Backend {
     pub(super) async fn spawn_dirty_files(&self, changes: Vec<RootDirtyChange>) {
-        self.reference_search_cache.clear();
+        self.session.cache.invalidate_after_index_change();
         let roots = self.workspace_roots.lock().await.clone();
         let include_paths = self.include_paths.lock().await.clone();
         let client = self.client.clone();
         let index_schedule = self.index_schedule.clone();
-        let name_tables = self.name_tables.clone();
-        let reach_graphs = self.reach_graphs.clone();
-        let include_tables = self.include_tables.clone();
-        let indexed_file_lists = self.indexed_file_lists.clone();
-        let index_generations = self.index_generations.clone();
+        let cache = self.session.cache.clone();
         let perf_logging_enabled = self
             .perf_logging_enabled
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -95,11 +89,7 @@ impl Backend {
                 client,
                 roots,
                 include_paths,
-                name_tables,
-                reach_graphs,
-                include_tables,
-                indexed_file_lists,
-                index_generations,
+                cache,
                 index_schedule,
                 perf_logging_enabled,
             )
@@ -108,16 +98,12 @@ impl Backend {
     }
 
     pub(super) async fn spawn_index_roots(&self, force: Option<bool>) {
-        self.reference_search_cache.clear();
+        self.session.cache.invalidate_after_index_change();
         let roots = self.workspace_roots.lock().await.clone();
         let include_paths = self.include_paths.lock().await.clone();
         let client = self.client.clone();
         let index_schedule = self.index_schedule.clone();
-        let name_tables = self.name_tables.clone();
-        let reach_graphs = self.reach_graphs.clone();
-        let include_tables = self.include_tables.clone();
-        let indexed_file_lists = self.indexed_file_lists.clone();
-        let index_generations = self.index_generations.clone();
+        let cache = self.session.cache.clone();
         let force = force.unwrap_or(false);
         let perf_logging_enabled = self
             .perf_logging_enabled
@@ -139,11 +125,7 @@ impl Backend {
                 client,
                 roots,
                 include_paths,
-                name_tables,
-                reach_graphs,
-                include_tables,
-                indexed_file_lists,
-                index_generations,
+                cache,
                 index_schedule,
                 perf_logging_enabled,
             )
@@ -156,11 +138,7 @@ async fn run_scheduled_indexes(
     client: Client,
     roots: Vec<PathBuf>,
     include_paths: Vec<String>,
-    name_tables: NameTables,
-    reach_graphs: ReachGraphs,
-    include_tables: IncludeTables,
-    indexed_file_lists: IndexedFileLists,
-    index_generations: IndexGenerations,
+    cache: CacheLedger,
     index_schedule: IndexSchedule,
     perf_logging_enabled: bool,
 ) {
@@ -190,11 +168,7 @@ async fn run_scheduled_indexes(
                     client.clone(),
                     roots.clone(),
                     include_paths.clone(),
-                    name_tables.clone(),
-                    reach_graphs.clone(),
-                    include_tables.clone(),
-                    indexed_file_lists.clone(),
-                    index_generations.clone(),
+                    cache.clone(),
                     force,
                     perf_logging_enabled,
                 )
@@ -204,11 +178,7 @@ async fn run_scheduled_indexes(
                 index_dirty_roots(
                     client.clone(),
                     include_paths.clone(),
-                    name_tables.clone(),
-                    reach_graphs.clone(),
-                    include_tables.clone(),
-                    indexed_file_lists.clone(),
-                    index_generations.clone(),
+                    cache.clone(),
                     changes,
                     perf_logging_enabled,
                 )
@@ -238,11 +208,7 @@ async fn index_roots(
     client: Client,
     roots: Vec<PathBuf>,
     include_paths: Vec<String>,
-    name_tables: NameTables,
-    reach_graphs: ReachGraphs,
-    include_tables: IncludeTables,
-    indexed_file_lists: IndexedFileLists,
-    index_generations: IndexGenerations,
+    cache: CacheLedger,
     force: bool,
     perf_logging_enabled: bool,
 ) {
@@ -318,77 +284,27 @@ async fn index_roots(
                         ),
                     )
                     .await;
-                let nt_started = tokio::time::Instant::now();
-                match rebuild_name_table(&name_tables, root.clone()).await {
-                    Ok(count) => {
-                        stats.name_table_ms = nt_started.elapsed().as_millis();
-                        let rg_started = tokio::time::Instant::now();
-                        let mut degraded = DegradedCapabilities::default();
-                        degraded.reach_graph =
-                            !rebuild_reach_graph(&client, &reach_graphs, root.clone()).await;
-                        let include_count =
-                            match rebuild_include_table(&include_tables, root.clone()).await {
-                                Ok(count) => count,
-                                Err(err) => {
-                                    degraded.include_table = true;
-                                    client
-                                        .log_message(
-                                            MessageType::WARNING,
-                                            format!(
-                                            "include completion table build failed for {}: {err:#}",
-                                            display_root
-                                        ),
-                                        )
-                                        .await;
-                                    0
-                                }
-                            };
-                        let ref_file_count = match rebuild_indexed_file_list(
-                            &indexed_file_lists,
-                            root.clone(),
-                        )
-                        .await
-                        {
-                            Ok(count) => count,
-                            Err(err) => {
-                                degraded.reference_file_list = true;
-                                client
-                                    .log_message(
-                                        MessageType::WARNING,
-                                        format!(
-                                            "reference file-list build failed for {}: {err:#}",
-                                            display_root
-                                        ),
-                                    )
-                                    .await;
-                                0
-                            }
-                        };
-                        stats.reach_graph_ms = rg_started.elapsed().as_millis();
-                        refresh_workspace_generation(
-                            &index_generations,
-                            &name_tables,
-                            &reach_graphs,
-                            &include_tables,
-                            &indexed_file_lists,
-                            root.clone(),
-                        )
-                        .await;
+                match cache.publish_full_index(&client, root.clone()).await {
+                    Ok(report) => {
+                        stats.name_table_ms = report.name_table_ms;
+                        stats.reach_graph_ms = report.reach_graph_ms;
+                        let _published_generation = report.generation;
+                        log_cache_degradation(&client, &display_root, "build", &report).await;
                         client
                             .log_message(
-                                if degraded.any() {
+                                if report.degraded.any() {
                                     MessageType::WARNING
                                 } else {
                                     MessageType::INFO
                                 },
                                 ready_cache_message(
                                     "name table ready",
-                                    count,
-                                    include_count,
-                                    ref_file_count,
+                                    report.symbol_count,
+                                    report.include_count,
+                                    report.reference_file_count,
                                     stats.name_table_ms,
                                     stats.reach_graph_ms,
-                                    &degraded,
+                                    &report.degraded,
                                 ),
                             )
                             .await;
@@ -412,7 +328,11 @@ async fn index_roots(
                         .await;
                         client
                             .send_notification::<IndexStatusNotification>(
-                                IndexStatus::ready_with_degraded(display_root, &stats, degraded),
+                                IndexStatus::ready_with_degraded(
+                                    display_root,
+                                    &stats,
+                                    report.degraded,
+                                ),
                             )
                             .await;
                     }
@@ -467,11 +387,7 @@ async fn index_roots(
 async fn index_dirty_roots(
     client: Client,
     include_paths: Vec<String>,
-    name_tables: NameTables,
-    reach_graphs: ReachGraphs,
-    include_tables: IncludeTables,
-    indexed_file_lists: IndexedFileLists,
-    index_generations: IndexGenerations,
+    cache: CacheLedger,
     changes: Vec<RootDirtyChange>,
     perf_logging_enabled: bool,
 ) {
@@ -559,86 +475,35 @@ async fn index_dirty_roots(
                         ),
                     )
                     .await;
-                let nt_started = tokio::time::Instant::now();
-                match update_name_table_paths(&name_tables, root.clone(), &rel_paths).await {
-                    Ok(count) => {
-                        stats.name_table_ms = nt_started.elapsed().as_millis();
-                        let rg_started = tokio::time::Instant::now();
-                        let mut degraded = DegradedCapabilities::default();
-                        degraded.reach_graph = !refresh_reach_graph_incremental(
-                            &client,
-                            &reach_graphs,
-                            root.clone(),
-                            &stats.include_edge_sources_rebuilt,
-                        )
-                        .await;
-                        let include_count = match rebuild_include_table(
-                            &include_tables,
-                            root.clone(),
-                        )
-                        .await
-                        {
-                            Ok(count) => count,
-                            Err(err) => {
-                                degraded.include_table = true;
-                                client
-                                        .log_message(
-                                            MessageType::WARNING,
-                                            format!(
-                                                "include completion table update failed for {}: {err:#}",
-                                                display_root
-                                            ),
-                                        )
-                                        .await;
-                                0
-                            }
-                        };
-                        let ref_file_count = match rebuild_indexed_file_list(
-                            &indexed_file_lists,
-                            root.clone(),
-                        )
-                        .await
-                        {
-                            Ok(count) => count,
-                            Err(err) => {
-                                degraded.reference_file_list = true;
-                                client
-                                    .log_message(
-                                        MessageType::WARNING,
-                                        format!(
-                                            "reference file-list update failed for {}: {err:#}",
-                                            display_root
-                                        ),
-                                    )
-                                    .await;
-                                0
-                            }
-                        };
-                        stats.reach_graph_ms = rg_started.elapsed().as_millis();
-                        refresh_workspace_generation(
-                            &index_generations,
-                            &name_tables,
-                            &reach_graphs,
-                            &include_tables,
-                            &indexed_file_lists,
-                            root.clone(),
-                        )
-                        .await;
+                match cache
+                    .publish_dirty_index(
+                        &client,
+                        root.clone(),
+                        &rel_paths,
+                        &stats.include_edge_sources_rebuilt,
+                    )
+                    .await
+                {
+                    Ok(report) => {
+                        stats.name_table_ms = report.name_table_ms;
+                        stats.reach_graph_ms = report.reach_graph_ms;
+                        let _published_generation = report.generation;
+                        log_cache_degradation(&client, &display_root, "update", &report).await;
                         client
                             .log_message(
-                                if degraded.any() {
+                                if report.degraded.any() {
                                     MessageType::WARNING
                                 } else {
                                     MessageType::INFO
                                 },
                                 ready_cache_message(
                                     "name table updated",
-                                    count,
-                                    include_count,
-                                    ref_file_count,
+                                    report.symbol_count,
+                                    report.include_count,
+                                    report.reference_file_count,
                                     stats.name_table_ms,
                                     stats.reach_graph_ms,
-                                    &degraded,
+                                    &report.degraded,
                                 ),
                             )
                             .await;
@@ -662,7 +527,11 @@ async fn index_dirty_roots(
                         .await;
                         client
                             .send_notification::<IndexStatusNotification>(
-                                IndexStatus::ready_with_degraded(display_root, &stats, degraded),
+                                IndexStatus::ready_with_degraded(
+                                    display_root,
+                                    &stats,
+                                    report.degraded,
+                                ),
                             )
                             .await;
                     }
@@ -711,5 +580,37 @@ async fn index_dirty_roots(
                     .await;
             }
         }
+    }
+}
+
+async fn log_cache_degradation(
+    client: &Client,
+    display_root: &str,
+    operation: &str,
+    report: &CachePublishReport,
+) {
+    if report.degraded.include_table {
+        let detail = report
+            .include_table_error
+            .as_deref()
+            .unwrap_or("unavailable");
+        client
+            .log_message(
+                MessageType::WARNING,
+                format!("include completion table {operation} failed for {display_root}: {detail}"),
+            )
+            .await;
+    }
+    if report.degraded.reference_file_list {
+        let detail = report
+            .reference_file_list_error
+            .as_deref()
+            .unwrap_or("unavailable");
+        client
+            .log_message(
+                MessageType::WARNING,
+                format!("reference file-list {operation} failed for {display_root}: {detail}"),
+            )
+            .await;
     }
 }
