@@ -1596,3 +1596,23 @@ If all checks pass, update `docs/smart-completion-v1-2-1/requirements.md`:
 git add docs/smart-completion-v1-2-1/requirements.md docs/smart-completion-v1-2-1/plans/2026-07-05--implementation-plan.md
 git commit -m "test: verify smart completion v1.2.1"
 ```
+
+## Executed verification, 2026-07-05
+
+| Command | Result |
+|---|---|
+| `cargo test -p fossilsense parser::tests -- --nocapture` | PASS: 31 parser tests. |
+| `cargo test -p fossilsense store::tests::members -- --nocapture` | PASS: 10 member store/query tests. |
+| `cargo test -p fossilsense store::tests::resilience_schema -- --nocapture` | PASS: 7 schema resilience tests. |
+| `cargo test -p fossilsense completion_history -- --nocapture` | PASS: 3 history/options tests. |
+| `cargo test -p fossilsense completion::tests -- --nocapture` | PASS: 45 completion/ranker tests. |
+| `cargo test -p fossilsense server::tests -- --nocapture` | PASS: 39 server tests. |
+| `cargo test -p fossilsense` | PASS: 472 unit tests and 2 LSP smoke tests. |
+| `cargo run -p fossilsense -- index samples/mini-c --db target/smart-completion-v1-2-1-mini.sqlite --force` | PASS: indexed 2 files, 13 symbols, no failures. |
+| `pnpm run compile` in `extensions/vscode` | PASS. |
+| `pnpm run test` in `extensions/vscode` | PASS. |
+| `git diff --check` | PASS: no whitespace errors. |
+| Placeholder scan over `docs/smart-completion-v1-2-1` | PASS: no matches. |
+| `pnpm run package` in `extensions/vscode` | PASS: generated VSIX with bundled `extension/bin/fossilsense.exe`. |
+
+Generated VSIX: `dist/fossilsense-vscode-1.2.1_BUILD20260705_180741.vsix`.

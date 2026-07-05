@@ -1,6 +1,6 @@
 # Smart Completion v1.2.1 Phase 7-8 Requirements
 
-Status: approved-planned
+Status: implemented-and-verified
 Date: 2026-07-05
 Feature brief name: smart-completion-v1-2-1
 
@@ -170,35 +170,35 @@ This is rejected for v1.2.1. It conflicts with the local-only privacy requiremen
 
 | Requirement | Sources | Scenarios | Design decisions | Plan tasks | Test/validation | Status |
 |---|---|---|---|---|---|---|
-| FR1 | UR1, user request | SC1 | D10 | Task 1, Task 8, Task 9 | `rg -n -F "1.2.1" crates/fossilsense/Cargo.toml extensions/vscode/package.json README.md extensions/vscode/README.md CLAUDE.md`; `pnpm run package` | 已计划 |
-| FR2 | UR2-UR5, eval Phase 7 | SC2-SC5 | D2 | Task 2, Task 3, Task 4 | `cargo test -p fossilsense store::tests::members -- --nocapture`; `cargo test -p fossilsense parser::tests -- --nocapture` | 已计划 |
-| FR3 | UR11, user full-rebuild clarification | SC11 | D1 | Task 2, Task 9 | `cargo test -p fossilsense store::tests::resilience_schema -- --nocapture`; mini-c index smoke | 已计划 |
-| FR4 | UR2, existing field behavior | SC3 | D3 | Task 2, Task 3, Task 4, Task 5 | `cargo test -p fossilsense store::tests::members -- --nocapture`; `cargo test -p fossilsense server::tests -- --nocapture` | 已计划 |
-| FR5 | UR2, UR5, eval Phase 7 | SC2, SC4 | D4 | Task 3 | `cargo test -p fossilsense parser::tests -- --nocapture` | 已计划 |
-| FR6 | UR5, UR6, eval Phase 7 | SC5 | D4, D5 | Task 3, Task 4 | parser/store tests for simple `Owner::method` lower-confidence association | 已计划 |
-| FR7 | UR2-UR7 | SC2-SC7 | D2, D5, D6 | Task 4 | store owner-scoped and fallback member query tests | 已计划 |
-| FR8 | UR2-UR4 | SC2-SC6 | D2, D6 | Task 5 | server member completion tests for FIELD/METHOD kinds and labels | 已计划 |
-| FR9 | UR7 | SC6 | D6 | Task 5 | fallback prefix/cap/incomplete tests | 已计划 |
-| FR10 | UR6 | SC7 | D5 | Task 5 | weak receiver inference unit tests for unique and ambiguous cases | 已计划 |
-| FR11 | UR7, `CLAUDE.md` ordinary completion rules | SC2-SC6 | D2, D6 | Task 4, Task 5 | ordinary completion tests proving members do not leak into identifier completion | 已计划 |
-| FR12 | UR8, VS Code API docs | SC8 | D7 | Task 6, Task 7 | TypeScript command plumbing tests and LSP execute-command tests | 已计划 |
-| FR13 | UR9 | SC8-SC10 | D8 | Task 6 | history store tests for workspace keying, bounds, and clear | 已计划 |
-| FR14 | UR8, UR10 | SC9, SC10 | D8, D9 | Task 7 | ranker tests for bounded history boost and disabled parity | 已计划 |
-| FR15 | UR9 | SC10 | D8 | Task 1, Task 6 | extension config/command tests | 已计划 |
-| FR16 | UR10 | SC10 | D8, D9 | Task 7 | deterministic no-history parity tests | 已计划 |
-| FR17 | UR9, privacy rules | SC8-SC12 | D8 | Task 5, Task 6, Task 7, Task 8 | source-safe summary tests and docs grep | 已计划 |
-| FR18 | UR12, docs consistency rules | SC1-SC12 | D10 | Task 8 | docs grep for v1.2.1, member evidence, local history, non-goals | 已计划 |
-| FR19 | release hard rule in `CLAUDE.md` | SC1, SC11 | D10 | Task 9 | `pnpm run package` creates v1.2.1 VSIX with bundled binary | 已计划 |
-| NFR1 | `CLAUDE.md` candidate-not-binding rule | SC2-SC7 | D2, D4, D5 | Task 5, Task 8 | wording review and tests for confidence labels | 已计划 |
-| NFR2 | hot path rules | SC2-SC10 | D6, D8, D9 | Task 5, Task 6, Task 7 | code review plus perf summary tests | 已计划 |
-| NFR3 | UX stability | SC2-SC10 | D6, D9 | Task 5, Task 7 | deterministic sorting tests | 已计划 |
-| NFR4 | UR9 | SC8-SC10, SC12 | D8 | Task 6, Task 7, Task 8 | clear/disable tests and source-safe log tests | 已计划 |
-| NFR5 | maintainability rules | SC2-SC12 | D2-D9 | Task 2, Task 3, Task 4, Task 5, Task 6, Task 7 | focused parser/store/server/extension tests | 已计划 |
-| NFR6 | user full-rebuild clarification, `CLAUDE.md` ready-state rule | SC11 | D1 | Task 2, Task 9 | schema rebuild and mini-c index smoke | 已计划 |
-| NFR7 | `CLAUDE.md` model stability rule | SC2-SC10 | D2, D9 | Task 2, Task 3, Task 4, Task 7, Task 8 | code review for reused model vocabulary | 已计划 |
-| NFR8 | UR10 | SC9, SC10 | D9 | Task 7 | history boost cannot beat protected current/local evidence tests | 已计划 |
-| NFR9 | settings compatibility | SC10 | D8 | Task 1, Task 6 | config tests for completion mode vs history mode | 已计划 |
-| NFR10 | docs consistency | SC1-SC12 | D10 | Task 8 | docs grep and review | 已计划 |
+| FR1 | UR1, user request | SC1 | D10 | Task 1, Task 8, Task 9 | `rg -n -F "1.2.1" crates/fossilsense/Cargo.toml extensions/vscode/package.json README.md extensions/vscode/README.md CLAUDE.md`; `pnpm run package` | 已验证 |
+| FR2 | UR2-UR5, eval Phase 7 | SC2-SC5 | D2 | Task 2, Task 3, Task 4 | `cargo test -p fossilsense store::tests::members -- --nocapture`; `cargo test -p fossilsense parser::tests -- --nocapture` | 已验证 |
+| FR3 | UR11, user full-rebuild clarification | SC11 | D1 | Task 2, Task 9 | `cargo test -p fossilsense store::tests::resilience_schema -- --nocapture`; mini-c index smoke | 已验证 |
+| FR4 | UR2, existing field behavior | SC3 | D3 | Task 2, Task 3, Task 4, Task 5 | `cargo test -p fossilsense store::tests::members -- --nocapture`; `cargo test -p fossilsense server::tests -- --nocapture` | 已验证 |
+| FR5 | UR2, UR5, eval Phase 7 | SC2, SC4 | D4 | Task 3 | `cargo test -p fossilsense parser::tests -- --nocapture` | 已验证 |
+| FR6 | UR5, UR6, eval Phase 7 | SC5 | D4, D5 | Task 3, Task 4 | parser/store tests for simple `Owner::method` lower-confidence association | 已验证 |
+| FR7 | UR2-UR7 | SC2-SC7 | D2, D5, D6 | Task 4 | store owner-scoped and fallback member query tests | 已验证 |
+| FR8 | UR2-UR4 | SC2-SC6 | D2, D6 | Task 5 | server member completion tests for FIELD/METHOD kinds and labels | 已验证 |
+| FR9 | UR7 | SC6 | D6 | Task 5 | fallback prefix/cap/incomplete tests | 已验证 |
+| FR10 | UR6 | SC7 | D5 | Task 5 | weak receiver inference unit tests for unique and ambiguous cases | 已验证 |
+| FR11 | UR7, `CLAUDE.md` ordinary completion rules | SC2-SC6 | D2, D6 | Task 4, Task 5 | ordinary completion tests proving members do not leak into identifier completion | 已验证 |
+| FR12 | UR8, VS Code API docs | SC8 | D7 | Task 6, Task 7 | TypeScript command plumbing tests and LSP execute-command tests | 已验证 |
+| FR13 | UR9 | SC8-SC10 | D8 | Task 6 | history store tests for workspace keying, bounds, and clear | 已验证 |
+| FR14 | UR8, UR10 | SC9, SC10 | D8, D9 | Task 7 | ranker tests for bounded history boost and disabled parity | 已验证 |
+| FR15 | UR9 | SC10 | D8 | Task 1, Task 6 | extension config/command tests | 已验证 |
+| FR16 | UR10 | SC10 | D8, D9 | Task 7 | deterministic no-history parity tests | 已验证 |
+| FR17 | UR9, privacy rules | SC8-SC12 | D8 | Task 5, Task 6, Task 7, Task 8 | source-safe summary tests and docs grep | 已验证 |
+| FR18 | UR12, docs consistency rules | SC1-SC12 | D10 | Task 8 | docs grep for v1.2.1, member evidence, local history, non-goals | 已验证 |
+| FR19 | release hard rule in `CLAUDE.md` | SC1, SC11 | D10 | Task 9 | `pnpm run package` creates v1.2.1 VSIX with bundled binary | 已验证 |
+| NFR1 | `CLAUDE.md` candidate-not-binding rule | SC2-SC7 | D2, D4, D5 | Task 5, Task 8 | wording review and tests for confidence labels | 已验证 |
+| NFR2 | hot path rules | SC2-SC10 | D6, D8, D9 | Task 5, Task 6, Task 7 | code review plus perf summary tests | 已验证 |
+| NFR3 | UX stability | SC2-SC10 | D6, D9 | Task 5, Task 7 | deterministic sorting tests | 已验证 |
+| NFR4 | UR9 | SC8-SC10, SC12 | D8 | Task 6, Task 7, Task 8 | clear/disable tests and source-safe log tests | 已验证 |
+| NFR5 | maintainability rules | SC2-SC12 | D2-D9 | Task 2, Task 3, Task 4, Task 5, Task 6, Task 7 | focused parser/store/server/extension tests | 已验证 |
+| NFR6 | user full-rebuild clarification, `CLAUDE.md` ready-state rule | SC11 | D1 | Task 2, Task 9 | schema rebuild and mini-c index smoke | 已验证 |
+| NFR7 | `CLAUDE.md` model stability rule | SC2-SC10 | D2, D9 | Task 2, Task 3, Task 4, Task 7, Task 8 | code review for reused model vocabulary | 已验证 |
+| NFR8 | UR10 | SC9, SC10 | D9 | Task 7 | history boost cannot beat protected current/local evidence tests | 已验证 |
+| NFR9 | settings compatibility | SC10 | D8 | Task 1, Task 6 | config tests for completion mode vs history mode | 已验证 |
+| NFR10 | docs consistency | SC1-SC12 | D10 | Task 8 | docs grep and review | 已验证 |
 
 ## 9. 风险与缓解
 
@@ -223,3 +223,4 @@ This is rejected for v1.2.1. It conflicts with the local-only privacy requiremen
 - 2026-07-05: User approved 方案 A: Phase 7 member evidence plus Phase 8 local history, with local history default `auto` and clear/disable controls.
 - 2026-07-05: User clarified that a large refactor is acceptable and startup full rebuild is acceptable.
 - 2026-07-05: User approved this requirements document and requested implementation planning.
+- 2026-07-05: Implementation and verification completed. Passed targeted Rust tests (`parser::tests`, `store::tests::members`, `store::tests::resilience_schema`, `completion_history`, `completion::tests`, `server::tests`), full `cargo test -p fossilsense`, mini-c forced index smoke, extension `pnpm run compile` / `pnpm run test`, `git diff --check`, placeholder scan, and `pnpm run package`. Generated VSIX: `dist/fossilsense-vscode-1.2.1_BUILD20260705_180741.vsix`.
