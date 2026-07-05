@@ -37,6 +37,14 @@ const CONFIDENCE_FALLBACK: i32 = 0;
 const PROXIMITY_SCORE_CAP: i32 = 750;
 #[allow(dead_code)]
 const LOW_TRUST_GLOBAL_TEXT_CAP_BELOW_REACHABLE: i32 = 8_000;
+#[allow(dead_code)]
+const INTENT_STRONG_MATCH: i32 = 1_600;
+#[allow(dead_code)]
+const INTENT_MEDIUM_MATCH: i32 = 900;
+#[allow(dead_code)]
+const INTENT_BOUNDED_DEMOTION: i32 = -450;
+#[allow(dead_code)]
+const DECLARATION_GLOBAL_REUSE_DEMOTION: i32 = -5_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CompletionIntentKind {
@@ -66,6 +74,79 @@ impl Default for CompletionIntent {
         Self {
             kind: CompletionIntentKind::Neutral,
             confidence: CompletionIntentConfidence::Low,
+        }
+    }
+}
+
+impl CompletionIntentKind {
+    fn as_summary_str(self) -> &'static str {
+        match self {
+            CompletionIntentKind::Neutral => "neutral",
+            CompletionIntentKind::TypeName => "type_name",
+            CompletionIntentKind::ExpressionValue => "expression_value",
+            CompletionIntentKind::CallTarget => "call_target",
+            CompletionIntentKind::MacroPreprocessor => "macro_preprocessor",
+            CompletionIntentKind::DeclarationName => "declaration_name",
+        }
+    }
+}
+
+impl CompletionIntentConfidence {
+    fn as_summary_str(self) -> &'static str {
+        match self {
+            CompletionIntentConfidence::Low => "low",
+            CompletionIntentConfidence::Medium => "medium",
+            CompletionIntentConfidence::High => "high",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CompletionCandidateKind {
+    Unknown,
+    Function,
+    Macro,
+    Type,
+    Variable,
+    EnumConstant,
+    Text,
+}
+
+impl CompletionCandidateKind {
+    fn priority(self) -> u8 {
+        match self {
+            CompletionCandidateKind::Unknown => 0,
+            CompletionCandidateKind::Text => 1,
+            CompletionCandidateKind::Variable => 2,
+            CompletionCandidateKind::EnumConstant => 3,
+            CompletionCandidateKind::Macro => 4,
+            CompletionCandidateKind::Function => 5,
+            CompletionCandidateKind::Type => 5,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CompletionRankContext {
+    pub intent: CompletionIntent,
+}
+
+impl CompletionRankContext {
+    #[allow(dead_code)]
+    pub(crate) fn for_intent(
+        kind: CompletionIntentKind,
+        confidence: CompletionIntentConfidence,
+    ) -> Self {
+        Self {
+            intent: CompletionIntent { kind, confidence },
+        }
+    }
+}
+
+impl Default for CompletionRankContext {
+    fn default() -> Self {
+        Self {
+            intent: CompletionIntent::default(),
         }
     }
 }
@@ -275,6 +356,7 @@ pub(crate) struct CandidateEvidence {
     pub match_score: i32,
     pub locality_score: i32,
     pub proximity_score: i32,
+    pub kind: CompletionCandidateKind,
 }
 
 impl CandidateEvidence {
@@ -294,6 +376,7 @@ impl CandidateEvidence {
             match_score: score,
             locality_score: 0,
             proximity_score: 0,
+            kind: CompletionCandidateKind::Unknown,
         }
     }
 
@@ -310,6 +393,9 @@ impl CandidateEvidence {
         self.match_score = self.match_score.max(other.match_score);
         self.locality_score = self.locality_score.max(other.locality_score);
         self.proximity_score = self.proximity_score.max(other.proximity_score);
+        if other.kind.priority() > self.kind.priority() {
+            self.kind = other.kind;
+        }
     }
 }
 
@@ -360,7 +446,7 @@ pub(crate) struct FinalRankSummary {
     pub guarded_low_trust: usize,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CompletionPipelineMetrics {
     pub input_total: usize,
     pub after_dedup_total: usize,
@@ -369,6 +455,24 @@ pub(crate) struct CompletionPipelineMetrics {
     pub returned_sources: SourceCounts,
     pub final_rank: FinalRankSummary,
     pub shadow: Option<ShadowRankSummary>,
+    pub intent_kind: CompletionIntentKind,
+    pub intent_confidence: CompletionIntentConfidence,
+}
+
+impl Default for CompletionPipelineMetrics {
+    fn default() -> Self {
+        Self {
+            input_total: 0,
+            after_dedup_total: 0,
+            returned_total: 0,
+            input_sources: SourceCounts::default(),
+            returned_sources: SourceCounts::default(),
+            final_rank: FinalRankSummary::default(),
+            shadow: None,
+            intent_kind: CompletionIntentKind::Neutral,
+            intent_confidence: CompletionIntentConfidence::Low,
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -428,9 +532,20 @@ pub(crate) fn run_evidence_aware_pipeline<T>(
     candidates: Vec<PipelineCandidate<T>>,
     limit: usize,
 ) -> CompletionPipelineOutput<T> {
+    run_evidence_aware_pipeline_with_context(candidates, limit, CompletionRankContext::default())
+}
+
+#[allow(dead_code)]
+pub(crate) fn run_evidence_aware_pipeline_with_context<T>(
+    candidates: Vec<PipelineCandidate<T>>,
+    limit: usize,
+    context: CompletionRankContext,
+) -> CompletionPipelineOutput<T> {
     let mut metrics = CompletionPipelineMetrics {
         input_total: candidates.len(),
         input_sources: count_sources(candidates.iter()),
+        intent_kind: context.intent.kind,
+        intent_confidence: context.intent.confidence,
         ..CompletionPipelineMetrics::default()
     };
 
@@ -440,7 +555,7 @@ pub(crate) fn run_evidence_aware_pipeline<T>(
 
     let mut guarded_low_trust = 0;
     for candidate in &mut kept {
-        let rank = final_rank_score(candidate.evidence);
+        let rank = final_rank_score(candidate.evidence, context);
         if is_guarded_low_trust(candidate.evidence) {
             guarded_low_trust += 1;
             candidate.evidence.score = rank.min(LOW_TRUST_GLOBAL_TEXT_CAP_BELOW_REACHABLE);
@@ -574,12 +689,71 @@ fn compatibility_order<T>(candidates: &[PipelineCandidate<T>]) -> Vec<String> {
 }
 
 #[allow(dead_code)]
-fn final_rank_score(evidence: CandidateEvidence) -> i32 {
+fn final_rank_score(evidence: CandidateEvidence, context: CompletionRankContext) -> i32 {
     source_prior(evidence.primary_source)
         + scope_prior(evidence.tier)
         + confidence_prior(evidence.confidence)
         + evidence.match_score
         + evidence.proximity_score.clamp(0, PROXIMITY_SCORE_CAP)
+        + intent_adjustment(evidence, context.intent)
+}
+
+fn intent_adjustment(evidence: CandidateEvidence, intent: CompletionIntent) -> i32 {
+    if intent.kind == CompletionIntentKind::Neutral {
+        return 0;
+    }
+    let adjustment = match intent.kind {
+        CompletionIntentKind::Neutral => 0,
+        CompletionIntentKind::TypeName => match evidence.kind {
+            CompletionCandidateKind::Type | CompletionCandidateKind::EnumConstant => {
+                INTENT_STRONG_MATCH + INTENT_MEDIUM_MATCH
+            }
+            CompletionCandidateKind::Variable
+            | CompletionCandidateKind::Function
+            | CompletionCandidateKind::Macro => INTENT_BOUNDED_DEMOTION,
+            CompletionCandidateKind::Unknown | CompletionCandidateKind::Text => 0,
+        },
+        CompletionIntentKind::ExpressionValue => match evidence.kind {
+            CompletionCandidateKind::Variable
+            | CompletionCandidateKind::Function
+            | CompletionCandidateKind::Macro
+            | CompletionCandidateKind::EnumConstant => INTENT_STRONG_MATCH,
+            CompletionCandidateKind::Type => INTENT_BOUNDED_DEMOTION,
+            CompletionCandidateKind::Unknown | CompletionCandidateKind::Text => 0,
+        },
+        CompletionIntentKind::CallTarget => match evidence.kind {
+            CompletionCandidateKind::Function | CompletionCandidateKind::Macro => {
+                INTENT_STRONG_MATCH
+            }
+            CompletionCandidateKind::Variable => INTENT_BOUNDED_DEMOTION,
+            _ => 0,
+        },
+        CompletionIntentKind::MacroPreprocessor => match evidence.kind {
+            CompletionCandidateKind::Macro => INTENT_STRONG_MATCH,
+            CompletionCandidateKind::Type | CompletionCandidateKind::Variable => {
+                INTENT_BOUNDED_DEMOTION
+            }
+            _ => 0,
+        },
+        CompletionIntentKind::DeclarationName => {
+            if evidence.sources.has_strong_current_or_local()
+                || evidence.primary_source == CandidateSource::LocalWord
+            {
+                INTENT_MEDIUM_MATCH
+            } else if evidence.primary_source == CandidateSource::Indexed
+                && evidence.tier == ScopeTier::Global
+            {
+                DECLARATION_GLOBAL_REUSE_DEMOTION
+            } else {
+                0
+            }
+        }
+    };
+    match intent.confidence {
+        CompletionIntentConfidence::High => adjustment,
+        CompletionIntentConfidence::Medium => adjustment / 2,
+        CompletionIntentConfidence::Low => adjustment / 4,
+    }
 }
 
 #[allow(dead_code)]
@@ -662,7 +836,7 @@ pub(crate) fn completion_perf_summary(
 ) -> String {
     let shadow = metrics.shadow.unwrap_or_default();
     format!(
-        "[perf] completion total={}ms context={}ms recall={}ms merge_rank={}ms render={}ms prefix_len={} hit={} candidates_in={} after_dedup={} returned={} indexed={} local_binding={} current_file_overlay={} local_word={} returned_indexed={} returned_local_binding={} returned_current_file_overlay={} returned_local_word={} guarded_low_trust={} shadow_moved={} shadow_max_delta={}",
+        "[perf] completion total={}ms context={}ms recall={}ms merge_rank={}ms render={}ms prefix_len={} hit={} intent={} intent_confidence={} candidates_in={} after_dedup={} returned={} indexed={} local_binding={} current_file_overlay={} local_word={} returned_indexed={} returned_local_binding={} returned_current_file_overlay={} returned_local_word={} guarded_low_trust={} shadow_moved={} shadow_max_delta={}",
         timings.total_ms,
         timings.context_ms,
         timings.recall_ms,
@@ -670,6 +844,8 @@ pub(crate) fn completion_perf_summary(
         timings.render_ms,
         prefix.chars().count(),
         memo_hit,
+        metrics.intent_kind.as_summary_str(),
+        metrics.intent_confidence.as_summary_str(),
         metrics.input_total,
         metrics.after_dedup_total,
         metrics.returned_total,
@@ -739,6 +915,197 @@ mod tests {
             CandidateEvidence::new(source, tier, ResolutionConfidence::Heuristic, score),
             payload,
         )
+    }
+
+    fn candidate_with_kind(
+        name: &str,
+        source: CandidateSource,
+        tier: ScopeTier,
+        score: i32,
+        kind: CompletionCandidateKind,
+        payload: &'static str,
+    ) -> PipelineCandidate<&'static str> {
+        let mut evidence =
+            CandidateEvidence::new(source, tier, ResolutionConfidence::Heuristic, score);
+        evidence.kind = kind;
+        PipelineCandidate::new(name, evidence, payload)
+    }
+
+    #[test]
+    fn type_intent_lifts_type_candidates_without_hiding_values() {
+        let output = run_evidence_aware_pipeline_with_context(
+            vec![
+                candidate_with_kind(
+                    "FsWidget",
+                    CandidateSource::Indexed,
+                    ScopeTier::Global,
+                    800,
+                    CompletionCandidateKind::Type,
+                    "type",
+                ),
+                candidate_with_kind(
+                    "fs_widget_value",
+                    CandidateSource::Indexed,
+                    ScopeTier::Reachable,
+                    650,
+                    CompletionCandidateKind::Variable,
+                    "value",
+                ),
+            ],
+            10,
+            CompletionRankContext::for_intent(
+                CompletionIntentKind::TypeName,
+                CompletionIntentConfidence::High,
+            ),
+        );
+
+        assert_eq!(output.items[0].payload, "type");
+        assert!(output.items.iter().any(|candidate| candidate.payload == "value"));
+    }
+
+    #[test]
+    fn expression_intent_demotes_type_only_candidates_but_keeps_them() {
+        let output = run_evidence_aware_pipeline_with_context(
+            vec![
+                candidate_with_kind(
+                    "FsWidget",
+                    CandidateSource::Indexed,
+                    ScopeTier::Reachable,
+                    800,
+                    CompletionCandidateKind::Type,
+                    "type",
+                ),
+                candidate_with_kind(
+                    "fs_value",
+                    CandidateSource::Indexed,
+                    ScopeTier::Reachable,
+                    760,
+                    CompletionCandidateKind::Variable,
+                    "value",
+                ),
+            ],
+            10,
+            CompletionRankContext::for_intent(
+                CompletionIntentKind::ExpressionValue,
+                CompletionIntentConfidence::High,
+            ),
+        );
+
+        assert_eq!(output.items[0].payload, "value");
+        assert!(output.items.iter().any(|candidate| candidate.payload == "type"));
+    }
+
+    #[test]
+    fn call_intent_lifts_functions() {
+        let output = run_evidence_aware_pipeline_with_context(
+            vec![
+                candidate_with_kind(
+                    "FsRun",
+                    CandidateSource::Indexed,
+                    ScopeTier::Reachable,
+                    720,
+                    CompletionCandidateKind::Function,
+                    "function",
+                ),
+                candidate_with_kind(
+                    "fs_runtime",
+                    CandidateSource::Indexed,
+                    ScopeTier::Reachable,
+                    780,
+                    CompletionCandidateKind::Variable,
+                    "variable",
+                ),
+            ],
+            10,
+            CompletionRankContext::for_intent(
+                CompletionIntentKind::CallTarget,
+                CompletionIntentConfidence::High,
+            ),
+        );
+
+        assert_eq!(output.items[0].payload, "function");
+    }
+
+    #[test]
+    fn macro_preprocessor_intent_lifts_macros() {
+        let output = run_evidence_aware_pipeline_with_context(
+            vec![
+                candidate_with_kind(
+                    "FS_WIDGET",
+                    CandidateSource::Indexed,
+                    ScopeTier::Reachable,
+                    760,
+                    CompletionCandidateKind::Type,
+                    "type",
+                ),
+                candidate_with_kind(
+                    "FS_ENABLED",
+                    CandidateSource::Indexed,
+                    ScopeTier::Reachable,
+                    720,
+                    CompletionCandidateKind::Macro,
+                    "macro",
+                ),
+            ],
+            10,
+            CompletionRankContext::for_intent(
+                CompletionIntentKind::MacroPreprocessor,
+                CompletionIntentConfidence::High,
+            ),
+        );
+
+        assert_eq!(output.items[0].payload, "macro");
+    }
+
+    #[test]
+    fn declaration_name_intent_reduces_global_reuse_pressure() {
+        let output = run_evidence_aware_pipeline_with_context(
+            vec![
+                candidate_with_kind(
+                    "fs_widget",
+                    CandidateSource::Indexed,
+                    ScopeTier::Global,
+                    900,
+                    CompletionCandidateKind::Variable,
+                    "global",
+                ),
+                candidate_with_kind(
+                    "fs_working_name",
+                    CandidateSource::LocalWord,
+                    ScopeTier::Global,
+                    860,
+                    CompletionCandidateKind::Text,
+                    "text",
+                ),
+            ],
+            10,
+            CompletionRankContext::for_intent(
+                CompletionIntentKind::DeclarationName,
+                CompletionIntentConfidence::High,
+            ),
+        );
+
+        assert_eq!(output.items[0].payload, "text");
+        assert!(output.items.iter().any(|candidate| candidate.payload == "global"));
+    }
+
+    #[test]
+    fn perf_summary_reports_intent_without_candidate_names() {
+        let metrics = CompletionPipelineMetrics {
+            intent_kind: CompletionIntentKind::CallTarget,
+            intent_confidence: CompletionIntentConfidence::High,
+            ..CompletionPipelineMetrics::default()
+        };
+        let line = completion_perf_summary(
+            "fs_",
+            "cold",
+            &CompletionStageTimings::default(),
+            &metrics,
+        );
+
+        assert!(line.contains("intent=call_target"));
+        assert!(line.contains("intent_confidence=high"));
+        assert!(!line.contains("fs_\""));
     }
 
     #[test]
@@ -854,6 +1221,7 @@ mod tests {
                 moved: 1,
                 max_delta: 2,
             }),
+            ..CompletionPipelineMetrics::default()
         };
         let timings = CompletionStageTimings {
             total_ms: 9,
@@ -1012,6 +1380,7 @@ mod tests {
                 moved: 2,
                 max_delta: 1,
             }),
+            ..CompletionPipelineMetrics::default()
         };
         let timings = CompletionStageTimings {
             total_ms: 9,

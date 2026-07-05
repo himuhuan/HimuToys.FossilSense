@@ -24,7 +24,9 @@ use tower_lsp::lsp_types::{
 };
 use tower_lsp::{async_trait, Client, LanguageServer, LspService, Server};
 
-use crate::completion::{self, CandidateEvidence, CandidateSource};
+use crate::completion::{
+    self, CandidateEvidence, CandidateSource, CompletionCandidateKind,
+};
 use crate::completion_words;
 use crate::config::WorkspaceConfig;
 use crate::includes::{self, IncludeForm};
@@ -79,6 +81,18 @@ type IndexSchedule = Arc<Mutex<IndexScheduleState>>;
 
 type CompletionCandidate = completion::PipelineCandidate<CompletionItem>;
 
+fn completion_candidate_kind_from_parser(kind: parser::SymbolKind) -> CompletionCandidateKind {
+    match kind {
+        parser::SymbolKind::Function => CompletionCandidateKind::Function,
+        parser::SymbolKind::Macro => CompletionCandidateKind::Macro,
+        parser::SymbolKind::Type => CompletionCandidateKind::Type,
+        parser::SymbolKind::EnumConstant => CompletionCandidateKind::EnumConstant,
+        parser::SymbolKind::GlobalVariable | parser::SymbolKind::Field => {
+            CompletionCandidateKind::Variable
+        }
+    }
+}
+
 fn completion_items_for_local_bindings(
     hits: Vec<query::LocalCompletionCandidate>,
 ) -> Vec<CompletionCandidate> {
@@ -91,6 +105,7 @@ fn completion_items_for_local_bindings(
                 hit.score,
             );
             evidence.match_score = hit.match_score;
+            evidence.kind = CompletionCandidateKind::Variable;
             CompletionCandidate::new(
                 hit.name.clone(),
                 evidence,
@@ -135,6 +150,11 @@ fn completion_items_for_current_file_overlay(
             let mut evidence = CandidateEvidence::new(source, tier, confidence, hit.match_score);
             evidence.match_score = hit.match_score;
             evidence.proximity_score = hit.proximity_score;
+            evidence.kind = if is_text {
+                CompletionCandidateKind::Text
+            } else {
+                completion_candidate_kind_from_parser(hit.kind)
+            };
 
             CompletionCandidate::new(
                 hit.name.clone(),
@@ -162,6 +182,7 @@ fn completion_items_for_indexed_hits(
             let mut evidence =
                 CandidateEvidence::new(CandidateSource::Indexed, hit.tier, confidence, hit.score);
             evidence.match_score = hit.base_match;
+            evidence.kind = completion_candidate_kind_from_parser(hit.kind);
             CompletionCandidate::new(
                 hit.name.clone(),
                 evidence,
@@ -202,6 +223,7 @@ fn exact_indexed_completion_candidates_for_local_word(
             let mut evidence =
                 CandidateEvidence::new(CandidateSource::Indexed, hit.tier, confidence, local_score);
             evidence.match_score = hit.base_match;
+            evidence.kind = completion_candidate_kind_from_parser(hit.kind);
             CompletionCandidate::new(
                 hit.name.clone(),
                 evidence,

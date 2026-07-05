@@ -500,7 +500,7 @@ impl LanguageServer for Backend {
         if prefix.len() < query::MIN_PREFIX_LEN {
             return Ok(Some(empty_completion_list(true)));
         }
-        let _intent = crate::completion::classify_completion_intent(
+        let intent = crate::completion::classify_completion_intent(
             line_text,
             position.character,
             &prefix,
@@ -699,14 +699,16 @@ impl LanguageServer for Backend {
                     if current_file_text_overlay_names.contains(word.as_str()) {
                         continue;
                     }
+                    let mut evidence = crate::completion::CandidateEvidence::new(
+                        crate::completion::CandidateSource::LocalWord,
+                        tier,
+                        confidence,
+                        word_score,
+                    );
+                    evidence.kind = crate::completion::CompletionCandidateKind::Text;
                     candidates.push(CompletionCandidate::new(
                         word.clone(),
-                        crate::completion::CandidateEvidence::new(
-                            crate::completion::CandidateSource::LocalWord,
-                            tier,
-                            confidence,
-                            word_score,
-                        ),
+                        evidence,
                         CompletionItem {
                             label: word.clone(),
                             kind: Some(CompletionItemKind::TEXT),
@@ -718,7 +720,11 @@ impl LanguageServer for Backend {
 
                 let recall_ms = recall_started.elapsed().as_millis();
                 let merge_rank_started = std::time::Instant::now();
-                let output = crate::completion::run_evidence_aware_pipeline(candidates, limit);
+                let output = crate::completion::run_evidence_aware_pipeline_with_context(
+                    candidates,
+                    limit,
+                    crate::completion::CompletionRankContext { intent },
+                );
                 let merge_rank_ms = merge_rank_started.elapsed().as_millis();
 
                 let render_started = std::time::Instant::now();
