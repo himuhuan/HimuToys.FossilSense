@@ -1,13 +1,31 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
+use rusqlite::types::Value;
 use rusqlite::OptionalExtension;
 
-use crate::model::RecordCandidate;
+use crate::model::{MemberCandidate, RecordCandidate};
 
 use super::{
     map_symbol_record, record_kind_from_str, IndexStore, SymbolRecord, SELECT_SYMBOL_JOIN,
 };
+
+fn member_kind_from_str(kind: &str) -> crate::parser::MemberKind {
+    match kind {
+        "method" => crate::parser::MemberKind::Method,
+        "static_method" => crate::parser::MemberKind::StaticMethod,
+        "nested_type" => crate::parser::MemberKind::NestedType,
+        _ => crate::parser::MemberKind::Field,
+    }
+}
+
+fn member_confidence_from_str(confidence: &str) -> crate::parser::MemberConfidence {
+    match confidence {
+        "out_of_class_owner" => crate::parser::MemberConfidence::OutOfClassOwner,
+        "heuristic" => crate::parser::MemberConfidence::Heuristic,
+        _ => crate::parser::MemberConfidence::InBody,
+    }
+}
 
 impl IndexStore {
     /// Load every symbol id + name (+ external flag) for building the in-memory
@@ -117,11 +135,11 @@ impl IndexStore {
     ) -> Result<Vec<(String, crate::model::ScopeTier)>> {
         let pattern = format!("{}%", prefix.replace('%', "\\%").replace('_', "\\_"));
         let mut stmt = self.conn.prepare(
-            "SELECT fi.name, f.path, f.source, f.directly_included \
-             FROM fields fi \
-             JOIN record_defs r ON r.id = fi.record_id \
+            "SELECT m.name, f.path, f.source, f.directly_included \
+             FROM members m \
+             JOIN record_defs r ON r.id = m.record_id \
              JOIN files f ON f.id = r.file_id \
-             WHERE fi.name LIKE ?1 ESCAPE '\\' COLLATE NOCASE",
+             WHERE m.kind = 'field' AND m.name LIKE ?1 ESCAPE '\\' COLLATE NOCASE",
         )?;
         let rows = stmt.query_map([pattern], |row| {
             let source_str: String = row.get(2)?;
@@ -431,25 +449,61 @@ impl IndexStore {
         ).optional().context("failed to fetch record by id")
     }
 
-    pub fn fields_for_records(&self, record_ids: &[i64]) -> Result<Vec<String>> {
+    pub fn members_for_records(
+        &self,
+        record_ids: &[i64],
+        prefix: Option<&str>,
+        _ctx: Option<&crate::resolver::ResolveContext<'_>>,
+    ) -> Result<Vec<MemberCandidate>> {
         if record_ids.is_empty() {
             return Ok(Vec::new());
         }
         let placeholders = vec!["?"; record_ids.len()].join(",");
-        let sql = format!(
-            "SELECT name FROM fields \
-             WHERE record_id IN ({placeholders}) \
-             GROUP BY name"
+        let mut sql = format!(
+            "SELECT m.name, m.kind, m.signature, m.confidence, f.path \
+             FROM members m \
+             JOIN record_defs r ON r.id = m.record_id \
+             JOIN files f ON f.id = r.file_id \
+             WHERE m.record_id IN ({placeholders})"
         );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(
-            rusqlite::params_from_iter(record_ids.iter().copied()),
-            |row| row.get::<_, String>(0),
-        )?;
-        let mut names = Vec::new();
-        for row in rows {
-            names.push(row?);
+        let mut params: Vec<Value> = record_ids.iter().copied().map(Value::Integer).collect();
+        if let Some(prefix) = prefix {
+            sql.push_str(" AND m.name LIKE ? ESCAPE '\\' COLLATE NOCASE");
+            params.push(Value::Text(format!(
+                "{}%",
+                prefix.replace('%', "\\%").replace('_', "\\_")
+            )));
         }
+        sql.push_str(" ORDER BY m.name, m.kind, m.signature");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
+            let kind_str: String = row.get(1)?;
+            let confidence_str: String = row.get(3)?;
+            Ok(MemberCandidate {
+                name: row.get(0)?,
+                kind: member_kind_from_str(&kind_str),
+                signature: row.get(2)?,
+                tier: crate::model::ScopeTier::Global,
+                confidence: member_confidence_from_str(&confidence_str),
+                owner_path: row.get(4)?,
+            })
+        })?;
+        let mut members = Vec::new();
+        for row in rows {
+            members.push(row?);
+        }
+        Ok(members)
+    }
+
+    pub fn fields_for_records(&self, record_ids: &[i64]) -> Result<Vec<String>> {
+        let mut names: Vec<String> = self
+            .members_for_records(record_ids, None, None)?
+            .into_iter()
+            .filter(|member| member.kind == crate::parser::MemberKind::Field)
+            .map(|member| member.name)
+            .collect();
+        names.sort();
+        names.dedup();
         Ok(names)
     }
 

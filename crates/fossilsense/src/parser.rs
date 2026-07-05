@@ -80,6 +80,7 @@ pub struct FileSemanticIndex {
     pub occurrences: Vec<Occurrence>,
     pub records: Vec<RecordDef>,
     pub fields: Vec<FieldDef>,
+    pub members: Vec<MemberDef>,
     pub aliases: Vec<TypeAlias>,
     /// Record-typed local/parameter declarations for positional receiver
     /// inference (AST-derived). Request-time data; not persisted.
@@ -272,6 +273,57 @@ pub struct FieldDef {
     pub signature: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberKind {
+    Field,
+    Method,
+    StaticMethod,
+    NestedType,
+}
+
+impl MemberKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MemberKind::Field => "field",
+            MemberKind::Method => "method",
+            MemberKind::StaticMethod => "static_method",
+            MemberKind::NestedType => "nested_type",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberConfidence {
+    InBody,
+    OutOfClassOwner,
+    Heuristic,
+}
+
+impl MemberConfidence {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MemberConfidence::InBody => "in_body",
+            MemberConfidence::OutOfClassOwner => "out_of_class_owner",
+            MemberConfidence::Heuristic => "heuristic",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberDef {
+    pub record_key: String,
+    pub name: String,
+    pub kind: MemberKind,
+    pub confidence: MemberConfidence,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub start_line: usize,
+    pub start_col: usize,
+    pub end_line: usize,
+    pub end_col: usize,
+    pub signature: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AliasTarget {
     RecordKey(String),
@@ -449,6 +501,7 @@ pub fn parse_with_handle(
         occurrences: ast.occurrences,
         records: ast.records,
         fields: ast.fields,
+        members: ast.members,
         aliases: ast.aliases,
         local_declarations: ast.local_declarations,
         local_bindings: ast.local_bindings,
@@ -498,6 +551,7 @@ fn lexical_fallback(symbols: Vec<Symbol>, includes: Vec<Include>) -> FileSemanti
         occurrences: Vec::new(),
         records: Vec::new(),
         fields: Vec::new(),
+        members: Vec::new(),
         aliases: Vec::new(),
         local_declarations: Vec::new(),
         local_bindings: Vec::new(),

@@ -21,10 +21,10 @@ fn test_store_schema_v6() {
         .map(|r| r.unwrap())
         .collect();
     assert!(tables.contains(&"record_defs".to_string()));
-    assert!(tables.contains(&"fields".to_string()));
+    assert!(tables.contains(&"members".to_string()));
     assert!(tables.contains(&"type_aliases".to_string()));
 
-    // 3. Deleting a file cascades its records, fields, and aliases
+    // 3. Deleting a file cascades its records, members, and aliases
     let mut store = IndexStore::open(&db, dir.path()).expect("store");
     let source = "struct Foo { int a; };\ntypedef struct Foo FooT;\n";
     let index = parse(std::path::Path::new("foo.h"), source);
@@ -44,8 +44,10 @@ fn test_store_schema_v6() {
         .resolve_record_candidates(&["Foo"], None)
         .expect("records");
     assert_eq!(records.len(), 1);
-    let fields = store.fields_for_records(&[records[0].id]).expect("fields");
-    assert_eq!(fields.len(), 1);
+    let members = store
+        .members_for_records(&[records[0].id], None, None)
+        .expect("members");
+    assert_eq!(members.len(), 1);
 
     // Delete the file
     store

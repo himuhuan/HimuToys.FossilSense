@@ -104,6 +104,104 @@ fn current_schema_includes_have_normalized_metadata() {
 }
 
 #[test]
+fn current_schema_has_members_table_and_version_9_or_newer() {
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+    let store = IndexStore::open(&db, dir.path()).expect("store");
+
+    let version: String = store
+        .conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("version");
+    assert!(version.parse::<i64>().expect("numeric version") >= 9);
+
+    store
+        .conn
+        .prepare("SELECT record_id, name, kind, confidence, signature FROM members LIMIT 1")
+        .expect("members table exists");
+}
+
+#[test]
+fn opening_v8_schema_drops_old_field_rows_for_full_rebuild() {
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+    {
+        let conn = rusqlite::Connection::open(&db).expect("conn");
+        conn.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);
+             INSERT INTO meta (key, value) VALUES ('schema_version', '8');
+             CREATE TABLE files (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 path TEXT NOT NULL UNIQUE,
+                 extension TEXT NOT NULL,
+                 size INTEGER NOT NULL,
+                 mtime_ns INTEGER NOT NULL,
+                 hash TEXT NOT NULL,
+                 indexed_at INTEGER NOT NULL,
+                 status TEXT NOT NULL,
+                 error TEXT,
+                 source TEXT NOT NULL DEFAULT 'workspace',
+                 directly_included INTEGER NOT NULL DEFAULT 0,
+                 unresolved_includes INTEGER NOT NULL DEFAULT 0,
+                 ambiguous_includes INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE record_defs (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 file_id INTEGER NOT NULL,
+                 display_name TEXT NOT NULL,
+                 tag_name TEXT,
+                 typedef_name TEXT,
+                 kind TEXT NOT NULL,
+                 start_byte INTEGER NOT NULL,
+                 end_byte INTEGER NOT NULL,
+                 start_line INTEGER NOT NULL,
+                 start_col INTEGER NOT NULL,
+                 end_line INTEGER NOT NULL,
+                 end_col INTEGER NOT NULL,
+                 signature TEXT NOT NULL,
+                 confidence TEXT NOT NULL
+             );
+             CREATE TABLE fields (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 record_id INTEGER NOT NULL,
+                 name TEXT NOT NULL,
+                 start_byte INTEGER NOT NULL,
+                 end_byte INTEGER NOT NULL,
+                 start_line INTEGER NOT NULL,
+                 start_col INTEGER NOT NULL,
+                 end_line INTEGER NOT NULL,
+                 end_col INTEGER NOT NULL,
+                 signature TEXT NOT NULL
+             );
+             INSERT INTO files (path, extension, size, mtime_ns, hash, indexed_at, status)
+             VALUES ('old.h', 'h', 1, 1, 'hash', 1, 'ok');
+             INSERT INTO record_defs (
+                 file_id, display_name, kind, start_byte, end_byte, start_line, start_col,
+                 end_line, end_col, signature, confidence
+             )
+             VALUES (1, 'Old', 'struct', 0, 1, 0, 0, 0, 1, 'struct Old', 'named_tag');
+             INSERT INTO fields (
+                 record_id, name, start_byte, end_byte, start_line, start_col, end_line, end_col,
+                 signature
+             )
+             VALUES (1, 'stale', 0, 5, 0, 0, 0, 5, 'int stale');",
+        )
+        .expect("seed v8");
+    }
+
+    let store = IndexStore::open(&db, dir.path()).expect("migrate");
+    let count: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM members", [], |row| row.get(0))
+        .expect("count members");
+    assert_eq!(count, 0);
+}
+
+#[test]
 fn current_schema_migrate_by_drop_clears_old_data() {
     // Simulate an older schema by opening v6, inserting data, then opening
     // with the current schema — the old tables should be dropped and recreated.

@@ -4,8 +4,9 @@ use rusqlite::{params, Connection};
 use crate::parser::AliasTarget;
 
 use super::{
-    include_normalized_metadata, now_unix_secs, record_confidence_to_str, record_kind_to_str,
-    symbol_kind, symbol_role, FileIndexPayload, FileIndexUpdate,
+    include_normalized_metadata, member_confidence_to_str, member_kind_to_str, now_unix_secs,
+    record_confidence_to_str, record_kind_to_str, symbol_kind, symbol_role, FileIndexPayload,
+    FileIndexUpdate,
 };
 
 pub(super) fn apply_file_updates_inner(
@@ -62,10 +63,11 @@ pub(super) fn apply_file_updates_inner(
                     start_line, start_col, end_line, end_col, signature, confidence
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         )?;
-        let mut field_stmt = tx.prepare(
-            "INSERT INTO fields (
-                    record_id, name, start_byte, end_byte, start_line, start_col, end_line, end_col, signature
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        let mut member_stmt = tx.prepare(
+            "INSERT INTO members (
+                    record_id, name, kind, confidence, start_byte, end_byte,
+                    start_line, start_col, end_line, end_col, signature
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         )?;
         let mut alias_stmt = tx.prepare(
             "INSERT INTO type_aliases (
@@ -168,19 +170,21 @@ pub(super) fn apply_file_updates_inner(
                 record_key_to_id.insert(record.record_key.clone(), record_id);
             }
 
-            for field in &index.fields {
-                let record_id = record_key_to_id.get(&field.record_key).copied();
+            for member in &index.members {
+                let record_id = record_key_to_id.get(&member.record_key).copied();
                 if let Some(rid) = record_id {
-                    field_stmt.execute(params![
+                    member_stmt.execute(params![
                         rid,
-                        field.name.as_str(),
-                        field.start_byte as i64,
-                        field.end_byte as i64,
-                        field.start_line as i64,
-                        field.start_col as i64,
-                        field.end_line as i64,
-                        field.end_col as i64,
-                        field.signature.as_str(),
+                        member.name.as_str(),
+                        member_kind_to_str(member.kind),
+                        member_confidence_to_str(member.confidence),
+                        member.start_byte as i64,
+                        member.end_byte as i64,
+                        member.start_line as i64,
+                        member.start_col as i64,
+                        member.end_line as i64,
+                        member.end_col as i64,
+                        member.signature.as_str(),
                     ])?;
                 }
             }

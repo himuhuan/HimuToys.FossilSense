@@ -238,6 +238,16 @@ pub struct RecordCandidate {
     pub tier: ScopeTier,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberCandidate {
+    pub name: String,
+    pub kind: crate::parser::MemberKind,
+    pub signature: String,
+    pub tier: ScopeTier,
+    pub confidence: crate::parser::MemberConfidence,
+    pub owner_path: String,
+}
+
 /// User-visible best-effort label for a completion candidate (R6). `detail` is a
 /// short inline tag shown next to the item; `documentation` is the full
 /// `tier` + `confidence` + `reason` shown only when the item is expanded. Both

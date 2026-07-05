@@ -1,14 +1,15 @@
 use super::lexical::{compact_whitespace, make_symbol};
 use super::{
-    AliasTarget, FieldDef, LocalBinding, LocalBindingKind, LocalDeclaration, Occurrence,
-    ParseFacts, RecordConfidence, RecordDef, RecordKind, Symbol, SymbolKind, SymbolRole,
-    SyntacticRole, TypeAlias,
+    AliasTarget, FieldDef, LocalBinding, LocalBindingKind, LocalDeclaration, MemberConfidence,
+    MemberDef, MemberKind, Occurrence, ParseFacts, RecordConfidence, RecordDef, RecordKind, Symbol,
+    SymbolKind, SymbolRole, SyntacticRole, TypeAlias,
 };
 
 pub(super) struct AstIndex {
     pub(super) parse_error_count: usize,
     pub(super) occurrences: Vec<Occurrence>,
     pub(super) fields: Vec<FieldDef>,
+    pub(super) members: Vec<MemberDef>,
     pub(super) enum_constants: Vec<Symbol>,
     pub(super) aliases: Vec<TypeAlias>,
     pub(super) records: Vec<RecordDef>,
@@ -28,6 +29,7 @@ pub(super) fn collect_ast_index(
         parse_error_count: 0,
         occurrences: Vec::new(),
         fields: Vec::new(),
+        members: Vec::new(),
         enum_constants: Vec::new(),
         aliases: Vec::new(),
         records: Vec::new(),
@@ -123,7 +125,14 @@ pub(super) fn collect_ast_index(
                         signature,
                     });
 
-                    collect_body_fields(body, &record_key, source, line_starts, &mut out.fields);
+                    collect_body_fields(
+                        body,
+                        &record_key,
+                        source,
+                        line_starts,
+                        &mut out.fields,
+                        &mut out.members,
+                    );
                 }
             }
         } else if node.kind() == "enumerator" {
@@ -452,6 +461,7 @@ fn collect_body_fields(
     source: &str,
     line_starts: &[usize],
     fields: &mut Vec<FieldDef>,
+    members: &mut Vec<MemberDef>,
 ) {
     let mut cursor = body.walk();
     for child in body.children(&mut cursor) {
@@ -468,7 +478,14 @@ fn collect_body_fields(
             if let Some(type_node) = child.child_by_field_name("type") {
                 if matches!(type_node.kind(), "struct_specifier" | "union_specifier") {
                     if let Some(inner) = type_node.child_by_field_name("body") {
-                        collect_body_fields(inner, record_key, source, line_starts, fields);
+                        collect_body_fields(
+                            inner,
+                            record_key,
+                            source,
+                            line_starts,
+                            fields,
+                            members,
+                        );
                     }
                 }
             }
@@ -494,6 +511,19 @@ fn collect_body_fields(
                 fields.push(FieldDef {
                     record_key: record_key.to_string(),
                     name: name.to_string(),
+                    start_byte,
+                    end_byte,
+                    start_line,
+                    start_col,
+                    end_line,
+                    end_col,
+                    signature: signature.clone(),
+                });
+                members.push(MemberDef {
+                    record_key: record_key.to_string(),
+                    name: name.to_string(),
+                    kind: MemberKind::Field,
+                    confidence: MemberConfidence::InBody,
                     start_byte,
                     end_byte,
                     start_line,

@@ -49,6 +49,29 @@ fn removing_a_file_prunes_its_fields() {
 }
 
 #[test]
+fn struct_fields_are_persisted_as_field_members() {
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+    let mut store = IndexStore::open(&db, dir.path()).expect("store");
+    upsert_source(&mut store, "point.h", "struct Point { int x; int y; };\n");
+
+    let reader = IndexStore::open_readonly(&db).expect("reader");
+    let records = reader
+        .resolve_record_candidates(&["Point"], None)
+        .expect("records");
+    let members = reader
+        .members_for_records(&[records[0].id], None, None)
+        .expect("members");
+
+    let names: Vec<_> = members
+        .iter()
+        .map(|member| (member.name.as_str(), member.kind.as_str()))
+        .collect();
+    assert!(names.contains(&("x", "field")));
+    assert!(names.contains(&("y", "field")));
+}
+
+#[test]
 fn field_candidates_honor_prefix_and_cap() {
     let dir = tempdir().expect("tempdir");
     let db = dir.path().join("index.sqlite");

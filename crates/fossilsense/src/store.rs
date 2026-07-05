@@ -375,7 +375,7 @@ impl IndexStore {
         self.drop_lookup_indexes()?;
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM type_aliases", [])?;
-        tx.execute("DELETE FROM fields", [])?;
+        tx.execute("DELETE FROM members", [])?;
         tx.execute("DELETE FROM record_defs", [])?;
         tx.execute("DELETE FROM include_edges", [])?;
         tx.execute("DELETE FROM includes", [])?;
@@ -545,6 +545,14 @@ fn record_confidence_to_str(c: crate::parser::RecordConfidence) -> &'static str 
         crate::parser::RecordConfidence::AnonymousTypedef => "anonymous_typedef",
         crate::parser::RecordConfidence::Heuristic => "heuristic",
     }
+}
+
+fn member_kind_to_str(k: crate::parser::MemberKind) -> &'static str {
+    k.as_str()
+}
+
+fn member_confidence_to_str(c: crate::parser::MemberConfidence) -> &'static str {
+    c.as_str()
 }
 
 fn symbol_role(role: SymbolRole) -> &'static str {
