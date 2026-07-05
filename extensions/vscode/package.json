@@ -2,7 +2,7 @@
   "name": "fossilsense-vscode",
   "displayName": "FossilSense",
   "description": "FossilSense C/C++ best-effort navigation: symbols, outlines, rich hover, ranked definitions, signature help, role-grouped references, and lightweight completion.",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "private": true,
   "license": "UNLICENSED",
   "publisher": "himutoys",
@@ -38,6 +38,10 @@
       {
         "command": "fossilsense.findReferencesGrouped",
         "title": "FossilSense: Find References (Grouped by Role)"
+      },
+      {
+        "command": "fossilsense.clearCompletionHistory",
+        "title": "FossilSense: Clear Completion History"
       }
     ],
     "configuration": {
@@ -67,6 +71,16 @@
           ],
           "default": "auto",
           "description": "Controls FossilSense completion, including degraded '.'/'->' member (field) completion. 'auto' and 'on' enable completion; 'off' disables completion. C/C++ language-server conflicts are reported by fossilsense.mode, not silently handled per feature."
+        },
+        "fossilsense.completionHistory.mode": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "on",
+            "off"
+          ],
+          "default": "auto",
+          "description": "Controls local-only accepted-completion history used as a bounded ranking signal. 'auto' and 'on' enable recording and ranking; 'off' disables both."
         },
         "fossilsense.semanticColoring.mode": {
           "type": "string",
@@ -120,7 +134,7 @@
   },
   "scripts": {
     "compile": "tsc -p ./",
-    "test": "pnpm run compile && node out/test/config.test.js && node out/test/status.test.js && node out/test/serverPath.test.js && node out/test/conflicts.test.js && node out/test/referencesView.test.js",
+    "test": "pnpm run compile && node out/test/config.test.js && node out/test/status.test.js && node out/test/serverPath.test.js && node out/test/conflicts.test.js && node out/test/referencesView.test.js && node out/test/completionHistory.test.js",
     "watch": "tsc -watch -p ./",
     "package": "node scripts/package.mjs"
   },

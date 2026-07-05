@@ -1,19 +1,30 @@
-# Smart Completion Phase 2-3 SDD Progress
+# Smart Completion v1.2.1 SDD Progress
 
-Feature brief: `smart-completion-phase2-3`
-Requirements: `docs/smart-completion-phase2-3/requirements.md`
-Plan: `docs/smart-completion-phase2-3/plans/2026-07-05--implementation-plan.md`
-Base SHA: `b776d0a681d42403e6a4beb51e8ca0a4646a40d4`
-Workspace: current checkout on `release/v1.2.0`, approved by user on 2026-07-05.
+Feature brief: `smart-completion-v1-2-1`
+Requirements: `docs/smart-completion-v1-2-1/requirements.md`
+Plan: `docs/smart-completion-v1-2-1/plans/2026-07-05--implementation-plan.md`
+Base SHA: `54ac864`
+Workspace: current checkout on `release/v1.2.1`, approved by user on 2026-07-05.
+Execution mode: smart subagent dispatch, with main agent owning core linear implementation unless a task has clear parallel, review, or mechanical-verification value.
 
 ## Baseline
 
-- 2026-07-05: `cargo test -p fossilsense` passed, 414 unit tests and 2 LSP smoke tests.
+- 2026-07-05: `cargo test -p fossilsense` passed: 451 unit tests and 2 LSP smoke tests.
+- 2026-07-05: `pnpm run compile` in `extensions/vscode` passed.
+
+## Dispatch Notes
+
+- Task 1-7 share core interfaces across parser, store, server, completion, and extension command plumbing. Main agent should execute them serially with TDD to avoid cross-agent contract drift.
+- Subagents are best reserved for independent review after core member/history implementation, or for mechanical verification/log collection during Task 9.
 
 ## Tasks
 
-- Task 1: completed. Implementer Faraday returned DONE. Reviewer Beauvoir returned PASS_WITH_WARNINGS. Follow-up warnings for Task 3: set indexed `match_score` from `RankedNameHit::base_match`, and keep returned metrics clear when merged evidence differs from primary source.
-- Task 2: completed. Implementer Lovelace returned DONE. Reviewer Nash returned FAIL with two P1s; fixer Erdos returned DONE; reviewer Peirce returned PASS_WITH_WARNINGS. Follow-up for Task 3: C++ using overlay is lexical best-effort, so labels must remain honest; raw overlay fallback must render as TEXT.
-- Task 3: completed. Implementer Rawls returned DONE_WITH_CONCERNS. Reviewer Feynman returned FAIL on local-binding packed-score leakage. Main fixed with RED/GREEN test, added raw `match_score` to `LocalCompletionCandidate`, cleaned warnings. Reviewer McClintock returned PASS.
-- Task 4: completed. Updated `CLAUDE.md`, root `README.md`, extension `README.md`, and requirements status/background for Phase 2-3 current behavior. Documentation grep and placeholder scan passed.
-- Task 5: completed. Verification passed after final review fix: `cargo test -p fossilsense` (430 unit tests + 2 LSP smoke), mini-c index smoke (2 files, 13 symbols), `pnpm run compile`, and `pnpm run package`. VSIX: `dist/fossilsense-vscode-1.2.0_BUILD20260705_125511.vsix`.
+- Task 1: completed by main agent. RED: `pnpm run compile` failed with missing `../completionHistory` module. GREEN: `pnpm run compile`, `node out/test/completionHistory.test.js`, `pnpm run test`, and `cargo check -p fossilsense` passed. Added v1.2.1 version facts, extension completion-history setting, clear-history command, pure helper module, and extension tests.
+- Task 2: not started.
+- Task 3: not started.
+- Task 4: not started.
+- Task 5: not started.
+- Task 6: not started.
+- Task 7: not started.
+- Task 8: not started.
+- Task 9: not started.
