@@ -500,11 +500,8 @@ impl LanguageServer for Backend {
         if prefix.len() < query::MIN_PREFIX_LEN {
             return Ok(Some(empty_completion_list(true)));
         }
-        let intent = crate::completion::classify_completion_intent(
-            line_text,
-            position.character,
-            &prefix,
-        );
+        let intent =
+            crate::completion::classify_completion_intent(line_text, position.character, &prefix);
 
         let parsed_document = match uri_to_path(&uri) {
             Some(path) => {
@@ -636,14 +633,21 @@ impl LanguageServer for Backend {
                 // key, and the LSP item.
                 let mut candidates: Vec<CompletionCandidate> = Vec::new();
                 let mut new_pools: Vec<Vec<usize>> = Vec::with_capacity(tables.len());
+                let mut recall_channels = query::CompletionRecallMetrics::default();
 
                 // Collect indexed symbol candidates from all workspace roots. The
                 // symbol `kind` is cached in the in-memory NameTable, so the hot
                 // path no longer opens a read-only SQLite store per keystroke.
+                let quotas = query::CompletionRecallQuotas::default_for_completion_limit(limit);
                 for (idx, (_root, table)) in tables.iter().enumerate() {
                     let prior = prior_pools.get(idx).and_then(|p| p.as_deref());
-                    let (hits, pool) =
-                        table.search_ranked_scoped_pooled(&prefix, limit, scope.as_ref(), prior);
+                    let (hits, pool, metrics) = table.search_completion_recall_pooled(
+                        &prefix,
+                        quotas,
+                        scope.as_ref(),
+                        prior,
+                    );
+                    recall_channels.merge_from(metrics);
                     new_pools.push(pool);
                     candidates.extend(completion_items_for_indexed_hits(hits, open_reason));
                 }
@@ -720,11 +724,12 @@ impl LanguageServer for Backend {
 
                 let recall_ms = recall_started.elapsed().as_millis();
                 let merge_rank_started = std::time::Instant::now();
-                let output = crate::completion::run_evidence_aware_pipeline_with_context(
+                let mut output = crate::completion::run_evidence_aware_pipeline_with_context(
                     candidates,
                     limit,
                     crate::completion::CompletionRankContext { intent },
                 );
+                output.metrics.recall_channels = recall_channels;
                 let merge_rank_ms = merge_rank_started.elapsed().as_millis();
 
                 let render_started = std::time::Instant::now();

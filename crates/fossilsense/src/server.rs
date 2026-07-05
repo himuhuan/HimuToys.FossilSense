@@ -24,9 +24,7 @@ use tower_lsp::lsp_types::{
 };
 use tower_lsp::{async_trait, Client, LanguageServer, LspService, Server};
 
-use crate::completion::{
-    self, CandidateEvidence, CandidateSource, CompletionCandidateKind,
-};
+use crate::completion::{self, CandidateEvidence, CandidateSource, CompletionCandidateKind};
 use crate::completion_words;
 use crate::config::WorkspaceConfig;
 use crate::includes::{self, IncludeForm};

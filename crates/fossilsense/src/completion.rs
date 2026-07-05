@@ -180,10 +180,7 @@ pub(crate) fn classify_completion_intent(
     }
 
     let previous_token = previous_token(before_prefix);
-    if previous_token
-        .as_deref()
-        .is_some_and(is_type_intent_cue)
-    {
+    if previous_token.as_deref().is_some_and(is_type_intent_cue) {
         return CompletionIntent {
             kind: CompletionIntentKind::TypeName,
             confidence: CompletionIntentConfidence::High,
@@ -267,8 +264,22 @@ fn is_type_intent_cue(token: &str) -> bool {
 fn is_expression_intent_cue(token: &str) -> bool {
     matches!(
         token,
-        "=" | "return" | "(" | "[" | "," | "?" | ":" | "+" | "-" | "*" | "/" | "%"
-            | "&" | "|" | "!" | "<" | ">"
+        "=" | "return"
+            | "("
+            | "["
+            | ","
+            | "?"
+            | ":"
+            | "+"
+            | "-"
+            | "*"
+            | "/"
+            | "%"
+            | "&"
+            | "|"
+            | "!"
+            | "<"
+            | ">"
     )
 }
 
@@ -280,9 +291,23 @@ fn is_typeish_declaration_token(token: &str) -> bool {
         .is_some_and(|ch| ch.is_ascii_uppercase())
         || matches!(
             trimmed,
-            "int" | "char" | "short" | "long" | "float" | "double" | "bool" | "void"
-                | "size_t" | "uint8_t" | "uint16_t" | "uint32_t" | "uint64_t" | "int8_t"
-                | "int16_t" | "int32_t" | "int64_t"
+            "int"
+                | "char"
+                | "short"
+                | "long"
+                | "float"
+                | "double"
+                | "bool"
+                | "void"
+                | "size_t"
+                | "uint8_t"
+                | "uint16_t"
+                | "uint32_t"
+                | "uint64_t"
+                | "int8_t"
+                | "int16_t"
+                | "int32_t"
+                | "int64_t"
         )
 }
 
@@ -457,6 +482,7 @@ pub(crate) struct CompletionPipelineMetrics {
     pub shadow: Option<ShadowRankSummary>,
     pub intent_kind: CompletionIntentKind,
     pub intent_confidence: CompletionIntentConfidence,
+    pub recall_channels: crate::query::CompletionRecallMetrics,
 }
 
 impl Default for CompletionPipelineMetrics {
@@ -471,6 +497,7 @@ impl Default for CompletionPipelineMetrics {
             shadow: None,
             intent_kind: CompletionIntentKind::Neutral,
             intent_confidence: CompletionIntentConfidence::Low,
+            recall_channels: crate::query::CompletionRecallMetrics::default(),
         }
     }
 }
@@ -836,7 +863,7 @@ pub(crate) fn completion_perf_summary(
 ) -> String {
     let shadow = metrics.shadow.unwrap_or_default();
     format!(
-        "[perf] completion total={}ms context={}ms recall={}ms merge_rank={}ms render={}ms prefix_len={} hit={} intent={} intent_confidence={} candidates_in={} after_dedup={} returned={} indexed={} local_binding={} current_file_overlay={} local_word={} returned_indexed={} returned_local_binding={} returned_current_file_overlay={} returned_local_word={} guarded_low_trust={} shadow_moved={} shadow_max_delta={}",
+        "[perf] completion total={}ms context={}ms recall={}ms merge_rank={}ms render={}ms prefix_len={} hit={} intent={} intent_confidence={} candidates_in={} after_dedup={} returned={} indexed={} local_binding={} current_file_overlay={} local_word={} returned_indexed={} returned_local_binding={} returned_current_file_overlay={} returned_local_word={} recall_reachable={} recall_external={} recall_unknown={} recall_global={} recall_pool={} guarded_low_trust={} shadow_moved={} shadow_max_delta={}",
         timings.total_ms,
         timings.context_ms,
         timings.recall_ms,
@@ -857,6 +884,11 @@ pub(crate) fn completion_perf_summary(
         metrics.returned_sources.local_binding,
         metrics.returned_sources.current_file_overlay,
         metrics.returned_sources.local_word,
+        metrics.recall_channels.reachable,
+        metrics.recall_channels.external,
+        metrics.recall_channels.unknown,
+        metrics.recall_channels.global,
+        metrics.recall_channels.pool_total,
         metrics.final_rank.guarded_low_trust,
         shadow.moved,
         shadow.max_delta,
@@ -960,7 +992,10 @@ mod tests {
         );
 
         assert_eq!(output.items[0].payload, "type");
-        assert!(output.items.iter().any(|candidate| candidate.payload == "value"));
+        assert!(output
+            .items
+            .iter()
+            .any(|candidate| candidate.payload == "value"));
     }
 
     #[test]
@@ -992,7 +1027,10 @@ mod tests {
         );
 
         assert_eq!(output.items[0].payload, "value");
-        assert!(output.items.iter().any(|candidate| candidate.payload == "type"));
+        assert!(output
+            .items
+            .iter()
+            .any(|candidate| candidate.payload == "type"));
     }
 
     #[test]
@@ -1086,7 +1124,10 @@ mod tests {
         );
 
         assert_eq!(output.items[0].payload, "text");
-        assert!(output.items.iter().any(|candidate| candidate.payload == "global"));
+        assert!(output
+            .items
+            .iter()
+            .any(|candidate| candidate.payload == "global"));
     }
 
     #[test]
@@ -1096,12 +1137,8 @@ mod tests {
             intent_confidence: CompletionIntentConfidence::High,
             ..CompletionPipelineMetrics::default()
         };
-        let line = completion_perf_summary(
-            "fs_",
-            "cold",
-            &CompletionStageTimings::default(),
-            &metrics,
-        );
+        let line =
+            completion_perf_summary("fs_", "cold", &CompletionStageTimings::default(), &metrics);
 
         assert!(line.contains("intent=call_target"));
         assert!(line.contains("intent_confidence=high"));
