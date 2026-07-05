@@ -17,6 +17,7 @@ impl LanguageServer for Backend {
         let completion_mode = parse_completion_mode(&params);
         self.completion_enabled
             .store(completion_mode.is_enabled(), Ordering::Relaxed);
+        *self.completion_history_mode.lock().await = parse_completion_history_mode(&params);
 
         let completion_provider = if self.completion_enabled.load(Ordering::Relaxed) {
             Some(CompletionOptions {
@@ -43,13 +44,15 @@ impl LanguageServer for Backend {
             Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
                 SemanticTokensOptions {
                     // Legend order defines the token-type indices used when
-                    // encoding (macro = 0, type = 1, enumMember = 2); no
-                    // modifiers are declared.
+                    // encoding (macro = 0, type = 1, enumMember = 2,
+                    // parameter = 3, variable = 4); no modifiers are declared.
                     legend: SemanticTokensLegend {
                         token_types: vec![
                             SemanticTokenType::MACRO,
                             SemanticTokenType::TYPE,
                             SemanticTokenType::ENUM_MEMBER,
+                            SemanticTokenType::PARAMETER,
+                            SemanticTokenType::VARIABLE,
                         ],
                         token_modifiers: vec![],
                     },
@@ -94,6 +97,8 @@ impl LanguageServer for Backend {
                         REFRESH_INDEX_LSP_COMMAND.to_string(),
                         REBUILD_INDEX_LSP_COMMAND.to_string(),
                         GROUPED_REFERENCES_LSP_COMMAND.to_string(),
+                        COMPLETION_ACCEPTED_LSP_COMMAND.to_string(),
+                        CLEAR_COMPLETION_HISTORY_LSP_COMMAND.to_string(),
                     ],
                     ..Default::default()
                 }),
@@ -110,6 +115,7 @@ impl LanguageServer for Backend {
         self.client
             .log_message(MessageType::INFO, "FossilSense initialized")
             .await;
+        self.preload_completion_history().await;
         self.spawn_index_roots(None).await;
     }
 
@@ -471,6 +477,7 @@ impl LanguageServer for Backend {
             return Ok(None);
         }
 
+        let ordinary_started = tokio::time::Instant::now();
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
 
@@ -484,7 +491,7 @@ impl LanguageServer for Backend {
         if let Some((form, partial)) =
             includes::include_completion_context(line_text, position.character)
         {
-            return self.complete_include(&uri, form, partial).await;
+            return self.complete_include(&uri, form, partial, &text).await;
         }
 
         if query::is_member_completion_context(line_text, position.character) {
@@ -497,6 +504,63 @@ impl LanguageServer for Backend {
         if prefix.len() < query::MIN_PREFIX_LEN {
             return Ok(Some(empty_completion_list(true)));
         }
+        let intent =
+            crate::completion::classify_completion_intent(line_text, position.character, &prefix);
+        let history_enabled = self.completion_history_mode.lock().await.is_enabled();
+        let history_root = if history_enabled {
+            self.root_for_uri(&uri).await
+        } else {
+            None
+        };
+        let history_workspace_hash = history_root
+            .as_ref()
+            .map(|root| completion_history_workspace_hash(root));
+        let history_prefix_bucket = crate::completion_history::prefix_bucket(&prefix);
+        let history_snapshot = match (
+            history_enabled,
+            history_root.as_deref(),
+            history_workspace_hash.as_deref(),
+        ) {
+            (true, Some(root), Some(workspace_hash)) => self
+                .completion_history_snapshot_for_root(root, workspace_hash)
+                .await
+                .unwrap_or_default(),
+            _ => crate::completion_history::CompletionHistorySnapshot::default(),
+        };
+
+        let parsed_document = match uri_to_path(&uri) {
+            Some(path) => {
+                self.get_or_parse_document(&uri, &path, version, &text)
+                    .await
+            }
+            None => None,
+        };
+        let local_binding_hits = parsed_document
+            .as_ref()
+            .map(|index| {
+                query::local_completion_candidates(
+                    &index.local_bindings,
+                    &text,
+                    position.line,
+                    position.character,
+                    &prefix,
+                    query::COMPLETION_LIMIT,
+                )
+            })
+            .unwrap_or_default();
+        let current_file_overlay_hits = parsed_document
+            .as_ref()
+            .map(|index| {
+                query::current_file_overlay_candidates(
+                    index,
+                    &text,
+                    position.line,
+                    position.character,
+                    &prefix,
+                    query::COMPLETION_LIMIT,
+                )
+            })
+            .unwrap_or_default();
 
         let local_words = self.local_words_for(&uri, version, &text).await;
 
@@ -571,10 +635,21 @@ impl LanguageServer for Backend {
             }
         };
         let memo_prefix = prefix.clone();
+        let command_workspace_hash = history_workspace_hash.clone();
+        let command_prefix_bucket = history_prefix_bucket.clone();
+        let context_ms = ordinary_started.elapsed().as_millis();
 
         let result = tokio::task::spawn_blocking(
-            move || -> Result<(Vec<CompletionItem>, Vec<Vec<usize>>)> {
+            move || -> Result<(
+                Vec<CompletionItem>,
+                Vec<Vec<usize>>,
+                crate::completion::CompletionPipelineMetrics,
+                u128,
+                u128,
+                u128,
+            )> {
                 use crate::model::ScopeTier;
+                let recall_started = std::time::Instant::now();
                 // First cause of the open scope (if any). An `Unknown`-tier
                 // candidate under an ambiguous include surfaces `Ambiguous`
                 // (and the `ambiguous` label) instead of a plain `Fallback`.
@@ -585,46 +660,34 @@ impl LanguageServer for Backend {
                 // key, and the LSP item.
                 let mut candidates: Vec<CompletionCandidate> = Vec::new();
                 let mut new_pools: Vec<Vec<usize>> = Vec::with_capacity(tables.len());
+                let mut recall_channels = query::CompletionRecallMetrics::default();
 
                 // Collect indexed symbol candidates from all workspace roots. The
                 // symbol `kind` is cached in the in-memory NameTable, so the hot
                 // path no longer opens a read-only SQLite store per keystroke.
+                let quotas = query::CompletionRecallQuotas::default_for_completion_limit(limit);
                 for (idx, (_root, table)) in tables.iter().enumerate() {
                     let prior = prior_pools.get(idx).and_then(|p| p.as_deref());
-                    let (hits, pool) =
-                        table.search_ranked_scoped_pooled(&prefix, limit, scope.as_ref(), prior);
+                    let (hits, pool, metrics) = table.search_completion_recall_pooled(
+                        &prefix,
+                        quotas,
+                        scope.as_ref(),
+                        prior,
+                    );
+                    recall_channels.merge_from(metrics);
                     new_pools.push(pool);
-                    for hit in hits {
-                        // Completion is prefix-based, so `exact_name = false`
-                        // for the confidence/reason projection. The reason is
-                        // no longer discarded — it drives the user-visible label.
-                        let (confidence, reason) =
-                            crate::resolver::confidence_reason_for(hit.tier, false, open_reason);
-                        let sort_text = format!("{:08}", 100_000_000 - hit.score);
-                        let kind = query::lsp_completion_kind_from_parser(hit.kind);
-                        // Non-current candidates get a visible best-effort scope
-                        // label (detail tag + documentation); current-file
-                        // candidates stay unlabeled. The label is derived from
-                        // the same (tier, confidence, reason) used to rank.
-                        let label = model::completion_scope_label(hit.tier, confidence, reason);
-                        candidates.push(CompletionCandidate {
-                            name: hit.name.clone(),
-                            tier: hit.tier,
-                            confidence,
-                            score: hit.score,
-                            item: CompletionItem {
-                                label: hit.name,
-                                kind: Some(kind),
-                                sort_text: Some(sort_text),
-                                detail: label.as_ref().map(|l| l.detail.to_string()),
-                                documentation: label
-                                    .map(|l| Documentation::String(l.documentation)),
-                                ..Default::default()
-                            },
-                            source: CompletionCandidateSource::Indexed,
-                        });
-                    }
+                    candidates.extend(completion_items_for_indexed_hits(hits, open_reason));
                 }
+
+                candidates.extend(completion_items_for_local_bindings(local_binding_hits));
+                let current_file_text_overlay_names: HashSet<String> = current_file_overlay_hits
+                    .iter()
+                    .filter(|hit| !hit.semantic || hit.detail.as_deref() == Some("text"))
+                    .map(|hit| hit.name.clone())
+                    .collect();
+                candidates.extend(completion_items_for_current_file_overlay(
+                    current_file_overlay_hits,
+                ));
 
                 // Add current-file word candidates as fallback-only items.
                 // They remain useful for not-yet-indexed names, but same-name
@@ -664,36 +727,68 @@ impl LanguageServer for Backend {
                         candidates.extend(exact_indexed);
                         continue;
                     }
-                    candidates.push(CompletionCandidate {
-                        name: word.clone(),
+                    if current_file_text_overlay_names.contains(word.as_str()) {
+                        continue;
+                    }
+                    let mut evidence = crate::completion::CandidateEvidence::new(
+                        crate::completion::CandidateSource::LocalWord,
                         tier,
                         confidence,
-                        score: word_score,
-                        item: CompletionItem {
+                        word_score,
+                    );
+                    evidence.kind = crate::completion::CompletionCandidateKind::Text;
+                    set_completion_history_key(&mut evidence, word);
+                    candidates.push(CompletionCandidate::new(
+                        word.clone(),
+                        evidence,
+                        CompletionItem {
                             label: word.clone(),
                             kind: Some(CompletionItemKind::TEXT),
                             sort_text: Some(sort_text),
                             ..Default::default()
                         },
-                        source: CompletionCandidateSource::LocalWord,
-                    });
+                    ));
                 }
 
-                // Sort by packed score descending, then name for stability.
-                let mut kept: Vec<(i32, String, CompletionItem)> =
-                    dedup_completion_candidates(candidates)
-                        .into_iter()
-                        .map(|candidate| (candidate.score, candidate.name, candidate.item))
-                        .collect();
-                kept.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+                let recall_ms = recall_started.elapsed().as_millis();
+                let merge_rank_started = std::time::Instant::now();
+                let mut output = crate::completion::run_evidence_aware_pipeline_with_context(
+                    candidates,
+                    limit,
+                    crate::completion::CompletionRankContext {
+                        intent,
+                        history_enabled,
+                        history: history_snapshot,
+                        prefix_bucket: history_prefix_bucket,
+                    },
+                );
+                output.metrics.recall_channels = recall_channels;
+                let merge_rank_ms = merge_rank_started.elapsed().as_millis();
 
-                let items: Vec<CompletionItem> = kept
+                let render_started = std::time::Instant::now();
+                let mut items: Vec<CompletionItem> = output
+                    .items
                     .into_iter()
-                    .take(limit)
-                    .map(|(_, _, item)| item)
+                    .map(|candidate| {
+                        let mut item = candidate.payload;
+                        if history_enabled {
+                            if let Some(workspace_hash) = command_workspace_hash.as_deref() {
+                                attach_completion_history_accept_command(
+                                    &mut item,
+                                    candidate.evidence,
+                                    workspace_hash,
+                                    intent.kind,
+                                    &command_prefix_bucket,
+                                );
+                            }
+                        }
+                        item
+                    })
                     .collect();
+                apply_final_completion_sort_text(&mut items);
+                let render_ms = render_started.elapsed().as_millis();
 
-                Ok((items, new_pools))
+                Ok((items, new_pools, output.metrics, recall_ms, merge_rank_ms, render_ms))
             },
         )
         .await;
@@ -704,17 +799,24 @@ impl LanguageServer for Backend {
         // every keystroke. This lets longer-named symbols re-enter the
         // truncation window as the user keeps typing, and prevents an empty
         // first batch from sticking as a "complete" no-match list.
-        self.perf_log(|| {
-            format!(
-                "[perf] completion total={}ms prefix=\"{}\" hit={}",
-                completion_started.elapsed().as_millis(),
-                memo_prefix,
-                hit_kind,
-            )
-        })
-        .await;
         match self.unwrap_query("completion", result).await {
-            Some((items, new_pools)) => {
+            Some((items, new_pools, metrics, recall_ms, merge_rank_ms, render_ms)) => {
+                let timings = crate::completion::CompletionStageTimings {
+                    total_ms: completion_started.elapsed().as_millis(),
+                    context_ms,
+                    recall_ms,
+                    merge_rank_ms,
+                    render_ms,
+                };
+                self.perf_log(|| {
+                    crate::completion::completion_perf_summary(
+                        &memo_prefix,
+                        hit_kind,
+                        &timings,
+                        &metrics,
+                    )
+                })
+                .await;
                 // Record this prefix's pools for the next (extending) keystroke.
                 self.completion_memo.lock().await.insert(
                     uri,
@@ -935,6 +1037,38 @@ impl LanguageServer for Backend {
                 }
                 None => Ok(None),
             }
+        } else if params.command == COMPLETION_ACCEPTED_LSP_COMMAND {
+            if let Some(event) = completion_accept_event_from_arg(params.arguments.first()) {
+                if self.record_completion_accept(event).await.is_err() {
+                    self.client
+                        .log_message(
+                            MessageType::ERROR,
+                            "FossilSense completion history record failed",
+                        )
+                        .await;
+                }
+            }
+            Ok(None)
+        } else if params.command == CLEAR_COMPLETION_HISTORY_LSP_COMMAND {
+            match self.clear_completion_history().await {
+                Ok(removed) => {
+                    self.client
+                        .log_message(
+                            MessageType::INFO,
+                            format!("FossilSense completion history cleared entries={removed}"),
+                        )
+                        .await;
+                }
+                Err(_) => {
+                    self.client
+                        .log_message(
+                            MessageType::ERROR,
+                            "FossilSense completion history clear failed",
+                        )
+                        .await;
+                }
+            }
+            Ok(None)
         } else {
             Ok(None)
         }

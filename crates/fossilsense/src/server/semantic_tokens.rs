@@ -88,11 +88,12 @@ impl Backend {
                 None => HashMap::new(),
             };
 
-            Ok(coloring::classify_occurrences(
+            Ok(coloring::classify_occurrences_with_locals(
                 &index.occurrences,
                 &defs.macro_defs,
                 &defs.type_defs,
                 &defs.enum_defs,
+                &index.local_bindings,
                 &index_counts,
             ))
         })

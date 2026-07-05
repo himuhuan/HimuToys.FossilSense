@@ -239,6 +239,80 @@ fn narrowing_keeps_subsequence_across_short_to_long_prefix() {
 }
 
 #[test]
+fn channel_recall_keeps_reachable_and_global_representation() {
+    let table = NameTable::build_with_paths(vec![
+        (
+            1,
+            "api_reachable".to_string(),
+            false,
+            "inc/a.h".to_string(),
+            "function".to_string(),
+            false,
+        ),
+        (
+            2,
+            "api_global".to_string(),
+            false,
+            "other/b.c".to_string(),
+            "function".to_string(),
+            false,
+        ),
+    ]);
+    let scope = scope("src/main.c", &["src/main.c", "inc/a.h"], false);
+    let quotas = CompletionRecallQuotas {
+        total_indexed: 4,
+        reachable: 2,
+        external: 1,
+        unknown: 1,
+        global: 2,
+    };
+
+    let (hits, pool, metrics) =
+        table.search_completion_recall_pooled("api", quotas, Some(&scope), None);
+
+    assert!(hits.iter().any(|hit| hit.name == "api_reachable"));
+    assert!(hits.iter().any(|hit| hit.name == "api_global"));
+    assert_eq!(metrics.reachable, 1);
+    assert_eq!(metrics.global, 1);
+    assert!(!pool.is_empty());
+}
+
+#[test]
+fn channel_recall_preserves_short_prefix_noise_gate() {
+    let table = NameTable::build(vec![
+        (1, "FooBar".to_string(), false),
+        (2, "Foobar".to_string(), false),
+    ]);
+    let quotas = CompletionRecallQuotas::default_for_completion_limit(100);
+
+    let (hits, _, _) = table.search_completion_recall_pooled("ba", quotas, None, None);
+    let names: Vec<_> = hits.iter().map(|hit| hit.name.as_str()).collect();
+
+    assert!(names.contains(&"FooBar"));
+    assert!(!names.contains(&"Foobar"));
+}
+
+#[test]
+fn channel_recall_narrowing_matches_cold_scan() {
+    let table = NameTable::build(vec![
+        (1, "foobar".to_string(), false),
+        (2, "foobaz".to_string(), false),
+        (3, "foxtrot".to_string(), false),
+    ]);
+    let quotas = CompletionRecallQuotas::default_for_completion_limit(100);
+    let (_, pool) = table.search_ranked_scoped_pooled("fo", 100, None, None);
+
+    let narrowed = table
+        .search_completion_recall_pooled("foob", quotas, None, Some(&pool))
+        .0;
+    let cold = table
+        .search_completion_recall_pooled("foob", quotas, None, None)
+        .0;
+
+    assert_eq!(narrowed, cold);
+}
+
+#[test]
 fn locality_breaks_ties_without_dropping() {
     let table = NameTable::build_with_paths(vec![
         (
@@ -342,6 +416,14 @@ fn name_table_replaces_entries_for_dirty_paths() {
 #[test]
 fn identifier_completion_starts_at_one_character() {
     assert_eq!(MIN_PREFIX_LEN, 1);
+}
+
+#[test]
+fn normalized_receiver_record_hint_strips_only_digits_and_underscores() {
+    assert_eq!(normalized_receiver_record_hint("widget"), "widget");
+    assert_eq!(normalized_receiver_record_hint("_widget"), "widget");
+    assert_eq!(normalized_receiver_record_hint("2Widget"), "widget");
+    assert_eq!(normalized_receiver_record_hint("pWidget"), "pwidget");
 }
 
 #[test]

@@ -8,8 +8,8 @@ use serde_json::Value;
 use tokio::sync::{Mutex, RwLock};
 use tower_lsp::jsonrpc::Result as LspResult;
 use tower_lsp::lsp_types::{
-    CompletionItem, CompletionItemKind, CompletionList, CompletionOptions, CompletionParams,
-    CompletionResponse, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
+    Command, CompletionItem, CompletionItemKind, CompletionList, CompletionOptions,
+    CompletionParams, CompletionResponse, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
     DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, Documentation,
     ExecuteCommandParams, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams,
@@ -24,6 +24,11 @@ use tower_lsp::lsp_types::{
 };
 use tower_lsp::{async_trait, Client, LanguageServer, LspService, Server};
 
+use crate::completion::{self, CandidateEvidence, CandidateSource, CompletionCandidateKind};
+use crate::completion_history::{
+    candidate_hash, candidate_hash_key, candidate_hash_key_from_hex, CompletionAcceptEvent,
+    CompletionHistoryMode, CompletionHistorySnapshot, CompletionHistoryStore,
+};
 use crate::completion_words;
 use crate::config::WorkspaceConfig;
 use crate::includes::{self, IncludeForm};
@@ -48,8 +53,9 @@ mod signature_help;
 mod state;
 
 use include_completion::{
-    collect_include_candidates_with_table, configured_include_paths, location_at_file_start,
-    resolve_include_paths, ExternalIncludeDirCache, IncludeCompletionTable,
+    collect_include_candidates_with_table_and_evidence, configured_include_paths,
+    location_at_file_start, resolve_include_paths, CurrentIncludeEvidence, ExternalIncludeDirCache,
+    IncludeCompletionTable,
 };
 #[cfg(test)]
 use indexing::{
@@ -62,9 +68,9 @@ use lsp_adapters::{
 };
 use options::{
     candidate_reason_log_lines, completion_trigger_characters, empty_completion_list,
-    member_completion_is_incomplete, parse_completion_mode, parse_debug_candidate_reasons,
-    parse_debug_perf_logs, parse_include_paths, parse_include_scoping_enabled,
-    parse_semantic_coloring_mode, signature_help_options,
+    member_completion_is_incomplete, parse_completion_history_mode, parse_completion_mode,
+    parse_debug_candidate_reasons, parse_debug_perf_logs, parse_include_paths,
+    parse_include_scoping_enabled, parse_semantic_coloring_mode, signature_help_options,
 };
 
 type NameTables = Arc<Mutex<HashMap<PathBuf, Arc<NameTable>>>>;
@@ -76,75 +82,132 @@ type LocalWordEntry = (i32, Arc<HashSet<String>>);
 type LocalWordCache = Arc<Mutex<HashMap<Url, LocalWordEntry>>>;
 type IndexSchedule = Arc<Mutex<IndexScheduleState>>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CompletionCandidateSource {
-    Indexed,
-    LocalWord,
-}
+type CompletionCandidate = completion::PipelineCandidate<CompletionItem>;
 
-#[derive(Debug)]
-struct CompletionCandidate {
-    name: String,
-    tier: model::ScopeTier,
-    confidence: model::ResolutionConfidence,
-    score: i32,
-    item: CompletionItem,
-    source: CompletionCandidateSource,
-}
-
-fn dedup_completion_candidates(candidates: Vec<CompletionCandidate>) -> Vec<CompletionCandidate> {
-    let mut best_by_name: HashMap<String, usize> = HashMap::new();
-    let mut survivors: Vec<Option<CompletionCandidate>> =
-        candidates.into_iter().map(Some).collect();
-    for i in 0..survivors.len() {
-        let Some((name, tier, confidence)) = survivors[i]
-            .as_ref()
-            .map(|candidate| (candidate.name.clone(), candidate.tier, candidate.confidence))
-        else {
-            continue;
-        };
-        let key = (tier, confidence);
-        match best_by_name.get(&name) {
-            None => {
-                best_by_name.insert(name, i);
-            }
-            Some(&prev_i) => {
-                let (prev_tier, prev_conf, prev_score, prev_source) = {
-                    let prev = survivors[prev_i].as_ref().expect("survivor present");
-                    (prev.tier, prev.confidence, prev.score, prev.source)
-                };
-                let current = survivors[i].as_ref().expect("survivor present");
-                if completion_candidate_beats(
-                    current.source,
-                    key,
-                    current.score,
-                    prev_source,
-                    (prev_tier, prev_conf),
-                    prev_score,
-                ) {
-                    survivors[prev_i] = None;
-                    best_by_name.insert(name, i);
-                } else {
-                    survivors[i] = None;
-                }
-            }
+fn completion_candidate_kind_from_parser(kind: parser::SymbolKind) -> CompletionCandidateKind {
+    match kind {
+        parser::SymbolKind::Function => CompletionCandidateKind::Function,
+        parser::SymbolKind::Macro => CompletionCandidateKind::Macro,
+        parser::SymbolKind::Type => CompletionCandidateKind::Type,
+        parser::SymbolKind::EnumConstant => CompletionCandidateKind::EnumConstant,
+        parser::SymbolKind::GlobalVariable | parser::SymbolKind::Field => {
+            CompletionCandidateKind::Variable
         }
     }
-    survivors.into_iter().flatten().collect()
 }
 
-fn completion_candidate_beats(
-    source: CompletionCandidateSource,
-    key: (model::ScopeTier, model::ResolutionConfidence),
-    score: i32,
-    prev_source: CompletionCandidateSource,
-    prev_key: (model::ScopeTier, model::ResolutionConfidence),
-    prev_score: i32,
-) -> bool {
-    match (source, prev_source) {
-        (CompletionCandidateSource::Indexed, CompletionCandidateSource::LocalWord) => true,
-        (CompletionCandidateSource::LocalWord, CompletionCandidateSource::Indexed) => false,
-        _ => key > prev_key || (key == prev_key && score > prev_score),
+fn completion_items_for_local_bindings(
+    hits: Vec<query::LocalCompletionCandidate>,
+) -> Vec<CompletionCandidate> {
+    hits.into_iter()
+        .map(|hit| {
+            let mut evidence = CandidateEvidence::new(
+                CandidateSource::LocalBinding,
+                model::ScopeTier::Current,
+                model::ResolutionConfidence::Heuristic,
+                hit.score,
+            );
+            evidence.match_score = hit.match_score;
+            evidence.kind = CompletionCandidateKind::Variable;
+            set_completion_history_key(&mut evidence, &hit.name);
+            CompletionCandidate::new(
+                hit.name.clone(),
+                evidence,
+                CompletionItem {
+                    label: hit.name,
+                    kind: Some(CompletionItemKind::VARIABLE),
+                    detail: Some(hit.detail),
+                    sort_text: Some(format!("{:08}", 100_000_000 - hit.score)),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect()
+}
+
+fn completion_items_for_current_file_overlay(
+    hits: Vec<query::CurrentFileOverlayCandidate>,
+) -> Vec<CompletionCandidate> {
+    hits.into_iter()
+        .map(|hit| {
+            let is_text = !hit.semantic || hit.detail.as_deref() == Some("text");
+            let source = if is_text {
+                CandidateSource::LocalWord
+            } else {
+                CandidateSource::CurrentFileOverlay
+            };
+            let tier = if is_text {
+                model::ScopeTier::Global
+            } else {
+                model::ScopeTier::Current
+            };
+            let confidence = if is_text {
+                model::ResolutionConfidence::Fallback
+            } else {
+                model::ResolutionConfidence::Heuristic
+            };
+            let kind = if is_text {
+                CompletionItemKind::TEXT
+            } else {
+                query::lsp_completion_kind_from_parser(hit.kind)
+            };
+            let mut evidence = CandidateEvidence::new(source, tier, confidence, hit.match_score);
+            evidence.match_score = hit.match_score;
+            evidence.proximity_score = hit.proximity_score;
+            evidence.kind = if is_text {
+                CompletionCandidateKind::Text
+            } else {
+                completion_candidate_kind_from_parser(hit.kind)
+            };
+            set_completion_history_key(&mut evidence, &hit.name);
+
+            CompletionCandidate::new(
+                hit.name.clone(),
+                evidence,
+                CompletionItem {
+                    label: hit.name,
+                    kind: Some(kind),
+                    detail: hit.detail,
+                    ..Default::default()
+                },
+            )
+        })
+        .collect()
+}
+
+fn completion_items_for_indexed_hits(
+    hits: Vec<query::RankedNameHit>,
+    open_reason: Option<reachability::OpenReason>,
+) -> Vec<CompletionCandidate> {
+    hits.into_iter()
+        .map(|hit| {
+            let (confidence, reason) =
+                resolver::confidence_reason_for(hit.tier, false, open_reason);
+            let label = model::completion_scope_label(hit.tier, confidence, reason);
+            let mut evidence =
+                CandidateEvidence::new(CandidateSource::Indexed, hit.tier, confidence, hit.score);
+            evidence.match_score = hit.base_match;
+            evidence.kind = completion_candidate_kind_from_parser(hit.kind);
+            set_completion_history_key(&mut evidence, &hit.name);
+            CompletionCandidate::new(
+                hit.name.clone(),
+                evidence,
+                CompletionItem {
+                    label: hit.name,
+                    kind: Some(query::lsp_completion_kind_from_parser(hit.kind)),
+                    sort_text: Some(format!("{:08}", 100_000_000 - hit.score)),
+                    detail: label.as_ref().map(|l| l.detail.to_string()),
+                    documentation: label.map(|l| Documentation::String(l.documentation)),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect()
+}
+
+fn apply_final_completion_sort_text(items: &mut [CompletionItem]) {
+    for (index, item) in items.iter_mut().enumerate() {
+        item.sort_text = Some(format!("{index:08}"));
     }
 }
 
@@ -163,12 +226,15 @@ fn exact_indexed_completion_candidates_for_local_word(
             let (confidence, reason) =
                 resolver::confidence_reason_for(hit.tier, false, open_reason);
             let label = model::completion_scope_label(hit.tier, confidence, reason);
-            CompletionCandidate {
-                name: hit.name.clone(),
-                tier: hit.tier,
-                confidence,
-                score: local_score,
-                item: CompletionItem {
+            let mut evidence =
+                CandidateEvidence::new(CandidateSource::Indexed, hit.tier, confidence, local_score);
+            evidence.match_score = hit.base_match;
+            evidence.kind = completion_candidate_kind_from_parser(hit.kind);
+            set_completion_history_key(&mut evidence, &hit.name);
+            CompletionCandidate::new(
+                hit.name.clone(),
+                evidence,
+                CompletionItem {
                     label: hit.name,
                     kind: Some(query::lsp_completion_kind_from_parser(hit.kind)),
                     sort_text: Some(format!("{:08}", 100_000_000 - local_score)),
@@ -176,16 +242,25 @@ fn exact_indexed_completion_candidates_for_local_word(
                     documentation: label.map(|l| Documentation::String(l.documentation)),
                     ..Default::default()
                 },
-                source: CompletionCandidateSource::Indexed,
-            }
+            )
         })
         .collect()
+}
+
+fn set_completion_history_key(evidence: &mut CandidateEvidence, label: &str) {
+    evidence.history_key = Some(candidate_hash_key(
+        label,
+        evidence.kind.as_history_kind_str(),
+    ));
 }
 
 const REFRESH_INDEX_COMMAND: &str = "fossilsense.refreshIndex";
 const REFRESH_INDEX_LSP_COMMAND: &str = "fossilsense.lsp.refreshIndex";
 const REBUILD_INDEX_COMMAND: &str = "fossilsense.rebuildIndex";
 const REBUILD_INDEX_LSP_COMMAND: &str = "fossilsense.lsp.rebuildIndex";
+pub(super) const COMPLETION_ACCEPTED_LSP_COMMAND: &str = "fossilsense.lsp.completionAccepted";
+pub(super) const CLEAR_COMPLETION_HISTORY_LSP_COMMAND: &str =
+    "fossilsense.lsp.clearCompletionHistory";
 /// Client command for role-grouped find-references: takes one argument object
 /// `{ uri, line, character }` and returns the role-labeled hits the standard
 /// `textDocument/references` cannot carry over the wire.
@@ -213,6 +288,8 @@ pub async fn run_stdio() -> Result<()> {
         completion_enabled: AtomicBool::new(true),
         semantic_coloring_enabled: AtomicBool::new(true),
         scoping_enabled: AtomicBool::new(true),
+        completion_history_mode: Arc::new(Mutex::new(CompletionHistoryMode::Auto)),
+        completion_history: Arc::new(Mutex::new(HashMap::new())),
         debug_candidate_reasons: AtomicBool::new(false),
         perf_logging_enabled: AtomicBool::new(false),
         reference_role_cache: Arc::new(references::ReferenceRoleCache::new()),
@@ -265,6 +342,12 @@ struct Backend {
     /// Whether limited include-reachability scoping is enabled. When off, both
     /// coloring and completion fall back to whole-index (unscoped) behavior.
     scoping_enabled: AtomicBool,
+    /// Local-only accepted-completion history mode. `auto` and `on` both record
+    /// anonymous positive feedback; `off` keeps deterministic v1.2.0 ranking.
+    completion_history_mode: Arc<Mutex<CompletionHistoryMode>>,
+    /// Workspace-local completion history stores, keyed by their cache file
+    /// path so multi-root workspaces remain separate on disk.
+    completion_history: Arc<Mutex<HashMap<PathBuf, CompletionHistoryStore>>>,
     /// Whether goto-definition logs each candidate's scope reasoning
     /// (tier/confidence/reason) to the output panel. Off by default; gated by
     /// `fossilsense.debug.candidateReasons`. A debug aid, not a user contract.
@@ -341,11 +424,18 @@ impl Backend {
         uri: &Url,
         form: IncludeForm,
         partial: String,
+        text: &str,
     ) -> LspResult<Option<CompletionResponse>> {
         let (dir_part, seg) = includes::split_partial(&partial);
         let current_dir = uri_to_path(uri).and_then(|p| p.parent().map(|d| d.to_path_buf()));
         let client_include_roots = self.include_paths.lock().await.clone();
         let workspace_root = self.root_for_uri(uri).await;
+        let current_rel_path = workspace_root.as_ref().and_then(|root| {
+            uri_to_path(uri).and_then(|path| pathing::relative_slash_path(root, &path).ok())
+        });
+        let current_rel_dir = current_rel_path
+            .as_deref()
+            .and_then(|path| path.rsplit_once('/').map(|(dir, _)| dir.to_string()));
         let include_table = match &workspace_root {
             Some(root) => self.include_tables.lock().await.get(root).cloned(),
             None => None,
@@ -357,38 +447,57 @@ impl Backend {
             .and_then(|root| pathing::default_index_path(root).ok());
         let external_cache = self.external_include_dir_cache.clone();
         let limit = query::COMPLETION_LIMIT;
+        let text = text.to_string();
 
         let started = tokio::time::Instant::now();
         let hit_memory = include_table.is_some();
         let hit_db = db_path.as_ref().is_some_and(|path| path.exists());
-        let result = tokio::task::spawn_blocking(move || -> Result<Vec<CompletionItem>> {
-            Ok(collect_include_candidates_with_table(
-                form,
-                &dir_part,
-                &seg,
-                current_dir.as_deref(),
-                workspace_root.as_deref(),
-                &include_roots,
-                db_path.as_deref(),
-                include_table.as_deref(),
-                Some(&external_cache),
-                limit,
-            ))
-        })
+        let result = tokio::task::spawn_blocking(
+            move || -> Result<(Vec<CompletionItem>, include_completion::IncludeCompletionMetrics)> {
+                let evidence =
+                    CurrentIncludeEvidence::from_text(&text, current_rel_path.as_deref());
+                Ok(collect_include_candidates_with_table_and_evidence(
+                    form,
+                    &dir_part,
+                    &seg,
+                    current_dir.as_deref(),
+                    workspace_root.as_deref(),
+                    &include_roots,
+                    db_path.as_deref(),
+                    include_table.as_deref(),
+                    Some(&external_cache),
+                    current_rel_dir.as_deref(),
+                    Some(&evidence),
+                    limit,
+                ))
+            },
+        )
         .await;
         let total_ms = started.elapsed().as_millis();
+        let metrics = result
+            .as_ref()
+            .ok()
+            .and_then(|inner| inner.as_ref().ok().map(|(_, metrics)| *metrics))
+            .unwrap_or_default();
         self.perf_log(|| {
             format!(
-                "[perf] include_completion total={}ms workspace_table={} workspace_index={}",
+                "[perf] include_completion total={}ms workspace_table={} workspace_index={} same_directory={} recent={} sibling={} basename={} depth_penalty={}",
                 total_ms,
                 if hit_memory { "memory" } else { "unavailable" },
-                if hit_db { "available" } else { "unavailable" }
+                if hit_db { "available" } else { "unavailable" },
+                metrics.same_directory,
+                metrics.recent,
+                metrics.sibling,
+                metrics.basename,
+                metrics.depth_penalty,
             )
         })
         .await;
 
         match self.unwrap_query("include completion", result).await {
-            Some(items) if !items.is_empty() => Ok(Some(CompletionResponse::Array(items))),
+            Some((items, _metrics)) if !items.is_empty() => {
+                Ok(Some(CompletionResponse::Array(items)))
+            }
             // Stay incomplete so the editor re-queries as the path is typed.
             _ => Ok(Some(empty_completion_list(true))),
         }
@@ -527,6 +636,189 @@ impl Backend {
         )
         .await;
     }
+
+    async fn preload_completion_history(&self) {
+        if !self.completion_history_mode.lock().await.is_enabled() {
+            return;
+        }
+        let roots = self.workspace_roots.lock().await.clone();
+        let history_paths: Vec<PathBuf> = roots
+            .iter()
+            .filter_map(|root| pathing::default_completion_history_path(root).ok())
+            .collect();
+        if history_paths.is_empty() {
+            return;
+        }
+
+        let loaded =
+            tokio::task::spawn_blocking(move || -> Vec<(PathBuf, CompletionHistoryStore)> {
+                history_paths
+                    .into_iter()
+                    .filter_map(|path| {
+                        CompletionHistoryStore::open(&path)
+                            .ok()
+                            .map(|store| (path, store))
+                    })
+                    .collect()
+            })
+            .await
+            .unwrap_or_default();
+        if loaded.is_empty() {
+            return;
+        }
+
+        let mut stores = self.completion_history.lock().await;
+        for (path, store) in loaded {
+            stores.entry(path).or_insert(store);
+        }
+    }
+
+    async fn record_completion_accept(&self, event: CompletionAcceptEvent) -> Result<()> {
+        if !self.completion_history_mode.lock().await.is_enabled() {
+            return Ok(());
+        }
+
+        let roots = self.workspace_roots.lock().await.clone();
+        let Some(root) = roots
+            .into_iter()
+            .find(|root| completion_history_workspace_hash(root) == event.workspace_hash)
+        else {
+            return Ok(());
+        };
+        let history_path = pathing::default_completion_history_path(&root)?;
+        let mut stores = self.completion_history.lock().await;
+        if !stores.contains_key(&history_path) {
+            stores.insert(
+                history_path.clone(),
+                CompletionHistoryStore::open(&history_path)?,
+            );
+        }
+        if let Some(store) = stores.get_mut(&history_path) {
+            store.record_accept(event)?;
+        }
+        Ok(())
+    }
+
+    async fn clear_completion_history(&self) -> Result<usize> {
+        let roots = self.workspace_roots.lock().await.clone();
+        let mut stores = self.completion_history.lock().await;
+        let mut removed = 0usize;
+
+        if roots.is_empty() {
+            for store in stores.values_mut() {
+                removed += store.clear_all()?;
+            }
+            return Ok(removed);
+        }
+
+        for root in roots {
+            let history_path = pathing::default_completion_history_path(&root)?;
+            if !stores.contains_key(&history_path) {
+                let store = CompletionHistoryStore::open(&history_path)
+                    .unwrap_or_else(|_| CompletionHistoryStore::empty(&history_path));
+                stores.insert(history_path.clone(), store);
+            }
+            if let Some(store) = stores.get_mut(&history_path) {
+                removed += store.clear_all()?;
+            }
+        }
+        Ok(removed)
+    }
+
+    async fn completion_history_snapshot_for_root(
+        &self,
+        root: &Path,
+        workspace_hash: &str,
+    ) -> Result<CompletionHistorySnapshot> {
+        let history_path = pathing::default_completion_history_path(root)?;
+        let stores = self.completion_history.lock().await;
+        Ok(stores
+            .get(&history_path)
+            .map(|store| store.snapshot(workspace_hash))
+            .unwrap_or_default())
+    }
+
+    #[cfg(test)]
+    async fn set_completion_history_mode_for_test(&self, mode: CompletionHistoryMode) {
+        *self.completion_history_mode.lock().await = mode;
+    }
+
+    #[cfg(test)]
+    async fn history_snapshot_for_test(&self, workspace_hash: &str) -> CompletionHistorySnapshot {
+        let stores = self.completion_history.lock().await;
+        let mut snapshot = CompletionHistorySnapshot::default();
+        for store in stores.values() {
+            snapshot.append_from(store.snapshot(workspace_hash));
+        }
+        snapshot
+    }
+}
+
+fn completion_accept_event_from_arg(arg: Option<&Value>) -> Option<CompletionAcceptEvent> {
+    let arg = arg?;
+    let workspace_hash = non_empty_string_field(arg, "workspaceHash")?;
+    let candidate_hash = candidate_hash_field(arg, "candidateHash")?;
+    let kind = non_empty_string_field(arg, "kind")?;
+    let intent = non_empty_string_field(arg, "intent")?;
+    let prefix_bucket = arg
+        .get("prefixBucket")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    Some(CompletionAcceptEvent {
+        workspace_hash,
+        candidate_hash,
+        kind,
+        intent,
+        prefix_bucket,
+        accepted_at: crate::completion_history::now_unix_secs(),
+    })
+}
+
+fn non_empty_string_field(value: &Value, field: &str) -> Option<String> {
+    value
+        .get(field)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn candidate_hash_field(value: &Value, field: &str) -> Option<String> {
+    let hash = non_empty_string_field(value, field)?;
+    candidate_hash_key_from_hex(&hash)?;
+    Some(hash.to_ascii_lowercase())
+}
+
+fn completion_history_workspace_hash(root: &Path) -> String {
+    pathing::canonical_workspace(root)
+        .map(|workspace| pathing::workspace_hash(&workspace))
+        .unwrap_or_else(|_| pathing::workspace_hash(root))
+}
+
+fn attach_completion_history_accept_command(
+    item: &mut CompletionItem,
+    evidence: CandidateEvidence,
+    workspace_hash: &str,
+    intent: completion::CompletionIntentKind,
+    prefix_bucket: &str,
+) {
+    if evidence.history_key.is_none() {
+        return;
+    }
+    let kind = evidence.kind.as_history_kind_str();
+    item.command = Some(Command {
+        title: "FossilSense completion accepted".to_string(),
+        command: COMPLETION_ACCEPTED_LSP_COMMAND.to_string(),
+        arguments: Some(vec![serde_json::json!({
+            "workspaceHash": workspace_hash,
+            "candidateHash": candidate_hash(&item.label, kind),
+            "kind": kind,
+            "intent": intent.as_summary_str(),
+            "prefixBucket": prefix_bucket,
+        })]),
+    });
 }
 
 fn query_error_log_line(what: &str, kind: &str, detail: &str) -> String {

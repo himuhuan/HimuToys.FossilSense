@@ -2,6 +2,7 @@ use tower_lsp::lsp_types::{
     CompletionList, CompletionResponse, InitializeParams, SignatureHelpOptions,
 };
 
+use crate::completion_history::CompletionHistoryMode;
 use crate::model;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +35,26 @@ pub(super) fn parse_completion_mode(params: &InitializeParams) -> CompletionMode
         "on" => CompletionMode::On,
         "off" => CompletionMode::Off,
         _ => CompletionMode::Auto,
+    }
+}
+
+pub(super) fn parse_completion_history_mode(params: &InitializeParams) -> CompletionHistoryMode {
+    let Some(opts) = &params.initialization_options else {
+        return CompletionHistoryMode::Auto;
+    };
+    let mode_val = opts
+        .as_object()
+        .and_then(|o| o.get("fossilsense"))
+        .and_then(|v| v.as_object())
+        .and_then(|o| o.get("completionHistory"))
+        .and_then(|v| v.as_object())
+        .and_then(|o| o.get("mode"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("auto");
+    match mode_val {
+        "on" => CompletionHistoryMode::On,
+        "off" => CompletionHistoryMode::Off,
+        _ => CompletionHistoryMode::Auto,
     }
 }
 
@@ -250,6 +271,18 @@ mod tests {
         }
     }
 
+    fn params_with_completion_history_mode(mode: Option<&str>) -> InitializeParams {
+        let initialization_options = mode.map(|mode| {
+            serde_json::json!({
+                "fossilsense": { "completionHistory": { "mode": mode } }
+            })
+        });
+        InitializeParams {
+            initialization_options,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn defaults_to_auto_when_unset() {
         assert_eq!(
@@ -286,6 +319,30 @@ mod tests {
         assert_eq!(
             parse_semantic_coloring_mode(&params_with_mode(Some("bogus"))),
             SemanticColoringMode::Auto
+        );
+    }
+
+    #[test]
+    fn parses_completion_history_modes() {
+        assert_eq!(
+            parse_completion_history_mode(&params_with_completion_history_mode(None)),
+            CompletionHistoryMode::Auto
+        );
+        assert_eq!(
+            parse_completion_history_mode(&params_with_completion_history_mode(Some("on"))),
+            CompletionHistoryMode::On
+        );
+        assert_eq!(
+            parse_completion_history_mode(&params_with_completion_history_mode(Some("off"))),
+            CompletionHistoryMode::Off
+        );
+        assert_eq!(
+            parse_completion_history_mode(&params_with_completion_history_mode(Some("bogus"))),
+            CompletionHistoryMode::Auto
+        );
+        assert!(
+            !parse_completion_history_mode(&params_with_completion_history_mode(Some("off")))
+                .is_enabled()
         );
     }
 

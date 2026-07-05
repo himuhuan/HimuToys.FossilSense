@@ -1,13 +1,130 @@
 use super::include_completion::IncludeCompletionTable;
 use super::{
-    dedup_completion_candidates, grouped_reference_items, local_words_for_cache,
+    completion_items_for_local_bindings, grouped_reference_items, local_words_for_cache,
     rebuild_include_table, rebuild_indexed_file_list,
 };
 use std::collections::HashMap;
+use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex as StdMutex};
 use tempfile::tempdir;
-use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind, Url};
+use tower_lsp::lsp_types::{
+    CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse, ExecuteCommandParams,
+    Position, TextDocumentIdentifier, TextDocumentPositionParams, Url,
+};
+use tower_lsp::{LanguageServer as _, LspService};
+
+fn test_backend_service() -> LspService<super::Backend> {
+    let (service, _) = LspService::new(|client| super::Backend {
+        client,
+        workspace_roots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+        index_schedule: Arc::new(tokio::sync::Mutex::new(IndexScheduleState::default())),
+        open_docs: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        live_parse_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+        name_tables: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        reach_graphs: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        include_tables: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        indexed_file_lists: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        index_generations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        external_include_dir_cache: Arc::new(StdMutex::new(HashMap::new())),
+        local_word_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        include_paths: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+        completion_enabled: AtomicBool::new(true),
+        semantic_coloring_enabled: AtomicBool::new(true),
+        scoping_enabled: AtomicBool::new(true),
+        completion_history_mode: Arc::new(tokio::sync::Mutex::new(
+            crate::completion_history::CompletionHistoryMode::Auto,
+        )),
+        completion_history: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        debug_candidate_reasons: AtomicBool::new(false),
+        perf_logging_enabled: AtomicBool::new(false),
+        reference_role_cache: Arc::new(crate::references::ReferenceRoleCache::new()),
+        reference_search_cache: Arc::new(crate::references::ReferenceSearchCache::new()),
+        completion_memo: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        config_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+    });
+    service
+}
+
+fn completion_params(uri: Url, line: u32, character: u32) -> CompletionParams {
+    CompletionParams {
+        text_document_position: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri },
+            position: Position::new(line, character),
+        },
+        work_done_progress_params: Default::default(),
+        partial_result_params: Default::default(),
+        context: None,
+    }
+}
+
+fn completion_items(response: CompletionResponse) -> Vec<CompletionItem> {
+    match response {
+        CompletionResponse::Array(items) => items,
+        CompletionResponse::List(list) => list.items,
+    }
+}
+
+fn text_and_position(marked: &str) -> (String, u32, u32) {
+    let marker = "/*cursor*/";
+    let cursor_byte = marked.find(marker).expect("cursor marker");
+    let text = marked.replacen(marker, "", 1);
+    let before = &text[..cursor_byte];
+    let line = before.bytes().filter(|byte| *byte == b'\n').count() as u32;
+    let line_start = before.rfind('\n').map_or(0, |index| index + 1);
+    let character = before[line_start..]
+        .chars()
+        .map(|ch| ch.len_utf16() as u32)
+        .sum();
+    (text, line, character)
+}
+
+fn write_workspace_file(root: &std::path::Path, rel: &str, text: &str) {
+    let path = root.join(rel);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("mkdir");
+    }
+    fs::write(path, text).expect("write file");
+}
+
+async fn indexed_backend_with_open_doc(
+    indexed_files: &[(&str, &str)],
+    open_rel: &str,
+    marked_open_text: &str,
+) -> (tempfile::TempDir, LspService<super::Backend>, Url, u32, u32) {
+    let dir = tempdir().expect("tempdir");
+    for (rel, text) in indexed_files {
+        write_workspace_file(dir.path(), rel, text);
+    }
+    let (open_text, line, character) = text_and_position(marked_open_text);
+    write_workspace_file(dir.path(), open_rel, &open_text);
+    crate::indexer::index_workspace(
+        dir.path(),
+        crate::indexer::IndexOptions {
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("index");
+
+    let uri = Url::from_file_path(dir.path().join(open_rel)).expect("file uri");
+    let service = test_backend_service();
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(dir.path().to_path_buf());
+    service
+        .inner()
+        .open_docs
+        .lock()
+        .await
+        .insert(uri.clone(), (1, open_text));
+    (dir, service, uri, line, character)
+}
 
 #[tokio::test]
 async fn local_word_cache_is_keyed_by_document_version() {
@@ -42,6 +159,37 @@ async fn failed_include_table_rebuild_clears_stale_cache() {
         !include_tables.lock().await.contains_key(&root_path),
         "degraded include table must not keep stale candidates"
     );
+}
+
+#[tokio::test]
+async fn include_table_rebuild_carries_include_edges_for_ranking() {
+    let root = tempdir().expect("root");
+    let root_path = root.path().to_path_buf();
+    std::fs::write(root.path().join("a.c"), "#include \"b.h\"\n").expect("a");
+    std::fs::write(root.path().join("b.h"), "int b;\n").expect("b");
+    crate::indexer::index_workspace(
+        root.path(),
+        crate::indexer::IndexOptions {
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("index");
+
+    let include_tables: super::IncludeTables = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let count = rebuild_include_table(&include_tables, root_path.clone())
+        .await
+        .expect("rebuild include table");
+    let table = include_tables
+        .lock()
+        .await
+        .get(&root_path)
+        .cloned()
+        .expect("table");
+
+    assert_eq!(count, 2);
+    assert_eq!(table.edge_count(), 1);
 }
 
 #[tokio::test]
@@ -93,6 +241,468 @@ fn grouped_reference_items_preserve_role_and_order() {
     // Definition group first; each item carries its role label for the client.
     assert_eq!(items[0].role, "definition");
     assert_eq!(items[1].role, "read");
+}
+
+#[tokio::test]
+async fn member_completion_returns_fields_and_methods_for_resolved_receiver() {
+    let (_dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[(
+            "widget.hpp",
+            "struct Widget { int width; void resize(); };\n",
+        )],
+        "main.cpp",
+        "#include \"widget.hpp\"\nvoid f(Widget *w) { w->/*cursor*/ }\n",
+    )
+    .await;
+
+    let response = service
+        .inner()
+        .completion(completion_params(uri, line, character))
+        .await
+        .expect("completion request")
+        .expect("completion response");
+    let items = completion_items(response);
+
+    assert!(items
+        .iter()
+        .any(|item| item.label == "resize" && item.kind == Some(CompletionItemKind::METHOD)));
+    assert!(items
+        .iter()
+        .any(|item| item.label == "width" && item.kind == Some(CompletionItemKind::FIELD)));
+}
+
+#[tokio::test]
+async fn member_completion_does_not_leak_global_owner_when_reachable_owner_lacks_prefix() {
+    let (dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[
+            ("reachable.hpp", "struct W { int width; };\n"),
+            ("global.hpp", "struct W { int height; };\n"),
+        ],
+        "main.cpp",
+        "#include \"reachable.hpp\"\nvoid f(W *w) { w->he/*cursor*/ }\n",
+    )
+    .await;
+    service.inner().reach_graphs.lock().await.insert(
+        dir.path().to_path_buf(),
+        Arc::new(std::sync::RwLock::new(
+            crate::reachability::ReachGraph::new(
+                vec![("main.cpp".to_string(), "reachable.hpp".to_string())],
+                vec![],
+                vec![],
+            ),
+        )),
+    );
+
+    let response = service
+        .inner()
+        .completion(completion_params(uri, line, character))
+        .await
+        .expect("completion request")
+        .expect("completion response");
+    let items = completion_items(response);
+
+    assert!(
+        !items.iter().any(|item| item.label == "height"),
+        "global W::height must not leak when reachable W has members but no 'he' member"
+    );
+    assert!(
+        items.is_empty(),
+        "resolved receiver should return an empty incomplete list instead of falling back"
+    );
+}
+
+#[tokio::test]
+async fn member_fallback_still_blocks_one_character_prefix() {
+    let (_dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[("widget.hpp", "struct Widget { int width; void wipe(); };\n")],
+        "main.cpp",
+        "void f(void) { make_widget()->w/*cursor*/ }\n",
+    )
+    .await;
+
+    let response = service
+        .inner()
+        .completion(completion_params(uri, line, character))
+        .await
+        .expect("completion request")
+        .expect("completion response");
+    assert!(completion_items(response).is_empty());
+}
+
+#[tokio::test]
+async fn weak_receiver_uses_member_fallback_min_prefix_gate() {
+    let (_dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[("widget.hpp", "struct Widget { int width; int window; };\n")],
+        "main.cpp",
+        "void f(void) { widget->w/*cursor*/ }\n",
+    )
+    .await;
+
+    let response = service
+        .inner()
+        .completion(completion_params(uri, line, character))
+        .await
+        .expect("completion request")
+        .expect("completion response");
+
+    assert!(
+        completion_items(response).is_empty(),
+        "weak receiver correlation must not bypass the member fallback short-prefix gate"
+    );
+}
+
+#[tokio::test]
+async fn execute_command_records_completion_accept_when_history_enabled() {
+    let service = test_backend_service();
+    let dir = tempdir().expect("tempdir");
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(dir.path().to_path_buf());
+    service
+        .inner()
+        .set_completion_history_mode_for_test(crate::completion_history::CompletionHistoryMode::On)
+        .await;
+    let workspace_hash = super::completion_history_workspace_hash(dir.path());
+
+    service
+        .inner()
+        .execute_command(ExecuteCommandParams {
+            command: super::COMPLETION_ACCEPTED_LSP_COMMAND.to_string(),
+            arguments: vec![serde_json::json!({
+                "workspaceHash": workspace_hash,
+                "candidateHash": crate::completion_history::candidate_hash("printf", "function"),
+                "kind": "function",
+                "intent": "call_target",
+                "prefixBucket": "pr"
+            })],
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .expect("command");
+
+    assert_eq!(
+        service
+            .inner()
+            .history_snapshot_for_test(&workspace_hash)
+            .await
+            .total_accepts(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn execute_command_ignores_invalid_completion_candidate_hash() {
+    let service = test_backend_service();
+    let dir = tempdir().expect("tempdir");
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(dir.path().to_path_buf());
+    service
+        .inner()
+        .set_completion_history_mode_for_test(crate::completion_history::CompletionHistoryMode::On)
+        .await;
+    let workspace_hash = super::completion_history_workspace_hash(dir.path());
+
+    service
+        .inner()
+        .execute_command(ExecuteCommandParams {
+            command: super::COMPLETION_ACCEPTED_LSP_COMMAND.to_string(),
+            arguments: vec![serde_json::json!({
+                "workspaceHash": workspace_hash,
+                "candidateHash": "abc",
+                "kind": "function",
+                "intent": "call_target",
+                "prefixBucket": "pr"
+            })],
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .expect("command");
+
+    assert_eq!(
+        service
+            .inner()
+            .history_snapshot_for_test(&workspace_hash)
+            .await
+            .total_accepts(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn completion_accept_history_is_recorded_in_matching_workspace_root() {
+    let service = test_backend_service();
+    let first = tempdir().expect("first tempdir");
+    let second = tempdir().expect("second tempdir");
+    {
+        let mut roots = service.inner().workspace_roots.lock().await;
+        roots.push(first.path().to_path_buf());
+        roots.push(second.path().to_path_buf());
+    }
+    service
+        .inner()
+        .set_completion_history_mode_for_test(crate::completion_history::CompletionHistoryMode::On)
+        .await;
+    let first_hash = super::completion_history_workspace_hash(first.path());
+    let second_hash = super::completion_history_workspace_hash(second.path());
+
+    service
+        .inner()
+        .execute_command(ExecuteCommandParams {
+            command: super::COMPLETION_ACCEPTED_LSP_COMMAND.to_string(),
+            arguments: vec![serde_json::json!({
+                "workspaceHash": second_hash,
+                "candidateHash": crate::completion_history::candidate_hash("printf", "function"),
+                "kind": "function",
+                "intent": "call_target",
+                "prefixBucket": "pr"
+            })],
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .expect("command");
+
+    let first_path = crate::pathing::default_completion_history_path(first.path()).expect("path");
+    let second_path = crate::pathing::default_completion_history_path(second.path()).expect("path");
+    let first_store =
+        crate::completion_history::CompletionHistoryStore::open(&first_path).expect("first store");
+    let second_store = crate::completion_history::CompletionHistoryStore::open(&second_path)
+        .expect("second store");
+
+    assert_eq!(first_store.snapshot(&first_hash).total_accepts(), 0);
+    assert_eq!(first_store.snapshot(&second_hash).total_accepts(), 0);
+    assert_eq!(second_store.snapshot(&second_hash).total_accepts(), 1);
+}
+
+#[tokio::test]
+async fn execute_command_ignores_completion_accept_when_history_disabled() {
+    let service = test_backend_service();
+    let dir = tempdir().expect("tempdir");
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(dir.path().to_path_buf());
+    service
+        .inner()
+        .set_completion_history_mode_for_test(crate::completion_history::CompletionHistoryMode::Off)
+        .await;
+    let workspace_hash = super::completion_history_workspace_hash(dir.path());
+
+    service
+        .inner()
+        .execute_command(ExecuteCommandParams {
+            command: super::COMPLETION_ACCEPTED_LSP_COMMAND.to_string(),
+            arguments: vec![serde_json::json!({
+                "workspaceHash": workspace_hash,
+                "candidateHash": crate::completion_history::candidate_hash("printf", "function"),
+                "kind": "function",
+                "intent": "call_target",
+                "prefixBucket": "pr"
+            })],
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .expect("command");
+
+    assert_eq!(
+        service
+            .inner()
+            .history_snapshot_for_test(&workspace_hash)
+            .await
+            .total_accepts(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn clear_completion_history_overwrites_corrupt_history_file() {
+    let service = test_backend_service();
+    let dir = tempdir().expect("tempdir");
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(dir.path().to_path_buf());
+    let history_path =
+        crate::pathing::default_completion_history_path(dir.path()).expect("history path");
+    std::fs::create_dir_all(history_path.parent().expect("history parent")).expect("mkdir");
+    std::fs::write(&history_path, "{not json").expect("write corrupt history");
+
+    service
+        .inner()
+        .clear_completion_history()
+        .await
+        .expect("clear corrupt history");
+
+    let store = crate::completion_history::CompletionHistoryStore::open(&history_path)
+        .expect("history should be parseable after clear");
+    assert_eq!(
+        store
+            .snapshot(&super::completion_history_workspace_hash(dir.path()))
+            .total_accepts(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn ordinary_completion_items_attach_history_accept_command_when_enabled() {
+    let (src, line, character) = text_and_position(
+        "#define FS_MAGIC 1\n\
+         void f(void) { FS/*cursor*/(); }\n",
+    );
+    let dir = tempdir().expect("tempdir");
+    let uri = Url::from_file_path(dir.path().join("a.c")).expect("file uri");
+    let service = test_backend_service();
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(dir.path().to_path_buf());
+    service
+        .inner()
+        .open_docs
+        .lock()
+        .await
+        .insert(uri.clone(), (1, src));
+    service
+        .inner()
+        .set_completion_history_mode_for_test(crate::completion_history::CompletionHistoryMode::On)
+        .await;
+
+    let response = service
+        .inner()
+        .completion(completion_params(uri, line, character))
+        .await
+        .expect("completion")
+        .expect("response");
+    let item = completion_items(response)
+        .into_iter()
+        .find(|item| item.label == "FS_MAGIC")
+        .expect("FS_MAGIC");
+
+    let command = item.command.as_ref().expect("history command");
+    assert_eq!(command.command, super::COMPLETION_ACCEPTED_LSP_COMMAND);
+    let argument = command
+        .arguments
+        .as_ref()
+        .and_then(|arguments| arguments.first())
+        .expect("command argument");
+    assert_eq!(
+        argument.get("kind").and_then(|value| value.as_str()),
+        Some("macro")
+    );
+    assert_eq!(
+        argument.get("intent").and_then(|value| value.as_str()),
+        Some("call_target")
+    );
+    assert_eq!(
+        argument
+            .get("prefixBucket")
+            .and_then(|value| value.as_str()),
+        Some("fs")
+    );
+    assert!(argument
+        .get("workspaceHash")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| !value.is_empty()));
+    assert!(argument
+        .get("candidateHash")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| value.len() == 16));
+}
+
+#[tokio::test]
+async fn ordinary_completion_does_not_open_history_store_on_completion_hot_path() {
+    let (src, line, character) = text_and_position(
+        "#define FS_MAGIC 1\n\
+         void f(void) { FS/*cursor*/(); }\n",
+    );
+    let dir = tempdir().expect("tempdir");
+    let history_path =
+        crate::pathing::default_completion_history_path(dir.path()).expect("history path");
+    std::fs::create_dir_all(history_path.parent().expect("history parent")).expect("mkdir");
+    std::fs::write(&history_path, "{\"version\":1,\"entries\":[]}").expect("write history");
+    let uri = Url::from_file_path(dir.path().join("a.c")).expect("file uri");
+    let service = test_backend_service();
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(dir.path().to_path_buf());
+    service
+        .inner()
+        .open_docs
+        .lock()
+        .await
+        .insert(uri.clone(), (1, src));
+    service
+        .inner()
+        .set_completion_history_mode_for_test(crate::completion_history::CompletionHistoryMode::On)
+        .await;
+
+    service
+        .inner()
+        .completion(completion_params(uri, line, character))
+        .await
+        .expect("completion")
+        .expect("response");
+
+    assert!(
+        service.inner().completion_history.lock().await.is_empty(),
+        "ordinary completion should use only already-loaded in-memory history"
+    );
+}
+
+#[test]
+fn history_accept_command_uses_final_kind_for_candidate_hash() {
+    let mut item = CompletionItem {
+        label: "same_name".to_string(),
+        ..Default::default()
+    };
+    let mut evidence = crate::completion::CandidateEvidence::new(
+        crate::completion::CandidateSource::Indexed,
+        crate::model::ScopeTier::Reachable,
+        crate::model::ResolutionConfidence::Heuristic,
+        700,
+    );
+    evidence.kind = crate::completion::CompletionCandidateKind::Function;
+    evidence.history_key = Some(crate::completion_history::candidate_hash_key(
+        "same_name",
+        "variable",
+    ));
+
+    super::attach_completion_history_accept_command(
+        &mut item,
+        evidence,
+        "workspace",
+        crate::completion::CompletionIntentKind::CallTarget,
+        "sa",
+    );
+
+    let argument = item
+        .command
+        .as_ref()
+        .and_then(|command| command.arguments.as_ref())
+        .and_then(|arguments| arguments.first())
+        .expect("history command argument");
+    let expected_hash = crate::completion_history::candidate_hash("same_name", "function");
+    assert_eq!(
+        argument
+            .get("candidateHash")
+            .and_then(|value| value.as_str()),
+        Some(expected_hash.as_str())
+    );
 }
 
 // --- R7: completion memo validity (generation + prefix extension check) ---
@@ -236,34 +846,355 @@ fn local_word_does_not_outrank_reachable_indexed_candidate() {
 fn completion_dedup_keeps_indexed_kind_over_same_name_local_word() {
     use crate::model::{ResolutionConfidence, ScopeTier};
 
-    let indexed = super::CompletionCandidate {
-        name: "hello_value".to_string(),
-        tier: ScopeTier::Reachable,
-        confidence: ResolutionConfidence::Reachable,
-        score: 30_000,
-        item: CompletionItem {
+    let indexed = super::CompletionCandidate::new(
+        "hello_value",
+        crate::completion::CandidateEvidence::new(
+            crate::completion::CandidateSource::Indexed,
+            ScopeTier::Reachable,
+            ResolutionConfidence::Reachable,
+            30_000,
+        ),
+        CompletionItem {
             label: "hello_value".to_string(),
             kind: Some(CompletionItemKind::FUNCTION),
             ..Default::default()
         },
-        source: super::CompletionCandidateSource::Indexed,
-    };
-    let local = super::CompletionCandidate {
-        name: "hello_value".to_string(),
-        tier: ScopeTier::Current,
-        confidence: ResolutionConfidence::Heuristic,
-        score: 40_000,
-        item: CompletionItem {
+    );
+    let local = super::CompletionCandidate::new(
+        "hello_value",
+        crate::completion::CandidateEvidence::new(
+            crate::completion::CandidateSource::LocalWord,
+            ScopeTier::Current,
+            ResolutionConfidence::Heuristic,
+            40_000,
+        ),
+        CompletionItem {
             label: "hello_value".to_string(),
             kind: Some(CompletionItemKind::TEXT),
             ..Default::default()
         },
-        source: super::CompletionCandidateSource::LocalWord,
-    };
+    );
 
-    let deduped = dedup_completion_candidates(vec![indexed, local]);
+    let deduped = crate::completion::run_compatible_pipeline(vec![indexed, local], 10).items;
     assert_eq!(deduped.len(), 1);
-    assert_eq!(deduped[0].item.kind, Some(CompletionItemKind::FUNCTION));
+    assert_eq!(deduped[0].payload.kind, Some(CompletionItemKind::FUNCTION));
+}
+
+#[test]
+fn completion_dedup_keeps_local_binding_over_same_name_indexed_and_local_word() {
+    use crate::model::{ResolutionConfidence, ScopeTier};
+
+    let indexed = super::CompletionCandidate::new(
+        "count",
+        crate::completion::CandidateEvidence::new(
+            crate::completion::CandidateSource::Indexed,
+            ScopeTier::Reachable,
+            ResolutionConfidence::Reachable,
+            30_000,
+        ),
+        CompletionItem {
+            label: "count".to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            ..Default::default()
+        },
+    );
+    let local_binding = super::CompletionCandidate::new(
+        "count",
+        crate::completion::CandidateEvidence::new(
+            crate::completion::CandidateSource::LocalBinding,
+            ScopeTier::Current,
+            ResolutionConfidence::Heuristic,
+            40_000,
+        ),
+        CompletionItem {
+            label: "count".to_string(),
+            kind: Some(CompletionItemKind::VARIABLE),
+            detail: Some("parameter: int".to_string()),
+            ..Default::default()
+        },
+    );
+    let local_word = super::CompletionCandidate::new(
+        "count",
+        crate::completion::CandidateEvidence::new(
+            crate::completion::CandidateSource::LocalWord,
+            ScopeTier::Global,
+            ResolutionConfidence::Fallback,
+            1_000,
+        ),
+        CompletionItem {
+            label: "count".to_string(),
+            kind: Some(CompletionItemKind::TEXT),
+            ..Default::default()
+        },
+    );
+
+    let deduped =
+        crate::completion::run_compatible_pipeline(vec![indexed, local_word, local_binding], 10)
+            .items;
+    assert_eq!(deduped.len(), 1);
+    assert_eq!(
+        deduped[0].evidence.source,
+        crate::completion::CandidateSource::LocalBinding
+    );
+    assert_eq!(deduped[0].payload.kind, Some(CompletionItemKind::VARIABLE));
+}
+
+#[test]
+fn local_binding_candidates_render_variable_kind_and_detail() {
+    let hits = vec![crate::query::LocalCompletionCandidate {
+        name: "cursor_limit".to_string(),
+        kind: crate::parser::LocalBindingKind::LocalVariable,
+        detail: "local: int".to_string(),
+        score: 42_000,
+        match_score: 550,
+        decl_start_byte: 10,
+    }];
+
+    let candidates = completion_items_for_local_bindings(hits);
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].name, "cursor_limit");
+    assert_eq!(
+        candidates[0].evidence.source,
+        crate::completion::CandidateSource::LocalBinding
+    );
+    assert_eq!(
+        candidates[0].payload.kind,
+        Some(CompletionItemKind::VARIABLE)
+    );
+    assert_eq!(candidates[0].payload.detail.as_deref(), Some("local: int"));
+}
+
+#[test]
+fn local_binding_evidence_uses_raw_match_not_packed_score() {
+    let packed_score = crate::resolver::pack_score(crate::model::ScopeTier::Current, 550, 0);
+    let hits = vec![crate::query::LocalCompletionCandidate {
+        name: "cursor_limit".to_string(),
+        kind: crate::parser::LocalBindingKind::LocalVariable,
+        detail: "local: int".to_string(),
+        score: packed_score,
+        match_score: 550,
+        decl_start_byte: 10,
+    }];
+
+    let candidates = completion_items_for_local_bindings(hits);
+
+    assert_eq!(candidates[0].evidence.score, packed_score);
+    assert_eq!(candidates[0].evidence.match_score, 550);
+}
+
+#[tokio::test]
+async fn ordinary_completion_uses_unsaved_current_file_overlay() {
+    let (src, line, character) = text_and_position(
+        "#define FS_MAGIC 1\n\
+         typedef int FsAlias;\n\
+         void f(void) { FS/*cursor*/ }\n",
+    );
+    let dir = tempdir().expect("tempdir");
+    let uri = Url::from_file_path(dir.path().join("a.c")).expect("file uri");
+    let service = test_backend_service();
+    service
+        .inner()
+        .open_docs
+        .lock()
+        .await
+        .insert(uri.clone(), (1, src));
+
+    let response = service
+        .inner()
+        .completion(completion_params(uri, line, character))
+        .await
+        .expect("completion request")
+        .expect("completion response");
+    if let CompletionResponse::List(list) = &response {
+        assert!(list.is_incomplete);
+    }
+    let items = completion_items(response);
+
+    assert!(items
+        .iter()
+        .any(|item| item.label == "FS_MAGIC" && item.detail.as_deref() == Some("current")));
+    assert!(items
+        .iter()
+        .any(|item| item.label == "FsAlias" && item.detail.as_deref() == Some("current")));
+}
+
+#[tokio::test]
+async fn current_file_text_overlay_renders_text_kind() {
+    let (src, line, character) = text_and_position(
+        "void f(void) {\n\
+             localThing();\n\
+             localT/*cursor*/\n\
+         }\n",
+    );
+    let dir = tempdir().expect("tempdir");
+    let uri = Url::from_file_path(dir.path().join("a.c")).expect("file uri");
+    let service = test_backend_service();
+    service
+        .inner()
+        .open_docs
+        .lock()
+        .await
+        .insert(uri.clone(), (1, src));
+
+    let response = service
+        .inner()
+        .completion(completion_params(uri, line, character))
+        .await
+        .expect("completion request")
+        .expect("completion response");
+    let items = completion_items(response);
+    let local = items
+        .iter()
+        .find(|item| item.label == "localThing")
+        .expect("localThing text overlay completion");
+
+    assert_eq!(local.kind, Some(CompletionItemKind::TEXT));
+    assert_eq!(local.detail.as_deref(), Some("text"));
+}
+
+#[tokio::test]
+async fn text_overlay_still_allows_exact_indexed_semantic_recovery() {
+    let (src, line, character) = text_and_position(
+        "void f(void) {\n\
+             localThing();\n\
+             loc/*cursor*/\n\
+         }\n",
+    );
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().to_path_buf();
+    let uri = Url::from_file_path(root.join("a.c")).expect("file uri");
+    let service = test_backend_service();
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(root.clone());
+    let mut names: Vec<_> = (0..150)
+        .map(|idx| {
+            (
+                idx,
+                format!("localT{idx:03}"),
+                false,
+                "dense.c".to_string(),
+                "global_variable".to_string(),
+                false,
+            )
+        })
+        .collect();
+    names.push((
+        999,
+        "localThing".to_string(),
+        false,
+        "a.c".to_string(),
+        "function".to_string(),
+        false,
+    ));
+    service.inner().name_tables.lock().await.insert(
+        root,
+        Arc::new(crate::query::NameTable::build_with_paths(names)),
+    );
+    service
+        .inner()
+        .open_docs
+        .lock()
+        .await
+        .insert(uri.clone(), (1, src));
+
+    let response = service
+        .inner()
+        .completion(completion_params(uri, line, character))
+        .await
+        .expect("completion request")
+        .expect("completion response");
+    let items = completion_items(response);
+    let local = items
+        .iter()
+        .find(|item| item.label == "localThing")
+        .expect("localThing completion");
+
+    assert_eq!(local.kind, Some(CompletionItemKind::FUNCTION));
+    assert_ne!(local.detail.as_deref(), Some("text"));
+}
+
+#[test]
+fn final_rank_sort_text_matches_pipeline_order() {
+    let mut items = vec![
+        CompletionItem {
+            label: "b".into(),
+            ..Default::default()
+        },
+        CompletionItem {
+            label: "a".into(),
+            ..Default::default()
+        },
+    ];
+
+    super::apply_final_completion_sort_text(&mut items);
+
+    assert_eq!(items[0].sort_text.as_deref(), Some("00000000"));
+    assert_eq!(items[1].sort_text.as_deref(), Some("00000001"));
+}
+
+#[test]
+fn indexed_candidate_evidence_uses_base_match_not_packed_score() {
+    use crate::model::ScopeTier;
+
+    let candidates = super::completion_items_for_indexed_hits(
+        vec![crate::query::RankedNameHit {
+            id: 1,
+            score: crate::resolver::pack_score(ScopeTier::Reachable, 800, 42),
+            tier: ScopeTier::Reachable,
+            base_match: 800,
+            name_len: "api_target".len(),
+            name: "api_target".to_string(),
+            kind: crate::parser::SymbolKind::Function,
+        }],
+        None,
+    );
+
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].evidence.match_score, 800);
+    assert_ne!(
+        candidates[0].evidence.match_score,
+        candidates[0].evidence.score
+    );
+    assert_eq!(
+        candidates[0].payload.kind,
+        Some(CompletionItemKind::FUNCTION)
+    );
+}
+
+#[tokio::test]
+async fn local_binding_pipeline_uses_open_document_bindings_before_local_words() {
+    let src = "int f(int count) {\n    int cursor_limit;\n    cur\n}\n";
+    let dir = tempdir().expect("tempdir");
+    let uri = Url::from_file_path(dir.path().join("a.c")).expect("file uri");
+    let service = test_backend_service();
+    service
+        .inner()
+        .open_docs
+        .lock()
+        .await
+        .insert(uri.clone(), (1, src.to_string()));
+
+    let response = service
+        .inner()
+        .completion(completion_params(uri, 2, 7))
+        .await
+        .expect("completion request")
+        .expect("completion response");
+    if let CompletionResponse::List(list) = &response {
+        assert!(list.is_incomplete);
+    }
+    let items = completion_items(response);
+    let cursor = items
+        .iter()
+        .find(|item| item.label == "cursor_limit")
+        .expect("cursor_limit completion");
+
+    assert_eq!(cursor.kind, Some(CompletionItemKind::VARIABLE));
+    assert_eq!(cursor.detail.as_deref(), Some("local: int"));
 }
 
 #[test]
@@ -293,8 +1224,11 @@ fn local_word_exact_index_match_uses_semantic_completion_kind() {
 
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].name, "api_target_function");
-    assert_eq!(candidates[0].score, local_score);
-    assert_eq!(candidates[0].item.kind, Some(CompletionItemKind::FUNCTION));
+    assert_eq!(candidates[0].evidence.score, local_score);
+    assert_eq!(
+        candidates[0].payload.kind,
+        Some(CompletionItemKind::FUNCTION)
+    );
 }
 
 // --- R7: watcher/debounce IndexScheduleState machine tests ---------------

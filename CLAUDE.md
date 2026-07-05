@@ -103,7 +103,7 @@ fossilsense 单一 Rust 原生二进制 (crates/fossilsense)
 | 符号 | 工作区符号、文档大纲、跳转定义候选 |
 | 引用 | 符号级查找，按句法角色分类；提供 grouped references 命令 |
 | 补全 | 标识符、include 路径、有限成员补全 |
-| 着色 | 宏、类型、枚举量；角色门控；成员字段不着色 |
+| 着色 | 宏、类型、枚举量、当前函数参数和局部变量；角色门控；成员字段不着色 |
 | include | 有限解析、跳转、可达性收窄 |
 | 外部头 | 通过 `fossilsense.includePaths` 索引和补全 |
 | 冲突扩展 | 检测 clangd / cpptools / ccls 并提示二选一 |
@@ -121,6 +121,24 @@ fossilsense 单一 Rust 原生二进制 (crates/fossilsense)
 | 召回 | exact / prefix 档通过 sorted-by-lower 前缀索引二分 |
 | 排序 | 可叠加目录局部性偏移，但绝不过滤 |
 
+Smart Completion 当前约定：
+
+| 项 | 规则 |
+|---|---|
+| pipeline | 普通标识符补全候选必须经过 `completion` 核心模块合并 evidence、去重、排序和截断 |
+| 排序 | 普通标识符补全使用 deterministic evidence-aware ranker；`ScopeTier` 是 soft prior，并通过 guard band 防止低置信 global/text 噪音反超 |
+| strict policy | `resolver::pack_score` 仍可用于跳转、着色、workspace symbol、`NameTable` recall 和兼容测试；不再作为普通补全最终 displayed ranking |
+| evidence merge | 同名候选合并 indexed、local binding、current-file overlay、local word evidence，优先保留更结构化的 LSP kind/detail |
+| current overlay | 当前 open document 的宏、typedef/using alias、枚举常量、函数声明/定义、record/type 定义和附近 identifier 使用可作为普通补全 evidence；raw text fallback 仍标为 `text` |
+| intent | 普通补全使用轻量规则式 intent ranking，覆盖 type、expression、call、macro preprocessor、declaration-name；intent 只是排序证据，不做类型推断或绑定，不硬过滤 |
+| recall | 普通补全 indexed recall 使用 bounded multi-channel quotas，在 current/local、reachable、external、unknown/open-scope、global、text evidence 间保留有限代表性后再统一 rerank |
+| include ranking | include path completion 保留 quote/angle source prior，并增加 same-directory、sibling/component edge、recent include、basename frequency、path depth 二级 evidence |
+| metrics | verbose/perf 日志只输出分阶段耗时、候选来源/返回计数、intent bucket、recall channel counts、guard 摘要、shadow rank 摘要和 include ranking 计数 |
+| 隐私 | 默认 debug/perf summary 不输出候选名、源码片段或用户代码内容 |
+| shadow | shadow ranking 只作 ranker 对比和回归观测；不得改变返回内容 |
+| v1.2.1 Phase 7-8 | member evidence 覆盖字段和第一版 C++ 方法；ordinary completion 可使用本地 accepted-completion history 作为有界排序证据 |
+| 后置能力 | auto include insertion、ML ranker、telemetry、cloud sync、完整 C++ 语义仍不属于当前版本 |
+
 短前缀：
 
 | 前缀长度 | 规则 |
@@ -134,17 +152,30 @@ fossilsense 单一 Rust 原生二进制 (crates/fossilsense)
 |---|---|
 | C | 用当前文件简单声明猜 receiver 的 record 类型，再查字段 |
 | 跨文件前向声明 | 可通过 record 索引补字段 |
-| 猜不到 receiver | 回退全库字段名前缀候选 |
-| C++ | 只复用 record/field 机制补 class/struct 数据成员 |
+| 猜不到 receiver | 回退全库 member 名前缀候选 |
+| C++ | 复用 record/member evidence 补 class/struct 字段和第一版方法 |
+| weak receiver | 只做明确声明和唯一名字相关的窄范围推断，并通过 confidence/fallback 标注 |
 | 不支持 | 继承、重载、模板、命名空间、访问控制、表达式类型推断 |
 
 成员 fallback 必须满足：
 
-- 只给字段，不做完整表达式类型推断。
+- 只给 prefix 命中的 member 候选，不做完整表达式类型推断。
 - 前缀长度 >= 2。
 - 只取前缀命中。
 - 数量受 `COMPLETION_LIMIT` 控制。
 - 前缀长度 < 2 时返回空 incomplete。
+
+本地补全历史：
+
+| 项 | 规则 |
+|---|---|
+| 范围 | 只作用于 ordinary identifier completion；不改变 include/member routing |
+| 信号 | 只记录 completion item command 触发的 positive accept evidence |
+| 存储 | workspace-local cache，bounded JSON；不写入源码仓库，不进主 symbol index |
+| 内容 | candidate hash、kind、intent、prefix bucket、时间；不存 raw label、源码片段或路径 |
+| 控制 | `fossilsense.completionHistory.mode = auto/on/off`；`FossilSense: Clear Completion History` 清除 |
+| 排序 | 小幅 capped boost；不得压过 high-confidence current/local evidence |
+| 禁用 | `off` 或清除后，ordinary completion 回到 deterministic evidence-aware ranker |
 
 ## 7. Include 与可达性
 
@@ -217,7 +248,7 @@ parse(path, source) -> FileSemanticIndex
 |---|---|
 | `symbols` / `includes` | 词法 pass |
 | `occurrences` | AST walk，含句法角色 |
-| `records` / `fields` / `aliases` | record、字段、type alias 候选 |
+| `records` / `members` / `aliases` | record、字段/方法 member、type alias 候选 |
 | `local_declarations` | 请求期 receiver 推断，不持久化 |
 | `ParseDiagnostics` | parse error、fallback、provenance |
 
@@ -271,24 +302,24 @@ command: FossilSense: Find References (Grouped by Role)
 - ambiguity 是作用域信号，通过 `OpenReason::AmbiguousInclude` 暴露。
 - 候选不是语义绑定。
 
-## 11. Record / Field / Alias
+## 11. Record / Member / Alias
 
 当前模型：
 
 | 数据 | 规则 |
 |---|---|
 | `record_defs` | 第一类 record 定义 |
-| `fields` | 字段带 `record_id` 外键；字段不进 `symbols` |
+| `members` | 字段、第一版方法、static method 等 member evidence 带 `record_id` 外键；member 不进普通 `symbols` |
 | `type_aliases` | 作用域感知 alias 候选 |
 | `RecordCandidate` | record 候选 |
 
-成员补全必须使用：`resolve_record_candidates`、`fields_for_records`、`fallback_field_candidates`。
+成员补全必须使用：`resolve_record_candidates`、`members_for_records`、`fallback_member_candidates`。`fields_for_records` 只作为兼容 wrapper 保留。
 
 禁止恢复：
 
 - 依赖 `symbols.container` 做成员补全。
 - 全局 `resolve_alias`。
-- `fields_by_record[_scoped]`。
+- `fields_by_record[_scoped]` 这类 field-only 查询面。
 
 alias 规则：递归解析必须防环；不收敛成单一全局赢家；同 tier 候选全保留，只按 record id 去重。
 
@@ -400,7 +431,8 @@ dist/fossilsense-vscode-<version>_BUILD<YYYYMMDD_HHMMSS>.vsix
 - 不捆绑 GPL 的 ctags。
 - 不在扩展宿主内跑索引。
 - 不把 best-effort 名字候选伪装成精确语义绑定。
-- 不实现完整 C++ 语义：继承、重载、模板、命名空间、访问控制等。
+- 不实现完整 C++ 语义：继承、重载、模板、命名空间、访问控制、表达式类型推断等。
+- 不上传 completion history，不做匿名 telemetry、cloud sync、ML ranker 或自动 include 插入。
 
 ## 18. 验收样本
 

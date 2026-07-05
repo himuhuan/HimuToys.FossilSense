@@ -24,7 +24,16 @@ extension's `bin/` folder.
   Doxygen or ordinary comments when they can be recovered. This is a ranked
   exact-name candidate display, not type-aware semantic binding; unsupported or
   unreadable comment sources degrade to signature-only hover.
-- Lightweight Completion: index-based and current-file word completion for C/C++.
+- Lightweight Completion: index-based, current-file overlay, and current-file
+  word completion for C/C++. When the cursor is inside a detected function body,
+  ordinary identifier completion also adds best-effort current-function
+  parameters and local variables declared before the cursor from the open
+  document snapshot. Current open-document facts such as unsaved macros,
+  typedef/using aliases, enum constants, function declarations/definitions, and
+  record/type definitions can also participate as structured current-file
+  overlay evidence. Nearby identifier usage can raise text fallback candidates,
+  but raw words remain visibly textual fallback and are not semantic bindings.
+  Unsupported parse shapes degrade to the existing indexed and word completion.
   The list is always marked `isIncomplete` so the editor re-queries with the full
   current prefix on every keystroke — longer-named symbols that fell outside the
   truncated top-N re-enter the window as you keep typing, and an empty first batch
@@ -39,6 +48,25 @@ extension's `bin/` folder.
   `external` / `global` / `ambiguous`) with the full tier/confidence/reason in the
   item documentation; indexed current-file candidates are left unlabeled. These are
   ranked candidates, not semantic bindings or overload resolution.
+  In v1.2.0, ordinary identifier completion uses the Phase 4-6 smart-completion
+  pipeline: candidates are merged by evidence, de-duplicated, ranked with a
+  deterministic evidence-aware ranker, and truncated. `ScopeTier` is now a soft
+  prior for ordinary completion rather than the final strict packed ordering, and
+  guard bands keep low-confidence global/text fallback from jumping ahead without
+  strong current/local evidence. Lightweight rule-based intent ranking lifts
+  type, expression-value, call-target, macro-preprocessor, and declaration-name
+  candidates when local lexical cues support that context. Intent is only ranking
+  evidence: it does not perform C/C++ type inference, overload resolution, or
+  semantic binding, and it never hard-filters candidates. Indexed recall is now
+  bounded multi-channel recall, preserving representation from reachable,
+  external, unknown/open-scope, global, current/local, and text evidence before
+  final reranking. Verbose perf logs report timings, source counts, intent bucket,
+  recall channel counts, guard summaries, and shadow-rank movement without
+  candidate names or snippets. In v1.2.1, ordinary completion can also use
+  local-only accepted-completion history as a small bounded ranking signal keyed
+  by anonymous candidate hash, kind, intent, and prefix bucket. It is workspace
+  local, clearable, disableable, and records positive accept feedback only. No
+  telemetry, cloud sync, ML ranking, or auto-include insertion is enabled.
 - Best-effort Signature Help: inside simple function calls, shows exact-name
   indexed function signatures ranked by the same include reachability tiers as
   Go to Definition. Candidates are hints, not overload resolution; there is no
@@ -53,20 +81,25 @@ extension's `bin/` folder.
   preprocessor, no conditional/macro evaluation, no transitive include graph. Missing or
   wrong-platform headers are skipped — FossilSense never compiles, so they cannot error.
   Include-path completion runs under `fossilsense.completion.mode`; jump-to-header is
-  always available.
-- Degraded Member Completion (`.`/`->`): returns struct/union fields only. It guesses
-  the receiver's record type from a simple declaration in the current file and lists
-  that record's fields (resolved from the global index, so cross-file definitions work);
-  when the receiver cannot be inferred it falls back to prefix-matched global field
-  names only (no subsequence), requires at least a 2-character prefix, caps the list,
-  and marks it `isIncomplete` — a 1-char/empty prefix returns an empty incomplete list
-  rather than dumping the whole index's fields. C-oriented; it never infers expression
-  types, so it may list the wrong record's fields. Runs under
-  `fossilsense.completion.mode`.
-- Degraded Semantic Coloring: colors only known macros, types (typedef / struct /
-  enum / union / class), and enum constants. Everything else — including struct/union
-  fields — is left to the editor's TextMate grammar. Multi-meaning names are colored by
-  a best guess and may occasionally be mis-colored. Runs under
+  always available. Completion ranking retains the quote/angle search-order prior
+  and then applies bounded same-directory, sibling/component edge, recent include,
+  basename frequency, and path-depth evidence. Include perf logs expose counts for
+  those ranking signals without raw include paths.
+- Degraded Member Completion (`.`/`->`): returns owner-scoped fields and first-version
+  C++ method evidence for structs/classes/unions. It guesses the receiver's record type
+  from simple declarations in the current file and can use a narrow weak receiver
+  correlation when the indexed owner name is unique; cross-file definitions work through
+  the member index. When the receiver cannot be inferred it falls back to prefix-matched
+  global member names only (no subsequence), requires at least a 2-character prefix, caps
+  the list, and marks it `isIncomplete` — a 1-char/empty prefix returns an empty
+  incomplete list rather than dumping the whole index's members. This is owner evidence,
+  not full C++ binding: no inheritance, overload resolution, templates, namespaces,
+  access control, or expression type inference. Runs under `fossilsense.completion.mode`.
+- Degraded Semantic Coloring: colors known macros, types (typedef / struct /
+  enum / union / class), enum constants, and best-effort current-function
+  parameters/local variables from the open document snapshot. Everything else —
+  including struct/union fields — is left to the editor's TextMate grammar.
+  Multi-meaning names are colored by a best guess and may occasionally be mis-colored. Runs under
   `fossilsense.semanticColoring.mode`.
 - Workspace scope configuration: optional root-level `fossilsense.json` controls
   `include`, `exclude`, and `extensions` for both indexing and reference search.
@@ -124,8 +157,15 @@ because FossilSense returns ranked text/index candidates.
   jump-to-header, and degraded symbol indexing. Distinct from workspace scope `include`.
   Changing it restarts the server. Empty by default (no behavior change).
 - `fossilsense.completion.mode` - controls FossilSense completion: `"auto"` (default,
-  enabled), `"on"` (enabled), `"off"` (never enabled). C/C++ language-server conflicts
-  are reported by `fossilsense.mode`, not handled by silently disabling completion.
+  enabled), `"on"` (enabled), `"off"` (never enabled). This includes ordinary
+  identifier completion, include-path completion, and degraded `.`/`->` field/method
+  member completion. C/C++ language-server conflicts are reported by `fossilsense.mode`,
+  not handled by silently disabling completion.
+- `fossilsense.completionHistory.mode` - controls local-only accepted-completion
+  history: `"auto"` (default, enabled), `"on"` (enabled), `"off"` (do not record or
+  rank with history). History stays in the local workspace cache, is bounded, stores
+  anonymous candidate hashes/buckets rather than raw labels or source, and can be removed
+  with **FossilSense: Clear Completion History**.
 - `fossilsense.semanticColoring.mode` - controls FossilSense semantic coloring of macros,
   types, and enum constants: `"auto"` (default, enabled), `"on"` (enabled), `"off"`
   (never enabled). C/C++ language-server conflicts are reported by `fossilsense.mode`,

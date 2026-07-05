@@ -21,6 +21,10 @@ pub fn default_index_path(workspace: &Path) -> Result<PathBuf> {
         .join("index.sqlite"))
 }
 
+pub fn default_completion_history_path(workspace: &Path) -> Result<PathBuf> {
+    Ok(default_index_path(workspace)?.with_file_name("completion_history.json"))
+}
+
 pub fn workspace_hash(workspace: &Path) -> String {
     let normalized = normalize_path_string(workspace);
     blake3::hash(normalized.as_bytes()).to_hex()[..16].to_string()

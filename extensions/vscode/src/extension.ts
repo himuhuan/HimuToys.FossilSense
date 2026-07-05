@@ -8,6 +8,11 @@ import {
   Trace,
 } from 'vscode-languageclient/node';
 import { normalizeIncludeScopingMode, normalizeOnOffAuto } from './config';
+import {
+  CLEAR_COMPLETION_HISTORY_COMMAND,
+  clearCompletionHistoryRequest,
+  completionHistoryInitializationOptions,
+} from './completionHistory';
 import { resolveServerPathFromCandidates } from './serverPath';
 import {
   DegradedCapabilities,
@@ -74,6 +79,9 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand(REFRESH_INDEX_COMMAND, () => refreshIndex()),
     vscode.commands.registerCommand(REBUILD_INDEX_COMMAND, () => rebuildIndex()),
     vscode.commands.registerCommand(GROUPED_REFERENCES_COMMAND, () => findReferencesGrouped()),
+    vscode.commands.registerCommand(CLEAR_COMPLETION_HISTORY_COMMAND, () =>
+      clearCompletionHistory(),
+    ),
     // These settings are sent via initializationOptions or control startup, so
     // changing them requires a restart to take effect.
     vscode.workspace.onDidChangeConfiguration(async (event) => {
@@ -87,6 +95,7 @@ export function activate(context: vscode.ExtensionContext): void {
         client &&
         (event.affectsConfiguration('fossilsense.includePaths') ||
           event.affectsConfiguration('fossilsense.completion.mode') ||
+          event.affectsConfiguration('fossilsense.completionHistory.mode') ||
           event.affectsConfiguration('fossilsense.semanticColoring.mode') ||
           event.affectsConfiguration('fossilsense.includeScoping.mode') ||
           event.affectsConfiguration('fossilsense.debug.candidateReasons') ||
@@ -167,6 +176,7 @@ async function startServer(context: vscode.ExtensionContext): Promise<void> {
   const conflictingExtensions = detectedCppLanguageServers();
 
   const completionMode = completionModeFromConfig();
+  const completionHistoryMode = completionHistoryModeFromConfig();
   const semanticColoringMode = semanticColoringModeFromConfig();
 
   const clientOptions: LanguageClientOptions = {
@@ -183,6 +193,7 @@ async function startServer(context: vscode.ExtensionContext): Promise<void> {
         completion: {
           mode: completionMode,
         },
+        ...completionHistoryInitializationOptions(completionHistoryMode),
         semanticColoring: {
           mode: semanticColoringMode,
         },
@@ -257,6 +268,16 @@ async function rebuildIndex(): Promise<void> {
     command: REBUILD_INDEX_LSP_COMMAND,
     arguments: [],
   });
+}
+
+async function clearCompletionHistory(): Promise<void> {
+  if (!client) {
+    void vscode.window.showWarningMessage('FossilSense server is not running. Start it first.');
+    return;
+  }
+
+  output.appendLine('Clearing local completion history...');
+  await client.sendRequest(ExecuteCommandRequest.type, clearCompletionHistoryRequest());
 }
 
 // Role-grouped find-references. The standard References panel (textDocument/
@@ -399,6 +420,14 @@ function completionModeFromConfig(): string {
   const setting = vscode.workspace
     .getConfiguration('fossilsense')
     .get<string>('completion.mode', 'auto');
+
+  return normalizeOnOffAuto(setting);
+}
+
+function completionHistoryModeFromConfig(): string {
+  const setting = vscode.workspace
+    .getConfiguration('fossilsense')
+    .get<string>('completionHistory.mode', 'auto');
 
   return normalizeOnOffAuto(setting);
 }

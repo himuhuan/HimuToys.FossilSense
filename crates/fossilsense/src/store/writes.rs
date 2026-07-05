@@ -4,8 +4,9 @@ use rusqlite::{params, Connection};
 use crate::parser::AliasTarget;
 
 use super::{
-    include_normalized_metadata, now_unix_secs, record_confidence_to_str, record_kind_to_str,
-    symbol_kind, symbol_role, FileIndexPayload, FileIndexUpdate,
+    include_normalized_metadata, member_confidence_to_str, member_kind_to_str, now_unix_secs,
+    record_confidence_to_str, record_kind_to_str, symbol_kind, symbol_role, FileIndexPayload,
+    FileIndexUpdate,
 };
 
 pub(super) fn apply_file_updates_inner(
@@ -62,10 +63,11 @@ pub(super) fn apply_file_updates_inner(
                     start_line, start_col, end_line, end_col, signature, confidence
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         )?;
-        let mut field_stmt = tx.prepare(
-            "INSERT INTO fields (
-                    record_id, name, start_byte, end_byte, start_line, start_col, end_line, end_col, signature
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        let mut member_stmt = tx.prepare(
+            "INSERT INTO members (
+                    record_id, name, kind, confidence, start_byte, end_byte,
+                    start_line, start_col, end_line, end_col, signature
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         )?;
         let mut alias_stmt = tx.prepare(
             "INSERT INTO type_aliases (
@@ -148,6 +150,8 @@ pub(super) fn apply_file_updates_inner(
             }
 
             let mut record_key_to_id = std::collections::HashMap::new();
+            let mut record_name_to_ids: std::collections::HashMap<String, Vec<i64>> =
+                std::collections::HashMap::new();
             for record in &index.records {
                 record_stmt.execute(params![
                     file_id,
@@ -166,21 +170,45 @@ pub(super) fn apply_file_updates_inner(
                 ])?;
                 let record_id = tx.last_insert_rowid();
                 record_key_to_id.insert(record.record_key.clone(), record_id);
+                let mut names = vec![record.display_name.as_str()];
+                if let Some(tag) = record.tag_name.as_deref() {
+                    names.push(tag);
+                }
+                if let Some(typedef) = record.typedef_name.as_deref() {
+                    names.push(typedef);
+                }
+                names.sort_unstable();
+                names.dedup();
+                for name in names {
+                    let ids = record_name_to_ids.entry(name.to_string()).or_default();
+                    if !ids.contains(&record_id) {
+                        ids.push(record_id);
+                    }
+                }
             }
 
-            for field in &index.fields {
-                let record_id = record_key_to_id.get(&field.record_key).copied();
+            for member in &index.members {
+                let record_id = record_key_to_id
+                    .get(&member.record_key)
+                    .copied()
+                    .or_else(|| {
+                        let owner = member.record_key.strip_prefix("owner:")?;
+                        let ids = record_name_to_ids.get(owner)?;
+                        (ids.len() == 1).then_some(ids[0])
+                    });
                 if let Some(rid) = record_id {
-                    field_stmt.execute(params![
+                    member_stmt.execute(params![
                         rid,
-                        field.name.as_str(),
-                        field.start_byte as i64,
-                        field.end_byte as i64,
-                        field.start_line as i64,
-                        field.start_col as i64,
-                        field.end_line as i64,
-                        field.end_col as i64,
-                        field.signature.as_str(),
+                        member.name.as_str(),
+                        member_kind_to_str(member.kind),
+                        member_confidence_to_str(member.confidence),
+                        member.start_byte as i64,
+                        member.end_byte as i64,
+                        member.start_line as i64,
+                        member.start_col as i64,
+                        member.end_line as i64,
+                        member.end_col as i64,
+                        member.signature.as_str(),
                     ])?;
                 }
             }

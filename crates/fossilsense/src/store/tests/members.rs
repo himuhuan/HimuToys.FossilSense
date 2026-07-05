@@ -49,6 +49,114 @@ fn removing_a_file_prunes_its_fields() {
 }
 
 #[test]
+fn struct_fields_are_persisted_as_field_members() {
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+    let mut store = IndexStore::open(&db, dir.path()).expect("store");
+    upsert_source(&mut store, "point.h", "struct Point { int x; int y; };\n");
+
+    let reader = IndexStore::open_readonly(&db).expect("reader");
+    let records = reader
+        .resolve_record_candidates(&["Point"], None)
+        .expect("records");
+    let members = reader
+        .members_for_records(&[records[0].id], None, None)
+        .expect("members");
+
+    let names: Vec<_> = members
+        .iter()
+        .map(|member| (member.name.as_str(), member.kind.as_str()))
+        .collect();
+    assert!(names.contains(&("x", "field")));
+    assert!(names.contains(&("y", "field")));
+}
+
+#[test]
+fn out_of_class_method_owner_is_persisted_when_owner_is_unique_in_file() {
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+    let mut store = IndexStore::open(&db, dir.path()).expect("store");
+    upsert_source(
+        &mut store,
+        "widget.cpp",
+        "class Widget { void resize(); };\nvoid Widget::resize() {}\n",
+    );
+
+    let reader = IndexStore::open_readonly(&db).expect("reader");
+    let records = reader
+        .resolve_record_candidates(&["Widget"], None)
+        .expect("records");
+    let members = reader
+        .members_for_records(&[records[0].id], None, None)
+        .expect("members");
+
+    assert!(members.iter().any(|member| {
+        member.name == "resize"
+            && member.kind == crate::parser::MemberKind::Method
+            && member.confidence == crate::parser::MemberConfidence::InBody
+    }));
+    assert!(members.iter().any(|member| {
+        member.name == "resize"
+            && member.kind == crate::parser::MemberKind::Method
+            && member.confidence == crate::parser::MemberConfidence::OutOfClassOwner
+    }));
+}
+
+#[test]
+fn members_for_records_returns_fields_and_methods() {
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+    let mut store = IndexStore::open(&db, dir.path()).expect("store");
+    upsert_source(
+        &mut store,
+        "widget.hpp",
+        "struct Widget { int width; void resize(); static int count(); };\n",
+    );
+
+    let reader = IndexStore::open_readonly(&db).expect("reader");
+    let records = reader
+        .resolve_record_candidates(&["Widget"], None)
+        .expect("records");
+    let members = reader
+        .members_for_records(&[records[0].id], None, None)
+        .expect("members");
+
+    assert!(members
+        .iter()
+        .any(|member| member.name == "width" && member.kind == crate::parser::MemberKind::Field));
+    assert!(members
+        .iter()
+        .any(|member| member.name == "resize" && member.kind == crate::parser::MemberKind::Method));
+    assert!(members
+        .iter()
+        .any(|member| member.name == "count"
+            && member.kind == crate::parser::MemberKind::StaticMethod));
+}
+
+#[test]
+fn fallback_member_candidates_are_prefix_only_and_capped() {
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+    let mut store = IndexStore::open(&db, dir.path()).expect("store");
+    upsert_source(
+        &mut store,
+        "widget.hpp",
+        "struct Widget { int width; int window; void wipe(); void draw(); };\n",
+    );
+
+    let reader = IndexStore::open_readonly(&db).expect("reader");
+    let members = reader
+        .fallback_member_candidates("wi", 2, None)
+        .expect("fallback");
+    let names: Vec<_> = members.iter().map(|member| member.name.as_str()).collect();
+
+    assert!(names.contains(&"width"));
+    assert!(names.contains(&"window") || names.contains(&"wipe"));
+    assert!(!names.contains(&"draw"));
+    assert!(members.len() <= 2);
+}
+
+#[test]
 fn field_candidates_honor_prefix_and_cap() {
     let dir = tempdir().expect("tempdir");
     let db = dir.path().join("index.sqlite");
@@ -127,8 +235,8 @@ fn name_table_from_index_carries_correct_kind_without_second_store() {
     // Index a small header + source pair mirroring samples/mini-c.
     upsert_source(
         &mut store,
-        "shapes.h",
-        "struct Point { int x; int y; };\n\
+        "shapes.hpp",
+        "struct Point { int x; int y; void resize(); };\n\
          enum Status { STATUS_OK, STATUS_BUSY };\n\
          int hello_value(void);\n",
     );
@@ -178,6 +286,13 @@ fn name_table_from_index_carries_correct_kind_without_second_store() {
     assert!(
         !table.search_ranked("x", 10).iter().any(|h| h.name == "x"),
         "fields must not appear in the name table"
+    );
+    assert!(
+        !table
+            .search_ranked("resize", 10)
+            .iter()
+            .any(|h| h.name == "resize"),
+        "member methods must not appear in the name table"
     );
 }
 

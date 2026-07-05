@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::model::Occurrence;
-use crate::parser::SyntacticRole;
+use crate::parser::{LocalBinding, LocalBindingKind, SyntacticRole};
 
 /// Legend index of the `macro` token type (declared first in the legend).
 pub const TOKEN_TYPE_MACRO: u32 = 0;
@@ -13,6 +13,10 @@ pub const TOKEN_TYPE_MACRO: u32 = 0;
 pub const TOKEN_TYPE_TYPE: u32 = 1;
 /// Legend index of the `enumMember` token type (declared third in the legend).
 pub const TOKEN_TYPE_ENUM_MEMBER: u32 = 2;
+/// Legend index of the `parameter` token type (declared fourth in the legend).
+pub const TOKEN_TYPE_PARAMETER: u32 = 3;
+/// Legend index of the `variable` token type (declared fifth in the legend).
+pub const TOKEN_TYPE_VARIABLE: u32 = 4;
 
 /// The only kinds FossilSense colors. Everything else is left to TextMate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,6 +24,8 @@ pub enum ColorKind {
     Macro,
     Type,
     EnumMember,
+    Parameter,
+    Variable,
 }
 
 impl ColorKind {
@@ -28,6 +34,8 @@ impl ColorKind {
             ColorKind::Macro => TOKEN_TYPE_MACRO,
             ColorKind::Type => TOKEN_TYPE_TYPE,
             ColorKind::EnumMember => TOKEN_TYPE_ENUM_MEMBER,
+            ColorKind::Parameter => TOKEN_TYPE_PARAMETER,
+            ColorKind::Variable => TOKEN_TYPE_VARIABLE,
         }
     }
 }
@@ -122,12 +130,14 @@ fn role_allows_color(kind: ColorKind, role: SyntacticRole) -> bool {
             SyntacticRole::TypeUse | SyntacticRole::Definition | SyntacticRole::Read
         ),
         ColorKind::Macro | ColorKind::EnumMember => true,
+        ColorKind::Parameter | ColorKind::Variable => !matches!(role, SyntacticRole::TypeUse),
     }
 }
 
 /// Resolve every occurrence, drop the ones we cannot color or whose role
 /// contradicts the kind, and return the kept tokens sorted by position. Kind
 /// resolution is cached per name; the role gate is applied per occurrence.
+#[cfg(test)]
 pub fn classify_occurrences(
     occurrences: &[Occurrence],
     macro_defs: &HashSet<String>,
@@ -135,10 +145,41 @@ pub fn classify_occurrences(
     enum_defs: &HashSet<String>,
     index_counts: &HashMap<String, HashMap<String, usize>>,
 ) -> Vec<ColoredToken> {
+    classify_occurrences_with_locals(
+        occurrences,
+        macro_defs,
+        type_defs,
+        enum_defs,
+        &[],
+        index_counts,
+    )
+}
+
+/// Like [`classify_occurrences`], but first colors best-effort current-function
+/// parameter/local bindings from the open-document parse. Local bindings are
+/// request-time facts, not compiler-grade scope resolution.
+pub fn classify_occurrences_with_locals(
+    occurrences: &[Occurrence],
+    macro_defs: &HashSet<String>,
+    type_defs: &HashSet<String>,
+    enum_defs: &HashSet<String>,
+    local_bindings: &[LocalBinding],
+    index_counts: &HashMap<String, HashMap<String, usize>>,
+) -> Vec<ColoredToken> {
     let mut cache: HashMap<&str, Option<ColorKind>> = HashMap::new();
     let mut tokens = Vec::new();
 
     for occ in occurrences {
+        if let Some(kind) = local_kind_for_occurrence(occ, local_bindings) {
+            tokens.push(ColoredToken {
+                line: occ.line,
+                start: occ.start_col,
+                length: occ.length,
+                token_type: kind.token_type(),
+            });
+            continue;
+        }
+
         let kind = *cache.entry(occ.name.as_str()).or_insert_with(|| {
             resolve_kind(&occ.name, macro_defs, type_defs, enum_defs, index_counts)
         });
@@ -157,6 +198,33 @@ pub fn classify_occurrences(
 
     tokens.sort_by(|a, b| a.line.cmp(&b.line).then(a.start.cmp(&b.start)));
     tokens
+}
+
+fn local_kind_for_occurrence(
+    occ: &Occurrence,
+    local_bindings: &[LocalBinding],
+) -> Option<ColorKind> {
+    if occ.role == SyntacticRole::TypeUse {
+        return None;
+    }
+
+    local_bindings
+        .iter()
+        .filter(|binding| {
+            binding.name == occ.name && local_binding_visible_at_occurrence(binding, occ.start_byte)
+        })
+        .max_by_key(|binding| binding.decl_start_byte)
+        .map(|binding| match binding.kind {
+            LocalBindingKind::Parameter => ColorKind::Parameter,
+            LocalBindingKind::LocalVariable => ColorKind::Variable,
+        })
+}
+
+fn local_binding_visible_at_occurrence(binding: &LocalBinding, byte_offset: usize) -> bool {
+    byte_offset == binding.decl_start_byte
+        || (binding.function_start_byte <= byte_offset
+            && byte_offset <= binding.function_end_byte
+            && binding.decl_start_byte < byte_offset)
 }
 
 /// Keep only tokens whose start line falls within `[start_line, end_line]`.
@@ -211,6 +279,7 @@ mod tests {
     fn occ_role(name: &str, line: u32, start: u32, role: SyntacticRole) -> Occurrence {
         Occurrence {
             name: name.to_string(),
+            start_byte: ((line as usize) << 16) + start as usize,
             line,
             start_col: start,
             length: name.chars().count() as u32,
@@ -602,6 +671,81 @@ mod tests {
         );
         assert!(tokens.iter().any(|t| t.token_type == TOKEN_TYPE_MACRO));
         assert!(tokens.iter().any(|t| t.token_type == TOKEN_TYPE_TYPE));
+    }
+
+    #[test]
+    fn pipeline_colors_current_function_parameters_and_locals() {
+        use crate::parser::parse;
+        use std::path::Path;
+
+        let current =
+            "int f(int count) {\n    int cursor_limit = count;\n    return cursor_limit;\n}\n";
+        let targets = parse(Path::new("use.c"), current);
+        let defs = targets.coloring_defs();
+        let tokens = classify_occurrences_with_locals(
+            &targets.occurrences,
+            &defs.macro_defs,
+            &defs.type_defs,
+            &defs.enum_defs,
+            &targets.local_bindings,
+            &HashMap::new(),
+        );
+
+        let token_type_at = |name: &str, nth: usize| -> Option<u32> {
+            let mut occurrences: Vec<_> = targets
+                .occurrences
+                .iter()
+                .filter(|occ| occ.name == name)
+                .collect();
+            occurrences.sort_by_key(|occ| occ.start_byte);
+            let occ = *occurrences.get(nth)?;
+            tokens
+                .iter()
+                .find(|token| token.line == occ.line && token.start == occ.start_col)
+                .map(|token| token.token_type)
+        };
+
+        assert_eq!(token_type_at("count", 0), Some(TOKEN_TYPE_PARAMETER));
+        assert_eq!(token_type_at("count", 1), Some(TOKEN_TYPE_PARAMETER));
+        assert_eq!(token_type_at("cursor_limit", 0), Some(TOKEN_TYPE_VARIABLE));
+        assert_eq!(token_type_at("cursor_limit", 1), Some(TOKEN_TYPE_VARIABLE));
+    }
+
+    #[test]
+    fn local_coloring_does_not_color_uses_before_declaration() {
+        use crate::parser::parse;
+        use std::path::Path;
+
+        let current =
+            "int f(void) {\n    future_value;\n    int future_value;\n    future_value;\n}\n";
+        let targets = parse(Path::new("use.c"), current);
+        let defs = targets.coloring_defs();
+        let tokens = classify_occurrences_with_locals(
+            &targets.occurrences,
+            &defs.macro_defs,
+            &defs.type_defs,
+            &defs.enum_defs,
+            &targets.local_bindings,
+            &HashMap::new(),
+        );
+
+        let token_type_at = |nth: usize| -> Option<u32> {
+            let mut occurrences: Vec<_> = targets
+                .occurrences
+                .iter()
+                .filter(|occ| occ.name == "future_value")
+                .collect();
+            occurrences.sort_by_key(|occ| occ.start_byte);
+            let occ = *occurrences.get(nth)?;
+            tokens
+                .iter()
+                .find(|token| token.line == occ.line && token.start == occ.start_col)
+                .map(|token| token.token_type)
+        };
+
+        assert_eq!(token_type_at(0), None);
+        assert_eq!(token_type_at(1), Some(TOKEN_TYPE_VARIABLE));
+        assert_eq!(token_type_at(2), Some(TOKEN_TYPE_VARIABLE));
     }
 
     #[test]

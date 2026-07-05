@@ -1,8 +1,8 @@
 use std::path::Path;
 
 use super::{
-    infer_receiver_record, parse, parse_with_handle, FileSemanticIndex, Occurrence, ParseFacts,
-    ParserHandle, SymbolKind, SymbolRole, SyntacticRole,
+    infer_receiver_record, parse, parse_with_handle, FileSemanticIndex, MemberConfidence,
+    MemberKind, Occurrence, ParseFacts, ParserHandle, SymbolKind, SymbolRole, SyntacticRole,
 };
 
 /// Role of the (single) occurrence of `name` in a parsed buffer.
@@ -142,6 +142,68 @@ fn extracts_named_struct_fields() {
     let index = parse(Path::new("p.c"), "struct Point { int x; int y; };\n");
     assert_eq!(field_containers(&index, "x"), vec!["Point".to_string()]);
     assert_eq!(field_containers(&index, "y"), vec!["Point".to_string()]);
+}
+
+#[test]
+fn parses_class_body_methods_as_members() {
+    let source = r#"
+        class Widget {
+        public:
+            int width;
+            void resize(int w);
+            static int count();
+        };
+    "#;
+    let index = parse(Path::new("widget.cpp"), source);
+
+    assert!(index
+        .members
+        .iter()
+        .any(|member| member.name == "width" && member.kind == MemberKind::Field));
+    assert!(index
+        .members
+        .iter()
+        .any(|member| member.name == "resize" && member.kind == MemberKind::Method));
+    assert!(index
+        .members
+        .iter()
+        .any(|member| member.name == "count" && member.kind == MemberKind::StaticMethod));
+}
+
+#[test]
+fn method_member_signature_uses_declaration_text() {
+    let source = "struct Widget { void resize(int width); };";
+    let index = parse(Path::new("widget.hpp"), source);
+    let method = index
+        .members
+        .iter()
+        .find(|member| member.name == "resize")
+        .expect("method");
+
+    assert_eq!(method.kind, MemberKind::Method);
+    assert!(method.signature.contains("void resize(int width)"));
+    assert_eq!(method.confidence, MemberConfidence::InBody);
+}
+
+#[test]
+fn parses_simple_out_of_class_method_owner_as_lower_confidence() {
+    let source = r#"
+        class Widget { void resize(); };
+        void Widget::resize() {}
+    "#;
+    let index = parse(Path::new("widget.cpp"), source);
+    let matches: Vec<_> = index
+        .members
+        .iter()
+        .filter(|member| member.name == "resize")
+        .collect();
+
+    assert!(matches
+        .iter()
+        .any(|member| member.confidence == MemberConfidence::InBody));
+    assert!(matches
+        .iter()
+        .any(|member| member.confidence == MemberConfidence::OutOfClassOwner));
 }
 
 #[test]
@@ -351,6 +413,43 @@ fn infers_receiver_record_for_local_param_and_file_scope() {
     assert_eq!(infer_in("a.c", local, "missing", off), None);
 }
 
+#[test]
+fn local_bindings_collect_parameters_and_locals_in_function() {
+    let src = "int f(int count, struct Foo *foo) {\n    int cursor_limit = count;\n    char *name;\n    return cursor_limit;\n}\n";
+    let index = parse(Path::new("a.c"), src);
+    let names: Vec<(&str, super::LocalBindingKind)> = index
+        .local_bindings
+        .iter()
+        .map(|binding| (binding.name.as_str(), binding.kind))
+        .collect();
+    assert!(names.contains(&("count", super::LocalBindingKind::Parameter)));
+    assert!(names.contains(&("foo", super::LocalBindingKind::Parameter)));
+    assert!(names.contains(&("cursor_limit", super::LocalBindingKind::LocalVariable)));
+    assert!(names.contains(&("name", super::LocalBindingKind::LocalVariable)));
+    assert!(index
+        .local_bindings
+        .iter()
+        .all(|binding| binding.function_start_byte < binding.function_end_byte));
+}
+
+#[test]
+fn local_bindings_ignore_file_scope_declarations() {
+    let src = "int global_value;\nvoid f(void) {\n    int local_value;\n}\n";
+    let index = parse(Path::new("a.c"), src);
+    assert!(index.local_bindings.iter().any(|b| b.name == "local_value"));
+    assert!(index
+        .local_bindings
+        .iter()
+        .all(|b| b.name != "global_value"));
+}
+
+#[test]
+fn local_bindings_are_empty_without_function_definition() {
+    let src = "#define Z 1\n";
+    let index = parse(Path::new("a.c"), src);
+    assert!(index.local_bindings.is_empty());
+}
+
 fn occurrence_lines(occurrences: &[Occurrence], name: &str) -> Vec<u32> {
     occurrences
         .iter()
@@ -386,6 +485,20 @@ int main(void) {
         .symbols
         .iter()
         .any(|symbol| { symbol.name == "main" && symbol.role == SymbolRole::Definition }));
+}
+
+#[test]
+fn leading_comments_do_not_pollute_symbol_signature_or_start_line() {
+    let source = "#define VALUE 1\n/// @brief Helps the smoke test.\nvoid helper(void);\n";
+    let index = parse(Path::new("defs.h"), source);
+    let symbol = index
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "helper")
+        .expect("helper symbol");
+
+    assert_eq!(symbol.start_line, 2);
+    assert_eq!(symbol.signature, "void helper(void);");
 }
 
 #[test]

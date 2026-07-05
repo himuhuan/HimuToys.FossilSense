@@ -162,8 +162,8 @@ mod tests {
         )
         .expect("hover markdown");
         assert!(markdown.contains("Current buffer docs"));
-        assert!(markdown.contains("```c\nint foo(void);\n```"));
-        assert!(markdown.contains("tier: `current`"));
+        assert!(markdown.contains("```c\n// In src/main.c\nint foo(void);\n```"));
+        assert!(markdown.contains("tier: current"));
     }
 
     #[test]
