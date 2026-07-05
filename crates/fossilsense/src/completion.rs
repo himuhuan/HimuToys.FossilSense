@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::completion_history::CompletionHistorySnapshot;
+use crate::completion_history::{candidate_hash_key, CompletionHistorySnapshot};
 use crate::model::{ResolutionConfidence, ScopeTier};
 
 #[allow(dead_code)]
@@ -652,7 +652,8 @@ pub(crate) fn run_evidence_aware_pipeline_with_context<T>(
     let mut history_boosted = 0;
     let mut history_max_boost = 0;
     for candidate in &mut kept {
-        candidate.evidence.history_score = history_adjustment(candidate.evidence, &context);
+        candidate.evidence.history_score =
+            history_adjustment(&candidate.name, candidate.evidence, &context);
         if candidate.evidence.history_score > 0 {
             history_boosted += 1;
             history_max_boost = history_max_boost.max(candidate.evidence.history_score);
@@ -803,13 +804,18 @@ fn final_rank_score(evidence: CandidateEvidence, context: &CompletionRankContext
         + evidence.history_score
 }
 
-fn history_adjustment(evidence: CandidateEvidence, context: &CompletionRankContext) -> i32 {
+fn history_adjustment(
+    label: &str,
+    evidence: CandidateEvidence,
+    context: &CompletionRankContext,
+) -> i32 {
     if !context.history_enabled {
         return 0;
     }
-    let Some(history_key) = evidence.history_key else {
+    if evidence.history_key.is_none() {
         return 0;
-    };
+    }
+    let history_key = candidate_hash_key(label, evidence.kind.as_history_kind_str());
     let accepts = context.history.accept_count(
         history_key,
         evidence.kind.as_history_kind_str(),
@@ -1140,6 +1146,58 @@ mod tests {
         assert_eq!(output.items[0].payload, "local");
         assert!(output.metrics.history_boosted >= 1);
         assert!(output.metrics.history_max_boost > 0);
+    }
+
+    #[test]
+    fn merged_candidate_history_uses_final_kind_hash() {
+        let history = CompletionHistorySnapshot::from_test_accepts(vec![(
+            candidate_hash("same_name", "function"),
+            "function",
+            "call_target",
+            "sa",
+            2,
+        )]);
+
+        let output = run_evidence_aware_pipeline_with_context(
+            vec![
+                candidate_with_history_key(
+                    "same_name",
+                    CandidateSource::LocalBinding,
+                    ScopeTier::Current,
+                    760,
+                    CompletionCandidateKind::Variable,
+                    "variable",
+                    "local",
+                ),
+                candidate_with_history_key(
+                    "same_name",
+                    CandidateSource::Indexed,
+                    ScopeTier::Reachable,
+                    820,
+                    CompletionCandidateKind::Function,
+                    "function",
+                    "indexed",
+                ),
+            ],
+            10,
+            CompletionRankContext {
+                intent: CompletionIntent {
+                    kind: CompletionIntentKind::CallTarget,
+                    confidence: CompletionIntentConfidence::High,
+                },
+                history_enabled: true,
+                history,
+                prefix_bucket: "sa".to_string(),
+            },
+        );
+
+        assert_eq!(output.items.len(), 1);
+        assert_eq!(
+            output.items[0].evidence.kind,
+            CompletionCandidateKind::Function
+        );
+        assert_eq!(output.metrics.history_boosted, 1);
+        assert!(output.items[0].evidence.history_score > 0);
     }
 
     #[test]

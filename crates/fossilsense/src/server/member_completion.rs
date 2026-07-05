@@ -113,7 +113,7 @@ impl Backend {
                 let explicit_record_found =
                     record_key.is_some() && !record_candidates_by_db.is_empty();
                 let mut weak_owner_used = false;
-                if record_candidates_by_db.is_empty() {
+                if record_candidates_by_db.is_empty() && prefix.len() >= min_prefix {
                     if let Some(receiver_name) = receiver.as_deref() {
                         let lookup_names = weak_receiver_lookup_names(receiver_name);
                         let lookup_refs: Vec<&str> =
@@ -182,7 +182,7 @@ impl Backend {
                             let store = IndexStore::open_readonly(db_path)?;
                             let members = store.members_for_records(
                                 &record_ids,
-                                (!prefix.is_empty()).then_some(prefix.as_str()),
+                                None,
                                 Some(&crate::resolver::ResolveContext {
                                     current_path: current_rel_path.as_deref(),
                                     reach: member_reach.as_ref(),
@@ -203,7 +203,7 @@ impl Backend {
                             let store = IndexStore::open_readonly(db_path)?;
                             let members = store.members_for_records(
                                 &record_ids,
-                                (!prefix.is_empty()).then_some(prefix.as_str()),
+                                None,
                                 Some(&crate::resolver::ResolveContext {
                                     current_path: current_rel_path.as_deref(),
                                     reach: member_reach.as_ref(),

@@ -115,6 +115,7 @@ impl LanguageServer for Backend {
         self.client
             .log_message(MessageType::INFO, "FossilSense initialized")
             .await;
+        self.preload_completion_history().await;
         self.spawn_index_roots(None).await;
     }
 

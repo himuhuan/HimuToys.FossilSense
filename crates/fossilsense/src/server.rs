@@ -26,8 +26,8 @@ use tower_lsp::{async_trait, Client, LanguageServer, LspService, Server};
 
 use crate::completion::{self, CandidateEvidence, CandidateSource, CompletionCandidateKind};
 use crate::completion_history::{
-    candidate_hash_from_key, candidate_hash_key, CompletionAcceptEvent, CompletionHistoryMode,
-    CompletionHistorySnapshot, CompletionHistoryStore,
+    candidate_hash, candidate_hash_key, candidate_hash_key_from_hex, CompletionAcceptEvent,
+    CompletionHistoryMode, CompletionHistorySnapshot, CompletionHistoryStore,
 };
 use crate::completion_words;
 use crate::config::WorkspaceConfig;
@@ -637,12 +637,52 @@ impl Backend {
         .await;
     }
 
+    async fn preload_completion_history(&self) {
+        if !self.completion_history_mode.lock().await.is_enabled() {
+            return;
+        }
+        let roots = self.workspace_roots.lock().await.clone();
+        let history_paths: Vec<PathBuf> = roots
+            .iter()
+            .filter_map(|root| pathing::default_completion_history_path(root).ok())
+            .collect();
+        if history_paths.is_empty() {
+            return;
+        }
+
+        let loaded =
+            tokio::task::spawn_blocking(move || -> Vec<(PathBuf, CompletionHistoryStore)> {
+                history_paths
+                    .into_iter()
+                    .filter_map(|path| {
+                        CompletionHistoryStore::open(&path)
+                            .ok()
+                            .map(|store| (path, store))
+                    })
+                    .collect()
+            })
+            .await
+            .unwrap_or_default();
+        if loaded.is_empty() {
+            return;
+        }
+
+        let mut stores = self.completion_history.lock().await;
+        for (path, store) in loaded {
+            stores.entry(path).or_insert(store);
+        }
+    }
+
     async fn record_completion_accept(&self, event: CompletionAcceptEvent) -> Result<()> {
         if !self.completion_history_mode.lock().await.is_enabled() {
             return Ok(());
         }
 
-        let Some(root) = self.workspace_roots.lock().await.first().cloned() else {
+        let roots = self.workspace_roots.lock().await.clone();
+        let Some(root) = roots
+            .into_iter()
+            .find(|root| completion_history_workspace_hash(root) == event.workspace_hash)
+        else {
             return Ok(());
         };
         let history_path = pathing::default_completion_history_path(&root)?;
@@ -674,10 +714,9 @@ impl Backend {
         for root in roots {
             let history_path = pathing::default_completion_history_path(&root)?;
             if !stores.contains_key(&history_path) {
-                stores.insert(
-                    history_path.clone(),
-                    CompletionHistoryStore::open(&history_path)?,
-                );
+                let store = CompletionHistoryStore::open(&history_path)
+                    .unwrap_or_else(|_| CompletionHistoryStore::empty(&history_path));
+                stores.insert(history_path.clone(), store);
             }
             if let Some(store) = stores.get_mut(&history_path) {
                 removed += store.clear_all()?;
@@ -692,13 +731,7 @@ impl Backend {
         workspace_hash: &str,
     ) -> Result<CompletionHistorySnapshot> {
         let history_path = pathing::default_completion_history_path(root)?;
-        let mut stores = self.completion_history.lock().await;
-        if !stores.contains_key(&history_path) {
-            stores.insert(
-                history_path.clone(),
-                CompletionHistoryStore::open(&history_path)?,
-            );
-        }
+        let stores = self.completion_history.lock().await;
         Ok(stores
             .get(&history_path)
             .map(|store| store.snapshot(workspace_hash))
@@ -724,7 +757,7 @@ impl Backend {
 fn completion_accept_event_from_arg(arg: Option<&Value>) -> Option<CompletionAcceptEvent> {
     let arg = arg?;
     let workspace_hash = non_empty_string_field(arg, "workspaceHash")?;
-    let candidate_hash = non_empty_string_field(arg, "candidateHash")?;
+    let candidate_hash = candidate_hash_field(arg, "candidateHash")?;
     let kind = non_empty_string_field(arg, "kind")?;
     let intent = non_empty_string_field(arg, "intent")?;
     let prefix_bucket = arg
@@ -752,6 +785,12 @@ fn non_empty_string_field(value: &Value, field: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn candidate_hash_field(value: &Value, field: &str) -> Option<String> {
+    let hash = non_empty_string_field(value, field)?;
+    candidate_hash_key_from_hex(&hash)?;
+    Some(hash.to_ascii_lowercase())
+}
+
 fn completion_history_workspace_hash(root: &Path) -> String {
     pathing::canonical_workspace(root)
         .map(|workspace| pathing::workspace_hash(&workspace))
@@ -765,16 +804,17 @@ fn attach_completion_history_accept_command(
     intent: completion::CompletionIntentKind,
     prefix_bucket: &str,
 ) {
-    let Some(history_key) = evidence.history_key else {
+    if evidence.history_key.is_none() {
         return;
-    };
+    }
+    let kind = evidence.kind.as_history_kind_str();
     item.command = Some(Command {
         title: "FossilSense completion accepted".to_string(),
         command: COMPLETION_ACCEPTED_LSP_COMMAND.to_string(),
         arguments: Some(vec![serde_json::json!({
             "workspaceHash": workspace_hash,
-            "candidateHash": candidate_hash_from_key(history_key),
-            "kind": evidence.kind.as_history_kind_str(),
+            "candidateHash": candidate_hash(&item.label, kind),
+            "kind": kind,
             "intent": intent.as_summary_str(),
             "prefixBucket": prefix_bucket,
         })]),

@@ -179,10 +179,10 @@ This is rejected for v1.2.1. It conflicts with the local-only privacy requiremen
 | FR7 | UR2-UR7 | SC2-SC7 | D2, D5, D6 | Task 4 | store owner-scoped and fallback member query tests | 已验证 |
 | FR8 | UR2-UR4 | SC2-SC6 | D2, D6 | Task 5 | server member completion tests for FIELD/METHOD kinds and labels | 已验证 |
 | FR9 | UR7 | SC6 | D6 | Task 5 | fallback prefix/cap/incomplete tests | 已验证 |
-| FR10 | UR6 | SC7 | D5 | Task 5 | weak receiver inference unit tests for unique and ambiguous cases | 已验证 |
+| FR10 | UR6 | SC7 | D5 | Task 5 | weak receiver inference tests for unique/ambiguous cases and short-prefix gating | 已验证 |
 | FR11 | UR7, `CLAUDE.md` ordinary completion rules | SC2-SC6 | D2, D6 | Task 4, Task 5 | ordinary completion tests proving members do not leak into identifier completion | 已验证 |
 | FR12 | UR8, VS Code API docs | SC8 | D7 | Task 6, Task 7 | TypeScript command plumbing tests and LSP execute-command tests | 已验证 |
-| FR13 | UR9 | SC8-SC10 | D8 | Task 6 | history store tests for workspace keying, bounds, and clear | 已验证 |
+| FR13 | UR9 | SC8-SC10 | D8 | Task 6 | history tests for multi-root workspace keying, invalid hash rejection, bounds, and clear | 已验证 |
 | FR14 | UR8, UR10 | SC9, SC10 | D8, D9 | Task 7 | ranker tests for bounded history boost and disabled parity | 已验证 |
 | FR15 | UR9 | SC10 | D8 | Task 1, Task 6 | extension config/command tests | 已验证 |
 | FR16 | UR10 | SC10 | D8, D9 | Task 7 | deterministic no-history parity tests | 已验证 |
@@ -190,7 +190,7 @@ This is rejected for v1.2.1. It conflicts with the local-only privacy requiremen
 | FR18 | UR12, docs consistency rules | SC1-SC12 | D10 | Task 8 | docs grep for v1.2.1, member evidence, local history, non-goals | 已验证 |
 | FR19 | release hard rule in `CLAUDE.md` | SC1, SC11 | D10 | Task 9 | `pnpm run package` creates v1.2.1 VSIX with bundled binary | 已验证 |
 | NFR1 | `CLAUDE.md` candidate-not-binding rule | SC2-SC7 | D2, D4, D5 | Task 5, Task 8 | wording review and tests for confidence labels | 已验证 |
-| NFR2 | hot path rules | SC2-SC10 | D6, D8, D9 | Task 5, Task 6, Task 7 | code review plus perf summary tests | 已验证 |
+| NFR2 | hot path rules | SC2-SC10 | D6, D8, D9 | Task 5, Task 6, Task 7 | code review plus ordinary-completion history no-open test | 已验证 |
 | NFR3 | UX stability | SC2-SC10 | D6, D9 | Task 5, Task 7 | deterministic sorting tests | 已验证 |
 | NFR4 | UR9 | SC8-SC10, SC12 | D8 | Task 6, Task 7, Task 8 | clear/disable tests and source-safe log tests | 已验证 |
 | NFR5 | maintainability rules | SC2-SC12 | D2-D9 | Task 2, Task 3, Task 4, Task 5, Task 6, Task 7 | focused parser/store/server/extension tests | 已验证 |

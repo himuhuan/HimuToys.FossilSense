@@ -1097,13 +1097,16 @@ In `server/tests.rs`:
 #[tokio::test]
 async fn execute_command_records_completion_accept_when_history_enabled() {
     let backend = test_backend();
+    let root = tempdir().expect("tempdir");
+    backend.workspace_roots.lock().await.push(root.path().to_path_buf());
     backend.set_completion_history_mode_for_test(CompletionHistoryMode::On).await;
+    let workspace_hash = completion_history_workspace_hash(root.path());
 
     backend.execute_command(ExecuteCommandParams {
         command: COMPLETION_ACCEPTED_LSP_COMMAND.to_string(),
         arguments: vec![serde_json::json!({
-            "workspaceHash": "test",
-            "candidateHash": "abc",
+            "workspaceHash": workspace_hash,
+            "candidateHash": "0123456789abcdef",
             "kind": "function",
             "intent": "call_target",
             "prefixBucket": "pr"
@@ -1111,7 +1114,7 @@ async fn execute_command_records_completion_accept_when_history_enabled() {
         work_done_progress_params: Default::default(),
     }).await.expect("command");
 
-    assert_eq!(backend.history_snapshot_for_test("test").await.total_accepts(), 1);
+    assert_eq!(backend.history_snapshot_for_test(&workspace_hash).await.total_accepts(), 1);
 }
 ```
 

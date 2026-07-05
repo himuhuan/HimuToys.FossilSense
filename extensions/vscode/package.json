@@ -50,7 +50,7 @@
         "fossilsense.serverPath": {
           "type": "string",
           "default": "",
-          "description": "Path to fossilsense.exe. Empty uses the repository debug binary during extension development."
+          "description": "Path to fossilsense.exe. Empty uses the bundled extension binary, falling back to repository release/debug binaries during extension development."
         },
         "fossilsense.mode": {
           "type": "string",

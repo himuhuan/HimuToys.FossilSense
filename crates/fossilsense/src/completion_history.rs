@@ -128,6 +128,13 @@ impl CompletionHistoryStore {
         })
     }
 
+    pub fn empty(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            data: HistoryFile::default(),
+        }
+    }
+
     pub fn record_accept(&mut self, event: CompletionAcceptEvent) -> Result<()> {
         self.data.entries.push(event);
         self.data
@@ -246,6 +253,24 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn accept_event(
+        workspace_hash: &str,
+        label: &str,
+        kind: &str,
+        intent: &str,
+        prefix_bucket: &str,
+        accepted_at: i64,
+    ) -> CompletionAcceptEvent {
+        CompletionAcceptEvent {
+            workspace_hash: workspace_hash.to_string(),
+            candidate_hash: candidate_hash(label, kind),
+            kind: kind.to_string(),
+            intent: intent.to_string(),
+            prefix_bucket: prefix_bucket.to_string(),
+            accepted_at,
+        }
+    }
+
     #[test]
     fn history_store_records_accepts_without_raw_label() {
         let dir = tempdir().expect("tempdir");
@@ -253,14 +278,14 @@ mod tests {
         let mut store = CompletionHistoryStore::open(&path).expect("store");
 
         store
-            .record_accept(CompletionAcceptEvent {
-                workspace_hash: "workspace".to_string(),
-                candidate_hash: candidate_hash("Widget::resize", "method"),
-                kind: "method".to_string(),
-                intent: "call_target".to_string(),
-                prefix_bucket: "r".to_string(),
-                accepted_at: 10,
-            })
+            .record_accept(accept_event(
+                "workspace",
+                "Widget::resize",
+                "method",
+                "call_target",
+                "r",
+                10,
+            ))
             .expect("record");
 
         let text = std::fs::read_to_string(&path).expect("read history");
@@ -275,29 +300,106 @@ mod tests {
         let mut store = CompletionHistoryStore::open(&path).expect("store");
 
         store
-            .record_accept(CompletionAcceptEvent {
-                workspace_hash: "one".to_string(),
-                candidate_hash: candidate_hash("first", "function"),
-                kind: "function".to_string(),
-                intent: "call_target".to_string(),
-                prefix_bucket: "fi".to_string(),
-                accepted_at: 10,
-            })
+            .record_accept(accept_event(
+                "one",
+                "first",
+                "function",
+                "call_target",
+                "fi",
+                10,
+            ))
             .expect("record one");
         store
-            .record_accept(CompletionAcceptEvent {
-                workspace_hash: "two".to_string(),
-                candidate_hash: candidate_hash("second", "function"),
-                kind: "function".to_string(),
-                intent: "call_target".to_string(),
-                prefix_bucket: "se".to_string(),
-                accepted_at: 20,
-            })
+            .record_accept(accept_event(
+                "two",
+                "second",
+                "function",
+                "call_target",
+                "se",
+                20,
+            ))
             .expect("record two");
 
         store.clear_workspace("one").expect("clear");
 
         assert_eq!(store.snapshot("one").total_accepts(), 0);
         assert_eq!(store.snapshot("two").total_accepts(), 1);
+    }
+
+    #[test]
+    fn history_record_accept_enforces_entry_cap() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("history.json");
+        let mut store = CompletionHistoryStore::open(&path).expect("store");
+        store.data.entries = (0..(MAX_HISTORY_ENTRIES + 5))
+            .map(|index| {
+                accept_event(
+                    "workspace",
+                    &format!("candidate_{index}"),
+                    "function",
+                    "call_target",
+                    "ca",
+                    index as i64,
+                )
+            })
+            .collect();
+
+        store
+            .record_accept(accept_event(
+                "workspace",
+                "newest",
+                "function",
+                "call_target",
+                "ne",
+                999_999,
+            ))
+            .expect("record newest");
+
+        assert_eq!(
+            store.snapshot("workspace").total_accepts(),
+            MAX_HISTORY_ENTRIES
+        );
+        let newest_hash = candidate_hash("newest", "function");
+        assert_eq!(
+            store
+                .data
+                .entries
+                .first()
+                .map(|entry| entry.candidate_hash.as_str()),
+            Some(newest_hash.as_str())
+        );
+    }
+
+    #[test]
+    fn history_clear_all_resets_accept_counts() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("history.json");
+        let mut store = CompletionHistoryStore::open(&path).expect("store");
+        let candidate = candidate_hash_key("printf", "function");
+        store
+            .record_accept(accept_event(
+                "workspace",
+                "printf",
+                "function",
+                "call_target",
+                "pr",
+                10,
+            ))
+            .expect("record");
+        assert_eq!(
+            store
+                .snapshot("workspace")
+                .accept_count(candidate, "function", "call_target", "pr"),
+            1
+        );
+
+        store.clear_all().expect("clear");
+
+        assert_eq!(
+            store
+                .snapshot("workspace")
+                .accept_count(candidate, "function", "call_target", "pr"),
+            0
+        );
     }
 }
