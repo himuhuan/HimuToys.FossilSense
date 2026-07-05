@@ -48,15 +48,22 @@ extension's `bin/` folder.
   `external` / `global` / `ambiguous`) with the full tier/confidence/reason in the
   item documentation; indexed current-file candidates are left unlabeled. These are
   ranked candidates, not semantic bindings or overload resolution.
-  In v1.2.0, ordinary identifier completion uses the Phase 2-3 smart-completion
+  In v1.2.0, ordinary identifier completion uses the Phase 4-6 smart-completion
   pipeline: candidates are merged by evidence, de-duplicated, ranked with a
   deterministic evidence-aware ranker, and truncated. `ScopeTier` is now a soft
   prior for ordinary completion rather than the final strict packed ordering, and
   guard bands keep low-confidence global/text fallback from jumping ahead without
-  strong current/local evidence. Verbose perf logs report timings, source counts,
-  guard summaries, and shadow-rank movement without candidate names or snippets.
-  Intent classification, multi-channel recall, include recent/sibling ranking, ML
-  ranking, local history, telemetry, and method-member completion are not enabled.
+  strong current/local evidence. Lightweight rule-based intent ranking lifts
+  type, expression-value, call-target, macro-preprocessor, and declaration-name
+  candidates when local lexical cues support that context. Intent is only ranking
+  evidence: it does not perform C/C++ type inference, overload resolution, or
+  semantic binding, and it never hard-filters candidates. Indexed recall is now
+  bounded multi-channel recall, preserving representation from reachable,
+  external, unknown/open-scope, global, current/local, and text evidence before
+  final reranking. Verbose perf logs report timings, source counts, intent bucket,
+  recall channel counts, guard summaries, and shadow-rank movement without
+  candidate names or snippets. ML ranking, local history, telemetry,
+  auto-include insertion, and method-member completion are not enabled.
 - Best-effort Signature Help: inside simple function calls, shows exact-name
   indexed function signatures ranked by the same include reachability tiers as
   Go to Definition. Candidates are hints, not overload resolution; there is no
@@ -71,7 +78,10 @@ extension's `bin/` folder.
   preprocessor, no conditional/macro evaluation, no transitive include graph. Missing or
   wrong-platform headers are skipped — FossilSense never compiles, so they cannot error.
   Include-path completion runs under `fossilsense.completion.mode`; jump-to-header is
-  always available.
+  always available. Completion ranking retains the quote/angle search-order prior
+  and then applies bounded same-directory, sibling/component edge, recent include,
+  basename frequency, and path-depth evidence. Include perf logs expose counts for
+  those ranking signals without raw include paths.
 - Degraded Member Completion (`.`/`->`): returns struct/union fields only. It guesses
   the receiver's record type from a simple declaration in the current file and lists
   that record's fields (resolved from the global index, so cross-file definitions work);

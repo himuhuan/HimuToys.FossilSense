@@ -121,7 +121,7 @@ fossilsense 单一 Rust 原生二进制 (crates/fossilsense)
 | 召回 | exact / prefix 档通过 sorted-by-lower 前缀索引二分 |
 | 排序 | 可叠加目录局部性偏移，但绝不过滤 |
 
-v1.2.0 Smart Completion Phase 0-3 约定：
+v1.2.0 Smart Completion Phase 0-6 约定：
 
 | 项 | 规则 |
 |---|---|
@@ -130,10 +130,13 @@ v1.2.0 Smart Completion Phase 0-3 约定：
 | strict policy | `resolver::pack_score` 仍可用于跳转、着色、workspace symbol、`NameTable` recall 和兼容测试；不再作为普通补全最终 displayed ranking |
 | evidence merge | 同名候选合并 indexed、local binding、current-file overlay、local word evidence，优先保留更结构化的 LSP kind/detail |
 | current overlay | 当前 open document 的宏、typedef/using alias、枚举常量、函数声明/定义、record/type 定义和附近 identifier 使用可作为普通补全 evidence；raw text fallback 仍标为 `text` |
-| metrics | verbose/perf 日志只输出分阶段耗时、候选来源/返回计数、guard 摘要和 shadow rank 摘要 |
+| intent | 普通补全使用轻量规则式 intent ranking，覆盖 type、expression、call、macro preprocessor、declaration-name；intent 只是排序证据，不做类型推断或绑定，不硬过滤 |
+| recall | 普通补全 indexed recall 使用 bounded multi-channel quotas，在 current/local、reachable、external、unknown/open-scope、global、text evidence 间保留有限代表性后再统一 rerank |
+| include ranking | include path completion 保留 quote/angle source prior，并增加 same-directory、sibling/component edge、recent include、basename frequency、path depth 二级 evidence |
+| metrics | verbose/perf 日志只输出分阶段耗时、候选来源/返回计数、intent bucket、recall channel counts、guard 摘要、shadow rank 摘要和 include ranking 计数 |
 | 隐私 | 默认 debug/perf summary 不输出候选名、源码片段或用户代码内容 |
 | shadow | shadow ranking 只作 ranker 对比和回归观测；不得改变返回内容 |
-| 后置能力 | intent classifier、多通道召回、include recent/sibling ranking、member method schema、local history、ML/telemetry 均不属于 Phase 2-3 |
+| 后置能力 | member method schema、weak receiver inference、local history、auto include insertion、ML/telemetry 均不属于 Phase 4-6 |
 
 短前缀：
 
