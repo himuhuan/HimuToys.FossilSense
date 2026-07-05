@@ -500,6 +500,11 @@ impl LanguageServer for Backend {
         if prefix.len() < query::MIN_PREFIX_LEN {
             return Ok(Some(empty_completion_list(true)));
         }
+        let _intent = crate::completion::classify_completion_intent(
+            line_text,
+            position.character,
+            &prefix,
+        );
 
         let parsed_document = match uri_to_path(&uri) {
             Some(path) => {

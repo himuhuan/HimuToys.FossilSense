@@ -38,6 +38,173 @@ const PROXIMITY_SCORE_CAP: i32 = 750;
 #[allow(dead_code)]
 const LOW_TRUST_GLOBAL_TEXT_CAP_BELOW_REACHABLE: i32 = 8_000;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CompletionIntentKind {
+    Neutral,
+    TypeName,
+    ExpressionValue,
+    CallTarget,
+    MacroPreprocessor,
+    DeclarationName,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum CompletionIntentConfidence {
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CompletionIntent {
+    pub kind: CompletionIntentKind,
+    pub confidence: CompletionIntentConfidence,
+}
+
+impl Default for CompletionIntent {
+    fn default() -> Self {
+        Self {
+            kind: CompletionIntentKind::Neutral,
+            confidence: CompletionIntentConfidence::Low,
+        }
+    }
+}
+
+pub(crate) fn classify_completion_intent(
+    line_text: &str,
+    character: u32,
+    prefix: &str,
+) -> CompletionIntent {
+    let cursor = byte_index_for_utf16_position(line_text, character);
+    let before_cursor = &line_text[..cursor];
+    let after_cursor = &line_text[cursor..];
+    let before_prefix = before_cursor
+        .strip_suffix(prefix)
+        .unwrap_or(before_cursor)
+        .trim_end();
+    let trimmed_before = before_cursor.trim_start();
+
+    if is_preprocessor_macro_context(trimmed_before) {
+        return CompletionIntent {
+            kind: CompletionIntentKind::MacroPreprocessor,
+            confidence: CompletionIntentConfidence::High,
+        };
+    }
+
+    if after_cursor.trim_start().starts_with('(') {
+        return CompletionIntent {
+            kind: CompletionIntentKind::CallTarget,
+            confidence: CompletionIntentConfidence::High,
+        };
+    }
+
+    let previous_token = previous_token(before_prefix);
+    if previous_token
+        .as_deref()
+        .is_some_and(is_type_intent_cue)
+    {
+        return CompletionIntent {
+            kind: CompletionIntentKind::TypeName,
+            confidence: CompletionIntentConfidence::High,
+        };
+    }
+
+    if previous_token
+        .as_deref()
+        .is_some_and(is_expression_intent_cue)
+    {
+        return CompletionIntent {
+            kind: CompletionIntentKind::ExpressionValue,
+            confidence: CompletionIntentConfidence::Medium,
+        };
+    }
+
+    if previous_token
+        .as_deref()
+        .is_some_and(is_typeish_declaration_token)
+    {
+        return CompletionIntent {
+            kind: CompletionIntentKind::DeclarationName,
+            confidence: CompletionIntentConfidence::Medium,
+        };
+    }
+
+    CompletionIntent::default()
+}
+
+fn byte_index_for_utf16_position(text: &str, character: u32) -> usize {
+    let mut utf16_units = 0;
+    for (byte_idx, ch) in text.char_indices() {
+        if utf16_units >= character {
+            return byte_idx;
+        }
+        utf16_units += ch.len_utf16() as u32;
+    }
+    text.len()
+}
+
+fn is_preprocessor_macro_context(trimmed_before: &str) -> bool {
+    let Some(rest) = trimmed_before.strip_prefix('#') else {
+        return false;
+    };
+    let directive = rest.split_whitespace().next().unwrap_or_default();
+    matches!(directive, "if" | "ifdef" | "ifndef" | "elif" | "define")
+}
+
+fn previous_token(before_prefix: &str) -> Option<String> {
+    let trimmed = before_prefix.trim_end();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let end = trimmed.len();
+    while end > 0 {
+        let ch = trimmed[..end].chars().next_back()?;
+        if ch.is_alphanumeric() || ch == '_' || ch == '*' || ch == '&' {
+            break;
+        }
+        return Some(ch.to_string());
+    }
+    let mut start = end;
+    while start > 0 {
+        let ch = trimmed[..start].chars().next_back()?;
+        if ch.is_alphanumeric() || ch == '_' || ch == '*' || ch == '&' {
+            start -= ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    Some(trimmed[start..end].to_string())
+}
+
+fn is_type_intent_cue(token: &str) -> bool {
+    matches!(
+        token,
+        "struct" | "union" | "enum" | "class" | "typedef" | "using" | "sizeof" | "new"
+    )
+}
+
+fn is_expression_intent_cue(token: &str) -> bool {
+    matches!(
+        token,
+        "=" | "return" | "(" | "[" | "," | "?" | ":" | "+" | "-" | "*" | "/" | "%"
+            | "&" | "|" | "!" | "<" | ">"
+    )
+}
+
+fn is_typeish_declaration_token(token: &str) -> bool {
+    let trimmed = token.trim_matches(|ch| ch == '*' || ch == '&');
+    trimmed
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_uppercase())
+        || matches!(
+            trimmed,
+            "int" | "char" | "short" | "long" | "float" | "double" | "bool" | "void"
+                | "size_t" | "uint8_t" | "uint16_t" | "uint32_t" | "uint64_t" | "int8_t"
+                | "int16_t" | "int32_t" | "int64_t"
+        )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum CandidateSource {
     Indexed,
@@ -523,6 +690,42 @@ pub(crate) fn completion_perf_summary(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn intent_classifies_preprocessor_macro_context() {
+        let intent = classify_completion_intent("#if FS_", 7, "FS_");
+
+        assert_eq!(intent.kind, CompletionIntentKind::MacroPreprocessor);
+        assert_eq!(intent.confidence, CompletionIntentConfidence::High);
+    }
+
+    #[test]
+    fn intent_classifies_call_target_before_open_paren() {
+        let intent = classify_completion_intent("    FS_do(", 9, "FS_do");
+
+        assert_eq!(intent.kind, CompletionIntentKind::CallTarget);
+        assert!(intent.confidence >= CompletionIntentConfidence::Medium);
+    }
+
+    #[test]
+    fn intent_classifies_type_and_declaration_name_contexts() {
+        let type_intent = classify_completion_intent("    struct FS_", 14, "FS_");
+        assert_eq!(type_intent.kind, CompletionIntentKind::TypeName);
+
+        let decl_intent = classify_completion_intent("    FsWidget fs_", 16, "fs_");
+        assert_eq!(decl_intent.kind, CompletionIntentKind::DeclarationName);
+    }
+
+    #[test]
+    fn intent_degrades_for_uncertain_expression_context() {
+        let intent = classify_completion_intent("    value = FS_", 15, "FS_");
+
+        assert!(matches!(
+            intent.kind,
+            CompletionIntentKind::ExpressionValue | CompletionIntentKind::Neutral
+        ));
+        assert!(intent.confidence <= CompletionIntentConfidence::Medium);
+    }
 
     fn candidate(
         name: &str,
