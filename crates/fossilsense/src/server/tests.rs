@@ -371,6 +371,74 @@ async fn execute_command_ignores_completion_accept_when_history_disabled() {
     );
 }
 
+#[tokio::test]
+async fn ordinary_completion_items_attach_history_accept_command_when_enabled() {
+    let (src, line, character) = text_and_position(
+        "#define FS_MAGIC 1\n\
+         void f(void) { FS/*cursor*/(); }\n",
+    );
+    let dir = tempdir().expect("tempdir");
+    let uri = Url::from_file_path(dir.path().join("a.c")).expect("file uri");
+    let service = test_backend_service();
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(dir.path().to_path_buf());
+    service
+        .inner()
+        .open_docs
+        .lock()
+        .await
+        .insert(uri.clone(), (1, src));
+    service
+        .inner()
+        .set_completion_history_mode_for_test(crate::completion_history::CompletionHistoryMode::On)
+        .await;
+
+    let response = service
+        .inner()
+        .completion(completion_params(uri, line, character))
+        .await
+        .expect("completion")
+        .expect("response");
+    let item = completion_items(response)
+        .into_iter()
+        .find(|item| item.label == "FS_MAGIC")
+        .expect("FS_MAGIC");
+
+    let command = item.command.as_ref().expect("history command");
+    assert_eq!(command.command, super::COMPLETION_ACCEPTED_LSP_COMMAND);
+    let argument = command
+        .arguments
+        .as_ref()
+        .and_then(|arguments| arguments.first())
+        .expect("command argument");
+    assert_eq!(
+        argument.get("kind").and_then(|value| value.as_str()),
+        Some("macro")
+    );
+    assert_eq!(
+        argument.get("intent").and_then(|value| value.as_str()),
+        Some("call_target")
+    );
+    assert_eq!(
+        argument
+            .get("prefixBucket")
+            .and_then(|value| value.as_str()),
+        Some("fs")
+    );
+    assert!(argument
+        .get("workspaceHash")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| !value.is_empty()));
+    assert!(argument
+        .get("candidateHash")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| value.len() == 16));
+}
+
 // --- R7: completion memo validity (generation + prefix extension check) ---
 
 #[test]

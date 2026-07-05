@@ -8,8 +8,8 @@ use serde_json::Value;
 use tokio::sync::{Mutex, RwLock};
 use tower_lsp::jsonrpc::Result as LspResult;
 use tower_lsp::lsp_types::{
-    CompletionItem, CompletionItemKind, CompletionList, CompletionOptions, CompletionParams,
-    CompletionResponse, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
+    Command, CompletionItem, CompletionItemKind, CompletionList, CompletionOptions,
+    CompletionParams, CompletionResponse, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
     DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, Documentation,
     ExecuteCommandParams, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams,
@@ -25,10 +25,9 @@ use tower_lsp::lsp_types::{
 use tower_lsp::{async_trait, Client, LanguageServer, LspService, Server};
 
 use crate::completion::{self, CandidateEvidence, CandidateSource, CompletionCandidateKind};
-#[cfg(test)]
-use crate::completion_history::CompletionHistorySnapshot;
 use crate::completion_history::{
-    CompletionAcceptEvent, CompletionHistoryMode, CompletionHistoryStore,
+    candidate_hash_from_key, candidate_hash_key, CompletionAcceptEvent, CompletionHistoryMode,
+    CompletionHistorySnapshot, CompletionHistoryStore,
 };
 use crate::completion_words;
 use crate::config::WorkspaceConfig;
@@ -110,6 +109,7 @@ fn completion_items_for_local_bindings(
             );
             evidence.match_score = hit.match_score;
             evidence.kind = CompletionCandidateKind::Variable;
+            set_completion_history_key(&mut evidence, &hit.name);
             CompletionCandidate::new(
                 hit.name.clone(),
                 evidence,
@@ -159,6 +159,7 @@ fn completion_items_for_current_file_overlay(
             } else {
                 completion_candidate_kind_from_parser(hit.kind)
             };
+            set_completion_history_key(&mut evidence, &hit.name);
 
             CompletionCandidate::new(
                 hit.name.clone(),
@@ -187,6 +188,7 @@ fn completion_items_for_indexed_hits(
                 CandidateEvidence::new(CandidateSource::Indexed, hit.tier, confidence, hit.score);
             evidence.match_score = hit.base_match;
             evidence.kind = completion_candidate_kind_from_parser(hit.kind);
+            set_completion_history_key(&mut evidence, &hit.name);
             CompletionCandidate::new(
                 hit.name.clone(),
                 evidence,
@@ -228,6 +230,7 @@ fn exact_indexed_completion_candidates_for_local_word(
                 CandidateEvidence::new(CandidateSource::Indexed, hit.tier, confidence, local_score);
             evidence.match_score = hit.base_match;
             evidence.kind = completion_candidate_kind_from_parser(hit.kind);
+            set_completion_history_key(&mut evidence, &hit.name);
             CompletionCandidate::new(
                 hit.name.clone(),
                 evidence,
@@ -242,6 +245,13 @@ fn exact_indexed_completion_candidates_for_local_word(
             )
         })
         .collect()
+}
+
+fn set_completion_history_key(evidence: &mut CandidateEvidence, label: &str) {
+    evidence.history_key = Some(candidate_hash_key(
+        label,
+        evidence.kind.as_history_kind_str(),
+    ));
 }
 
 const REFRESH_INDEX_COMMAND: &str = "fossilsense.refreshIndex";
@@ -676,6 +686,25 @@ impl Backend {
         Ok(removed)
     }
 
+    async fn completion_history_snapshot_for_root(
+        &self,
+        root: &Path,
+        workspace_hash: &str,
+    ) -> Result<CompletionHistorySnapshot> {
+        let history_path = pathing::default_completion_history_path(root)?;
+        let mut stores = self.completion_history.lock().await;
+        if !stores.contains_key(&history_path) {
+            stores.insert(
+                history_path.clone(),
+                CompletionHistoryStore::open(&history_path)?,
+            );
+        }
+        Ok(stores
+            .get(&history_path)
+            .map(|store| store.snapshot(workspace_hash))
+            .unwrap_or_default())
+    }
+
     #[cfg(test)]
     async fn set_completion_history_mode_for_test(&self, mode: CompletionHistoryMode) {
         *self.completion_history_mode.lock().await = mode;
@@ -721,6 +750,35 @@ fn non_empty_string_field(value: &Value, field: &str) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
+}
+
+fn completion_history_workspace_hash(root: &Path) -> String {
+    pathing::canonical_workspace(root)
+        .map(|workspace| pathing::workspace_hash(&workspace))
+        .unwrap_or_else(|_| pathing::workspace_hash(root))
+}
+
+fn attach_completion_history_accept_command(
+    item: &mut CompletionItem,
+    evidence: CandidateEvidence,
+    workspace_hash: &str,
+    intent: completion::CompletionIntentKind,
+    prefix_bucket: &str,
+) {
+    let Some(history_key) = evidence.history_key else {
+        return;
+    };
+    item.command = Some(Command {
+        title: "FossilSense completion accepted".to_string(),
+        command: COMPLETION_ACCEPTED_LSP_COMMAND.to_string(),
+        arguments: Some(vec![serde_json::json!({
+            "workspaceHash": workspace_hash,
+            "candidateHash": candidate_hash_from_key(history_key),
+            "kind": evidence.kind.as_history_kind_str(),
+            "intent": intent.as_summary_str(),
+            "prefixBucket": prefix_bucket,
+        })]),
+    });
 }
 
 fn query_error_log_line(what: &str, kind: &str, detail: &str) -> String {

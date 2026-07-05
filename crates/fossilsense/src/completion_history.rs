@@ -31,20 +31,58 @@ pub struct CompletionAcceptEvent {
     pub accepted_at: i64,
 }
 
-#[derive(Debug, Clone, Default)]
-#[allow(dead_code)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CompletionHistorySnapshot {
     entries: Vec<CompletionAcceptEvent>,
 }
 
-#[allow(dead_code)]
 impl CompletionHistorySnapshot {
+    #[allow(dead_code)]
     pub fn total_accepts(&self) -> usize {
         self.entries.len()
     }
 
+    pub fn accept_count(
+        &self,
+        candidate_key: u64,
+        kind: &str,
+        intent: &str,
+        prefix_bucket: &str,
+    ) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| {
+                candidate_hash_key_from_hex(&entry.candidate_hash) == Some(candidate_key)
+                    && entry.kind == kind
+                    && entry.intent == intent
+                    && entry.prefix_bucket == prefix_bucket
+            })
+            .count()
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn append_from(&mut self, other: CompletionHistorySnapshot) {
         self.entries.extend(other.entries);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_accepts(
+        accepts: Vec<(String, &'static str, &'static str, &'static str, usize)>,
+    ) -> Self {
+        let mut entries = Vec::new();
+        for (candidate_hash, kind, intent, prefix_bucket, count) in accepts {
+            for index in 0..count {
+                entries.push(CompletionAcceptEvent {
+                    workspace_hash: "test".to_string(),
+                    candidate_hash: candidate_hash.clone(),
+                    kind: kind.to_string(),
+                    intent: intent.to_string(),
+                    prefix_bucket: prefix_bucket.to_string(),
+                    accepted_at: index as i64,
+                });
+            }
+        }
+        Self { entries }
     }
 }
 
@@ -157,11 +195,43 @@ impl CompletionHistoryStore {
 
 #[allow(dead_code)]
 pub fn candidate_hash(label: &str, kind: &str) -> String {
+    candidate_hash_from_key(candidate_hash_key(label, kind))
+}
+
+pub fn candidate_hash_key(label: &str, kind: &str) -> u64 {
     let mut hasher = blake3::Hasher::new();
     hasher.update(kind.as_bytes());
     hasher.update(b"\0");
     hasher.update(label.as_bytes());
-    hasher.finalize().to_hex()[..16].to_string()
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest.as_bytes()[..8]);
+    u64::from_be_bytes(bytes)
+}
+
+pub fn candidate_hash_from_key(key: u64) -> String {
+    format!("{key:016x}")
+}
+
+pub fn candidate_hash_key_from_hex(hash: &str) -> Option<u64> {
+    if hash.len() != 16 || !hash.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(hash, 16).ok()
+}
+
+pub fn prefix_bucket(prefix: &str) -> String {
+    let bucket: String = prefix
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+        .map(|ch| ch.to_ascii_lowercase())
+        .take(2)
+        .collect();
+    if bucket.is_empty() {
+        "none".to_string()
+    } else {
+        bucket
+    }
 }
 
 pub fn now_unix_secs() -> i64 {

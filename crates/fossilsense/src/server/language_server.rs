@@ -505,6 +505,27 @@ impl LanguageServer for Backend {
         }
         let intent =
             crate::completion::classify_completion_intent(line_text, position.character, &prefix);
+        let history_enabled = self.completion_history_mode.lock().await.is_enabled();
+        let history_root = if history_enabled {
+            self.root_for_uri(&uri).await
+        } else {
+            None
+        };
+        let history_workspace_hash = history_root
+            .as_ref()
+            .map(|root| completion_history_workspace_hash(root));
+        let history_prefix_bucket = crate::completion_history::prefix_bucket(&prefix);
+        let history_snapshot = match (
+            history_enabled,
+            history_root.as_deref(),
+            history_workspace_hash.as_deref(),
+        ) {
+            (true, Some(root), Some(workspace_hash)) => self
+                .completion_history_snapshot_for_root(root, workspace_hash)
+                .await
+                .unwrap_or_default(),
+            _ => crate::completion_history::CompletionHistorySnapshot::default(),
+        };
 
         let parsed_document = match uri_to_path(&uri) {
             Some(path) => {
@@ -613,6 +634,8 @@ impl LanguageServer for Backend {
             }
         };
         let memo_prefix = prefix.clone();
+        let command_workspace_hash = history_workspace_hash.clone();
+        let command_prefix_bucket = history_prefix_bucket.clone();
         let context_ms = ordinary_started.elapsed().as_millis();
 
         let result = tokio::task::spawn_blocking(
@@ -713,6 +736,7 @@ impl LanguageServer for Backend {
                         word_score,
                     );
                     evidence.kind = crate::completion::CompletionCandidateKind::Text;
+                    set_completion_history_key(&mut evidence, word);
                     candidates.push(CompletionCandidate::new(
                         word.clone(),
                         evidence,
@@ -730,7 +754,12 @@ impl LanguageServer for Backend {
                 let mut output = crate::completion::run_evidence_aware_pipeline_with_context(
                     candidates,
                     limit,
-                    crate::completion::CompletionRankContext { intent },
+                    crate::completion::CompletionRankContext {
+                        intent,
+                        history_enabled,
+                        history: history_snapshot,
+                        prefix_bucket: history_prefix_bucket,
+                    },
                 );
                 output.metrics.recall_channels = recall_channels;
                 let merge_rank_ms = merge_rank_started.elapsed().as_millis();
@@ -739,7 +768,21 @@ impl LanguageServer for Backend {
                 let mut items: Vec<CompletionItem> = output
                     .items
                     .into_iter()
-                    .map(|candidate| candidate.payload)
+                    .map(|candidate| {
+                        let mut item = candidate.payload;
+                        if history_enabled {
+                            if let Some(workspace_hash) = command_workspace_hash.as_deref() {
+                                attach_completion_history_accept_command(
+                                    &mut item,
+                                    candidate.evidence,
+                                    workspace_hash,
+                                    intent.kind,
+                                    &command_prefix_bucket,
+                                );
+                            }
+                        }
+                        item
+                    })
                     .collect();
                 apply_final_completion_sort_text(&mut items);
                 let render_ms = render_started.elapsed().as_millis();

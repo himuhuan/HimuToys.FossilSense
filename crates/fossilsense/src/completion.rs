@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use crate::completion_history::CompletionHistorySnapshot;
 use crate::model::{ResolutionConfidence, ScopeTier};
 
 #[allow(dead_code)]
@@ -45,6 +46,8 @@ const INTENT_MEDIUM_MATCH: i32 = 900;
 const INTENT_BOUNDED_DEMOTION: i32 = -450;
 #[allow(dead_code)]
 const DECLARATION_GLOBAL_REUSE_DEMOTION: i32 = -5_000;
+const HISTORY_MAX_BOOST: i32 = 700;
+const HISTORY_REPEAT_STEP: i32 = 120;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CompletionIntentKind {
@@ -79,7 +82,7 @@ impl Default for CompletionIntent {
 }
 
 impl CompletionIntentKind {
-    fn as_summary_str(self) -> &'static str {
+    pub(crate) fn as_summary_str(self) -> &'static str {
         match self {
             CompletionIntentKind::Neutral => "neutral",
             CompletionIntentKind::TypeName => "type_name",
@@ -124,11 +127,26 @@ impl CompletionCandidateKind {
             CompletionCandidateKind::Type => 5,
         }
     }
+
+    pub(crate) fn as_history_kind_str(self) -> &'static str {
+        match self {
+            CompletionCandidateKind::Unknown => "unknown",
+            CompletionCandidateKind::Function => "function",
+            CompletionCandidateKind::Macro => "macro",
+            CompletionCandidateKind::Type => "type",
+            CompletionCandidateKind::Variable => "variable",
+            CompletionCandidateKind::EnumConstant => "enum_constant",
+            CompletionCandidateKind::Text => "text",
+        }
+    }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CompletionRankContext {
     pub intent: CompletionIntent,
+    pub history_enabled: bool,
+    pub history: CompletionHistorySnapshot,
+    pub prefix_bucket: String,
 }
 
 impl CompletionRankContext {
@@ -139,6 +157,9 @@ impl CompletionRankContext {
     ) -> Self {
         Self {
             intent: CompletionIntent { kind, confidence },
+            history_enabled: false,
+            history: CompletionHistorySnapshot::default(),
+            prefix_bucket: String::new(),
         }
     }
 }
@@ -147,6 +168,9 @@ impl Default for CompletionRankContext {
     fn default() -> Self {
         Self {
             intent: CompletionIntent::default(),
+            history_enabled: false,
+            history: CompletionHistorySnapshot::default(),
+            prefix_bucket: String::new(),
         }
     }
 }
@@ -411,6 +435,8 @@ pub(crate) struct CandidateEvidence {
     pub locality_score: i32,
     pub proximity_score: i32,
     pub kind: CompletionCandidateKind,
+    pub history_key: Option<u64>,
+    pub history_score: i32,
 }
 
 impl CandidateEvidence {
@@ -431,6 +457,8 @@ impl CandidateEvidence {
             locality_score: 0,
             proximity_score: 0,
             kind: CompletionCandidateKind::Unknown,
+            history_key: None,
+            history_score: 0,
         }
     }
 
@@ -450,10 +478,14 @@ impl CandidateEvidence {
         if other.kind.priority() > self.kind.priority() {
             self.kind = other.kind;
         }
+        if self.history_key.is_none() {
+            self.history_key = other.history_key;
+        }
+        self.history_score = self.history_score.max(other.history_score);
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct PipelineCandidate<T> {
     pub name: String,
     pub evidence: CandidateEvidence,
@@ -511,6 +543,9 @@ pub(crate) struct CompletionPipelineMetrics {
     pub shadow: Option<ShadowRankSummary>,
     pub intent_kind: CompletionIntentKind,
     pub intent_confidence: CompletionIntentConfidence,
+    pub history_enabled: bool,
+    pub history_boosted: usize,
+    pub history_max_boost: i32,
     pub recall_channels: crate::query::CompletionRecallMetrics,
 }
 
@@ -526,6 +561,9 @@ impl Default for CompletionPipelineMetrics {
             shadow: None,
             intent_kind: CompletionIntentKind::Neutral,
             intent_confidence: CompletionIntentConfidence::Low,
+            history_enabled: false,
+            history_boosted: 0,
+            history_max_boost: 0,
             recall_channels: crate::query::CompletionRecallMetrics::default(),
         }
     }
@@ -602,6 +640,7 @@ pub(crate) fn run_evidence_aware_pipeline_with_context<T>(
         input_sources: count_sources(candidates.iter()),
         intent_kind: context.intent.kind,
         intent_confidence: context.intent.confidence,
+        history_enabled: context.history_enabled,
         ..CompletionPipelineMetrics::default()
     };
 
@@ -610,8 +649,15 @@ pub(crate) fn run_evidence_aware_pipeline_with_context<T>(
     let shadow_order = compatibility_order(&kept);
 
     let mut guarded_low_trust = 0;
+    let mut history_boosted = 0;
+    let mut history_max_boost = 0;
     for candidate in &mut kept {
-        let rank = final_rank_score(candidate.evidence, context);
+        candidate.evidence.history_score = history_adjustment(candidate.evidence, &context);
+        if candidate.evidence.history_score > 0 {
+            history_boosted += 1;
+            history_max_boost = history_max_boost.max(candidate.evidence.history_score);
+        }
+        let rank = final_rank_score(candidate.evidence, &context);
         if is_guarded_low_trust(candidate.evidence) {
             guarded_low_trust += 1;
             candidate.evidence.score = rank.min(LOW_TRUST_GLOBAL_TEXT_CAP_BELOW_REACHABLE);
@@ -620,6 +666,8 @@ pub(crate) fn run_evidence_aware_pipeline_with_context<T>(
         }
     }
     metrics.final_rank = FinalRankSummary { guarded_low_trust };
+    metrics.history_boosted = history_boosted;
+    metrics.history_max_boost = history_max_boost;
 
     kept.sort_by(|a, b| {
         b.evidence
@@ -745,13 +793,30 @@ fn compatibility_order<T>(candidates: &[PipelineCandidate<T>]) -> Vec<String> {
 }
 
 #[allow(dead_code)]
-fn final_rank_score(evidence: CandidateEvidence, context: CompletionRankContext) -> i32 {
+fn final_rank_score(evidence: CandidateEvidence, context: &CompletionRankContext) -> i32 {
     source_prior(evidence.primary_source)
         + scope_prior(evidence.tier)
         + confidence_prior(evidence.confidence)
         + evidence.match_score
         + evidence.proximity_score.clamp(0, PROXIMITY_SCORE_CAP)
         + intent_adjustment(evidence, context.intent)
+        + evidence.history_score
+}
+
+fn history_adjustment(evidence: CandidateEvidence, context: &CompletionRankContext) -> i32 {
+    if !context.history_enabled {
+        return 0;
+    }
+    let Some(history_key) = evidence.history_key else {
+        return 0;
+    };
+    let accepts = context.history.accept_count(
+        history_key,
+        evidence.kind.as_history_kind_str(),
+        context.intent.kind.as_summary_str(),
+        &context.prefix_bucket,
+    );
+    ((accepts as i32) * HISTORY_REPEAT_STEP).min(HISTORY_MAX_BOOST)
 }
 
 fn intent_adjustment(evidence: CandidateEvidence, intent: CompletionIntent) -> i32 {
@@ -892,7 +957,7 @@ pub(crate) fn completion_perf_summary(
 ) -> String {
     let shadow = metrics.shadow.unwrap_or_default();
     format!(
-        "[perf] completion total={}ms context={}ms recall={}ms merge_rank={}ms render={}ms prefix_len={} hit={} intent={} intent_confidence={} candidates_in={} after_dedup={} returned={} indexed={} local_binding={} current_file_overlay={} local_word={} returned_indexed={} returned_local_binding={} returned_current_file_overlay={} returned_local_word={} recall_reachable={} recall_external={} recall_unknown={} recall_global={} recall_pool={} guarded_low_trust={} shadow_moved={} shadow_max_delta={}",
+        "[perf] completion total={}ms context={}ms recall={}ms merge_rank={}ms render={}ms prefix_len={} hit={} intent={} intent_confidence={} history_enabled={} history_boosted={} history_max_boost={} candidates_in={} after_dedup={} returned={} indexed={} local_binding={} current_file_overlay={} local_word={} returned_indexed={} returned_local_binding={} returned_current_file_overlay={} returned_local_word={} recall_reachable={} recall_external={} recall_unknown={} recall_global={} recall_pool={} guarded_low_trust={} shadow_moved={} shadow_max_delta={}",
         timings.total_ms,
         timings.context_ms,
         timings.recall_ms,
@@ -902,6 +967,9 @@ pub(crate) fn completion_perf_summary(
         memo_hit,
         metrics.intent_kind.as_summary_str(),
         metrics.intent_confidence.as_summary_str(),
+        metrics.history_enabled,
+        metrics.history_boosted,
+        metrics.history_max_boost,
         metrics.input_total,
         metrics.after_dedup_total,
         metrics.returned_total,
@@ -927,6 +995,9 @@ pub(crate) fn completion_perf_summary(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::completion_history::{
+        candidate_hash, candidate_hash_key, CompletionHistorySnapshot,
+    };
 
     #[test]
     fn intent_classifies_preprocessor_macro_context() {
@@ -1005,6 +1076,109 @@ mod tests {
             CandidateEvidence::new(source, tier, ResolutionConfidence::Heuristic, score);
         evidence.kind = kind;
         PipelineCandidate::new(name, evidence, payload)
+    }
+
+    fn candidate_with_history_key(
+        name: &str,
+        source: CandidateSource,
+        tier: ScopeTier,
+        score: i32,
+        kind: CompletionCandidateKind,
+        kind_str: &str,
+        payload: &'static str,
+    ) -> PipelineCandidate<&'static str> {
+        let mut evidence =
+            CandidateEvidence::new(source, tier, ResolutionConfidence::Heuristic, score);
+        evidence.kind = kind;
+        evidence.history_key = Some(candidate_hash_key(name, kind_str));
+        PipelineCandidate::new(name, evidence, payload)
+    }
+
+    #[test]
+    fn history_boost_lifts_comparable_candidate_but_not_current_local() {
+        let history = CompletionHistorySnapshot::from_test_accepts(vec![(
+            candidate_hash("global_fn", "function"),
+            "function",
+            "call_target",
+            "gl",
+            4,
+        )]);
+
+        let output = run_evidence_aware_pipeline_with_context(
+            vec![
+                candidate_with_history_key(
+                    "global_fn",
+                    CandidateSource::Indexed,
+                    ScopeTier::Global,
+                    820,
+                    CompletionCandidateKind::Function,
+                    "function",
+                    "global",
+                ),
+                candidate_with_history_key(
+                    "local_value",
+                    CandidateSource::LocalBinding,
+                    ScopeTier::Current,
+                    760,
+                    CompletionCandidateKind::Variable,
+                    "variable",
+                    "local",
+                ),
+            ],
+            10,
+            CompletionRankContext {
+                intent: CompletionIntent {
+                    kind: CompletionIntentKind::CallTarget,
+                    confidence: CompletionIntentConfidence::High,
+                },
+                history_enabled: true,
+                history,
+                prefix_bucket: "gl".to_string(),
+            },
+        );
+
+        assert_eq!(output.items[0].payload, "local");
+        assert!(output.metrics.history_boosted >= 1);
+        assert!(output.metrics.history_max_boost > 0);
+    }
+
+    #[test]
+    fn neutral_history_context_preserves_existing_order() {
+        let candidates = vec![
+            candidate(
+                "alpha",
+                CandidateSource::Indexed,
+                ScopeTier::Reachable,
+                700,
+                "a",
+            ),
+            candidate(
+                "beta",
+                CandidateSource::Indexed,
+                ScopeTier::Global,
+                900,
+                "b",
+            ),
+        ];
+        let without = run_evidence_aware_pipeline(candidates.clone(), 10);
+        let disabled = run_evidence_aware_pipeline_with_context(
+            candidates,
+            10,
+            CompletionRankContext::default(),
+        );
+
+        assert_eq!(
+            without
+                .items
+                .iter()
+                .map(|candidate| candidate.payload)
+                .collect::<Vec<_>>(),
+            disabled
+                .items
+                .iter()
+                .map(|candidate| candidate.payload)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
