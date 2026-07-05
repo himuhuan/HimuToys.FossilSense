@@ -16,7 +16,7 @@ Feature brief name: smart-completion-v1-2-1
 - `CLAUDE.md` records v1.2.0 Phase 0-6 completion rules: ordinary identifier completion uses the completion core, deterministic evidence-aware ranking, current-file overlay, intent evidence, multi-channel recall, include ranking, and source-safe perf summaries. It explicitly keeps member method schema, weak receiver inference, local history, auto include insertion, ML, and telemetry outside Phase 4-6.
 - `README.md` and `extensions/vscode/README.md` currently describe v1.2.0 and state that method-member completion and local history are not enabled. v1.2.1 must update these facts without contradicting archived Phase 0-6 requirements.
 - `docs/research/smart-completion-dev-eval.md` defines Phase 7 as extending member completion to member evidence, starting with schema/parser/store support for methods, then weak receiver inference. It defines Phase 8 as local-only completion history using accepted-count/intent/prefix statistics, clearable and disableable, with no upload.
-- Existing code facts:
+- Pre-implementation code facts captured before v1.2.1 work:
   - `crates/fossilsense/src/server/member_completion.rs` is field-only. It resolves a simple receiver record from current-file local declarations, queries `record_defs` plus `fields`, and falls back to prefix-matched global field names.
   - `crates/fossilsense/src/store/schema.rs` uses `SCHEMA_VERSION = 8`, `record_defs`, `fields`, and `type_aliases`; there is no `members` table.
   - `crates/fossilsense/src/parser.rs` and `crates/fossilsense/src/parser/ast.rs` expose `RecordDef`, `FieldDef`, aliases, record-typed local declarations, and local bindings. They do not expose method members.

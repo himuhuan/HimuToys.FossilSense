@@ -1496,6 +1496,13 @@ git add CLAUDE.md README.md extensions/vscode/README.md extensions/vscode/packag
 git commit -m "docs: describe smart completion v1.2.1"
 ```
 
+### Task 8 documentation sync note, 2026-07-05
+
+- Current README, CLAUDE, extension README, and package metadata describe v1.2.1 member evidence for fields and first-version C++ methods.
+- Docs state member completion remains best-effort owner evidence, not complete C++ binding; inheritance, overloads, templates, namespaces, access control, and expression typing remain out of scope.
+- Docs state local completion history is local-only, bounded, clearable, disableable, uses positive accept feedback only, and does not upload telemetry or raw accepted labels.
+- Docs mention schema mismatch may trigger a first-launch full rebuild for v1.2.1.
+
 ## Task 9：Full verification and package smoke
 
 **覆盖需求：** FR1-FR19, NFR1-NFR10

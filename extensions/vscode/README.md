@@ -62,8 +62,11 @@ extension's `bin/` folder.
   external, unknown/open-scope, global, current/local, and text evidence before
   final reranking. Verbose perf logs report timings, source counts, intent bucket,
   recall channel counts, guard summaries, and shadow-rank movement without
-  candidate names or snippets. ML ranking, local history, telemetry,
-  auto-include insertion, and method-member completion are not enabled.
+  candidate names or snippets. In v1.2.1, ordinary completion can also use
+  local-only accepted-completion history as a small bounded ranking signal keyed
+  by anonymous candidate hash, kind, intent, and prefix bucket. It is workspace
+  local, clearable, disableable, and records positive accept feedback only. No
+  telemetry, cloud sync, ML ranking, or auto-include insertion is enabled.
 - Best-effort Signature Help: inside simple function calls, shows exact-name
   indexed function signatures ranked by the same include reachability tiers as
   Go to Definition. Candidates are hints, not overload resolution; there is no
@@ -82,15 +85,16 @@ extension's `bin/` folder.
   and then applies bounded same-directory, sibling/component edge, recent include,
   basename frequency, and path-depth evidence. Include perf logs expose counts for
   those ranking signals without raw include paths.
-- Degraded Member Completion (`.`/`->`): returns struct/union fields only. It guesses
-  the receiver's record type from a simple declaration in the current file and lists
-  that record's fields (resolved from the global index, so cross-file definitions work);
-  when the receiver cannot be inferred it falls back to prefix-matched global field
-  names only (no subsequence), requires at least a 2-character prefix, caps the list,
-  and marks it `isIncomplete` — a 1-char/empty prefix returns an empty incomplete list
-  rather than dumping the whole index's fields. C-oriented; it never infers expression
-  types, so it may list the wrong record's fields. Runs under
-  `fossilsense.completion.mode`.
+- Degraded Member Completion (`.`/`->`): returns owner-scoped fields and first-version
+  C++ method evidence for structs/classes/unions. It guesses the receiver's record type
+  from simple declarations in the current file and can use a narrow weak receiver
+  correlation when the indexed owner name is unique; cross-file definitions work through
+  the member index. When the receiver cannot be inferred it falls back to prefix-matched
+  global member names only (no subsequence), requires at least a 2-character prefix, caps
+  the list, and marks it `isIncomplete` — a 1-char/empty prefix returns an empty
+  incomplete list rather than dumping the whole index's members. This is owner evidence,
+  not full C++ binding: no inheritance, overload resolution, templates, namespaces,
+  access control, or expression type inference. Runs under `fossilsense.completion.mode`.
 - Degraded Semantic Coloring: colors known macros, types (typedef / struct /
   enum / union / class), enum constants, and best-effort current-function
   parameters/local variables from the open document snapshot. Everything else —
@@ -153,8 +157,15 @@ because FossilSense returns ranked text/index candidates.
   jump-to-header, and degraded symbol indexing. Distinct from workspace scope `include`.
   Changing it restarts the server. Empty by default (no behavior change).
 - `fossilsense.completion.mode` - controls FossilSense completion: `"auto"` (default,
-  enabled), `"on"` (enabled), `"off"` (never enabled). C/C++ language-server conflicts
-  are reported by `fossilsense.mode`, not handled by silently disabling completion.
+  enabled), `"on"` (enabled), `"off"` (never enabled). This includes ordinary
+  identifier completion, include-path completion, and degraded `.`/`->` field/method
+  member completion. C/C++ language-server conflicts are reported by `fossilsense.mode`,
+  not handled by silently disabling completion.
+- `fossilsense.completionHistory.mode` - controls local-only accepted-completion
+  history: `"auto"` (default, enabled), `"on"` (enabled), `"off"` (do not record or
+  rank with history). History stays in the local workspace cache, is bounded, stores
+  anonymous candidate hashes/buckets rather than raw labels or source, and can be removed
+  with **FossilSense: Clear Completion History**.
 - `fossilsense.semanticColoring.mode` - controls FossilSense semantic coloring of macros,
   types, and enum constants: `"auto"` (default, enabled), `"on"` (enabled), `"off"`
   (never enabled). C/C++ language-server conflicts are reported by `fossilsense.mode`,
