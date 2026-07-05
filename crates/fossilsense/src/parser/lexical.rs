@@ -39,7 +39,7 @@ pub(super) fn extract_symbols_and_includes(
         if top_level && !trimmed.starts_with('#') && !trimmed.is_empty() {
             statement.push(line, line_index);
             if statement.is_complete() {
-                if !statement.pending_typedef {
+                if !statement.pending_typedef || trimmed.ends_with(';') {
                     symbols.extend(capture_statement_symbols(
                         &statement,
                         line_starts,

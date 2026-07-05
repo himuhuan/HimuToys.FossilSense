@@ -660,3 +660,21 @@ fn lexical_edge_cases_typedef_and_tag() {
     }), "E: Expected Widget Type symbol");
     assert!(index_e.fields.iter().any(|f| f.name == "count"), "E: Expected field count");
 }
+
+#[test]
+fn lexical_alias_on_separate_line_after_brace() {
+    let index = super::parse(
+        std::path::Path::new("test.c"),
+        "typedef struct {\n    int x;\n}\nToken;\nint answer;\n",
+    );
+    // Typedef alias on its own top-level line after closing brace
+    assert!(index.symbols.iter().any(|s| {
+        s.name == "Token" && s.kind == super::SymbolKind::Type && s.role == super::SymbolRole::Definition
+    }), "Expected Token Type symbol");
+    // Subsequent decl must NOT be corrupted by leftover pending_typedef
+    assert!(index.symbols.iter().any(|s| {
+        s.name == "answer" && s.kind == super::SymbolKind::GlobalVariable
+    }), "Expected subsequent int answer; to still be captured");
+    // AST fields still collected
+    assert!(index.fields.iter().any(|f| f.name == "x"), "Expected field x");
+}
