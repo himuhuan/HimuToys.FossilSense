@@ -189,6 +189,17 @@ pub(crate) fn classify_completion_intent(
 
     if previous_token
         .as_deref()
+        .is_some_and(is_pointer_or_reference)
+        && typeish_token_before_pointer_or_reference(before_prefix)
+    {
+        return CompletionIntent {
+            kind: CompletionIntentKind::DeclarationName,
+            confidence: CompletionIntentConfidence::Medium,
+        };
+    }
+
+    if previous_token
+        .as_deref()
         .is_some_and(is_expression_intent_cue)
     {
         return CompletionIntent {
@@ -309,6 +320,24 @@ fn is_typeish_declaration_token(token: &str) -> bool {
                 | "int32_t"
                 | "int64_t"
         )
+}
+
+fn is_pointer_or_reference(token: &str) -> bool {
+    token.chars().all(|ch| ch == '*' || ch == '&')
+}
+
+fn typeish_token_before_pointer_or_reference(before_prefix: &str) -> bool {
+    let mut trimmed = before_prefix.trim_end();
+    while let Some(ch) = trimmed.chars().next_back() {
+        if ch == '*' || ch == '&' || ch.is_whitespace() {
+            trimmed = &trimmed[..trimmed.len() - ch.len_utf8()];
+        } else {
+            break;
+        }
+    }
+    previous_token(trimmed)
+        .as_deref()
+        .is_some_and(is_typeish_declaration_token)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -922,6 +951,21 @@ mod tests {
 
         let decl_intent = classify_completion_intent("    FsWidget fs_", 16, "fs_");
         assert_eq!(decl_intent.kind, CompletionIntentKind::DeclarationName);
+    }
+
+    #[test]
+    fn intent_classifies_pointer_and_reference_declaration_names() {
+        let pointer_intent = classify_completion_intent("    FsWidget *fs_", 17, "fs_");
+        assert_eq!(pointer_intent.kind, CompletionIntentKind::DeclarationName);
+
+        let const_pointer_intent = classify_completion_intent("    const FsWidget *fs_", 23, "fs_");
+        assert_eq!(
+            const_pointer_intent.kind,
+            CompletionIntentKind::DeclarationName
+        );
+
+        let reference_intent = classify_completion_intent("    FsWidget &fs_", 17, "fs_");
+        assert_eq!(reference_intent.kind, CompletionIntentKind::DeclarationName);
     }
 
     #[test]

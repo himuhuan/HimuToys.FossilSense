@@ -14,7 +14,7 @@
 - Task 3 completed: bounded multi-channel `NameTable` recall and source-safe recall metrics implemented and committed as `b6e801b`.
 - Task 4 completed: include completion ranking evidence and edge-aware include table rebuild implemented and committed as `1d94106`.
 - Task 5 completed in working tree: README, extension README, `CLAUDE.md`, requirements, and this plan synchronized for Phase 4-6 wording.
-- Task 6 completed in working tree: full verification and package smoke passed; generated `dist/fossilsense-vscode-1.2.0_BUILD20260705_152610.vsix`; final requirements status and verification record updated.
+- Task 6 completed in working tree: full verification and package smoke passed; latest post-review package generated `dist/fossilsense-vscode-1.2.0_BUILD20260705_153916.vsix`; final requirements status and verification record updated.
 
 ## 全局约束
 
@@ -824,3 +824,24 @@ git commit -m "test: verify smart completion phase 4-6"
 - `pnpm run package` in `extensions/vscode`: passed, generated `dist/fossilsense-vscode-1.2.0_BUILD20260705_152610.vsix`.
 
 No failed verification commands in this run. The generated VSIX includes the bundled `extension/bin/fossilsense.exe`.
+
+## Post-review fixes and verification, 2026-07-05
+
+Review feedback addressed:
+
+- Include completion secondary evidence is now capped so same-directory/recent/sibling/basename boosts cannot cross the quote/angle source bucket gap; added production-path tests for angle external and quote current-dir priority.
+- Declaration-name intent now handles pointer/reference declarators such as `FsWidget *fs_`, `const FsWidget *fs_`, and `FsWidget &fs_`.
+- Include perf metrics now report `same_directory` counts in addition to recent/sibling/basename/depth penalty counts.
+- `git diff --check` was run after the fixes and passed.
+
+Executed verification after review:
+
+- `cargo test -p fossilsense completion::tests -- --nocapture`: passed, 42 targeted tests passed.
+- `cargo test -p fossilsense server::include_completion::tests -- --nocapture`: passed, 17 targeted tests passed.
+- `cargo test -p fossilsense server::tests -- --nocapture`: passed, 34 targeted tests passed.
+- `cargo test -p fossilsense`: passed, 451 unit tests and 2 LSP smoke tests passed.
+- `cargo run -p fossilsense -- index samples/mini-c --db target/smart-completion-phase4-6-mini.sqlite --force`: passed, indexed 2 files and 13 symbols.
+- `pnpm run compile` in `extensions/vscode`: passed.
+- `pnpm run package` in `extensions/vscode`: passed, generated `dist/fossilsense-vscode-1.2.0_BUILD20260705_153916.vsix`.
+
+No failed verification commands in the post-review run. The generated VSIX includes the bundled `extension/bin/fossilsense.exe`.

@@ -21,6 +21,7 @@ pub(super) struct IncludeCompletionTable {
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(super) struct IncludeCompletionMetrics {
+    pub same_directory: usize,
     pub recent: usize,
     pub sibling: usize,
     pub basename: usize,
@@ -29,6 +30,7 @@ pub(super) struct IncludeCompletionMetrics {
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct IncludeRankingSignals {
+    same_directory: bool,
     recent: bool,
     sibling: bool,
     basename: bool,
@@ -99,6 +101,9 @@ impl IncludeCompletionTable {
                 if signals.recent {
                     metrics.recent += 1;
                 }
+                if signals.same_directory {
+                    metrics.same_directory += 1;
+                }
                 if signals.sibling {
                     metrics.sibling += 1;
                 }
@@ -125,6 +130,7 @@ impl IncludeCompletionTable {
         let mut signals = IncludeRankingSignals::default();
         if current_rel_dir.is_some_and(|dir| parent_slash(rel_path).as_deref() == Some(dir)) {
             boost += 35;
+            signals.same_directory = true;
         }
         if let Some(evidence) = evidence {
             let rel_lower = rel_path.to_ascii_lowercase();
@@ -156,7 +162,7 @@ impl IncludeCompletionTable {
         let depth_penalty = (rel_path.matches('/').count() as i32 * 3).min(20);
         boost -= depth_penalty;
         signals.depth_penalty = depth_penalty > 0;
-        (boost, signals)
+        (boost.min(49), signals)
     }
 }
 
@@ -1161,6 +1167,81 @@ mod tests {
         );
 
         assert_eq!(items[0].label, "config.h");
+    }
+
+    #[test]
+    fn angle_include_external_bucket_stays_above_boosted_workspace_candidate() {
+        let root = tempdir().expect("root");
+        fs::write(root.path().join("core.h"), "x").expect("external");
+        let root_str = root.path().to_string_lossy().replace('\\', "/");
+        let table = IncludeCompletionTable::build_with_edges(
+            vec![
+                "src/driver/main.c".to_string(),
+                "src/driver/config.h".to_string(),
+            ],
+            vec![(
+                "src/driver/main.c".to_string(),
+                "src/driver/config.h".to_string(),
+            )],
+        );
+        let evidence =
+            CurrentIncludeEvidence::from_text("#include \"config.h\"\n", Some("src/driver/main.c"));
+
+        let (items, metrics) = collect_include_candidates_with_table_and_evidence(
+            IncludeForm::Angle,
+            "",
+            "c",
+            None,
+            None,
+            &[root_str],
+            None,
+            Some(&table),
+            None,
+            Some("src/driver"),
+            Some(&evidence),
+            20,
+        );
+
+        assert_eq!(items[0].label, "core.h");
+        assert!(items.iter().any(|item| item.label == "config.h"));
+        assert!(metrics.same_directory > 0);
+    }
+
+    #[test]
+    fn quote_include_current_dir_bucket_stays_above_boosted_workspace_candidate() {
+        let current = tempdir().expect("current");
+        fs::write(current.path().join("core.h"), "x").expect("local");
+        let table = IncludeCompletionTable::build_with_edges(
+            vec![
+                "src/driver/main.c".to_string(),
+                "src/driver/config.h".to_string(),
+            ],
+            vec![(
+                "src/driver/main.c".to_string(),
+                "src/driver/config.h".to_string(),
+            )],
+        );
+        let evidence =
+            CurrentIncludeEvidence::from_text("#include \"config.h\"\n", Some("src/driver/main.c"));
+
+        let (items, metrics) = collect_include_candidates_with_table_and_evidence(
+            IncludeForm::Quote,
+            "",
+            "c",
+            Some(current.path()),
+            None,
+            &[],
+            None,
+            Some(&table),
+            None,
+            Some("src/driver"),
+            Some(&evidence),
+            20,
+        );
+
+        assert_eq!(items[0].label, "core.h");
+        assert!(items.iter().any(|item| item.label == "config.h"));
+        assert!(metrics.same_directory > 0);
     }
 
     #[test]

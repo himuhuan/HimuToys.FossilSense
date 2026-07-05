@@ -455,10 +455,11 @@ impl Backend {
             .unwrap_or_default();
         self.perf_log(|| {
             format!(
-                "[perf] include_completion total={}ms workspace_table={} workspace_index={} recent={} sibling={} basename={} depth_penalty={}",
+                "[perf] include_completion total={}ms workspace_table={} workspace_index={} same_directory={} recent={} sibling={} basename={} depth_penalty={}",
                 total_ms,
                 if hit_memory { "memory" } else { "unavailable" },
                 if hit_db { "available" } else { "unavailable" },
+                metrics.same_directory,
                 metrics.recent,
                 metrics.sibling,
                 metrics.basename,
