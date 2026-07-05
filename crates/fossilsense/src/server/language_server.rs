@@ -521,6 +521,19 @@ impl LanguageServer for Backend {
                 )
             })
             .unwrap_or_default();
+        let current_file_overlay_hits = parsed_document
+            .as_ref()
+            .map(|index| {
+                query::current_file_overlay_candidates(
+                    index,
+                    &text,
+                    position.line,
+                    position.character,
+                    &prefix,
+                    query::COMPLETION_LIMIT,
+                )
+            })
+            .unwrap_or_default();
 
         let local_words = self.local_words_for(&uri, version, &text).await;
 
@@ -627,41 +640,18 @@ impl LanguageServer for Backend {
                     let (hits, pool) =
                         table.search_ranked_scoped_pooled(&prefix, limit, scope.as_ref(), prior);
                     new_pools.push(pool);
-                    for hit in hits {
-                        // Completion is prefix-based, so `exact_name = false`
-                        // for the confidence/reason projection. The reason is
-                        // no longer discarded — it drives the user-visible label.
-                        let (confidence, reason) =
-                            crate::resolver::confidence_reason_for(hit.tier, false, open_reason);
-                        let sort_text = format!("{:08}", 100_000_000 - hit.score);
-                        let kind = query::lsp_completion_kind_from_parser(hit.kind);
-                        // Non-current candidates get a visible best-effort scope
-                        // label (detail tag + documentation); current-file
-                        // candidates stay unlabeled. The label is derived from
-                        // the same (tier, confidence, reason) used to rank.
-                        let label = model::completion_scope_label(hit.tier, confidence, reason);
-                        candidates.push(CompletionCandidate::new(
-                            hit.name.clone(),
-                            crate::completion::CandidateEvidence::new(
-                                crate::completion::CandidateSource::Indexed,
-                                hit.tier,
-                                confidence,
-                                hit.score,
-                            ),
-                            CompletionItem {
-                                label: hit.name,
-                                kind: Some(kind),
-                                sort_text: Some(sort_text),
-                                detail: label.as_ref().map(|l| l.detail.to_string()),
-                                documentation: label
-                                    .map(|l| Documentation::String(l.documentation)),
-                                ..Default::default()
-                            },
-                        ));
-                    }
+                    candidates.extend(completion_items_for_indexed_hits(hits, open_reason));
                 }
 
                 candidates.extend(completion_items_for_local_bindings(local_binding_hits));
+                let current_file_text_overlay_names: HashSet<String> = current_file_overlay_hits
+                    .iter()
+                    .filter(|hit| !hit.semantic || hit.detail.as_deref() == Some("text"))
+                    .map(|hit| hit.name.clone())
+                    .collect();
+                candidates.extend(completion_items_for_current_file_overlay(
+                    current_file_overlay_hits,
+                ));
 
                 // Add current-file word candidates as fallback-only items.
                 // They remain useful for not-yet-indexed names, but same-name
@@ -701,6 +691,9 @@ impl LanguageServer for Backend {
                         candidates.extend(exact_indexed);
                         continue;
                     }
+                    if current_file_text_overlay_names.contains(word.as_str()) {
+                        continue;
+                    }
                     candidates.push(CompletionCandidate::new(
                         word.clone(),
                         crate::completion::CandidateEvidence::new(
@@ -720,15 +713,16 @@ impl LanguageServer for Backend {
 
                 let recall_ms = recall_started.elapsed().as_millis();
                 let merge_rank_started = std::time::Instant::now();
-                let output = crate::completion::run_compatible_pipeline(candidates, limit);
+                let output = crate::completion::run_evidence_aware_pipeline(candidates, limit);
                 let merge_rank_ms = merge_rank_started.elapsed().as_millis();
 
                 let render_started = std::time::Instant::now();
-                let items: Vec<CompletionItem> = output
+                let mut items: Vec<CompletionItem> = output
                     .items
                     .into_iter()
                     .map(|candidate| candidate.payload)
                     .collect();
+                apply_final_completion_sort_text(&mut items);
                 let render_ms = render_started.elapsed().as_millis();
 
                 Ok((items, new_pools, output.metrics, recall_ms, merge_rank_ms, render_ms))

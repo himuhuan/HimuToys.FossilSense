@@ -121,16 +121,19 @@ fossilsense 单一 Rust 原生二进制 (crates/fossilsense)
 | 召回 | exact / prefix 档通过 sorted-by-lower 前缀索引二分 |
 | 排序 | 可叠加目录局部性偏移，但绝不过滤 |
 
-v1.2.0 Phase 0-1 约定：
+v1.2.0 Smart Completion Phase 0-3 约定：
 
 | 项 | 规则 |
 |---|---|
-| pipeline | 普通标识符补全候选必须经过 `completion` 核心模块的兼容 pipeline 合并、去重、排序和截断 |
-| 兼容排序 | 当前阶段继续使用 strict resolver-packed score；不得悄悄启用 soft scope prior |
-| metrics | verbose/perf 日志只输出分阶段耗时、候选来源计数、dedup/returned 数量和 shadow rank 摘要 |
+| pipeline | 普通标识符补全候选必须经过 `completion` 核心模块合并 evidence、去重、排序和截断 |
+| 排序 | 普通标识符补全使用 deterministic evidence-aware ranker；`ScopeTier` 是 soft prior，并通过 guard band 防止低置信 global/text 噪音反超 |
+| strict policy | `resolver::pack_score` 仍可用于跳转、着色、workspace symbol、`NameTable` recall 和兼容测试；不再作为普通补全最终 displayed ranking |
+| evidence merge | 同名候选合并 indexed、local binding、current-file overlay、local word evidence，优先保留更结构化的 LSP kind/detail |
+| current overlay | 当前 open document 的宏、typedef/using alias、枚举常量、函数声明/定义、record/type 定义和附近 identifier 使用可作为普通补全 evidence；raw text fallback 仍标为 `text` |
+| metrics | verbose/perf 日志只输出分阶段耗时、候选来源/返回计数、guard 摘要和 shadow rank 摘要 |
 | 隐私 | 默认 debug/perf summary 不输出候选名、源码片段或用户代码内容 |
-| shadow | shadow ranking 只作后续 ranker 对比基础；当前 displayed ranking 不受 shadow 结果影响 |
-| 后置能力 | intent classifier、多通道召回、include recent/sibling ranking、member method schema、local history、ML/telemetry 均不属于 Phase 0-1 |
+| shadow | shadow ranking 只作 ranker 对比和回归观测；不得改变返回内容 |
+| 后置能力 | intent classifier、多通道召回、include recent/sibling ranking、member method schema、local history、ML/telemetry 均不属于 Phase 2-3 |
 
 短前缀：
 

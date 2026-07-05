@@ -61,6 +61,20 @@ fn completion_items(response: CompletionResponse) -> Vec<CompletionItem> {
     }
 }
 
+fn text_and_position(marked: &str) -> (String, u32, u32) {
+    let marker = "/*cursor*/";
+    let cursor_byte = marked.find(marker).expect("cursor marker");
+    let text = marked.replacen(marker, "", 1);
+    let before = &text[..cursor_byte];
+    let line = before.bytes().filter(|byte| *byte == b'\n').count() as u32;
+    let line_start = before.rfind('\n').map_or(0, |index| index + 1);
+    let character = before[line_start..]
+        .chars()
+        .map(|ch| ch.len_utf16() as u32)
+        .sum();
+    (text, line, character)
+}
+
 #[tokio::test]
 async fn local_word_cache_is_keyed_by_document_version() {
     let cache = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
@@ -388,6 +402,7 @@ fn local_binding_candidates_render_variable_kind_and_detail() {
         kind: crate::parser::LocalBindingKind::LocalVariable,
         detail: "local: int".to_string(),
         score: 42_000,
+        match_score: 550,
         decl_start_byte: 10,
     }];
 
@@ -403,6 +418,207 @@ fn local_binding_candidates_render_variable_kind_and_detail() {
         Some(CompletionItemKind::VARIABLE)
     );
     assert_eq!(candidates[0].payload.detail.as_deref(), Some("local: int"));
+}
+
+#[test]
+fn local_binding_evidence_uses_raw_match_not_packed_score() {
+    let packed_score = crate::resolver::pack_score(crate::model::ScopeTier::Current, 550, 0);
+    let hits = vec![crate::query::LocalCompletionCandidate {
+        name: "cursor_limit".to_string(),
+        kind: crate::parser::LocalBindingKind::LocalVariable,
+        detail: "local: int".to_string(),
+        score: packed_score,
+        match_score: 550,
+        decl_start_byte: 10,
+    }];
+
+    let candidates = completion_items_for_local_bindings(hits);
+
+    assert_eq!(candidates[0].evidence.score, packed_score);
+    assert_eq!(candidates[0].evidence.match_score, 550);
+}
+
+#[tokio::test]
+async fn ordinary_completion_uses_unsaved_current_file_overlay() {
+    let (src, line, character) = text_and_position(
+        "#define FS_MAGIC 1\n\
+         typedef int FsAlias;\n\
+         void f(void) { FS/*cursor*/ }\n",
+    );
+    let dir = tempdir().expect("tempdir");
+    let uri = Url::from_file_path(dir.path().join("a.c")).expect("file uri");
+    let service = test_backend_service();
+    service
+        .inner()
+        .open_docs
+        .lock()
+        .await
+        .insert(uri.clone(), (1, src));
+
+    let response = service
+        .inner()
+        .completion(completion_params(uri, line, character))
+        .await
+        .expect("completion request")
+        .expect("completion response");
+    if let CompletionResponse::List(list) = &response {
+        assert!(list.is_incomplete);
+    }
+    let items = completion_items(response);
+
+    assert!(items
+        .iter()
+        .any(|item| item.label == "FS_MAGIC" && item.detail.as_deref() == Some("current")));
+    assert!(items
+        .iter()
+        .any(|item| item.label == "FsAlias" && item.detail.as_deref() == Some("current")));
+}
+
+#[tokio::test]
+async fn current_file_text_overlay_renders_text_kind() {
+    let (src, line, character) = text_and_position(
+        "void f(void) {\n\
+             localThing();\n\
+             localT/*cursor*/\n\
+         }\n",
+    );
+    let dir = tempdir().expect("tempdir");
+    let uri = Url::from_file_path(dir.path().join("a.c")).expect("file uri");
+    let service = test_backend_service();
+    service
+        .inner()
+        .open_docs
+        .lock()
+        .await
+        .insert(uri.clone(), (1, src));
+
+    let response = service
+        .inner()
+        .completion(completion_params(uri, line, character))
+        .await
+        .expect("completion request")
+        .expect("completion response");
+    let items = completion_items(response);
+    let local = items
+        .iter()
+        .find(|item| item.label == "localThing")
+        .expect("localThing text overlay completion");
+
+    assert_eq!(local.kind, Some(CompletionItemKind::TEXT));
+    assert_eq!(local.detail.as_deref(), Some("text"));
+}
+
+#[tokio::test]
+async fn text_overlay_still_allows_exact_indexed_semantic_recovery() {
+    let (src, line, character) = text_and_position(
+        "void f(void) {\n\
+             localThing();\n\
+             loc/*cursor*/\n\
+         }\n",
+    );
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().to_path_buf();
+    let uri = Url::from_file_path(root.join("a.c")).expect("file uri");
+    let service = test_backend_service();
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(root.clone());
+    let mut names: Vec<_> = (0..150)
+        .map(|idx| {
+            (
+                idx,
+                format!("localT{idx:03}"),
+                false,
+                "dense.c".to_string(),
+                "global_variable".to_string(),
+                false,
+            )
+        })
+        .collect();
+    names.push((
+        999,
+        "localThing".to_string(),
+        false,
+        "a.c".to_string(),
+        "function".to_string(),
+        false,
+    ));
+    service.inner().name_tables.lock().await.insert(
+        root,
+        Arc::new(crate::query::NameTable::build_with_paths(names)),
+    );
+    service
+        .inner()
+        .open_docs
+        .lock()
+        .await
+        .insert(uri.clone(), (1, src));
+
+    let response = service
+        .inner()
+        .completion(completion_params(uri, line, character))
+        .await
+        .expect("completion request")
+        .expect("completion response");
+    let items = completion_items(response);
+    let local = items
+        .iter()
+        .find(|item| item.label == "localThing")
+        .expect("localThing completion");
+
+    assert_eq!(local.kind, Some(CompletionItemKind::FUNCTION));
+    assert_ne!(local.detail.as_deref(), Some("text"));
+}
+
+#[test]
+fn final_rank_sort_text_matches_pipeline_order() {
+    let mut items = vec![
+        CompletionItem {
+            label: "b".into(),
+            ..Default::default()
+        },
+        CompletionItem {
+            label: "a".into(),
+            ..Default::default()
+        },
+    ];
+
+    super::apply_final_completion_sort_text(&mut items);
+
+    assert_eq!(items[0].sort_text.as_deref(), Some("00000000"));
+    assert_eq!(items[1].sort_text.as_deref(), Some("00000001"));
+}
+
+#[test]
+fn indexed_candidate_evidence_uses_base_match_not_packed_score() {
+    use crate::model::ScopeTier;
+
+    let candidates = super::completion_items_for_indexed_hits(
+        vec![crate::query::RankedNameHit {
+            id: 1,
+            score: crate::resolver::pack_score(ScopeTier::Reachable, 800, 42),
+            tier: ScopeTier::Reachable,
+            base_match: 800,
+            name_len: "api_target".len(),
+            name: "api_target".to_string(),
+            kind: crate::parser::SymbolKind::Function,
+        }],
+        None,
+    );
+
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].evidence.match_score, 800);
+    assert_ne!(
+        candidates[0].evidence.match_score,
+        candidates[0].evidence.score
+    );
+    assert_eq!(
+        candidates[0].payload.kind,
+        Some(CompletionItemKind::FUNCTION)
+    );
 }
 
 #[tokio::test]

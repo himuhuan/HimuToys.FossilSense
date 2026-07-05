@@ -24,12 +24,16 @@ extension's `bin/` folder.
   Doxygen or ordinary comments when they can be recovered. This is a ranked
   exact-name candidate display, not type-aware semantic binding; unsupported or
   unreadable comment sources degrade to signature-only hover.
-- Lightweight Completion: index-based and current-file word completion for C/C++.
-  When the cursor is inside a detected function body, ordinary identifier
-  completion also adds best-effort current-function parameters and local
-  variables declared before the cursor from the open document snapshot. These
-  structured local candidates are distinct from raw current-file word fallback;
-  unsupported parse shapes degrade to the existing indexed and word completion.
+- Lightweight Completion: index-based, current-file overlay, and current-file
+  word completion for C/C++. When the cursor is inside a detected function body,
+  ordinary identifier completion also adds best-effort current-function
+  parameters and local variables declared before the cursor from the open
+  document snapshot. Current open-document facts such as unsaved macros,
+  typedef/using aliases, enum constants, function declarations/definitions, and
+  record/type definitions can also participate as structured current-file
+  overlay evidence. Nearby identifier usage can raise text fallback candidates,
+  but raw words remain visibly textual fallback and are not semantic bindings.
+  Unsupported parse shapes degrade to the existing indexed and word completion.
   The list is always marked `isIncomplete` so the editor re-queries with the full
   current prefix on every keystroke — longer-named symbols that fell outside the
   truncated top-N re-enter the window as you keep typing, and an empty first batch
@@ -44,12 +48,15 @@ extension's `bin/` folder.
   `external` / `global` / `ambiguous`) with the full tier/confidence/reason in the
   item documentation; indexed current-file candidates are left unlabeled. These are
   ranked candidates, not semantic bindings or overload resolution.
-  In v1.2.0, ordinary identifier completion also goes through the Phase 0-1 smart
-  completion groundwork: a compatibility pipeline for merge/dedup/rank/truncate,
-  structured source-count metrics, timing breakdowns, and a shadow-rank comparison
-  hook for future rankers. Displayed ranking remains compatibility-mode in this
-  release slice; soft scope prior, intent classification, ML ranking, local history,
-  and method-member completion are not enabled.
+  In v1.2.0, ordinary identifier completion uses the Phase 2-3 smart-completion
+  pipeline: candidates are merged by evidence, de-duplicated, ranked with a
+  deterministic evidence-aware ranker, and truncated. `ScopeTier` is now a soft
+  prior for ordinary completion rather than the final strict packed ordering, and
+  guard bands keep low-confidence global/text fallback from jumping ahead without
+  strong current/local evidence. Verbose perf logs report timings, source counts,
+  guard summaries, and shadow-rank movement without candidate names or snippets.
+  Intent classification, multi-channel recall, include recent/sibling ranking, ML
+  ranking, local history, telemetry, and method-member completion are not enabled.
 - Best-effort Signature Help: inside simple function calls, shows exact-name
   indexed function signatures ranked by the same include reachability tiers as
   Go to Definition. Candidates are hints, not overload resolution; there is no

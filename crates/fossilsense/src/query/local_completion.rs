@@ -12,6 +12,7 @@ pub struct LocalCompletionCandidate {
     pub kind: LocalBindingKind,
     pub detail: String,
     pub score: i32,
+    pub match_score: i32,
     pub decl_start_byte: usize,
 }
 
@@ -38,6 +39,7 @@ pub fn local_completion_candidates(
                 kind: binding.kind,
                 detail: local_binding_detail(binding),
                 score: resolver::pack_score(ScopeTier::Current, base_match, 0),
+                match_score: base_match,
                 decl_start_byte: binding.decl_start_byte,
             })
         })

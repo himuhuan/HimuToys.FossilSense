@@ -84,14 +84,16 @@ fn completion_items_for_local_bindings(
 ) -> Vec<CompletionCandidate> {
     hits.into_iter()
         .map(|hit| {
+            let mut evidence = CandidateEvidence::new(
+                CandidateSource::LocalBinding,
+                model::ScopeTier::Current,
+                model::ResolutionConfidence::Heuristic,
+                hit.score,
+            );
+            evidence.match_score = hit.match_score;
             CompletionCandidate::new(
                 hit.name.clone(),
-                CandidateEvidence::new(
-                    CandidateSource::LocalBinding,
-                    model::ScopeTier::Current,
-                    model::ResolutionConfidence::Heuristic,
-                    hit.score,
-                ),
+                evidence,
                 CompletionItem {
                     label: hit.name,
                     kind: Some(CompletionItemKind::VARIABLE),
@@ -102,6 +104,84 @@ fn completion_items_for_local_bindings(
             )
         })
         .collect()
+}
+
+fn completion_items_for_current_file_overlay(
+    hits: Vec<query::CurrentFileOverlayCandidate>,
+) -> Vec<CompletionCandidate> {
+    hits.into_iter()
+        .map(|hit| {
+            let is_text = !hit.semantic || hit.detail.as_deref() == Some("text");
+            let source = if is_text {
+                CandidateSource::LocalWord
+            } else {
+                CandidateSource::CurrentFileOverlay
+            };
+            let tier = if is_text {
+                model::ScopeTier::Global
+            } else {
+                model::ScopeTier::Current
+            };
+            let confidence = if is_text {
+                model::ResolutionConfidence::Fallback
+            } else {
+                model::ResolutionConfidence::Heuristic
+            };
+            let kind = if is_text {
+                CompletionItemKind::TEXT
+            } else {
+                query::lsp_completion_kind_from_parser(hit.kind)
+            };
+            let mut evidence = CandidateEvidence::new(source, tier, confidence, hit.match_score);
+            evidence.match_score = hit.match_score;
+            evidence.proximity_score = hit.proximity_score;
+
+            CompletionCandidate::new(
+                hit.name.clone(),
+                evidence,
+                CompletionItem {
+                    label: hit.name,
+                    kind: Some(kind),
+                    detail: hit.detail,
+                    ..Default::default()
+                },
+            )
+        })
+        .collect()
+}
+
+fn completion_items_for_indexed_hits(
+    hits: Vec<query::RankedNameHit>,
+    open_reason: Option<reachability::OpenReason>,
+) -> Vec<CompletionCandidate> {
+    hits.into_iter()
+        .map(|hit| {
+            let (confidence, reason) =
+                resolver::confidence_reason_for(hit.tier, false, open_reason);
+            let label = model::completion_scope_label(hit.tier, confidence, reason);
+            let mut evidence =
+                CandidateEvidence::new(CandidateSource::Indexed, hit.tier, confidence, hit.score);
+            evidence.match_score = hit.base_match;
+            CompletionCandidate::new(
+                hit.name.clone(),
+                evidence,
+                CompletionItem {
+                    label: hit.name,
+                    kind: Some(query::lsp_completion_kind_from_parser(hit.kind)),
+                    sort_text: Some(format!("{:08}", 100_000_000 - hit.score)),
+                    detail: label.as_ref().map(|l| l.detail.to_string()),
+                    documentation: label.map(|l| Documentation::String(l.documentation)),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect()
+}
+
+fn apply_final_completion_sort_text(items: &mut [CompletionItem]) {
+    for (index, item) in items.iter_mut().enumerate() {
+        item.sort_text = Some(format!("{index:08}"));
+    }
 }
 
 fn exact_indexed_completion_candidates_for_local_word(
@@ -119,9 +199,12 @@ fn exact_indexed_completion_candidates_for_local_word(
             let (confidence, reason) =
                 resolver::confidence_reason_for(hit.tier, false, open_reason);
             let label = model::completion_scope_label(hit.tier, confidence, reason);
+            let mut evidence =
+                CandidateEvidence::new(CandidateSource::Indexed, hit.tier, confidence, local_score);
+            evidence.match_score = hit.base_match;
             CompletionCandidate::new(
                 hit.name.clone(),
-                CandidateEvidence::new(CandidateSource::Indexed, hit.tier, confidence, local_score),
+                evidence,
                 CompletionItem {
                     label: hit.name,
                     kind: Some(query::lsp_completion_kind_from_parser(hit.kind)),
