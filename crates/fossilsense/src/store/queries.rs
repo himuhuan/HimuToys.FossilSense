@@ -485,7 +485,7 @@ impl IndexStore {
         }
         let placeholders = vec!["?"; record_ids.len()].join(",");
         let mut sql = format!(
-            "SELECT m.name, m.kind, m.signature, m.confidence, f.path, f.source, f.directly_included \
+            "SELECT m.name, m.kind, m.signature, m.confidence, m.type_name, f.path, f.source, f.directly_included \
              FROM members m \
              JOIN record_defs r ON r.id = m.record_id \
              JOIN files f ON f.id = r.file_id \
@@ -504,13 +504,14 @@ impl IndexStore {
         let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
             let kind_str: String = row.get(1)?;
             let confidence_str: String = row.get(3)?;
-            let path: String = row.get(4)?;
-            let source_str: String = row.get(5)?;
-            let directly_included: i64 = row.get(6)?;
+            let path: String = row.get(5)?;
+            let source_str: String = row.get(6)?;
+            let directly_included: i64 = row.get(7)?;
             Ok(MemberCandidate {
                 name: row.get(0)?,
                 kind: member_kind_from_str(&kind_str),
                 signature: row.get(2)?,
+                type_name: row.get(4)?,
                 tier: crate::resolver::scope_tier(
                     &path,
                     source_str == "external",
@@ -552,7 +553,7 @@ impl IndexStore {
         }
         let pattern = format!("{}%", prefix.replace('%', "\\%").replace('_', "\\_"));
         let mut stmt = self.conn.prepare(
-            "SELECT m.name, m.kind, m.confidence, m.signature, f.path, f.source, f.directly_included \
+            "SELECT m.name, m.kind, m.confidence, m.signature, m.type_name, f.path, f.source, f.directly_included \
              FROM members m \
              JOIN record_defs r ON r.id = m.record_id \
              JOIN files f ON f.id = r.file_id \
@@ -561,13 +562,14 @@ impl IndexStore {
         let rows = stmt.query_map([pattern], |row| {
             let kind_str: String = row.get(1)?;
             let confidence_str: String = row.get(2)?;
-            let path: String = row.get(4)?;
-            let source_str: String = row.get(5)?;
-            let directly_included: i64 = row.get(6)?;
+            let path: String = row.get(5)?;
+            let source_str: String = row.get(6)?;
+            let directly_included: i64 = row.get(7)?;
             Ok(MemberCandidate {
                 name: row.get(0)?,
                 kind: member_kind_from_str(&kind_str),
                 signature: row.get(3)?,
+                type_name: row.get(4)?,
                 tier: crate::resolver::scope_tier(
                     &path,
                     source_str == "external",

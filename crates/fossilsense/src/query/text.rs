@@ -87,12 +87,27 @@ pub fn is_member_completion_context(line_text: &str, character: u32) -> bool {
     start >= 2 && chars[start - 2] == '-' && chars[start - 1] == '>'
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberAccessChain {
+    pub receiver: String,
+    pub completed_members: Vec<String>,
+}
+
 /// The single-identifier receiver immediately before the `.`/`->` at the cursor.
 ///
 /// Returns `None` for receivers we will not try to type-infer: a call result
 /// (`get()->`), a chained/multi-segment access (`a.b.`), or an indexed
 /// expression (`arr[i].`). Those degrade to the global field fallback.
+#[allow(dead_code)]
 pub fn member_receiver_name(line_text: &str, character: u32) -> Option<String> {
+    member_access_chain_at(line_text, character)
+        .and_then(|chain| chain.completed_members.is_empty().then_some(chain.receiver))
+}
+
+/// Extract a bounded identifier-only member chain before the current member
+/// prefix. Handles `a.b.` and `a->b.c` but still rejects calls, indexes, and
+/// other expressions so member completion stays best-effort and explainable.
+pub fn member_access_chain_at(line_text: &str, character: u32) -> Option<MemberAccessChain> {
     let chars: Vec<char> = line_text.chars().collect();
     let target = char_index_at_utf16(&chars, character);
     let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
@@ -113,25 +128,52 @@ pub fn member_receiver_name(line_text: &str, character: u32) -> Option<String> {
     if op_pos == 0 || !is_ident(chars[op_pos - 1]) {
         return None;
     }
-    let mut rstart = op_pos;
-    while rstart > 0 && is_ident(chars[rstart - 1]) {
-        rstart -= 1;
+    let mut chain_start = op_pos;
+    while chain_start > 0
+        && (is_ident(chars[chain_start - 1]) || matches!(chars[chain_start - 1], '.' | '-' | '>'))
+    {
+        chain_start -= 1;
     }
-    // Reject chained/call/indexed receivers: only a bare identifier qualifies.
-    if rstart > 0 && matches!(chars[rstart - 1], '.' | '>' | ')' | ']') {
-        return None;
+    parse_member_chain_prefix(&chars[chain_start..op_pos])
+}
+
+fn parse_member_chain_prefix(chars: &[char]) -> Option<MemberAccessChain> {
+    let is_ident_start = |c: char| c.is_ascii_alphabetic() || c == '_';
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut cursor = 0usize;
+    let mut names = Vec::new();
+    while cursor < chars.len() && chars[cursor].is_whitespace() {
+        cursor += 1;
     }
 
-    let recv: String = chars[rstart..op_pos].iter().collect();
-    if recv
-        .chars()
-        .next()
-        .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
-    {
-        Some(recv)
-    } else {
-        None
+    loop {
+        if cursor >= chars.len() || !is_ident_start(chars[cursor]) {
+            return None;
+        }
+        let start = cursor;
+        cursor += 1;
+        while cursor < chars.len() && is_ident(chars[cursor]) {
+            cursor += 1;
+        }
+        names.push(chars[start..cursor].iter().collect::<String>());
+
+        if cursor == chars.len() {
+            break;
+        }
+        if chars[cursor] == '.' {
+            cursor += 1;
+        } else if cursor + 1 < chars.len() && chars[cursor] == '-' && chars[cursor + 1] == '>' {
+            cursor += 2;
+        } else {
+            return None;
+        }
     }
+
+    let receiver = names.first()?.clone();
+    Some(MemberAccessChain {
+        receiver,
+        completed_members: names.into_iter().skip(1).collect(),
+    })
 }
 
 /// Byte offset of an LSP position (line + UTF-16 column) within `text`.
@@ -281,13 +323,33 @@ mod tests {
     fn member_receiver_name_rejects_call_chain_and_index() {
         // Call result: `get()->v` -> no simple receiver.
         assert_eq!(member_receiver_name("get()->v", 8), None);
-        // Multi-segment chain: `a.b.c` -> receiver before the second `.` is `b`,
-        // but it is itself preceded by `.`, so we decline to infer.
+        // Multi-segment chain has a chain parser, but the compatibility API
+        // still exposes only a bare receiver.
         assert_eq!(member_receiver_name("a.b.c", 5), None);
         // Indexed: `arr[i].x` -> no simple receiver.
         assert_eq!(member_receiver_name("arr[i].x", 8), None);
         // Not a member context at all.
         assert_eq!(member_receiver_name("plain", 5), None);
+    }
+
+    #[test]
+    fn member_access_chain_extracts_identifier_only_segments() {
+        assert_eq!(
+            member_access_chain_at("void f(void) { a.mem1.xxx", 26),
+            Some(MemberAccessChain {
+                receiver: "a".to_string(),
+                completed_members: vec!["mem1".to_string()],
+            })
+        );
+        assert_eq!(
+            member_access_chain_at("ptr->inner.value", 16),
+            Some(MemberAccessChain {
+                receiver: "ptr".to_string(),
+                completed_members: vec!["inner".to_string()],
+            })
+        );
+        assert_eq!(member_access_chain_at("get()->value", 12), None);
+        assert_eq!(member_access_chain_at("arr[i].value", 12), None);
     }
 
     #[test]

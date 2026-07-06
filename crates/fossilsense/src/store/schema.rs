@@ -1,4 +1,4 @@
-pub(crate) const SCHEMA_VERSION: i64 = 9;
+pub(crate) const SCHEMA_VERSION: i64 = 10;
 
 pub(crate) const DROP_DATA_TABLES_SQL: &str = "
     DROP TABLE IF EXISTS type_aliases;
@@ -96,7 +96,8 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
         start_col INTEGER NOT NULL,
         end_line INTEGER NOT NULL,
         end_col INTEGER NOT NULL,
-        signature TEXT NOT NULL
+        signature TEXT NOT NULL,
+        type_name TEXT
     );
 
     CREATE TABLE IF NOT EXISTS type_aliases (

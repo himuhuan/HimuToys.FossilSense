@@ -66,8 +66,8 @@ pub(super) fn apply_file_updates_inner(
         let mut member_stmt = tx.prepare(
             "INSERT INTO members (
                     record_id, name, kind, confidence, start_byte, end_byte,
-                    start_line, start_col, end_line, end_col, signature
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    start_line, start_col, end_line, end_col, signature, type_name
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         )?;
         let mut alias_stmt = tx.prepare(
             "INSERT INTO type_aliases (
@@ -209,6 +209,7 @@ pub(super) fn apply_file_updates_inner(
                         member.end_line as i64,
                         member.end_col as i64,
                         member.signature.as_str(),
+                        member.type_name.as_deref(),
                     ])?;
                 }
             }

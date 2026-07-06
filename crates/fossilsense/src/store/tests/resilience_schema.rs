@@ -121,7 +121,9 @@ fn current_schema_has_members_table_and_version_9_or_newer() {
 
     store
         .conn
-        .prepare("SELECT record_id, name, kind, confidence, signature FROM members LIMIT 1")
+        .prepare(
+            "SELECT record_id, name, kind, confidence, signature, type_name FROM members LIMIT 1",
+        )
         .expect("members table exists");
 }
 

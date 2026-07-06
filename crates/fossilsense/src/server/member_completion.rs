@@ -29,7 +29,12 @@ impl Backend {
         line_text: &str,
         position: Position,
     ) -> LspResult<Option<CompletionResponse>> {
-        let receiver = query::member_receiver_name(line_text, position.character);
+        let member_chain = query::member_access_chain_at(line_text, position.character);
+        let receiver = member_chain.as_ref().map(|chain| chain.receiver.clone());
+        let completed_members = member_chain
+            .as_ref()
+            .map(|chain| chain.completed_members.clone())
+            .unwrap_or_default();
         let prefix = query::completion_prefix_at(line_text, position.character).unwrap_or_default();
         let byte_offset = query::byte_offset_at(text, position.line, position.character);
         let path = uri_to_path(uri);
@@ -110,10 +115,13 @@ impl Backend {
                     }
                 }
 
-                let explicit_record_found =
+                let mut explicit_record_found =
                     record_key.is_some() && !record_candidates_by_db.is_empty();
                 let mut weak_owner_used = false;
-                if record_candidates_by_db.is_empty() && prefix.len() >= min_prefix {
+                if record_candidates_by_db.is_empty()
+                    && completed_members.is_empty()
+                    && prefix.len() >= min_prefix
+                {
                     if let Some(receiver_name) = receiver.as_deref() {
                         let lookup_names = weak_receiver_lookup_names(receiver_name);
                         let lookup_refs: Vec<&str> =
@@ -161,6 +169,32 @@ impl Backend {
                             }
                         }
                     }
+                }
+
+                if !completed_members.is_empty() && !record_candidates_by_db.is_empty() {
+                    for member_name in completed_members {
+                        let type_names = member_type_names_for_segment(
+                            &record_candidates_by_db,
+                            &member_name,
+                            current_rel_path.as_deref(),
+                            member_reach.as_ref(),
+                        )?;
+                        if type_names.is_empty() {
+                            record_candidates_by_db.clear();
+                            break;
+                        }
+
+                        record_candidates_by_db = resolve_record_names_across_roots(
+                            &roots,
+                            &type_names,
+                            current_rel_path.as_deref(),
+                            member_reach.as_ref(),
+                        )?;
+                        if record_candidates_by_db.is_empty() {
+                            break;
+                        }
+                    }
+                    explicit_record_found = !record_candidates_by_db.is_empty();
                 }
 
                 let mut member_to_best: HashMap<(String, MemberKind), MemberPresentation> =
@@ -499,6 +533,84 @@ fn member_documentation(
         confidence.as_str(),
         receiver
     )
+}
+
+fn member_type_names_for_segment(
+    record_candidates_by_db: &[(PathBuf, Vec<crate::model::RecordCandidate>)],
+    member_name: &str,
+    current_rel_path: Option<&str>,
+    member_reach: Option<&crate::reachability::ReachScope>,
+) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    for (db_path, candidates) in record_candidates_by_db {
+        let Some(highest_rank) = candidates
+            .iter()
+            .map(|candidate| candidate.tier.rank())
+            .max()
+        else {
+            continue;
+        };
+        let record_ids: Vec<i64> = candidates
+            .iter()
+            .filter(|candidate| candidate.tier.rank() == highest_rank)
+            .map(|candidate| candidate.id)
+            .collect();
+        if record_ids.is_empty() {
+            continue;
+        }
+        let store = IndexStore::open_readonly(db_path)?;
+        let members = store.members_for_records(
+            &record_ids,
+            Some(member_name),
+            Some(&crate::resolver::ResolveContext {
+                current_path: current_rel_path,
+                reach: member_reach,
+            }),
+        )?;
+        for member in members {
+            if member.kind == MemberKind::Field && member.name.eq_ignore_ascii_case(member_name) {
+                if let Some(type_name) = member.type_name {
+                    names.push(type_name);
+                }
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    Ok(names)
+}
+
+fn resolve_record_names_across_roots(
+    roots: &[PathBuf],
+    type_names: &[String],
+    current_rel_path: Option<&str>,
+    member_reach: Option<&crate::reachability::ReachScope>,
+) -> Result<Vec<(PathBuf, Vec<crate::model::RecordCandidate>)>> {
+    let lookup_refs: Vec<&str> = type_names.iter().map(String::as_str).collect();
+    let mut by_db = Vec::new();
+    for root in roots {
+        let db_path = pathing::default_index_path(root)?;
+        if !db_path.exists() {
+            continue;
+        }
+        let store = IndexStore::open_readonly(&db_path)?;
+        let ctx = crate::resolver::ResolveContext {
+            current_path: current_rel_path,
+            reach: member_reach,
+        };
+        let mut candidates = store.resolve_record_candidates(&lookup_refs, Some(&ctx))?;
+        if candidates.is_empty() && member_reach.is_some() {
+            let ctx_unscoped = crate::resolver::ResolveContext {
+                current_path: current_rel_path,
+                reach: None,
+            };
+            candidates = store.resolve_record_candidates(&lookup_refs, Some(&ctx_unscoped))?;
+        }
+        if !candidates.is_empty() {
+            by_db.push((db_path, candidates));
+        }
+    }
+    Ok(by_db)
 }
 
 fn weak_receiver_lookup_names(receiver_name: &str) -> Vec<String> {

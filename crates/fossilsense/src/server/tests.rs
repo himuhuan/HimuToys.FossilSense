@@ -557,6 +557,31 @@ async fn member_completion_returns_fields_and_methods_for_resolved_receiver() {
 }
 
 #[tokio::test]
+async fn member_completion_resolves_simple_nested_member_chain() {
+    let (_dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[(
+            "nested.hpp",
+            "struct Inner { int value; };\nstruct Outer { struct Inner mem1; };\n",
+        )],
+        "main.cpp",
+        "#include \"nested.hpp\"\nvoid f(Outer *a) { a->mem1./*cursor*/ }\n",
+    )
+    .await;
+
+    let response = service
+        .inner()
+        .completion(completion_params(uri, line, character))
+        .await
+        .expect("completion request")
+        .expect("completion response");
+    let items = completion_items(response);
+
+    assert!(items
+        .iter()
+        .any(|item| item.label == "value" && item.kind == Some(CompletionItemKind::FIELD)));
+}
+
+#[tokio::test]
 async fn member_completion_does_not_leak_global_owner_when_reachable_owner_lacks_prefix() {
     let (dir, service, uri, line, character) = indexed_backend_with_open_doc(
         &[

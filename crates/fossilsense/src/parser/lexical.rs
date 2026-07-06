@@ -37,7 +37,7 @@ pub(super) fn extract_symbols_and_includes(
             symbols.push(symbol);
         }
 
-        if top_level && !trimmed.starts_with('#') && !trimmed.is_empty() {
+        if (statement.active || top_level) && !trimmed.starts_with('#') && !trimmed.is_empty() {
             statement.push(&line, line_index);
             if statement.is_complete() {
                 symbols.extend(capture_statement_symbols(
@@ -382,6 +382,7 @@ struct PendingStatement {
     start_line: usize,
     end_line: usize,
     active: bool,
+    brace_balance: isize,
 }
 
 impl PendingStatement {
@@ -393,17 +394,52 @@ impl PendingStatement {
         self.end_line = line_index;
         self.text.push_str(line);
         self.text.push('\n');
+        self.brace_balance += brace_delta(line);
     }
 
     fn is_complete(&self) -> bool {
         let trimmed = self.text.trim_end();
-        trimmed.ends_with(';') || trimmed.ends_with('{') || trimmed.ends_with('}')
+        if trimmed.ends_with(';') && self.brace_balance <= 0 {
+            return true;
+        }
+        if trimmed.ends_with('{') {
+            return !looks_like_record_body_declaration(trimmed);
+        }
+        if trimmed.ends_with('}') && self.brace_balance <= 0 {
+            return true;
+        }
+        false
     }
 
     fn clear(&mut self) {
         self.text.clear();
         self.active = false;
+        self.brace_balance = 0;
     }
+}
+
+fn looks_like_record_body_declaration(text: &str) -> bool {
+    let compact = compact_whitespace(text);
+    if !compact.ends_with('{') {
+        return false;
+    }
+    let prefix = compact.trim_end_matches('{').trim_end();
+    prefix.starts_with("typedef struct ")
+        || prefix == "typedef struct"
+        || prefix.starts_with("typedef union ")
+        || prefix == "typedef union"
+        || prefix.starts_with("typedef enum ")
+        || prefix == "typedef enum"
+        || prefix.starts_with("typedef class ")
+        || prefix == "typedef class"
+        || prefix.starts_with("struct ")
+        || prefix == "struct"
+        || prefix.starts_with("union ")
+        || prefix == "union"
+        || prefix.starts_with("enum ")
+        || prefix == "enum"
+        || prefix.starts_with("class ")
+        || prefix == "class"
 }
 
 fn include_regex() -> &'static Regex {

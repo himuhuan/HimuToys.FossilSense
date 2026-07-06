@@ -243,6 +243,7 @@ pub struct MemberCandidate {
     pub name: String,
     pub kind: crate::parser::MemberKind,
     pub signature: String,
+    pub type_name: Option<String>,
     pub tier: ScopeTier,
     pub confidence: crate::parser::MemberConfidence,
     pub owner_path: String,

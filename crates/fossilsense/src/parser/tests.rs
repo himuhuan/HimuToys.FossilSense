@@ -240,6 +240,50 @@ fn extracts_anonymous_typedef_struct_fields() {
 }
 
 #[test]
+fn extracts_multiline_typedef_struct_type_symbol() {
+    let index = parse(
+        Path::new("b.c"),
+        "typedef struct {\n    int x;\n    int y;\n} Boom;\n",
+    );
+
+    assert!(index.symbols.iter().any(|symbol| {
+        symbol.name == "Boom"
+            && symbol.kind == SymbolKind::Type
+            && symbol.role == SymbolRole::Definition
+    }));
+    assert_eq!(field_containers(&index, "x"), vec!["Boom".to_string()]);
+}
+
+#[test]
+fn field_members_capture_record_type_name() {
+    let index = parse(
+        Path::new("nested.c"),
+        "struct Inner { int value; };\ntypedef struct Inner Inner;\nstruct Outer { struct Inner mem1; Inner *mem2; int count; };\n",
+    );
+
+    let mem1 = index
+        .members
+        .iter()
+        .find(|member| member.name == "mem1")
+        .expect("mem1");
+    assert_eq!(mem1.type_name.as_deref(), Some("Inner"));
+
+    let mem2 = index
+        .members
+        .iter()
+        .find(|member| member.name == "mem2")
+        .expect("mem2");
+    assert_eq!(mem2.type_name.as_deref(), Some("Inner"));
+
+    let count = index
+        .members
+        .iter()
+        .find(|member| member.name == "count")
+        .expect("count");
+    assert_eq!(count.type_name, None);
+}
+
+#[test]
 fn flattens_nested_anonymous_union_fields() {
     let index = parse(
         Path::new("v.c"),

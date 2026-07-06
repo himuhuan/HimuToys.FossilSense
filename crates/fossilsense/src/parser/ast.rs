@@ -499,9 +499,15 @@ fn collect_body_members(
         }
 
         let signature = compact_whitespace(child.utf8_text(source.as_bytes()).unwrap_or_default());
+        let member_type_name = child
+            .child_by_field_name("type")
+            .and_then(|type_node| record_type_name(type_node, source));
         for decl in declarators {
             if let Some((id_node, name)) = declarator_identifier(decl, source) {
                 let kind = method_member_kind(child, decl, source);
+                let type_name = (kind == MemberKind::Field)
+                    .then(|| member_type_name.clone())
+                    .flatten();
                 if kind == MemberKind::Field {
                     let start_pos = id_node.start_position();
                     let end_pos = id_node.end_position();
@@ -535,6 +541,7 @@ fn collect_body_members(
                     id_node,
                     kind,
                     MemberConfidence::InBody,
+                    type_name,
                     signature.clone(),
                     source,
                     line_starts,
@@ -612,6 +619,7 @@ fn collect_out_of_class_method_member(
         method_byte,
         MemberKind::Method,
         MemberConfidence::OutOfClassOwner,
+        None,
         signature,
         source,
         line_starts,
@@ -661,6 +669,7 @@ fn push_member(
     id_node: tree_sitter::Node<'_>,
     kind: MemberKind,
     confidence: MemberConfidence,
+    type_name: Option<String>,
     signature: String,
     source: &str,
     line_starts: &[usize],
@@ -672,6 +681,7 @@ fn push_member(
         id_node.start_byte(),
         kind,
         confidence,
+        type_name,
         signature,
         source,
         line_starts,
@@ -685,6 +695,7 @@ fn push_member_at_byte(
     start_byte: usize,
     kind: MemberKind,
     confidence: MemberConfidence,
+    type_name: Option<String>,
     signature: String,
     source: &str,
     line_starts: &[usize],
@@ -699,6 +710,7 @@ fn push_member_at_byte(
         name,
         kind,
         confidence,
+        type_name,
         start_byte,
         end_byte,
         start_line,

@@ -315,6 +315,7 @@ pub struct MemberDef {
     pub name: String,
     pub kind: MemberKind,
     pub confidence: MemberConfidence,
+    pub type_name: Option<String>,
     pub start_byte: usize,
     pub end_byte: usize,
     pub start_line: usize,

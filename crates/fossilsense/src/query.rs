@@ -35,7 +35,7 @@ pub use signatures::{
 use text::is_boundary;
 pub use text::{
     byte_offset_at, completion_prefix_at, completion_word_score, is_member_completion_context,
-    member_receiver_name, word_at,
+    member_access_chain_at, word_at,
 };
 
 /// Default cap on workspace-symbol results handed back to the editor.
