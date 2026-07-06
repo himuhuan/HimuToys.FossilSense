@@ -64,6 +64,46 @@ fn reads_symbols_by_name_and_id() {
 }
 
 #[test]
+fn indexes_first_typedef_after_multiline_macro_for_goto_definition() {
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+    let mut store = IndexStore::open(&db, dir.path()).expect("store");
+    let source = r#"#define FREE(ptr)                                                              \
+    do                                                                         \
+    {                                                                          \
+        if ((ptr) != NULL)                                                     \
+        {                                                                      \
+            free(ptr);                                                         \
+            (ptr) = NULL;                                                      \
+        }                                                                      \
+    } while (0)
+
+typedef struct xxx {
+    int value;
+} xxx_t;
+
+typedef struct xxxa {
+    int other;
+} xxxa_t;
+"#;
+    upsert_source(&mut store, "macro_typedef.h", source);
+
+    let reader = IndexStore::open_readonly(&db).expect("readonly");
+    let xxx_defs = reader.symbols_by_name("xxx_t").expect("xxx_t");
+    assert_eq!(xxx_defs.len(), 1);
+    assert_eq!(xxx_defs[0].kind, "type");
+    assert_eq!(xxx_defs[0].role, "definition");
+    assert!(xxx_defs[0].signature.starts_with("typedef struct xxx"));
+    assert!(!xxx_defs[0].signature.contains("while (0)"));
+
+    assert_eq!(reader.symbols_by_name("xxxa_t").expect("xxxa_t").len(), 1);
+    assert_eq!(
+        fields_by_record_names(&reader, &["xxx_t"]),
+        vec!["value".to_string()]
+    );
+}
+
+#[test]
 fn marking_file_error_clears_old_symbols() {
     let dir = tempdir().expect("tempdir");
     let db = dir.path().join("index.sqlite");

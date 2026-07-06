@@ -14,11 +14,12 @@ use crate::query::NameTable;
 use crate::reachability::ReachGraph;
 use crate::references;
 
+type LiveParseCache = Arc<RwLock<HashMap<Url, (i32, Arc<FileSemanticIndex>)>>>;
+
 #[derive(Clone, Default)]
 pub(super) struct DocumentStore {
     pub(in crate::server) open_docs: Arc<Mutex<HashMap<Url, (i32, String)>>>,
-    pub(in crate::server) live_parse_cache:
-        Arc<RwLock<HashMap<Url, (i32, Arc<FileSemanticIndex>)>>>,
+    pub(in crate::server) live_parse_cache: LiveParseCache,
     pub(in crate::server) local_word_cache: LocalWordCache,
 }
 

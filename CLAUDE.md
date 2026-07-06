@@ -138,6 +138,7 @@ Smart Completion 当前约定：
 | shadow | shadow ranking 只作 ranker 对比和回归观测；不得改变返回内容 |
 | v1.2.1 Phase 7-8 | member evidence 覆盖字段和第一版 C++ 方法；ordinary completion 可使用本地 accepted-completion history 作为有界排序证据 |
 | v1.2.2 Phase A-D/H | 行为保持型架构健康发布；新增架构基线、fitness functions、WorkspaceSession/CacheLedger/DocumentStore 边界、ordinary completion service 边界和 release hardening 门禁 |
+| v1.2.3 | 解析与成员补全体验修复版；多行 typedef struct 容错、匿名嵌套 record evidence、数组下标/括号/解引用的简单成员链补全，以及链解析失败后的全局 member fallback |
 | 后置能力 | auto include insertion、ML ranker、telemetry、cloud sync、完整 C++ 语义仍不属于当前版本 |
 
 短前缀：
@@ -153,10 +154,13 @@ Smart Completion 当前约定：
 |---|---|
 | C | 用当前文件简单声明猜 receiver 的 record 类型，再查字段 |
 | 跨文件前向声明 | 可通过 record 索引补字段 |
+| 链式访问 | 支持简单字段链、数组下标、括号和 `*`/`&` lvalue 形态，例如 `a.mem1[n].`、`arr[i].`、`(*ptr).inner.` |
+| 匿名嵌套 record | 对匿名嵌套 `struct/union` 成员生成 best-effort record evidence，可继续补内层字段 |
+| 链解析失败 | 调用结果、复杂表达式等解析失败时，不做表达式类型推断，按 prefix 走全局 member fallback |
 | 猜不到 receiver | 回退全库 member 名前缀候选 |
 | C++ | 复用 record/member evidence 补 class/struct 字段和第一版方法 |
 | weak receiver | 只做明确声明和唯一名字相关的窄范围推断，并通过 confidence/fallback 标注 |
-| 不支持 | 继承、重载、模板、命名空间、访问控制、表达式类型推断 |
+| 不支持 | 函数调用结果、复杂 cast、宏展开、继承、重载、模板、命名空间、访问控制、完整表达式类型推断 |
 
 成员 fallback 必须满足：
 

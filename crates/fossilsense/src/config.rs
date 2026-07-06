@@ -570,7 +570,7 @@ fn char_class_matches(ch: u8, pattern: &[u8], start: usize) -> Option<usize> {
     }
 }
 
-fn extension_from_slash_path_lower<'a>(path_lower: &'a str) -> Option<&'a str> {
+fn extension_from_slash_path_lower(path_lower: &str) -> Option<&str> {
     let name = path_lower.rsplit('/').next().unwrap_or(path_lower);
     let pos = name.rfind('.')?;
     if pos == 0 || pos == name.len() - 1 {

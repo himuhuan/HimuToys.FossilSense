@@ -117,7 +117,7 @@ pub(super) fn collect_ast_index(
 
                     out.records.push(RecordDef {
                         record_key: record_key.clone(),
-                        display_name,
+                        display_name: display_name.clone(),
                         tag_name,
                         typedef_name,
                         kind,
@@ -134,8 +134,10 @@ pub(super) fn collect_ast_index(
                     collect_body_members(
                         body,
                         &record_key,
+                        &display_name,
                         source,
                         line_starts,
+                        &mut out.records,
                         &mut out.fields,
                         &mut out.members,
                     );
@@ -461,16 +463,32 @@ fn binding_role(node: tree_sitter::Node<'_>) -> Option<SyntacticRole> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_body_members(
     body: tree_sitter::Node<'_>,
     record_key: &str,
+    record_display_name: &str,
     source: &str,
     line_starts: &[usize],
+    records: &mut Vec<RecordDef>,
     fields: &mut Vec<FieldDef>,
     members: &mut Vec<MemberDef>,
 ) {
     let mut cursor = body.walk();
     for child in body.children(&mut cursor) {
+        if child.kind().starts_with("preproc_") {
+            collect_body_members(
+                child,
+                record_key,
+                record_display_name,
+                source,
+                line_starts,
+                records,
+                fields,
+                members,
+            );
+            continue;
+        }
         if child.kind() != "field_declaration" {
             continue;
         }
@@ -487,8 +505,10 @@ fn collect_body_members(
                         collect_body_members(
                             inner,
                             record_key,
+                            record_display_name,
                             source,
                             line_starts,
+                            records,
                             fields,
                             members,
                         );
@@ -499,9 +519,46 @@ fn collect_body_members(
         }
 
         let signature = compact_whitespace(child.utf8_text(source.as_bytes()).unwrap_or_default());
+        let member_type_name = child
+            .child_by_field_name("type")
+            .and_then(|type_node| record_type_name(type_node, source));
+        let anonymous_record_type = child
+            .child_by_field_name("type")
+            .filter(|type_node| anonymous_record_type_node(*type_node));
         for decl in declarators {
             if let Some((id_node, name)) = declarator_identifier(decl, source) {
                 let kind = method_member_kind(child, decl, source);
+                let mut type_name = (kind == MemberKind::Field)
+                    .then(|| member_type_name.clone())
+                    .flatten();
+                if kind == MemberKind::Field && type_name.is_none() {
+                    if let Some(type_node) = anonymous_record_type {
+                        let nested_display_name = format!("{record_display_name}.{name}");
+                        let nested_record_key =
+                            format!("rec_{}_{}", type_node.start_byte(), id_node.start_byte());
+                        push_synthetic_nested_record(
+                            records,
+                            type_node,
+                            &nested_record_key,
+                            &nested_display_name,
+                            source,
+                            line_starts,
+                        );
+                        if let Some(inner) = type_node.child_by_field_name("body") {
+                            collect_body_members(
+                                inner,
+                                &nested_record_key,
+                                &nested_display_name,
+                                source,
+                                line_starts,
+                                records,
+                                fields,
+                                members,
+                            );
+                        }
+                        type_name = Some(nested_display_name);
+                    }
+                }
                 if kind == MemberKind::Field {
                     let start_pos = id_node.start_position();
                     let end_pos = id_node.end_position();
@@ -535,6 +592,7 @@ fn collect_body_members(
                     id_node,
                     kind,
                     MemberConfidence::InBody,
+                    type_name,
                     signature.clone(),
                     source,
                     line_starts,
@@ -550,6 +608,9 @@ fn method_member_kind(
     source: &str,
 ) -> MemberKind {
     if !declarator_contains_kind(declarator, "function_declarator") {
+        return MemberKind::Field;
+    }
+    if function_declarator_is_pointer_like(declarator) {
         return MemberKind::Field;
     }
     let signature = declaration
@@ -587,6 +648,21 @@ fn declarator_contains_kind(node: tree_sitter::Node<'_>, kind: &str) -> bool {
     found
 }
 
+fn function_declarator_is_pointer_like(node: tree_sitter::Node<'_>) -> bool {
+    if node.kind() == "function_declarator" {
+        if let Some(inner) = node.child_by_field_name("declarator") {
+            return declarator_contains_kind(inner, "pointer_declarator")
+                || declarator_contains_kind(inner, "reference_declarator");
+        }
+        return false;
+    }
+    let mut cursor = node.walk();
+    let found = node
+        .children(&mut cursor)
+        .any(function_declarator_is_pointer_like);
+    found
+}
+
 fn collect_out_of_class_method_member(
     node: tree_sitter::Node<'_>,
     source: &str,
@@ -612,6 +688,7 @@ fn collect_out_of_class_method_member(
         method_byte,
         MemberKind::Method,
         MemberConfidence::OutOfClassOwner,
+        None,
         signature,
         source,
         line_starts,
@@ -645,6 +722,62 @@ fn function_like_signature(node: tree_sitter::Node<'_>, source: &str) -> String 
     compact_whitespace(source.get(node.start_byte()..end).unwrap_or_default())
 }
 
+fn anonymous_record_type_node(type_node: tree_sitter::Node<'_>) -> bool {
+    matches!(
+        type_node.kind(),
+        "struct_specifier" | "union_specifier" | "class_specifier"
+    ) && type_node.child_by_field_name("body").is_some()
+        && type_node.child_by_field_name("name").is_none()
+}
+
+fn push_synthetic_nested_record(
+    records: &mut Vec<RecordDef>,
+    type_node: tree_sitter::Node<'_>,
+    record_key: &str,
+    display_name: &str,
+    source: &str,
+    line_starts: &[usize],
+) {
+    if records.iter().any(|record| record.record_key == record_key) {
+        return;
+    }
+
+    let kind = match type_node.kind() {
+        "union_specifier" => RecordKind::Union,
+        "class_specifier" => RecordKind::Class,
+        _ => RecordKind::Struct,
+    };
+    let start_pos = type_node.start_position();
+    let end_pos = type_node.end_position();
+    let start_byte = type_node.start_byte();
+    let end_byte = type_node.end_byte();
+    let start_line = start_pos.row;
+    let end_line = end_pos.row;
+    let start_line_byte = line_starts.get(start_line).copied().unwrap_or(0);
+    let end_line_byte = line_starts.get(end_line).copied().unwrap_or(0);
+    let sig_end = type_node
+        .child_by_field_name("body")
+        .map(|body| body.start_byte())
+        .unwrap_or(end_byte);
+    let signature = compact_whitespace(source.get(start_byte..sig_end).unwrap_or(""));
+
+    records.push(RecordDef {
+        record_key: record_key.to_string(),
+        display_name: display_name.to_string(),
+        tag_name: None,
+        typedef_name: None,
+        kind,
+        start_byte,
+        end_byte,
+        start_line,
+        start_col: byte_to_utf16_col(source, start_line_byte, start_byte),
+        end_line,
+        end_col: byte_to_utf16_col(source, end_line_byte, end_byte),
+        confidence: RecordConfidence::Heuristic,
+        signature,
+    });
+}
+
 fn is_identifier(text: &str) -> bool {
     let mut chars = text.chars();
     let Some(first) = chars.next() else {
@@ -654,6 +787,7 @@ fn is_identifier(text: &str) -> bool {
         && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_member(
     members: &mut Vec<MemberDef>,
     record_key: String,
@@ -661,6 +795,7 @@ fn push_member(
     id_node: tree_sitter::Node<'_>,
     kind: MemberKind,
     confidence: MemberConfidence,
+    type_name: Option<String>,
     signature: String,
     source: &str,
     line_starts: &[usize],
@@ -672,12 +807,14 @@ fn push_member(
         id_node.start_byte(),
         kind,
         confidence,
+        type_name,
         signature,
         source,
         line_starts,
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_member_at_byte(
     members: &mut Vec<MemberDef>,
     record_key: String,
@@ -685,6 +822,7 @@ fn push_member_at_byte(
     start_byte: usize,
     kind: MemberKind,
     confidence: MemberConfidence,
+    type_name: Option<String>,
     signature: String,
     source: &str,
     line_starts: &[usize],
@@ -699,6 +837,7 @@ fn push_member_at_byte(
         name,
         kind,
         confidence,
+        type_name,
         start_byte,
         end_byte,
         start_line,
@@ -763,7 +902,13 @@ fn record_type_name(type_node: tree_sitter::Node<'_>, source: &str) -> Option<St
             .and_then(|n| node_text(n, source))
             .map(str::to_string),
         "type_identifier" => node_text(type_node, source).map(str::to_string),
-        _ => None,
+        _ => {
+            let mut cursor = type_node.walk();
+            let found = type_node
+                .children(&mut cursor)
+                .find_map(|child| record_type_name(child, source));
+            found
+        }
     }
 }
 
@@ -779,8 +924,31 @@ fn declarator_identifier<'a>(
         }
         _ => node
             .child_by_field_name("declarator")
-            .and_then(|inner| declarator_identifier(inner, source)),
+            .and_then(|inner| declarator_identifier(inner, source))
+            .or_else(|| declarator_identifier_deep(node, source)),
     }
+}
+
+fn declarator_identifier_deep<'a>(
+    node: tree_sitter::Node<'a>,
+    source: &'a str,
+) -> Option<(tree_sitter::Node<'a>, &'a str)> {
+    if matches!(node.kind(), "parameter_list" | "parameter_declaration") {
+        return None;
+    }
+    if matches!(
+        node.kind(),
+        "identifier" | "field_identifier" | "type_identifier"
+    ) {
+        return node_text(node, source).map(|text| (node, text));
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if let Some(found) = declarator_identifier_deep(child, source) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 fn node_text<'a>(node: tree_sitter::Node<'_>, source: &'a str) -> Option<&'a str> {

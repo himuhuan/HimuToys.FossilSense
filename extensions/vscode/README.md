@@ -7,10 +7,10 @@ native Rust indexing engine - no external tools (ctags / cscope / clangd) requir
 This VSIX is self-contained: the `fossilsense` engine binary ships inside the
 extension's `bin/` folder.
 
-v1.2.2 is a behavior-preserving architecture health release. It keeps the v1.2.1
-user-visible navigation, completion, references, coloring, configuration, and
-privacy behavior while adding architecture guardrails and release verification
-for the self-contained VSIX.
+v1.2.3 is a parser and member-completion quality release. It improves multiline
+`typedef struct { ... } Name;` extraction and nested member completion for common
+C lvalue chains such as `a.mem1[n].`, `arr[i].`, and `(*ptr).inner.` while
+keeping FossilSense's best-effort candidate model.
 
 ## Current Capability
 

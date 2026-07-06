@@ -1,3 +1,5 @@
+#![allow(clippy::field_reassign_with_default)]
+
 use super::include_completion::IncludeCompletionTable;
 use super::{
     grouped_reference_items, local_words_for_cache, rebuild_include_table,
@@ -11,7 +13,8 @@ use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use tempfile::tempdir;
 use tower_lsp::lsp_types::{
     CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse, Documentation,
-    ExecuteCommandParams, Position, TextDocumentIdentifier, TextDocumentPositionParams, Url,
+    ExecuteCommandParams, GotoDefinitionParams, GotoDefinitionResponse, Position,
+    TextDocumentIdentifier, TextDocumentPositionParams, Url,
 };
 use tower_lsp::{LanguageServer as _, LspService};
 
@@ -49,6 +52,17 @@ fn completion_params(uri: Url, line: u32, character: u32) -> CompletionParams {
         work_done_progress_params: Default::default(),
         partial_result_params: Default::default(),
         context: None,
+    }
+}
+
+fn goto_definition_params(uri: Url, line: u32, character: u32) -> GotoDefinitionParams {
+    GotoDefinitionParams {
+        text_document_position_params: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri },
+            position: Position::new(line, character),
+        },
+        work_done_progress_params: Default::default(),
+        partial_result_params: Default::default(),
     }
 }
 
@@ -132,6 +146,106 @@ async fn indexed_backend_with_open_doc(
         .push(dir.path().to_path_buf());
     open_test_document(&service, uri.clone(), 1, open_text).await;
     (dir, service, uri, line, character)
+}
+
+#[tokio::test]
+async fn goto_definition_uses_live_current_document_typedef_when_index_is_stale() {
+    let dir = tempdir().expect("tempdir");
+    write_workspace_file(dir.path(), "main.c", "void indexed_only(void) {}\n");
+    crate::indexer::index_workspace(
+        dir.path(),
+        crate::indexer::IndexOptions {
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("index");
+
+    let uri = Url::from_file_path(dir.path().join("main.c")).expect("file uri");
+    let service = test_backend_service();
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(dir.path().to_path_buf());
+
+    let (src, line, character) = text_and_position(
+        "typedef struct {\n\
+             int value;\n\
+         } Boom;\n\
+         \n\
+         void f(void) {\n\
+             Boom/*cursor*/ b;\n\
+         }\n",
+    );
+    open_test_document(&service, uri.clone(), 2, src).await;
+
+    let response = service
+        .inner()
+        .goto_definition(goto_definition_params(uri.clone(), line, character))
+        .await
+        .expect("goto definition")
+        .expect("definition response");
+    let locations = match response {
+        GotoDefinitionResponse::Array(locations) => locations,
+        GotoDefinitionResponse::Scalar(location) => vec![location],
+        GotoDefinitionResponse::Link(_) => panic!("unexpected location links"),
+    };
+
+    assert!(
+        locations
+            .iter()
+            .any(|location| location.uri == uri && location.range.start.line == 0),
+        "live typedef definition should be returned even when the persisted index is stale"
+    );
+}
+
+#[tokio::test]
+async fn goto_definition_finds_first_typedef_after_multiline_macro_from_index() {
+    let (_dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[],
+        "macro_typedef.h",
+        r#"#define FREE(ptr)                                                              \
+    do                                                                         \
+    {                                                                          \
+        if ((ptr) != NULL)                                                     \
+        {                                                                      \
+            free(ptr);                                                         \
+            (ptr) = NULL;                                                      \
+        }                                                                      \
+    } while (0)
+
+typedef struct xxx {
+    int value;
+} xxx_t;
+
+void use_type(void) {
+    xxx_t/*cursor*/ item;
+}
+"#,
+    )
+    .await;
+
+    let response = service
+        .inner()
+        .goto_definition(goto_definition_params(uri.clone(), line, character))
+        .await
+        .expect("goto definition")
+        .expect("definition response");
+    let locations = match response {
+        GotoDefinitionResponse::Array(locations) => locations,
+        GotoDefinitionResponse::Scalar(location) => vec![location],
+        GotoDefinitionResponse::Link(_) => panic!("unexpected location links"),
+    };
+
+    assert!(
+        locations
+            .iter()
+            .any(|location| location.uri == uri && location.range.start.line == 10),
+        "indexed typedef immediately after multiline macro should be a goto-definition target"
+    );
 }
 
 #[tokio::test]
@@ -554,6 +668,81 @@ async fn member_completion_returns_fields_and_methods_for_resolved_receiver() {
     assert!(items
         .iter()
         .any(|item| item.label == "width" && item.kind == Some(CompletionItemKind::FIELD)));
+}
+
+#[tokio::test]
+async fn member_completion_resolves_simple_nested_member_chain() {
+    let (_dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[(
+            "nested.hpp",
+            "struct Inner { int value; };\nstruct Outer { struct Inner mem1; };\n",
+        )],
+        "main.cpp",
+        "#include \"nested.hpp\"\nvoid f(Outer *a) { a->mem1./*cursor*/ }\n",
+    )
+    .await;
+
+    let response = service
+        .inner()
+        .completion(completion_params(uri, line, character))
+        .await
+        .expect("completion request")
+        .expect("completion response");
+    let items = completion_items(response);
+
+    assert!(items
+        .iter()
+        .any(|item| item.label == "value" && item.kind == Some(CompletionItemKind::FIELD)));
+}
+
+#[tokio::test]
+async fn member_completion_resolves_indexed_anonymous_nested_member_chain() {
+    let (_dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[(
+            "nested.h",
+            "typedef struct { struct { int xxx; } mem1[4]; } A;\n",
+        )],
+        "main.c",
+        "#include \"nested.h\"\nvoid f(void) { A a; a.mem1[0]./*cursor*/ }\n",
+    )
+    .await;
+
+    let response = service
+        .inner()
+        .completion(completion_params(uri, line, character))
+        .await
+        .expect("completion request")
+        .expect("completion response");
+    let items = completion_items(response);
+
+    assert!(items
+        .iter()
+        .any(|item| item.label == "xxx" && item.kind == Some(CompletionItemKind::FIELD)));
+}
+
+#[tokio::test]
+async fn member_completion_falls_back_when_chain_parse_fails() {
+    let (_dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[("widget.hpp", "struct Widget { int width; int window; };\n")],
+        "main.cpp",
+        "void f(void) { make_widget()->wi/*cursor*/ }\n",
+    )
+    .await;
+
+    let response = service
+        .inner()
+        .completion(completion_params(uri, line, character))
+        .await
+        .expect("completion request")
+        .expect("completion response");
+    let items = completion_items(response);
+
+    assert!(items
+        .iter()
+        .any(|item| item.label == "width" && item.kind == Some(CompletionItemKind::FIELD)));
+    assert!(items
+        .iter()
+        .any(|item| item.label == "window" && item.kind == Some(CompletionItemKind::FIELD)));
 }
 
 #[tokio::test]

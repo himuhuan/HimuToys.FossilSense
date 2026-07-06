@@ -77,22 +77,31 @@ pub fn is_member_completion_context(line_text: &str, character: u32) -> bool {
     while start > 0 && is_ident(chars[start - 1]) {
         start -= 1;
     }
-
-    if start == 0 {
-        return false;
-    }
-    if chars[start - 1] == '.' {
-        return true;
-    }
-    start >= 2 && chars[start - 2] == '-' && chars[start - 1] == '>'
+    member_operator_before_prefix(&chars, start).is_some()
 }
 
-/// The single-identifier receiver immediately before the `.`/`->` at the cursor.
-///
-/// Returns `None` for receivers we will not try to type-infer: a call result
-/// (`get()->`), a chained/multi-segment access (`a.b.`), or an indexed
-/// expression (`arr[i].`). Those degrade to the global field fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberAccessChain {
+    pub receiver: String,
+    pub completed_members: Vec<String>,
+}
+
+/// The single receiver name before the `.`/`->` at the cursor when the
+/// expression can be reduced to one record-typed identifier. Calls and casts
+/// still return `None` and degrade to the global member fallback.
+#[allow(dead_code)]
 pub fn member_receiver_name(line_text: &str, character: u32) -> Option<String> {
+    member_access_chain_at(line_text, character)
+        .and_then(|chain| chain.completed_members.is_empty().then_some(chain.receiver))
+}
+
+/// Extract a bounded C member chain before the current member prefix. Handles
+/// simple identifiers plus common lvalue adornments such as array subscripts,
+/// parentheses, and unary `*`/`&`: `a.b[i].`, `p->items[n]->`, `(*p).x.`.
+/// Calls, casts, arithmetic, and macro-shaped expressions stay unsupported so
+/// member completion remains a best-effort candidate lookup, not expression
+/// type inference.
+pub fn member_access_chain_at(line_text: &str, character: u32) -> Option<MemberAccessChain> {
     let chars: Vec<char> = line_text.chars().collect();
     let target = char_index_at_utf16(&chars, character);
     let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
@@ -102,36 +111,172 @@ pub fn member_receiver_name(line_text: &str, character: u32) -> Option<String> {
     while start > 0 && is_ident(chars[start - 1]) {
         start -= 1;
     }
-    let op_pos = if start >= 1 && chars[start - 1] == '.' {
-        start - 1
-    } else if start >= 2 && chars[start - 2] == '-' && chars[start - 1] == '>' {
-        start - 2
-    } else {
-        return None;
-    };
+    let (op_pos, _) = member_operator_before_prefix(&chars, start)?;
 
-    if op_pos == 0 || !is_ident(chars[op_pos - 1]) {
-        return None;
+    for chain_start in 0..op_pos {
+        if chain_start > 0
+            && (is_ident(chars[chain_start - 1])
+                || matches!(chars[chain_start - 1], '.' | '>' | ']' | ')'))
+        {
+            continue;
+        }
+        if let Some(chain) = parse_member_chain_expr(&chars[chain_start..op_pos]) {
+            return Some(chain);
+        }
     }
-    let mut rstart = op_pos;
-    while rstart > 0 && is_ident(chars[rstart - 1]) {
-        rstart -= 1;
-    }
-    // Reject chained/call/indexed receivers: only a bare identifier qualifies.
-    if rstart > 0 && matches!(chars[rstart - 1], '.' | '>' | ')' | ']') {
-        return None;
-    }
+    None
+}
 
-    let recv: String = chars[rstart..op_pos].iter().collect();
-    if recv
-        .chars()
-        .next()
-        .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
-    {
-        Some(recv)
+fn member_operator_before_prefix(chars: &[char], prefix_start: usize) -> Option<(usize, usize)> {
+    let mut op_end = prefix_start;
+    while op_end > 0 && chars[op_end - 1].is_whitespace() {
+        op_end -= 1;
+    }
+    if op_end >= 1 && chars[op_end - 1] == '.' {
+        Some((op_end - 1, op_end))
+    } else if op_end >= 2 && chars[op_end - 2] == '-' && chars[op_end - 1] == '>' {
+        Some((op_end - 2, op_end))
     } else {
         None
     }
+}
+
+fn parse_member_chain_expr(chars: &[char]) -> Option<MemberAccessChain> {
+    let mut cursor = 0usize;
+    skip_ws(chars, &mut cursor);
+    let chain = parse_chain_expr(chars, &mut cursor)?;
+    skip_ws(chars, &mut cursor);
+    (cursor == chars.len()).then_some(chain)
+}
+
+fn parse_chain_expr(chars: &[char], cursor: &mut usize) -> Option<MemberAccessChain> {
+    skip_ws(chars, cursor);
+    while *cursor < chars.len() && matches!(chars[*cursor], '*' | '&') {
+        *cursor += 1;
+        skip_ws(chars, cursor);
+    }
+
+    let mut chain = if *cursor < chars.len() && chars[*cursor] == '(' {
+        *cursor += 1;
+        let inner = parse_chain_expr(chars, cursor)?;
+        skip_ws(chars, cursor);
+        if chars.get(*cursor) != Some(&')') {
+            return None;
+        }
+        *cursor += 1;
+        inner
+    } else {
+        let receiver = parse_identifier(chars, cursor)?;
+        MemberAccessChain {
+            receiver,
+            completed_members: Vec::new(),
+        }
+    };
+
+    loop {
+        skip_ws(chars, cursor);
+        if chars.get(*cursor) == Some(&'[') {
+            *cursor = skip_balanced(chars, *cursor, '[', ']')?;
+            continue;
+        }
+
+        let member_op = if chars.get(*cursor) == Some(&'.') {
+            *cursor += 1;
+            true
+        } else if chars.get(*cursor) == Some(&'-') && chars.get(*cursor + 1) == Some(&'>') {
+            *cursor += 2;
+            true
+        } else {
+            false
+        };
+        if !member_op {
+            break;
+        }
+
+        skip_ws(chars, cursor);
+        let member = parse_identifier(chars, cursor)?;
+        chain.completed_members.push(member);
+    }
+
+    Some(chain)
+}
+
+fn parse_identifier(chars: &[char], cursor: &mut usize) -> Option<String> {
+    let is_ident_start = |c: char| c.is_ascii_alphabetic() || c == '_';
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    if *cursor >= chars.len() || !is_ident_start(chars[*cursor]) {
+        return None;
+    }
+    let start = *cursor;
+    *cursor += 1;
+    while *cursor < chars.len() && is_ident(chars[*cursor]) {
+        *cursor += 1;
+    }
+    Some(chars[start..*cursor].iter().collect())
+}
+
+fn skip_ws(chars: &[char], cursor: &mut usize) {
+    while *cursor < chars.len() && chars[*cursor].is_whitespace() {
+        *cursor += 1;
+    }
+}
+
+fn skip_balanced(chars: &[char], open_pos: usize, open: char, close: char) -> Option<usize> {
+    if chars.get(open_pos) != Some(&open) {
+        return None;
+    }
+    let mut depth = 1usize;
+    let mut cursor = open_pos + 1;
+    while cursor < chars.len() {
+        match chars[cursor] {
+            '"' | '\'' => cursor = skip_quoted(chars, cursor),
+            '/' if chars.get(cursor + 1) == Some(&'/') => {
+                cursor += 2;
+                while cursor < chars.len() && chars[cursor] != '\n' {
+                    cursor += 1;
+                }
+            }
+            '/' if chars.get(cursor + 1) == Some(&'*') => {
+                cursor += 2;
+                while cursor + 1 < chars.len()
+                    && !(chars[cursor] == '*' && chars[cursor + 1] == '/')
+                {
+                    cursor += 1;
+                }
+                cursor = (cursor + 2).min(chars.len());
+            }
+            ch if ch == open => {
+                depth += 1;
+                cursor += 1;
+            }
+            ch if ch == close => {
+                depth = depth.saturating_sub(1);
+                cursor += 1;
+                if depth == 0 {
+                    return Some(cursor);
+                }
+            }
+            '(' => cursor = skip_balanced(chars, cursor, '(', ')')?,
+            _ => cursor += 1,
+        }
+    }
+    None
+}
+
+fn skip_quoted(chars: &[char], quote_start: usize) -> usize {
+    let quote = chars[quote_start];
+    let mut cursor = quote_start + 1;
+    while cursor < chars.len() {
+        if chars[cursor] == '\\' {
+            cursor = (cursor + 2).min(chars.len());
+            continue;
+        }
+        if chars[cursor] == quote {
+            return cursor + 1;
+        }
+        cursor += 1;
+    }
+    chars.len()
 }
 
 /// Byte offset of an LSP position (line + UTF-16 column) within `text`.
@@ -281,13 +426,53 @@ mod tests {
     fn member_receiver_name_rejects_call_chain_and_index() {
         // Call result: `get()->v` -> no simple receiver.
         assert_eq!(member_receiver_name("get()->v", 8), None);
-        // Multi-segment chain: `a.b.c` -> receiver before the second `.` is `b`,
-        // but it is itself preceded by `.`, so we decline to infer.
+        // Multi-segment chain has a chain parser, but the compatibility API
+        // still exposes only a bare receiver.
         assert_eq!(member_receiver_name("a.b.c", 5), None);
-        // Indexed: `arr[i].x` -> no simple receiver.
-        assert_eq!(member_receiver_name("arr[i].x", 8), None);
+        // Indexed receiver: `arr[i].x` resolves to the base receiver.
+        assert_eq!(member_receiver_name("arr[i].x", 8).as_deref(), Some("arr"));
         // Not a member context at all.
         assert_eq!(member_receiver_name("plain", 5), None);
+    }
+
+    #[test]
+    fn member_access_chain_extracts_supported_c_lvalue_segments() {
+        assert_eq!(
+            member_access_chain_at("void f(void) { a.mem1.xxx", 26),
+            Some(MemberAccessChain {
+                receiver: "a".to_string(),
+                completed_members: vec!["mem1".to_string()],
+            })
+        );
+        assert_eq!(
+            member_access_chain_at("ptr->inner.value", 16),
+            Some(MemberAccessChain {
+                receiver: "ptr".to_string(),
+                completed_members: vec!["inner".to_string()],
+            })
+        );
+        assert_eq!(
+            member_access_chain_at("a.mem1[n].xxx", 14),
+            Some(MemberAccessChain {
+                receiver: "a".to_string(),
+                completed_members: vec!["mem1".to_string()],
+            })
+        );
+        assert_eq!(
+            member_access_chain_at("(*ptr).inner.value", 18),
+            Some(MemberAccessChain {
+                receiver: "ptr".to_string(),
+                completed_members: vec!["inner".to_string()],
+            })
+        );
+        assert_eq!(
+            member_access_chain_at("arr[i].value", 12),
+            Some(MemberAccessChain {
+                receiver: "arr".to_string(),
+                completed_members: Vec::new(),
+            })
+        );
+        assert_eq!(member_access_chain_at("get()->value", 12), None);
     }
 
     #[test]

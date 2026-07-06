@@ -2,7 +2,7 @@
   "name": "fossilsense-vscode",
   "displayName": "FossilSense",
   "description": "FossilSense C/C++ best-effort navigation: symbols, outlines, rich hover, ranked definitions, member completion, role-grouped references, and local-only history-aware completion.",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "private": true,
   "license": "UNLICENSED",
   "publisher": "himutoys",

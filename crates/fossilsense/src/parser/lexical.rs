@@ -15,30 +15,44 @@ pub(super) fn extract_symbols_and_includes(
     let mut includes = Vec::new();
     let mut guard_stack = Vec::new();
     let mut brace_depth = 0isize;
+    let mut brace_state = BraceScanState::default();
     let mut statement = PendingStatement::default();
     let mut in_leading_block_comment = false;
+    let mut preprocessor_continuation = false;
 
     for (line_index, line) in source.lines().enumerate() {
         let line = strip_leading_comments(line, &mut in_leading_block_comment);
         let trimmed = line.trim();
+        let starts_preprocessor = trimmed.starts_with('#');
+        let preprocessor_line = preprocessor_continuation || starts_preprocessor;
+        let directive_start = starts_preprocessor && !preprocessor_continuation;
         let top_level = brace_depth == 0;
+        let line_brace_delta = if preprocessor_line {
+            0
+        } else {
+            code_brace_delta(&line, &mut brace_state)
+        };
 
-        if let Some(include) = capture_include(trimmed, line_index) {
-            includes.push(include);
+        if directive_start {
+            if let Some(include) = capture_include(trimmed, line_index) {
+                includes.push(include);
+            }
         }
 
-        if let Some(symbol) = capture_macro(
-            &line,
-            line_index,
-            line_starts,
-            source,
-            current_guard(&guard_stack),
-        ) {
-            symbols.push(symbol);
+        if directive_start {
+            if let Some(symbol) = capture_macro(
+                &line,
+                line_index,
+                line_starts,
+                source,
+                current_guard(&guard_stack),
+            ) {
+                symbols.push(symbol);
+            }
         }
 
-        if top_level && !trimmed.starts_with('#') && !trimmed.is_empty() {
-            statement.push(&line, line_index);
+        if (statement.active || top_level) && !preprocessor_line && !trimmed.is_empty() {
+            statement.push(&line, line_index, line_brace_delta);
             if statement.is_complete() {
                 symbols.extend(capture_statement_symbols(
                     &statement,
@@ -48,15 +62,18 @@ pub(super) fn extract_symbols_and_includes(
                 ));
                 statement.clear();
             }
-        } else if !top_level {
+        } else if !top_level && !statement.active {
             statement.clear();
         }
 
-        update_guard_stack(trimmed, &mut guard_stack);
-        brace_depth += brace_delta(&line);
+        if directive_start {
+            update_guard_stack(trimmed, &mut guard_stack);
+        }
+        brace_depth += line_brace_delta;
         if brace_depth < 0 {
             brace_depth = 0;
         }
+        preprocessor_continuation = preprocessor_line && line_continues_preprocessor(&line);
     }
 
     (symbols, includes)
@@ -138,9 +155,13 @@ fn capture_statement_symbols(
         return symbols;
     }
 
-    if let Some(symbol) = capture_typedef(statement, &compact, line_starts, source, guard.clone()) {
-        symbols.push(symbol);
-    }
+    symbols.extend(capture_typedefs(
+        statement,
+        &compact,
+        line_starts,
+        source,
+        guard.clone(),
+    ));
 
     symbols.extend(capture_tag_types(
         statement,
@@ -196,26 +217,44 @@ fn capture_function(
     ))
 }
 
-fn capture_typedef(
+fn capture_typedefs(
     statement: &PendingStatement,
     compact: &str,
     line_starts: &[usize],
     source: &str,
     guard: Option<String>,
-) -> Option<Symbol> {
-    let captures = typedef_regex().captures(compact)?;
-    let name = captures.get(1)?.as_str();
-    Some(make_symbol(
-        name,
-        SymbolKind::Type,
-        SymbolRole::Definition,
-        statement.start_line,
-        statement.end_line,
-        line_starts,
-        source,
-        compact.to_string(),
-        guard,
-    ))
+) -> Vec<Symbol> {
+    if !compact.starts_with("typedef ") && compact != "typedef" {
+        return Vec::new();
+    }
+
+    let mut names = record_typedef_aliases(&statement.text);
+    if names.is_empty() {
+        if let Some(captures) = typedef_regex().captures(compact) {
+            if let Some(name) = captures.get(1) {
+                names.push(name.as_str().to_string());
+            }
+        }
+    }
+
+    names.sort();
+    names.dedup();
+    names
+        .into_iter()
+        .map(|name| {
+            make_symbol(
+                &name,
+                SymbolKind::Type,
+                SymbolRole::Definition,
+                statement.start_line,
+                statement.end_line,
+                line_starts,
+                source,
+                compact.to_string(),
+                guard.clone(),
+            )
+        })
+        .collect()
 }
 
 fn capture_tag_types(
@@ -329,24 +368,16 @@ fn current_guard(guard_stack: &[String]) -> Option<String> {
     }
 }
 
-fn brace_delta(line: &str) -> isize {
-    let mut delta = 0;
-    for byte in line.bytes() {
-        match byte {
-            b'{' => delta += 1,
-            b'}' => delta -= 1,
-            _ => {}
-        }
-    }
-    delta
-}
-
 fn line_end_byte(source: &str, line_starts: &[usize], line: usize) -> usize {
     line_starts
         .get(line + 1)
         .copied()
         .map(|next| next.saturating_sub(1))
         .unwrap_or(source.len())
+}
+
+fn line_continues_preprocessor(line: &str) -> bool {
+    line.trim_end_matches([' ', '\t', '\r']).ends_with('\\')
 }
 
 pub(super) fn compact_whitespace(text: &str) -> String {
@@ -382,10 +413,11 @@ struct PendingStatement {
     start_line: usize,
     end_line: usize,
     active: bool,
+    brace_balance: isize,
 }
 
 impl PendingStatement {
-    fn push(&mut self, line: &str, line_index: usize) {
+    fn push(&mut self, line: &str, line_index: usize, brace_delta: isize) {
         if !self.active {
             self.start_line = line_index;
             self.active = true;
@@ -393,18 +425,425 @@ impl PendingStatement {
         self.end_line = line_index;
         self.text.push_str(line);
         self.text.push('\n');
+        self.brace_balance += brace_delta;
     }
 
     fn is_complete(&self) -> bool {
         let trimmed = self.text.trim_end();
-        trimmed.ends_with(';') || trimmed.ends_with('{') || trimmed.ends_with('}')
+        if trimmed.ends_with(';') && self.brace_balance <= 0 {
+            return true;
+        }
+        if trimmed.ends_with('{') {
+            return !looks_like_record_body_declaration(trimmed);
+        }
+        if trimmed.ends_with('}') && self.brace_balance <= 0 {
+            return true;
+        }
+        false
     }
 
     fn clear(&mut self) {
         self.text.clear();
         self.active = false;
+        self.brace_balance = 0;
     }
 }
+
+fn looks_like_record_body_declaration(text: &str) -> bool {
+    let compact = compact_whitespace(text);
+    if !compact.ends_with('{') {
+        return false;
+    }
+    let prefix = compact.trim_end_matches('{').trim_end();
+    prefix.starts_with("typedef struct ")
+        || prefix == "typedef struct"
+        || prefix.starts_with("typedef union ")
+        || prefix == "typedef union"
+        || prefix.starts_with("typedef enum ")
+        || prefix == "typedef enum"
+        || prefix.starts_with("typedef class ")
+        || prefix == "typedef class"
+        || prefix.starts_with("struct ")
+        || prefix == "struct"
+        || prefix.starts_with("union ")
+        || prefix == "union"
+        || prefix.starts_with("enum ")
+        || prefix == "enum"
+        || prefix.starts_with("class ")
+        || prefix == "class"
+}
+
+#[derive(Debug, Default)]
+struct BraceScanState {
+    in_block_comment: bool,
+}
+
+fn code_brace_delta(line: &str, state: &mut BraceScanState) -> isize {
+    let mut delta = 0isize;
+    let bytes = line.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if state.in_block_comment {
+            if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                state.in_block_comment = false;
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+            break;
+        }
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            state.in_block_comment = true;
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'"' || bytes[i] == b'\'' {
+            i = skip_quoted_bytes(bytes, i);
+            continue;
+        }
+
+        match bytes[i] {
+            b'{' => delta += 1,
+            b'}' => delta -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    delta
+}
+
+fn skip_quoted_bytes(bytes: &[u8], quote_start: usize) -> usize {
+    let quote = bytes[quote_start];
+    let mut i = quote_start + 1;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            i = (i + 2).min(bytes.len());
+            continue;
+        }
+        if bytes[i] == quote {
+            return i + 1;
+        }
+        i += 1;
+    }
+    bytes.len()
+}
+
+fn record_typedef_aliases(text: &str) -> Vec<String> {
+    if !starts_with_typedef_keyword(text) {
+        return Vec::new();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let Some(open) = first_code_char(&chars, '{') else {
+        return Vec::new();
+    };
+    let Some(close) = matching_code_delimiter(&chars, open, '{', '}') else {
+        return Vec::new();
+    };
+    let Some(semi) = first_code_char_from(&chars, ';', close + 1) else {
+        return Vec::new();
+    };
+    if !looks_like_record_typedef_prefix(&chars[..open]) {
+        return Vec::new();
+    }
+
+    split_top_level_declarators(&chars[close + 1..semi])
+        .into_iter()
+        .filter_map(|segment| declarator_alias_name(&segment))
+        .collect()
+}
+
+fn starts_with_typedef_keyword(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed == "typedef"
+        || trimmed
+            .strip_prefix("typedef")
+            .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+}
+
+fn looks_like_record_typedef_prefix(chars: &[char]) -> bool {
+    let text: String = chars.iter().collect();
+    record_keyword_regex().is_match(&text)
+}
+
+fn first_code_char(chars: &[char], needle: char) -> Option<usize> {
+    first_code_char_from(chars, needle, 0)
+}
+
+fn first_code_char_from(chars: &[char], needle: char, start: usize) -> Option<usize> {
+    let mut i = start;
+    let mut in_block_comment = false;
+    while i < chars.len() {
+        if in_block_comment {
+            if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                in_block_comment = false;
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if chars[i] == '/' && chars.get(i + 1) == Some(&'/') {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+            in_block_comment = true;
+            i += 2;
+            continue;
+        }
+        if chars[i] == '"' || chars[i] == '\'' {
+            i = skip_quoted_chars(chars, i);
+            continue;
+        }
+        if chars[i] == needle {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn matching_code_delimiter(
+    chars: &[char],
+    open_pos: usize,
+    open: char,
+    close: char,
+) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = open_pos;
+    let mut in_block_comment = false;
+    while i < chars.len() {
+        if in_block_comment {
+            if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                in_block_comment = false;
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if chars[i] == '/' && chars.get(i + 1) == Some(&'/') {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+            in_block_comment = true;
+            i += 2;
+            continue;
+        }
+        if chars[i] == '"' || chars[i] == '\'' {
+            i = skip_quoted_chars(chars, i);
+            continue;
+        }
+        if chars[i] == open {
+            depth += 1;
+        } else if chars[i] == close {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn split_top_level_declarators(chars: &[char]) -> Vec<Vec<char>> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    let mut paren = 0usize;
+    let mut bracket = 0usize;
+    while i < chars.len() {
+        match chars[i] {
+            '"' | '\'' => i = skip_quoted_chars(chars, i),
+            '(' => {
+                paren += 1;
+                i += 1;
+            }
+            ')' => {
+                paren = paren.saturating_sub(1);
+                i += 1;
+            }
+            '[' => {
+                bracket += 1;
+                i += 1;
+            }
+            ']' => {
+                bracket = bracket.saturating_sub(1);
+                i += 1;
+            }
+            ',' if paren == 0 && bracket == 0 => {
+                parts.push(chars[start..i].to_vec());
+                start = i + 1;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    if start < chars.len() {
+        parts.push(chars[start..].to_vec());
+    }
+    parts
+}
+
+fn declarator_alias_name(segment: &[char]) -> Option<String> {
+    let mut chars = strip_known_attributes(segment);
+    trim_char_vec(&mut chars);
+
+    loop {
+        trim_char_vec(&mut chars);
+        let last = chars.last().copied()?;
+        if last == ']' {
+            let open = matching_open_delimiter(&chars, chars.len() - 1, '[', ']')?;
+            chars.truncate(open);
+            continue;
+        }
+        if last == ')' {
+            let open = matching_open_delimiter(&chars, chars.len() - 1, '(', ')')?;
+            if open == 0 {
+                break;
+            }
+            chars.truncate(open);
+            continue;
+        }
+        break;
+    }
+
+    let text: String = chars.iter().collect();
+    identifier_regex()
+        .find_iter(&text)
+        .map(|m| m.as_str())
+        .filter(|ident| !TYPEDEF_DECLARATOR_SKIP_WORDS.contains(ident))
+        .last()
+        .map(str::to_string)
+}
+
+fn strip_known_attributes(chars: &[char]) -> Vec<char> {
+    let mut out = Vec::with_capacity(chars.len());
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] == '[' && chars.get(i + 1) == Some(&'[') {
+            if let Some(close) = find_double_bracket_close(chars, i + 2) {
+                i = close + 2;
+                continue;
+            }
+        }
+
+        if is_ident_start(chars[i]) {
+            let start = i;
+            i += 1;
+            while i < chars.len() && is_ident_continue(chars[i]) {
+                i += 1;
+            }
+            let word: String = chars[start..i].iter().collect();
+            if matches!(
+                word.as_str(),
+                "__attribute__" | "__declspec" | "_Alignas" | "alignas"
+            ) {
+                let mut j = i;
+                while j < chars.len() && chars[j].is_whitespace() {
+                    j += 1;
+                }
+                if chars.get(j) == Some(&'(') {
+                    if let Some(close) = matching_code_delimiter(chars, j, '(', ')') {
+                        i = close + 1;
+                        continue;
+                    }
+                }
+            }
+            out.extend(chars[start..i].iter());
+            continue;
+        }
+
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+fn find_double_bracket_close(chars: &[char], start: usize) -> Option<usize> {
+    let mut i = start;
+    while i + 1 < chars.len() {
+        if chars[i] == ']' && chars[i + 1] == ']' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn matching_open_delimiter(
+    chars: &[char],
+    close_pos: usize,
+    open: char,
+    close: char,
+) -> Option<usize> {
+    let mut depth = 0usize;
+    for i in (0..=close_pos).rev() {
+        if chars[i] == close {
+            depth += 1;
+        } else if chars[i] == open {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+fn trim_char_vec(chars: &mut Vec<char>) {
+    while chars.first().is_some_and(|ch| ch.is_whitespace()) {
+        chars.remove(0);
+    }
+    while chars.last().is_some_and(|ch| ch.is_whitespace()) {
+        chars.pop();
+    }
+}
+
+fn skip_quoted_chars(chars: &[char], quote_start: usize) -> usize {
+    let quote = chars[quote_start];
+    let mut i = quote_start + 1;
+    while i < chars.len() {
+        if chars[i] == '\\' {
+            i = (i + 2).min(chars.len());
+            continue;
+        }
+        if chars[i] == quote {
+            return i + 1;
+        }
+        i += 1;
+    }
+    chars.len()
+}
+
+fn is_ident_start(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphabetic()
+}
+
+fn is_ident_continue(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphanumeric()
+}
+
+const TYPEDEF_DECLARATOR_SKIP_WORDS: &[&str] = &[
+    "const",
+    "volatile",
+    "restrict",
+    "_Atomic",
+    "__attribute__",
+    "__declspec",
+    "_Alignas",
+    "alignas",
+];
 
 fn include_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
@@ -431,6 +870,19 @@ fn typedef_regex() -> &'static Regex {
     REGEX.get_or_init(|| {
         Regex::new(r#"\btypedef\b.*\b([A-Za-z_][A-Za-z0-9_]*)\s*;"#).expect("typedef regex")
     })
+}
+
+fn record_keyword_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(r#"\btypedef\b[\s\S]*\b(struct|union|enum|class)\b"#)
+            .expect("record typedef regex")
+    })
+}
+
+fn identifier_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r#"[A-Za-z_][A-Za-z0-9_]*"#).expect("identifier regex"))
 }
 
 fn tag_type_regex() -> &'static Regex {

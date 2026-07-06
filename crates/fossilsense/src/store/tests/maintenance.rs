@@ -119,5 +119,5 @@ fn wal_checkpoint_after_full_rebuild() {
 
     // No error = WAL checkpoint succeeded. Verify store is still readable.
     let reader = IndexStore::open_readonly(&db).expect("readonly");
-    assert!(reader.load_symbol_names().expect("names").len() > 0);
+    assert!(!reader.load_symbol_names().expect("names").is_empty());
 }

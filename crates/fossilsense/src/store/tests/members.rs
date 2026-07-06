@@ -134,6 +134,72 @@ fn members_for_records_returns_fields_and_methods() {
 }
 
 #[test]
+fn field_member_type_names_are_persisted_for_chain_completion() {
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+    let mut store = IndexStore::open(&db, dir.path()).expect("store");
+    upsert_source(
+        &mut store,
+        "nested.h",
+        "struct Inner { int value; };\nstruct Outer { struct Inner mem1; int count; };\n",
+    );
+
+    let reader = IndexStore::open_readonly(&db).expect("reader");
+    let outer = reader
+        .resolve_record_candidates(&["Outer"], None)
+        .expect("outer");
+    let outer_members = reader
+        .members_for_records(&[outer[0].id], None, None)
+        .expect("outer members");
+    let mem1 = outer_members
+        .iter()
+        .find(|member| member.name == "mem1")
+        .expect("mem1");
+    assert_eq!(mem1.type_name.as_deref(), Some("Inner"));
+
+    let inner = reader
+        .resolve_record_candidates(&[mem1.type_name.as_deref().expect("type")], None)
+        .expect("inner");
+    let inner_members = reader
+        .members_for_records(&[inner[0].id], Some("val"), None)
+        .expect("inner members");
+    assert!(inner_members.iter().any(|member| member.name == "value"));
+}
+
+#[test]
+fn nested_anonymous_member_type_names_are_persisted_for_chain_completion() {
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+    let mut store = IndexStore::open(&db, dir.path()).expect("store");
+    upsert_source(
+        &mut store,
+        "nested.h",
+        "typedef struct { struct { int xxx; } mem1[4]; } A;\n",
+    );
+
+    let reader = IndexStore::open_readonly(&db).expect("reader");
+    let outer = reader
+        .resolve_record_candidates(&["A"], None)
+        .expect("outer");
+    let outer_members = reader
+        .members_for_records(&[outer[0].id], None, None)
+        .expect("outer members");
+    let mem1 = outer_members
+        .iter()
+        .find(|member| member.name == "mem1")
+        .expect("mem1");
+    assert_eq!(mem1.type_name.as_deref(), Some("A.mem1"));
+
+    let inner = reader
+        .resolve_record_candidates(&[mem1.type_name.as_deref().expect("type")], None)
+        .expect("inner");
+    let inner_members = reader
+        .members_for_records(&[inner[0].id], Some("xx"), None)
+        .expect("inner members");
+    assert!(inner_members.iter().any(|member| member.name == "xxx"));
+}
+
+#[test]
 fn fallback_member_candidates_are_prefix_only_and_capped() {
     let dir = tempdir().expect("tempdir");
     let db = dir.path().join("index.sqlite");
@@ -214,7 +280,7 @@ fn member_completion_pipeline_resolves_cross_file_and_falls_back() {
     // Call receiver: inference declines, so the caller uses the global fallback.
     let call_line = "make_widget()->wi";
     assert!(
-        crate::query::member_receiver_name(call_line, call_line.len() as u32).is_none(),
+        crate::query::member_access_chain_at(call_line, call_line.len() as u32).is_none(),
         "call receiver should not infer"
     );
     let fallback = field_prefix_names(&reader, "wi", 100);

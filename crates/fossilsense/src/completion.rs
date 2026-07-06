@@ -143,7 +143,7 @@ impl CompletionCandidateKind {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CompletionRankContext {
     pub intent: CompletionIntent,
     pub history_enabled: bool,
@@ -159,17 +159,6 @@ impl CompletionRankContext {
     ) -> Self {
         Self {
             intent: CompletionIntent { kind, confidence },
-            history_enabled: false,
-            history: CompletionHistorySnapshot::default(),
-            prefix_bucket: String::new(),
-        }
-    }
-}
-
-impl Default for CompletionRankContext {
-    fn default() -> Self {
-        Self {
-            intent: CompletionIntent::default(),
             history_enabled: false,
             history: CompletionHistorySnapshot::default(),
             prefix_bucket: String::new(),
@@ -272,12 +261,12 @@ fn previous_token(before_prefix: &str) -> Option<String> {
         return None;
     }
     let end = trimmed.len();
-    while end > 0 {
+    if end > 0 {
         let ch = trimmed[..end].chars().next_back()?;
         if ch.is_alphanumeric() || ch == '_' || ch == '*' || ch == '&' {
-            break;
+        } else {
+            return Some(ch.to_string());
         }
-        return Some(ch.to_string());
     }
     let mut start = end;
     while start > 0 {

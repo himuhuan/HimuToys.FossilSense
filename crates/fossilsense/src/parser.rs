@@ -315,6 +315,7 @@ pub struct MemberDef {
     pub name: String,
     pub kind: MemberKind,
     pub confidence: MemberConfidence,
+    pub type_name: Option<String>,
     pub start_byte: usize,
     pub end_byte: usize,
     pub start_line: usize,
@@ -437,7 +438,7 @@ impl ParserHandle {
         old_tree: Option<&tree_sitter::Tree>,
     ) -> Result<Option<tree_sitter::Tree>, ()> {
         let mut state = self.state.lock().unwrap();
-        let needs_set = state.current_lang.as_ref().map_or(true, |c| *c != lang);
+        let needs_set = state.current_lang.as_ref().is_none_or(|c| *c != lang);
         if needs_set {
             state.parser.set_language(&lang).map_err(|_| ())?;
             state.current_lang = Some(lang);
