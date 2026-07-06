@@ -679,3 +679,115 @@ fn compact_whitespace_equivalence_fuzzy() {
         );
     }
 }
+
+#[test]
+fn lexical_captures_two_line_anonymous_typedef() {
+    let index = super::parse(
+        std::path::Path::new("test.c"),
+        "typedef struct {\n} Token;\n",
+    );
+    assert!(index.symbols.iter().any(|s| {
+        s.name == "Token" && s.kind == super::SymbolKind::Type && s.role == super::SymbolRole::Definition
+    }), "Expected Token Type symbol");
+}
+
+#[test]
+fn lexical_captures_multi_line_anonymous_typedef() {
+    let index = super::parse(
+        std::path::Path::new("test.c"),
+        "typedef struct {\n    int x;\n    char *name;\n} Widget;\n",
+    );
+    assert!(index.symbols.iter().any(|s| {
+        s.name == "Widget" && s.kind == super::SymbolKind::Type && s.role == super::SymbolRole::Definition
+    }), "Expected Widget Type symbol");
+    // Also verify the AST pass still collects fields
+    assert!(index.fields.iter().any(|f| f.name == "x"), "Expected field x");
+    assert!(index.fields.iter().any(|f| f.name == "name"), "Expected field name");
+}
+
+#[test]
+fn lexical_dedups_same_name_tag_and_typedef_alias() {
+    let index = super::parse(
+        std::path::Path::new("test.c"),
+        "typedef struct Node { int id; struct Node *next; } Node;\n",
+    );
+    // After fix: exactly 1 Type symbol named Node
+    let node_type_count = index.symbols.iter().filter(|s| {
+        s.name == "Node" && s.kind == super::SymbolKind::Type && s.role == super::SymbolRole::Definition
+    }).count();
+    assert_eq!(node_type_count, 1, "Expected exactly 1 Node Type symbol, got {}", node_type_count);
+}
+
+#[test]
+fn lexical_edge_cases_typedef_and_tag() {
+    // Sub-case A: named struct (no typedef) - single line
+    let index_a = super::parse(
+        std::path::Path::new("a.c"),
+        "struct Point { int x; };\n",
+    );
+    assert!(index_a.symbols.iter().any(|s| {
+        s.name == "Point" && s.kind == super::SymbolKind::Type && s.role == super::SymbolRole::Definition
+    }), "A: Expected Point Type symbol");
+    assert!(index_a.fields.iter().any(|f| f.name == "x"), "A: Expected field x");
+
+    // Sub-case B: different tag/typedef names
+    let index_b = super::parse(
+        std::path::Path::new("b.c"),
+        "typedef struct Rect { int w; } RectT;\n",
+    );
+    assert!(index_b.symbols.iter().any(|s| {
+        s.name == "Rect" && s.kind == super::SymbolKind::Type && s.role == super::SymbolRole::Definition
+    }), "B: Expected Rect Type symbol");
+    assert!(index_b.symbols.iter().any(|s| {
+        s.name == "RectT" && s.kind == super::SymbolKind::Type && s.role == super::SymbolRole::Definition
+    }), "B: Expected RectT Type symbol");
+    assert!(index_b.fields.iter().any(|f| f.name == "w"), "B: Expected field w");
+
+    // Sub-case C: single-line, no space before alias
+    let index_c = super::parse(
+        std::path::Path::new("c.c"),
+        "typedef struct {}Quick;\n",
+    );
+    assert!(index_c.symbols.iter().any(|s| {
+        s.name == "Quick" && s.kind == super::SymbolKind::Type && s.role == super::SymbolRole::Definition
+    }), "C: Expected Quick Type symbol");
+
+    // Sub-case D: anonymous union typedef (single-line)
+    let index_d = super::parse(
+        std::path::Path::new("d.c"),
+        "typedef union { int i; float f; } Value;\n",
+    );
+    assert!(index_d.symbols.iter().any(|s| {
+        s.name == "Value" && s.kind == super::SymbolKind::Type && s.role == super::SymbolRole::Definition
+    }), "D: Expected Value Type symbol");
+    assert!(index_d.fields.iter().any(|f| f.name == "i"), "D: Expected field i");
+    assert!(index_d.fields.iter().any(|f| f.name == "f"), "D: Expected field f");
+
+    // Sub-case E: C++ class (.hpp path)
+    let index_e = super::parse(
+        std::path::Path::new("e.hpp"),
+        "class Widget { int count; };\n",
+    );
+    assert!(index_e.symbols.iter().any(|s| {
+        s.name == "Widget" && s.kind == super::SymbolKind::Type && s.role == super::SymbolRole::Definition
+    }), "E: Expected Widget Type symbol");
+    assert!(index_e.fields.iter().any(|f| f.name == "count"), "E: Expected field count");
+}
+
+#[test]
+fn lexical_alias_on_separate_line_after_brace() {
+    let index = super::parse(
+        std::path::Path::new("test.c"),
+        "typedef struct {\n    int x;\n}\nToken;\nint answer;\n",
+    );
+    // Typedef alias on its own top-level line after closing brace
+    assert!(index.symbols.iter().any(|s| {
+        s.name == "Token" && s.kind == super::SymbolKind::Type && s.role == super::SymbolRole::Definition
+    }), "Expected Token Type symbol");
+    // Subsequent decl must NOT be corrupted by leftover pending_typedef
+    assert!(index.symbols.iter().any(|s| {
+        s.name == "answer" && s.kind == super::SymbolKind::GlobalVariable
+    }), "Expected subsequent int answer; to still be captured");
+    // AST fields still collected
+    assert!(index.fields.iter().any(|f| f.name == "x"), "Expected field x");
+}

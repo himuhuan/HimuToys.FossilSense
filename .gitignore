@@ -8,4 +8,5 @@ out/
 extensions/vscode/bin/
 *.vsix
 *.log
+.sisyphus/
 openspec/

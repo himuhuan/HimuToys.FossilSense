@@ -37,19 +37,36 @@ pub(super) fn extract_symbols_and_includes(
             symbols.push(symbol);
         }
 
+        let delta = brace_delta(line);
         if top_level && !trimmed.starts_with('#') && !trimmed.is_empty() {
             statement.push(&line, line_index);
             if statement.is_complete() {
-                symbols.extend(capture_statement_symbols(
-                    &statement,
-                    line_starts,
-                    source,
-                    current_guard(&guard_stack),
-                ));
-                statement.clear();
+                if !statement.pending_typedef || trimmed.ends_with(';') {
+                    symbols.extend(capture_statement_symbols(
+                        &statement,
+                        line_starts,
+                        source,
+                        current_guard(&guard_stack),
+                    ));
+                    statement.clear();
+                }
             }
         } else if !top_level {
-            statement.clear();
+            if statement.pending_typedef {
+                statement.push(line, line_index);
+                let trimmed_line = line.trim();
+                if brace_depth + delta == 0 && trimmed_line.ends_with(';') {
+                    symbols.extend(capture_statement_symbols(
+                        &statement,
+                        line_starts,
+                        source,
+                        current_guard(&guard_stack),
+                    ));
+                    statement.clear();
+                }
+            } else {
+                statement.clear();
+            }
         }
 
         update_guard_stack(trimmed, &mut guard_stack);
@@ -138,7 +155,10 @@ fn capture_statement_symbols(
         return symbols;
     }
 
-    if let Some(symbol) = capture_typedef(statement, &compact, line_starts, source, guard.clone()) {
+    // Capture typedef first so we can exclude its name from tag type captures
+    let typedef_symbol = capture_typedef(statement, &compact, line_starts, source, guard.clone());
+    let typedef_name = typedef_symbol.as_ref().map(|s| s.name.clone());
+    if let Some(symbol) = typedef_symbol {
         symbols.push(symbol);
     }
 
@@ -148,6 +168,7 @@ fn capture_statement_symbols(
         line_starts,
         source,
         guard.clone(),
+        typedef_name.as_deref(),
     ));
 
     // Enum constants are extracted from the AST (`collect_enum_constants`), which
@@ -224,10 +245,18 @@ fn capture_tag_types(
     line_starts: &[usize],
     source: &str,
     guard: Option<String>,
+    skip_name: Option<&str>,
 ) -> Vec<Symbol> {
     tag_type_regex()
         .captures_iter(compact)
         .filter_map(|captures| captures.get(2).map(|name| name.as_str()))
+        .filter(|name| {
+            if let Some(skip) = skip_name {
+                *name != skip
+            } else {
+                true
+            }
+        })
         .map(|name| {
             make_symbol(
                 name,
@@ -382,6 +411,7 @@ struct PendingStatement {
     start_line: usize,
     end_line: usize,
     active: bool,
+    pending_typedef: bool,
 }
 
 impl PendingStatement {
@@ -393,6 +423,18 @@ impl PendingStatement {
         self.end_line = line_index;
         self.text.push_str(line);
         self.text.push('\n');
+        let trimmed_text = self.text.trim();
+        let line_trimmed = line.trim();
+        if !line_trimmed.ends_with(';') {
+            if trimmed_text.starts_with("typedef ")
+                || trimmed_text.starts_with("struct ")
+                || trimmed_text.starts_with("union ")
+                || trimmed_text.starts_with("enum ")
+                || trimmed_text.starts_with("class ")
+            {
+                self.pending_typedef = true;
+            }
+        }
     }
 
     fn is_complete(&self) -> bool {
@@ -403,6 +445,7 @@ impl PendingStatement {
     fn clear(&mut self) {
         self.text.clear();
         self.active = false;
+        self.pending_typedef = false;
     }
 }
 
