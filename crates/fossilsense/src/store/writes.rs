@@ -117,8 +117,9 @@ pub(super) fn apply_file_updates_inner(
             let FileIndexPayload::Ok(index) = update.payload else {
                 continue;
             };
+            let facts = index.persistent_facts();
 
-            for symbol in &index.symbols {
+            for symbol in facts.symbols {
                 symbol_stmt.execute(params![
                     file_id,
                     symbol.name.as_str(),
@@ -136,7 +137,7 @@ pub(super) fn apply_file_updates_inner(
                 ])?;
             }
 
-            for include in &index.includes {
+            for include in facts.includes {
                 let (form, normalized, basename) =
                     include_normalized_metadata(&include.target_text);
                 include_stmt.execute(params![
@@ -152,7 +153,7 @@ pub(super) fn apply_file_updates_inner(
             let mut record_key_to_id = std::collections::HashMap::new();
             let mut record_name_to_ids: std::collections::HashMap<String, Vec<i64>> =
                 std::collections::HashMap::new();
-            for record in &index.records {
+            for record in facts.records {
                 record_stmt.execute(params![
                     file_id,
                     record.display_name.as_str(),
@@ -187,7 +188,7 @@ pub(super) fn apply_file_updates_inner(
                 }
             }
 
-            for member in &index.members {
+            for member in facts.members {
                 let record_id = record_key_to_id
                     .get(&member.record_key)
                     .copied()
@@ -214,7 +215,7 @@ pub(super) fn apply_file_updates_inner(
                 }
             }
 
-            for alias in &index.aliases {
+            for alias in facts.aliases {
                 let (target_record_id, target_name, target_kind, confidence) = match &alias.target {
                     AliasTarget::RecordKey(key) => {
                         let rid = record_key_to_id.get(key).copied();

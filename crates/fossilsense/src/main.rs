@@ -188,9 +188,9 @@ fn run_query(kind: QueryCommand) -> Result<()> {
         } => {
             let db_path = resolve_db_path(db, &workspace)?;
             let store = IndexStore::open_readonly(&db_path)?;
-            let table = query::NameTable::build(store.load_symbol_names()?);
+            let table = query::NameTable::build_from_rows(store.name_table_view().symbol_rows()?);
             let ids: Vec<i64> = table.search(&text, query::WORKSPACE_SYMBOL_LIMIT);
-            let records = store.symbols_by_ids(&ids)?;
+            let records = store.symbol_read_view().symbols_by_ids(&ids)?;
 
             println!("symbols: {} (of {} names)", records.len(), table.len());
             for record in records {
@@ -218,7 +218,7 @@ fn run_query(kind: QueryCommand) -> Result<()> {
             let store = IndexStore::open_readonly(&db_path)?;
             let rel = pathing::normalize_path_string(&file);
             let candidates = query::rank_definitions_into_candidates_with_scope(
-                store.symbols_by_name(&word)?,
+                store.symbol_read_view().symbols_by_name(&word)?,
                 &rel,
                 None,
             );

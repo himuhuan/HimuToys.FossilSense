@@ -5,7 +5,9 @@ use rusqlite::params;
 
 use super::IndexStore;
 
+#[allow(dead_code)]
 type IncludeEdgeRows = Vec<(String, String)>;
+#[allow(dead_code)]
 type IncludeOpenRows = Vec<(String, crate::reachability::OpenReason)>;
 
 impl IndexStore {
@@ -168,18 +170,13 @@ impl IndexStore {
     /// in-memory reachability graph. Resolution kind is *not* read here — the
     /// graph is a plain file-to-file closure; the kind is read where a decision
     /// needs it (e.g. [`apply_directly_included_derivation`] via in-row SQL).
+    #[allow(dead_code)]
     pub fn load_include_edge_paths(&self) -> Result<Vec<(String, String)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT sf.path, df.path FROM include_edges e \
-             JOIN files sf ON sf.id = e.src_file_id \
-             JOIN files df ON df.id = e.dst_file_id",
-        )?;
-        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
-        let mut edges = Vec::new();
-        for row in rows {
-            edges.push(row?);
-        }
-        Ok(edges)
+        self.reach_graph_view().include_edges().map(|rows| {
+            rows.into_iter()
+                .map(crate::store::views::IncludeEdgeRow::into_legacy_tuple)
+                .collect()
+        })
     }
 
     /// Resolved include edges as `(src_path, dst_path, resolution_kind)` — for
@@ -188,31 +185,22 @@ impl IndexStore {
     #[cfg(test)]
     #[allow(dead_code)]
     pub fn load_include_edge_paths_with_resolution(&self) -> Result<Vec<(String, String, String)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT sf.path, df.path, e.resolution FROM include_edges e \
-             JOIN files sf ON sf.id = e.src_file_id \
-             JOIN files df ON df.id = e.dst_file_id",
-        )?;
-        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
-        let mut edges = Vec::new();
-        for row in rows {
-            edges.push(row?);
-        }
-        Ok(edges)
+        self.reach_graph_view()
+            .include_edges_with_resolution()
+            .map(|rows| {
+                rows.into_iter()
+                    .map(crate::store::views::IncludeEdgeResolutionRow::into_legacy_tuple)
+                    .collect()
+            })
     }
 
     /// Paths of files with at least one unresolved `#include` — one source of
     /// "open" (uncertain) nodes in the reachability graph.
+    #[allow(dead_code)]
     pub fn open_include_file_paths(&self) -> Result<Vec<String>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT path FROM files WHERE unresolved_includes > 0")?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-        let mut paths = Vec::new();
-        for row in rows {
-            paths.push(row?);
-        }
-        Ok(paths)
+        self.reach_graph_view()
+            .unresolved_includes()
+            .map(|rows| rows.into_iter().map(|row| row.source_path).collect())
     }
 
     /// Paths of files with at least one ambiguous (multi-hit, no exact-tier
@@ -220,16 +208,11 @@ impl IndexStore {
     /// the reachability graph. Mirrors [`open_include_file_paths`]; the
     /// first-cause precedence (`UnresolvedInclude` before `AmbiguousInclude`)
     /// is encoded by `ReachGraph::new`, not by this query.
+    #[allow(dead_code)]
     pub fn ambiguous_include_file_paths(&self) -> Result<Vec<String>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT path FROM files WHERE ambiguous_includes > 0")?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-        let mut paths = Vec::new();
-        for row in rows {
-            paths.push(row?);
-        }
-        Ok(paths)
+        self.reach_graph_view()
+            .ambiguous_includes()
+            .map(|rows| rows.into_iter().map(|row| row.source_path).collect())
     }
 
     /// Find (distinct, sorted) source file paths whose include rows name a path
@@ -339,63 +322,23 @@ impl IndexStore {
     ///
     /// `OpenReason::AmbiguousInclude` wins on tie: the caller should use the
     /// same `UnresolvedInclude` > `AmbiguousInclude` precedence as `ReachGraph::new`.
+    #[allow(dead_code)]
     pub fn load_include_data_for_sources(
         &self,
         source_paths: &[String],
     ) -> Result<(IncludeEdgeRows, IncludeOpenRows)> {
-        if source_paths.is_empty() {
-            return Ok((Vec::new(), Vec::new()));
-        }
-
-        let mut edges = Vec::new();
-        let mut open = Vec::new();
-
-        for chunk in source_paths.chunks(400) {
-            let placeholders = vec!["?"; chunk.len()].join(",");
-
-            // Load edges for these sources.
-            let edge_sql = format!(
-                "SELECT sf.path, df.path FROM include_edges e \
-                 JOIN files sf ON sf.id = e.src_file_id \
-                 JOIN files df ON df.id = e.dst_file_id \
-                 WHERE sf.path IN ({placeholders})"
-            );
-            let mut stmt = self.conn.prepare(&edge_sql)?;
-            let rows = stmt.query_map(
-                rusqlite::params_from_iter(chunk.iter().map(String::as_str)),
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )?;
-            for row in rows {
-                edges.push(row?);
-            }
-
-            // Load open status: unresolved > 0, ambiguous > 0.
-            let open_sql = format!(
-                "SELECT path, unresolved_includes, ambiguous_includes FROM files \
-                 WHERE path IN ({placeholders})"
-            );
-            let mut open_stmt = self.conn.prepare(&open_sql)?;
-            let open_rows = open_stmt.query_map(
-                rusqlite::params_from_iter(chunk.iter().map(String::as_str)),
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, i64>(2)?,
-                    ))
-                },
-            )?;
-            for row in open_rows {
-                let (path, unresolved_count, ambiguous_count) = row?;
-                use crate::reachability::OpenReason;
-                if unresolved_count > 0 {
-                    open.push((path, OpenReason::UnresolvedInclude));
-                } else if ambiguous_count > 0 {
-                    open.push((path, OpenReason::AmbiguousInclude));
-                }
-            }
-        }
-
-        Ok((edges, open))
+        self.reach_graph_view()
+            .include_data_for_sources(source_paths)
+            .map(|(edges, open)| {
+                (
+                    edges
+                        .into_iter()
+                        .map(crate::store::views::IncludeEdgeRow::into_legacy_tuple)
+                        .collect(),
+                    open.into_iter()
+                        .map(crate::store::views::OpenIncludeRow::into_legacy_tuple)
+                        .collect(),
+                )
+            })
     }
 }

@@ -11,8 +11,8 @@ pub(super) async fn rebuild_name_table(name_tables: &NameTables, root: PathBuf) 
     let built = tokio::task::spawn_blocking(move || -> Result<NameTable> {
         let db_path = pathing::default_index_path(&build_root)?;
         let store = IndexStore::open_readonly(&db_path)?;
-        Ok(NameTable::build_with_paths(
-            store.load_symbol_names_with_paths()?,
+        Ok(NameTable::build_from_rows(
+            store.name_table_view().symbol_rows()?,
         ))
     })
     .await;
@@ -72,7 +72,9 @@ pub(super) async fn refresh_reach_graph_incremental(
         tokio::task::spawn_blocking(move || -> Result<_> {
             let db_path = crate::pathing::default_index_path(&db_root)?;
             let store = IndexStore::open_readonly(&db_path)?;
-            store.load_include_data_for_sources(&source_vec_clone)
+            store
+                .reach_graph_view()
+                .include_data_for_sources(&source_vec_clone)
         })
         .await
     };
@@ -82,7 +84,7 @@ pub(super) async fn refresh_reach_graph_incremental(
             let existing = reach_graphs.lock().await.get(&root).cloned();
             let refreshed = existing.is_some_and(|graph| match graph.write() {
                 Ok(mut graph) => {
-                    graph.refresh_sources(&source_vec, edges, open);
+                    graph.refresh_sources_from_rows(&source_vec, edges, open);
                     true
                 }
                 Err(_) => false,
@@ -127,10 +129,11 @@ pub(super) async fn rebuild_reach_graph(
     let built = tokio::task::spawn_blocking(move || -> Result<ReachGraph> {
         let db_path = pathing::default_index_path(&build_root)?;
         let store = IndexStore::open_readonly(&db_path)?;
-        Ok(ReachGraph::new(
-            store.load_include_edge_paths()?,
-            store.open_include_file_paths()?,
-            store.ambiguous_include_file_paths()?,
+        let reach_view = store.reach_graph_view();
+        Ok(ReachGraph::from_rows(
+            reach_view.include_edges()?,
+            reach_view.unresolved_includes()?,
+            reach_view.ambiguous_includes()?,
         ))
     })
     .await;
@@ -175,10 +178,10 @@ pub(super) async fn update_name_table_paths(
     let paths_vec = paths.to_vec();
     #[allow(clippy::type_complexity)]
     let loaded = tokio::task::spawn_blocking(
-        move || -> Result<Vec<(i64, String, bool, String, String, bool)>> {
+        move || -> Result<Vec<crate::store::views::NameTableSymbolRow>> {
             let db_path = pathing::default_index_path(&build_root)?;
             let store = IndexStore::open_readonly(&db_path)?;
-            store.load_symbol_names_for_paths(&paths_vec)
+            store.name_table_view().symbol_rows_for_paths(&paths_vec)
         },
     )
     .await;
@@ -192,7 +195,7 @@ pub(super) async fn update_name_table_paths(
     let path_set: HashSet<String> = paths.iter().cloned().collect();
     let mut tables = name_tables.lock().await;
     let updated = match tables.get(&root) {
-        Some(existing) => existing.with_updated_paths(&path_set, fresh_names),
+        Some(existing) => existing.with_updated_path_rows(&path_set, fresh_names),
         None => {
             drop(tables);
             return rebuild_name_table(name_tables, root).await;
@@ -211,9 +214,9 @@ pub(in crate::server) async fn rebuild_include_table(
     let built = tokio::task::spawn_blocking(move || -> Result<IncludeCompletionTable> {
         let db_path = pathing::default_index_path(&build_root)?;
         let store = IndexStore::open_readonly(&db_path)?;
-        Ok(IncludeCompletionTable::build_with_edges(
-            store.workspace_file_paths()?,
-            store.load_include_edge_paths()?,
+        Ok(IncludeCompletionTable::build_from_rows(
+            store.include_table_view().workspace_paths()?,
+            store.reach_graph_view().include_edges()?,
         ))
     })
     .await;
@@ -244,11 +247,12 @@ pub(in crate::server) async fn rebuild_indexed_file_list(
         let db_path = pathing::default_index_path(&build_root)?;
         let store = IndexStore::open_readonly(&db_path)?;
         Ok(store
+            .reference_file_view()
             .indexed_workspace_files()?
             .into_iter()
-            .map(|rel| {
-                let abs = build_root.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
-                (rel, abs)
+            .map(|row| {
+                let abs = build_root.join(row.path.replace('/', std::path::MAIN_SEPARATOR_STR));
+                (row.path, abs)
             })
             .collect())
     })

@@ -479,7 +479,12 @@ fn position_roles(
     }
 
     let source = std::fs::read_to_string(abs_path).ok()?;
-    let occurrences = parser::parse(abs_path, &source).occurrences;
+    let parsed = parser::parse_with_handle(abs_path, &source, None, parser::ParseFacts::COLOR_REF);
+    let request_facts = parsed.request_facts();
+    let occurrences = match parsed.fact_availability(parser::FactGroup::Occurrences) {
+        parser::FactAvailability::Available => request_facts.occurrences,
+        parser::FactAvailability::NotRequested | parser::FactAvailability::Unavailable(_) => &[],
+    };
     let mut map: HashMap<(u32, u32), SyntacticRole> = HashMap::with_capacity(occurrences.len());
     for occ in occurrences {
         map.entry((occ.line, occ.start_col)).or_insert(occ.role);

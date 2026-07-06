@@ -131,16 +131,18 @@ pub(super) fn collect_ast_index(
                         signature,
                     });
 
-                    collect_body_members(
-                        body,
-                        &record_key,
-                        &display_name,
-                        source,
-                        line_starts,
-                        &mut out.records,
-                        &mut out.fields,
-                        &mut out.members,
-                    );
+                    if facts.contains(ParseFacts::FIELDS) {
+                        collect_body_members(
+                            body,
+                            &record_key,
+                            &display_name,
+                            source,
+                            line_starts,
+                            &mut out.records,
+                            &mut out.fields,
+                            &mut out.members,
+                        );
+                    }
                 }
             }
         } else if node.kind() == "enumerator" {

@@ -11,7 +11,9 @@ use tower_lsp::lsp_types::{
 
 use super::{empty_completion_list, member_completion_is_incomplete, uri_to_path, Backend};
 use crate::model;
-use crate::parser::{self, FileSemanticIndex, MemberConfidence, MemberKind};
+use crate::parser::{
+    self, FactAvailability, FactGroup, FileSemanticIndex, MemberConfidence, MemberKind,
+};
 use crate::pathing;
 use crate::query;
 use crate::store::IndexStore;
@@ -76,7 +78,17 @@ impl Backend {
                 // The parse is served from the live-document cache when available.
                 let record_key = match (&receiver, &path) {
                     (Some(name), Some(_path)) => cached_index.as_ref().and_then(|index| {
-                        parser::infer_receiver_record(&index.local_declarations, name, byte_offset)
+                        if !matches!(
+                            index.fact_availability(FactGroup::LocalDeclarations),
+                            FactAvailability::Available
+                        ) {
+                            return None;
+                        }
+                        parser::infer_receiver_record(
+                            index.request_facts().local_declarations,
+                            name,
+                            byte_offset,
+                        )
                     }),
                     _ => None,
                 };
@@ -94,15 +106,16 @@ impl Backend {
                                 current_path: current_rel_path.as_deref(),
                                 reach: member_reach.as_ref(),
                             };
-                            let mut candidates =
-                                store.resolve_record_candidates(&[key.as_str()], Some(&ctx))?;
+                            let mut candidates = store
+                                .member_view()
+                                .resolve_record_candidates(&[key.as_str()], Some(&ctx))?;
 
                             if candidates.is_empty() && member_reach.is_some() {
                                 let ctx_unscoped = crate::resolver::ResolveContext {
                                     current_path: current_rel_path.as_deref(),
                                     reach: None,
                                 };
-                                candidates = store.resolve_record_candidates(
+                                candidates = store.member_view().resolve_record_candidates(
                                     &[key.as_str()],
                                     Some(&ctx_unscoped),
                                 )?;
@@ -136,8 +149,9 @@ impl Backend {
                                     current_path: current_rel_path.as_deref(),
                                     reach: member_reach.as_ref(),
                                 };
-                                let candidates =
-                                    store.resolve_record_candidates(&lookup_refs, Some(&ctx))?;
+                                let candidates = store
+                                    .member_view()
+                                    .resolve_record_candidates(&lookup_refs, Some(&ctx))?;
                                 if !candidates.is_empty() {
                                     all_candidates.extend(candidates.iter().cloned());
                                     weak_candidates_by_db.push((db_path, candidates));
@@ -214,7 +228,7 @@ impl Backend {
                             .collect();
                         if !record_ids.is_empty() {
                             let store = IndexStore::open_readonly(db_path)?;
-                            let members = store.members_for_records(
+                            let members = store.member_view().members_for_records(
                                 &record_ids,
                                 None,
                                 Some(&crate::resolver::ResolveContext {
@@ -235,7 +249,7 @@ impl Backend {
                             candidates.iter().map(|candidate| candidate.id).collect();
                         if !record_ids.is_empty() {
                             let store = IndexStore::open_readonly(db_path)?;
-                            let members = store.members_for_records(
+                            let members = store.member_view().members_for_records(
                                 &record_ids,
                                 None,
                                 Some(&crate::resolver::ResolveContext {
@@ -276,6 +290,7 @@ impl Backend {
                             };
                             fallback.extend(
                                 store
+                                    .member_view()
                                     .fallback_member_candidates(&prefix, limit, Some(&ctx))?
                                     .into_iter()
                                     .map(|candidate| MemberPresentation {
@@ -559,7 +574,7 @@ fn member_type_names_for_segment(
             continue;
         }
         let store = IndexStore::open_readonly(db_path)?;
-        let members = store.members_for_records(
+        let members = store.member_view().members_for_records(
             &record_ids,
             Some(member_name),
             Some(&crate::resolver::ResolveContext {
@@ -598,13 +613,17 @@ fn resolve_record_names_across_roots(
             current_path: current_rel_path,
             reach: member_reach,
         };
-        let mut candidates = store.resolve_record_candidates(&lookup_refs, Some(&ctx))?;
+        let mut candidates = store
+            .member_view()
+            .resolve_record_candidates(&lookup_refs, Some(&ctx))?;
         if candidates.is_empty() && member_reach.is_some() {
             let ctx_unscoped = crate::resolver::ResolveContext {
                 current_path: current_rel_path,
                 reach: None,
             };
-            candidates = store.resolve_record_candidates(&lookup_refs, Some(&ctx_unscoped))?;
+            candidates = store
+                .member_view()
+                .resolve_record_candidates(&lookup_refs, Some(&ctx_unscoped))?;
         }
         if !candidates.is_empty() {
             by_db.push((db_path, candidates));

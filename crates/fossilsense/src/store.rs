@@ -3,13 +3,14 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
 use crate::parser::{FileSemanticIndex, SymbolKind, SymbolRole};
 
 mod includes;
 mod queries;
 mod schema;
+pub mod views;
 mod writes;
 
 /// Whether an indexed file belongs to the workspace or to an external include
@@ -205,44 +206,26 @@ impl IndexStore {
 
     /// Workspace files whose path equals `rel` or ends with `/rel` — the
     /// degraded "workspace headers" fallback for include-target resolution.
+    #[allow(dead_code)]
     pub fn workspace_files_by_suffix(&self, rel: &str) -> Result<Vec<String>> {
-        let like = format!(
-            "%/{}",
-            rel.replace('\\', "\\\\")
-                .replace('%', "\\%")
-                .replace('_', "\\_")
-        );
-        let mut stmt = self.conn.prepare(
-            "SELECT path FROM files WHERE source = 'workspace' \
-             AND (path = ?1 OR path LIKE ?2 ESCAPE '\\')",
-        )?;
-        let rows = stmt.query_map(params![rel, like], |row| row.get::<_, String>(0))?;
-        let mut paths = Vec::new();
-        for row in rows {
-            paths.push(row?);
-        }
-        Ok(paths)
+        self.include_table_view().workspace_files_by_suffix(rel)
     }
 
     /// All indexed workspace file paths, used by degraded include completion to
     /// surface headers that live below common include roots.
+    #[allow(dead_code)]
     pub fn workspace_file_paths(&self) -> Result<Vec<String>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT path FROM files WHERE source = 'workspace' ORDER BY path")?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-        let mut paths = Vec::new();
-        for row in rows {
-            paths.push(row?);
-        }
-        Ok(paths)
+        self.include_table_view().workspace_file_paths()
     }
 
     /// Indexed workspace files as relative paths, excluding external include
     /// files. Used by reference search discovery to avoid walking the
     /// workspace tree on each request.
+    #[allow(dead_code)]
     pub fn indexed_workspace_files(&self) -> Result<Vec<String>> {
-        self.workspace_file_paths()
+        self.reference_file_view()
+            .indexed_workspace_files()
+            .map(|rows| rows.into_iter().map(|row| row.path).collect())
     }
 
     /// Count of indexed symbols belonging to external files (test/diagnostic).
@@ -490,6 +473,30 @@ impl IndexStore {
     fn create_lookup_indexes(&self) -> Result<()> {
         self.conn.execute_batch(schema::CREATE_LOOKUP_INDEXES_SQL)?;
         Ok(())
+    }
+
+    pub fn name_table_view(&self) -> views::NameTableStoreView<'_> {
+        views::NameTableStoreView::new(self)
+    }
+
+    pub fn reach_graph_view(&self) -> views::ReachGraphStoreView<'_> {
+        views::ReachGraphStoreView::new(self)
+    }
+
+    pub fn include_table_view(&self) -> views::IncludeTableStoreView<'_> {
+        views::IncludeTableStoreView::new(self)
+    }
+
+    pub fn symbol_read_view(&self) -> views::SymbolReadView<'_> {
+        views::SymbolReadView::new(self)
+    }
+
+    pub fn reference_file_view(&self) -> views::ReferenceFileStoreView<'_> {
+        views::ReferenceFileStoreView::new(self)
+    }
+
+    pub fn member_view(&self) -> views::MemberStoreView<'_> {
+        views::MemberStoreView::new(self)
     }
 }
 

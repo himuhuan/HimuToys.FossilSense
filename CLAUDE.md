@@ -50,8 +50,8 @@ fossilsense 单一 Rust 原生二进制 (crates/fossilsense)
 | `scanner` | 文件遍历，尊重 `.gitignore` 和默认排除 |
 | `indexer` | 扫描、增量判定、解析、SQLite 写入、进度事件 |
 | `model` | 候选语义层与规范导出名 |
-| `parser` | tree-sitter C/C++ 容错解析；唯一入口 `parse()` |
-| `store` | SQLite schema、迁移、事务、清理 |
+| `parser` | tree-sitter C/C++ 容错解析；唯一入口 `parse()`；提供 persistent/request facts 投影与 fact availability |
+| `store` | SQLite schema、迁移、事务、清理、写入，以及 durable read views / typed rows |
 | `pathing` | Windows 路径规范化、仓库相对路径、workspace hash |
 | `progress` | CLI / LSP 共用索引状态 |
 | `coloring` | 语义着色分类与 LSP 相对编码 |
@@ -93,6 +93,15 @@ fossilsense 单一 Rust 原生二进制 (crates/fossilsense)
 | IO 边界 | 单点转换为平台路径 |
 | 外部 include 头 | 存规范化绝对路径 |
 | `files.source` | 标记 `workspace` / `external` |
+
+Store read-view 规则：
+
+| 项 | 规则 |
+|---|---|
+| read views | 跨模块 durable reads 通过 `store::views` 的窄视图：name table、reach graph、include table、symbol/reference file、member |
+| typed rows | read-model builder 输入使用 typed row / DTO，不依赖 SQL tuple column order |
+| SQL ownership | `rusqlite` 与 SQL-to-domain 转换留在 `store` / persistence 边界 |
+| compatibility | 旧 `IndexStore` query wrapper 可作为兼容/测试 oracle 保留，但应委托 read views 或共享 typed loader |
 
 ## 5. 当前能力
 
@@ -257,6 +266,17 @@ parse(path, source) -> FileSemanticIndex
 | `local_declarations` | 请求期 receiver 推断，不持久化 |
 | `ParseDiagnostics` | parse error、fallback、provenance |
 
+Parser facts 合同：
+
+| 项 | 规则 |
+|---|---|
+| `ParseFacts::INDEX` | 索引期事实；跳过 occurrences、local declarations、local bindings |
+| `ParseFacts::COLOR_REF` | 着色和引用角色所需 occurrences + lexical facts |
+| `ParseFacts::MEMBER` | 成员补全 receiver 推断所需 local declarations / bindings + record/member/alias facts |
+| `PersistentFacts` | `FileSemanticIndex::persistent_facts()` 返回 symbols、includes、records、fields、members、aliases 的借用投影 |
+| `RequestFacts` | `FileSemanticIndex::request_facts()` 返回 occurrences、local declarations、local bindings 的借用投影 |
+| `FactAvailability` | `Available` / `NotRequested` / `Unavailable(LexicalFallback)`；空向量不能单独代表 skipped 或 fallback |
+
 降级：
 
 - 普通解析问题不返回 `Err`。
@@ -319,6 +339,8 @@ command: FossilSense: Find References (Grouped by Role)
 | `RecordCandidate` | record 候选 |
 
 成员补全必须使用：`resolve_record_candidates`、`members_for_records`、`fallback_member_candidates`。`fields_for_records` 只作为兼容 wrapper 保留。
+
+成员 durable reads 必须通过 `store::views::MemberStoreView` 或兼容 wrapper，保持 `RecordCandidate` / `MemberCandidate`、`ScopeTier`、alias recursion、prefix filtering、fallback caps 与排序语义不变。
 
 禁止恢复：
 
@@ -417,7 +439,7 @@ dist/fossilsense-vscode-<version>_BUILD<YYYYMMDD_HHMMSS>.vsix
 | 历史文档标状态 | `current` / `implemented` / `archived` / `superseded`；不得自动复活历史愿景 |
 | 先稳定概念 | 新能力先说明使用 `Definition`、`Declaration`、`Occurrence`、`ReferenceHit`、`RecordDef`、`FieldDef`、`TypeAlias`、`IncludeEdge`、`ReachScope` 中哪个概念 |
 | 候选不是绑定 | 没有编译级证据时，跳转、补全、引用、着色都是 best-effort candidate |
-| 文档必须写清 | confidence、fallback、ambiguity、open scope、truncation、cache invalidation |
+| 文档必须写清 | confidence、fallback、ambiguity、open scope、truncation、cache invalidation、parser fact availability、store read-view contracts |
 | 少叠 magic score | 排序必须分清 match quality、scope tier、external penalty、locality、fallback confidence；继续走共享 `resolver` |
 | 注释讲不变量 | 避免 `always` / `never` / `complete` / `zero-cost` / `non-empty`，除非代码和测试支撑 |
 | 错误处理可见 | 解析和配置缺口可降级；索引失败、DB 损坏、`NameTable` / `ReachGraph` 构建失败不能伪装 ready |

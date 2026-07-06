@@ -6,7 +6,7 @@ use tower_lsp::lsp_types::{Range, SemanticToken, Url};
 
 use super::{uri_to_path, Backend};
 use crate::coloring;
-use crate::parser::FileSemanticIndex;
+use crate::parser::{FactAvailability, FactGroup, FileSemanticIndex};
 use crate::query;
 
 impl Backend {
@@ -61,12 +61,21 @@ impl Backend {
 
         let result = tokio::task::spawn_blocking(move || -> Result<Vec<coloring::ColoredToken>> {
             let defs = index.coloring_defs();
+            let request_facts = index.request_facts();
+            let occurrences = match index.fact_availability(FactGroup::Occurrences) {
+                FactAvailability::Available => request_facts.occurrences,
+                FactAvailability::NotRequested | FactAvailability::Unavailable(_) => &[],
+            };
+            let local_bindings = match index.fact_availability(FactGroup::LocalBindings) {
+                FactAvailability::Available => request_facts.local_bindings,
+                FactAvailability::NotRequested | FactAvailability::Unavailable(_) => &[],
+            };
 
             // Batch the index lookup over distinct names not already resolved by
             // a current-file definition.
             let mut wanted: Vec<&str> = Vec::new();
             let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-            for occ in &index.occurrences {
+            for occ in occurrences {
                 if defs.macro_defs.contains(&occ.name)
                     || defs.type_defs.contains(&occ.name)
                     || defs.enum_defs.contains(&occ.name)
@@ -90,11 +99,11 @@ impl Backend {
             };
 
             Ok(coloring::classify_occurrences_with_locals(
-                &index.occurrences,
+                occurrences,
                 &defs.macro_defs,
                 &defs.type_defs,
                 &defs.enum_defs,
-                &index.local_bindings,
+                local_bindings,
                 &index_counts,
             ))
         })

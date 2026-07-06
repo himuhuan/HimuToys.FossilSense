@@ -1,6 +1,6 @@
 //! Limited `#include` reachability analysis.
 //!
-//! Two concerns, both kept free of `tower-lsp` and store types so they unit-test
+//! Two concerns, both kept free of `tower-lsp` request types so they unit-test
 //! cleanly: (1) resolving a lexical `#include` target to the indexed file(s) it
 //! names, and (2) computing, from the resolved file-to-file graph, the bounded
 //! set of files reachable from a given file. The reachable set is the *scope*
@@ -9,6 +9,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
+
+use crate::store::views::{IncludeEdgeRow, OpenIncludeRow};
 
 /// Maximum include depth followed before a reachable set is declared "open".
 pub const MAX_REACH_DEPTH: usize = 32;
@@ -95,6 +97,26 @@ impl ReachGraph {
         }
     }
 
+    pub fn from_rows(
+        edge_rows: Vec<IncludeEdgeRow>,
+        unresolved_rows: Vec<OpenIncludeRow>,
+        ambiguous_rows: Vec<OpenIncludeRow>,
+    ) -> Self {
+        let edge_pairs = edge_rows
+            .into_iter()
+            .map(|row| (row.source_path, row.target_path))
+            .collect();
+        let unresolved_files = unresolved_rows
+            .into_iter()
+            .map(|row| row.source_path)
+            .collect();
+        let ambiguous_files = ambiguous_rows
+            .into_iter()
+            .map(|row| row.source_path)
+            .collect();
+        Self::new(edge_pairs, unresolved_files, ambiguous_files)
+    }
+
     /// Replace the out-edges and open flags for the given source paths, clearing
     /// the memoized reachable-set cache so subsequent queries recompute from the
     /// updated graph state. Sources not in `sources` retain their current edges
@@ -142,6 +164,24 @@ impl ReachGraph {
 
         // Clear the cache so subsequent reachable() calls recompute.
         self.cache = Mutex::new(HashMap::new());
+    }
+
+    pub fn refresh_sources_from_rows(
+        &mut self,
+        sources: &[String],
+        edges: Vec<IncludeEdgeRow>,
+        open: Vec<OpenIncludeRow>,
+    ) {
+        self.refresh_sources(
+            sources,
+            edges
+                .into_iter()
+                .map(|row| (row.source_path, row.target_path))
+                .collect(),
+            open.into_iter()
+                .map(|row| (row.source_path, row.reason))
+                .collect(),
+        );
     }
 
     /// Reachable set for `start`, memoized for this graph generation.

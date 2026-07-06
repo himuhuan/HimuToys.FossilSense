@@ -9,6 +9,7 @@ use crate::model::ScopeTier;
 use crate::parser::SymbolKind as ParserKind;
 use crate::reachability::ReachScope;
 use crate::resolver::{self, ResolveContext};
+use crate::store::views::NameTableSymbolRow;
 
 #[allow(dead_code)]
 mod current_file_overlay;
@@ -198,6 +199,7 @@ fn all_workspace_reach(entries: &[NameEntry]) -> ReachScope {
 }
 
 impl NameTable {
+    #[allow(dead_code)]
     pub fn build(names: Vec<(i64, String, bool)>) -> Self {
         Self::build_with_paths(
             names
@@ -209,8 +211,18 @@ impl NameTable {
         )
     }
 
+    #[allow(dead_code)]
     pub fn build_with_paths(names: Vec<(i64, String, bool, String, String, bool)>) -> Self {
         let entries: Vec<NameEntry> = names.into_iter().map(name_entry).collect();
+        Self::from_entries(entries)
+    }
+
+    pub fn build_from_rows(rows: Vec<NameTableSymbolRow>) -> Self {
+        let entries: Vec<NameEntry> = rows.into_iter().map(name_entry_from_row).collect();
+        Self::from_entries(entries)
+    }
+
+    fn from_entries(entries: Vec<NameEntry>) -> Self {
         let sorted = sorted_indices(&entries);
         let all_workspace_reach = Arc::new(all_workspace_reach(&entries));
         Self {
@@ -220,10 +232,29 @@ impl NameTable {
         }
     }
 
+    #[allow(dead_code)]
     pub fn with_updated_paths(
         &self,
         paths: &HashSet<String>,
         names: Vec<(i64, String, bool, String, String, bool)>,
+    ) -> Self {
+        let fresh_entries = names.into_iter().map(name_entry);
+        self.with_updated_entries(paths, fresh_entries)
+    }
+
+    pub fn with_updated_path_rows(
+        &self,
+        paths: &HashSet<String>,
+        rows: Vec<NameTableSymbolRow>,
+    ) -> Self {
+        let fresh_entries = rows.into_iter().map(name_entry_from_row);
+        self.with_updated_entries(paths, fresh_entries)
+    }
+
+    fn with_updated_entries(
+        &self,
+        paths: &HashSet<String>,
+        fresh_entries: impl IntoIterator<Item = NameEntry>,
     ) -> Self {
         let mut entries: Vec<NameEntry> = self
             .entries
@@ -231,14 +262,8 @@ impl NameTable {
             .filter(|entry| !paths.contains(&entry.path))
             .cloned()
             .collect();
-        entries.extend(names.into_iter().map(name_entry));
-        let sorted = sorted_indices(&entries);
-        let all_workspace_reach = Arc::new(all_workspace_reach(&entries));
-        Self {
-            entries,
-            sorted,
-            all_workspace_reach,
-        }
+        entries.extend(fresh_entries);
+        Self::from_entries(entries)
     }
 
     /// Entry indices whose lowercased name starts with `needle_lower` (the exact
@@ -793,8 +818,31 @@ fn recall_metrics(hits: &[RankedNameHit], pool_total: usize) -> CompletionRecall
 
 /// Build a `NameEntry` from a loader tuple
 /// `(id, name, external, path, kind, directly_included)`.
+#[allow(dead_code)]
 fn name_entry(
     (id, name, external, path, kind, directly_included): (i64, String, bool, String, String, bool),
+) -> NameEntry {
+    name_entry_parts(id, name, external, path, kind, directly_included)
+}
+
+fn name_entry_from_row(row: NameTableSymbolRow) -> NameEntry {
+    name_entry_parts(
+        row.symbol_id,
+        row.label,
+        row.external,
+        row.path,
+        row.kind,
+        row.directly_included,
+    )
+}
+
+fn name_entry_parts(
+    id: i64,
+    name: String,
+    external: bool,
+    path: String,
+    kind: String,
+    directly_included: bool,
 ) -> NameEntry {
     let lower = name.to_ascii_lowercase();
     NameEntry {

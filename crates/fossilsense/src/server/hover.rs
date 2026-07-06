@@ -42,7 +42,7 @@ impl Backend {
             }
             let store = IndexStore::open_readonly(&db_path)?;
             let candidates = query::rank_hover_candidates(
-                store.symbols_by_name(&word)?,
+                store.symbol_read_view().symbols_by_name(&word)?,
                 &current_rel,
                 reach_scope.as_deref(),
                 query::HOVER_CANDIDATE_LIMIT,

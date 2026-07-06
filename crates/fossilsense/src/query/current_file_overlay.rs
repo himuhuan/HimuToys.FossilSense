@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
-use crate::parser::{FactSource, FileSemanticIndex, SymbolKind, SymbolRole, TypeAlias};
+use crate::parser::{
+    FactAvailability, FactGroup, FactSource, FileSemanticIndex, SymbolKind, SymbolRole, TypeAlias,
+};
 
 use super::{byte_offset_at, completion_word_score};
 
@@ -31,9 +33,11 @@ pub fn current_file_overlay_candidates(
 
     let cursor_byte = byte_offset_at(text, line, character).min(text.len());
     let mut by_name: HashMap<String, CurrentFileOverlayCandidate> = HashMap::new();
-    let usage_stats = occurrence_usage_stats(index, cursor_byte, prefix);
+    let persistent_facts = index.persistent_facts();
+    let request_facts = index.request_facts();
+    let usage_stats = occurrence_usage_stats(request_facts.occurrences, cursor_byte, prefix);
 
-    for symbol in &index.symbols {
+    for symbol in persistent_facts.symbols {
         if !is_overlay_symbol(symbol.kind, symbol.role) {
             continue;
         }
@@ -58,13 +62,13 @@ pub fn current_file_overlay_candidates(
         );
     }
 
-    for alias in &index.aliases {
+    for alias in persistent_facts.aliases {
         add_alias_candidate(&mut by_name, alias, prefix, cursor_byte, &usage_stats);
     }
 
     add_cpp_using_alias_candidates(&mut by_name, text, cursor_byte, prefix, &usage_stats);
 
-    for record in &index.records {
+    for record in persistent_facts.records {
         let Some(match_score) = completion_word_score(prefix, &record.display_name, 0) else {
             continue;
         };
@@ -241,12 +245,12 @@ struct UsageStats {
 }
 
 fn occurrence_usage_stats(
-    index: &FileSemanticIndex,
+    occurrences: &[crate::parser::Occurrence],
     cursor_byte: usize,
     prefix: &str,
 ) -> HashMap<String, UsageStats> {
     let mut stats = HashMap::new();
-    for occurrence in &index.occurrences {
+    for occurrence in occurrences {
         let occurrence_end = occurrence.start_byte.saturating_add(occurrence.name.len());
         if occurrence_end > cursor_byte {
             continue;
@@ -328,7 +332,12 @@ fn is_ident_continue(byte: u8) -> bool {
 }
 
 fn should_use_raw_scan(index: &FileSemanticIndex) -> bool {
-    index.occurrences.is_empty()
+    let occurrences_available = matches!(
+        index.fact_availability(FactGroup::Occurrences),
+        FactAvailability::Available
+    );
+    !occurrences_available
+        || index.request_facts().occurrences.is_empty()
         || index.diagnostics.fallback_used
         || index.diagnostics.ast_source == FactSource::LexicalFallback
 }

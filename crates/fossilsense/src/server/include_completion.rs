@@ -8,6 +8,7 @@ use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind, Location, Positio
 use crate::config::WorkspaceConfig;
 use crate::includes::{self, IncludeForm};
 use crate::pathing;
+use crate::store::views::{IncludeCompletionPathRow, IncludeEdgeRow};
 use crate::store::IndexStore;
 
 pub(super) type ExternalIncludeDirCache = Arc<StdMutex<HashMap<String, CachedDirListing>>>;
@@ -67,6 +68,19 @@ impl IncludeCompletionTable {
             basename_counts,
             incoming_by_src_dir,
         }
+    }
+
+    pub(super) fn build_from_rows(
+        workspace_paths: Vec<IncludeCompletionPathRow>,
+        include_edges: Vec<IncludeEdgeRow>,
+    ) -> Self {
+        Self::build_with_edges(
+            workspace_paths.into_iter().map(|row| row.path).collect(),
+            include_edges
+                .into_iter()
+                .map(|row| (row.source_path, row.target_path))
+                .collect(),
+        )
     }
 
     pub(super) fn len(&self) -> usize {
@@ -258,6 +272,7 @@ pub(super) fn resolve_include_paths(
         (Some(ws), Some(db)) if db.exists() => {
             let store = IndexStore::open_readonly(db)?;
             store
+                .include_table_view()
                 .workspace_files_by_suffix(rel)?
                 .into_iter()
                 .map(|rel| ws.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR)))
@@ -645,7 +660,7 @@ fn collect_workspace_include_candidates(
     let Ok(store) = IndexStore::open_readonly(db_path) else {
         return;
     };
-    let Ok(paths) = store.workspace_file_paths() else {
+    let Ok(paths) = store.include_table_view().workspace_file_paths() else {
         return;
     };
     for path in paths {

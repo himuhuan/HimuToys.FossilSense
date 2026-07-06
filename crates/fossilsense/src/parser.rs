@@ -91,6 +91,67 @@ pub struct FileSemanticIndex {
     pub diagnostics: ParseDiagnostics,
 }
 
+/// Stable index-time projection over the fields callers persist to SQLite.
+///
+/// This is a borrowed view so existing `FileSemanticIndex` ownership and field
+/// access remain unchanged while parser consumers migrate incrementally.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub struct PersistentFacts<'a> {
+    pub symbols: &'a [Symbol],
+    pub includes: &'a [Include],
+    pub records: &'a [RecordDef],
+    pub fields: &'a [FieldDef],
+    pub members: &'a [MemberDef],
+    pub aliases: &'a [TypeAlias],
+}
+
+/// Request-time AST facts used by live features such as coloring, references,
+/// member completion receiver inference, and local completion evidence.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub struct RequestFacts<'a> {
+    pub occurrences: &'a [Occurrence],
+    pub local_declarations: &'a [LocalDeclaration],
+    pub local_bindings: &'a [LocalBinding],
+}
+
+/// Parser fact groups with explicit request/availability state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(dead_code)]
+pub enum FactGroup {
+    Symbols,
+    Includes,
+    Occurrences,
+    Records,
+    Fields,
+    Members,
+    Aliases,
+    LocalDeclarations,
+    LocalBindings,
+}
+
+/// Why a requested fact group is not available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum FactUnavailableReason {
+    /// tree-sitter did not produce a usable tree, so only lexical facts exist.
+    LexicalFallback,
+}
+
+/// Availability for a fact group under the requested [`ParseFacts`] mask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum FactAvailability {
+    /// The caller's fact mask omitted this group.
+    NotRequested,
+    /// The group was requested and the parser product can be trusted for it;
+    /// an empty vector still means "available, with no facts found".
+    Available,
+    /// The group was requested, but parser degradation prevented collection.
+    Unavailable(FactUnavailableReason),
+}
+
 /// Where a group of facts in a `FileSemanticIndex` came from. R5 keeps symbol
 /// extraction lexical and only labels provenance; it does not move top-level
 /// symbols onto the AST.
@@ -117,6 +178,10 @@ pub struct ParseDiagnostics {
     /// Provenance of the AST fact groups: `Ast` on a usable tree, otherwise
     /// `LexicalFallback`.
     pub ast_source: FactSource,
+    /// The fact mask used to produce this index. Compatibility fields still
+    /// carry the same values as before; this lets callers distinguish skipped
+    /// groups from requested groups that are empty or unavailable.
+    pub requested_facts: ParseFacts,
 }
 
 /// A record-typed declaration in a file, used by positional receiver inference.
@@ -157,6 +222,40 @@ pub struct ColoringDefs {
 }
 
 impl FileSemanticIndex {
+    /// Borrow the persistent/index-time facts without changing the legacy field
+    /// layout. Group 5 parser consumers can migrate to this projection while
+    /// older call sites keep reading the public fields.
+    #[allow(dead_code)]
+    pub fn persistent_facts(&self) -> PersistentFacts<'_> {
+        PersistentFacts {
+            symbols: &self.symbols,
+            includes: &self.includes,
+            records: &self.records,
+            fields: &self.fields,
+            members: &self.members,
+            aliases: &self.aliases,
+        }
+    }
+
+    /// Borrow request-time facts without implying that every group was
+    /// requested. Use [`FileSemanticIndex::fact_availability`] to distinguish
+    /// skipped, available-empty, and fallback-unavailable groups.
+    #[allow(dead_code)]
+    pub fn request_facts(&self) -> RequestFacts<'_> {
+        RequestFacts {
+            occurrences: &self.occurrences,
+            local_declarations: &self.local_declarations,
+            local_bindings: &self.local_bindings,
+        }
+    }
+
+    /// Return the availability of one fact group under the parse mask that
+    /// produced this index.
+    #[allow(dead_code)]
+    pub fn fact_availability(&self, group: FactGroup) -> FactAvailability {
+        self.diagnostics.fact_availability(group)
+    }
+
     /// Project the coloring definition-name sets from this index's symbols. This
     /// reuses the already-extracted symbols (no re-parse): definition-role macros
     /// and types from the lexical pass, plus enum constants from the AST pass.
@@ -177,6 +276,48 @@ impl FileSemanticIndex {
             }
         }
         defs
+    }
+}
+
+impl ParseDiagnostics {
+    /// Availability for one group based on the requested mask and parser
+    /// provenance. This is intentionally metadata-only: it does not change the
+    /// existing vectors or tolerant parse behavior.
+    #[allow(dead_code)]
+    pub fn fact_availability(&self, group: FactGroup) -> FactAvailability {
+        if matches!(group, FactGroup::Symbols | FactGroup::Includes) {
+            return FactAvailability::Available;
+        }
+
+        if !self.group_requested(group) {
+            return FactAvailability::NotRequested;
+        }
+
+        if self.ast_source == FactSource::LexicalFallback {
+            FactAvailability::Unavailable(FactUnavailableReason::LexicalFallback)
+        } else {
+            FactAvailability::Available
+        }
+    }
+
+    /// True when the group was requested by the parse mask or collected as a
+    /// required dependency of a requested group.
+    #[allow(dead_code)]
+    pub fn group_requested(&self, group: FactGroup) -> bool {
+        match group {
+            FactGroup::Symbols | FactGroup::Includes => true,
+            FactGroup::Occurrences => self.requested_facts.contains(ParseFacts::OCCURRENCES),
+            FactGroup::Records => self
+                .requested_facts
+                .intersects(ParseFacts::RECORDS | ParseFacts::FIELDS),
+            FactGroup::Fields | FactGroup::Members => {
+                self.requested_facts.contains(ParseFacts::FIELDS)
+            }
+            FactGroup::Aliases => self.requested_facts.contains(ParseFacts::ALIASES),
+            FactGroup::LocalDeclarations | FactGroup::LocalBindings => {
+                self.requested_facts.contains(ParseFacts::LOCAL_DECLS)
+            }
+        }
     }
 }
 
@@ -487,7 +628,7 @@ pub fn parse_with_handle(
 
     let tree = match active_handle.parse_with_language(language, source, None) {
         Ok(Some(tree)) => tree,
-        Ok(None) | Err(()) => return lexical_fallback(symbols, includes),
+        Ok(None) | Err(()) => return lexical_fallback_with_facts(symbols, includes, facts),
     };
 
     let ast = collect_ast_index(tree.root_node(), source, &line_starts, facts);
@@ -511,6 +652,7 @@ pub fn parse_with_handle(
             fallback_used: false,
             symbols_source: FactSource::Lexical,
             ast_source: FactSource::Ast,
+            requested_facts: facts,
         },
     }
 }
@@ -545,7 +687,16 @@ pub fn parse_thread_local_with_facts(
 /// includes only, all AST fact vectors empty, `fallback_used = true` so a
 /// consumer or test can tell AST facts are absent by fallback rather than
 /// genuinely empty.
+#[allow(dead_code)]
 fn lexical_fallback(symbols: Vec<Symbol>, includes: Vec<Include>) -> FileSemanticIndex {
+    lexical_fallback_with_facts(symbols, includes, ParseFacts::ALL)
+}
+
+fn lexical_fallback_with_facts(
+    symbols: Vec<Symbol>,
+    includes: Vec<Include>,
+    facts: ParseFacts,
+) -> FileSemanticIndex {
     FileSemanticIndex {
         symbols,
         includes,
@@ -561,6 +712,7 @@ fn lexical_fallback(symbols: Vec<Symbol>, includes: Vec<Include>) -> FileSemanti
             fallback_used: true,
             symbols_source: FactSource::Lexical,
             ast_source: FactSource::LexicalFallback,
+            requested_facts: facts,
         },
     }
 }

@@ -1,8 +1,9 @@
 use std::path::Path;
 
 use super::{
-    infer_receiver_record, parse, parse_with_handle, FileSemanticIndex, MemberConfidence,
-    MemberKind, Occurrence, ParseFacts, ParserHandle, SymbolKind, SymbolRole, SyntacticRole,
+    infer_receiver_record, parse, parse_with_handle, FactAvailability, FactGroup,
+    FactUnavailableReason, FileSemanticIndex, MemberConfidence, MemberKind, Occurrence, ParseFacts,
+    ParserHandle, SymbolKind, SymbolRole, SyntacticRole,
 };
 
 /// Role of the (single) occurrence of `name` in a parsed buffer.
@@ -911,4 +912,303 @@ fn compact_whitespace_equivalence_fuzzy() {
             case, got, expected
         );
     }
+}
+
+fn fact_mask_source() -> &'static str {
+    r#"#include "api.h"
+#define FLAG 1
+enum Color { RED };
+struct Widget { int width; void resize(); static int count(); };
+typedef Widget WidgetAlias;
+int use(Widget *w, int count) {
+    int local_value = count;
+    w->width = local_value;
+    return FLAG + RED;
+}
+"#
+}
+
+fn has_symbol(index: &FileSemanticIndex, name: &str, kind: SymbolKind) -> bool {
+    index
+        .symbols
+        .iter()
+        .any(|symbol| symbol.name == name && symbol.kind == kind)
+}
+
+#[test]
+fn parse_fact_masks_document_current_field_contents() {
+    let path = Path::new("facts.cpp");
+
+    let index = parse_with_handle(path, fact_mask_source(), None, ParseFacts::INDEX);
+    let persistent = index.persistent_facts();
+    assert_eq!(persistent.symbols.len(), index.symbols.len());
+    assert_eq!(persistent.includes.len(), index.includes.len());
+    assert_eq!(persistent.records.len(), index.records.len());
+    assert_eq!(persistent.fields.len(), index.fields.len());
+    assert_eq!(persistent.members.len(), index.members.len());
+    assert_eq!(persistent.aliases.len(), index.aliases.len());
+    assert!(has_symbol(&index, "FLAG", SymbolKind::Macro));
+    assert!(has_symbol(&index, "RED", SymbolKind::EnumConstant));
+    assert_eq!(index.includes.len(), 1);
+    assert!(index
+        .records
+        .iter()
+        .any(|record| record.display_name == "Widget"));
+    assert!(index.fields.iter().any(|field| field.name == "width"));
+    assert!(index.members.iter().any(|member| member.name == "resize"));
+    assert!(index
+        .aliases
+        .iter()
+        .any(|alias| alias.alias == "WidgetAlias"));
+    assert!(index.occurrences.is_empty());
+    assert!(index.local_declarations.is_empty());
+    assert!(index.local_bindings.is_empty());
+    assert_eq!(index.diagnostics.ast_source, super::FactSource::Ast);
+    assert_eq!(index.diagnostics.requested_facts, ParseFacts::INDEX);
+    assert_eq!(
+        index.fact_availability(FactGroup::Occurrences),
+        FactAvailability::NotRequested
+    );
+    assert_eq!(
+        index.fact_availability(FactGroup::LocalDeclarations),
+        FactAvailability::NotRequested
+    );
+    assert_eq!(
+        index.fact_availability(FactGroup::LocalBindings),
+        FactAvailability::NotRequested
+    );
+    assert_eq!(
+        index.fact_availability(FactGroup::Records),
+        FactAvailability::Available
+    );
+    assert_eq!(
+        index.fact_availability(FactGroup::Fields),
+        FactAvailability::Available
+    );
+    assert_eq!(
+        index.fact_availability(FactGroup::Members),
+        FactAvailability::Available
+    );
+    assert_eq!(
+        index.fact_availability(FactGroup::Aliases),
+        FactAvailability::Available
+    );
+
+    let color_ref = parse_with_handle(path, fact_mask_source(), None, ParseFacts::COLOR_REF);
+    let request = color_ref.request_facts();
+    assert_eq!(request.occurrences.len(), color_ref.occurrences.len());
+    assert_eq!(
+        request.local_declarations.len(),
+        color_ref.local_declarations.len()
+    );
+    assert_eq!(request.local_bindings.len(), color_ref.local_bindings.len());
+    assert!(has_symbol(&color_ref, "FLAG", SymbolKind::Macro));
+    assert!(has_symbol(&color_ref, "RED", SymbolKind::EnumConstant));
+    assert_eq!(color_ref.includes.len(), 1);
+    assert!(color_ref.occurrences.iter().any(|occ| occ.name == "w"));
+    assert!(color_ref.records.is_empty());
+    assert!(color_ref.fields.is_empty());
+    assert!(color_ref.members.is_empty());
+    assert!(color_ref.aliases.is_empty());
+    assert!(color_ref.local_declarations.is_empty());
+    assert!(color_ref.local_bindings.is_empty());
+    assert_eq!(
+        color_ref.fact_availability(FactGroup::Occurrences),
+        FactAvailability::Available
+    );
+    assert_eq!(
+        color_ref.fact_availability(FactGroup::Records),
+        FactAvailability::NotRequested
+    );
+    assert_eq!(
+        color_ref.fact_availability(FactGroup::LocalDeclarations),
+        FactAvailability::NotRequested
+    );
+
+    let member = parse_with_handle(path, fact_mask_source(), None, ParseFacts::MEMBER);
+    assert!(has_symbol(&member, "FLAG", SymbolKind::Macro));
+    assert_eq!(member.includes.len(), 1);
+    assert!(member.occurrences.is_empty());
+    assert!(member
+        .records
+        .iter()
+        .any(|record| record.display_name == "Widget"));
+    assert!(member.members.iter().any(|m| m.name == "width"));
+    assert!(member
+        .aliases
+        .iter()
+        .any(|alias| alias.alias == "WidgetAlias"));
+    assert!(member
+        .local_declarations
+        .iter()
+        .any(|decl| decl.name == "w" && decl.record_type == "Widget"));
+    assert!(member
+        .local_bindings
+        .iter()
+        .any(|binding| binding.name == "local_value"));
+    assert_eq!(
+        member.fact_availability(FactGroup::Occurrences),
+        FactAvailability::NotRequested
+    );
+    assert_eq!(
+        member.fact_availability(FactGroup::LocalDeclarations),
+        FactAvailability::Available
+    );
+    assert_eq!(
+        member.fact_availability(FactGroup::LocalBindings),
+        FactAvailability::Available
+    );
+
+    let all = parse_with_handle(path, fact_mask_source(), None, ParseFacts::ALL);
+    assert!(has_symbol(&all, "FLAG", SymbolKind::Macro));
+    assert!(has_symbol(&all, "RED", SymbolKind::EnumConstant));
+    assert_eq!(all.includes.len(), 1);
+    assert!(all.occurrences.iter().any(|occ| occ.name == "FLAG"));
+    assert!(all
+        .records
+        .iter()
+        .any(|record| record.display_name == "Widget"));
+    assert!(all.members.iter().any(|m| m.name == "resize"));
+    assert!(all.aliases.iter().any(|alias| alias.alias == "WidgetAlias"));
+    assert!(all.local_declarations.iter().any(|decl| decl.name == "w"));
+    assert!(all
+        .local_bindings
+        .iter()
+        .any(|binding| binding.name == "count"));
+    assert_eq!(
+        all.fact_availability(FactGroup::Occurrences),
+        FactAvailability::Available
+    );
+    assert_eq!(
+        all.fact_availability(FactGroup::LocalDeclarations),
+        FactAvailability::Available
+    );
+    assert_eq!(
+        parse(Path::new("facts.cpp"), fact_mask_source())
+            .diagnostics
+            .requested_facts,
+        ParseFacts::ALL
+    );
+}
+
+#[test]
+fn records_only_mask_keeps_member_facts_not_requested() {
+    let index = parse_with_handle(
+        Path::new("records_only.cpp"),
+        fact_mask_source(),
+        None,
+        ParseFacts::RECORDS,
+    );
+
+    assert!(index
+        .records
+        .iter()
+        .any(|record| record.display_name == "Widget"));
+    assert!(index.fields.is_empty());
+    assert!(index.members.is_empty());
+    assert_eq!(
+        index.fact_availability(FactGroup::Records),
+        FactAvailability::Available
+    );
+    assert_eq!(
+        index.fact_availability(FactGroup::Fields),
+        FactAvailability::NotRequested
+    );
+    assert_eq!(
+        index.fact_availability(FactGroup::Members),
+        FactAvailability::NotRequested
+    );
+}
+
+#[test]
+fn availability_distinguishes_empty_skipped_and_fallback_ast_vectors() {
+    let path = Path::new("facts.cpp");
+    let all = parse_with_handle(path, fact_mask_source(), None, ParseFacts::ALL);
+    assert!(!all.local_declarations.is_empty());
+
+    let skipped = parse_with_handle(path, fact_mask_source(), None, ParseFacts::INDEX);
+    assert!(skipped.local_declarations.is_empty());
+    assert!(skipped.local_bindings.is_empty());
+    assert!(!skipped.diagnostics.fallback_used);
+    assert_eq!(skipped.diagnostics.ast_source, super::FactSource::Ast);
+    assert_eq!(
+        skipped.fact_availability(FactGroup::LocalDeclarations),
+        FactAvailability::NotRequested
+    );
+    assert_eq!(
+        skipped.fact_availability(FactGroup::LocalBindings),
+        FactAvailability::NotRequested
+    );
+
+    let clean_empty = parse_with_handle(
+        Path::new("empty.c"),
+        "int only_global;\n",
+        None,
+        ParseFacts::ALL,
+    );
+    assert!(clean_empty.records.is_empty());
+    assert!(clean_empty.members.is_empty());
+    assert!(clean_empty.aliases.is_empty());
+    assert!(clean_empty.local_declarations.is_empty());
+    assert!(!clean_empty.diagnostics.fallback_used);
+    assert_eq!(clean_empty.diagnostics.ast_source, super::FactSource::Ast);
+    assert_eq!(
+        clean_empty.fact_availability(FactGroup::Records),
+        FactAvailability::Available
+    );
+    assert_eq!(
+        clean_empty.fact_availability(FactGroup::Members),
+        FactAvailability::Available
+    );
+    assert_eq!(
+        clean_empty.fact_availability(FactGroup::LocalDeclarations),
+        FactAvailability::Available
+    );
+
+    let fallback_source = "#include \"x.h\"\n#define ONLY_LEXICAL 1\n";
+    let line_starts = super::line_starts(fallback_source);
+    let (symbols, includes) = super::extract_symbols_and_includes(fallback_source, &line_starts);
+    let fallback = super::lexical_fallback_with_facts(symbols, includes, ParseFacts::ALL);
+    assert!(fallback.records.is_empty());
+    assert!(fallback.members.is_empty());
+    assert!(fallback.aliases.is_empty());
+    assert!(fallback.local_declarations.is_empty());
+    assert!(fallback.local_bindings.is_empty());
+    assert!(fallback.diagnostics.fallback_used);
+    assert_eq!(
+        fallback.diagnostics.ast_source,
+        super::FactSource::LexicalFallback
+    );
+    assert_eq!(fallback.diagnostics.requested_facts, ParseFacts::ALL);
+    assert_eq!(
+        fallback.fact_availability(FactGroup::Records),
+        FactAvailability::Unavailable(FactUnavailableReason::LexicalFallback)
+    );
+    assert_eq!(
+        fallback.fact_availability(FactGroup::Members),
+        FactAvailability::Unavailable(FactUnavailableReason::LexicalFallback)
+    );
+    assert_eq!(
+        fallback.fact_availability(FactGroup::LocalDeclarations),
+        FactAvailability::Unavailable(FactUnavailableReason::LexicalFallback)
+    );
+
+    let (symbols, includes) = super::extract_symbols_and_includes(fallback_source, &line_starts);
+    let fallback_index = super::lexical_fallback_with_facts(symbols, includes, ParseFacts::INDEX);
+    assert_eq!(
+        fallback_index.fact_availability(FactGroup::Occurrences),
+        FactAvailability::NotRequested
+    );
+    assert_eq!(
+        fallback_index.fact_availability(FactGroup::LocalDeclarations),
+        FactAvailability::NotRequested
+    );
+    assert_eq!(
+        fallback_index.fact_availability(FactGroup::Records),
+        FactAvailability::Unavailable(FactUnavailableReason::LexicalFallback)
+    );
+
+    assert_eq!(skipped.local_declarations, clean_empty.local_declarations);
+    assert_eq!(clean_empty.local_declarations, fallback.local_declarations);
+    assert_eq!(clean_empty.records, fallback.records);
 }

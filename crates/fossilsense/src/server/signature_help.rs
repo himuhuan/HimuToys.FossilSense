@@ -46,7 +46,7 @@ impl Backend {
             }
             let store = IndexStore::open_readonly(&db_path)?;
             let ranked = query::rank_function_signature_candidates(
-                store.symbols_by_name(&call_name)?,
+                store.symbol_read_view().symbols_by_name(&call_name)?,
                 &current_rel,
                 reach_scope.as_deref(),
                 limit,

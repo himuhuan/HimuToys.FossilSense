@@ -221,7 +221,7 @@ impl LanguageServer for Backend {
                 let db_path = pathing::default_index_path(&root)?;
                 if db_path.exists() {
                     let store = IndexStore::open_readonly(&db_path)?;
-                    let mut indexed_records = store.symbols_by_name(&word)?;
+                    let mut indexed_records = store.symbol_read_view().symbols_by_name(&word)?;
                     if live_records_replace_current_file {
                         indexed_records.retain(|record| record.path != current_rel);
                     }
@@ -404,7 +404,7 @@ impl LanguageServer for Backend {
                     continue;
                 }
                 let store = IndexStore::open_readonly(&db_path)?;
-                for record in store.symbols_by_ids(&ids)? {
+                for record in store.symbol_read_view().symbols_by_ids(&ids)? {
                     records_by_root_and_id.insert((root.clone(), record.id), record);
                 }
             }
@@ -444,10 +444,13 @@ impl LanguageServer for Backend {
         let Some(index) = index else {
             return Ok(None);
         };
-        // Extract symbols synchronously from the cached index.
-        let symbols = index.symbols.clone();
-        let document_symbols: Vec<DocumentSymbol> =
-            symbols.iter().map(parsed_to_document_symbol).collect();
+        // Extract persistent symbols synchronously from the cached index.
+        let document_symbols: Vec<DocumentSymbol> = index
+            .persistent_facts()
+            .symbols
+            .iter()
+            .map(parsed_to_document_symbol)
+            .collect();
         self.perf_log(|| {
             format!(
                 "[perf] document_symbol total={}ms count={}",
@@ -902,7 +905,8 @@ fn live_definition_records_for_word(
     word: &str,
     current_rel: &str,
 ) -> Vec<crate::store::SymbolRecord> {
-    let mut records: Vec<_> = index
+    let persistent_facts = index.persistent_facts();
+    let mut records: Vec<_> = persistent_facts
         .symbols
         .iter()
         .filter(|symbol| symbol.name == word)
@@ -929,7 +933,7 @@ fn live_definition_records_for_word(
     // duplicate-free for typedefs such as `typedef struct { ... } Boom;`.
     if records.is_empty() {
         records.extend(
-            index
+            persistent_facts
                 .aliases
                 .iter()
                 .filter(|alias| alias.alias == word)
@@ -950,7 +954,7 @@ fn live_definition_records_for_word(
                 }),
         );
         records.extend(
-            index
+            persistent_facts
                 .records
                 .iter()
                 .filter(|record| {

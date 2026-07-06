@@ -71,7 +71,7 @@ pub(super) fn parse_and_write_changed(
             for parsed in chunk {
                 match &parsed.result {
                     Ok(index) => {
-                        chunk_symbols += index.symbols.len();
+                        chunk_symbols += index.persistent_facts().symbols.len();
                         updates.push(FileIndexUpdate {
                             fingerprint: &parsed.fingerprint,
                             source: parsed.source,

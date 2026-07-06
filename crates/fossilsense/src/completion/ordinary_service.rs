@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::completion_history::{candidate_hash_key, CompletionHistorySnapshot};
 use crate::model;
-use crate::parser::{self, FileSemanticIndex};
+use crate::parser::{self, FactAvailability, FactGroup, FileSemanticIndex};
 use crate::query::{self, NameTable};
 use crate::reachability;
 use crate::resolver;
@@ -103,8 +103,13 @@ pub(crate) fn complete_ordinary_identifier(
         .parsed_document
         .as_ref()
         .map(|index| {
+            let request_facts = index.request_facts();
+            let local_bindings = match index.fact_availability(FactGroup::LocalBindings) {
+                FactAvailability::Available => request_facts.local_bindings,
+                FactAvailability::NotRequested | FactAvailability::Unavailable(_) => &[],
+            };
             query::local_completion_candidates(
-                &index.local_bindings,
+                local_bindings,
                 &input.text,
                 input.line,
                 input.character,
