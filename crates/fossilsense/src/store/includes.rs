@@ -5,6 +5,9 @@ use rusqlite::params;
 
 use super::IndexStore;
 
+type IncludeEdgeRows = Vec<(String, String)>;
+type IncludeOpenRows = Vec<(String, crate::reachability::OpenReason)>;
+
 impl IndexStore {
     /// Reset the first-layer flag on every external file, then set it on the
     /// external files whose path is in `paths`. Idempotent; the production path
@@ -339,10 +342,7 @@ impl IndexStore {
     pub fn load_include_data_for_sources(
         &self,
         source_paths: &[String],
-    ) -> Result<(
-        Vec<(String, String)>,
-        Vec<(String, crate::reachability::OpenReason)>,
-    )> {
+    ) -> Result<(IncludeEdgeRows, IncludeOpenRows)> {
         if source_paths.is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }

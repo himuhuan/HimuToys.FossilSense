@@ -78,6 +78,7 @@ impl IncludeCompletionTable {
         self.incoming_by_src_dir.values().map(HashSet::len).sum()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn collect_candidates(
         &self,
         dir_part: &str,
@@ -535,6 +536,7 @@ fn collect_disk_include_candidates(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_cached_disk_include_candidates(
     base: &Path,
     dir_native: &str,
@@ -608,6 +610,7 @@ fn cached_dir_entries(dir: &Path, cache: &ExternalIncludeDirCache) -> Option<Vec
     Some(entries)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_workspace_include_candidates(
     db_path: Option<&Path>,
     include_table: Option<&IncludeCompletionTable>,

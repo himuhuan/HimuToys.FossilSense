@@ -568,7 +568,7 @@ fn member_type_names_for_segment(
             }),
         )?;
         for member in members {
-            if member.kind == MemberKind::Field && member.name.eq_ignore_ascii_case(member_name) {
+            if member.kind == MemberKind::Field && member.name == member_name {
                 if let Some(type_name) = member.type_name {
                     names.push(type_name);
                 }

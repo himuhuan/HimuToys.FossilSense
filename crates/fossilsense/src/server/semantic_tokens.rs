@@ -57,9 +57,7 @@ impl Backend {
 
         let cached = self.get_or_parse_document(uri, &path, version, &text).await;
         let index: Option<Arc<FileSemanticIndex>> = cached;
-        let Some(index) = index else {
-            return None;
-        };
+        let index = index?;
 
         let result = tokio::task::spawn_blocking(move || -> Result<Vec<coloring::ColoredToken>> {
             let defs = index.coloring_defs();

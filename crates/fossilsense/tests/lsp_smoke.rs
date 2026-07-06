@@ -1,5 +1,5 @@
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
@@ -478,7 +478,7 @@ fn file_uri(path: &Path) -> Result<String> {
     Ok(path_to_file_uri(&absolute))
 }
 
-fn path_to_file_uri(path: &PathBuf) -> String {
+fn path_to_file_uri(path: &Path) -> String {
     let mut slash = path.to_string_lossy().replace('\\', "/");
     if let Some(stripped) = slash.strip_prefix("//?/") {
         slash = stripped.to_string();

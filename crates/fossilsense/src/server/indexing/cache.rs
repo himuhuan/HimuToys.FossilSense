@@ -330,8 +330,10 @@ impl CacheLedger {
         let symbol_count = rebuild_name_table(&self.name_tables, root.clone()).await?;
         let name_table_ms = nt_started.elapsed().as_millis();
         let rg_started = tokio::time::Instant::now();
-        let mut degraded = DegradedCapabilities::default();
-        degraded.reach_graph = !rebuild_reach_graph(client, &self.reach_graphs, root.clone()).await;
+        let mut degraded = DegradedCapabilities {
+            reach_graph: !rebuild_reach_graph(client, &self.reach_graphs, root.clone()).await,
+            ..Default::default()
+        };
         let mut include_table_error = None;
         let include_count = match rebuild_include_table(&self.include_tables, root.clone()).await {
             Ok(count) => count,
@@ -388,14 +390,16 @@ impl CacheLedger {
             update_name_table_paths(&self.name_tables, root.clone(), rel_paths).await?;
         let name_table_ms = nt_started.elapsed().as_millis();
         let rg_started = tokio::time::Instant::now();
-        let mut degraded = DegradedCapabilities::default();
-        degraded.reach_graph = !refresh_reach_graph_incremental(
-            client,
-            &self.reach_graphs,
-            root.clone(),
-            include_edge_sources_rebuilt,
-        )
-        .await;
+        let mut degraded = DegradedCapabilities {
+            reach_graph: !refresh_reach_graph_incremental(
+                client,
+                &self.reach_graphs,
+                root.clone(),
+                include_edge_sources_rebuilt,
+            )
+            .await,
+            ..Default::default()
+        };
         let mut include_table_error = None;
         let include_count = match rebuild_include_table(&self.include_tables, root.clone()).await {
             Ok(count) => count,

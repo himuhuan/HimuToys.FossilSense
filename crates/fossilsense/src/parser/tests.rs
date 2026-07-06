@@ -255,10 +255,141 @@ fn extracts_multiline_typedef_struct_type_symbol() {
 }
 
 #[test]
+fn extracts_multiline_typedef_struct_when_member_comments_contain_braces() {
+    let index = parse(
+        Path::new("b.c"),
+        "typedef struct {\n    int x; // comment with }\n    const char *text; /* comment with { */\n} Boom;\n",
+    );
+
+    assert!(index.symbols.iter().any(|symbol| {
+        symbol.name == "Boom"
+            && symbol.kind == SymbolKind::Type
+            && symbol.role == SymbolRole::Definition
+    }));
+    assert_eq!(field_containers(&index, "x"), vec!["Boom".to_string()]);
+    assert_eq!(field_containers(&index, "text"), vec!["Boom".to_string()]);
+}
+
+#[test]
+fn multiline_macro_with_braces_does_not_swallow_following_typedef_struct() {
+    let source = r#"#define FREE(ptr)                                                              \
+    do                                                                         \
+    {                                                                          \
+        if ((ptr) != NULL)                                                     \
+        {                                                                      \
+            free(ptr);                                                         \
+            (ptr) = NULL;                                                      \
+        }                                                                      \
+    } while (0)
+
+typedef struct xxx {
+    int value;
+} xxx_t;
+
+typedef struct xxxa {
+    int other;
+} xxxa_t;
+"#;
+    let index = parse(Path::new("macro_typedef.c"), source);
+
+    let xxx_t = index
+        .symbols
+        .iter()
+        .find(|symbol| {
+            symbol.name == "xxx_t"
+                && symbol.kind == SymbolKind::Type
+                && symbol.role == SymbolRole::Definition
+        })
+        .expect("first typedef after multiline macro should be a type definition");
+    assert!(
+        xxx_t.signature.starts_with("typedef struct xxx"),
+        "typedef signature should not include the macro body: {:?}",
+        xxx_t.signature
+    );
+    assert!(!xxx_t.signature.contains("while (0)"));
+
+    assert!(index.symbols.iter().any(|symbol| {
+        symbol.name == "xxxa_t"
+            && symbol.kind == SymbolKind::Type
+            && symbol.role == SymbolRole::Definition
+    }));
+    assert_eq!(field_containers(&index, "value"), vec!["xxx_t".to_string()]);
+    assert_eq!(
+        field_containers(&index, "other"),
+        vec!["xxxa_t".to_string()]
+    );
+}
+
+#[test]
+fn multiline_macro_with_trailing_space_after_backslash_does_not_swallow_typedef() {
+    let source = "#define WRAP(value) \\   \n    do { (value); } while (0)\n\ntypedef struct after_macro {\n    int field;\n} after_macro_t;\n";
+    let index = parse(Path::new("macro_spacing.h"), source);
+
+    assert!(index.symbols.iter().any(|symbol| {
+        symbol.name == "after_macro_t"
+            && symbol.kind == SymbolKind::Type
+            && symbol.role == SymbolRole::Definition
+    }));
+    assert_eq!(
+        field_containers(&index, "field"),
+        vec!["after_macro_t".to_string()]
+    );
+}
+
+#[test]
+fn preprocessor_directives_inside_typedef_struct_body_keep_typedef_statement() {
+    let source = r#"typedef struct guarded {
+#if defined(CONFIG_X)
+    int enabled;
+#else
+    int disabled;
+#endif
+} guarded_t;
+"#;
+    let index = parse(Path::new("guarded_typedef.h"), source);
+
+    assert!(index.symbols.iter().any(|symbol| {
+        symbol.name == "guarded_t"
+            && symbol.kind == SymbolKind::Type
+            && symbol.role == SymbolRole::Definition
+    }));
+    assert_eq!(
+        field_containers(&index, "enabled"),
+        vec!["guarded_t".to_string()]
+    );
+    assert_eq!(
+        field_containers(&index, "disabled"),
+        vec!["guarded_t".to_string()]
+    );
+}
+
+#[test]
+fn multiline_macro_inside_typedef_struct_body_does_not_reset_pending_typedef() {
+    let source = r#"typedef struct context {
+#define DECL_FIELD(name)                                                       \
+    int name
+    DECL_FIELD(generated);
+    int explicit_field;
+} context_t;
+"#;
+    let index = parse(Path::new("macro_in_record.h"), source);
+
+    assert!(index.symbols.iter().any(|symbol| {
+        symbol.name == "context_t"
+            && symbol.kind == SymbolKind::Type
+            && symbol.role == SymbolRole::Definition
+    }));
+    assert_eq!(
+        field_containers(&index, "explicit_field"),
+        vec!["context_t".to_string()]
+    );
+}
+
+#[test]
 fn field_members_capture_record_type_name() {
     let index = parse(
         Path::new("nested.c"),
-        "struct Inner { int value; };\ntypedef struct Inner Inner;\nstruct Outer { struct Inner mem1; Inner *mem2; int count; };\n",
+        "struct Inner { int value; };\ntypedef struct Inner Inner;\nstruct Outer { struct Inner mem1; Inner *mem2; const struct Inner *mem3; int count; };\n",
     );
 
     let mem1 = index
@@ -275,12 +406,70 @@ fn field_members_capture_record_type_name() {
         .expect("mem2");
     assert_eq!(mem2.type_name.as_deref(), Some("Inner"));
 
+    let mem3 = index
+        .members
+        .iter()
+        .find(|member| member.name == "mem3")
+        .expect("mem3");
+    assert_eq!(mem3.type_name.as_deref(), Some("Inner"));
+
     let count = index
         .members
         .iter()
         .find(|member| member.name == "count")
         .expect("count");
     assert_eq!(count.type_name, None);
+}
+
+#[test]
+fn nested_anonymous_record_members_get_synthetic_type_names() {
+    let index = parse(
+        Path::new("nested.c"),
+        "typedef struct { struct { int xxx; } mem1[4]; union { int tag; } u; } A;\n",
+    );
+
+    let mem1 = index
+        .members
+        .iter()
+        .find(|member| member.name == "mem1")
+        .expect("mem1");
+    assert_eq!(mem1.type_name.as_deref(), Some("A.mem1"));
+    assert!(index
+        .records
+        .iter()
+        .any(|record| record.display_name == "A.mem1"
+            && record.confidence == super::RecordConfidence::Heuristic));
+    assert_eq!(field_containers(&index, "xxx"), vec!["A.mem1".to_string()]);
+
+    let u = index
+        .members
+        .iter()
+        .find(|member| member.name == "u")
+        .expect("u");
+    assert_eq!(u.type_name.as_deref(), Some("A.u"));
+    assert_eq!(field_containers(&index, "tag"), vec!["A.u".to_string()]);
+}
+
+#[test]
+fn function_pointer_fields_are_fields_not_methods() {
+    let index = parse(
+        Path::new("callbacks.c"),
+        "struct Callbacks { int (*on_value)(int value); void run(void); };\n",
+    );
+
+    let cb = index
+        .members
+        .iter()
+        .find(|member| member.name == "on_value")
+        .expect("on_value");
+    assert_eq!(cb.kind, MemberKind::Field);
+
+    let run = index
+        .members
+        .iter()
+        .find(|member| member.name == "run")
+        .expect("run");
+    assert_eq!(run.kind, MemberKind::Method);
 }
 
 #[test]
