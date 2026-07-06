@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 /// Narrowing state for one document's in-flight completion. `generation`
 /// identifies the indexed workspace-state instances the `pools` index into;
 /// rebuilding any derived state for those roots invalidates the memo.
+#[derive(Clone)]
 pub(super) struct CompletionMemo {
     pub(super) prefix: String,
     pub(super) generation: u64,

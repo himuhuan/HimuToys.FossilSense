@@ -1,0 +1,4 @@
+Architecture fitness report
+status severity rule file detail allowlist
+FAIL ERROR ordinary-completion-service-lsp-boundary crates/fossilsense/src/completion/ordinary_service.rs ordinary completion service must stay protocol-neutral and must not import tower_lsp -
+Summary: fail=1 warn=0 allowlisted=0

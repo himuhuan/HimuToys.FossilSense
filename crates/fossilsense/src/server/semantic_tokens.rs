@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -21,7 +20,12 @@ impl Backend {
         uri: &Url,
         range: Option<Range>,
     ) -> Option<Vec<SemanticToken>> {
-        if !self.semantic_coloring_enabled.load(Ordering::Relaxed) {
+        let snapshot = self.workspace_snapshot_for_uri(uri).await;
+        if snapshot
+            .as_ref()
+            .is_some_and(|snapshot| !snapshot.settings.semantic_coloring_enabled)
+            || (snapshot.is_none() && !self.snapshot_settings().semantic_coloring_enabled)
+        {
             return None;
         }
 
@@ -31,10 +35,9 @@ impl Backend {
         // Coloring kind resolution is served from the in-memory name table — no
         // per-request SQLite open. An absent table (not yet indexed) leaves only
         // current-file definitions to color, same as a missing index before.
-        let name_table = match self.root_for_uri(uri).await {
-            Some(root) => self.name_tables.lock().await.get(&root).cloned(),
-            None => None,
-        };
+        let name_table = snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.name_table.clone());
 
         // Reachability scope for coloring kind resolution: delegated to the
         // shared `scope_tier` primitive. A determinate scope restricts coloring
@@ -44,13 +47,13 @@ impl Backend {
         // disabled or no graph) falls back to the unscoped `workspace OR
         // directly_included` behavior via a synthesized all-workspace context
         // inside `colorable_kind_counts`.
-        let color_scope: Option<query::CompletionScope> =
-            self.reach_scope_for(uri)
-                .await
-                .map(|(rel, reach)| query::CompletionScope {
-                    current_path: Some(rel),
-                    reach: (*reach).clone(),
-                });
+        let color_scope: Option<query::CompletionScope> = snapshot
+            .as_ref()
+            .and_then(|snapshot| self.reach_scope_from_snapshot(uri, snapshot))
+            .map(|(rel, reach)| query::CompletionScope {
+                current_path: Some(rel),
+                reach: (*reach).clone(),
+            });
 
         let cached = self.get_or_parse_document(uri, &path, version, &text).await;
         let index: Option<Arc<FileSemanticIndex>> = cached;

@@ -137,6 +137,7 @@ Smart Completion 当前约定：
 | 隐私 | 默认 debug/perf summary 不输出候选名、源码片段或用户代码内容 |
 | shadow | shadow ranking 只作 ranker 对比和回归观测；不得改变返回内容 |
 | v1.2.1 Phase 7-8 | member evidence 覆盖字段和第一版 C++ 方法；ordinary completion 可使用本地 accepted-completion history 作为有界排序证据 |
+| v1.2.2 Phase A-D/H | 行为保持型架构健康发布；新增架构基线、fitness functions、WorkspaceSession/CacheLedger/DocumentStore 边界、ordinary completion service 边界和 release hardening 门禁 |
 | 后置能力 | auto include insertion、ML ranker、telemetry、cloud sync、完整 C++ 语义仍不属于当前版本 |
 
 短前缀：
@@ -362,6 +363,12 @@ cargo run -p fossilsense -- index samples/mini-c --db target/mini.sqlite --force
 pnpm install
 pnpm run compile
 pnpm run package
+```
+
+Release hardening gate:
+
+```bash
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify_release_hardening.ps1
 ```
 
 ## 15. 打包与发布硬约定
