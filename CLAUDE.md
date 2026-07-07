@@ -137,12 +137,13 @@ Smart Completion 当前约定：
 | pipeline | 普通标识符补全候选必须经过 `completion` 核心模块合并 evidence、去重、排序和截断 |
 | 排序 | 普通标识符补全使用 deterministic evidence-aware ranker；`ScopeTier` 是 soft prior，并通过 guard band 防止低置信 global/text 噪音反超 |
 | strict policy | `resolver::pack_score` 仍可用于跳转、着色、workspace symbol、`NameTable` recall 和兼容测试；不再作为普通补全最终 displayed ranking |
-| evidence merge | 同名候选合并 indexed、local binding、current-file overlay、local word evidence，优先保留更结构化的 LSP kind/detail |
+| evidence merge | 同名候选合并 indexed、local binding、current-file overlay、language builtin、local word evidence，优先保留更结构化的 LSP kind/detail |
 | current overlay | 当前 open document 的宏、typedef/using alias、枚举常量、函数声明/定义、record/type 定义和附近 identifier 使用可作为普通补全 evidence；raw text fallback 仍标为 `text` |
+| language builtin | 静态 C/C++ 关键词、内置类型和常量可作为低置信 fallback 补全 evidence；显示为 `keyword` / `builtin type` / `builtin constant`，不写入索引，不参与跳转、workspace symbol 或着色 |
 | intent | 普通补全使用轻量规则式 intent ranking，覆盖 type、expression、call、macro preprocessor、declaration-name；intent 只是排序证据，不做类型推断或绑定，不硬过滤 |
 | recall | 普通补全 indexed recall 使用 bounded multi-channel quotas，在 current/local、reachable、external、unknown/open-scope、global、text evidence 间保留有限代表性后再统一 rerank |
 | include ranking | include path completion 保留 quote/angle source prior，并增加 same-directory、sibling/component edge、recent include、basename frequency、path depth 二级 evidence |
-| metrics | verbose/perf 日志只输出分阶段耗时、候选来源/返回计数、intent bucket、recall channel counts、guard 摘要、shadow rank 摘要和 include ranking 计数 |
+| metrics | verbose/perf 日志只输出分阶段耗时、候选来源/返回计数（含 language_builtin 聚合计数）、intent bucket、recall channel counts、guard 摘要、shadow rank 摘要和 include ranking 计数 |
 | 隐私 | 默认 debug/perf summary 不输出候选名、源码片段或用户代码内容 |
 | shadow | shadow ranking 只作 ranker 对比和回归观测；不得改变返回内容 |
 | v1.2.1 Phase 7-8 | member evidence 覆盖字段和第一版 C++ 方法；ordinary completion 可使用本地 accepted-completion history 作为有界排序证据 |

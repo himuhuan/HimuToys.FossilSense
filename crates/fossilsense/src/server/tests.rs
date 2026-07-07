@@ -1135,6 +1135,53 @@ async fn ordinary_completion_does_not_open_history_store_on_completion_hot_path(
     );
 }
 
+#[tokio::test]
+async fn ordinary_completion_presents_static_keyword_with_lsp_kind_and_detail() {
+    let (src, line, character) = text_and_position("str/*cursor*/");
+    let dir = tempdir().expect("tempdir");
+    let uri = Url::from_file_path(dir.path().join("a.c")).expect("file uri");
+    let service = test_backend_service();
+    open_test_document(&service, uri.clone(), 1, src).await;
+
+    let response = service
+        .inner()
+        .completion(completion_params(uri, line, character))
+        .await
+        .expect("completion")
+        .expect("response");
+    assert!(completion_response_is_incomplete(&response));
+    let item = completion_items(response)
+        .into_iter()
+        .find(|item| item.label == "struct")
+        .expect("struct keyword completion");
+
+    assert_eq!(item.kind, Some(CompletionItemKind::KEYWORD));
+    assert_eq!(item.detail.as_deref(), Some("keyword"));
+}
+
+#[tokio::test]
+async fn ordinary_completion_builtin_only_result_stays_incomplete() {
+    let (src, line, character) = text_and_position("si/*cursor*/");
+    let dir = tempdir().expect("tempdir");
+    let uri = Url::from_file_path(dir.path().join("a.c")).expect("file uri");
+    let service = test_backend_service();
+    open_test_document(&service, uri.clone(), 1, src).await;
+
+    let response = service
+        .inner()
+        .completion(completion_params(uri, line, character))
+        .await
+        .expect("completion")
+        .expect("response");
+
+    assert!(completion_response_is_incomplete(&response));
+    assert!(completion_items(response)
+        .into_iter()
+        .any(|item| item.label == "size_t"
+            && item.kind == Some(CompletionItemKind::STRUCT)
+            && item.detail.as_deref() == Some("builtin type")));
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct PresentedCompletion {
     label: String,

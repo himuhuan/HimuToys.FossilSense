@@ -5,6 +5,7 @@ mod completion_words;
 mod config;
 mod includes;
 mod indexer;
+mod language_builtins;
 mod model;
 mod parser;
 mod pathing;

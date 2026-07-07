@@ -38,7 +38,13 @@ keeping FossilSense's best-effort candidate model.
   record/type definitions can also participate as structured current-file
   overlay evidence. Nearby identifier usage can raise text fallback candidates,
   but raw words remain visibly textual fallback and are not semantic bindings.
-  Unsupported parse shapes degrade to the existing indexed and word completion.
+  A bounded static language-builtin source also offers common C/C++ keywords,
+  builtin-style types, and literal-like constants such as `struct`, `sizeof`,
+  `size_t`, `uint32_t`, and `NULL` when matching the current prefix. These items
+  are fallback completion candidates with `keyword`, `builtin type`, or
+  `builtin constant` details; they do not create index records, definition
+  targets, workspace symbols, semantic tokens, or auto-include edits. Unsupported
+  parse shapes degrade to the existing indexed, builtin, and word completion.
   The list is always marked `isIncomplete` so the editor re-queries with the full
   current prefix on every keystroke — longer-named symbols that fell outside the
   truncated top-N re-enter the window as you keep typing, and an empty first batch
@@ -67,7 +73,8 @@ keeping FossilSense's best-effort candidate model.
   external, unknown/open-scope, global, current/local, and text evidence before
   final reranking. Verbose perf logs report timings, source counts, intent bucket,
   recall channel counts, guard summaries, and shadow-rank movement without
-  candidate names or snippets. In v1.2.1, ordinary completion can also use
+  candidate names or snippets; language-builtin evidence is reported only as an
+  aggregate source count. In v1.2.1, ordinary completion can also use
   local-only accepted-completion history as a small bounded ranking signal keyed
   by anonymous candidate hash, kind, intent, and prefix bucket. It is workspace
   local, clearable, disableable, and records positive accept feedback only. No

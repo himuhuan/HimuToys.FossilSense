@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::completion_history::{candidate_hash_key, CompletionHistorySnapshot};
+use crate::language_builtins::{LanguageBuiltin, LanguageBuiltinCategory};
 use crate::model;
 use crate::parser::{self, FactAvailability, FactGroup, FileSemanticIndex};
 use crate::query::{self, NameTable};
@@ -69,11 +70,75 @@ struct OrdinaryCompletionPresentation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OrdinaryCompletionKind {
     Text,
+    Keyword,
     Function,
     Macro,
     Type,
     Variable,
     EnumConstant,
+}
+
+fn completion_items_for_language_builtins(prefix: &str) -> Vec<OrdinaryPipelineCandidate> {
+    crate::language_builtins::language_builtins()
+        .iter()
+        .filter_map(|builtin| completion_item_for_language_builtin(*builtin, prefix))
+        .collect()
+}
+
+fn completion_item_for_language_builtin(
+    builtin: LanguageBuiltin,
+    prefix: &str,
+) -> Option<OrdinaryPipelineCandidate> {
+    if builtin.label.eq_ignore_ascii_case(prefix) {
+        return None;
+    }
+    let score = query::completion_word_score(prefix, builtin.label, 0)?;
+    let mut evidence = CandidateEvidence::new(
+        CandidateSource::LanguageBuiltin,
+        model::ScopeTier::Global,
+        model::ResolutionConfidence::Fallback,
+        score,
+    );
+    evidence.match_score = score;
+    evidence.kind = completion_kind_for_language_builtin(builtin.category);
+    set_completion_history_key(&mut evidence, builtin.label);
+
+    Some(OrdinaryPipelineCandidate::new(
+        builtin.label,
+        evidence,
+        OrdinaryCompletionPresentation {
+            kind: ordinary_kind_for_language_builtin(builtin.category),
+            detail: Some(detail_for_language_builtin(builtin.category).to_string()),
+            documentation: None,
+            initial_sort_text: Some(format!("{:08}", 100_000_000 - score)),
+        },
+    ))
+}
+
+fn completion_kind_for_language_builtin(
+    category: LanguageBuiltinCategory,
+) -> CompletionCandidateKind {
+    match category {
+        LanguageBuiltinCategory::Keyword => CompletionCandidateKind::Keyword,
+        LanguageBuiltinCategory::BuiltinType => CompletionCandidateKind::Type,
+        LanguageBuiltinCategory::BuiltinConstant => CompletionCandidateKind::EnumConstant,
+    }
+}
+
+fn ordinary_kind_for_language_builtin(category: LanguageBuiltinCategory) -> OrdinaryCompletionKind {
+    match category {
+        LanguageBuiltinCategory::Keyword => OrdinaryCompletionKind::Keyword,
+        LanguageBuiltinCategory::BuiltinType => OrdinaryCompletionKind::Type,
+        LanguageBuiltinCategory::BuiltinConstant => OrdinaryCompletionKind::EnumConstant,
+    }
+}
+
+fn detail_for_language_builtin(category: LanguageBuiltinCategory) -> &'static str {
+    match category {
+        LanguageBuiltinCategory::Keyword => "keyword",
+        LanguageBuiltinCategory::BuiltinType => "builtin type",
+        LanguageBuiltinCategory::BuiltinConstant => "builtin constant",
+    }
 }
 
 pub(crate) fn complete_ordinary_identifier(
@@ -142,6 +207,7 @@ pub(crate) fn complete_ordinary_identifier(
     candidates.extend(completion_items_for_current_file_overlay(
         current_file_overlay_hits,
     ));
+    candidates.extend(completion_items_for_language_builtins(&input.prefix));
 
     for word in input.local_words.iter() {
         if word == &input.prefix {
@@ -404,7 +470,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use crate::completion::CompletionIntent;
+    use crate::completion::{CandidateSource, CompletionIntent};
     use crate::completion_history::CompletionHistorySnapshot;
     use crate::model::ScopeTier;
     use crate::parser;
@@ -588,6 +654,172 @@ mod tests {
         assert!(output.items.is_empty());
         assert_eq!(output.metrics.input_total, 0);
         assert_eq!(output.metrics.returned_total, 0);
+    }
+
+    #[test]
+    fn service_adds_static_language_builtin_candidates() {
+        for (prefix, expected, expected_kind) in [
+            ("str", "struct", None),
+            ("si", "size_t", Some(OrdinaryCompletionKind::Type)),
+            ("NU", "NULL", Some(OrdinaryCompletionKind::EnumConstant)),
+        ] {
+            let output = complete_ordinary_identifier(OrdinaryCompletionInput {
+                prefix: prefix.to_string(),
+                text: prefix.to_string(),
+                line: 0,
+                character: prefix.len() as u32,
+                parsed_document: None,
+                local_words: Arc::new(HashSet::new()),
+                tables: vec![OrdinaryCompletionNameTable {
+                    table: Arc::new(NameTable::build_with_paths(Vec::new())),
+                }],
+                scope: None,
+                prior_pools: vec![None],
+                intent: CompletionIntent::default(),
+                history_enabled: false,
+                history: CompletionHistorySnapshot::default(),
+                prefix_bucket: prefix.to_ascii_lowercase(),
+                limit: COMPLETION_LIMIT,
+                locality_bonus: COMPLETION_LOCALITY_BONUS,
+            });
+
+            let item = output
+                .items
+                .iter()
+                .find(|item| item.label == expected)
+                .unwrap_or_else(|| panic!("{expected} language builtin completion"));
+            if let Some(expected_kind) = expected_kind {
+                assert_eq!(item.kind, expected_kind);
+            }
+        }
+    }
+
+    #[test]
+    fn service_dedups_indexed_size_t_over_language_builtin_fallback() {
+        let output = complete_ordinary_identifier(OrdinaryCompletionInput {
+            prefix: "si".to_string(),
+            text: "si".to_string(),
+            line: 0,
+            character: 2,
+            parsed_document: None,
+            local_words: Arc::new(HashSet::new()),
+            tables: vec![OrdinaryCompletionNameTable {
+                table: Arc::new(NameTable::build_with_paths(vec![(
+                    1,
+                    "size_t".to_string(),
+                    false,
+                    "stddef.h".to_string(),
+                    "type".to_string(),
+                    false,
+                )])),
+            }],
+            scope: None,
+            prior_pools: vec![None],
+            intent: CompletionIntent::default(),
+            history_enabled: false,
+            history: CompletionHistorySnapshot::default(),
+            prefix_bucket: "si".to_string(),
+            limit: COMPLETION_LIMIT,
+            locality_bonus: COMPLETION_LOCALITY_BONUS,
+        });
+
+        let size_t_items: Vec<_> = output
+            .items
+            .iter()
+            .filter(|item| item.label == "size_t")
+            .collect();
+        assert_eq!(size_t_items.len(), 1);
+        assert_eq!(
+            size_t_items[0].evidence.primary_source,
+            CandidateSource::Indexed
+        );
+        assert!(
+            output.metrics.input_total > output.metrics.after_dedup_total,
+            "static size_t fallback should participate before dedup"
+        );
+    }
+
+    #[test]
+    fn service_ranks_current_local_evidence_above_language_builtins() {
+        let (text, line, character) = text_and_position(
+            "void fixture(void) {\n\
+                 int signal_value;\n\
+                 si/*cursor*/\n\
+             }\n",
+        );
+        let parsed = Arc::new(parser::parse(&PathBuf::from("src/main.c"), &text));
+        let output = complete_ordinary_identifier(OrdinaryCompletionInput {
+            prefix: "si".to_string(),
+            text,
+            line,
+            character,
+            parsed_document: Some(parsed),
+            local_words: Arc::new(HashSet::new()),
+            tables: vec![OrdinaryCompletionNameTable {
+                table: Arc::new(NameTable::build_with_paths(Vec::new())),
+            }],
+            scope: None,
+            prior_pools: vec![None],
+            intent: CompletionIntent::default(),
+            history_enabled: false,
+            history: CompletionHistorySnapshot::default(),
+            prefix_bucket: "si".to_string(),
+            limit: COMPLETION_LIMIT,
+            locality_bonus: COMPLETION_LOCALITY_BONUS,
+        });
+
+        let labels: Vec<_> = output
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect();
+        let signal_index = labels
+            .iter()
+            .position(|label| *label == "signal_value")
+            .expect("local binding completion");
+        let size_index = labels
+            .iter()
+            .position(|label| *label == "size_t")
+            .expect("language builtin type completion");
+        assert!(signal_index < size_index);
+    }
+
+    #[test]
+    fn service_demotes_language_builtins_for_declaration_names() {
+        let output = complete_ordinary_identifier(OrdinaryCompletionInput {
+            prefix: "si".to_string(),
+            text: "int si".to_string(),
+            line: 0,
+            character: 6,
+            parsed_document: None,
+            local_words: Arc::new(HashSet::from(["signal_name".to_string()])),
+            tables: vec![OrdinaryCompletionNameTable {
+                table: Arc::new(NameTable::build_with_paths(Vec::new())),
+            }],
+            scope: None,
+            prior_pools: vec![None],
+            intent: crate::completion::classify_completion_intent("int si", 6, "si"),
+            history_enabled: false,
+            history: CompletionHistorySnapshot::default(),
+            prefix_bucket: "si".to_string(),
+            limit: COMPLETION_LIMIT,
+            locality_bonus: COMPLETION_LOCALITY_BONUS,
+        });
+
+        let labels: Vec<_> = output
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect();
+        let signal_index = labels
+            .iter()
+            .position(|label| *label == "signal_name")
+            .expect("raw declaration-name candidate");
+        let size_index = labels
+            .iter()
+            .position(|label| *label == "size_t")
+            .expect("language builtin type completion");
+        assert!(signal_index < size_index);
     }
 
     #[test]

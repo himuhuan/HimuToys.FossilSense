@@ -108,6 +108,7 @@ fn ordinary_completion_item_to_lsp(item: OrdinaryCompletionItem) -> CompletionIt
 fn ordinary_completion_kind_to_lsp(kind: OrdinaryCompletionKind) -> CompletionItemKind {
     match kind {
         OrdinaryCompletionKind::Text => CompletionItemKind::TEXT,
+        OrdinaryCompletionKind::Keyword => CompletionItemKind::KEYWORD,
         OrdinaryCompletionKind::Function => CompletionItemKind::FUNCTION,
         OrdinaryCompletionKind::Macro => CompletionItemKind::CONSTANT,
         OrdinaryCompletionKind::Type => CompletionItemKind::STRUCT,

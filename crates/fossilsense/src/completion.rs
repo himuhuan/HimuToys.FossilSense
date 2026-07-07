@@ -12,6 +12,8 @@ const SOURCE_CURRENT_FILE_OVERLAY: i32 = 9_000;
 #[allow(dead_code)]
 const SOURCE_INDEXED: i32 = 5_000;
 #[allow(dead_code)]
+const SOURCE_LANGUAGE_BUILTIN: i32 = 2_000;
+#[allow(dead_code)]
 const SOURCE_LOCAL_WORD: i32 = 0;
 
 #[allow(dead_code)]
@@ -109,6 +111,7 @@ impl CompletionIntentConfidence {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CompletionCandidateKind {
     Unknown,
+    Keyword,
     Function,
     Macro,
     Type,
@@ -122,6 +125,7 @@ impl CompletionCandidateKind {
         match self {
             CompletionCandidateKind::Unknown => 0,
             CompletionCandidateKind::Text => 1,
+            CompletionCandidateKind::Keyword => 2,
             CompletionCandidateKind::Variable => 2,
             CompletionCandidateKind::EnumConstant => 3,
             CompletionCandidateKind::Macro => 4,
@@ -133,6 +137,7 @@ impl CompletionCandidateKind {
     pub(crate) fn as_history_kind_str(self) -> &'static str {
         match self {
             CompletionCandidateKind::Unknown => "unknown",
+            CompletionCandidateKind::Keyword => "keyword",
             CompletionCandidateKind::Function => "function",
             CompletionCandidateKind::Macro => "macro",
             CompletionCandidateKind::Type => "type",
@@ -361,15 +366,17 @@ pub(crate) enum CandidateSource {
     LocalBinding,
     #[allow(dead_code)]
     CurrentFileOverlay,
+    LanguageBuiltin,
     LocalWord,
 }
 
 impl CandidateSource {
     fn priority(self) -> u8 {
         match self {
-            CandidateSource::LocalBinding => 4,
-            CandidateSource::CurrentFileOverlay => 3,
-            CandidateSource::Indexed => 2,
+            CandidateSource::LocalBinding => 5,
+            CandidateSource::CurrentFileOverlay => 4,
+            CandidateSource::Indexed => 3,
+            CandidateSource::LanguageBuiltin => 2,
             CandidateSource::LocalWord => 1,
         }
     }
@@ -380,6 +387,7 @@ pub(crate) struct EvidenceSources {
     pub indexed: bool,
     pub local_binding: bool,
     pub current_file_overlay: bool,
+    pub language_builtin: bool,
     pub local_word: bool,
 }
 
@@ -395,6 +403,7 @@ impl EvidenceSources {
             CandidateSource::Indexed => self.indexed = true,
             CandidateSource::LocalBinding => self.local_binding = true,
             CandidateSource::CurrentFileOverlay => self.current_file_overlay = true,
+            CandidateSource::LanguageBuiltin => self.language_builtin = true,
             CandidateSource::LocalWord => self.local_word = true,
         }
     }
@@ -404,6 +413,7 @@ impl EvidenceSources {
         self.indexed |= other.indexed;
         self.local_binding |= other.local_binding;
         self.current_file_overlay |= other.current_file_overlay;
+        self.language_builtin |= other.language_builtin;
         self.local_word |= other.local_word;
     }
 
@@ -498,6 +508,7 @@ pub(crate) struct SourceCounts {
     pub indexed: usize,
     pub local_binding: usize,
     pub current_file_overlay: usize,
+    pub language_builtin: usize,
     pub local_word: usize,
 }
 
@@ -507,6 +518,7 @@ impl SourceCounts {
             CandidateSource::Indexed => self.indexed += 1,
             CandidateSource::LocalBinding => self.local_binding += 1,
             CandidateSource::CurrentFileOverlay => self.current_file_overlay += 1,
+            CandidateSource::LanguageBuiltin => self.language_builtin += 1,
             CandidateSource::LocalWord => self.local_word += 1,
         }
     }
@@ -826,6 +838,7 @@ fn intent_adjustment(evidence: CandidateEvidence, intent: CompletionIntent) -> i
             CompletionCandidateKind::Type | CompletionCandidateKind::EnumConstant => {
                 INTENT_STRONG_MATCH + INTENT_MEDIUM_MATCH
             }
+            CompletionCandidateKind::Keyword => INTENT_MEDIUM_MATCH,
             CompletionCandidateKind::Variable
             | CompletionCandidateKind::Function
             | CompletionCandidateKind::Macro => INTENT_BOUNDED_DEMOTION,
@@ -836,7 +849,9 @@ fn intent_adjustment(evidence: CandidateEvidence, intent: CompletionIntent) -> i
             | CompletionCandidateKind::Function
             | CompletionCandidateKind::Macro
             | CompletionCandidateKind::EnumConstant => INTENT_STRONG_MATCH,
-            CompletionCandidateKind::Type => INTENT_BOUNDED_DEMOTION,
+            CompletionCandidateKind::Type | CompletionCandidateKind::Keyword => {
+                INTENT_BOUNDED_DEMOTION
+            }
             CompletionCandidateKind::Unknown | CompletionCandidateKind::Text => 0,
         },
         CompletionIntentKind::CallTarget => match evidence.kind {
@@ -848,6 +863,7 @@ fn intent_adjustment(evidence: CandidateEvidence, intent: CompletionIntent) -> i
         },
         CompletionIntentKind::MacroPreprocessor => match evidence.kind {
             CompletionCandidateKind::Macro => INTENT_STRONG_MATCH,
+            CompletionCandidateKind::Keyword => INTENT_MEDIUM_MATCH,
             CompletionCandidateKind::Type | CompletionCandidateKind::Variable => {
                 INTENT_BOUNDED_DEMOTION
             }
@@ -858,6 +874,8 @@ fn intent_adjustment(evidence: CandidateEvidence, intent: CompletionIntent) -> i
                 || evidence.primary_source == CandidateSource::LocalWord
             {
                 INTENT_MEDIUM_MATCH
+            } else if evidence.primary_source == CandidateSource::LanguageBuiltin {
+                DECLARATION_GLOBAL_REUSE_DEMOTION
             } else if evidence.primary_source == CandidateSource::Indexed
                 && evidence.tier == ScopeTier::Global
             {
@@ -887,6 +905,7 @@ fn source_prior(source: CandidateSource) -> i32 {
         CandidateSource::LocalBinding => SOURCE_LOCAL_BINDING,
         CandidateSource::CurrentFileOverlay => SOURCE_CURRENT_FILE_OVERLAY,
         CandidateSource::Indexed => SOURCE_INDEXED,
+        CandidateSource::LanguageBuiltin => SOURCE_LANGUAGE_BUILTIN,
         CandidateSource::LocalWord => SOURCE_LOCAL_WORD,
     }
 }
@@ -954,7 +973,7 @@ pub(crate) fn completion_perf_summary(
 ) -> String {
     let shadow = metrics.shadow.unwrap_or_default();
     format!(
-        "[perf] completion total={}ms context={}ms recall={}ms merge_rank={}ms render={}ms prefix_len={} hit={} intent={} intent_confidence={} history_enabled={} history_boosted={} history_max_boost={} candidates_in={} after_dedup={} returned={} indexed={} local_binding={} current_file_overlay={} local_word={} returned_indexed={} returned_local_binding={} returned_current_file_overlay={} returned_local_word={} recall_reachable={} recall_external={} recall_unknown={} recall_global={} recall_pool={} guarded_low_trust={} shadow_moved={} shadow_max_delta={}",
+        "[perf] completion total={}ms context={}ms recall={}ms merge_rank={}ms render={}ms prefix_len={} hit={} intent={} intent_confidence={} history_enabled={} history_boosted={} history_max_boost={} candidates_in={} after_dedup={} returned={} indexed={} local_binding={} current_file_overlay={} language_builtin={} local_word={} returned_indexed={} returned_local_binding={} returned_current_file_overlay={} returned_language_builtin={} returned_local_word={} recall_reachable={} recall_external={} recall_unknown={} recall_global={} recall_pool={} guarded_low_trust={} shadow_moved={} shadow_max_delta={}",
         timings.total_ms,
         timings.context_ms,
         timings.recall_ms,
@@ -973,10 +992,12 @@ pub(crate) fn completion_perf_summary(
         metrics.input_sources.indexed,
         metrics.input_sources.local_binding,
         metrics.input_sources.current_file_overlay,
+        metrics.input_sources.language_builtin,
         metrics.input_sources.local_word,
         metrics.returned_sources.indexed,
         metrics.returned_sources.local_binding,
         metrics.returned_sources.current_file_overlay,
+        metrics.returned_sources.language_builtin,
         metrics.returned_sources.local_word,
         metrics.recall_channels.reachable,
         metrics.recall_channels.external,
@@ -1503,19 +1524,21 @@ mod tests {
     #[test]
     fn evidence_perf_summary_is_source_safe_and_reports_ranker_fields() {
         let metrics = CompletionPipelineMetrics {
-            input_total: 4,
-            after_dedup_total: 3,
-            returned_total: 3,
+            input_total: 5,
+            after_dedup_total: 4,
+            returned_total: 4,
             input_sources: SourceCounts {
                 indexed: 1,
                 local_binding: 1,
                 current_file_overlay: 1,
+                language_builtin: 1,
                 local_word: 1,
             },
             returned_sources: SourceCounts {
                 indexed: 1,
                 local_binding: 1,
                 current_file_overlay: 1,
+                language_builtin: 1,
                 local_word: 0,
             },
             final_rank: FinalRankSummary {
@@ -1538,7 +1561,9 @@ mod tests {
         let line = completion_perf_summary("Widget", "miss", &timings, &metrics);
 
         assert!(line.contains("current_file_overlay=1"));
+        assert!(line.contains("language_builtin=1"));
         assert!(line.contains("returned_current_file_overlay=1"));
+        assert!(line.contains("returned_language_builtin=1"));
         assert!(line.contains("guarded_low_trust=2"));
         assert!(!line.contains("Widget\""));
         assert!(!line.contains("reachable_api"));
@@ -1671,12 +1696,14 @@ mod tests {
                 indexed: 1,
                 local_binding: 1,
                 current_file_overlay: 0,
+                language_builtin: 0,
                 local_word: 1,
             },
             returned_sources: SourceCounts {
                 indexed: 0,
                 local_binding: 1,
                 current_file_overlay: 0,
+                language_builtin: 0,
                 local_word: 1,
             },
             final_rank: FinalRankSummary::default(),
