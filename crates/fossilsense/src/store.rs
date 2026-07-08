@@ -206,14 +206,14 @@ impl IndexStore {
 
     /// Workspace files whose path equals `rel` or ends with `/rel` — the
     /// degraded "workspace headers" fallback for include-target resolution.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn workspace_files_by_suffix(&self, rel: &str) -> Result<Vec<String>> {
         self.include_table_view().workspace_files_by_suffix(rel)
     }
 
     /// All indexed workspace file paths, used by degraded include completion to
     /// surface headers that live below common include roots.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn workspace_file_paths(&self) -> Result<Vec<String>> {
         self.include_table_view().workspace_file_paths()
     }
@@ -221,7 +221,7 @@ impl IndexStore {
     /// Indexed workspace files as relative paths, excluding external include
     /// files. Used by reference search discovery to avoid walking the
     /// workspace tree on each request.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn indexed_workspace_files(&self) -> Result<Vec<String>> {
         self.reference_file_view()
             .indexed_workspace_files()

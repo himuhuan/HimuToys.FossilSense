@@ -9,6 +9,10 @@ const RULES = {
   ordinaryCompletionServiceLspBoundary: "ordinary-completion-service-lsp-boundary",
   sqliteBoundary: "sqlite-boundary",
   coreDirection: "core-dependency-direction",
+  parserFactBoundary: "parser-fact-boundary",
+  readViewBoundary: "read-view-boundary",
+  referenceQuerySeparation: "reference-query-separation",
+  conceptVocabulary: "concept-vocabulary",
   largeFile: "large-source-file",
 };
 
@@ -151,6 +155,18 @@ function isStoreBoundary(relPath) {
   return relPath === "crates/fossilsense/src/store.rs" || relPath.startsWith("crates/fossilsense/src/store/");
 }
 
+function isParserBoundary(relPath) {
+  return relPath === "crates/fossilsense/src/parser.rs" || relPath.startsWith("crates/fossilsense/src/parser/");
+}
+
+function isRustTestSource(relPath) {
+  return relPath.endsWith("/tests.rs") || relPath.includes("/tests/");
+}
+
+function isProductionRustSource(relPath) {
+  return isRustSource(relPath) && !isRustTestSource(relPath);
+}
+
 function isOrdinaryCompletionService(relPath) {
   return relPath === "crates/fossilsense/src/completion/ordinary_service.rs";
 }
@@ -232,6 +248,221 @@ function checkCoreDirection(findings, relPath, text) {
   }
 }
 
+const PARSER_FACT_BYPASS_PATTERNS = [
+  "index.symbols",
+  "index.includes",
+  "index.records",
+  "index.fields",
+  "index.members",
+  "index.aliases",
+  "index.occurrences",
+  "index.local_declarations",
+  "index.local_bindings",
+  "index.diagnostics",
+  "parsed.symbols",
+  "parsed.includes",
+  "parsed.records",
+  "parsed.fields",
+  "parsed.members",
+  "parsed.aliases",
+  "parsed.occurrences",
+  "parsed.local_declarations",
+  "parsed.local_bindings",
+  "request_facts().occurrences.is_empty()",
+  "request_facts().local_declarations.is_empty()",
+  "request_facts().local_bindings.is_empty()",
+  "persistent_facts().symbols.is_empty()",
+  "persistent_facts().includes.is_empty()",
+  "persistent_facts().records.is_empty()",
+  "persistent_facts().members.is_empty()",
+  "persistent_facts().aliases.is_empty()",
+];
+
+const BROAD_STORE_WRAPPER_PATTERNS = [
+  "store.load_symbol_names(",
+  "store.load_symbol_names_with_paths(",
+  "store.load_symbol_names_for_paths(",
+  "store.symbols_by_ids(",
+  "store.symbols_by_name(",
+  "store.resolve_record_candidates(",
+  "store.members_for_records(",
+  "store.fallback_member_candidates(",
+  "store.fields_for_records(",
+  "store.fallback_field_candidates(",
+  "store.workspace_files_by_suffix(",
+  "store.workspace_file_paths(",
+  "store.indexed_workspace_files(",
+  "store.load_include_edge_paths(",
+  "store.open_include_file_paths(",
+  "store.ambiguous_include_file_paths(",
+  "store.load_include_data_for_sources(",
+  "store.kind_counts_by_names(",
+  "store.kind_counts_by_names_scoped(",
+];
+
+const CANONICAL_CONCEPT_TYPES = new Set([
+  "CompletionIntentConfidence",
+  "CompletionScope",
+  "CompletionScopeLabel",
+  "FactUnavailableReason",
+  "LocalBinding",
+  "LocalBindingKind",
+  "MemberConfidence",
+  "OpenReason",
+  "ReachScope",
+  "RecordConfidence",
+  "ReferenceRoleCache",
+  "ResolutionConfidence",
+  "ResolutionReason",
+  "RoleCacheInner",
+  "ScopeChannel",
+  "ScopeTier",
+  "SymbolRole",
+  "SyntacticRole",
+]);
+
+function checkParserFactBoundary(findings, relPath, text) {
+  if (!isProductionRustSource(relPath) || isParserBoundary(relPath)) {
+    return;
+  }
+
+  for (const pattern of PARSER_FACT_BYPASS_PATTERNS) {
+    if (text.includes(pattern)) {
+      addFinding(
+        findings,
+        "ERROR",
+        RULES.parserFactBoundary,
+        relPath,
+        `parser facts must use projections plus fact_availability; found ${pattern}`
+      );
+    }
+  }
+}
+
+function checkReadViewBoundary(findings, relPath, text) {
+  if (!isProductionRustSource(relPath) || isStoreBoundary(relPath)) {
+    return;
+  }
+
+  for (const pattern of BROAD_STORE_WRAPPER_PATTERNS) {
+    if (text.includes(pattern)) {
+      addFinding(
+        findings,
+        "ERROR",
+        RULES.readViewBoundary,
+        relPath,
+        `durable reads with view equivalents must use store::views; found ${pattern}`
+      );
+    }
+  }
+}
+
+function referenceHitBody(text) {
+  const start = text.indexOf("pub struct ReferenceHit");
+  if (start === -1) {
+    return null;
+  }
+  const open = text.indexOf("{", start);
+  if (open === -1) {
+    return null;
+  }
+  let depth = 0;
+  for (let index = open; index < text.length; index += 1) {
+    const ch = text[index];
+    if (ch === "{") {
+      depth += 1;
+    } else if (ch === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        return text.slice(open, index + 1);
+      }
+    }
+  }
+  return null;
+}
+
+function checkReferenceQuerySeparation(findings, relPath, text) {
+  if (relPath !== "crates/fossilsense/src/references.rs") {
+    return;
+  }
+
+  for (const pattern of [
+    "crate::resolver",
+    "resolver::",
+    "pack_score",
+    "scope_tier",
+    "confidence_reason_for",
+  ]) {
+    if (text.includes(pattern)) {
+      addFinding(
+        findings,
+        "ERROR",
+        RULES.referenceQuerySeparation,
+        relPath,
+        `references must stay text-hit/role based and resolver-free; found ${pattern}`
+      );
+    }
+  }
+
+  const body = referenceHitBody(text);
+  if (!body) {
+    addFinding(
+      findings,
+      "ERROR",
+      RULES.referenceQuerySeparation,
+      relPath,
+      "ReferenceHit definition was not found"
+    );
+    return;
+  }
+
+  for (const pattern of [
+    "ScopeTier",
+    "ResolutionConfidence",
+    "ResolutionReason",
+    "tier:",
+    "scope:",
+    "confidence:",
+    "reason:",
+    "score:",
+    "candidate:",
+  ]) {
+    if (body.includes(pattern)) {
+      addFinding(
+        findings,
+        "ERROR",
+        RULES.referenceQuerySeparation,
+        relPath,
+        `ReferenceHit must not carry resolver/query ranking data; found ${pattern}`
+      );
+    }
+  }
+}
+
+function checkConceptVocabulary(findings, relPath, text) {
+  if (!isProductionRustSource(relPath)) {
+    return;
+  }
+
+  const typeRegex = /\b(?:enum|struct|type)\s+([A-Za-z_][A-Za-z0-9_]*)/g;
+  let match;
+  while ((match = typeRegex.exec(text)) !== null) {
+    const name = match[1];
+    if (
+      /(Confidence|Reason|Binding|Scope|Role)/.test(name) &&
+      !CANONICAL_CONCEPT_TYPES.has(name)
+    ) {
+      addFinding(
+        findings,
+        "ERROR",
+        RULES.conceptVocabulary,
+        relPath,
+        `new confidence/reason/binding/scope/role concept must reuse canonical vocabulary; found ${name}`
+      );
+    }
+  }
+}
+
 function collectFindings(root, options = {}) {
   const sourceRoots = [
     path.join(root, "crates", "fossilsense", "src"),
@@ -298,6 +529,10 @@ function collectFindings(root, options = {}) {
     }
 
     checkCoreDirection(findings, relPath, text);
+    checkParserFactBoundary(findings, relPath, text);
+    checkReadViewBoundary(findings, relPath, text);
+    checkReferenceQuerySeparation(findings, relPath, text);
+    checkConceptVocabulary(findings, relPath, text);
   }
 
   applyAllowlist(findings, options.allowlist);

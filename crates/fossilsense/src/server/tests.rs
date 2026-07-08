@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use tempfile::tempdir;
 use tower_lsp::lsp_types::{
     CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse, Documentation,
-    ExecuteCommandParams, GotoDefinitionParams, GotoDefinitionResponse, Position,
-    TextDocumentIdentifier, TextDocumentPositionParams, Url,
+    ExecuteCommandParams, GotoDefinitionParams, GotoDefinitionResponse, HoverContents, HoverParams,
+    Position, SignatureHelpParams, TextDocumentIdentifier, TextDocumentPositionParams, Url,
 };
 use tower_lsp::{LanguageServer as _, LspService};
 
@@ -66,6 +66,27 @@ fn goto_definition_params(uri: Url, line: u32, character: u32) -> GotoDefinition
     }
 }
 
+fn hover_params(uri: Url, line: u32, character: u32) -> HoverParams {
+    HoverParams {
+        text_document_position_params: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri },
+            position: Position::new(line, character),
+        },
+        work_done_progress_params: Default::default(),
+    }
+}
+
+fn signature_help_params(uri: Url, line: u32, character: u32) -> SignatureHelpParams {
+    SignatureHelpParams {
+        text_document_position_params: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri },
+            position: Position::new(line, character),
+        },
+        work_done_progress_params: Default::default(),
+        context: None,
+    }
+}
+
 fn completion_items(response: CompletionResponse) -> Vec<CompletionItem> {
     match response {
         CompletionResponse::Array(items) => items,
@@ -92,6 +113,25 @@ fn text_and_position(marked: &str) -> (String, u32, u32) {
         .map(|ch| ch.len_utf16() as u32)
         .sum();
     (text, line, character)
+}
+
+fn position_after(text: &str, needle: &str) -> (u32, u32) {
+    let byte = text.rfind(needle).expect("needle") + needle.len();
+    let before = &text[..byte];
+    let line = before.bytes().filter(|byte| *byte == b'\n').count() as u32;
+    let line_start = before.rfind('\n').map_or(0, |index| index + 1);
+    let character = before[line_start..]
+        .chars()
+        .map(|ch| ch.len_utf16() as u32)
+        .sum();
+    (line, character)
+}
+
+fn marked_string_text(value: tower_lsp::lsp_types::MarkedString) -> String {
+    match value {
+        tower_lsp::lsp_types::MarkedString::String(value) => value,
+        tower_lsp::lsp_types::MarkedString::LanguageString(value) => value.value,
+    }
 }
 
 fn write_workspace_file(root: &std::path::Path, rel: &str, text: &str) {
@@ -246,6 +286,109 @@ void use_type(void) {
             .any(|location| location.uri == uri && location.range.start.line == 10),
         "indexed typedef immediately after multiline macro should be a goto-definition target"
     );
+}
+
+#[tokio::test]
+async fn definition_hover_and_signature_preserve_read_view_candidate_order_and_labels() {
+    let dir = tempdir().expect("tempdir");
+    write_workspace_file(
+        dir.path(),
+        "src/main.c",
+        "#include \"api.h\"\n\
+         int target(void);\n\
+         void call(void) {\n\
+             target();\n\
+         }\n",
+    );
+    write_workspace_file(dir.path(), "src/api.h", "int target(int reachable_arg);\n");
+    write_workspace_file(
+        dir.path(),
+        "other/target.c",
+        "int target(float global_arg) { return 0; }\n",
+    );
+    crate::indexer::index_workspace(
+        dir.path(),
+        crate::indexer::IndexOptions {
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("index");
+
+    let uri = Url::from_file_path(dir.path().join("src/main.c")).expect("file uri");
+    let service = test_backend_service();
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(dir.path().to_path_buf());
+    let (open_text, hover_line, hover_character) = text_and_position(
+        "#include \"api.h\"\n\
+         int target(void);\n\
+         void call(void) {\n\
+             target/*cursor*/();\n\
+         }\n",
+    );
+    let (sig_line, sig_character) = position_after(&open_text, "target(");
+    open_test_document(&service, uri.clone(), 2, open_text).await;
+
+    let response = service
+        .inner()
+        .goto_definition(goto_definition_params(
+            uri.clone(),
+            hover_line,
+            hover_character,
+        ))
+        .await
+        .expect("goto definition")
+        .expect("definition response");
+    let locations = match response {
+        GotoDefinitionResponse::Array(locations) => locations,
+        GotoDefinitionResponse::Scalar(location) => vec![location],
+        GotoDefinitionResponse::Link(_) => panic!("unexpected location links"),
+    };
+    assert_eq!(locations[0].uri, uri);
+    assert_eq!(locations[0].range.start.line, 1);
+
+    let hover = service
+        .inner()
+        .hover(hover_params(uri.clone(), hover_line, hover_character))
+        .await
+        .expect("hover")
+        .expect("hover response");
+    let hover_text = match hover.contents {
+        HoverContents::Markup(markup) => markup.value,
+        HoverContents::Scalar(value) => marked_string_text(value),
+        HoverContents::Array(values) => values
+            .into_iter()
+            .map(marked_string_text)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    };
+    assert!(hover_text.contains("// In src/main.c\nint target(void);"));
+    assert!(hover_text.contains("tier: current | confidence: exact | reason: current_file"));
+
+    let signature = service
+        .inner()
+        .signature_help(signature_help_params(uri, sig_line, sig_character))
+        .await
+        .expect("signature help")
+        .expect("signature response");
+    assert_eq!(signature.active_signature, Some(0));
+    assert_eq!(signature.signatures[0].label, "int target(void);");
+    let documentation = match signature.signatures[0]
+        .documentation
+        .clone()
+        .expect("signature docs")
+    {
+        Documentation::String(value) => value,
+        Documentation::MarkupContent(markup) => markup.value,
+    };
+    assert!(documentation.contains("tier: current"));
+    assert!(documentation.contains("confidence: exact"));
+    assert!(documentation.contains("reason: current_file"));
 }
 
 #[tokio::test]
@@ -446,6 +589,76 @@ async fn cache_ledger_publishes_full_and_dirty_read_models_with_generations() {
     let dirty_snapshot = service.inner().session.snapshot_for_root(root_path).await;
     assert_ne!(full_snapshot.generation, dirty_snapshot.generation);
     assert_eq!(dirty_snapshot.name_table.as_ref().expect("table").len(), 2);
+}
+
+#[tokio::test]
+async fn cache_ledger_full_publish_rebuilds_read_model_contents() {
+    let root = tempdir().expect("root");
+    let root_path = root.path().to_path_buf();
+    write_workspace_file(
+        root.path(),
+        "src/main.c",
+        "#include \"api.h\"\n#include \"missing.h\"\nint alpha_symbol;\n",
+    );
+    write_workspace_file(root.path(), "src/api.h", "int api_symbol(void);\n");
+    crate::indexer::index_workspace(
+        root.path(),
+        crate::indexer::IndexOptions {
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("index");
+
+    let service = test_backend_service();
+    let report = service
+        .inner()
+        .session
+        .cache
+        .publish_full_index(&service.inner().client, root_path.clone())
+        .await
+        .expect("publish");
+    assert_eq!(report.symbol_count, 2);
+    assert_eq!(report.reference_file_count, 2);
+    assert!(!report.degraded.any());
+
+    let snapshot = service
+        .inner()
+        .session
+        .snapshot_for_root(root_path.clone())
+        .await;
+    let name_table = snapshot.name_table.as_ref().expect("name table");
+    assert!(name_table
+        .search_ranked("api_symbol", 10)
+        .iter()
+        .any(|hit| hit.name == "api_symbol"));
+
+    let reach_graph = snapshot.reach_graph.as_ref().expect("reach graph");
+    let reachable = reach_graph
+        .read()
+        .expect("reach graph read")
+        .reachable("src/main.c");
+    assert!(reachable.files.contains("src/api.h"));
+    assert!(reachable.open);
+    assert_eq!(
+        reachable.reason,
+        Some(crate::reachability::OpenReason::UnresolvedInclude)
+    );
+
+    let include_table = snapshot.include_table.as_ref().expect("include table");
+    assert_eq!(include_table.len(), 2);
+    assert_eq!(include_table.edge_count(), 1);
+
+    let indexed_files = snapshot.indexed_files.as_ref().expect("indexed files");
+    let rels: Vec<&str> = indexed_files
+        .iter()
+        .map(|(rel, _abs)| rel.as_str())
+        .collect();
+    assert_eq!(rels, vec!["src/api.h", "src/main.c"]);
+    assert!(indexed_files
+        .iter()
+        .all(|(_rel, abs)| abs.starts_with(&root_path)));
 }
 
 #[tokio::test]

@@ -1,19 +1,23 @@
 #[cfg(test)]
 use std::collections::HashMap;
 
+#[cfg(test)]
 use anyhow::Result;
 
+#[cfg(test)]
 use crate::model::{MemberCandidate, RecordCandidate};
 
+#[cfg(test)]
 use super::{IndexStore, SymbolRecord};
 
+#[cfg(test)]
 impl IndexStore {
     /// Load every symbol id + name (+ external flag) for building the in-memory
     /// fuzzy name table.
     ///
     /// Compatibility wrapper: the typed contract lives in
     /// [`crate::store::views::NameTableStoreView`].
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn load_symbol_names(&self) -> Result<Vec<(i64, String, bool)>> {
         self.name_table_view().symbol_name_rows()
     }
@@ -23,7 +27,7 @@ impl IndexStore {
     ///
     /// Compatibility wrapper around the typed name-table read view.
     #[allow(clippy::type_complexity)]
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn load_symbol_names_with_paths(
         &self,
     ) -> Result<Vec<(i64, String, bool, String, String, bool)>> {
@@ -35,6 +39,7 @@ impl IndexStore {
     }
 
     #[allow(clippy::type_complexity)]
+    #[cfg(test)]
     #[allow(dead_code)]
     pub fn load_symbol_names_for_paths(
         &self,
@@ -52,7 +57,7 @@ impl IndexStore {
     /// Degraded member-completion fallback used when receiver inference fails.
     ///
     /// Compatibility wrapper around [`crate::store::views::MemberStoreView`].
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn fallback_field_candidates(
         &self,
         prefix: &str,
@@ -66,7 +71,7 @@ impl IndexStore {
     /// Scoped record/alias candidate lookup.
     ///
     /// Compatibility wrapper around [`crate::store::views::MemberStoreView`].
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn resolve_record_candidates(
         &self,
         names: &[&str],
@@ -75,7 +80,7 @@ impl IndexStore {
         self.member_view().resolve_record_candidates(names, ctx)
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn members_for_records(
         &self,
         record_ids: &[i64],
@@ -86,7 +91,7 @@ impl IndexStore {
             .members_for_records(record_ids, prefix, ctx)
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn fallback_member_candidates(
         &self,
         prefix: &str,
@@ -97,7 +102,7 @@ impl IndexStore {
             .fallback_member_candidates(prefix, limit, ctx)
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn fields_for_records(&self, record_ids: &[i64]) -> Result<Vec<String>> {
         let mut names: Vec<String> = self
             .members_for_records(record_ids, None, None)?
@@ -112,7 +117,7 @@ impl IndexStore {
 
     /// Fetch full records for the given symbol ids, preserving caller order.
     /// Missing ids are silently omitted.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn symbols_by_ids(&self, ids: &[i64]) -> Result<Vec<SymbolRecord>> {
         self.symbol_read_view().symbols_by_ids(ids)
     }
@@ -160,7 +165,7 @@ impl IndexStore {
     }
 
     /// Fetch all symbols with an exact name (definition candidate set).
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn symbols_by_name(&self, name: &str) -> Result<Vec<SymbolRecord>> {
         self.symbol_read_view().symbols_by_name(name)
     }

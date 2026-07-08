@@ -284,7 +284,9 @@ impl ReferenceSearchCache {
 /// Search `root` for whole-word occurrences of `identifier`.
 ///
 /// Returns the hits and a flag indicating whether results were truncated to
-/// `REFERENCES_LIMIT`. Hits are sorted by path, line, and column.
+/// `REFERENCES_LIMIT`. Hits are capped after deterministic path/line/column
+/// ordering; callers may then apply role grouping to the retained hits for
+/// presentation.
 pub fn search_references(
     root: impl AsRef<Path>,
     identifier: &str,
@@ -479,7 +481,19 @@ fn position_roles(
     }
 
     let source = std::fs::read_to_string(abs_path).ok()?;
-    let parsed = parser::parse_with_handle(abs_path, &source, None, parser::ParseFacts::COLOR_REF);
+    let roles = reference_role_facts(abs_path, &source);
+
+    if let Some(cache) = cache {
+        cache.put(key, fingerprint, roles.clone());
+    }
+    Some(roles)
+}
+
+/// Parse exactly the request-time occurrence facts references need and project
+/// them into a text-position role map. Unavailable occurrence facts return an
+/// empty map so callers keep their default `Read` fallback.
+fn reference_role_facts(abs_path: &Path, source: &str) -> Arc<HashMap<(u32, u32), SyntacticRole>> {
+    let parsed = parser::parse_with_handle(abs_path, source, None, parser::ParseFacts::COLOR_REF);
     let request_facts = parsed.request_facts();
     let occurrences = match parsed.fact_availability(parser::FactGroup::Occurrences) {
         parser::FactAvailability::Available => request_facts.occurrences,
@@ -489,12 +503,7 @@ fn position_roles(
     for occ in occurrences {
         map.entry((occ.line, occ.start_col)).or_insert(occ.role);
     }
-    let roles = Arc::new(map);
-
-    if let Some(cache) = cache {
-        cache.put(key, fingerprint, roles.clone());
-    }
-    Some(roles)
+    Arc::new(map)
 }
 
 /// Cheap content fingerprint: (mtime in ns, byte length). `None` when the file

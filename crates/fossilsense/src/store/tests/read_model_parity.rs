@@ -304,3 +304,75 @@ fn record_member_queries_preserve_alias_recursion_dedup_prefix_ordering_and_caps
         "fallback remains prefix-only, not subsequence/fuzzy"
     );
 }
+
+#[test]
+fn member_read_view_preserves_recursive_aliases_across_open_scope_candidates() {
+    use crate::model::ScopeTier;
+    use crate::parser::MemberKind;
+    use crate::reachability::{OpenReason, ReachScope};
+    use crate::resolver::ResolveContext;
+
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+    let mut store = IndexStore::open(&db, dir.path()).expect("store");
+    upsert_source(
+        &mut store,
+        "inc/base.hpp",
+        "struct Base { int width; };\n\
+         typedef Base BaseAlias;\n\
+         typedef BaseAlias PublicBase;\n",
+    );
+    upsert_source(
+        &mut store,
+        "other/base.hpp",
+        "struct Base { int window; };\n\
+         typedef Base BaseAlias;\n\
+         typedef BaseAlias PublicBase;\n",
+    );
+
+    let reach = ReachScope {
+        files: ["src/main.cpp".to_string(), "inc/base.hpp".to_string()]
+            .into_iter()
+            .collect(),
+        open: true,
+        reason: Some(OpenReason::AmbiguousInclude),
+    };
+    let ctx = ResolveContext {
+        current_path: Some("src/main.cpp"),
+        reach: Some(&reach),
+    };
+    let reader = IndexStore::open_readonly(&db).expect("readonly");
+    let records = reader
+        .member_view()
+        .resolve_record_candidates(&["PublicBase"], Some(&ctx))
+        .expect("records");
+    let tiers_and_paths: Vec<_> = records
+        .iter()
+        .map(|record| (record.tier, record.path.as_str()))
+        .collect();
+    assert_eq!(
+        tiers_and_paths,
+        vec![
+            (ScopeTier::Reachable, "inc/base.hpp"),
+            (ScopeTier::Unknown, "other/base.hpp"),
+        ],
+        "open scope keeps recursive alias candidates instead of collapsing to one global winner"
+    );
+
+    let members = reader
+        .member_view()
+        .members_for_records(
+            &records.iter().map(|record| record.id).collect::<Vec<_>>(),
+            Some("wi"),
+            Some(&ctx),
+        )
+        .expect("members");
+    let names_and_kinds: Vec<_> = members
+        .iter()
+        .map(|member| (member.name.as_str(), member.kind))
+        .collect();
+    assert_eq!(
+        names_and_kinds,
+        vec![("width", MemberKind::Field), ("window", MemberKind::Field)]
+    );
+}

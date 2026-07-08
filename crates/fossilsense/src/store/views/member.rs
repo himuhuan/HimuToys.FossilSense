@@ -199,6 +199,7 @@ impl<'a> MemberStoreView<'a> {
             .collect())
     }
 
+    #[cfg(test)]
     pub fn fallback_field_candidates(
         &self,
         prefix: &str,

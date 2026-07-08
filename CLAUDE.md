@@ -76,6 +76,16 @@ fossilsense 单一 Rust 原生二进制 (crates/fossilsense)
 
 新增能力不得绕开这些模型另起 `smart` / `semantic` 等平行概念。
 
+Fact consumption boundary:
+
+- Unified fact boundary, separate domain pipelines.
+- Parser facts must be consumed through persistent_facts(), request_facts(), fact_availability(...), or narrow helpers.
+- Durable reads must use store::views, typed rows, or domain loaders outside the store boundary.
+- Query-like features may use resolver/model candidate semantics for scope, confidence, reason, fallback, ambiguity, and ordering.
+- References remain text hits annotated with syntactic roles; they do not use resolver ranking or ScopeTier.
+- Reference discovery keeps the historical path/line/column truncation cap; standard and grouped presentations sort the retained hits by role/path/line/column.
+- Legacy broad IndexStore query wrappers are restricted to #[cfg(test)] parity helpers.
+
 ## 4. 存储与路径
 
 默认索引库：
@@ -102,6 +112,7 @@ Store read-view 规则：
 | typed rows | read-model builder 输入使用 typed row / DTO，不依赖 SQL tuple column order |
 | SQL ownership | `rusqlite` 与 SQL-to-domain 转换留在 `store` / persistence 边界 |
 | compatibility | 旧 `IndexStore` query wrapper 可作为兼容/测试 oracle 保留，但应委托 read views 或共享 typed loader |
+| legacy wrappers | Legacy broad IndexStore query wrappers are restricted to #[cfg(test)] parity helpers |
 
 ## 5. 当前能力
 
@@ -277,6 +288,7 @@ Parser facts 合同：
 | `PersistentFacts` | `FileSemanticIndex::persistent_facts()` 返回 symbols、includes、records、fields、members、aliases 的借用投影 |
 | `RequestFacts` | `FileSemanticIndex::request_facts()` 返回 occurrences、local declarations、local bindings 的借用投影 |
 | `FactAvailability` | `Available` / `NotRequested` / `Unavailable(LexicalFallback)`；空向量不能单独代表 skipped 或 fallback |
+| consumption | Parser facts must be consumed through persistent_facts(), request_facts(), fact_availability(...), or narrow helpers |
 
 降级：
 
@@ -299,6 +311,8 @@ Parser facts 合同：
 - 按文件指纹做 LRU 缓存。
 - 解析失败时角色降级为 `Read`。
 - 返回前按角色分组，定义和声明在前。
+- References remain text hits annotated with syntactic roles; they do not use resolver ranking or ScopeTier.
+- Reference discovery keeps the historical path/line/column truncation cap; standard and grouped presentations sort the retained hits by role/path/line/column.
 - 保持 `REFERENCES_LIMIT` 截断与汇报规则。
 
 标准 `textDocument/references` 仍返回 `Location`。带角色入口：

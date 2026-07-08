@@ -256,6 +256,26 @@ impl FileSemanticIndex {
         self.diagnostics.fact_availability(group)
     }
 
+    /// True when occurrence facts were requested, are available, and contain at
+    /// least one parsed occurrence. This keeps request-vector emptiness checks
+    /// inside the parser boundary for consumers that need a raw-text fallback.
+    pub fn has_available_occurrence_facts(&self) -> bool {
+        matches!(
+            self.fact_availability(FactGroup::Occurrences),
+            FactAvailability::Available
+        ) && !self.occurrences.is_empty()
+    }
+
+    /// True when a live current-file consumer should use a raw identifier scan
+    /// instead of occurrence-derived usage stats. This preserves the historical
+    /// fallback trigger while keeping parser diagnostics interpretation inside
+    /// the parser boundary.
+    pub fn should_use_raw_identifier_scan(&self) -> bool {
+        !self.has_available_occurrence_facts()
+            || self.diagnostics.fallback_used
+            || self.diagnostics.ast_source == FactSource::LexicalFallback
+    }
+
     /// Project the coloring definition-name sets from this index's symbols. This
     /// reuses the already-extracted symbols (no re-parse): definition-role macros
     /// and types from the lexical pass, plus enum constants from the AST pass.

@@ -1,8 +1,6 @@
 use std::collections::HashMap;
 
-use crate::parser::{
-    FactAvailability, FactGroup, FactSource, FileSemanticIndex, SymbolKind, SymbolRole, TypeAlias,
-};
+use crate::parser::{FileSemanticIndex, SymbolKind, SymbolRole, TypeAlias};
 
 use super::{byte_offset_at, completion_word_score};
 
@@ -332,14 +330,7 @@ fn is_ident_continue(byte: u8) -> bool {
 }
 
 fn should_use_raw_scan(index: &FileSemanticIndex) -> bool {
-    let occurrences_available = matches!(
-        index.fact_availability(FactGroup::Occurrences),
-        FactAvailability::Available
-    );
-    !occurrences_available
-        || index.request_facts().occurrences.is_empty()
-        || index.diagnostics.fallback_used
-        || index.diagnostics.ast_source == FactSource::LexicalFallback
+    index.should_use_raw_identifier_scan()
 }
 
 fn proximity_score(stats: &UsageStats, cursor_byte: usize) -> i32 {

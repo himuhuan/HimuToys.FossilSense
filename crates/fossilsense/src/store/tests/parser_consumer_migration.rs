@@ -35,6 +35,51 @@ fn assert_present(path: &str, required: &[&str]) {
     }
 }
 
+fn rust_sources_under(dir: &Path, out: &mut Vec<String>) {
+    for entry in fs::read_dir(dir).unwrap_or_else(|err| panic!("failed to read {dir:?}: {err}")) {
+        let entry = entry.expect("dir entry");
+        let path = entry.path();
+        if path.is_dir() {
+            rust_sources_under(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+            let rel = path
+                .strip_prefix(root)
+                .expect("source below manifest dir")
+                .to_string_lossy()
+                .replace('\\', "/");
+            out.push(rel);
+        }
+    }
+}
+
+fn production_rust_sources() -> Vec<String> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut paths = Vec::new();
+    rust_sources_under(&root.join("src"), &mut paths);
+    paths
+        .into_iter()
+        .filter(|path| {
+            !path.ends_with("/tests.rs")
+                && !path.contains("/tests/")
+                && !path.starts_with("src/parser.rs")
+                && !path.starts_with("src/parser/")
+        })
+        .collect()
+}
+
+fn assert_all_production_sources_absent(forbidden: &[&str]) {
+    for path in production_rust_sources() {
+        let source = production_source(&path);
+        for pattern in forbidden {
+            assert!(
+                !source.contains(pattern),
+                "{path} should not directly interpret parser fact fields, found `{pattern}`"
+            );
+        }
+    }
+}
+
 #[test]
 fn index_storage_paths_consume_persistent_parser_facts() {
     assert_absent("src/indexer/parse_pipeline.rs", &["index.symbols"]);
@@ -124,8 +169,15 @@ fn live_parser_consumers_consume_request_facts_and_availability() {
         &[
             "persistent_facts()",
             "request_facts()",
-            "fact_availability",
-            "FactGroup::Occurrences",
+            "should_use_raw_identifier_scan()",
+        ],
+    );
+    assert_absent(
+        "src/query/current_file_overlay.rs",
+        &[
+            "index.diagnostics",
+            "FactSource::LexicalFallback",
+            "fallback_used",
         ],
     );
 
@@ -134,4 +186,58 @@ fn live_parser_consumers_consume_request_facts_and_availability() {
         &["index.symbols", "index.aliases", "index.records"],
     );
     assert_present("src/server/language_server.rs", &["persistent_facts()"]);
+}
+
+#[test]
+fn production_parser_consumers_do_not_bypass_projection_availability() {
+    assert_all_production_sources_absent(&[
+        "index.symbols",
+        "index.includes",
+        "index.records",
+        "index.fields",
+        "index.members",
+        "index.aliases",
+        "index.occurrences",
+        "index.local_declarations",
+        "index.local_bindings",
+        "parsed.symbols",
+        "parsed.includes",
+        "parsed.records",
+        "parsed.fields",
+        "parsed.members",
+        "parsed.aliases",
+        "parsed.occurrences",
+        "parsed.local_declarations",
+        "parsed.local_bindings",
+        "request_facts().occurrences.is_empty()",
+        "request_facts().local_declarations.is_empty()",
+        "request_facts().local_bindings.is_empty()",
+        "persistent_facts().symbols.is_empty()",
+        "persistent_facts().includes.is_empty()",
+        "persistent_facts().records.is_empty()",
+        "persistent_facts().members.is_empty()",
+        "persistent_facts().aliases.is_empty()",
+        "index.diagnostics",
+    ]);
+}
+
+#[test]
+fn parser_consumer_guard_fixture_catches_request_fact_emptiness() {
+    let fixture =
+        "fn bad(index: &FileSemanticIndex) -> bool { index.request_facts().occurrences.is_empty() }";
+
+    assert!(
+        fixture.contains("request_facts().occurrences.is_empty()"),
+        "guard fixture should model the request-fact emptiness bypass"
+    );
+}
+
+#[test]
+fn parser_consumer_guard_fixture_catches_diagnostics_interpretation() {
+    let fixture = "fn bad(index: &FileSemanticIndex) -> bool { index.diagnostics.fallback_used }";
+
+    assert!(
+        fixture.contains("index.diagnostics"),
+        "guard fixture should model direct parser diagnostics interpretation"
+    );
 }

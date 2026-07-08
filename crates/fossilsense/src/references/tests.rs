@@ -430,3 +430,82 @@ fn sort_hits_by_role_groups_definitions_first() {
         "definition/declaration sort before call/read"
     );
 }
+
+#[test]
+fn role_fact_fallback_cache_grouping_and_truncation_preserve_presented_hits() {
+    let dir = tempdir().expect("tempdir");
+    let mut noisy_reads = String::new();
+    for i in 0..REFERENCES_LIMIT + 20 {
+        noisy_reads.push_str(&format!("foo /* read {i} */;\n"));
+    }
+    let early_definition_path = dir.path().join("0_definition.c");
+    let invalid_path = dir.path().join("1_invalid.c");
+    let noisy_path = dir.path().join("a_reads.c");
+    let late_definition_path = dir.path().join("z_definition.c");
+    fs::write(
+        &early_definition_path,
+        "int foo(void) { return 0; }\nint use(void) { return foo(); }\n",
+    )
+    .expect("early definition");
+    fs::write(&noisy_path, noisy_reads).expect("reads");
+
+    let mut invalid_bytes: Vec<u8> = vec![0x2F, 0x2F, 0x20, 0xC0, 0xC1, 0x20];
+    invalid_bytes.extend_from_slice(b"foo\n");
+    fs::write(&invalid_path, invalid_bytes).expect("invalid");
+    fs::write(
+        &late_definition_path,
+        "int foo(void) { return 0; }\nint use(void) { return foo(); }\n",
+    )
+    .expect("late definition");
+
+    let role_cache = ReferenceRoleCache::new();
+    let search_cache = ReferenceSearchCache::new();
+    let indexed_files = vec![
+        ("0_definition.c".to_string(), early_definition_path),
+        ("1_invalid.c".to_string(), invalid_path),
+        ("a_reads.c".to_string(), noisy_path),
+        ("z_definition.c".to_string(), late_definition_path),
+    ];
+
+    let (mut first, truncated, first_timing) = search_references_with_result_cache_and_files(
+        dir.path(),
+        "foo",
+        &role_cache,
+        &search_cache,
+        7,
+        Some(indexed_files.clone()),
+    )
+    .expect("first search");
+    assert!(truncated);
+    assert!(!first_timing.cached);
+    assert_eq!(first.len(), REFERENCES_LIMIT);
+
+    sort_hits_by_role(&mut first);
+    assert_eq!(first[0].role, SyntacticRole::Definition);
+    assert_eq!(first[0].rel_path, "0_definition.c");
+    assert!(
+        first
+            .iter()
+            .any(|hit| hit.rel_path == "1_invalid.c" && hit.role == SyntacticRole::Read),
+        "unparseable files keep default read fallback instead of dropping the text hit"
+    );
+    assert!(
+        first.iter().all(|hit| hit.rel_path != "z_definition.c"),
+        "reference truncation keeps the historical path/line/column cap before role presentation"
+    );
+
+    let (mut cached, cached_truncated, cached_timing) =
+        search_references_with_result_cache_and_files(
+            dir.path(),
+            "foo",
+            &role_cache,
+            &search_cache,
+            7,
+            Some(indexed_files),
+        )
+        .expect("cached search");
+    sort_hits_by_role(&mut cached);
+    assert!(cached_truncated);
+    assert!(cached_timing.cached);
+    assert_eq!(cached, first);
+}

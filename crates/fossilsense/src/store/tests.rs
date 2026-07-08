@@ -6,6 +6,9 @@ use super::{FileFingerprint, FileSource, IndexStore};
 use std::collections::HashSet;
 
 mod basic;
+mod concept_vocabulary;
+mod documentation_contracts;
+mod fact_consumption_inventory;
 mod maintenance;
 mod members;
 mod parser_consumer_migration;
@@ -13,6 +16,7 @@ mod query_scoping;
 mod read_model_parity;
 mod read_view_migration;
 mod read_views;
+mod reference_query_separation;
 mod resilience_schema;
 mod schema_aliases;
 mod scoping;

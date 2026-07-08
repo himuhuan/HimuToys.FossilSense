@@ -5,9 +5,9 @@ use rusqlite::params;
 
 use super::IndexStore;
 
-#[allow(dead_code)]
+#[cfg(test)]
 type IncludeEdgeRows = Vec<(String, String)>;
-#[allow(dead_code)]
+#[cfg(test)]
 type IncludeOpenRows = Vec<(String, crate::reachability::OpenReason)>;
 
 impl IndexStore {
@@ -170,7 +170,7 @@ impl IndexStore {
     /// in-memory reachability graph. Resolution kind is *not* read here — the
     /// graph is a plain file-to-file closure; the kind is read where a decision
     /// needs it (e.g. [`apply_directly_included_derivation`] via in-row SQL).
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn load_include_edge_paths(&self) -> Result<Vec<(String, String)>> {
         self.reach_graph_view().include_edges().map(|rows| {
             rows.into_iter()
@@ -196,7 +196,7 @@ impl IndexStore {
 
     /// Paths of files with at least one unresolved `#include` — one source of
     /// "open" (uncertain) nodes in the reachability graph.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn open_include_file_paths(&self) -> Result<Vec<String>> {
         self.reach_graph_view()
             .unresolved_includes()
@@ -208,7 +208,7 @@ impl IndexStore {
     /// the reachability graph. Mirrors [`open_include_file_paths`]; the
     /// first-cause precedence (`UnresolvedInclude` before `AmbiguousInclude`)
     /// is encoded by `ReachGraph::new`, not by this query.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn ambiguous_include_file_paths(&self) -> Result<Vec<String>> {
         self.reach_graph_view()
             .ambiguous_includes()
@@ -322,7 +322,7 @@ impl IndexStore {
     ///
     /// `OpenReason::AmbiguousInclude` wins on tie: the caller should use the
     /// same `UnresolvedInclude` > `AmbiguousInclude` precedence as `ReachGraph::new`.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn load_include_data_for_sources(
         &self,
         source_paths: &[String],

@@ -882,6 +882,82 @@ mod tests {
     }
 
     #[test]
+    fn scoped_projection_keeps_role_gate_suppress_only_for_shadowing_names() {
+        use crate::parser::parse;
+        use crate::query::NameTable;
+        use crate::store::{FileFingerprint, IndexStore};
+        use std::collections::HashSet;
+        use std::path::Path;
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let db = dir.path().join("index.sqlite");
+        let mut store = IndexStore::open(&db, dir.path()).expect("store");
+
+        {
+            let mut index_file = |path: &str, source: &str, mtime_ns: u64| {
+                let parsed = parse(Path::new(path), source);
+                store
+                    .upsert_file_index(
+                        &FileFingerprint {
+                            path: path.to_string(),
+                            extension: path.rsplit('.').next().unwrap_or("").to_string(),
+                            size: source.len() as u64,
+                            mtime_ns: mtime_ns as i64,
+                            hash: format!("hash-{mtime_ns}"),
+                        },
+                        &parsed,
+                    )
+                    .expect("upsert");
+            };
+            index_file("reachable/color.h", "typedef int Color;\n", 1);
+            index_file("unreachable/color.h", "#define Color 1\n", 2);
+        }
+
+        let current = "Color value;\nint Color;\n";
+        let targets = parse(Path::new("src/use.c"), current);
+        let defs = targets.coloring_defs();
+        let wanted: HashSet<&str> = targets
+            .occurrences
+            .iter()
+            .map(|occ| occ.name.as_str())
+            .collect();
+
+        let reader = IndexStore::open_readonly(&db).expect("readonly");
+        let table =
+            NameTable::build_with_paths(reader.load_symbol_names_with_paths().expect("names"));
+        let scope = crate::query::CompletionScope {
+            current_path: Some("src/use.c".to_string()),
+            reach: crate::reachability::ReachScope {
+                files: ["src/use.c".to_string(), "reachable/color.h".to_string()]
+                    .into_iter()
+                    .collect(),
+                open: false,
+                reason: None,
+            },
+        };
+        let counts = table.colorable_kind_counts(&wanted, Some(&scope));
+        let tokens = classify_occurrences(
+            &targets.occurrences,
+            &defs.macro_defs,
+            &defs.type_defs,
+            &defs.enum_defs,
+            &counts,
+        );
+
+        let type_lines: Vec<u32> = tokens
+            .iter()
+            .filter(|token| token.token_type == TOKEN_TYPE_TYPE)
+            .map(|token| token.line)
+            .collect();
+        assert_eq!(
+            type_lines,
+            vec![0],
+            "scope may choose the indexed type, but role gating only suppresses incompatible positions"
+        );
+    }
+
+    #[test]
     fn parity_in_memory_counts_match_sql_coloring() {
         use crate::parser::parse;
         use crate::query::NameTable;
