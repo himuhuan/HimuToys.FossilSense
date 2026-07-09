@@ -7,7 +7,11 @@ import {
   ServerOptions,
   Trace,
 } from 'vscode-languageclient/node';
-import { normalizeIncludeScopingMode, normalizeOnOffAuto } from './config';
+import {
+  normalizeIncludeScopingMode,
+  normalizeOnOffAuto,
+  normalizeProjectContextMode,
+} from './config';
 import {
   CLEAR_COMPLETION_HISTORY_COMMAND,
   clearCompletionHistoryRequest,
@@ -21,6 +25,19 @@ import {
 } from './status';
 import { mutualExclusionMessage } from './conflicts';
 import { GroupedReferenceItem, groupedReferencePickRows } from './referencesView';
+import {
+  PROJECT_CONTEXT_WORKSPACE_STATE_KEY,
+  PROJECT_CONTEXTS_LSP_COMMAND,
+  ProjectContextSelection,
+  ProjectContextStatus,
+  SET_PROJECT_CONTEXT_LSP_COMMAND,
+  SHOW_PROJECT_CONTEXT_COMMAND,
+  projectContextPickRows,
+  projectContextStatusText,
+  selectionForMode,
+  shouldPromptForAmbiguous,
+  validStoredProjectContextSelection,
+} from './projectContext';
 
 const REFRESH_INDEX_COMMAND = 'fossilsense.refreshIndex';
 const REFRESH_INDEX_LSP_COMMAND = 'fossilsense.lsp.refreshIndex';
@@ -28,6 +45,16 @@ const REBUILD_INDEX_COMMAND = 'fossilsense.rebuildIndex';
 const REBUILD_INDEX_LSP_COMMAND = 'fossilsense.lsp.rebuildIndex';
 const GROUPED_REFERENCES_COMMAND = 'fossilsense.findReferencesGrouped';
 const GROUPED_REFERENCES_LSP_COMMAND = 'fossilsense.lsp.groupedReferences';
+const PROJECT_CONTEXT_MARKER_PATTERNS = [
+  '**/Makefile',
+  '**/makefile',
+  '**/GNUmakefile',
+  '**/CMakeLists.txt',
+  '**/*.pro',
+  '**/*.sln',
+  '**/*.vcxproj',
+  '**/*.vcproj',
+];
 
 const CONFLICT_EXTENSIONS = [
   { id: 'llvm-vs-code-extensions.vscode-clangd', name: 'clangd' },
@@ -37,11 +64,14 @@ const CONFLICT_EXTENSIONS = [
 
 let client: LanguageClient | undefined;
 let statusBar: vscode.StatusBarItem;
+let projectContextStatusBar: vscode.StatusBarItem;
 let output: vscode.OutputChannel;
 let configWarning: string | undefined;
 let capabilityWarning: string | undefined;
 let currentIndexStartedWithWarning = false;
 let mutualExclusionWarningShown = false;
+let currentProjectContextStatus: ProjectContextStatus | undefined;
+const promptedAmbiguousUris = new Set<string>();
 
 interface IndexStatus {
   state: 'indexing' | 'ready' | 'failed';
@@ -70,10 +100,15 @@ export function activate(context: vscode.ExtensionContext): void {
   statusBar.command = 'fossilsense.startServer';
   setStatus('stopped');
   statusBar.show();
+  projectContextStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 99);
+  projectContextStatusBar.command = SHOW_PROJECT_CONTEXT_COMMAND;
+  setProjectContextStatus(undefined);
+  projectContextStatusBar.show();
 
   context.subscriptions.push(
     output,
     statusBar,
+    projectContextStatusBar,
     vscode.commands.registerCommand('fossilsense.startServer', () => startServer(context)),
     vscode.commands.registerCommand('fossilsense.stopServer', () => stopServer()),
     vscode.commands.registerCommand(REFRESH_INDEX_COMMAND, () => refreshIndex()),
@@ -82,6 +117,10 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand(CLEAR_COMPLETION_HISTORY_COMMAND, () =>
       clearCompletionHistory(),
     ),
+    vscode.commands.registerCommand(SHOW_PROJECT_CONTEXT_COMMAND, () =>
+      showProjectContextSelector(context, false),
+    ),
+    vscode.window.onDidChangeActiveTextEditor(() => updateProjectContextForActiveEditor(context)),
     // These settings are sent via initializationOptions or control startup, so
     // changing them requires a restart to take effect.
     vscode.workspace.onDidChangeConfiguration(async (event) => {
@@ -89,6 +128,14 @@ export function activate(context: vscode.ExtensionContext): void {
         output.appendLine('fossilsense.mode changed; restarting server.');
         await stopServer();
         await startServer(context);
+        return;
+      }
+      if (
+        event.affectsConfiguration('fossilsense.projectContext.mode') &&
+        client
+      ) {
+        await applyProjectContextSelectionFromState(context);
+        await updateProjectContextForActiveEditor(context);
         return;
       }
       if (
@@ -171,6 +218,11 @@ async function startServer(context: vscode.ExtensionContext): Promise<void> {
         new vscode.RelativePattern(folder, 'fossilsense.json'),
       ),
     ),
+    ...workspaceFolders.flatMap((folder) =>
+      PROJECT_CONTEXT_MARKER_PATTERNS.map((pattern) =>
+        vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(folder, pattern)),
+      ),
+    ),
   ];
 
   const conflictingExtensions = detectedCppLanguageServers();
@@ -218,6 +270,8 @@ async function startServer(context: vscode.ExtensionContext): Promise<void> {
   try {
     await client.start();
     setStatus('ready');
+    await applyProjectContextSelectionFromState(context);
+    await updateProjectContextForActiveEditor(context);
     if (fossilsenseMode === 'auto' && conflictingExtensions.length > 0) {
       void showMutualExclusionWarning(conflictingExtensions);
     }
@@ -233,6 +287,8 @@ async function stopServer(): Promise<void> {
   const current = client;
   client = undefined;
   configWarning = undefined;
+  currentProjectContextStatus = undefined;
+  promptedAmbiguousUris.clear();
   currentIndexStartedWithWarning = false;
 
   if (current) {
@@ -240,6 +296,7 @@ async function stopServer(): Promise<void> {
   }
 
   setStatus('stopped');
+  setProjectContextStatus(undefined);
 }
 
 async function refreshIndex(): Promise<void> {
@@ -278,6 +335,119 @@ async function clearCompletionHistory(): Promise<void> {
 
   output.appendLine('Clearing local completion history...');
   await client.sendRequest(ExecuteCommandRequest.type, clearCompletionHistoryRequest());
+}
+
+async function applyProjectContextSelectionFromState(
+  context: vscode.ExtensionContext,
+): Promise<void> {
+  if (!client) {
+    return;
+  }
+  const status = await requestProjectContextStatus();
+  if (!status) {
+    setProjectContextStatus(undefined);
+    return;
+  }
+  const stored = context.workspaceState.get(PROJECT_CONTEXT_WORKSPACE_STATE_KEY);
+  const validStored = validStoredProjectContextSelection(stored, status.projects);
+  const selection = selectionForMode(projectContextModeFromConfig(), validStored);
+  if (stored && !validStored) {
+    await context.workspaceState.update(PROJECT_CONTEXT_WORKSPACE_STATE_KEY, { kind: 'auto' });
+  }
+  const next = await sendProjectContextSelection(selection);
+  setProjectContextStatus(next ?? status);
+}
+
+async function updateProjectContextForActiveEditor(
+  context: vscode.ExtensionContext,
+): Promise<void> {
+  if (!client) {
+    return;
+  }
+  const status = await requestProjectContextStatus();
+  setProjectContextStatus(status);
+  const activeUri = vscode.window.activeTextEditor?.document.uri.toString();
+  if (!activeUri || !shouldPromptForAmbiguous(projectContextModeFromConfig(), status)) {
+    return;
+  }
+  if (promptedAmbiguousUris.has(activeUri)) {
+    return;
+  }
+  promptedAmbiguousUris.add(activeUri);
+  await showProjectContextSelector(context, true);
+}
+
+async function showProjectContextSelector(
+  context: vscode.ExtensionContext,
+  prompted: boolean,
+): Promise<void> {
+  if (!client) {
+    void vscode.window.showWarningMessage('FossilSense server is not running. Start it first.');
+    return;
+  }
+  if (projectContextModeFromConfig() === 'off') {
+    const status = await sendProjectContextSelection({ kind: 'unspecified' });
+    setProjectContextStatus(status);
+    void vscode.window.showInformationMessage(
+      'FossilSense project context is disabled by fossilsense.projectContext.mode=off.',
+    );
+    return;
+  }
+  const status = await requestProjectContextStatus();
+  if (!status) {
+    void vscode.window.showInformationMessage('FossilSense project contexts are not ready yet.');
+    return;
+  }
+  const rows = projectContextPickRows(status.projects).map((row) => ({
+    label: row.label,
+    description: row.description,
+    row,
+  }));
+  const chosen = await vscode.window.showQuickPick(rows, {
+    placeHolder: prompted
+      ? 'FossilSense: no confident project for this file. Choose a project context.'
+      : 'FossilSense project context',
+    matchOnDescription: true,
+  });
+  if (!chosen) {
+    return;
+  }
+  await context.workspaceState.update(
+    PROJECT_CONTEXT_WORKSPACE_STATE_KEY,
+    chosen.row.selection,
+  );
+  const next = await sendProjectContextSelection(chosen.row.selection);
+  setProjectContextStatus(next ?? status);
+}
+
+async function requestProjectContextStatus(): Promise<ProjectContextStatus | undefined> {
+  if (!client) {
+    return undefined;
+  }
+  return (await client.sendRequest(ExecuteCommandRequest.type, {
+    command: PROJECT_CONTEXTS_LSP_COMMAND,
+    arguments: activeEditorUriArgument(),
+  })) as ProjectContextStatus | undefined;
+}
+
+async function sendProjectContextSelection(
+  selection: ProjectContextSelection,
+): Promise<ProjectContextStatus | undefined> {
+  if (!client) {
+    return undefined;
+  }
+  const effectiveSelection =
+    projectContextModeFromConfig() === 'off' ? { kind: 'unspecified' as const } : selection;
+  const [uriArg] = activeEditorUriArgument();
+  return (await client.sendRequest(ExecuteCommandRequest.type, {
+    command: SET_PROJECT_CONTEXT_LSP_COMMAND,
+    arguments: [{ selection: effectiveSelection, ...(uriArg ?? {}) }],
+  })) as ProjectContextStatus | undefined;
+}
+
+function activeEditorUriArgument(): Array<{ uri: string }> {
+  const uri = vscode.window.activeTextEditor?.document.uri.toString();
+  return uri ? [{ uri }] : [];
 }
 
 // Role-grouped find-references. The standard References panel (textDocument/
@@ -395,6 +565,13 @@ function includeScopingModeFromConfig(): string {
   return normalizeIncludeScopingMode(setting);
 }
 
+function projectContextModeFromConfig(): ReturnType<typeof normalizeProjectContextMode> {
+  const setting = vscode.workspace
+    .getConfiguration('fossilsense')
+    .get<string>('projectContext.mode', 'auto');
+  return normalizeProjectContextMode(setting);
+}
+
 function traceFromConfig(): Trace {
   const value = vscode.workspace
     .getConfiguration('fossilsense')
@@ -483,6 +660,7 @@ function handleIndexStatus(status: IndexStatus): void {
     case 'ready':
       capabilityWarning = degradedCapabilityWarning(status.degradedCapabilities);
       setStatus('ready');
+      void requestProjectContextStatus().then((projectStatus) => setProjectContextStatus(projectStatus));
       output.appendLine(
         `Index ready: ${status.workspace}; files=${status.totalFiles}, indexed=${status.indexedFiles}, skipped=${status.skippedFiles}, symbols=${status.symbols}, elapsed=${status.elapsedMs}ms (discover=${status.discoverMs}ms, check=${status.checkMs}ms, parse=${status.parseMs}ms, write=${status.writeMs}ms, include_edge=${status.includeEdgeMs}ms, name_table=${status.nameTableMs}ms, reach_graph=${status.reachGraphMs}ms)${capabilityWarning ? `; degraded=${capabilityWarning}` : ''}`,
       );
@@ -516,4 +694,14 @@ function setStatus(state: string): void {
   statusBar.backgroundColor = configWarning || capabilityWarning
     ? new vscode.ThemeColor('statusBarItem.warningBackground')
     : undefined;
+}
+
+function setProjectContextStatus(status: ProjectContextStatus | undefined): void {
+  currentProjectContextStatus = status;
+  const mode = projectContextModeFromConfig();
+  projectContextStatusBar.text = projectContextStatusText(mode, status);
+  projectContextStatusBar.tooltip = status
+    ? `Projects discovered: ${status.projects.length}`
+    : 'Project-context status is unavailable until the server is running.';
+  projectContextStatusBar.command = SHOW_PROJECT_CONTEXT_COMMAND;
 }

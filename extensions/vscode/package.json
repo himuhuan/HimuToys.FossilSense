@@ -42,6 +42,10 @@
       {
         "command": "fossilsense.clearCompletionHistory",
         "title": "FossilSense: Clear Completion History"
+      },
+      {
+        "command": "fossilsense.showProjectContext",
+        "title": "FossilSense: Select Project Context"
       }
     ],
     "configuration": {
@@ -81,6 +85,16 @@
           ],
           "default": "auto",
           "description": "Controls local-only accepted-completion history used as a bounded positive-feedback ranking signal. 'auto' and 'on' record anonymous candidate hashes/buckets and use them for ranking; 'off' disables both. Use 'FossilSense: Clear Completion History' to remove local workspace history."
+        },
+        "fossilsense.projectContext.mode": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "promptOnAmbiguous",
+            "off"
+          ],
+          "default": "auto",
+          "markdownDescription": "Controls build-marker-derived project-context ranking for ordinary identifier completion. `auto` uses the active file's nearest supported marker, `promptOnAmbiguous` prompts when no confident marker context is available, and `off` disables project-context ranking even if a workspace selection was saved."
         },
         "fossilsense.semanticColoring.mode": {
           "type": "string",
@@ -134,7 +148,7 @@
   },
   "scripts": {
     "compile": "tsc -p ./",
-    "test": "pnpm run compile && node out/test/config.test.js && node out/test/status.test.js && node out/test/serverPath.test.js && node out/test/conflicts.test.js && node out/test/referencesView.test.js && node out/test/completionHistory.test.js",
+    "test": "pnpm run compile && node out/test/config.test.js && node out/test/status.test.js && node out/test/serverPath.test.js && node out/test/conflicts.test.js && node out/test/referencesView.test.js && node out/test/completionHistory.test.js && node out/test/projectContext.test.js",
     "watch": "tsc -watch -p ./",
     "package": "node scripts/package.mjs"
   },

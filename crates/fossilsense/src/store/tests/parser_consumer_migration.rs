@@ -185,7 +185,8 @@ fn live_parser_consumers_consume_request_facts_and_availability() {
         "src/server/language_server.rs",
         &["index.symbols", "index.aliases", "index.records"],
     );
-    assert_present("src/server/language_server.rs", &["persistent_facts()"]);
+    assert_present("src/server/definition.rs", &["persistent_facts()"]);
+    assert_present("src/server/symbols.rs", &["persistent_facts()"]);
 }
 
 #[test]

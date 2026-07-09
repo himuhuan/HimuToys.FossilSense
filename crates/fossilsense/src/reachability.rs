@@ -67,6 +67,16 @@ pub struct ReachGraph {
     cache: Mutex<HashMap<String, Arc<ReachScope>>>,
 }
 
+impl Clone for ReachGraph {
+    fn clone(&self) -> Self {
+        Self {
+            edges: self.edges.clone(),
+            open: self.open.clone(),
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
 impl ReachGraph {
     /// Build from resolved `(src_path, dst_path)` edges and the open-node
     /// inputs: files with at least one unresolved `#include` and files with at

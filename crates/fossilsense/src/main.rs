@@ -10,6 +10,7 @@ mod model;
 mod parser;
 mod pathing;
 mod progress;
+mod project_context;
 mod query;
 mod reachability;
 mod references;

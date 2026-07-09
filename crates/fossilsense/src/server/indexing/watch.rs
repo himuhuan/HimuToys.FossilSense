@@ -41,6 +41,18 @@ pub(in crate::server) async fn watched_change_in_scope(
             }
         };
 
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                !crate::project_context::is_ninja_marker_file_name(name)
+                    && crate::project_context::is_supported_marker_file_name(name)
+            })
+            && config.is_path_allowed_by_scope_without_extension(&rel)
+        {
+            return Some(WatchDecision::ProjectContext(root.clone()));
+        }
+
         if config.is_in_scope(&rel) {
             let kind = if change.typ == FileChangeType::DELETED {
                 indexer::DirtyFileKind::Delete

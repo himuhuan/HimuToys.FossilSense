@@ -79,6 +79,15 @@ keeping FossilSense's best-effort candidate model.
   by anonymous candidate hash, kind, intent, and prefix bucket. It is workspace
   local, clearable, disableable, and records positive accept feedback only. No
   telemetry, cloud sync, ML ranking, or auto-include insertion is enabled.
+  Project context can add another bounded ordinary-completion signal. FossilSense
+  discovers source-owned build marker directories from `Makefile` / `makefile` /
+  `GNUmakefile`, `CMakeLists.txt`, QMake `*.pro`, and Visual Studio `*.sln` /
+  `*.vcxproj` / `*.vcproj`; Ninja markers such as `build.ninja` are deliberately
+  ignored. In automatic mode the active file's nearest ancestor marker directory
+  is used; nested projects choose the nearest marker and same-directory markers
+  coalesce. Project context never filters cross-project candidates and never
+  changes Go to Definition, references, coloring, member completion, or include
+  completion. It is a soft ranking/recall hint only, with no build-system parsing.
 - Best-effort Signature Help: inside simple function calls, shows exact-name
   indexed function signatures ranked by the same include reachability tiers as
   Go to Definition. Candidates are hints, not overload resolution; there is no
@@ -178,6 +187,14 @@ because FossilSense returns ranked text/index candidates.
   rank with history). History stays in the local workspace cache, is bounded, stores
   anonymous candidate hashes/buckets rather than raw labels or source, and can be removed
   with **FossilSense: Clear Completion History**.
+- `fossilsense.projectContext.mode` - controls build-marker-derived project-context
+  ranking for ordinary identifier completion: `"auto"` uses the active file's nearest
+  marker, `"promptOnAmbiguous"` prompts once when no confident marker context is
+  available, and `"off"` disables project-context ranking even when a workspace
+  selection was saved. The status-bar item lets you choose **Current Project (Auto)**,
+  a discovered project path, or **Unspecified**. Manual selection is stored only in
+  VS Code workspace state; stale selections fall back safely and are not sent to the
+  server.
 - `fossilsense.semanticColoring.mode` - controls FossilSense semantic coloring of macros,
   types, and enum constants: `"auto"` (default, enabled), `"on"` (enabled), `"off"`
   (never enabled). C/C++ language-server conflicts are reported by `fossilsense.mode`,

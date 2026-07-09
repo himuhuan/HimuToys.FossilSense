@@ -49,6 +49,7 @@ pub(super) struct RootDirtyChange {
 pub(super) enum WatchDecision {
     Full,
     Dirty(RootDirtyChange),
+    ProjectContext(PathBuf),
 }
 
 enum ScheduledIndex {
@@ -64,6 +65,43 @@ impl Notification for IndexStatusNotification {
 }
 
 impl Backend {
+    pub(super) async fn refresh_project_context_roots(&self, roots: Vec<PathBuf>) {
+        self.session.cache.invalidate_after_index_change();
+        self.session.cache.clear_all_completion_memos().await;
+        for root in roots {
+            match self
+                .session
+                .cache
+                .refresh_project_context_index(&self.client, root.clone())
+                .await
+            {
+                Ok(count) => {
+                    self.client
+                        .log_message(
+                            MessageType::INFO,
+                            format!(
+                                "project contexts refreshed for {}: {} contexts",
+                                root.display(),
+                                count
+                            ),
+                        )
+                        .await;
+                }
+                Err(err) => {
+                    self.client
+                        .log_message(
+                            MessageType::WARNING,
+                            format!(
+                                "project context refresh failed for {}: {err:#}",
+                                root.display()
+                            ),
+                        )
+                        .await;
+                }
+            }
+        }
+    }
+
     pub(super) async fn spawn_dirty_files(&self, changes: Vec<RootDirtyChange>) {
         self.session.cache.invalidate_after_index_change();
         let roots = self.workspace_roots.lock().await.clone();

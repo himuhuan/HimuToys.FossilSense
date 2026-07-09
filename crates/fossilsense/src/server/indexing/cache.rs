@@ -1,18 +1,24 @@
 use super::*;
-use crate::server::workspace::{ReadModelSnapshots, WorkspaceReadModels};
+use crate::server::workspace::WorkspaceReadModels;
 use crate::server::{
-    state, CacheLedger, CachePublishReport, IncludeTables, IndexGenerations, IndexedFileLists,
-    NameTables, ReachGraphs,
+    state, CacheLedger, CachePublishReport, IncludeTables, IndexedFileLists, NameTables,
+    ProjectContextIndexes, ReachGraphs,
 };
+use crate::{config::WorkspaceConfig, project_context};
 
 /// Rebuild the in-memory fuzzy name table for `root` from its SQLite index.
-pub(super) async fn rebuild_name_table(name_tables: &NameTables, root: PathBuf) -> Result<usize> {
+pub(super) async fn rebuild_name_table(
+    name_tables: &NameTables,
+    root: PathBuf,
+    project_context: Option<Arc<project_context::ProjectContextIndex>>,
+) -> Result<usize> {
     let build_root = root.clone();
     let built = tokio::task::spawn_blocking(move || -> Result<NameTable> {
         let db_path = pathing::default_index_path(&build_root)?;
         let store = IndexStore::open_readonly(&db_path)?;
-        Ok(NameTable::build_from_rows(
+        Ok(NameTable::build_from_rows_with_project_context(
             store.name_table_view().symbol_rows()?,
+            project_context.as_deref(),
         ))
     })
     .await;
@@ -82,16 +88,19 @@ pub(super) async fn refresh_reach_graph_incremental(
     match loaded {
         Ok(Ok((edges, open))) => {
             let existing = reach_graphs.lock().await.get(&root).cloned();
-            let refreshed = existing.is_some_and(|graph| match graph.write() {
-                Ok(mut graph) => {
-                    graph.refresh_sources_from_rows(&source_vec, edges, open);
-                    true
-                }
-                Err(_) => false,
-            });
-            if !refreshed {
+            let Some(refreshed_graph) = existing.and_then(|graph| {
+                graph.read().ok().map(|graph| {
+                    let mut refreshed = graph.clone();
+                    refreshed.refresh_sources_from_rows(&source_vec, edges, open);
+                    refreshed
+                })
+            }) else {
                 return rebuild_reach_graph(client, reach_graphs, root).await;
-            }
+            };
+            reach_graphs
+                .lock()
+                .await
+                .insert(root, Arc::new(StdRwLock::new(refreshed_graph)));
             client
                 .log_message(
                     MessageType::INFO,
@@ -173,6 +182,7 @@ pub(super) async fn update_name_table_paths(
     name_tables: &NameTables,
     root: PathBuf,
     paths: &[String],
+    project_context: Option<Arc<project_context::ProjectContextIndex>>,
 ) -> Result<usize> {
     let build_root = root.clone();
     let paths_vec = paths.to_vec();
@@ -195,10 +205,14 @@ pub(super) async fn update_name_table_paths(
     let path_set: HashSet<String> = paths.iter().cloned().collect();
     let mut tables = name_tables.lock().await;
     let updated = match tables.get(&root) {
-        Some(existing) => existing.with_updated_path_rows(&path_set, fresh_names),
+        Some(existing) => existing.with_updated_path_rows_with_project_context(
+            &path_set,
+            fresh_names,
+            project_context.as_deref(),
+        ),
         None => {
             drop(tables);
-            return rebuild_name_table(name_tables, root).await;
+            return rebuild_name_table(name_tables, root, project_context).await;
         }
     };
     let count = updated.len();
@@ -278,19 +292,52 @@ pub(in crate::server) async fn rebuild_indexed_file_list(
     }
 }
 
+pub(in crate::server) async fn rebuild_project_context_index(
+    project_context_indexes: &ProjectContextIndexes,
+    root: PathBuf,
+) -> Result<usize> {
+    let build_root = root.clone();
+    let built =
+        tokio::task::spawn_blocking(move || -> Result<project_context::ProjectContextIndex> {
+            let (config, _) = WorkspaceConfig::load(&build_root);
+            project_context::discover_project_contexts(&build_root, &config)
+        })
+        .await;
+
+    match built {
+        Ok(Ok(index)) => {
+            let count = index.projects().len();
+            project_context_indexes
+                .lock()
+                .await
+                .insert(root, Arc::new(index));
+            Ok(count)
+        }
+        Ok(Err(err)) => {
+            project_context_indexes.lock().await.remove(&root);
+            Err(err)
+        }
+        Err(err) => {
+            project_context_indexes.lock().await.remove(&root);
+            Err(err.into())
+        }
+    }
+}
+
 pub(super) async fn refresh_workspace_generation(
-    index_generations: &IndexGenerations,
-    read_model_snapshots: &ReadModelSnapshots,
-    name_tables: &NameTables,
-    reach_graphs: &ReachGraphs,
-    include_tables: &IncludeTables,
-    indexed_file_lists: &IndexedFileLists,
+    cache: &CacheLedger,
     root: PathBuf,
 ) -> state::WorkspaceGeneration {
-    let name_table = name_tables.lock().await.get(&root).cloned();
-    let reach_graph = reach_graphs.lock().await.get(&root).cloned();
-    let include_table = include_tables.lock().await.get(&root).cloned();
-    let indexed_file_list = indexed_file_lists.lock().await.get(&root).cloned();
+    let name_table = cache.name_tables.lock().await.get(&root).cloned();
+    let reach_graph = cache.reach_graphs.lock().await.get(&root).cloned();
+    let include_table = cache.include_tables.lock().await.get(&root).cloned();
+    let project_context = cache
+        .project_context_indexes
+        .lock()
+        .await
+        .get(&root)
+        .cloned();
+    let indexed_file_list = cache.indexed_file_lists.lock().await.get(&root).cloned();
 
     let generation = state::workspace_generation_for_parts(
         &root,
@@ -302,22 +349,27 @@ pub(super) async fn refresh_workspace_generation(
             include_table: include_table
                 .as_ref()
                 .map(|table| Arc::as_ptr(table) as usize),
+            project_context: project_context
+                .as_ref()
+                .map(|index| Arc::as_ptr(index) as usize),
             indexed_file_list: indexed_file_list
                 .as_ref()
                 .map(|files| Arc::as_ptr(files) as usize),
         },
     );
-    index_generations
+    cache
+        .index_generations
         .lock()
         .await
         .insert(root.clone(), generation);
-    read_model_snapshots.lock().await.insert(
+    cache.read_model_snapshots.lock().await.insert(
         root,
         WorkspaceReadModels {
             generation,
             name_table,
             reach_graph,
             include_table,
+            project_context,
             indexed_files: indexed_file_list,
         },
     );
@@ -325,13 +377,45 @@ pub(super) async fn refresh_workspace_generation(
 }
 
 impl CacheLedger {
+    pub(in crate::server) async fn refresh_project_context_index(
+        &self,
+        _client: &Client,
+        root: PathBuf,
+    ) -> Result<usize> {
+        let count =
+            rebuild_project_context_index(&self.project_context_indexes, root.clone()).await?;
+        if self.name_tables.lock().await.contains_key(&root) {
+            let project_context = self
+                .project_context_indexes
+                .lock()
+                .await
+                .get(&root)
+                .cloned();
+            rebuild_name_table(&self.name_tables, root.clone(), project_context).await?;
+        }
+        refresh_workspace_generation(self, root).await;
+        self.invalidate_after_index_change();
+        Ok(count)
+    }
+
     pub(in crate::server) async fn publish_full_index(
         &self,
         client: &Client,
         root: PathBuf,
     ) -> Result<CachePublishReport> {
+        let project_context_count =
+            rebuild_project_context_index(&self.project_context_indexes, root.clone())
+                .await
+                .unwrap_or(0);
+        let project_context = self
+            .project_context_indexes
+            .lock()
+            .await
+            .get(&root)
+            .cloned();
         let nt_started = tokio::time::Instant::now();
-        let symbol_count = rebuild_name_table(&self.name_tables, root.clone()).await?;
+        let symbol_count =
+            rebuild_name_table(&self.name_tables, root.clone(), project_context).await?;
         let name_table_ms = nt_started.elapsed().as_millis();
         let rg_started = tokio::time::Instant::now();
         let mut degraded = DegradedCapabilities {
@@ -358,17 +442,14 @@ impl CacheLedger {
                 }
             };
         let reach_graph_ms = rg_started.elapsed().as_millis();
-        let generation = refresh_workspace_generation(
-            &self.index_generations,
-            &self.read_model_snapshots,
-            &self.name_tables,
-            &self.reach_graphs,
-            &self.include_tables,
-            &self.indexed_file_lists,
-            root,
-        )
-        .await;
+        let generation = refresh_workspace_generation(self, root).await;
         self.invalidate_after_index_change();
+        client
+            .log_message(
+                MessageType::INFO,
+                format!("project contexts discovered: {project_context_count}"),
+            )
+            .await;
         Ok(CachePublishReport {
             symbol_count,
             include_count,
@@ -389,9 +470,16 @@ impl CacheLedger {
         rel_paths: &[String],
         include_edge_sources_rebuilt: &[String],
     ) -> Result<CachePublishReport> {
+        let project_context = self
+            .project_context_indexes
+            .lock()
+            .await
+            .get(&root)
+            .cloned();
         let nt_started = tokio::time::Instant::now();
         let symbol_count =
-            update_name_table_paths(&self.name_tables, root.clone(), rel_paths).await?;
+            update_name_table_paths(&self.name_tables, root.clone(), rel_paths, project_context)
+                .await?;
         let name_table_ms = nt_started.elapsed().as_millis();
         let rg_started = tokio::time::Instant::now();
         let mut degraded = DegradedCapabilities {
@@ -423,18 +511,22 @@ impl CacheLedger {
                     0
                 }
             };
+        let project_context_count = self
+            .project_context_indexes
+            .lock()
+            .await
+            .get(&root)
+            .map(|index| index.projects().len())
+            .unwrap_or(0);
         let reach_graph_ms = rg_started.elapsed().as_millis();
-        let generation = refresh_workspace_generation(
-            &self.index_generations,
-            &self.read_model_snapshots,
-            &self.name_tables,
-            &self.reach_graphs,
-            &self.include_tables,
-            &self.indexed_file_lists,
-            root,
-        )
-        .await;
+        let generation = refresh_workspace_generation(self, root).await;
         self.invalidate_after_index_change();
+        client
+            .log_message(
+                MessageType::INFO,
+                format!("project contexts discovered: {project_context_count}"),
+            )
+            .await;
         Ok(CachePublishReport {
             symbol_count,
             include_count,

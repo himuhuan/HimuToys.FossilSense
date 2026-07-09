@@ -153,6 +153,7 @@ Smart Completion 当前约定：
 | language builtin | 静态 C/C++ 关键词、内置类型和常量可作为低置信 fallback 补全 evidence；显示为 `keyword` / `builtin type` / `builtin constant`，不写入索引，不参与跳转、workspace symbol 或着色 |
 | intent | 普通补全使用轻量规则式 intent ranking，覆盖 type、expression、call、macro preprocessor、declaration-name；intent 只是排序证据，不做类型推断或绑定，不硬过滤 |
 | recall | 普通补全 indexed recall 使用 bounded multi-channel quotas，在 current/local、reachable、external、unknown/open-scope、global、text evidence 间保留有限代表性后再统一 rerank |
+| project context | 普通补全可使用 Make/CMake/QMake/Visual Studio 构建标记推断的项目上下文作为有界召回/排序证据；默认排除 Ninja；`Unspecified` 和 `fossilsense.projectContext.mode=off` 必须等价于禁用该证据 |
 | include ranking | include path completion 保留 quote/angle source prior，并增加 same-directory、sibling/component edge、recent include、basename frequency、path depth 二级 evidence |
 | metrics | verbose/perf 日志只输出分阶段耗时、候选来源/返回计数（含 language_builtin 聚合计数）、intent bucket、recall channel counts、guard 摘要、shadow rank 摘要和 include ranking 计数 |
 | 隐私 | 默认 debug/perf summary 不输出候选名、源码片段或用户代码内容 |

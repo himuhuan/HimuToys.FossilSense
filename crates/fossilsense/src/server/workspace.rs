@@ -10,6 +10,7 @@ use super::state;
 use super::{IndexGenerations, IndexedFileLists, LocalWordCache, NameTables, ReachGraphs};
 use crate::completion_words;
 use crate::parser::FileSemanticIndex;
+use crate::project_context::ProjectContextIndex;
 use crate::query::NameTable;
 use crate::reachability::ReachGraph;
 use crate::references;
@@ -142,6 +143,7 @@ pub(super) struct CacheLedger {
     pub(in crate::server) name_tables: NameTables,
     pub(in crate::server) reach_graphs: ReachGraphs,
     pub(in crate::server) include_tables: super::IncludeTables,
+    pub(in crate::server) project_context_indexes: super::ProjectContextIndexes,
     pub(in crate::server) indexed_file_lists: IndexedFileLists,
     pub(in crate::server) index_generations: IndexGenerations,
     pub(in crate::server) read_model_snapshots: ReadModelSnapshots,
@@ -158,6 +160,7 @@ pub(in crate::server) struct WorkspaceReadModels {
     pub(in crate::server) name_table: Option<Arc<NameTable>>,
     pub(in crate::server) reach_graph: Option<Arc<StdRwLock<ReachGraph>>>,
     pub(in crate::server) include_table: Option<Arc<IncludeCompletionTable>>,
+    pub(in crate::server) project_context: Option<Arc<ProjectContextIndex>>,
     pub(in crate::server) indexed_files: Option<Arc<Vec<(String, PathBuf)>>>,
 }
 
@@ -167,6 +170,7 @@ impl Default for CacheLedger {
             name_tables: Arc::new(Mutex::new(HashMap::new())),
             reach_graphs: Arc::new(Mutex::new(HashMap::new())),
             include_tables: Arc::new(Mutex::new(HashMap::new())),
+            project_context_indexes: Arc::new(Mutex::new(HashMap::new())),
             indexed_file_lists: Arc::new(Mutex::new(HashMap::new())),
             index_generations: Arc::new(Mutex::new(HashMap::new())),
             read_model_snapshots: Arc::new(Mutex::new(HashMap::new())),
@@ -198,6 +202,7 @@ pub(super) struct WorkspaceSnapshot {
     pub(super) name_table: Option<Arc<NameTable>>,
     pub(super) reach_graph: Option<Arc<StdRwLock<ReachGraph>>>,
     pub(super) include_table: Option<Arc<IncludeCompletionTable>>,
+    pub(super) project_context: Option<Arc<ProjectContextIndex>>,
     pub(super) indexed_files: Option<Arc<Vec<(String, PathBuf)>>>,
 }
 
@@ -237,6 +242,10 @@ impl CacheLedger {
         self.indexed_file_lists.lock().await.get(root).cloned()
     }
 
+    pub(super) async fn project_context(&self, root: &PathBuf) -> Option<Arc<ProjectContextIndex>> {
+        self.project_context_indexes.lock().await.get(root).cloned()
+    }
+
     pub(super) async fn generation(&self, root: &PathBuf) -> state::WorkspaceGeneration {
         self.index_generations
             .lock()
@@ -257,6 +266,7 @@ impl CacheLedger {
                 name_table: models.name_table,
                 reach_graph: models.reach_graph,
                 include_table: models.include_table,
+                project_context: models.project_context,
                 indexed_files: models.indexed_files,
                 root,
                 settings,
@@ -268,6 +278,7 @@ impl CacheLedger {
             name_table: self.name_table(&root).await,
             reach_graph: self.reach_graph(&root).await,
             include_table: self.include_table(&root).await,
+            project_context: self.project_context(&root).await,
             indexed_files: self.indexed_file_list(&root).await,
             root,
             settings,
@@ -284,6 +295,10 @@ impl CacheLedger {
 
     pub(super) async fn clear_completion_memo(&self, uri: &Url) {
         self.completion_memo.lock().await.remove(uri);
+    }
+
+    pub(super) async fn clear_all_completion_memos(&self) {
+        self.completion_memo.lock().await.clear();
     }
 
     pub(super) async fn record_completion_memo(

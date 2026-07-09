@@ -30,6 +30,7 @@ pub(super) struct WorkspaceGenerationParts {
     pub(super) name_table: Option<usize>,
     pub(super) reach_graph: Option<usize>,
     pub(super) include_table: Option<usize>,
+    pub(super) project_context: Option<usize>,
     pub(super) indexed_file_list: Option<usize>,
 }
 
@@ -42,6 +43,7 @@ pub(super) fn workspace_generation_for_parts(
     parts.name_table.hash(&mut hasher);
     parts.reach_graph.hash(&mut hasher);
     parts.include_table.hash(&mut hasher);
+    parts.project_context.hash(&mut hasher);
     parts.indexed_file_list.hash(&mut hasher);
     WorkspaceGeneration(hasher.finish())
 }

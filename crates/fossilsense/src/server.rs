@@ -37,11 +37,16 @@ use crate::config::WorkspaceConfig;
 use crate::includes::{self, IncludeForm};
 use crate::parser::{self, FileSemanticIndex};
 use crate::pathing;
+use crate::project_context::{ProjectContextIndex, ProjectContextSelection, ProjectContextStatus};
 use crate::query::{self, NameTable};
 use crate::reachability::{self, ReachGraph};
 use crate::references;
 use crate::store::IndexStore;
 
+mod commands;
+mod completion_handler;
+mod definition;
+mod document_events;
 mod hover;
 mod include_completion;
 mod indexing;
@@ -49,9 +54,11 @@ mod language_server;
 mod lsp_adapters;
 mod member_completion;
 mod options;
+mod references_handler;
 mod semantic_tokens;
 mod signature_help;
 mod state;
+mod symbols;
 mod workspace;
 
 use include_completion::{
@@ -82,6 +89,7 @@ use workspace::{
 type NameTables = Arc<Mutex<HashMap<PathBuf, Arc<NameTable>>>>;
 type ReachGraphs = Arc<Mutex<HashMap<PathBuf, Arc<StdRwLock<ReachGraph>>>>>;
 type IncludeTables = Arc<Mutex<HashMap<PathBuf, Arc<IncludeCompletionTable>>>>;
+type ProjectContextIndexes = Arc<Mutex<HashMap<PathBuf, Arc<ProjectContextIndex>>>>;
 type IndexedFileLists = Arc<Mutex<HashMap<PathBuf, Arc<Vec<(String, PathBuf)>>>>>;
 type IndexGenerations = Arc<Mutex<HashMap<PathBuf, state::WorkspaceGeneration>>>;
 type LocalWordEntry = (i32, Arc<HashSet<String>>);
@@ -128,6 +136,8 @@ pub(super) const CLEAR_COMPLETION_HISTORY_LSP_COMMAND: &str =
 /// `{ uri, line, character }` and returns the role-labeled hits the standard
 /// `textDocument/references` cannot carry over the wire.
 const GROUPED_REFERENCES_LSP_COMMAND: &str = "fossilsense.lsp.groupedReferences";
+const PROJECT_CONTEXTS_LSP_COMMAND: &str = "fossilsense.lsp.projectContexts";
+const SET_PROJECT_CONTEXT_LSP_COMMAND: &str = "fossilsense.lsp.setProjectContext";
 
 pub async fn run_stdio() -> Result<()> {
     eprintln!("FossilSense LSP starting on stdio");
@@ -149,6 +159,7 @@ pub async fn run_stdio() -> Result<()> {
         debug_candidate_reasons: AtomicBool::new(false),
         perf_logging_enabled: AtomicBool::new(false),
         config_cache: Arc::new(Mutex::new(HashMap::new())),
+        project_context_selection: Arc::new(Mutex::new(ProjectContextSelection::Auto)),
     });
 
     Server::new(stdin, stdout, socket).serve(service).await;
@@ -191,6 +202,7 @@ struct Backend {
     /// Invalidated when `fossilsense.json` itself changes (which triggers
     /// `WatchDecision::Full` and reloads the config in the index path).
     config_cache: Arc<Mutex<HashMap<PathBuf, WorkspaceConfig>>>,
+    project_context_selection: Arc<Mutex<ProjectContextSelection>>,
 }
 
 impl Backend {

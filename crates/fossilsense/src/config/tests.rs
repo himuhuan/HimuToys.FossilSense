@@ -340,6 +340,29 @@ fn load_parses_and_dedupes_include_paths() {
 }
 
 #[test]
+fn duplicate_include_paths_still_rebuild_matchers() {
+    let dir = tempdir().expect("tempdir");
+    fs::write(
+        dir.path().join("fossilsense.json"),
+        r#"{
+            "include": ["src"],
+            "exclude": ["src/generated"],
+            "extensions": ["hh"],
+            "includePaths": ["C:/a/inc", "C:/a/inc/"]
+        }"#,
+    )
+    .expect("write");
+
+    let (config, issue) = WorkspaceConfig::load(dir.path());
+
+    assert!(issue.is_some());
+    assert!(config.keep_during_walk("src", true));
+    assert!(config.is_in_scope("src/public/api.hh"));
+    assert!(!config.is_in_scope("src/public/api.h"));
+    assert!(!config.is_in_scope("src/generated/api.hh"));
+}
+
+#[test]
 fn load_default_has_empty_include_paths() {
     let dir = tempdir().expect("tempdir");
     let (config, _) = WorkspaceConfig::load(dir.path());

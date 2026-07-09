@@ -81,7 +81,10 @@ fn function_body(source: &str, signature: &str) -> String {
 }
 
 fn assert_reference_hit_has_no_scope_tier_data(source: &str) {
-    for forbidden in reference_hit_scope_tier_violations(source) {
+    if let Some(forbidden) = reference_hit_scope_tier_violations(source)
+        .into_iter()
+        .next()
+    {
         panic!("ReferenceHit must stay a text hit with syntactic role only; found `{forbidden}`");
     }
 }

@@ -201,6 +201,7 @@ impl WorkspaceConfig {
         };
 
         let mut config = Self::default();
+        let mut issue = None;
 
         if let Some(include) = raw.include {
             config.include = include.into_iter().map(normalize_entry).collect();
@@ -222,13 +223,13 @@ impl WorkspaceConfig {
                 include_paths.into_iter().map(normalize_include_path_entry),
             );
             config.include_paths = deduped;
-            if let Some(issue) = duplicate_issues.into_iter().next() {
-                return (config, Some(issue));
+            if issue.is_none() {
+                issue = duplicate_issues.into_iter().next();
             }
         }
 
         config.matchers = PrecomputedMatchers::build(&config);
-        (config, None)
+        (config, issue)
     }
 
     /// Cheap traversal-layer filter shared by the indexer, reference search,
@@ -357,6 +358,40 @@ impl WorkspaceConfig {
         // Extension check via precomputed HashSet.
         extension_from_slash_path_lower(&path_lower)
             .is_some_and(|ext_lower| self.matchers.extension_set.contains(ext_lower))
+    }
+
+    pub fn is_path_allowed_by_scope_without_extension(&self, rel_slash_path: &str) -> bool {
+        let path_lower = rel_slash_path.to_ascii_lowercase();
+
+        if !self.include.is_empty() {
+            let include_match = self
+                .matchers
+                .include_lower
+                .iter()
+                .any(|entry_lower| path_matches_entry_lower(&path_lower, entry_lower));
+            let glob_match = !self.matchers.include_glob_entries.is_empty()
+                && self
+                    .matchers
+                    .include_glob_entries
+                    .iter()
+                    .any(|entry| path_matches_glob_entry(rel_slash_path, entry));
+            if !include_match && !glob_match {
+                return false;
+            }
+        }
+
+        let exclude_match = self
+            .matchers
+            .exclude_lower
+            .iter()
+            .any(|entry_lower| path_matches_entry_lower(&path_lower, entry_lower));
+        let glob_exclude = !self.matchers.exclude_glob_entries.is_empty()
+            && self
+                .matchers
+                .exclude_glob_entries
+                .iter()
+                .any(|entry| path_matches_glob_entry(rel_slash_path, entry));
+        !(exclude_match || glob_exclude)
     }
 
     /// Rebuild `matchers` from the current config fields. Needed after
