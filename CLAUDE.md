@@ -449,10 +449,20 @@ dist/fossilsense-vscode-<version>_BUILD<YYYYMMDD_HHMMSS>.vsix
 
 核心风险：局部补丁看似完整，却造成概念漂移。后续修改优先保持概念稳定、行为可解释、测试有杀伤力、文档同步当前实现。
 
+文档分层（详见 `docs/README.md`）：
+
+| 层 | 位置 | 规则 |
+|---|---|---|
+| 权威 | 本文件、README、扩展 README、代码/测试 | 当前事实只认这里；冲突时改文档对齐实现 |
+| 活笔记 | `docs/architecture/` | 只保留仍指导当前理解的短文；不堆施工过程 |
+| 施工单 | `openspec/changes/<name>/` | 仅未完成变更；完成后必须迁入 `openspec/changes/archive/` |
+| 归档 | `docs/archive/`、`openspec/changes/archive/` | 标 `archived` / `superseded`；可查痕迹，不当 backlog，不得自动复活愿景 |
+
 | 规则 | 要求 |
 |---|---|
 | 当前事实优先 | `CLAUDE.md`、README、扩展 README、`package.json` 描述、CLI about 必须同步实现 |
 | 历史文档标状态 | `current` / `implemented` / `archived` / `superseded`；不得自动复活历史愿景 |
+| 过程文档不平行 | research / OpenSpec design 落地后归档或抽成短笔记；禁止与本文件抢权威 |
 | 先稳定概念 | 新能力先说明使用 `Definition`、`Declaration`、`Occurrence`、`ReferenceHit`、`RecordDef`、`FieldDef`、`TypeAlias`、`IncludeEdge`、`ReachScope` 中哪个概念 |
 | 候选不是绑定 | 没有编译级证据时，跳转、补全、引用、着色都是 best-effort candidate |
 | 文档必须写清 | confidence、fallback、ambiguity、open scope、truncation、cache invalidation、parser fact availability、store read-view contracts |

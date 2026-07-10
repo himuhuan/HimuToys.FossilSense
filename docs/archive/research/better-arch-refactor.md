@@ -1,3 +1,6 @@
+> **Status: superseded** (2026-07-10)
+>
+> 权威事实以仓库根目录 CLAUDE.md 与当前代码为准。本文是历史过程/评估文档，只保留决策痕迹，不得当作 backlog、实现规范或自动复活的愿景来源。
 # 总体判断
 
 基于你提供的 FossilSense 架构材料，我认为它的**产品架构方向是正确的，但已经接近复杂度拐点**：薄 VS Code 扩展、单 Rust 进程、SQLite 持久索引、内存读模型、容错解析，以及把“不确定性”显式建模为 `ScopeTier`、`ResolutionConfidence`、`ResolutionReason`、`ReachScope`，这些都是很有价值的基础。当前真正的风险不是功能不足，而是**状态生命周期、缓存一致性和策略归属尚未成为一等架构概念**。

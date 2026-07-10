@@ -1,3 +1,6 @@
+> **Status: superseded** (2026-07-10)
+>
+> 权威事实以仓库根目录 CLAUDE.md 与当前代码为准。本文是历史过程/评估文档，只保留决策痕迹，不得当作 backlog、实现规范或自动复活的愿景来源。
 # Healthy FossilSense 架构重构开发评估报告
 
 Status: draft

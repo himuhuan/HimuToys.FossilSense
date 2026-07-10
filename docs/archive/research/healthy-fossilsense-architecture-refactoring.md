@@ -1,3 +1,6 @@
+> **Status: superseded** (2026-07-10)
+>
+> 权威事实以仓库根目录 CLAUDE.md 与当前代码为准。本文是历史过程/评估文档，只保留决策痕迹，不得当作 backlog、实现规范或自动复活的愿景来源。
 ## 总体判断
 
 我会把 FossilSense 视为一个**“不依赖可靠编译环境的 C/C++ 候选语义系统”**，而不是传统意义上的编译器前端、clangd 替代品或纯 LSP 包装器。它的核心价值不在于“给出唯一正确绑定”，而在于：在大规模、Windows-oriented、缺失 `compile_commands.json`、宏展开不可靠、IntelliSense/clangd 不可用或成本过高的环境下，持续产出带置信度、作用域、降级原因和候选来源的导航/补全/引用/着色结果。这个产品定位已经比较清晰，而且当前架构中 `model.rs`、`resolver.rs`、`ScopeTier`、`ResolutionConfidence`、`ResolutionReason`、`ReachScope`、`OpenReason` 等抽象，是最值得保护的“架构资产”。

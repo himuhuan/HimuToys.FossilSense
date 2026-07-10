@@ -102,10 +102,9 @@ impl ResolutionReason {
 /// means "in the current file", not "is the bound definition".
 ///
 /// Total order, strongest evidence first: `Current > Reachable > External >
-/// Unknown > Global`. See `openspec/changes/candidate-resolver/design.md` D2
-/// for the rationale, including the contentious `External > Global` edge (a
-/// direct include is reachability evidence; a global workspace symbol has no
-/// path from the current file).
+/// Unknown > Global`. `External > Global` is intentional: a direct include is
+/// reachability evidence, while a global workspace symbol has no path from the
+/// current file. See `CLAUDE.md` resolver rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ScopeTier {
     /// Definition in the current file.
