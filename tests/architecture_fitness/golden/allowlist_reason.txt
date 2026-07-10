@@ -1,4 +1,0 @@
-Architecture fitness report
-status severity rule file detail allowlist
-ALLOWLISTED ERROR lsp-boundary crates/fossilsense/src/query/lsp_kinds.rs tower_lsp usage is limited to server and LSP adapter boundaries Query currently contains a transitional LSP-kind adapter; move it under server/lsp_adapters.rs during a later behavior-preserving step.
-Summary: fail=0 warn=0 allowlisted=1

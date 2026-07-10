@@ -288,9 +288,10 @@ impl LanguageServer for Backend {
         let search_word = word.clone();
         let role_cache = self.session.cache.reference_role_cache.clone();
         let search_cache = self.session.cache.reference_search_cache.clone();
-        let snapshot = self.workspace_snapshot_for_root(root.clone()).await;
-        let indexed_generation = snapshot.generation.as_u64();
-        let indexed_files = snapshot
+        let context = self.request_context_for_root(root.clone()).await;
+        let indexed_generation = context.engine.epoch.as_u64();
+        let indexed_files = context
+            .engine
             .indexed_files
             .as_ref()
             .map(|files| (**files).clone());
@@ -360,9 +361,9 @@ impl LanguageServer for Backend {
             let roots = self.workspace_roots.lock().await.clone();
             let mut tables = Vec::new();
             for root in roots {
-                let snapshot = self.workspace_snapshot_for_root(root.clone()).await;
-                if let Some(table) = snapshot.name_table {
-                    tables.push((snapshot.root, table));
+                let context = self.request_context_for_root(root).await;
+                if let Some(table) = context.engine.name_table.clone() {
+                    tables.push((context.engine.root.clone(), table));
                 }
             }
             tables
@@ -463,7 +464,7 @@ impl LanguageServer for Backend {
     }
 
     async fn completion(&self, params: CompletionParams) -> LspResult<Option<CompletionResponse>> {
-        let request_settings = self.snapshot_settings();
+        let request_settings = self.request_settings();
         if !request_settings.completion_enabled {
             return Ok(None);
         }
@@ -528,19 +529,19 @@ impl LanguageServer for Backend {
         };
         let local_words = self.local_words_for(&uri, version, &text).await;
 
-        let snapshots = {
+        let contexts = {
             let roots = self.workspace_roots.lock().await.clone();
-            let mut snapshots = Vec::with_capacity(roots.len());
+            let mut contexts = Vec::with_capacity(roots.len());
             for root in roots {
-                snapshots.push(self.workspace_snapshot_for_root(root).await);
+                contexts.push(self.request_context_for_root(root).await);
             }
-            snapshots
+            contexts
         };
         let mut tables = Vec::new();
         let mut table_generations = Vec::new();
-        for snapshot in &snapshots {
-            if let Some(table) = snapshot.name_table.clone() {
-                table_generations.push((snapshot.root.clone(), snapshot.generation));
+        for context in &contexts {
+            if let Some(table) = context.engine.name_table.clone() {
+                table_generations.push((context.engine.root.clone(), context.engine.epoch));
                 tables.push(OrdinaryCompletionNameTable { table });
             }
         }
@@ -549,12 +550,12 @@ impl LanguageServer for Backend {
         // `ScopeTier` (current / reachable / first-layer external / unknown /
         // global) via the shared resolver. None => whole-index ranking (scoping
         // off, no graph yet, or unresolvable path).
-        let current_snapshot = self
+        let current_context = self
             .root_for_uri(&uri)
             .await
-            .and_then(|root| snapshots.iter().find(|snapshot| snapshot.root == root));
-        let scope = current_snapshot
-            .and_then(|snapshot| self.reach_scope_from_snapshot(&uri, snapshot))
+            .and_then(|root| contexts.iter().find(|context| context.engine.root == root));
+        let scope = current_context
+            .and_then(|context| self.reach_scope_from_context(&uri, context))
             .map(|(rel, reach)| query::CompletionScope {
                 current_path: Some(rel),
                 reach: (*reach).clone(),
@@ -645,6 +646,8 @@ impl LanguageServer for Backend {
                     crate::completion::completion_perf_summary(
                         &memo_prefix,
                         hit_kind,
+                        version,
+                        completion_generation,
                         &timings,
                         &metrics,
                     )
@@ -820,9 +823,10 @@ impl LanguageServer for Backend {
             };
             let role_cache = self.session.cache.reference_role_cache.clone();
             let search_cache = self.session.cache.reference_search_cache.clone();
-            let snapshot = self.workspace_snapshot_for_root(root.clone()).await;
-            let indexed_generation = snapshot.generation.as_u64();
-            let indexed_files = snapshot
+            let context = self.request_context_for_root(root.clone()).await;
+            let indexed_generation = context.engine.epoch.as_u64();
+            let indexed_files = context
+                .engine
                 .indexed_files
                 .as_ref()
                 .map(|files| (**files).clone());

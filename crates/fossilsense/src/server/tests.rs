@@ -1,6 +1,5 @@
 #![allow(clippy::field_reassign_with_default)]
 
-use super::include_completion::IncludeCompletionTable;
 use super::{
     grouped_reference_items, local_words_for_cache, rebuild_include_table,
     rebuild_indexed_file_list,
@@ -9,7 +8,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
+use std::sync::{Arc, Mutex as StdMutex};
 use tempfile::tempdir;
 use tower_lsp::lsp_types::{
     CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse, Documentation,
@@ -319,6 +318,63 @@ async fn workspace_session_change_invalidates_live_document_caches() {
 }
 
 #[tokio::test]
+async fn stale_document_work_cannot_overwrite_latest_revision_caches() {
+    let documents = super::DocumentStore::default();
+    let root = tempdir().expect("root");
+    let path = root.path().join("main.c");
+    let uri = Url::from_file_path(&path).expect("uri");
+
+    documents
+        .open_document(uri.clone(), 1, "int old_word;\n".to_string())
+        .await;
+    documents
+        .change_document(uri.clone(), 2, "int new_word;\n".to_string())
+        .await;
+
+    let stale_parse = Arc::new(crate::parser::parse(&path, "int old_word;\n"));
+    documents
+        .store_live_parse_for_test(uri.clone(), 1, stale_parse)
+        .await;
+    assert!(
+        documents.live_parse_for_test(&uri).await.is_none(),
+        "a completed old parse must be discarded after the document advances"
+    );
+
+    let current_parse = Arc::new(crate::parser::parse(&path, "int new_word;\n"));
+    documents
+        .store_live_parse_for_test(uri.clone(), 2, current_parse.clone())
+        .await;
+    assert!(Arc::ptr_eq(
+        &documents
+            .cached_live_parse(&uri, 2)
+            .await
+            .expect("current parse"),
+        &current_parse
+    ));
+
+    let stale_words = documents.local_words_for(&uri, 1, "int old_word;\n").await;
+    assert!(stale_words.contains("old_word"));
+    assert!(
+        documents
+            .local_word_cache_entry_for_test(&uri)
+            .await
+            .is_none(),
+        "old request words may be returned to that request but not cached"
+    );
+
+    let current_words = documents.local_words_for(&uri, 2, "int new_word;\n").await;
+    assert!(current_words.contains("new_word"));
+    assert_eq!(
+        documents
+            .local_word_cache_entry_for_test(&uri)
+            .await
+            .expect("current words")
+            .0,
+        2
+    );
+}
+
+#[tokio::test]
 async fn workspace_session_close_clears_live_only_state_not_indexed_workspace_data() {
     let documents = super::DocumentStore::default();
     let cache = super::CacheLedger::default();
@@ -366,12 +422,16 @@ async fn workspace_session_close_clears_live_only_state_not_indexed_workspace_da
         .local_word_cache_entry_for_test(&uri)
         .await
         .is_none());
+    let engine = cache
+        .current_engine_snapshot(&root_path)
+        .await
+        .expect("published engine snapshot");
     assert!(
-        cache.name_table(&root_path).await.is_some(),
+        engine.name_table.is_some(),
         "closing an editor buffer must not delete indexed symbol data"
     );
     assert!(
-        cache.indexed_file_list(&root_path).await.is_some(),
+        engine.indexed_files.is_some(),
         "closing an editor buffer must not delete indexed reference scope"
     );
 }
@@ -401,16 +461,16 @@ async fn cache_ledger_publishes_full_and_dirty_read_models_with_generations() {
         .expect("publish full");
     assert_eq!(full.symbol_count, 1);
     assert_eq!(full.reference_file_count, 1);
-    let full_snapshot = service
+    let full_context = service
         .inner()
         .session
-        .snapshot_for_root(root_path.clone())
+        .request_context_for_root(root_path.clone())
         .await;
-    assert!(full_snapshot.name_table.is_some());
-    assert!(full_snapshot.reach_graph.is_some());
-    assert!(full_snapshot.include_table.is_some());
-    assert!(full_snapshot.indexed_files.is_some());
-    assert_ne!(full_snapshot.generation.as_u64(), 0);
+    assert!(full_context.engine.name_table.is_some());
+    assert!(full_context.engine.reach_graph.is_some());
+    assert!(full_context.engine.include_table.is_some());
+    assert!(full_context.engine.indexed_files.is_some());
+    assert_ne!(full_context.engine.epoch.as_u64(), 0);
 
     write_workspace_file(
         root.path(),
@@ -443,9 +503,96 @@ async fn cache_ledger_publishes_full_and_dirty_read_models_with_generations() {
         .await
         .expect("publish dirty");
     assert_eq!(dirty.symbol_count, 2);
-    let dirty_snapshot = service.inner().session.snapshot_for_root(root_path).await;
-    assert_ne!(full_snapshot.generation, dirty_snapshot.generation);
-    assert_eq!(dirty_snapshot.name_table.as_ref().expect("table").len(), 2);
+    let dirty_context = service
+        .inner()
+        .session
+        .request_context_for_root(root_path)
+        .await;
+    assert_ne!(full_context.engine.epoch, dirty_context.engine.epoch);
+    assert_eq!(
+        dirty_context
+            .engine
+            .name_table
+            .as_ref()
+            .expect("table")
+            .len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn dirty_publish_does_not_mutate_an_in_flight_engine_snapshot() {
+    let root = tempdir().expect("root");
+    let root_path = root.path().to_path_buf();
+    write_workspace_file(root.path(), "main.c", "#include \"old.h\"\nint before;\n");
+    write_workspace_file(root.path(), "old.h", "int old_symbol;\n");
+    write_workspace_file(root.path(), "new.h", "int new_symbol;\n");
+    crate::indexer::index_workspace(
+        root.path(),
+        crate::indexer::IndexOptions {
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("initial index");
+
+    let service = test_backend_service();
+    service
+        .inner()
+        .session
+        .cache
+        .publish_full_index(&service.inner().client, root_path.clone())
+        .await
+        .expect("full publish");
+    let in_flight = service
+        .inner()
+        .session
+        .request_context_for_root(root_path.clone())
+        .await;
+    let old_graph = in_flight.engine.reach_graph.clone().expect("old graph");
+    assert!(old_graph.reachable("main.c").files.contains("old.h"));
+
+    write_workspace_file(root.path(), "main.c", "#include \"new.h\"\nint after;\n");
+    crate::indexer::index_dirty_files(
+        root.path(),
+        vec![crate::indexer::DirtyFileChange {
+            absolute_path: root.path().join("main.c"),
+            kind: crate::indexer::DirtyFileKind::Upsert,
+        }],
+        crate::indexer::IndexOptions::default(),
+        |_| {},
+    )
+    .expect("dirty index");
+    service
+        .inner()
+        .session
+        .cache
+        .publish_dirty_index(
+            &service.inner().client,
+            root_path.clone(),
+            &["main.c".to_string()],
+            &["main.c".to_string()],
+        )
+        .await
+        .expect("dirty publish");
+
+    let current = service
+        .inner()
+        .session
+        .request_context_for_root(root_path)
+        .await;
+    let new_graph = current.engine.reach_graph.clone().expect("new graph");
+    assert!(!Arc::ptr_eq(&old_graph, &new_graph));
+    assert_ne!(in_flight.engine.epoch, current.engine.epoch);
+
+    let old_scope = old_graph.reachable("main.c");
+    assert!(old_scope.files.contains("old.h"));
+    assert!(!old_scope.files.contains("new.h"));
+
+    let new_scope = new_graph.reachable("main.c");
+    assert!(new_scope.files.contains("new.h"));
+    assert!(!new_scope.files.contains("old.h"));
 }
 
 #[tokio::test]
@@ -490,49 +637,50 @@ async fn cache_ledger_clears_reference_search_cache_after_document_and_index_cha
 }
 
 #[tokio::test]
-async fn reach_scope_uses_captured_workspace_snapshot_graph() {
+async fn reach_scope_uses_captured_request_context_graph() {
     let service = test_backend_service();
     let dir = tempdir().expect("tempdir");
     let root = dir.path().to_path_buf();
     let uri = Url::from_file_path(root.join("main.c")).expect("file uri");
-    let captured_graph = Arc::new(StdRwLock::new(crate::reachability::ReachGraph::new(
+    let captured_graph = Arc::new(crate::reachability::ReachGraph::new(
         vec![("main.c".to_string(), "captured.h".to_string())],
         vec![],
         vec![],
-    )));
-    let snapshot = super::WorkspaceSnapshot {
-        root: root.clone(),
-        generation: super::state::WorkspaceGeneration::missing(),
-        settings: super::WorkspaceSnapshotSettings {
+    ));
+    let context = super::RequestContext {
+        engine: Arc::new(super::workspace::EngineSnapshot {
+            root: root.clone(),
+            epoch: super::state::EngineEpoch::missing(),
+            name_table: None,
+            reach_graph: Some(captured_graph),
+            include_table: None,
+            indexed_files: None,
+            degraded: crate::progress::DegradedCapabilities::default(),
+        }),
+        settings: super::RequestSettings {
             scoping_enabled: true,
             ..Default::default()
         },
-        name_table: None,
-        reach_graph: Some(captured_graph),
-        include_table: None,
-        indexed_files: None,
     };
 
     service
         .inner()
         .session
         .cache
-        .reach_graphs
-        .lock()
-        .await
-        .insert(
+        .set_reach_graph_for_test(
             root,
-            Arc::new(StdRwLock::new(crate::reachability::ReachGraph::new(
+            Arc::new(crate::reachability::ReachGraph::new(
                 vec![("main.c".to_string(), "ledger.h".to_string())],
                 vec![],
                 vec![],
-            ))),
-        );
+            )),
+        )
+        .await;
 
     let (_rel, scope) = service
         .inner()
-        .reach_scope_from_snapshot(&uri, &snapshot)
-        .expect("scope from captured snapshot");
+        .reach_scope_from_context(&uri, &context)
+        .expect("scope from captured request context");
 
     assert!(scope.files.contains("captured.h"));
     assert!(
@@ -542,22 +690,12 @@ async fn reach_scope_uses_captured_workspace_snapshot_graph() {
 }
 
 #[tokio::test]
-async fn failed_include_table_rebuild_clears_stale_cache() {
+async fn failed_include_table_rebuild_cannot_replace_published_state() {
     let root = tempdir().expect("root");
     let root_path = root.path().to_path_buf();
-    let include_tables: super::IncludeTables = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-    include_tables.lock().await.insert(
-        root_path.clone(),
-        Arc::new(IncludeCompletionTable::build(vec!["stale.h".to_string()])),
-    );
-
-    let result = rebuild_include_table(&include_tables, root_path.clone()).await;
+    let result = rebuild_include_table(root_path).await;
 
     assert!(result.is_err(), "missing index should fail the rebuild");
-    assert!(
-        !include_tables.lock().await.contains_key(&root_path),
-        "degraded include table must not keep stale candidates"
-    );
 }
 
 #[tokio::test]
@@ -576,39 +714,21 @@ async fn include_table_rebuild_carries_include_edges_for_ranking() {
     )
     .expect("index");
 
-    let include_tables: super::IncludeTables = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-    let count = rebuild_include_table(&include_tables, root_path.clone())
+    let table = rebuild_include_table(root_path)
         .await
         .expect("rebuild include table");
-    let table = include_tables
-        .lock()
-        .await
-        .get(&root_path)
-        .cloned()
-        .expect("table");
 
-    assert_eq!(count, 2);
+    assert_eq!(table.len(), 2);
     assert_eq!(table.edge_count(), 1);
 }
 
 #[tokio::test]
-async fn failed_reference_file_list_rebuild_clears_stale_cache() {
+async fn failed_reference_file_list_rebuild_cannot_replace_published_state() {
     let root = tempdir().expect("root");
     let root_path = root.path().to_path_buf();
-    let indexed_file_lists: super::IndexedFileLists =
-        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-    indexed_file_lists.lock().await.insert(
-        root_path.clone(),
-        Arc::new(vec![("stale.c".to_string(), root_path.join("stale.c"))]),
-    );
-
-    let result = rebuild_indexed_file_list(&indexed_file_lists, root_path.clone()).await;
+    let result = rebuild_indexed_file_list(root_path).await;
 
     assert!(result.is_err(), "missing index should fail the rebuild");
-    assert!(
-        !indexed_file_lists.lock().await.contains_key(&root_path),
-        "degraded reference file-list must not keep stale discovery scope"
-    );
 }
 
 // --- R6 section 4: grouped references role exposure --------------------
@@ -760,19 +880,15 @@ async fn member_completion_does_not_leak_global_owner_when_reachable_owner_lacks
         .inner()
         .session
         .cache
-        .reach_graphs
-        .lock()
-        .await
-        .insert(
+        .set_reach_graph_for_test(
             dir.path().to_path_buf(),
-            Arc::new(std::sync::RwLock::new(
-                crate::reachability::ReachGraph::new(
-                    vec![("main.cpp".to_string(), "reachable.hpp".to_string())],
-                    vec![],
-                    vec![],
-                ),
+            Arc::new(crate::reachability::ReachGraph::new(
+                vec![("main.cpp".to_string(), "reachable.hpp".to_string())],
+                vec![],
+                vec![],
             )),
-        );
+        )
+        .await;
 
     let response = service
         .inner()
@@ -1235,10 +1351,7 @@ async fn ordinary_completion_compat_fixture_captures_presented_boundary_output()
         .inner()
         .session
         .cache
-        .name_tables
-        .lock()
-        .await
-        .insert(
+        .set_name_table_for_test(
             root.clone(),
             Arc::new(crate::query::NameTable::build_with_paths(vec![
                 (
@@ -1274,24 +1387,21 @@ async fn ordinary_completion_compat_fixture_captures_presented_boundary_output()
                     false,
                 ),
             ])),
-        );
+        )
+        .await;
     service
         .inner()
         .session
         .cache
-        .reach_graphs
-        .lock()
-        .await
-        .insert(
+        .set_reach_graph_for_test(
             root.clone(),
-            Arc::new(std::sync::RwLock::new(
-                crate::reachability::ReachGraph::new(
-                    vec![("src/main.c".to_string(), "reachable.h".to_string())],
-                    vec![],
-                    vec!["src/main.c".to_string()],
-                ),
+            Arc::new(crate::reachability::ReachGraph::new(
+                vec![("src/main.c".to_string(), "reachable.h".to_string())],
+                vec![],
+                vec!["src/main.c".to_string()],
             )),
-        );
+        )
+        .await;
     open_test_document(&service, uri.clone(), 1, src).await;
     service
         .inner()
@@ -1468,61 +1578,20 @@ fn completion_memo_invalid_when_prior_prefix_empty() {
 }
 
 #[test]
-fn workspace_generation_changes_when_derived_state_changes() {
-    let root = PathBuf::from("workspace");
-    let base = super::state::workspace_generation_for_parts(
-        &root,
-        super::state::WorkspaceGenerationParts {
-            name_table: Some(1),
-            reach_graph: Some(2),
-            include_table: Some(3),
-            indexed_file_list: Some(4),
-        },
+fn engine_epoch_reserves_zero_for_missing_state() {
+    assert_eq!(super::state::EngineEpoch::missing().as_u64(), 0);
+    assert_eq!(super::state::EngineEpoch::published(1).as_u64(), 1);
+    assert_ne!(
+        super::state::EngineEpoch::missing(),
+        super::state::EngineEpoch::published(1)
     );
-    let same = super::state::workspace_generation_for_parts(
-        &root,
-        super::state::WorkspaceGenerationParts {
-            name_table: Some(1),
-            reach_graph: Some(2),
-            include_table: Some(3),
-            indexed_file_list: Some(4),
-        },
-    );
-    let changed = super::state::workspace_generation_for_parts(
-        &root,
-        super::state::WorkspaceGenerationParts {
-            name_table: Some(1),
-            reach_graph: Some(2),
-            include_table: Some(3),
-            indexed_file_list: Some(99),
-        },
-    );
-
-    assert_eq!(base, same);
-    assert_ne!(base, changed);
 }
 
 #[test]
-fn combined_workspace_generation_changes_when_root_generation_changes() {
+fn combined_workspace_generation_changes_when_engine_epoch_changes() {
     let root = PathBuf::from("workspace");
-    let first = super::state::workspace_generation_for_parts(
-        &root,
-        super::state::WorkspaceGenerationParts {
-            name_table: Some(1),
-            reach_graph: None,
-            include_table: None,
-            indexed_file_list: Some(2),
-        },
-    );
-    let second = super::state::workspace_generation_for_parts(
-        &root,
-        super::state::WorkspaceGenerationParts {
-            name_table: Some(1),
-            reach_graph: None,
-            include_table: None,
-            indexed_file_list: Some(3),
-        },
-    );
+    let first = super::state::EngineEpoch::published(1);
+    let second = super::state::EngineEpoch::published(2);
 
     let combined_first = super::state::combine_workspace_generations(&[(root.clone(), first)]);
     let combined_second = super::state::combine_workspace_generations(&[(root, second)]);
@@ -1772,13 +1841,11 @@ async fn text_overlay_still_allows_exact_indexed_semantic_recovery() {
         .inner()
         .session
         .cache
-        .name_tables
-        .lock()
-        .await
-        .insert(
+        .set_name_table_for_test(
             root,
             Arc::new(crate::query::NameTable::build_with_paths(names)),
-        );
+        )
+        .await;
     open_test_document(&service, uri.clone(), 1, src).await;
 
     let response = service

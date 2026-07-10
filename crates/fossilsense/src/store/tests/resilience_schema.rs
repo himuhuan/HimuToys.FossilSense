@@ -1,6 +1,18 @@
 use super::*;
 
 #[test]
+fn bundled_sqlite_contains_wal_reset_fix() {
+    let version = rusqlite::version_number();
+    let fixed = version >= 3_051_003
+        || (3_050_007..3_051_000).contains(&version)
+        || (3_044_006..3_045_000).contains(&version);
+    assert!(
+        fixed,
+        "bundled SQLite {version} predates the WAL-reset corruption fix"
+    );
+}
+
+#[test]
 fn corrupted_db_errors_on_query_not_panic() {
     // SQLite defers validation; open_readonly may succeed even on garbage,
     // but the first SQL query must fail gracefully (no panic).

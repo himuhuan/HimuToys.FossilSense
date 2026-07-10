@@ -1,23 +1,16 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock as StdRwLock};
+use std::sync::Arc;
 
-use anyhow::Result;
 use tokio::time::{sleep, Duration};
 use tower_lsp::lsp_types::notification::Notification;
 use tower_lsp::lsp_types::{FileChangeType, FileEvent, MessageType};
 use tower_lsp::Client;
 
-use super::{
-    emit_perf_log, uri_to_path, Backend, CacheLedger, CachePublishReport, IncludeCompletionTable,
-    IndexSchedule,
-};
+use super::{emit_perf_log, uri_to_path, Backend, CacheLedger, CachePublishReport, IndexSchedule};
 use crate::indexer::{self, IndexOptions};
 use crate::pathing;
-use crate::progress::{DegradedCapabilities, IndexState, IndexStatus};
-use crate::query::NameTable;
-use crate::reachability::ReachGraph;
-use crate::store::IndexStore;
+use crate::progress::{IndexState, IndexStatus};
 
 mod cache;
 mod watch;
@@ -288,7 +281,7 @@ async fn index_roots(
                     Ok(report) => {
                         stats.name_table_ms = report.name_table_ms;
                         stats.reach_graph_ms = report.reach_graph_ms;
-                        let _published_generation = report.generation;
+                        let _published_epoch = report.epoch;
                         log_cache_degradation(&client, &display_root, "build", &report).await;
                         client
                             .log_message(
@@ -487,7 +480,7 @@ async fn index_dirty_roots(
                     Ok(report) => {
                         stats.name_table_ms = report.name_table_ms;
                         stats.reach_graph_ms = report.reach_graph_ms;
-                        let _published_generation = report.generation;
+                        let _published_epoch = report.epoch;
                         log_cache_degradation(&client, &display_root, "update", &report).await;
                         client
                             .log_message(

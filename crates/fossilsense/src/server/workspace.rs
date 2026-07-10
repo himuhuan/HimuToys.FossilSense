@@ -1,13 +1,14 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock as StdRwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use tokio::sync::{Mutex, RwLock};
 use tower_lsp::lsp_types::Url;
 
 use super::include_completion::IncludeCompletionTable;
 use super::state;
-use super::{IndexGenerations, IndexedFileLists, LocalWordCache, NameTables, ReachGraphs};
+use super::LocalWordCache;
 use crate::completion_words;
 use crate::parser::FileSemanticIndex;
 use crate::query::NameTable;
@@ -79,10 +80,19 @@ impl DocumentStore {
         }
 
         let words = Arc::new(completion_words::extract_words(text));
-        self.local_word_cache
-            .lock()
-            .await
-            .insert(uri.clone(), (version, words.clone()));
+        // Hold the document version stable through publication. If didChange
+        // already advanced the buffer, this older request may still use its
+        // local result but must not overwrite the cache for the latest text.
+        let open_docs = self.open_docs.lock().await;
+        if open_docs
+            .get(uri)
+            .is_some_and(|(current_version, _)| *current_version == version)
+        {
+            self.local_word_cache
+                .lock()
+                .await
+                .insert(uri.clone(), (version, words.clone()));
+        }
         words
     }
 
@@ -103,10 +113,20 @@ impl DocumentStore {
         version: i32,
         parsed: Arc<FileSemanticIndex>,
     ) {
-        self.live_parse_cache
-            .write()
-            .await
-            .insert(uri, (version, parsed));
+        // Latest document revision wins. Holding `open_docs` until the cache
+        // write completes makes this atomic with didChange's version update:
+        // either the old result lands first and didChange clears it, or the
+        // version has advanced and the old result is discarded.
+        let open_docs = self.open_docs.lock().await;
+        if open_docs
+            .get(&uri)
+            .is_some_and(|(current_version, _)| *current_version == version)
+        {
+            self.live_parse_cache
+                .write()
+                .await
+                .insert(uri, (version, parsed));
+        }
     }
 
     #[cfg(test)]
@@ -139,37 +159,51 @@ impl DocumentStore {
 
 #[derive(Clone)]
 pub(super) struct CacheLedger {
-    pub(in crate::server) name_tables: NameTables,
-    pub(in crate::server) reach_graphs: ReachGraphs,
-    pub(in crate::server) include_tables: super::IncludeTables,
-    pub(in crate::server) indexed_file_lists: IndexedFileLists,
-    pub(in crate::server) index_generations: IndexGenerations,
-    pub(in crate::server) read_model_snapshots: ReadModelSnapshots,
+    pub(in crate::server) engine_snapshots: EngineSnapshots,
+    pub(in crate::server) publish_gate: Arc<Mutex<()>>,
+    next_engine_epoch: Arc<AtomicU64>,
     pub(in crate::server) reference_role_cache: Arc<references::ReferenceRoleCache>,
     pub(in crate::server) reference_search_cache: Arc<references::ReferenceSearchCache>,
     pub(in crate::server) completion_memo: Arc<Mutex<HashMap<Url, state::CompletionMemo>>>,
 }
 
-pub(in crate::server) type ReadModelSnapshots = Arc<Mutex<HashMap<PathBuf, WorkspaceReadModels>>>;
+pub(in crate::server) type EngineSnapshots = Arc<Mutex<HashMap<PathBuf, Arc<EngineSnapshot>>>>;
 
+/// Complete immutable read-model state published for one workspace. Every
+/// request holds one `Arc<EngineSnapshot>` for its entire indexed read, so a
+/// later index publication cannot change any component under that request.
 #[derive(Clone)]
-pub(in crate::server) struct WorkspaceReadModels {
-    pub(in crate::server) generation: state::WorkspaceGeneration,
+pub(in crate::server) struct EngineSnapshot {
+    pub(in crate::server) root: PathBuf,
+    pub(in crate::server) epoch: state::EngineEpoch,
     pub(in crate::server) name_table: Option<Arc<NameTable>>,
-    pub(in crate::server) reach_graph: Option<Arc<StdRwLock<ReachGraph>>>,
+    pub(in crate::server) reach_graph: Option<Arc<ReachGraph>>,
     pub(in crate::server) include_table: Option<Arc<IncludeCompletionTable>>,
     pub(in crate::server) indexed_files: Option<Arc<Vec<(String, PathBuf)>>>,
+    #[allow(dead_code)] // Captured now; request capability-health routing is the next phase.
+    pub(in crate::server) degraded: crate::progress::DegradedCapabilities,
+}
+
+impl EngineSnapshot {
+    fn empty(root: PathBuf) -> Self {
+        Self {
+            root,
+            epoch: state::EngineEpoch::missing(),
+            name_table: None,
+            reach_graph: None,
+            include_table: None,
+            indexed_files: None,
+            degraded: crate::progress::DegradedCapabilities::default(),
+        }
+    }
 }
 
 impl Default for CacheLedger {
     fn default() -> Self {
         Self {
-            name_tables: Arc::new(Mutex::new(HashMap::new())),
-            reach_graphs: Arc::new(Mutex::new(HashMap::new())),
-            include_tables: Arc::new(Mutex::new(HashMap::new())),
-            indexed_file_lists: Arc::new(Mutex::new(HashMap::new())),
-            index_generations: Arc::new(Mutex::new(HashMap::new())),
-            read_model_snapshots: Arc::new(Mutex::new(HashMap::new())),
+            engine_snapshots: Arc::new(Mutex::new(HashMap::new())),
+            publish_gate: Arc::new(Mutex::new(())),
+            next_engine_epoch: Arc::new(AtomicU64::new(1)),
             reference_role_cache: Arc::new(references::ReferenceRoleCache::new()),
             reference_search_cache: Arc::new(references::ReferenceSearchCache::new()),
             completion_memo: Arc::new(Mutex::new(HashMap::new())),
@@ -183,22 +217,20 @@ pub(super) struct CompletionMemoLookup {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub(super) struct WorkspaceSnapshotSettings {
+pub(super) struct RequestSettings {
     pub(super) completion_enabled: bool,
     pub(super) semantic_coloring_enabled: bool,
     pub(super) scoping_enabled: bool,
     pub(super) perf_logging_enabled: bool,
 }
 
+/// Indexed inputs and request-scoped settings captured before a feature begins.
+/// Document text/revision remains owned by `DocumentStore` and will be folded
+/// into this context in the next request-boundary phase.
 #[derive(Clone)]
-pub(super) struct WorkspaceSnapshot {
-    pub(super) root: PathBuf,
-    pub(super) generation: state::WorkspaceGeneration,
-    pub(super) settings: WorkspaceSnapshotSettings,
-    pub(super) name_table: Option<Arc<NameTable>>,
-    pub(super) reach_graph: Option<Arc<StdRwLock<ReachGraph>>>,
-    pub(super) include_table: Option<Arc<IncludeCompletionTable>>,
-    pub(super) indexed_files: Option<Arc<Vec<(String, PathBuf)>>>,
+pub(super) struct RequestContext {
+    pub(super) engine: Arc<EngineSnapshot>,
+    pub(super) settings: RequestSettings,
 }
 
 #[derive(Clone)]
@@ -209,69 +241,46 @@ pub(super) struct CachePublishReport {
     pub(super) name_table_ms: u128,
     pub(super) reach_graph_ms: u128,
     pub(super) degraded: crate::progress::DegradedCapabilities,
-    pub(super) generation: state::WorkspaceGeneration,
+    pub(super) epoch: state::EngineEpoch,
     pub(super) include_table_error: Option<String>,
     pub(super) reference_file_list_error: Option<String>,
 }
 
 impl CacheLedger {
-    pub(super) async fn name_table(&self, root: &PathBuf) -> Option<Arc<NameTable>> {
-        self.name_tables.lock().await.get(root).cloned()
-    }
-
-    pub(super) async fn reach_graph(&self, root: &PathBuf) -> Option<Arc<StdRwLock<ReachGraph>>> {
-        self.reach_graphs.lock().await.get(root).cloned()
-    }
-
-    pub(super) async fn include_table(
+    pub(in crate::server) async fn current_engine_snapshot(
         &self,
         root: &PathBuf,
-    ) -> Option<Arc<IncludeCompletionTable>> {
-        self.include_tables.lock().await.get(root).cloned()
+    ) -> Option<Arc<EngineSnapshot>> {
+        self.engine_snapshots.lock().await.get(root).cloned()
     }
 
-    pub(super) async fn indexed_file_list(
+    pub(in crate::server) fn allocate_engine_epoch(&self) -> state::EngineEpoch {
+        let value = self.next_engine_epoch.fetch_add(1, Ordering::Relaxed);
+        state::EngineEpoch::published(value)
+    }
+
+    pub(in crate::server) async fn publish_engine_snapshot(
         &self,
-        root: &PathBuf,
-    ) -> Option<Arc<Vec<(String, PathBuf)>>> {
-        self.indexed_file_lists.lock().await.get(root).cloned()
-    }
-
-    pub(super) async fn generation(&self, root: &PathBuf) -> state::WorkspaceGeneration {
-        self.index_generations
+        snapshot: EngineSnapshot,
+    ) -> Arc<EngineSnapshot> {
+        let snapshot = Arc::new(snapshot);
+        self.engine_snapshots
             .lock()
             .await
-            .get(root)
-            .copied()
-            .unwrap_or_else(state::WorkspaceGeneration::missing)
+            .insert(snapshot.root.clone(), snapshot.clone());
+        snapshot
     }
 
-    pub(super) async fn snapshot(
+    pub(super) async fn request_context(
         &self,
         root: PathBuf,
-        settings: WorkspaceSnapshotSettings,
-    ) -> WorkspaceSnapshot {
-        if let Some(models) = self.read_model_snapshots.lock().await.get(&root).cloned() {
-            return WorkspaceSnapshot {
-                generation: models.generation,
-                name_table: models.name_table,
-                reach_graph: models.reach_graph,
-                include_table: models.include_table,
-                indexed_files: models.indexed_files,
-                root,
-                settings,
-            };
-        }
-
-        WorkspaceSnapshot {
-            generation: self.generation(&root).await,
-            name_table: self.name_table(&root).await,
-            reach_graph: self.reach_graph(&root).await,
-            include_table: self.include_table(&root).await,
-            indexed_files: self.indexed_file_list(&root).await,
-            root,
-            settings,
-        }
+        settings: RequestSettings,
+    ) -> RequestContext {
+        let engine = self
+            .current_engine_snapshot(&root)
+            .await
+            .unwrap_or_else(|| Arc::new(EngineSnapshot::empty(root)));
+        RequestContext { engine, settings }
     }
 
     pub(super) fn invalidate_references(&self) {
@@ -346,7 +355,20 @@ impl CacheLedger {
 
     #[cfg(test)]
     pub(super) async fn set_name_table_for_test(&self, root: PathBuf, table: Arc<NameTable>) {
-        self.name_tables.lock().await.insert(root, table);
+        let current = self
+            .current_engine_snapshot(&root)
+            .await
+            .unwrap_or_else(|| Arc::new(EngineSnapshot::empty(root.clone())));
+        self.publish_engine_snapshot(EngineSnapshot {
+            root,
+            epoch: self.allocate_engine_epoch(),
+            name_table: Some(table),
+            reach_graph: current.reach_graph.clone(),
+            include_table: current.include_table.clone(),
+            indexed_files: current.indexed_files.clone(),
+            degraded: current.degraded.clone(),
+        })
+        .await;
     }
 
     #[cfg(test)]
@@ -355,7 +377,38 @@ impl CacheLedger {
         root: PathBuf,
         files: Arc<Vec<(String, PathBuf)>>,
     ) {
-        self.indexed_file_lists.lock().await.insert(root, files);
+        let current = self
+            .current_engine_snapshot(&root)
+            .await
+            .unwrap_or_else(|| Arc::new(EngineSnapshot::empty(root.clone())));
+        self.publish_engine_snapshot(EngineSnapshot {
+            root,
+            epoch: self.allocate_engine_epoch(),
+            name_table: current.name_table.clone(),
+            reach_graph: current.reach_graph.clone(),
+            include_table: current.include_table.clone(),
+            indexed_files: Some(files),
+            degraded: current.degraded.clone(),
+        })
+        .await;
+    }
+
+    #[cfg(test)]
+    pub(super) async fn set_reach_graph_for_test(&self, root: PathBuf, graph: Arc<ReachGraph>) {
+        let current = self
+            .current_engine_snapshot(&root)
+            .await
+            .unwrap_or_else(|| Arc::new(EngineSnapshot::empty(root.clone())));
+        self.publish_engine_snapshot(EngineSnapshot {
+            root,
+            epoch: self.allocate_engine_epoch(),
+            name_table: current.name_table.clone(),
+            reach_graph: Some(graph),
+            include_table: current.include_table.clone(),
+            indexed_files: current.indexed_files.clone(),
+            degraded: current.degraded.clone(),
+        })
+        .await;
     }
 
     #[cfg(test)]
@@ -404,17 +457,17 @@ impl WorkspaceSession {
     }
 
     #[cfg(test)]
-    pub(super) async fn snapshot_for_root(&self, root: PathBuf) -> WorkspaceSnapshot {
+    pub(super) async fn request_context_for_root(&self, root: PathBuf) -> RequestContext {
         self.cache
-            .snapshot(root, WorkspaceSnapshotSettings::default())
+            .request_context(root, RequestSettings::default())
             .await
     }
 
-    pub(super) async fn snapshot_for_root_with_settings(
+    pub(super) async fn request_context_for_root_with_settings(
         &self,
         root: PathBuf,
-        settings: WorkspaceSnapshotSettings,
-    ) -> WorkspaceSnapshot {
-        self.cache.snapshot(root, settings).await
+        settings: RequestSettings,
+    ) -> RequestContext {
+        self.cache.request_context(root, settings).await
     }
 }

@@ -58,7 +58,8 @@ fossilsense 单一 Rust 原生二进制 (crates/fossilsense)
 | `includes` | include 解析、规范化、补全上下文 |
 | `reachability` | include 图、可达集、有界闭包、开放原因 |
 | `resolver` | 共享作用域与排名原语，无 `tower-lsp`，可单测 |
-| `server` | tower-lsp 服务、`fossilsense/indexStatus` 通知 |
+| `completion` | 普通补全 intent、candidate evidence、确定性 pipeline/ranking，以及 ordinary service/provider 转换 |
+| `server` | tower-lsp 适配、`fossilsense/indexStatus` 通知、不可变 `EngineSnapshot` 原子发布与请求上下文 |
 
 必须复用的模型名：
 
@@ -102,6 +103,18 @@ Store read-view 规则：
 | typed rows | read-model builder 输入使用 typed row / DTO，不依赖 SQL tuple column order |
 | SQL ownership | `rusqlite` 与 SQL-to-domain 转换留在 `store` / persistence 边界 |
 | compatibility | 旧 `IndexStore` query wrapper 可作为兼容/测试 oracle 保留，但应委托 read views 或共享 typed loader |
+| bundled SQLite | 必须包含 WAL-reset 并发损坏修复（当前基线 SQLite 3.51.3+）；`store` resilience test 防止版本回退 |
+
+Runtime snapshot 规则：
+
+| 项 | 规则 |
+|---|---|
+| `EngineSnapshot` | 每工作区一个完整不可变读模型，统一携带 name table、reach graph、include table、reference file list、degraded state |
+| publication | 所有下一代读模型在后台构建完成后，只通过一次 map 交换发布；构建期间旧快照继续服务请求 |
+| `EngineEpoch` | 每次成功发布分配显式单调 epoch；`0` 只表示尚未发布索引读模型 |
+| `RequestContext` | 请求开始时捕获一个 `Arc<EngineSnapshot>` 和 request settings；请求期间不得重新逐项读取缓存 |
+| dirty reach graph | 增量 include edge 更新生成新的 `ReachGraph`，不得原地修改旧快照持有的图 |
+| publisher | snapshot publisher 串行协调；发布失败不得暴露半更新状态 |
 
 ## 5. 当前能力
 
@@ -135,6 +148,7 @@ Smart Completion 当前约定：
 | 项 | 规则 |
 |---|---|
 | pipeline | 普通标识符补全候选必须经过 `completion` 核心模块合并 evidence、去重、排序和截断 |
+| module boundary | `completion/intent.rs` 负责 intent；`completion/pipeline.rs` 负责 evidence、merge/dedup、policy、metrics；`completion/ordinary_service/providers.rs` 负责候选源到统一 evidence 的转换 |
 | 排序 | 普通标识符补全使用 deterministic evidence-aware ranker；`ScopeTier` 是 soft prior，并通过 guard band 防止低置信 global/text 噪音反超 |
 | strict policy | `resolver::pack_score` 仍可用于跳转、着色、workspace symbol、`NameTable` recall 和兼容测试；不再作为普通补全最终 displayed ranking |
 | evidence merge | 同名候选合并 indexed、local binding、current-file overlay、language builtin、local word evidence，优先保留更结构化的 LSP kind/detail |

@@ -1,5 +1,5 @@
 //! Protocol-agnostic query logic: in-memory fuzzy name table, definition
-//! ranking, cursor-word extraction and symbol-kind mapping. Kept free of
+//! ranking, and cursor-word extraction. Kept free of
 //! `tower-lsp` request types so the scoring/ranking can be unit-tested.
 
 use std::collections::{HashMap, HashSet};
@@ -16,7 +16,6 @@ mod current_file_overlay;
 mod definitions;
 mod hover;
 mod local_completion;
-mod lsp_kinds;
 mod signatures;
 mod text;
 
@@ -28,7 +27,6 @@ pub use hover::{
     RankedHoverCandidate, HOVER_CANDIDATE_LIMIT,
 };
 pub use local_completion::{local_completion_candidates, LocalCompletionCandidate};
-pub use lsp_kinds::{lsp_kind_from_parser, lsp_symbol_kind};
 pub use signatures::{
     call_context_at, rank_function_signature_candidates, signature_parts, signature_parts_for_name,
     CallContext, ParameterSpan, RankedSignatureCandidate, SignatureParts, SIGNATURE_HELP_LIMIT,

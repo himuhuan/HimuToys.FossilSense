@@ -12,14 +12,7 @@ const RULES = {
   largeFile: "large-source-file",
 };
 
-const DEFAULT_ALLOWLIST = [
-  {
-    rule: RULES.lspBoundary,
-    file: "crates/fossilsense/src/query/lsp_kinds.rs",
-    reason:
-      "Query currently contains a transitional LSP-kind adapter; move it under server/lsp_adapters.rs during a later behavior-preserving step.",
-  },
-];
+const DEFAULT_ALLOWLIST = [];
 
 function parseArgs(argv) {
   const args = {
