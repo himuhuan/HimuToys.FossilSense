@@ -57,7 +57,9 @@ pub struct ReachScope {
 ///
 /// One graph is built per workspace from the store after each index pass; a new
 /// graph instance is a fresh "generation", so its cache starts empty and old
-/// memoized sets are discarded simply by replacing the `Arc`.
+/// memoized sets are discarded simply by replacing the `Arc`. Published graphs
+/// are immutable: an incremental refresh is prepared as a new graph so requests
+/// holding an older engine snapshot cannot observe a mixed generation.
 pub struct ReachGraph {
     edges: HashMap<String, Vec<String>>,
     /// First-cause `OpenReason` for every "open" node (an empty set means a
@@ -182,6 +184,25 @@ impl ReachGraph {
                 .map(|row| (row.source_path, row.reason))
                 .collect(),
         );
+    }
+
+    /// Create the next immutable graph generation by applying a source-scoped
+    /// refresh to a copy of this graph. The memoized reachability cache is not
+    /// copied. Runtime publication uses this method instead of mutating a graph
+    /// that may already be visible through an older engine snapshot.
+    pub fn with_refreshed_sources_from_rows(
+        &self,
+        sources: &[String],
+        edges: Vec<IncludeEdgeRow>,
+        open: Vec<OpenIncludeRow>,
+    ) -> Self {
+        let mut next = Self {
+            edges: self.edges.clone(),
+            open: self.open.clone(),
+            cache: Mutex::new(HashMap::new()),
+        };
+        next.refresh_sources_from_rows(sources, edges, open);
+        next
     }
 
     /// Reachable set for `start`, memoized for this graph generation.
@@ -638,5 +659,27 @@ mod tests {
             Some(OpenReason::UnresolvedInclude),
             "UnresolvedInclude must take precedence"
         );
+    }
+
+    #[test]
+    fn immutable_refresh_keeps_prior_generation_unchanged() {
+        let graph = ReachGraph::new(vec![("a.c".into(), "old.h".into())], vec![], vec![]);
+
+        let next = graph.with_refreshed_sources_from_rows(
+            &["a.c".to_string()],
+            vec![IncludeEdgeRow {
+                source_path: "a.c".to_string(),
+                target_path: "new.h".to_string(),
+            }],
+            vec![],
+        );
+
+        let prior_scope = graph.reachable("a.c");
+        assert!(prior_scope.files.contains("old.h"));
+        assert!(!prior_scope.files.contains("new.h"));
+
+        let next_scope = next.reachable("a.c");
+        assert!(next_scope.files.contains("new.h"));
+        assert!(!next_scope.files.contains("old.h"));
     }
 }

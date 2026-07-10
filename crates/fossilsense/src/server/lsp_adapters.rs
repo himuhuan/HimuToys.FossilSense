@@ -1,12 +1,48 @@
 use std::path::Path;
 
-use tower_lsp::lsp_types::{DocumentSymbol, Location, Position, Range, SymbolInformation, Url};
+use tower_lsp::lsp_types::{
+    CompletionItemKind, DocumentSymbol, Location, Position, Range, SymbolInformation, SymbolKind,
+    Url,
+};
 
 use crate::model;
-use crate::parser::Symbol;
-use crate::query;
+use crate::parser::{Symbol, SymbolKind as ParserSymbolKind};
 use crate::references::{self, ReferenceHit};
 use crate::store::SymbolRecord;
+
+fn lsp_symbol_kind(kind: &str) -> SymbolKind {
+    match kind {
+        "function" => SymbolKind::FUNCTION,
+        "macro" => SymbolKind::CONSTANT,
+        "type" => SymbolKind::STRUCT,
+        "enum_constant" => SymbolKind::ENUM_MEMBER,
+        "global_variable" => SymbolKind::VARIABLE,
+        _ => SymbolKind::VARIABLE,
+    }
+}
+
+fn lsp_kind_from_parser(kind: ParserSymbolKind) -> SymbolKind {
+    match kind {
+        ParserSymbolKind::Function => SymbolKind::FUNCTION,
+        ParserSymbolKind::Macro => SymbolKind::CONSTANT,
+        ParserSymbolKind::Type => SymbolKind::STRUCT,
+        ParserSymbolKind::EnumConstant => SymbolKind::ENUM_MEMBER,
+        ParserSymbolKind::GlobalVariable => SymbolKind::VARIABLE,
+        ParserSymbolKind::Field => SymbolKind::FIELD,
+    }
+}
+
+#[allow(dead_code)]
+fn lsp_completion_kind(kind: &str) -> CompletionItemKind {
+    match kind {
+        "function" => CompletionItemKind::FUNCTION,
+        "macro" => CompletionItemKind::CONSTANT,
+        "type" => CompletionItemKind::STRUCT,
+        "enum_constant" => CompletionItemKind::ENUM_MEMBER,
+        "global_variable" => CompletionItemKind::VARIABLE,
+        _ => CompletionItemKind::TEXT,
+    }
+}
 
 pub(super) fn record_range(record: &SymbolRecord) -> Range {
     Range {
@@ -106,7 +142,7 @@ pub(super) fn record_to_symbol_information(
     let location = record_to_location(root, record)?;
     Some(SymbolInformation {
         name: record.name.clone(),
-        kind: query::lsp_symbol_kind(&record.kind),
+        kind: lsp_symbol_kind(&record.kind),
         tags: None,
         deprecated: None,
         location,
@@ -131,12 +167,36 @@ pub(super) fn parsed_to_document_symbol(symbol: &Symbol) -> DocumentSymbol {
     DocumentSymbol {
         name: symbol.name.clone(),
         detail: Some(symbol.signature.clone()),
-        kind: query::lsp_kind_from_parser(symbol.kind),
+        kind: lsp_kind_from_parser(symbol.kind),
         tags: None,
         deprecated: None,
         range,
         // selection_range must be contained within range.
         selection_range: Range { start, end: start },
         children: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completion_kind_mapping() {
+        assert_eq!(
+            lsp_completion_kind("function"),
+            CompletionItemKind::FUNCTION
+        );
+        assert_eq!(lsp_completion_kind("macro"), CompletionItemKind::CONSTANT);
+        assert_eq!(lsp_completion_kind("type"), CompletionItemKind::STRUCT);
+        assert_eq!(
+            lsp_completion_kind("enum_constant"),
+            CompletionItemKind::ENUM_MEMBER
+        );
+        assert_eq!(
+            lsp_completion_kind("global_variable"),
+            CompletionItemKind::VARIABLE
+        );
+        assert_eq!(lsp_completion_kind("unknown"), CompletionItemKind::TEXT);
     }
 }

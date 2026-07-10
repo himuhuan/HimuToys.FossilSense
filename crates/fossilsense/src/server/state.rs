@@ -1,6 +1,6 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Narrowing state for one document's in-flight completion. `generation`
 /// identifies the indexed workspace-state instances the `pools` index into;
@@ -12,12 +12,19 @@ pub(super) struct CompletionMemo {
     pub(super) pools: Vec<Vec<usize>>,
 }
 
+/// Monotonic identity of one atomically published workspace engine snapshot.
+/// Zero is reserved for the pre-index empty snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct WorkspaceGeneration(u64);
+pub(super) struct EngineEpoch(u64);
 
-impl WorkspaceGeneration {
+impl EngineEpoch {
     pub(super) fn missing() -> Self {
         Self(0)
+    }
+
+    pub(super) fn published(value: u64) -> Self {
+        debug_assert_ne!(value, 0, "published engine epochs reserve zero");
+        Self(value)
     }
 
     pub(super) fn as_u64(self) -> u64 {
@@ -25,28 +32,7 @@ impl WorkspaceGeneration {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub(super) struct WorkspaceGenerationParts {
-    pub(super) name_table: Option<usize>,
-    pub(super) reach_graph: Option<usize>,
-    pub(super) include_table: Option<usize>,
-    pub(super) indexed_file_list: Option<usize>,
-}
-
-pub(super) fn workspace_generation_for_parts(
-    root: &Path,
-    parts: WorkspaceGenerationParts,
-) -> WorkspaceGeneration {
-    let mut hasher = DefaultHasher::new();
-    root.hash(&mut hasher);
-    parts.name_table.hash(&mut hasher);
-    parts.reach_graph.hash(&mut hasher);
-    parts.include_table.hash(&mut hasher);
-    parts.indexed_file_list.hash(&mut hasher);
-    WorkspaceGeneration(hasher.finish())
-}
-
-pub(super) fn combine_workspace_generations(generations: &[(PathBuf, WorkspaceGeneration)]) -> u64 {
+pub(super) fn combine_workspace_generations(generations: &[(PathBuf, EngineEpoch)]) -> u64 {
     let mut hasher = DefaultHasher::new();
     for (root, generation) in generations {
         root.hash(&mut hasher);

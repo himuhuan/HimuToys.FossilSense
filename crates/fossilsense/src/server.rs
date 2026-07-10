@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
+use std::sync::{Arc, Mutex as StdMutex};
 
 use anyhow::Result;
 use serde_json::Value;
@@ -38,7 +38,7 @@ use crate::includes::{self, IncludeForm};
 use crate::parser::{self, FileSemanticIndex};
 use crate::pathing;
 use crate::query::{self, NameTable};
-use crate::reachability::{self, ReachGraph};
+use crate::reachability;
 use crate::references;
 use crate::store::IndexStore;
 
@@ -75,15 +75,10 @@ use options::{
     parse_include_scoping_enabled, parse_semantic_coloring_mode, signature_help_options,
 };
 use workspace::{
-    CacheLedger, CachePublishReport, DocumentStore, WorkspaceSession, WorkspaceSnapshot,
-    WorkspaceSnapshotSettings,
+    CacheLedger, CachePublishReport, DocumentStore, RequestContext, RequestSettings,
+    WorkspaceSession,
 };
 
-type NameTables = Arc<Mutex<HashMap<PathBuf, Arc<NameTable>>>>;
-type ReachGraphs = Arc<Mutex<HashMap<PathBuf, Arc<StdRwLock<ReachGraph>>>>>;
-type IncludeTables = Arc<Mutex<HashMap<PathBuf, Arc<IncludeCompletionTable>>>>;
-type IndexedFileLists = Arc<Mutex<HashMap<PathBuf, Arc<Vec<(String, PathBuf)>>>>>;
-type IndexGenerations = Arc<Mutex<HashMap<PathBuf, state::WorkspaceGeneration>>>;
 type LocalWordEntry = (i32, Arc<HashSet<String>>);
 type LocalWordCache = Arc<Mutex<HashMap<Url, LocalWordEntry>>>;
 type IndexSchedule = Arc<Mutex<IndexScheduleState>>;
@@ -258,11 +253,12 @@ impl Backend {
             .as_deref()
             .and_then(|path| path.rsplit_once('/').map(|(dir, _)| dir.to_string()));
         let include_table = match &workspace_root {
-            Some(root) => {
-                self.workspace_snapshot_for_root(root.clone())
-                    .await
-                    .include_table
-            }
+            Some(root) => self
+                .request_context_for_root(root.clone())
+                .await
+                .engine
+                .include_table
+                .clone(),
             None => None,
         };
         let include_roots =
@@ -406,27 +402,27 @@ impl Backend {
             return None;
         }
         let root = self.root_for_uri(uri).await?;
-        let snapshot = self.workspace_snapshot_for_root(root).await;
-        self.reach_scope_from_snapshot(uri, &snapshot)
+        let context = self.request_context_for_root(root).await;
+        self.reach_scope_from_context(uri, &context)
     }
 
-    fn reach_scope_from_snapshot(
+    fn reach_scope_from_context(
         &self,
         uri: &Url,
-        snapshot: &WorkspaceSnapshot,
+        context: &RequestContext,
     ) -> Option<(String, Arc<reachability::ReachScope>)> {
         let path = uri_to_path(uri)?;
-        if !snapshot.settings.scoping_enabled {
+        if !context.settings.scoping_enabled {
             return None;
         }
-        let rel = pathing::relative_slash_path(&snapshot.root, &path).ok()?;
-        let graph = snapshot.reach_graph.clone()?;
-        let scope = graph.read().ok()?.reachable(&rel);
+        let rel = pathing::relative_slash_path(&context.engine.root, &path).ok()?;
+        let graph = context.engine.reach_graph.clone()?;
+        let scope = graph.reachable(&rel);
         Some((rel, scope))
     }
 
-    fn snapshot_settings(&self) -> WorkspaceSnapshotSettings {
-        WorkspaceSnapshotSettings {
+    fn request_settings(&self) -> RequestSettings {
+        RequestSettings {
             completion_enabled: self.completion_enabled.load(Ordering::Relaxed),
             semantic_coloring_enabled: self.semantic_coloring_enabled.load(Ordering::Relaxed),
             scoping_enabled: self.scoping_enabled.load(Ordering::Relaxed),
@@ -434,15 +430,15 @@ impl Backend {
         }
     }
 
-    async fn workspace_snapshot_for_root(&self, root: PathBuf) -> WorkspaceSnapshot {
+    async fn request_context_for_root(&self, root: PathBuf) -> RequestContext {
         self.session
-            .snapshot_for_root_with_settings(root, self.snapshot_settings())
+            .request_context_for_root_with_settings(root, self.request_settings())
             .await
     }
 
-    async fn workspace_snapshot_for_uri(&self, uri: &Url) -> Option<WorkspaceSnapshot> {
+    async fn request_context_for_uri(&self, uri: &Url) -> Option<RequestContext> {
         let root = self.root_for_uri(uri).await?;
-        Some(self.workspace_snapshot_for_root(root).await)
+        Some(self.request_context_for_root(root).await)
     }
 
     /// Workspace root containing `uri`, falling back to the first root.
@@ -486,7 +482,7 @@ impl Backend {
     async fn perf_log(&self, build_message: impl FnOnce() -> String) {
         emit_perf_log(
             &self.client,
-            self.snapshot_settings().perf_logging_enabled,
+            self.request_settings().perf_logging_enabled,
             build_message,
         )
         .await;

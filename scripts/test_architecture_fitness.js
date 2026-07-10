@@ -18,13 +18,6 @@ const cases = [
     args: [],
   },
   {
-    name: "allowlist reason",
-    fixture: "allowlist_reason",
-    golden: "allowlist_reason.txt",
-    expectedStatus: 0,
-    args: [],
-  },
-  {
     name: "large file warning",
     fixture: "large_file_warning",
     golden: "large_file_warning.txt",

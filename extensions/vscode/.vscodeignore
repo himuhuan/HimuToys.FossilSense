@@ -4,8 +4,10 @@
 src/**
 scripts/**
 node_modules/**
-out/**/*.map
-out/test/**
+# package.mjs emits a self-contained extension.js bundle. Excluding the rest of
+# out/ prevents stale tsc modules from being accidentally shipped in the VSIX.
+out/**
+!out/extension.js
 tsconfig.json
 pnpm-lock.yaml
 **/*.ts
