@@ -163,6 +163,7 @@ Smart Completion 当前约定：
 | v1.2.1 Phase 7-8 | member evidence 覆盖字段和第一版 C++ 方法；ordinary completion 可使用本地 accepted-completion history 作为有界排序证据 |
 | v1.2.2 Phase A-D/H | 行为保持型架构健康发布；新增架构基线、fitness functions、WorkspaceSession/CacheLedger/DocumentStore 边界、ordinary completion service 边界和 release hardening 门禁 |
 | v1.2.3 | 解析与成员补全体验修复版；多行 typedef struct 容错、匿名嵌套 record evidence、数组下标/括号/解引用的简单成员链补全，以及链解析失败后的全局 member fallback |
+| v1.3.0 | 架构健康与补全 evidence 版本；收敛 parser/store/server 边界，并加入有界 language builtin 与 project context 普通补全证据 |
 | 后置能力 | auto include insertion、ML ranker、telemetry、cloud sync、完整 C++ 语义仍不属于当前版本 |
 
 短前缀：
