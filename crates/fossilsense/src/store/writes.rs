@@ -64,6 +64,33 @@ pub(super) fn stage_file_updates(
                     target_record_id, target_name, target_kind, confidence
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         )?;
+        let mut callable_stmt = tx.prepare(
+            "INSERT INTO callable_anchor_facts (
+                revision_id, file_id, entity_key, anchor_fingerprint, name, qualified_name,
+                owner, owner_kind, kind, role, linkage_kind, linkage_file, signature,
+                min_arity, max_arity, variadic,
+                name_start_byte, name_end_byte, name_start_line, name_start_col,
+                name_end_line, name_end_col, declaration_start_byte, declaration_end_byte,
+                body_start_byte, body_end_byte, guard, provenance, syntax_error_overlap
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25,
+                ?26, ?27, ?28, ?29
+             )",
+        )?;
+        let mut call_site_stmt = tx.prepare(
+            "INSERT INTO call_site_facts (
+                revision_id, file_id, caller_entity_key, site_fingerprint,
+                expression_start_byte, expression_end_byte, expression_start_line,
+                expression_start_col, expression_end_line, expression_end_col,
+                callee_start_byte, callee_end_byte, callee_start_line, callee_start_col,
+                callee_end_line, callee_end_col, callee_name, qualified_name, call_form,
+                argument_count, guard, provenance, syntax_error_overlap
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23
+             )",
+        )?;
 
         for update in updates {
             let fingerprint = update.fingerprint;
@@ -241,6 +268,77 @@ pub(super) fn stage_file_updates(
                     target_name,
                     target_kind,
                     confidence,
+                ])?;
+            }
+
+            for anchor in facts.callable_anchors {
+                let (linkage_kind, linkage_file) = match &anchor.linkage {
+                    crate::call_model::LinkageDomain::External => ("external", None),
+                    crate::call_model::LinkageDomain::Internal(path) => {
+                        ("internal", Some(path.as_str()))
+                    }
+                    crate::call_model::LinkageDomain::Unknown => ("unknown", None),
+                };
+                callable_stmt.execute(params![
+                    revision_id,
+                    file_id,
+                    anchor.entity_key.as_str(),
+                    anchor.anchor_fingerprint.as_str(),
+                    anchor.name.as_str(),
+                    anchor.qualified_name.as_str(),
+                    anchor.owner.as_deref(),
+                    anchor
+                        .owner_kind
+                        .map(crate::call_model::OwnerKindHint::as_str),
+                    anchor.kind.as_str(),
+                    anchor.role.as_str(),
+                    linkage_kind,
+                    linkage_file,
+                    anchor.signature.normalized.as_str(),
+                    anchor.signature.min_arity.map(i64::from),
+                    anchor.signature.max_arity.map(i64::from),
+                    i64::from(anchor.signature.variadic),
+                    anchor.name_range.start_byte as i64,
+                    anchor.name_range.end_byte as i64,
+                    anchor.name_range.start.line as i64,
+                    anchor.name_range.start.character as i64,
+                    anchor.name_range.end.line as i64,
+                    anchor.name_range.end.character as i64,
+                    anchor.declaration_range.start_byte as i64,
+                    anchor.declaration_range.end_byte as i64,
+                    anchor.body_range.map(|range| range.start_byte as i64),
+                    anchor.body_range.map(|range| range.end_byte as i64),
+                    anchor.guard.as_deref(),
+                    anchor.provenance.as_str(),
+                    i64::from(anchor.syntax_error_overlap),
+                ])?;
+            }
+
+            for call in facts.call_sites {
+                call_site_stmt.execute(params![
+                    revision_id,
+                    file_id,
+                    call.caller_entity_key.as_str(),
+                    call.site_fingerprint.as_str(),
+                    call.expression_range.start_byte as i64,
+                    call.expression_range.end_byte as i64,
+                    call.expression_range.start.line as i64,
+                    call.expression_range.start.character as i64,
+                    call.expression_range.end.line as i64,
+                    call.expression_range.end.character as i64,
+                    call.callee_range.start_byte as i64,
+                    call.callee_range.end_byte as i64,
+                    call.callee_range.start.line as i64,
+                    call.callee_range.start.character as i64,
+                    call.callee_range.end.line as i64,
+                    call.callee_range.end.character as i64,
+                    call.callee_name.as_deref(),
+                    call.qualified_name.as_deref(),
+                    call.form.as_str(),
+                    call.argument_count.map(i64::from),
+                    call.guard.as_deref(),
+                    call.provenance.as_str(),
+                    i64::from(call.syntax_error_overlap),
                 ])?;
             }
         }

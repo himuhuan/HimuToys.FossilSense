@@ -488,6 +488,8 @@ impl IndexStore {
         if let Some(version) = stored_version {
             if version != schema::SCHEMA_VERSION {
                 for name in [
+                    "call_sites",
+                    "callable_anchors",
                     "type_aliases",
                     "members",
                     "record_defs",
@@ -562,6 +564,11 @@ impl IndexStore {
 
     pub fn member_view(&self) -> views::MemberStoreView<'_> {
         views::MemberStoreView::new(self)
+    }
+
+    #[allow(dead_code)] // Consumed by the relation catalog in the next stage.
+    pub fn call_fact_view(&self) -> views::CallFactStoreView<'_> {
+        views::CallFactStoreView::new(self)
     }
 }
 

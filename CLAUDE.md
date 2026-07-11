@@ -104,7 +104,7 @@ Store read-view 规则：
 
 | 项 | 规则 |
 |---|---|
-| read views | 跨模块 durable reads 通过 `store::views` 的窄视图：name table、reach graph、include table、symbol/reference file、member |
+| read views | 跨模块 durable reads 通过 `store::views` 的窄视图：name table、reach graph、include table、symbol/reference file、member、call facts |
 | typed rows | read-model builder 输入使用 typed row / DTO，不依赖 SQL tuple column order |
 | SQL ownership | `rusqlite` 与 SQL-to-domain 转换留在 `store` / persistence 边界 |
 | compatibility | 旧 `IndexStore` query wrapper 可作为兼容/测试 oracle 保留，但应委托 read views 或共享 typed loader |
@@ -314,6 +314,7 @@ parse(path, source) -> FileSemanticIndex
 | `symbols` / `includes` | 词法 pass |
 | `occurrences` | AST walk，含句法角色 |
 | `records` / `members` / `aliases` | record、字段/方法 member、type alias 候选 |
+| `callable_anchors` / `call_sites` | AST 同遍历产生的可调用锚点与调用表达式事实；不代表编译级绑定 |
 | `local_declarations` | 请求期 receiver 推断，不持久化 |
 | `ParseDiagnostics` | parse error、fallback、provenance |
 
@@ -321,10 +322,11 @@ Parser facts 合同：
 
 | 项 | 规则 |
 |---|---|
-| `ParseFacts::INDEX` | 索引期事实；跳过 occurrences、local declarations、local bindings |
+| `ParseFacts::INDEX` | 索引期事实；包含 call relations，跳过 occurrences、local declarations、local bindings |
+| `ParseFacts::CALL_RELATIONS` | callable anchors 与 call sites；与既有 symbol 投影并行，不能替换文档符号语义 |
 | `ParseFacts::COLOR_REF` | 着色和引用角色所需 occurrences + lexical facts |
 | `ParseFacts::MEMBER` | 成员补全 receiver 推断所需 local declarations / bindings + record/member/alias facts |
-| `PersistentFacts` | `FileSemanticIndex::persistent_facts()` 返回 symbols、includes、records、fields、members、aliases 的借用投影 |
+| `PersistentFacts` | `FileSemanticIndex::persistent_facts()` 返回 symbols、includes、records、fields、members、aliases、callable anchors、call sites 的借用投影 |
 | `RequestFacts` | `FileSemanticIndex::request_facts()` 返回 occurrences、local declarations、local bindings 的借用投影 |
 | `FactAvailability` | `Available` / `NotRequested` / `Unavailable(LexicalFallback)`；空向量不能单独代表 skipped 或 fallback |
 
@@ -335,6 +337,13 @@ Parser facts 合同：
 - tree-sitter 给不出可用 tree 时走 `lexical_fallback`。
 - 带 `ERROR` node 的 tree 仍视为可用 tree。
 - fallback 只保留词法 `symbols` / `includes`，AST 向量为空。
+
+调用事实首版边界：
+
+- C/C++ 自由函数是关系解析的正式候选；record method、member call、函数指针和 callable object 仍持久化为显式事实，但不得伪装为已绑定关系。
+- 外部头只贡献声明锚点，不索引函数体调用点。
+- 全局初始化表达式使用 synthetic global initializer 作为 caller；lambda 内调用暂不错误归属给外层函数。
+- schema 13 为 callable anchors / call sites 建立独立 active views 和查询索引，与统一语义代际一起发布。
 
 旧入口已移除：`FileIndex`、`ColoringTargets`、`collect_coloring_targets`、`occurrences_with_roles`。
 

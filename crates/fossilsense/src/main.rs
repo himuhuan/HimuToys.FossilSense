@@ -153,6 +153,8 @@ async fn main() -> Result<()> {
             println!("skipped: {}", stats.skipped_files);
             println!("deleted: {}", stats.deleted_files);
             println!("symbols: {}", stats.symbols);
+            println!("callable_anchors: {}", stats.callable_anchors);
+            println!("call_sites: {}", stats.call_sites);
             println!("elapsed_ms: {}", stats.elapsed_ms);
             println!("discover_ms: {}", stats.discover_ms);
             println!("parse_ms: {}", stats.parse_ms);

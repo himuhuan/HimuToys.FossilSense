@@ -1141,6 +1141,135 @@ fn parse_fact_masks_document_current_field_contents() {
 }
 
 #[test]
+fn call_facts_capture_free_function_anchors_and_direct_calls() {
+    let source = r#"
+static int helper(int value) { return value; }
+int caller(void) { return helper(7); }
+"#;
+    let index = parse(std::path::Path::new("src/main.c"), source);
+    let helper = index
+        .callable_anchors
+        .iter()
+        .find(|anchor| anchor.name == "helper")
+        .expect("helper anchor");
+    assert_eq!(helper.role, crate::call_model::AnchorRole::Definition);
+    assert!(matches!(
+        helper.linkage,
+        crate::call_model::LinkageDomain::Internal(_)
+    ));
+    assert_eq!(helper.signature.min_arity, Some(1));
+    assert_eq!(helper.signature.max_arity, Some(1));
+
+    let call = index
+        .call_sites
+        .iter()
+        .find(|call| call.callee_name.as_deref() == Some("helper"))
+        .expect("helper call");
+    assert_eq!(call.form, crate::call_model::CallForm::DirectName);
+    assert_eq!(call.argument_count, Some(1));
+    assert_eq!(call.caller_entity_key, index.callable_anchors[1].entity_key);
+}
+
+#[test]
+fn call_facts_capture_namespace_qualified_free_calls() {
+    let source = r#"
+namespace net { int open(int port) { return port; } }
+int start(void) { return net::open(80); }
+"#;
+    let index = parse(std::path::Path::new("src/main.cpp"), source);
+    let open = index
+        .callable_anchors
+        .iter()
+        .find(|anchor| anchor.name == "open")
+        .expect("namespace function");
+    assert_eq!(open.qualified_name, "net::open");
+    assert_eq!(
+        open.owner_kind,
+        Some(crate::call_model::OwnerKindHint::Namespace)
+    );
+    let call = index
+        .call_sites
+        .iter()
+        .find(|call| call.callee_name.as_deref() == Some("open"))
+        .expect("qualified call");
+    assert_eq!(call.form, crate::call_model::CallForm::QualifiedName);
+    assert_eq!(call.qualified_name.as_deref(), Some("net::open"));
+}
+
+#[test]
+fn call_facts_label_record_methods_and_member_calls_without_binding_them() {
+    let source = r#"
+struct Worker {
+  int run(void) { return helper(); }
+};
+int invoke(Worker *worker) { return worker->run(); }
+"#;
+    let index = parse(std::path::Path::new("src/main.cpp"), source);
+    let method = index
+        .callable_anchors
+        .iter()
+        .find(|anchor| anchor.name == "run")
+        .expect("method anchor");
+    assert_eq!(
+        method.owner_kind,
+        Some(crate::call_model::OwnerKindHint::Record)
+    );
+    let member_call = index
+        .call_sites
+        .iter()
+        .find(|call| call.callee_name.as_deref() == Some("run"))
+        .expect("member call fact");
+    assert_eq!(member_call.form, crate::call_model::CallForm::MemberArrow);
+}
+
+#[test]
+fn call_facts_keep_indirect_and_global_initialization_explicit() {
+    let source = r#"
+int target(void);
+int (*fp)(void) = target;
+int initialized = target();
+int caller(void) { return (*fp)(); }
+"#;
+    let index = parse(std::path::Path::new("src/main.c"), source);
+    assert!(index.callable_anchors.iter().any(|anchor| {
+        anchor.kind == crate::call_model::CallableKind::SyntheticGlobalInitializer
+    }));
+    assert!(index
+        .call_sites
+        .iter()
+        .any(|call| call.form == crate::call_model::CallForm::FunctionPointer));
+}
+
+#[test]
+fn call_relation_fact_mask_is_explicit() {
+    let source = "int caller(void) { return callee(); }\n";
+    let skipped = parse_with_handle(
+        std::path::Path::new("main.c"),
+        source,
+        None,
+        ParseFacts::COLOR_REF,
+    );
+    assert!(skipped.callable_anchors.is_empty());
+    assert!(skipped.call_sites.is_empty());
+    assert_eq!(
+        skipped.fact_availability(FactGroup::CallSites),
+        FactAvailability::NotRequested
+    );
+
+    let indexed = parse_with_handle(
+        std::path::Path::new("main.c"),
+        source,
+        None,
+        ParseFacts::INDEX,
+    );
+    assert_eq!(
+        indexed.fact_availability(FactGroup::CallSites),
+        FactAvailability::Available
+    );
+    assert_eq!(indexed.call_sites.len(), 1);
+}
+
+#[test]
 fn records_only_mask_keeps_member_facts_not_requested() {
     let index = parse_with_handle(
         Path::new("records_only.cpp"),

@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use super::lexical::{compact_whitespace, make_symbol};
 use super::{
     AliasTarget, FieldDef, LocalBinding, LocalBindingKind, LocalDeclaration, MemberConfidence,
@@ -16,12 +18,15 @@ pub(super) struct AstIndex {
     pub(super) records: Vec<RecordDef>,
     pub(super) local_declarations: Vec<LocalDeclaration>,
     pub(super) local_bindings: Vec<LocalBinding>,
+    pub(super) callable_anchors: Vec<crate::call_model::CallableAnchor>,
+    pub(super) call_sites: Vec<crate::call_model::CallSiteFact>,
 }
 
 /// Collect AST-only index data in one iterative pass. This keeps indexing fast
 /// on large workspaces and avoids recursive Rust stack use on deep syntax trees.
 pub(super) fn collect_ast_index(
     root: tree_sitter::Node<'_>,
+    path: &Path,
     source: &str,
     line_starts: &[usize],
     facts: ParseFacts,
@@ -37,9 +42,30 @@ pub(super) fn collect_ast_index(
         records: Vec::new(),
         local_declarations: Vec::new(),
         local_bindings: Vec::new(),
+        callable_anchors: Vec::new(),
+        call_sites: Vec::new(),
     };
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
+    enum Visit<'tree> {
+        Enter(tree_sitter::Node<'tree>),
+        Exit(tree_sitter::Node<'tree>),
+    }
+    let mut call_collector = facts
+        .contains(ParseFacts::CALL_RELATIONS)
+        .then(|| super::callables::CallFactCollector::new(path, source, line_starts));
+    let mut stack = vec![Visit::Enter(root)];
+    while let Some(visit) = stack.pop() {
+        let node = match visit {
+            Visit::Enter(node) => node,
+            Visit::Exit(node) => {
+                if let Some(collector) = call_collector.as_mut() {
+                    collector.exit(node);
+                }
+                continue;
+            }
+        };
+        if let Some(collector) = call_collector.as_mut() {
+            collector.enter(node);
+        }
         out.parse_error_count += usize::from(node.is_error() || node.is_missing());
 
         // Identifier occurrences (coloring + reference roles). Skipped when
@@ -259,10 +285,19 @@ pub(super) fn collect_ast_index(
                 }
             }
         }
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            stack.push(child);
+        if call_collector.is_some() {
+            stack.push(Visit::Exit(node));
         }
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.children(&mut cursor).collect();
+        for child in children.into_iter().rev() {
+            stack.push(Visit::Enter(child));
+        }
+    }
+    if let Some(collector) = call_collector {
+        let facts = collector.finish();
+        out.callable_anchors = facts.anchors;
+        out.call_sites = facts.call_sites;
     }
     out
 }

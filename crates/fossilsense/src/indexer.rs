@@ -176,6 +176,9 @@ pub fn index_workspace(
     stats.semantic_generation = store.commit_index_build(build, &include_graph)?;
     stats.include_edge_ms = include_edge_started.elapsed().as_millis();
     stats.symbols = store.symbol_count()?;
+    let call_coverage = store.call_fact_view().coverage()?;
+    stats.callable_anchors = call_coverage.callable_anchors as usize;
+    stats.call_sites = call_coverage.call_sites as usize;
     stats.elapsed_ms = started.elapsed().as_millis();
     progress(IndexStatus::ready(workspace_display, &stats));
     Ok(stats)
@@ -307,6 +310,9 @@ pub fn index_dirty_files(
     stats.semantic_generation = store.commit_index_build(build, &include_graph)?;
     stats.include_edge_ms = include_edge_started.elapsed().as_millis();
     stats.symbols = store.symbol_count()?;
+    let call_coverage = store.call_fact_view().coverage()?;
+    stats.callable_anchors = call_coverage.callable_anchors as usize;
+    stats.call_sites = call_coverage.call_sites as usize;
     stats.elapsed_ms = started.elapsed().as_millis();
     progress(IndexStatus::ready(workspace_display, &stats));
     Ok(stats)

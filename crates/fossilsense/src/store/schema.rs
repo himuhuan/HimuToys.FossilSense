@@ -1,14 +1,16 @@
-// Version 12 replaces destructive per-file fact updates with immutable file
-// revisions plus an atomically switched active manifest. All semantic read
+// Version 13 adds callable-anchor and call-site facts to the immutable file
+// revisions plus atomically switched active manifest introduced by version 12. All semantic read
 // names remain SQL views, so a SQLite read transaction sees one complete
 // generation even while the next generation is staged.
-pub(crate) const SCHEMA_VERSION: i64 = 12;
+pub(crate) const SCHEMA_VERSION: i64 = 13;
 
 pub(crate) const DROP_DATA_TABLES_SQL: &str = "
     DROP TABLE IF EXISTS pending_file_revisions;
     DROP TABLE IF EXISTS index_builds;
     DROP TABLE IF EXISTS active_file_revisions;
     DROP TABLE IF EXISTS type_alias_facts;
+    DROP TABLE IF EXISTS call_site_facts;
+    DROP TABLE IF EXISTS callable_anchor_facts;
     DROP TABLE IF EXISTS member_facts;
     DROP TABLE IF EXISTS record_facts;
     DROP TABLE IF EXISTS include_edges;
@@ -165,6 +167,66 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
         confidence TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS callable_anchor_facts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        revision_id INTEGER NOT NULL REFERENCES file_revisions(id) ON DELETE CASCADE,
+        file_id INTEGER NOT NULL REFERENCES file_entries(id) ON DELETE CASCADE,
+        entity_key TEXT NOT NULL,
+        anchor_fingerprint TEXT NOT NULL,
+        name TEXT NOT NULL,
+        qualified_name TEXT NOT NULL,
+        owner TEXT,
+        owner_kind TEXT,
+        kind TEXT NOT NULL,
+        role TEXT NOT NULL,
+        linkage_kind TEXT NOT NULL,
+        linkage_file TEXT,
+        signature TEXT NOT NULL,
+        min_arity INTEGER,
+        max_arity INTEGER,
+        variadic INTEGER NOT NULL,
+        name_start_byte INTEGER NOT NULL,
+        name_end_byte INTEGER NOT NULL,
+        name_start_line INTEGER NOT NULL,
+        name_start_col INTEGER NOT NULL,
+        name_end_line INTEGER NOT NULL,
+        name_end_col INTEGER NOT NULL,
+        declaration_start_byte INTEGER NOT NULL,
+        declaration_end_byte INTEGER NOT NULL,
+        body_start_byte INTEGER,
+        body_end_byte INTEGER,
+        guard TEXT,
+        provenance TEXT NOT NULL,
+        syntax_error_overlap INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS call_site_facts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        revision_id INTEGER NOT NULL REFERENCES file_revisions(id) ON DELETE CASCADE,
+        file_id INTEGER NOT NULL REFERENCES file_entries(id) ON DELETE CASCADE,
+        caller_entity_key TEXT NOT NULL,
+        site_fingerprint TEXT NOT NULL,
+        expression_start_byte INTEGER NOT NULL,
+        expression_end_byte INTEGER NOT NULL,
+        expression_start_line INTEGER NOT NULL,
+        expression_start_col INTEGER NOT NULL,
+        expression_end_line INTEGER NOT NULL,
+        expression_end_col INTEGER NOT NULL,
+        callee_start_byte INTEGER NOT NULL,
+        callee_end_byte INTEGER NOT NULL,
+        callee_start_line INTEGER NOT NULL,
+        callee_start_col INTEGER NOT NULL,
+        callee_end_line INTEGER NOT NULL,
+        callee_end_col INTEGER NOT NULL,
+        callee_name TEXT,
+        qualified_name TEXT,
+        call_form TEXT NOT NULL,
+        argument_count INTEGER,
+        guard TEXT,
+        provenance TEXT NOT NULL,
+        syntax_error_overlap INTEGER NOT NULL
+    );
+
     CREATE VIEW IF NOT EXISTS files AS
         SELECT f.* FROM file_entries f
         JOIN active_file_revisions a ON a.file_id = f.id;
@@ -194,6 +256,16 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
         SELECT f.* FROM type_alias_facts f
         JOIN active_file_revisions a
           ON a.file_id = f.file_id AND a.revision_id = f.revision_id;
+
+    CREATE VIEW IF NOT EXISTS callable_anchors AS
+        SELECT f.* FROM callable_anchor_facts f
+        JOIN active_file_revisions a
+          ON a.file_id = f.file_id AND a.revision_id = f.revision_id;
+
+    CREATE VIEW IF NOT EXISTS call_sites AS
+        SELECT f.* FROM call_site_facts f
+        JOIN active_file_revisions a
+          ON a.file_id = f.file_id AND a.revision_id = f.revision_id;
 ";
 
 pub(crate) const CREATE_LOOKUP_INDEXES_SQL: &str = "
@@ -214,4 +286,11 @@ pub(crate) const CREATE_LOOKUP_INDEXES_SQL: &str = "
     CREATE INDEX IF NOT EXISTS idx_include_facts_target_basename ON include_facts(target_basename);
     CREATE INDEX IF NOT EXISTS idx_include_facts_target_normalized ON include_facts(target_normalized);
     CREATE INDEX IF NOT EXISTS idx_include_facts_file_id ON include_facts(file_id);
+    CREATE INDEX IF NOT EXISTS idx_callable_anchor_name ON callable_anchor_facts(name);
+    CREATE INDEX IF NOT EXISTS idx_callable_anchor_qualified_name ON callable_anchor_facts(qualified_name);
+    CREATE INDEX IF NOT EXISTS idx_callable_anchor_entity_key ON callable_anchor_facts(entity_key);
+    CREATE INDEX IF NOT EXISTS idx_callable_anchor_revision ON callable_anchor_facts(revision_id);
+    CREATE INDEX IF NOT EXISTS idx_call_site_caller ON call_site_facts(caller_entity_key);
+    CREATE INDEX IF NOT EXISTS idx_call_site_callee_arity ON call_site_facts(callee_name, argument_count);
+    CREATE INDEX IF NOT EXISTS idx_call_site_revision ON call_site_facts(revision_id);
 ";

@@ -6,6 +6,7 @@ use std::sync::Mutex;
 use crate::config::normalized_extension;
 
 mod ast;
+mod callables;
 mod lexical;
 
 use ast::collect_ast_index;
@@ -38,13 +39,16 @@ bitflags::bitflags! {
         const ALIASES       = 1 << 5;
         /// Record-typed local/parameter declarations (AST DFS).
         const LOCAL_DECLS   = 1 << 6;
+        /// Callable anchors and call-expression facts for relation queries.
+        const CALL_RELATIONS = 1 << 7;
 
         /// Indexing: everything except request-time facts.
         const INDEX         = Self::SYMBOLS.bits()
                             | Self::INCLUDES.bits()
                             | Self::RECORDS.bits()
                             | Self::FIELDS.bits()
-                            | Self::ALIASES.bits();
+                            | Self::ALIASES.bits()
+                            | Self::CALL_RELATIONS.bits();
 
         /// Coloring / references: occurrences + symbols + includes.
         const COLOR_REF     = Self::SYMBOLS.bits()
@@ -82,6 +86,8 @@ pub struct FileSemanticIndex {
     pub fields: Vec<FieldDef>,
     pub members: Vec<MemberDef>,
     pub aliases: Vec<TypeAlias>,
+    pub callable_anchors: Vec<crate::call_model::CallableAnchor>,
+    pub call_sites: Vec<crate::call_model::CallSiteFact>,
     /// Record-typed local/parameter declarations for positional receiver
     /// inference (AST-derived). Request-time data; not persisted.
     pub local_declarations: Vec<LocalDeclaration>,
@@ -104,6 +110,8 @@ pub struct PersistentFacts<'a> {
     pub fields: &'a [FieldDef],
     pub members: &'a [MemberDef],
     pub aliases: &'a [TypeAlias],
+    pub callable_anchors: &'a [crate::call_model::CallableAnchor],
+    pub call_sites: &'a [crate::call_model::CallSiteFact],
 }
 
 /// Request-time AST facts used by live features such as coloring, references,
@@ -129,6 +137,8 @@ pub enum FactGroup {
     Aliases,
     LocalDeclarations,
     LocalBindings,
+    CallableAnchors,
+    CallSites,
 }
 
 /// Why a requested fact group is not available.
@@ -222,6 +232,18 @@ pub struct ColoringDefs {
 }
 
 impl FileSemanticIndex {
+    /// External reference headers contribute declarations but never bodies or
+    /// body-derived call sites. They are navigation leaves, not analyzed code.
+    pub fn retain_external_call_declarations(&mut self) {
+        for anchor in &mut self.callable_anchors {
+            if anchor.role == crate::call_model::AnchorRole::Definition {
+                anchor.role = crate::call_model::AnchorRole::Declaration;
+                anchor.body_range = None;
+            }
+        }
+        self.call_sites.clear();
+    }
+
     /// Borrow the persistent/index-time facts without changing the legacy field
     /// layout. Group 5 parser consumers can migrate to this projection while
     /// older call sites keep reading the public fields.
@@ -234,6 +256,8 @@ impl FileSemanticIndex {
             fields: &self.fields,
             members: &self.members,
             aliases: &self.aliases,
+            callable_anchors: &self.callable_anchors,
+            call_sites: &self.call_sites,
         }
     }
 
@@ -316,6 +340,9 @@ impl ParseDiagnostics {
             FactGroup::Aliases => self.requested_facts.contains(ParseFacts::ALIASES),
             FactGroup::LocalDeclarations | FactGroup::LocalBindings => {
                 self.requested_facts.contains(ParseFacts::LOCAL_DECLS)
+            }
+            FactGroup::CallableAnchors | FactGroup::CallSites => {
+                self.requested_facts.contains(ParseFacts::CALL_RELATIONS)
             }
         }
     }
@@ -631,7 +658,7 @@ pub fn parse_with_handle(
         Ok(None) | Err(()) => return lexical_fallback_with_facts(symbols, includes, facts),
     };
 
-    let ast = collect_ast_index(tree.root_node(), source, &line_starts, facts);
+    let ast = collect_ast_index(tree.root_node(), path, source, &line_starts, facts);
 
     // A usable syntax tree is authoritative for type definitions. The lexical
     // pass remains the fallback source when tree-sitter cannot produce a tree,
@@ -652,6 +679,8 @@ pub fn parse_with_handle(
         fields: ast.fields,
         members: ast.members,
         aliases: ast.aliases,
+        callable_anchors: ast.callable_anchors,
+        call_sites: ast.call_sites,
         local_declarations: ast.local_declarations,
         local_bindings: ast.local_bindings,
         diagnostics: ParseDiagnostics {
@@ -712,6 +741,8 @@ fn lexical_fallback_with_facts(
         fields: Vec::new(),
         members: Vec::new(),
         aliases: Vec::new(),
+        callable_anchors: Vec::new(),
+        call_sites: Vec::new(),
         local_declarations: Vec::new(),
         local_bindings: Vec::new(),
         diagnostics: ParseDiagnostics {

@@ -58,12 +58,51 @@ pub enum CallableKind {
     FunctionLikeMacro,
 }
 
+impl CallableKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Function => "function",
+            Self::SyntheticGlobalInitializer => "synthetic_global_initializer",
+            Self::SyntheticLambda => "synthetic_lambda",
+            Self::FunctionLikeMacro => "function_like_macro",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AnchorRole {
     Declaration,
     Definition,
     Synthetic,
+}
+
+impl AnchorRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Declaration => "declaration",
+            Self::Definition => "definition",
+            Self::Synthetic => "synthetic",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OwnerKindHint {
+    Namespace,
+    Record,
+    Unknown,
+}
+
+impl OwnerKindHint {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Namespace => "namespace",
+            Self::Record => "record",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -80,6 +119,16 @@ pub enum FactProvenance {
     Ast,
     LexicalFallback,
     Synthetic,
+}
+
+impl FactProvenance {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ast => "ast",
+            Self::LexicalFallback => "lexical_fallback",
+            Self::Synthetic => "synthetic",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -131,6 +180,7 @@ pub struct CallableAnchor {
     pub name: String,
     pub qualified_name: String,
     pub owner: Option<String>,
+    pub owner_kind: Option<OwnerKindHint>,
     pub kind: CallableKind,
     pub role: AnchorRole,
     pub linkage: LinkageDomain,
@@ -152,6 +202,7 @@ pub struct CallableEntity {
     pub name: String,
     pub qualified_name: String,
     pub owner: Option<String>,
+    pub owner_kind: Option<OwnerKindHint>,
     pub kind: CallableKind,
     pub linkage: LinkageDomain,
     pub signature: SignatureShape,
@@ -172,6 +223,23 @@ pub enum CallForm {
     CallableObject,
     ExplicitConstruction,
     Unsupported,
+}
+
+impl CallForm {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DirectName => "direct_name",
+            Self::QualifiedName => "qualified_name",
+            Self::ParenthesizedName => "parenthesized_name",
+            Self::MemberDot => "member_dot",
+            Self::MemberArrow => "member_arrow",
+            Self::StaticMember => "static_member",
+            Self::FunctionPointer => "function_pointer",
+            Self::CallableObject => "callable_object",
+            Self::ExplicitConstruction => "explicit_construction",
+            Self::Unsupported => "unsupported",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

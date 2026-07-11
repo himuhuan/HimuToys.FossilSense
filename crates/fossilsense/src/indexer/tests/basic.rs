@@ -8,7 +8,7 @@ fn indexes_mini_workspace_and_skips_unchanged_files() {
     fs::create_dir_all(dir.path().join("target")).expect("target");
     fs::write(
         dir.path().join("src/main.c"),
-        "int main(void) { return 0; }\n",
+        "int main(void) { return hello_value(); }\n",
     )
     .expect("main");
     fs::write(
@@ -37,6 +37,8 @@ fn indexes_mini_workspace_and_skips_unchanged_files() {
     assert_eq!(first.total_files, 2);
     assert_eq!(first.indexed_files, 2);
     assert!(first.symbols >= 2);
+    assert_eq!(first.callable_anchors, 2);
+    assert_eq!(first.call_sites, 1);
 
     let second = index_workspace(
         dir.path(),
@@ -52,6 +54,8 @@ fn indexes_mini_workspace_and_skips_unchanged_files() {
     assert_eq!(second.total_files, 2);
     assert_eq!(second.indexed_files, 0);
     assert_eq!(second.skipped_files, 2);
+    assert_eq!(second.callable_anchors, 2);
+    assert_eq!(second.call_sites, 1);
 }
 
 #[test]
@@ -94,6 +98,8 @@ fn dirty_file_update_reindexes_only_changed_file() {
     assert_eq!(stats.skipped_files, 0);
     assert_eq!(stats.deleted_files, 0);
     assert_eq!(stats.discover_ms, 0);
+    assert_eq!(stats.callable_anchors, 1);
+    assert_eq!(stats.call_sites, 0);
 
     let store = IndexStore::open_readonly(&db).expect("store");
     assert!(store
@@ -162,7 +168,7 @@ fn indexes_external_headers_and_marks_first_layer() {
     let ext = tempdir().expect("ext");
     fs::write(
         ext.path().join("ext.h"),
-        "#include <deep.h>\ntypedef unsigned long size_t;\nstruct ExtType { int a; };\n",
+        "#include <deep.h>\ntypedef unsigned long size_t;\nstruct ExtType { int a; };\nint external_inline(void) { return deep_value(); }\n",
     )
     .expect("ext.h");
     fs::write(ext.path().join("deep.h"), "typedef int DeepType;\n").expect("deep.h");
@@ -183,6 +189,7 @@ fn indexes_external_headers_and_marks_first_layer() {
 
     // Workspace file + both external headers are indexed.
     assert_eq!(stats.total_files, 3);
+    assert_eq!(stats.call_sites, 0, "external bodies are navigation leaves");
 
     let store = IndexStore::open_readonly(&db).expect("readonly");
     assert!(store.external_symbol_count().expect("ext count") > 0);

@@ -6,6 +6,7 @@ use super::{FileFingerprint, FileSource, IndexStore};
 use std::collections::HashSet;
 
 mod basic;
+mod call_facts;
 mod generations;
 mod maintenance;
 mod members;

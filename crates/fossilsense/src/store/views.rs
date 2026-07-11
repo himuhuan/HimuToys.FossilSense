@@ -4,8 +4,11 @@ use anyhow::Result;
 
 use crate::reachability::OpenReason;
 
+mod call_facts;
 mod member;
 
+#[allow(unused_imports)]
+pub use call_facts::{CallCoverageRow, CallFactStoreView, CallSiteRow, CallableAnchorRow};
 #[allow(unused_imports)]
 pub use member::{MemberReadRow, MemberStoreView, RecordReadRow};
 

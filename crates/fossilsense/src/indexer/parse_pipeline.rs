@@ -127,8 +127,11 @@ fn parse_candidate(candidate: FileCandidate) -> ParsedFile {
             // vectors would be cleared before writing anyway).
             // It is infallible for ordinary parse problems (degrades to the
             // lexical-fallback product), so the only error here is the file read.
-            let index =
+            let mut index =
                 parse_thread_local_with_facts(&candidate.absolute_path, &source, ParseFacts::INDEX);
+            if candidate.source == FileSource::External {
+                index.retain_external_call_declarations();
+            }
             Ok(index)
         }
         Err(error) => Err(format!(
