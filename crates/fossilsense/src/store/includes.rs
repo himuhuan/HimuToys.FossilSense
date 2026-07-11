@@ -3,14 +3,89 @@ use std::collections::HashSet;
 use anyhow::Result;
 use rusqlite::params;
 
-use super::IndexStore;
+use super::{IndexBuild, IndexStore};
 
 #[allow(dead_code)]
 type IncludeEdgeRows = Vec<(String, String)>;
 #[allow(dead_code)]
 type IncludeOpenRows = Vec<(String, crate::reachability::OpenReason)>;
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl IndexStore {
+    pub fn effective_files_with_ids(
+        &self,
+        build: IndexBuild,
+    ) -> Result<Vec<(i64, String, String)>> {
+        let sql = if build.full_rebuild {
+            "SELECT f.id, f.path, f.source
+             FROM pending_file_revisions p
+             JOIN file_entries f ON f.id = p.file_id
+             WHERE p.build_id = ?1 AND p.revision_id IS NOT NULL"
+        } else {
+            "WITH effective AS (
+                 SELECT a.file_id FROM active_file_revisions a
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM pending_file_revisions p
+                     WHERE p.build_id = ?1 AND p.file_id = a.file_id
+                 )
+                 UNION ALL
+                 SELECT p.file_id FROM pending_file_revisions p
+                 WHERE p.build_id = ?1 AND p.revision_id IS NOT NULL
+             )
+             SELECT f.id, f.path, f.source FROM effective e
+             JOIN file_entries f ON f.id = e.file_id"
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map([build.id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn effective_includes_with_file_ids(
+        &self,
+        build: IndexBuild,
+        only: Option<&[i64]>,
+    ) -> Result<Vec<(i64, String)>> {
+        let mut allowed = std::collections::HashSet::new();
+        if let Some(ids) = only {
+            allowed.extend(ids.iter().copied());
+        }
+        let sql = if build.full_rebuild {
+            "SELECT i.file_id, i.target_text
+             FROM include_facts i
+             JOIN pending_file_revisions p
+               ON p.file_id = i.file_id AND p.revision_id = i.revision_id
+             WHERE p.build_id = ?1 AND p.revision_id IS NOT NULL"
+        } else {
+            "WITH effective AS (
+                 SELECT a.file_id, a.revision_id FROM active_file_revisions a
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM pending_file_revisions p
+                     WHERE p.build_id = ?1 AND p.file_id = a.file_id
+                 )
+                 UNION ALL
+                 SELECT p.file_id, p.revision_id FROM pending_file_revisions p
+                 WHERE p.build_id = ?1 AND p.revision_id IS NOT NULL
+             )
+             SELECT i.file_id, i.target_text FROM include_facts i
+             JOIN effective e ON e.file_id = i.file_id AND e.revision_id = i.revision_id"
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map([build.id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let row = row?;
+            if only.is_none() || allowed.contains(&row.0) {
+                out.push(row);
+            }
+        }
+        Ok(out)
+    }
+
     /// Reset the first-layer flag on every external file, then set it on the
     /// external files whose path is in `paths`. Idempotent; the production path
     /// is [`apply_directly_included_derivation`]; this curated setter stays as a
@@ -20,12 +95,12 @@ impl IndexStore {
     pub fn mark_directly_included(&mut self, paths: &[String]) -> Result<()> {
         let tx = self.conn.transaction()?;
         tx.execute(
-            "UPDATE files SET directly_included = 0 WHERE source = 'external'",
+            "UPDATE file_entries SET directly_included = 0 WHERE source = 'external'",
             [],
         )?;
         {
             let mut stmt = tx.prepare(
-                "UPDATE files SET directly_included = 1 WHERE source = 'external' AND path = ?1",
+                "UPDATE file_entries SET directly_included = 1 WHERE source = 'external' AND path = ?1",
             )?;
             for path in paths {
                 stmt.execute([path])?;
@@ -100,14 +175,14 @@ impl IndexStore {
         let tx = self.conn.transaction()?;
         if clear_all {
             tx.execute("DELETE FROM include_edges", [])?;
-            tx.execute("UPDATE files SET unresolved_includes = 0", [])?;
-            tx.execute("UPDATE files SET ambiguous_includes = 0", [])?;
+            tx.execute("UPDATE file_entries SET unresolved_includes = 0", [])?;
+            tx.execute("UPDATE file_entries SET ambiguous_includes = 0", [])?;
         } else {
             let mut del_edges = tx.prepare("DELETE FROM include_edges WHERE src_file_id = ?1")?;
             let mut reset_unresolved =
-                tx.prepare("UPDATE files SET unresolved_includes = 0 WHERE id = ?1")?;
+                tx.prepare("UPDATE file_entries SET unresolved_includes = 0 WHERE id = ?1")?;
             let mut reset_ambiguous =
-                tx.prepare("UPDATE files SET ambiguous_includes = 0 WHERE id = ?1")?;
+                tx.prepare("UPDATE file_entries SET ambiguous_includes = 0 WHERE id = ?1")?;
             for id in src_ids {
                 del_edges.execute([id])?;
                 reset_unresolved.execute([id])?;
@@ -123,12 +198,12 @@ impl IndexStore {
                 ins.execute(params![src, dst, resolution])?;
             }
             let mut set_unresolved =
-                tx.prepare("UPDATE files SET unresolved_includes = ?2 WHERE id = ?1")?;
+                tx.prepare("UPDATE file_entries SET unresolved_includes = ?2 WHERE id = ?1")?;
             for (src, count) in unresolved {
                 set_unresolved.execute(params![src, count])?;
             }
             let mut set_ambiguous =
-                tx.prepare("UPDATE files SET ambiguous_includes = ?2 WHERE id = ?1")?;
+                tx.prepare("UPDATE file_entries SET ambiguous_includes = ?2 WHERE id = ?1")?;
             for (src, count) in ambiguous {
                 set_ambiguous.execute(params![src, count])?;
             }
@@ -147,15 +222,15 @@ impl IndexStore {
     pub fn apply_directly_included_derivation(&mut self) -> Result<()> {
         let tx = self.conn.transaction()?;
         tx.execute(
-            "UPDATE files SET directly_included = 0 WHERE source = 'external'",
+            "UPDATE file_entries SET directly_included = 0 WHERE source = 'external'",
             [],
         )?;
         tx.execute(
-            "UPDATE files SET directly_included = 1 \
+            "UPDATE file_entries SET directly_included = 1 \
              WHERE source = 'external' AND path IN ( \
                  SELECT DISTINCT df.path FROM include_edges e \
-                 JOIN files sf ON sf.id = e.src_file_id \
-                 JOIN files df ON df.id = e.dst_file_id \
+                 JOIN file_entries sf ON sf.id = e.src_file_id \
+                 JOIN file_entries df ON df.id = e.dst_file_id \
                  WHERE sf.source = 'workspace' \
                    AND df.source = 'external' \
                    AND e.resolution = 'external_exact' \

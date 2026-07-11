@@ -7,6 +7,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
 use crate::parser::{FileSemanticIndex, SymbolKind, SymbolRole};
 
+mod generations;
 mod includes;
 mod queries;
 mod schema;
@@ -87,6 +88,54 @@ pub struct FileIndexUpdate<'a> {
 
 pub struct IndexStore {
     conn: Connection,
+    legacy_full_build: Option<IndexBuild>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexBuild {
+    pub id: i64,
+    pub target_generation: u64,
+    pub full_rebuild: bool,
+}
+
+#[derive(Debug, Default)]
+pub struct IncludeGraphUpdate {
+    pub source_ids: Vec<i64>,
+    pub edges: Vec<(i64, i64, String)>,
+    pub unresolved: Vec<(i64, i64)>,
+    pub ambiguous: Vec<(i64, i64)>,
+    pub clear_all: bool,
+}
+
+pub struct SemanticReadGuard<'a> {
+    store: &'a IndexStore,
+    generation: u64,
+    active: bool,
+}
+
+impl<'a> SemanticReadGuard<'a> {
+    #[allow(dead_code)] // Relation read views consume this in the next implementation stage.
+    pub fn store(&self) -> &'a IndexStore {
+        self.store
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn finish(mut self) -> Result<()> {
+        self.store.conn.execute_batch("COMMIT")?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for SemanticReadGuard<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.store.conn.execute_batch("ROLLBACK");
+        }
+    }
 }
 
 /// Extract normalized include metadata from raw target text. Malformed or
@@ -122,7 +171,10 @@ impl IndexStore {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
 
-        let store = Self { conn };
+        let store = Self {
+            conn,
+            legacy_full_build: None,
+        };
         store.migrate(workspace_root)?;
         Ok(store)
     }
@@ -138,7 +190,10 @@ impl IndexStore {
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .with_context(|| format!("failed to open SQLite index {}", path.display()))?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            legacy_full_build: None,
+        })
     }
 
     /// Reachability-scoped variant of [`kind_counts_by_names`]: only definitions
@@ -246,7 +301,10 @@ impl IndexStore {
     pub fn stored_file(&self, path: &str) -> Result<Option<StoredFile>> {
         self.conn
             .query_row(
-                "SELECT id, size, mtime_ns, hash FROM files WHERE path = ?1",
+                "SELECT f.id, r.size, r.mtime_ns, r.hash FROM files f
+                 JOIN active_file_revisions a ON a.file_id = f.id
+                 JOIN file_revisions r ON r.id = a.revision_id
+                 WHERE f.path = ?1",
                 [path],
                 |row| {
                     Ok(StoredFile {
@@ -270,7 +328,10 @@ impl IndexStore {
         for chunk in paths.chunks(400) {
             let placeholders = vec!["?"; chunk.len()].join(",");
             let sql = format!(
-                "SELECT path, id, size, mtime_ns, hash FROM files WHERE path IN ({placeholders})"
+                "SELECT f.path, f.id, r.size, r.mtime_ns, r.hash FROM files f
+                 JOIN active_file_revisions a ON a.file_id = f.id
+                 JOIN file_revisions r ON r.id = a.revision_id
+                 WHERE f.path IN ({placeholders})"
             );
             let mut stmt = self.conn.prepare(&sql)?;
             let rows = stmt.query_map(
@@ -339,79 +400,60 @@ impl IndexStore {
     }
 
     pub fn apply_file_updates(&mut self, updates: &[FileIndexUpdate<'_>]) -> Result<()> {
-        self.apply_file_updates_inner(updates, true)
-    }
-
-    pub fn apply_fresh_file_updates(&mut self, updates: &[FileIndexUpdate<'_>]) -> Result<()> {
-        self.apply_file_updates_inner(updates, false)
-    }
-
-    fn apply_file_updates_inner(
-        &mut self,
-        updates: &[FileIndexUpdate<'_>],
-        delete_existing_rows: bool,
-    ) -> Result<()> {
-        writes::apply_file_updates_inner(&mut self.conn, updates, delete_existing_rows)
-    }
-
-    pub fn begin_full_rebuild_load(&mut self) -> Result<()> {
-        self.drop_lookup_indexes()?;
-        let tx = self.conn.transaction()?;
-        tx.execute("DELETE FROM type_aliases", [])?;
-        tx.execute("DELETE FROM members", [])?;
-        tx.execute("DELETE FROM record_defs", [])?;
-        tx.execute("DELETE FROM include_edges", [])?;
-        tx.execute("DELETE FROM includes", [])?;
-        tx.execute("DELETE FROM symbols", [])?;
-        tx.execute("DELETE FROM files", [])?;
-        tx.commit()?;
+        if let Some(build) = self.legacy_full_build {
+            return self.stage_file_updates(build, updates);
+        }
+        let build = self.begin_index_build(false)?;
+        self.stage_file_updates(build, updates)?;
+        self.commit_index_build(build, &IncludeGraphUpdate::default())?;
         Ok(())
     }
 
-    pub fn finish_full_rebuild_load(&self) -> Result<()> {
-        self.create_lookup_indexes()?;
+    pub fn stage_file_updates(
+        &mut self,
+        build: IndexBuild,
+        updates: &[FileIndexUpdate<'_>],
+    ) -> Result<()> {
+        writes::stage_file_updates(&mut self.conn, build, updates)
+    }
+
+    #[allow(dead_code)]
+    pub fn begin_full_rebuild_load(&mut self) -> Result<()> {
+        self.legacy_full_build = Some(self.begin_index_build(true)?);
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn finish_full_rebuild_load(&mut self) -> Result<()> {
+        if let Some(build) = self.legacy_full_build.take() {
+            self.commit_index_build(
+                build,
+                &IncludeGraphUpdate {
+                    clear_all: true,
+                    ..Default::default()
+                },
+            )?;
+        }
         // Truncate the WAL after bulk load to control disk footprint.
-        // Dirty updates do NOT run this checkpoint.
         self.conn
             .pragma_update(None, "wal_checkpoint", "TRUNCATE")?;
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn delete_missing_files(&mut self, seen_paths: &HashSet<String>) -> Result<usize> {
-        if seen_paths.is_empty() {
-            // Nothing seen → delete all files. Use a fast path.
-            let deleted: i64 = self
-                .conn
-                .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))?;
-            let tx = self.conn.transaction()?;
-            tx.execute("DELETE FROM files", [])?;
-            tx.commit()?;
-            return Ok(deleted as usize);
-        }
-
-        let tx = self.conn.transaction()?;
-        // Stage seen paths in a temp table for anti-join delete.
-        tx.execute_batch("CREATE TEMP TABLE seen_paths (path TEXT PRIMARY KEY);")?;
-        {
-            let mut ins = tx.prepare("INSERT OR IGNORE INTO seen_paths (path) VALUES (?1)")?;
-            for path in seen_paths {
-                ins.execute([path.as_str()])?;
-            }
-        }
-        let deleted = tx.execute(
-            "DELETE FROM files WHERE path NOT IN (SELECT path FROM seen_paths)",
-            [],
-        )?;
-        tx.execute_batch("DROP TABLE IF EXISTS seen_paths;")?;
-        tx.commit()?;
+        let build = self.begin_index_build(false)?;
+        let deleted = self.stage_delete_missing_files(build, seen_paths)?;
+        self.commit_index_build(build, &IncludeGraphUpdate::default())?;
         Ok(deleted)
     }
 
     #[allow(dead_code)]
     pub fn delete_file(&mut self, path: &str) -> Result<usize> {
-        self.conn
-            .execute("DELETE FROM files WHERE path = ?1", [path])
-            .context("failed to delete indexed file")
+        let build = self.begin_index_build(false)?;
+        let deleted = self.stage_delete_file(build, path)?;
+        self.commit_index_build(build, &IncludeGraphUpdate::default())?;
+        Ok(deleted)
     }
 
     pub fn symbol_count(&self) -> Result<usize> {
@@ -445,6 +487,30 @@ impl IndexStore {
             .and_then(|value| value.parse().ok());
         if let Some(version) = stored_version {
             if version != schema::SCHEMA_VERSION {
+                for name in [
+                    "type_aliases",
+                    "members",
+                    "record_defs",
+                    "includes",
+                    "symbols",
+                    "files",
+                ] {
+                    let object_type: Option<String> = self
+                        .conn
+                        .query_row(
+                            "SELECT type FROM sqlite_master WHERE name = ?1",
+                            [name],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    if let Some(object_type) = object_type {
+                        let statement = match object_type.as_str() {
+                            "view" => format!("DROP VIEW IF EXISTS {name}"),
+                            _ => format!("DROP TABLE IF EXISTS {name}"),
+                        };
+                        self.conn.execute_batch(&statement)?;
+                    }
+                }
                 self.conn.execute_batch(schema::DROP_DATA_TABLES_SQL)?;
             }
         }
@@ -462,11 +528,10 @@ impl IndexStore {
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [workspace_root.display().to_string()],
         )?;
-        Ok(())
-    }
-
-    fn drop_lookup_indexes(&self) -> Result<()> {
-        self.conn.execute_batch(schema::DROP_LOOKUP_INDEXES_SQL)?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO meta (key, value) VALUES ('semantic_generation', '0')",
+            [],
+        )?;
         Ok(())
     }
 

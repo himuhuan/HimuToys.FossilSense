@@ -10,7 +10,7 @@ use super::candidates::FileCandidate;
 use super::ProgressLimiter;
 use crate::parser::{parse_thread_local_with_facts, FileSemanticIndex, ParseFacts};
 use crate::progress::{IndexStats, IndexStatus};
-use crate::store::{FileIndexPayload, FileIndexUpdate, FileSource, IndexStore};
+use crate::store::{FileIndexPayload, FileIndexUpdate, FileSource, IndexBuild, IndexStore};
 
 const DEFAULT_MAX_PARSE_THREADS: usize = 8;
 const PARSER_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
@@ -26,7 +26,7 @@ struct ParsedFile {
 pub(super) fn parse_and_write_changed(
     changed: Vec<FileCandidate>,
     parse_threads: usize,
-    replace_all_files: bool,
+    build: IndexBuild,
     store: &mut IndexStore,
     workspace_display: &str,
     stats: &mut IndexStats,
@@ -58,11 +58,6 @@ pub(super) fn parse_and_write_changed(
         stats,
         "indexing",
     ));
-    let full_rebuild_load = replace_all_files && stats.skipped_files == 0;
-    if full_rebuild_load {
-        store.begin_full_rebuild_load()?;
-    }
-
     let mut index_progress = ProgressLimiter::new();
     let write_result = (|| -> Result<()> {
         for chunk in parsed_files.chunks(WRITE_BATCH_SIZE) {
@@ -89,11 +84,7 @@ pub(super) fn parse_and_write_changed(
             }
 
             let write_started = Instant::now();
-            if full_rebuild_load {
-                store.apply_fresh_file_updates(&updates)?;
-            } else {
-                store.apply_file_updates(&updates)?;
-            }
+            store.stage_file_updates(build, &updates)?;
             stats.write_ms = stats
                 .write_ms
                 .saturating_add(write_started.elapsed().as_millis());
@@ -104,9 +95,6 @@ pub(super) fn parse_and_write_changed(
         }
         Ok(())
     })();
-    if full_rebuild_load {
-        store.finish_full_rebuild_load()?;
-    }
     write_result?;
     index_progress.emit_if_changed(progress, workspace_display, stats, "indexing");
     Ok(())

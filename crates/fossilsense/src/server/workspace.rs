@@ -9,6 +9,7 @@ use tower_lsp::lsp_types::Url;
 use super::include_completion::IncludeCompletionTable;
 use super::state;
 use super::LocalWordCache;
+use crate::call_model::SemanticGeneration;
 use crate::completion_words;
 use crate::parser::FileSemanticIndex;
 use crate::project_context::ProjectContextIndex;
@@ -177,6 +178,7 @@ pub(in crate::server) type EngineSnapshots = Arc<Mutex<HashMap<PathBuf, Arc<Engi
 pub(in crate::server) struct EngineSnapshot {
     pub(in crate::server) root: PathBuf,
     pub(in crate::server) epoch: state::EngineEpoch,
+    pub(in crate::server) semantic_generation: SemanticGeneration,
     pub(in crate::server) name_table: Option<Arc<NameTable>>,
     pub(in crate::server) reach_graph: Option<Arc<ReachGraph>>,
     pub(in crate::server) include_table: Option<Arc<IncludeCompletionTable>>,
@@ -191,6 +193,7 @@ impl EngineSnapshot {
         Self {
             root,
             epoch: state::EngineEpoch::missing(),
+            semantic_generation: SemanticGeneration::MISSING,
             name_table: None,
             reach_graph: None,
             include_table: None,
@@ -369,6 +372,7 @@ impl CacheLedger {
         self.publish_engine_snapshot(EngineSnapshot {
             root,
             epoch: self.allocate_engine_epoch(),
+            semantic_generation: current.semantic_generation,
             name_table: Some(table),
             reach_graph: current.reach_graph.clone(),
             include_table: current.include_table.clone(),
@@ -392,6 +396,7 @@ impl CacheLedger {
         self.publish_engine_snapshot(EngineSnapshot {
             root,
             epoch: self.allocate_engine_epoch(),
+            semantic_generation: current.semantic_generation,
             name_table: current.name_table.clone(),
             reach_graph: current.reach_graph.clone(),
             include_table: current.include_table.clone(),
@@ -411,6 +416,7 @@ impl CacheLedger {
         self.publish_engine_snapshot(EngineSnapshot {
             root,
             epoch: self.allocate_engine_epoch(),
+            semantic_generation: current.semantic_generation,
             name_table: current.name_table.clone(),
             reach_graph: Some(graph),
             include_table: current.include_table.clone(),

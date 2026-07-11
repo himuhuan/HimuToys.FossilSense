@@ -20,7 +20,7 @@ use candidates::{
     candidate_for_path, canonicalize_existing_prefix, discover_candidates,
     discover_external_candidates, DEFAULT_EXTERNAL_MAX_BYTES, DEFAULT_EXTERNAL_MAX_FILES,
 };
-use include_edges::{rebuild_include_edges, sql_affected_include_edge_sources};
+use include_edges::{build_include_edges, sql_affected_include_edge_sources};
 use parse_pipeline::{parse_and_write_changed, parse_thread_count};
 use progress_limiter::ProgressLimiter;
 
@@ -129,6 +129,7 @@ pub fn index_workspace(
         .collect();
     let stored_files = store.stored_files(&candidate_paths)?;
     let replace_all_files = options.force || stored_files.is_empty();
+    let build = store.begin_index_build(replace_all_files)?;
     for candidate in candidates {
         // Fast incremental check: reading and hashing every unchanged workspace
         // file defeats the point of an incremental pass. Size + mtime is the
@@ -155,7 +156,7 @@ pub fn index_workspace(
     parse_and_write_changed(
         changed,
         parse_thread_count(options.parse_threads),
-        replace_all_files,
+        build,
         &mut store,
         &workspace_display,
         &mut stats,
@@ -167,11 +168,12 @@ pub fn index_workspace(
         &stats,
         "finalizing",
     ));
-    stats.deleted_files = store.delete_missing_files(&seen_paths)?;
+    stats.deleted_files = store.stage_delete_missing_files(build, &seen_paths)?;
     // Rebuild the full include graph that backs reachability scoping, and
     // derive the first-layer `directly_included` flag in the same pass.
     let include_edge_started = Instant::now();
-    rebuild_include_edges(&mut store, &include_roots, None)?;
+    let include_graph = build_include_edges(&store, build, &include_roots, None)?;
+    stats.semantic_generation = store.commit_index_build(build, &include_graph)?;
     stats.include_edge_ms = include_edge_started.elapsed().as_millis();
     stats.symbols = store.symbol_count()?;
     stats.elapsed_ms = started.elapsed().as_millis();
@@ -224,6 +226,7 @@ pub fn index_dirty_files(
     }
 
     let mut store = IndexStore::open(&db_path, &workspace)?;
+    let build = store.begin_index_build(false)?;
     let check_started = Instant::now();
     let mut upserts = Vec::new();
     let mut upsert_rels: Vec<String> = Vec::new();
@@ -269,8 +272,7 @@ pub fn index_dirty_files(
 
     for rel in deletes {
         let write_started = Instant::now();
-        store.delete_file(&rel)?;
-        stats.deleted_files += 1;
+        stats.deleted_files += store.stage_delete_file(build, &rel)?;
         stats.processed_files += 1;
         stats.write_ms = stats
             .write_ms
@@ -280,7 +282,7 @@ pub fn index_dirty_files(
     parse_and_write_changed(
         upserts,
         parse_thread_count(options.parse_threads),
-        false,
+        build,
         &mut store,
         &workspace_display,
         &mut stats,
@@ -301,7 +303,8 @@ pub fn index_dirty_files(
     let affected_rels =
         sql_affected_include_edge_sources(&store, &roots_slash, &upsert_rels, &changed_rels)?;
     stats.include_edge_sources_rebuilt = affected_rels.clone();
-    rebuild_include_edges(&mut store, &include_roots, Some(&affected_rels))?;
+    let include_graph = build_include_edges(&store, build, &include_roots, Some(&affected_rels))?;
+    stats.semantic_generation = store.commit_index_build(build, &include_graph)?;
     stats.include_edge_ms = include_edge_started.elapsed().as_millis();
     stats.symbols = store.symbol_count()?;
     stats.elapsed_ms = started.elapsed().as_millis();

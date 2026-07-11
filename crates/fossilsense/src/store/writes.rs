@@ -6,13 +6,13 @@ use crate::parser::AliasTarget;
 use super::{
     include_normalized_metadata, member_confidence_to_str, member_kind_to_str, now_unix_secs,
     record_confidence_to_str, record_kind_to_str, symbol_kind, symbol_role, FileIndexPayload,
-    FileIndexUpdate,
+    FileIndexUpdate, IndexBuild,
 };
 
-pub(super) fn apply_file_updates_inner(
+pub(super) fn stage_file_updates(
     conn: &mut Connection,
+    build: IndexBuild,
     updates: &[FileIndexUpdate<'_>],
-    delete_existing_rows: bool,
 ) -> Result<()> {
     if updates.is_empty() {
         return Ok(());
@@ -21,98 +21,93 @@ pub(super) fn apply_file_updates_inner(
     let tx = conn.transaction()?;
     let indexed_at = now_unix_secs();
     {
-        let mut ok_file_stmt = tx.prepare(
-            "INSERT INTO files (path, extension, size, mtime_ns, hash, indexed_at, status, error, source)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'ok', NULL, ?7)
-             ON CONFLICT(path) DO UPDATE SET
-                extension = excluded.extension,
-                size = excluded.size,
-                mtime_ns = excluded.mtime_ns,
-                hash = excluded.hash,
-                indexed_at = excluded.indexed_at,
-                status = excluded.status,
-                error = excluded.error",
+        let mut file_stmt = tx.prepare(
+            "INSERT INTO file_entries (path, extension, size, mtime_ns, hash, indexed_at, status, error, source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(path) DO NOTHING",
         )?;
-        let mut error_file_stmt = tx.prepare(
-            "INSERT INTO files (path, extension, size, mtime_ns, hash, indexed_at, status, error, source)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'error', ?7, ?8)
-             ON CONFLICT(path) DO UPDATE SET
-                extension = excluded.extension,
-                size = excluded.size,
-                mtime_ns = excluded.mtime_ns,
-                hash = excluded.hash,
-                indexed_at = excluded.indexed_at,
-                status = excluded.status,
-                error = excluded.error",
+        let mut file_id_stmt = tx.prepare("SELECT id FROM file_entries WHERE path = ?1")?;
+        let mut revision_stmt = tx.prepare(
+            "INSERT INTO file_revisions (
+                file_id, extension, size, mtime_ns, hash, indexed_at, status, error, source,
+                parser_version, fact_mask, parse_error_count, fallback_used
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11, ?12)",
         )?;
-        let mut file_id_stmt = tx.prepare("SELECT id FROM files WHERE path = ?1")?;
-        let mut delete_symbols_stmt = tx.prepare("DELETE FROM symbols WHERE file_id = ?1")?;
-        let mut delete_includes_stmt = tx.prepare("DELETE FROM includes WHERE file_id = ?1")?;
-        let mut delete_aliases_stmt = tx.prepare("DELETE FROM type_aliases WHERE file_id = ?1")?;
+        let mut pending_stmt = tx.prepare(
+            "INSERT INTO pending_file_revisions (build_id, file_id, revision_id)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(build_id, file_id) DO UPDATE SET revision_id = excluded.revision_id",
+        )?;
         let mut symbol_stmt = tx.prepare(
-            "INSERT INTO symbols (
-                    file_id, name, kind, role, start_byte, end_byte,
+            "INSERT INTO symbol_facts (
+                    revision_id, file_id, name, kind, role, start_byte, end_byte,
                     start_line, start_col, end_line, end_col, signature, guard, container
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         )?;
         let mut include_stmt = tx
-            .prepare("INSERT INTO includes (file_id, line, target_text, target_form, target_normalized, target_basename) VALUES (?1, ?2, ?3, ?4, ?5, ?6)")?;
+            .prepare("INSERT INTO include_facts (revision_id, file_id, line, target_text, target_form, target_normalized, target_basename) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")?;
         let mut record_stmt = tx.prepare(
-            "INSERT INTO record_defs (
-                    file_id, display_name, tag_name, typedef_name, kind, start_byte, end_byte,
+            "INSERT INTO record_facts (
+                    revision_id, file_id, display_name, tag_name, typedef_name, kind, start_byte, end_byte,
                     start_line, start_col, end_line, end_col, signature, confidence
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         )?;
         let mut member_stmt = tx.prepare(
-            "INSERT INTO members (
+            "INSERT INTO member_facts (
                     record_id, name, kind, confidence, start_byte, end_byte,
                     start_line, start_col, end_line, end_col, signature, type_name
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         )?;
         let mut alias_stmt = tx.prepare(
-            "INSERT INTO type_aliases (
-                    file_id, alias, start_byte, end_byte, start_line, start_col, end_line, end_col,
+            "INSERT INTO type_alias_facts (
+                    revision_id, file_id, alias, start_byte, end_byte, start_line, start_col, end_line, end_col,
                     target_record_id, target_name, target_kind, confidence
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         )?;
-        let mut delete_records_stmt = tx.prepare("DELETE FROM record_defs WHERE file_id = ?1")?;
 
         for update in updates {
             let fingerprint = update.fingerprint;
-            match update.payload {
-                FileIndexPayload::Ok(_) => {
-                    ok_file_stmt.execute(params![
-                        fingerprint.path.as_str(),
-                        fingerprint.extension.as_str(),
-                        fingerprint.size as i64,
-                        fingerprint.mtime_ns,
-                        fingerprint.hash.as_str(),
-                        indexed_at,
-                        update.source.as_str(),
-                    ])?;
-                }
-                FileIndexPayload::Error(error) => {
-                    error_file_stmt.execute(params![
-                        fingerprint.path.as_str(),
-                        fingerprint.extension.as_str(),
-                        fingerprint.size as i64,
-                        fingerprint.mtime_ns,
-                        fingerprint.hash.as_str(),
-                        indexed_at,
-                        error,
-                        update.source.as_str(),
-                    ])?;
-                }
-            }
+            let (status, error, fact_mask, parse_error_count, fallback_used) = match update.payload
+            {
+                FileIndexPayload::Ok(index) => (
+                    "ok",
+                    None,
+                    index.diagnostics.requested_facts.bits() as i64,
+                    index.diagnostics.parse_error_count as i64,
+                    i64::from(index.diagnostics.fallback_used),
+                ),
+                FileIndexPayload::Error(error) => ("error", Some(error), 0, 0, 0),
+            };
+            file_stmt.execute(params![
+                fingerprint.path.as_str(),
+                fingerprint.extension.as_str(),
+                fingerprint.size as i64,
+                fingerprint.mtime_ns,
+                fingerprint.hash.as_str(),
+                indexed_at,
+                status,
+                error,
+                update.source.as_str(),
+            ])?;
 
             let file_id: i64 =
                 file_id_stmt.query_row([fingerprint.path.as_str()], |row| row.get(0))?;
-            if delete_existing_rows {
-                delete_symbols_stmt.execute([file_id])?;
-                delete_includes_stmt.execute([file_id])?;
-                delete_aliases_stmt.execute([file_id])?;
-                delete_records_stmt.execute([file_id])?;
-            }
+            revision_stmt.execute(params![
+                file_id,
+                fingerprint.extension.as_str(),
+                fingerprint.size as i64,
+                fingerprint.mtime_ns,
+                fingerprint.hash.as_str(),
+                indexed_at,
+                status,
+                error,
+                update.source.as_str(),
+                fact_mask,
+                parse_error_count,
+                fallback_used,
+            ])?;
+            let revision_id = tx.last_insert_rowid();
+            pending_stmt.execute(params![build.id, file_id, revision_id])?;
 
             let FileIndexPayload::Ok(index) = update.payload else {
                 continue;
@@ -121,6 +116,7 @@ pub(super) fn apply_file_updates_inner(
 
             for symbol in facts.symbols {
                 symbol_stmt.execute(params![
+                    revision_id,
                     file_id,
                     symbol.name.as_str(),
                     symbol_kind(symbol.kind),
@@ -141,6 +137,7 @@ pub(super) fn apply_file_updates_inner(
                 let (form, normalized, basename) =
                     include_normalized_metadata(&include.target_text);
                 include_stmt.execute(params![
+                    revision_id,
                     file_id,
                     include.line as i64,
                     include.target_text.as_str(),
@@ -155,6 +152,7 @@ pub(super) fn apply_file_updates_inner(
                 std::collections::HashMap::new();
             for record in facts.records {
                 record_stmt.execute(params![
+                    revision_id,
                     file_id,
                     record.display_name.as_str(),
                     record.tag_name.as_deref(),
@@ -230,6 +228,7 @@ pub(super) fn apply_file_updates_inner(
                     }
                 };
                 alias_stmt.execute(params![
+                    revision_id,
                     file_id,
                     alias.alias.as_str(),
                     alias.start_byte as i64,

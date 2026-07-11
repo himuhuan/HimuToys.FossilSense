@@ -271,33 +271,15 @@ fn current_schema_migrate_by_drop_clears_old_data() {
         .expect("count");
     assert_eq!(count, 0, "old includes rows dropped by migration");
 
-    // Insert a file row first (needed for FK), then verify new columns exist.
-    store
+    let columns: Vec<String> = store
         .conn
-        .execute(
-            "INSERT INTO files (path, extension, size, mtime_ns, hash, indexed_at, status)
-             VALUES ('test.h', 'h', 100, 1, 'abc', 1, 'ok')",
-            [],
-        )
-        .expect("insert file");
-    store
-        .conn
-        .execute(
-            "INSERT INTO includes (file_id, line, target_text, target_form, target_normalized, target_basename)
-             VALUES (1, 1, '\"test.h\"', 'quote', 'test.h', 'test.h')",
-            [],
-        )
-        .expect("insert into current schema");
-
-    let (form, norm, bn): (String, String, String) = store
-        .conn
-        .query_row(
-            "SELECT target_form, target_normalized, target_basename FROM includes LIMIT 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .expect("read current columns");
-    assert_eq!(form, "quote");
-    assert_eq!(norm, "test.h");
-    assert_eq!(bn, "test.h");
+        .prepare("PRAGMA table_info(includes)")
+        .unwrap()
+        .query_map([], |row| row.get(1))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert!(columns.contains(&"target_form".to_string()));
+    assert!(columns.contains(&"target_normalized".to_string()));
+    assert!(columns.contains(&"target_basename".to_string()));
 }

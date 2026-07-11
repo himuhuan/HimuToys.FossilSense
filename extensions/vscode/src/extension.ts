@@ -89,6 +89,7 @@ interface IndexStatus {
   indexedFiles: number;
   skippedFiles: number;
   symbols: number;
+  semanticGeneration: number;
   elapsedMs: number;
   discoverMs: number;
   parseMs: number;

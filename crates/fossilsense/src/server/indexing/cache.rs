@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use tower_lsp::lsp_types::MessageType;
 use tower_lsp::Client;
 
+use crate::call_model::SemanticGeneration;
 use crate::pathing;
 use crate::progress::DegradedCapabilities;
 use crate::project_context::{self, ProjectContextIndex};
@@ -14,6 +15,18 @@ use crate::reachability::ReachGraph;
 use crate::server::workspace::EngineSnapshot;
 use crate::server::{CacheLedger, CachePublishReport, IncludeCompletionTable};
 use crate::store::IndexStore;
+
+async fn load_semantic_generation(root: PathBuf) -> Result<SemanticGeneration> {
+    tokio::task::spawn_blocking(move || -> Result<SemanticGeneration> {
+        let db_path = pathing::default_index_path(&root)?;
+        let store = IndexStore::open_readonly(&db_path)?;
+        let guard = store.begin_semantic_read(None)?;
+        let generation = SemanticGeneration(guard.generation());
+        guard.finish()?;
+        Ok(generation)
+    })
+    .await?
+}
 
 /// Build the in-memory fuzzy name table for `root` from one committed SQLite
 /// view. The result remains private until the complete engine snapshot is
@@ -275,6 +288,7 @@ impl CacheLedger {
         // previous engine snapshot stays visible while every next component is
         // built off to the side.
         let _publish_guard = self.publish_gate.lock().await;
+        let semantic_generation = load_semantic_generation(root.clone()).await?;
 
         let nt_started = tokio::time::Instant::now();
         let project_context = rebuild_project_context(client, root.clone()).await;
@@ -312,11 +326,17 @@ impl CacheLedger {
         };
         let reference_file_count = indexed_files.as_ref().map_or(0, |files| files.len());
         let reach_graph_ms = rg_started.elapsed().as_millis();
+        let observed_generation = load_semantic_generation(root.clone()).await?;
+        anyhow::ensure!(
+            observed_generation == semantic_generation,
+            "semantic generation changed while building the engine snapshot"
+        );
 
         let epoch = self.allocate_engine_epoch();
         self.publish_engine_snapshot(EngineSnapshot {
             root,
             epoch,
+            semantic_generation,
             name_table: Some(name_table),
             reach_graph,
             include_table,
@@ -348,6 +368,7 @@ impl CacheLedger {
         include_edge_sources_rebuilt: &[String],
     ) -> Result<CachePublishReport> {
         let _publish_guard = self.publish_gate.lock().await;
+        let semantic_generation = load_semantic_generation(root.clone()).await?;
         let previous = self.current_engine_snapshot(&root).await;
         let project_context = previous
             .as_ref()
@@ -404,11 +425,17 @@ impl CacheLedger {
         };
         let reference_file_count = indexed_files.as_ref().map_or(0, |files| files.len());
         let reach_graph_ms = rg_started.elapsed().as_millis();
+        let observed_generation = load_semantic_generation(root.clone()).await?;
+        anyhow::ensure!(
+            observed_generation == semantic_generation,
+            "semantic generation changed while building the engine snapshot"
+        );
 
         let epoch = self.allocate_engine_epoch();
         self.publish_engine_snapshot(EngineSnapshot {
             root,
             epoch,
+            semantic_generation,
             name_table: Some(name_table),
             reach_graph,
             include_table,
@@ -461,6 +488,7 @@ impl CacheLedger {
         self.publish_engine_snapshot(EngineSnapshot {
             root,
             epoch: self.allocate_engine_epoch(),
+            semantic_generation: previous.semantic_generation,
             name_table: Some(name_table),
             reach_graph: previous.reach_graph.clone(),
             include_table: previous.include_table.clone(),

@@ -6,6 +6,7 @@ use super::{FileFingerprint, FileSource, IndexStore};
 use std::collections::HashSet;
 
 mod basic;
+mod generations;
 mod maintenance;
 mod members;
 mod parser_consumer_migration;

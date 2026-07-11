@@ -110,6 +110,17 @@ Store read-view 规则：
 | compatibility | 旧 `IndexStore` query wrapper 可作为兼容/测试 oracle 保留，但应委托 read views 或共享 typed loader |
 | bundled SQLite | 必须包含 WAL-reset 并发损坏修复（当前基线 SQLite 3.51.3+）；`store` resilience test 防止版本回退 |
 
+统一语义代际规则：
+
+| 项 | 规则 |
+|---|---|
+| immutable facts | 每次解析生成新的 `file_revisions` 与 fact rows；索引期间不得覆盖 active facts |
+| active views | `files`、`symbols`、`includes`、`record_defs`、`members`、`type_aliases` 只暴露 `active_file_revisions` 指向的事实 |
+| staging | 全量和 dirty 索引都先写 `index_builds` / `pending_file_revisions`，失败或废弃 build 不得改变生产查询结果 |
+| publication | 文件 manifest、include edges/open counts、first-layer external 标记与持久化 `SemanticGeneration` 在一个短事务中切换 |
+| SQLite snapshot | `SemanticReadGuard` 在事务开始时捕获并可校验 generation；旧 WAL reader 在发布后继续看到完整旧代 |
+| cleanup | inactive/orphan revisions 在发布后清理；清理失败不得回滚已发布 generation |
+
 Runtime snapshot 规则：
 
 | 项 | 规则 |
@@ -117,6 +128,7 @@ Runtime snapshot 规则：
 | `EngineSnapshot` | 每工作区一个完整不可变读模型，统一携带 name table、reach graph、include table、reference file list、project context、degraded state |
 | publication | 所有下一代读模型在后台构建完成后，只通过一次 map 交换发布；构建期间旧快照继续服务请求 |
 | `EngineEpoch` | 每次成功发布分配显式单调 epoch；`0` 只表示尚未发布索引读模型 |
+| `SemanticGeneration` | SQLite active manifest 的持久化单调代际；marker-only 等纯派生刷新不得推进它 |
 | `RequestContext` | 请求开始时捕获一个 `Arc<EngineSnapshot>` 和 request settings；请求期间不得重新逐项读取缓存 |
 | dirty reach graph | 增量 include edge 更新生成新的 `ReachGraph`，不得原地修改旧快照持有的图 |
 | publisher | snapshot publisher 串行协调；发布失败不得暴露半更新状态 |

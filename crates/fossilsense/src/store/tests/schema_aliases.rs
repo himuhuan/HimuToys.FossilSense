@@ -10,11 +10,11 @@ fn test_store_schema_v6() {
         let _store = IndexStore::open(&db, dir.path()).expect("store");
     }
 
-    // 2. Open read-only and query sqlite_master to verify tables exist
+    // 2. Active semantic names are views over immutable revision fact tables.
     let reader = IndexStore::open_readonly(&db).expect("readonly");
     let tables: Vec<String> = reader
         .conn
-        .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+        .prepare("SELECT name FROM sqlite_master WHERE type IN ('table', 'view')")
         .unwrap()
         .query_map([], |row| row.get(0))
         .unwrap()

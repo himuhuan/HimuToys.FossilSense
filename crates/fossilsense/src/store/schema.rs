@@ -1,17 +1,22 @@
-// Version 11 invalidates symbols produced before AST-exact type-name ranges and
-// comment-safe lexical fallback. Rebuilding is required even though the SQL
-// shape is unchanged, otherwise stale keyword/type rows can survive forever.
-pub(crate) const SCHEMA_VERSION: i64 = 11;
+// Version 12 replaces destructive per-file fact updates with immutable file
+// revisions plus an atomically switched active manifest. All semantic read
+// names remain SQL views, so a SQLite read transaction sees one complete
+// generation even while the next generation is staged.
+pub(crate) const SCHEMA_VERSION: i64 = 12;
 
 pub(crate) const DROP_DATA_TABLES_SQL: &str = "
-    DROP TABLE IF EXISTS type_aliases;
-    DROP TABLE IF EXISTS members;
-    DROP TABLE IF EXISTS fields;
-    DROP TABLE IF EXISTS record_defs;
+    DROP TABLE IF EXISTS pending_file_revisions;
+    DROP TABLE IF EXISTS index_builds;
+    DROP TABLE IF EXISTS active_file_revisions;
+    DROP TABLE IF EXISTS type_alias_facts;
+    DROP TABLE IF EXISTS member_facts;
+    DROP TABLE IF EXISTS record_facts;
     DROP TABLE IF EXISTS include_edges;
-    DROP TABLE IF EXISTS includes;
-    DROP TABLE IF EXISTS symbols;
-    DROP TABLE IF EXISTS files;
+    DROP TABLE IF EXISTS include_facts;
+    DROP TABLE IF EXISTS symbol_facts;
+    DROP TABLE IF EXISTS file_revisions;
+    DROP TABLE IF EXISTS fields;
+    DROP TABLE IF EXISTS file_entries;
 ";
 
 pub(crate) const CREATE_SCHEMA_SQL: &str = "
@@ -20,7 +25,7 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
         value TEXT NOT NULL
     );
 
-    CREATE TABLE IF NOT EXISTS files (
+    CREATE TABLE IF NOT EXISTS file_entries (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         path TEXT NOT NULL UNIQUE,
         extension TEXT NOT NULL,
@@ -36,9 +41,47 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
         ambiguous_includes INTEGER NOT NULL DEFAULT 0
     );
 
-    CREATE TABLE IF NOT EXISTS symbols (
+    CREATE TABLE IF NOT EXISTS file_revisions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+        file_id INTEGER NOT NULL REFERENCES file_entries(id) ON DELETE CASCADE,
+        extension TEXT NOT NULL,
+        size INTEGER NOT NULL,
+        mtime_ns INTEGER NOT NULL,
+        hash TEXT NOT NULL,
+        indexed_at INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        error TEXT,
+        source TEXT NOT NULL,
+        parser_version INTEGER NOT NULL DEFAULT 1,
+        fact_mask INTEGER NOT NULL DEFAULT 0,
+        parse_error_count INTEGER NOT NULL DEFAULT 0,
+        fallback_used INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS active_file_revisions (
+        file_id INTEGER PRIMARY KEY REFERENCES file_entries(id) ON DELETE CASCADE,
+        revision_id INTEGER NOT NULL UNIQUE REFERENCES file_revisions(id) ON DELETE CASCADE
+    ) WITHOUT ROWID;
+
+    CREATE TABLE IF NOT EXISTS index_builds (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        target_generation INTEGER NOT NULL UNIQUE,
+        full_rebuild INTEGER NOT NULL,
+        state TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS pending_file_revisions (
+        build_id INTEGER NOT NULL REFERENCES index_builds(id) ON DELETE CASCADE,
+        file_id INTEGER NOT NULL REFERENCES file_entries(id) ON DELETE CASCADE,
+        revision_id INTEGER REFERENCES file_revisions(id) ON DELETE CASCADE,
+        PRIMARY KEY (build_id, file_id)
+    ) WITHOUT ROWID;
+
+    CREATE TABLE IF NOT EXISTS symbol_facts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        revision_id INTEGER NOT NULL REFERENCES file_revisions(id) ON DELETE CASCADE,
+        file_id INTEGER NOT NULL REFERENCES file_entries(id) ON DELETE CASCADE,
         name TEXT NOT NULL,
         kind TEXT NOT NULL,
         role TEXT NOT NULL,
@@ -53,9 +96,10 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
         container TEXT
     );
 
-    CREATE TABLE IF NOT EXISTS includes (
+    CREATE TABLE IF NOT EXISTS include_facts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+        revision_id INTEGER NOT NULL REFERENCES file_revisions(id) ON DELETE CASCADE,
+        file_id INTEGER NOT NULL REFERENCES file_entries(id) ON DELETE CASCADE,
         line INTEGER NOT NULL,
         target_text TEXT NOT NULL,
         target_form TEXT NOT NULL DEFAULT 'unknown',
@@ -64,15 +108,16 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
     );
 
     CREATE TABLE IF NOT EXISTS include_edges (
-        src_file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
-        dst_file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+        src_file_id INTEGER NOT NULL REFERENCES file_entries(id) ON DELETE CASCADE,
+        dst_file_id INTEGER NOT NULL REFERENCES file_entries(id) ON DELETE CASCADE,
         resolution TEXT NOT NULL DEFAULT 'suffix_match',
         PRIMARY KEY (src_file_id, dst_file_id)
     ) WITHOUT ROWID;
 
-    CREATE TABLE IF NOT EXISTS record_defs (
+    CREATE TABLE IF NOT EXISTS record_facts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+        revision_id INTEGER NOT NULL REFERENCES file_revisions(id) ON DELETE CASCADE,
+        file_id INTEGER NOT NULL REFERENCES file_entries(id) ON DELETE CASCADE,
         display_name TEXT NOT NULL,
         tag_name TEXT,
         typedef_name TEXT,
@@ -87,9 +132,9 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
         confidence TEXT NOT NULL
     );
 
-    CREATE TABLE IF NOT EXISTS members (
+    CREATE TABLE IF NOT EXISTS member_facts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        record_id INTEGER NOT NULL REFERENCES record_defs(id) ON DELETE CASCADE,
+        record_id INTEGER NOT NULL REFERENCES record_facts(id) ON DELETE CASCADE,
         name TEXT NOT NULL,
         kind TEXT NOT NULL,
         confidence TEXT NOT NULL,
@@ -103,9 +148,10 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
         type_name TEXT
     );
 
-    CREATE TABLE IF NOT EXISTS type_aliases (
+    CREATE TABLE IF NOT EXISTS type_alias_facts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+        revision_id INTEGER NOT NULL REFERENCES file_revisions(id) ON DELETE CASCADE,
+        file_id INTEGER NOT NULL REFERENCES file_entries(id) ON DELETE CASCADE,
         alias TEXT NOT NULL,
         start_byte INTEGER NOT NULL,
         end_byte INTEGER NOT NULL,
@@ -113,50 +159,59 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
         start_col INTEGER NOT NULL,
         end_line INTEGER NOT NULL,
         end_col INTEGER NOT NULL,
-        target_record_id INTEGER REFERENCES record_defs(id) ON DELETE SET NULL,
+        target_record_id INTEGER REFERENCES record_facts(id) ON DELETE SET NULL,
         target_name TEXT,
         target_kind TEXT,
         confidence TEXT NOT NULL
     );
-";
 
-pub(crate) const DROP_LOOKUP_INDEXES_SQL: &str = "
-    DROP INDEX IF EXISTS idx_files_source;
-    DROP INDEX IF EXISTS idx_symbols_name;
-    DROP INDEX IF EXISTS idx_symbols_file_id;
-    DROP INDEX IF EXISTS idx_symbols_container;
-    DROP INDEX IF EXISTS idx_type_aliases_alias;
-    DROP INDEX IF EXISTS idx_type_aliases_file_id;
-    DROP INDEX IF EXISTS idx_include_edges_src;
-    DROP INDEX IF EXISTS idx_record_defs_display_name;
-    DROP INDEX IF EXISTS idx_record_defs_tag_name;
-    DROP INDEX IF EXISTS idx_record_defs_typedef_name;
-    DROP INDEX IF EXISTS idx_record_defs_file_id;
-    DROP INDEX IF EXISTS idx_members_record_id;
-    DROP INDEX IF EXISTS idx_members_name;
-    DROP INDEX IF EXISTS idx_members_kind;
-    DROP INDEX IF EXISTS idx_fields_record_id;
-    DROP INDEX IF EXISTS idx_fields_name;
-    DROP INDEX IF EXISTS idx_includes_target_basename;
-    DROP INDEX IF EXISTS idx_includes_target_normalized;
-    DROP INDEX IF EXISTS idx_includes_file_id;
+    CREATE VIEW IF NOT EXISTS files AS
+        SELECT f.* FROM file_entries f
+        JOIN active_file_revisions a ON a.file_id = f.id;
+
+    CREATE VIEW IF NOT EXISTS symbols AS
+        SELECT f.* FROM symbol_facts f
+        JOIN active_file_revisions a
+          ON a.file_id = f.file_id AND a.revision_id = f.revision_id;
+
+    CREATE VIEW IF NOT EXISTS includes AS
+        SELECT f.* FROM include_facts f
+        JOIN active_file_revisions a
+          ON a.file_id = f.file_id AND a.revision_id = f.revision_id;
+
+    CREATE VIEW IF NOT EXISTS record_defs AS
+        SELECT f.* FROM record_facts f
+        JOIN active_file_revisions a
+          ON a.file_id = f.file_id AND a.revision_id = f.revision_id;
+
+    CREATE VIEW IF NOT EXISTS members AS
+        SELECT m.* FROM member_facts m
+        JOIN record_facts r ON r.id = m.record_id
+        JOIN active_file_revisions a
+          ON a.file_id = r.file_id AND a.revision_id = r.revision_id;
+
+    CREATE VIEW IF NOT EXISTS type_aliases AS
+        SELECT f.* FROM type_alias_facts f
+        JOIN active_file_revisions a
+          ON a.file_id = f.file_id AND a.revision_id = f.revision_id;
 ";
 
 pub(crate) const CREATE_LOOKUP_INDEXES_SQL: &str = "
-    CREATE INDEX IF NOT EXISTS idx_files_source ON files(source);
-    CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
-    CREATE INDEX IF NOT EXISTS idx_symbols_file_id ON symbols(file_id);
-    CREATE INDEX IF NOT EXISTS idx_type_aliases_alias ON type_aliases(alias);
-    CREATE INDEX IF NOT EXISTS idx_type_aliases_file_id ON type_aliases(file_id);
+    CREATE INDEX IF NOT EXISTS idx_files_source ON file_entries(source);
+    CREATE INDEX IF NOT EXISTS idx_file_revisions_file_id ON file_revisions(file_id);
+    CREATE INDEX IF NOT EXISTS idx_symbol_facts_name ON symbol_facts(name);
+    CREATE INDEX IF NOT EXISTS idx_symbol_facts_file_id ON symbol_facts(file_id);
+    CREATE INDEX IF NOT EXISTS idx_type_alias_facts_alias ON type_alias_facts(alias);
+    CREATE INDEX IF NOT EXISTS idx_type_alias_facts_file_id ON type_alias_facts(file_id);
     CREATE INDEX IF NOT EXISTS idx_include_edges_src ON include_edges(src_file_id);
-    CREATE INDEX IF NOT EXISTS idx_record_defs_display_name ON record_defs(display_name);
-    CREATE INDEX IF NOT EXISTS idx_record_defs_tag_name ON record_defs(tag_name);
-    CREATE INDEX IF NOT EXISTS idx_record_defs_typedef_name ON record_defs(typedef_name);
-    CREATE INDEX IF NOT EXISTS idx_record_defs_file_id ON record_defs(file_id);
-    CREATE INDEX IF NOT EXISTS idx_members_record_id ON members(record_id);
-    CREATE INDEX IF NOT EXISTS idx_members_name ON members(name);
-    CREATE INDEX IF NOT EXISTS idx_members_kind ON members(kind);
-    CREATE INDEX IF NOT EXISTS idx_includes_target_basename ON includes(target_basename);
-    CREATE INDEX IF NOT EXISTS idx_includes_target_normalized ON includes(target_normalized);
-    CREATE INDEX IF NOT EXISTS idx_includes_file_id ON includes(file_id);
+    CREATE INDEX IF NOT EXISTS idx_record_facts_display_name ON record_facts(display_name);
+    CREATE INDEX IF NOT EXISTS idx_record_facts_tag_name ON record_facts(tag_name);
+    CREATE INDEX IF NOT EXISTS idx_record_facts_typedef_name ON record_facts(typedef_name);
+    CREATE INDEX IF NOT EXISTS idx_record_facts_file_id ON record_facts(file_id);
+    CREATE INDEX IF NOT EXISTS idx_member_facts_record_id ON member_facts(record_id);
+    CREATE INDEX IF NOT EXISTS idx_member_facts_name ON member_facts(name);
+    CREATE INDEX IF NOT EXISTS idx_member_facts_kind ON member_facts(kind);
+    CREATE INDEX IF NOT EXISTS idx_include_facts_target_basename ON include_facts(target_basename);
+    CREATE INDEX IF NOT EXISTS idx_include_facts_target_normalized ON include_facts(target_normalized);
+    CREATE INDEX IF NOT EXISTS idx_include_facts_file_id ON include_facts(file_id);
 ";

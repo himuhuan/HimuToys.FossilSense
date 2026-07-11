@@ -5,7 +5,7 @@ use anyhow::Result;
 
 use crate::includes::{resolve_include, IncludeResolution, ResolutionKind};
 use crate::pathing::normalize_abs_path;
-use crate::store::IndexStore;
+use crate::store::{IncludeGraphUpdate, IndexBuild, IndexStore};
 
 /// (Re)build the resolved file-to-file `#include` edges, the per-file
 /// `unresolved_includes` / `ambiguous_includes` counts, and the inferred
@@ -33,12 +33,13 @@ use crate::store::IndexStore;
 /// an external includer's "own directory" is one of the configured roots, so a
 /// quote include of a sibling external header resolves `RelativeExact` against
 /// it, consistent with form/priority by construction.
-pub(super) fn rebuild_include_edges(
-    store: &mut IndexStore,
+pub(super) fn build_include_edges(
+    store: &IndexStore,
+    build: IndexBuild,
     roots: &[PathBuf],
     only: Option<&[String]>,
-) -> Result<()> {
-    let files = store.files_with_ids()?;
+) -> Result<IncludeGraphUpdate> {
+    let files = store.effective_files_with_ids(build)?;
     let id_of_path: HashMap<String, i64> = files
         .iter()
         .map(|(id, path, _)| (path.clone(), *id))
@@ -80,7 +81,7 @@ pub(super) fn rebuild_include_edges(
             }
         }
     }
-    for (file_id, target) in store.includes_with_file_ids(src_ids.as_deref())? {
+    for (file_id, target) in store.effective_includes_with_file_ids(build, src_ids.as_deref())? {
         by_src.entry(file_id).or_default().push(target);
     }
 
@@ -129,15 +130,13 @@ pub(super) fn rebuild_include_edges(
     // Full pass (only = None) wipes edges AND both counts first; incremental
     // pass only resets the listed src_ids. `directly_included` is derived
     // globally afterward from the new edge table.
-    store.replace_include_edges(
-        &src_id_list,
-        &edges,
-        &unresolved,
-        &ambiguous,
-        only.is_none(),
-    )?;
-    store.apply_directly_included_derivation()?;
-    Ok(())
+    Ok(IncludeGraphUpdate {
+        source_ids: src_id_list,
+        edges,
+        unresolved,
+        ambiguous,
+        clear_all: only.is_none(),
+    })
 }
 
 /// Find source files whose include edges need rebuild because `changed_paths`

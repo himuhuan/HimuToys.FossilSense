@@ -502,6 +502,7 @@ async fn cache_ledger_publishes_full_and_dirty_read_models_with_generations() {
     assert!(full_context.engine.indexed_files.is_some());
     assert!(full_context.engine.project_context.is_some());
     assert_ne!(full_context.engine.epoch.as_u64(), 0);
+    assert_eq!(full_context.engine.semantic_generation.0, 1);
 
     write_workspace_file(
         root.path(),
@@ -540,6 +541,7 @@ async fn cache_ledger_publishes_full_and_dirty_read_models_with_generations() {
         .request_context_for_root(root_path)
         .await;
     assert_ne!(full_context.engine.epoch, dirty_context.engine.epoch);
+    assert_eq!(dirty_context.engine.semantic_generation.0, 2);
     assert_eq!(
         dirty_context
             .engine
@@ -1002,6 +1004,7 @@ async fn project_context_commands_validate_selection_and_outside_uri_has_no_auto
         .publish_engine_snapshot(super::workspace::EngineSnapshot {
             root: root_path,
             epoch: service.inner().session.cache.allocate_engine_epoch(),
+            semantic_generation: current.semantic_generation,
             name_table: current.name_table.clone(),
             reach_graph: current.reach_graph.clone(),
             include_table: current.include_table.clone(),
@@ -1365,6 +1368,7 @@ async fn reach_scope_uses_captured_request_context_graph() {
         engine: Arc::new(super::workspace::EngineSnapshot {
             root: root.clone(),
             epoch: super::state::EngineEpoch::missing(),
+            semantic_generation: crate::call_model::SemanticGeneration::MISSING,
             name_table: None,
             reach_graph: Some(captured_graph),
             include_table: None,
