@@ -9,8 +9,9 @@ use crate::reachability;
 use crate::resolver;
 
 use super::{
-    CandidateEvidence, CandidateSource, CompletionCandidateKind, OrdinaryCompletionKind,
-    OrdinaryCompletionPresentation, OrdinaryPipelineCandidate,
+    CandidateEvidence, CandidateSource, CompletionCandidateKind,
+    OrdinaryCompletionDocumentationTarget, OrdinaryCompletionKind, OrdinaryCompletionPresentation,
+    OrdinaryPipelineCandidate,
 };
 
 pub(super) fn completion_items_for_language_builtins(
@@ -48,6 +49,7 @@ fn completion_item_for_language_builtin(
             detail: Some(detail_for_language_builtin(builtin.category).to_string()),
             documentation: None,
             initial_sort_text: Some(format!("{:08}", 100_000_000 - score)),
+            documentation_target: None,
         },
     ))
 }
@@ -80,6 +82,7 @@ fn detail_for_language_builtin(category: LanguageBuiltinCategory) -> &'static st
 
 pub(super) fn completion_items_for_local_bindings(
     hits: Vec<query::LocalCompletionCandidate>,
+    text: &str,
 ) -> Vec<OrdinaryPipelineCandidate> {
     hits.into_iter()
         .map(|hit| {
@@ -100,6 +103,11 @@ pub(super) fn completion_items_for_local_bindings(
                     detail: Some(hit.detail),
                     documentation: None,
                     initial_sort_text: Some(format!("{:08}", 100_000_000 - hit.score)),
+                    documentation_target: Some(
+                        OrdinaryCompletionDocumentationTarget::CurrentDocument {
+                            start_line: line_for_byte(text, hit.decl_start_byte),
+                        },
+                    ),
                 },
             )
         })
@@ -108,6 +116,7 @@ pub(super) fn completion_items_for_local_bindings(
 
 pub(super) fn completion_items_for_current_file_overlay(
     hits: Vec<query::CurrentFileOverlayCandidate>,
+    text: &str,
 ) -> Vec<OrdinaryPipelineCandidate> {
     hits.into_iter()
         .map(|hit| {
@@ -149,6 +158,11 @@ pub(super) fn completion_items_for_current_file_overlay(
                     detail: hit.detail,
                     documentation: None,
                     initial_sort_text: None,
+                    documentation_target: (!is_text).then_some(
+                        OrdinaryCompletionDocumentationTarget::CurrentDocument {
+                            start_line: line_for_byte(text, hit.source_start_byte),
+                        },
+                    ),
                 },
             )
         })
@@ -159,6 +173,7 @@ pub(super) fn completion_items_for_indexed_hits(
     hits: Vec<query::RankedNameHit>,
     open_reason: Option<reachability::OpenReason>,
     active_project_context: Option<&ProjectKey>,
+    table_index: usize,
 ) -> Vec<OrdinaryPipelineCandidate> {
     hits.into_iter()
         .map(|hit| {
@@ -183,6 +198,10 @@ pub(super) fn completion_items_for_indexed_hits(
                     initial_sort_text: Some(format!("{:08}", 100_000_000 - hit.score)),
                     detail: label.as_ref().map(|value| value.detail.to_string()),
                     documentation: label.map(|value| value.documentation),
+                    documentation_target: Some(OrdinaryCompletionDocumentationTarget::Indexed {
+                        table_index,
+                        symbol_id: hit.id,
+                    }),
                 },
             )
         })
@@ -190,7 +209,7 @@ pub(super) fn completion_items_for_indexed_hits(
 }
 
 pub(super) fn exact_indexed_completion_candidates_for_local_word(
-    table: &NameTable,
+    table: (&NameTable, usize),
     word: &str,
     local_score: i32,
     scope: Option<&query::CompletionScope>,
@@ -198,6 +217,7 @@ pub(super) fn exact_indexed_completion_candidates_for_local_word(
     open_reason: Option<reachability::OpenReason>,
     limit: usize,
 ) -> Vec<OrdinaryPipelineCandidate> {
+    let (table, table_index) = table;
     table
         .exact_name_hits_scoped(word, limit, scope)
         .into_iter()
@@ -223,10 +243,21 @@ pub(super) fn exact_indexed_completion_candidates_for_local_word(
                     initial_sort_text: Some(format!("{:08}", 100_000_000 - local_score)),
                     detail: label.as_ref().map(|value| value.detail.to_string()),
                     documentation: label.map(|value| value.documentation),
+                    documentation_target: Some(OrdinaryCompletionDocumentationTarget::Indexed {
+                        table_index,
+                        symbol_id: hit.id,
+                    }),
                 },
             )
         })
         .collect()
+}
+
+fn line_for_byte(text: &str, byte: usize) -> u32 {
+    text.as_bytes()[..byte.min(text.len())]
+        .iter()
+        .filter(|value| **value == b'\n')
+        .count() as u32
 }
 
 fn completion_candidate_kind_from_parser(kind: parser::SymbolKind) -> CompletionCandidateKind {

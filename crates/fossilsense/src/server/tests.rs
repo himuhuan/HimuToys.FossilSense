@@ -1572,7 +1572,7 @@ async fn member_completion_returns_fields_and_methods_for_resolved_receiver() {
     let (_dir, service, uri, line, character) = indexed_backend_with_open_doc(
         &[(
             "widget.hpp",
-            "struct Widget { int width; void resize(); };\n",
+            "struct Widget {\n/// Current widget width.\nint width;\n/// Resizes the widget.\nvoid resize();\n};\n",
         )],
         "main.cpp",
         "#include \"widget.hpp\"\nvoid f(Widget *w) { w->/*cursor*/ }\n",
@@ -1593,6 +1593,22 @@ async fn member_completion_returns_fields_and_methods_for_resolved_receiver() {
     assert!(items
         .iter()
         .any(|item| item.label == "width" && item.kind == Some(CompletionItemKind::FIELD)));
+
+    let resize = items
+        .into_iter()
+        .find(|item| item.label == "resize")
+        .expect("resize completion");
+    let resolved = service
+        .inner()
+        .completion_resolve(resize)
+        .await
+        .expect("resolve member completion");
+    let documentation = resolved.documentation.expect("member documentation");
+    let documentation = match documentation {
+        Documentation::String(value) => value,
+        Documentation::MarkupContent(markup) => markup.value,
+    };
+    assert!(documentation.contains("Resizes the widget."));
 }
 
 #[tokio::test]
@@ -2559,7 +2575,8 @@ fn completion_dedup_keeps_local_binding_over_same_name_indexed_and_local_word() 
 #[tokio::test]
 async fn ordinary_completion_uses_unsaved_current_file_overlay() {
     let (src, line, character) = text_and_position(
-        "#define FS_MAGIC 1\n\
+        "/// Unsaved magic value.\n\
+         #define FS_MAGIC 1\n\
          typedef int FsAlias;\n\
          void f(void) { FS/*cursor*/ }\n",
     );
@@ -2570,7 +2587,7 @@ async fn ordinary_completion_uses_unsaved_current_file_overlay() {
 
     let response = service
         .inner()
-        .completion(completion_params(uri, line, character))
+        .completion(completion_params(uri.clone(), line, character))
         .await
         .expect("completion request")
         .expect("completion response");
@@ -2585,6 +2602,22 @@ async fn ordinary_completion_uses_unsaved_current_file_overlay() {
     assert!(items
         .iter()
         .any(|item| item.label == "FsAlias" && item.detail.as_deref() == Some("current")));
+
+    let magic = items
+        .into_iter()
+        .find(|item| item.label == "FS_MAGIC")
+        .expect("FS_MAGIC completion");
+    let resolved = service
+        .inner()
+        .completion_resolve(magic)
+        .await
+        .expect("resolve current completion");
+    let documentation = resolved.documentation.expect("current documentation");
+    let documentation = match documentation {
+        Documentation::String(value) => value,
+        Documentation::MarkupContent(markup) => markup.value,
+    };
+    assert!(documentation.contains("Unsaved magic value."));
 }
 
 #[tokio::test]

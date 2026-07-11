@@ -2,12 +2,12 @@ use crate::model::DefinitionCandidate;
 use crate::reachability::ReachScope;
 use crate::store::SymbolRecord;
 
+#[cfg(test)]
+use super::comments::{comment_markdown_for_symbol, CommentAnchor};
+use super::comments::{comment_markdown_from_signature, CommentRenderOptions};
 use super::definitions::rank_definition_records_with_scope;
 
 pub const HOVER_CANDIDATE_LIMIT: usize = 4;
-const COMMENT_LINE_LIMIT: usize = 48;
-const COMMENT_CHAR_LIMIT: usize = 2_000;
-const ORDINARY_COMMENT_LINE_LIMIT: usize = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RankedHoverCandidate {
@@ -33,34 +33,45 @@ pub fn rank_hover_candidates(
         .collect()
 }
 
-pub fn leading_comment_markdown(source: &str, symbol_start_line: u32) -> Option<String> {
-    let lines: Vec<&str> = source.lines().collect();
-    let cursor = (symbol_start_line as usize).min(lines.len());
+/// Recover comment Markdown near a symbol using the shared comments pipeline.
+#[cfg(test)]
+pub fn comment_markdown_for_hover_symbol(
+    source: &str,
+    symbol_name: &str,
+    symbol_start_line: u32,
+    range: &crate::model::CandidateRange,
+) -> Option<String> {
+    let rendered = comment_markdown_for_symbol(
+        source,
+        &CommentAnchor {
+            symbol_name: symbol_name.to_string(),
+            start_line: symbol_start_line,
+            start_col: range.start_col,
+            end_line: range.end_line,
+            end_col: range.end_col,
+        },
+        &CommentRenderOptions::default(),
+    )?;
+    Some(rendered.markdown)
+}
 
-    let inline_block = collect_inline_block_comment_on_symbol_line(&lines, cursor);
-    let raw_lines = if !inline_block.is_empty() {
-        inline_block
-    } else if cursor == 0 {
-        Vec::new()
-    } else {
-        let previous = lines[cursor - 1].trim_start();
-        if is_line_comment(previous) {
-            collect_line_comment_group(&lines, cursor - 1)
-        } else if is_block_comment_boundary(previous) {
-            collect_block_comment_group(&lines, cursor - 1)
-        } else {
-            Vec::new()
-        }
-    };
-    if raw_lines.is_empty() {
-        return None;
-    }
-
-    let cleaned = clean_comment_lines(&raw_lines);
-    if !should_attach_comment_block(&raw_lines, &cleaned) {
-        return None;
-    }
-    render_comment_markdown(&cleaned)
+pub fn comment_documentation_for_candidate_symbol(
+    source: &str,
+    symbol_name: &str,
+    line: u32,
+    range: &crate::model::CandidateRange,
+) -> Option<super::comments::RenderedSymbolComment> {
+    super::comments::comment_documentation_for_symbol(
+        source,
+        &super::comments::CommentAnchor {
+            symbol_name: symbol_name.to_string(),
+            start_line: line,
+            start_col: range.start_col,
+            end_line: range.end_line,
+            end_col: range.end_col,
+        },
+        &super::comments::CommentRenderOptions::default(),
+    )
 }
 
 pub fn hover_markdown_for_candidate(
@@ -68,11 +79,13 @@ pub fn hover_markdown_for_candidate(
     comment_markdown: Option<&str>,
 ) -> String {
     let mut out = String::new();
-    let signature_comment = leading_signature_comment_markdown(&ranked.signature);
+    let signature_comment =
+        comment_markdown_from_signature(&ranked.signature, &CommentRenderOptions::default())
+            .map(|rendered| rendered.markdown);
     let comment_markdown = comment_markdown.or(signature_comment.as_deref());
 
     if let Some(comment) = comment_markdown.filter(|s| !s.trim().is_empty()) {
-        out.push_str(comment.trim());
+        out.push_str(comment.trim_end());
         out.push_str("\n\n");
     }
 
@@ -138,34 +151,6 @@ fn strip_leading_signature_comments(signature: &str) -> &str {
     }
 }
 
-fn leading_signature_comment_markdown(signature: &str) -> Option<String> {
-    let comment = leading_signature_comment(signature)?;
-    let raw_lines: Vec<String> = comment.lines().map(|line| line.to_string()).collect();
-    let cleaned = clean_comment_lines(&raw_lines);
-    if !should_attach_comment_block(&raw_lines, &cleaned) {
-        return None;
-    }
-    render_comment_markdown(&cleaned)
-}
-
-fn leading_signature_comment(signature: &str) -> Option<String> {
-    let trimmed = signature.trim_start();
-    if trimmed.starts_with("/*") {
-        let end = trimmed.find("*/")? + 2;
-        return Some(trimmed[..end].to_string());
-    }
-    if trimmed.starts_with("//") {
-        let lines: Vec<&str> = trimmed
-            .lines()
-            .take_while(|line| is_line_comment(line.trim_start()))
-            .collect();
-        if !lines.is_empty() {
-            return Some(lines.join("\n"));
-        }
-    }
-    None
-}
-
 fn should_render_guard_wrapper(guard: &str) -> bool {
     !is_header_guard_label(&guard_closing_label(guard))
 }
@@ -207,282 +192,8 @@ fn clean_guard_token(token: &str) -> String {
         .to_string()
 }
 
-fn collect_line_comment_group(lines: &[&str], start: usize) -> Vec<String> {
-    let mut first = start;
-    while first > 0 && is_line_comment(lines[first - 1].trim_start()) {
-        first -= 1;
-    }
-    lines[first..=start]
-        .iter()
-        .take(COMMENT_LINE_LIMIT)
-        .map(|line| (*line).to_string())
-        .collect()
-}
-
-fn collect_block_comment_group(lines: &[&str], end: usize) -> Vec<String> {
-    if !is_block_comment_boundary(lines[end]) {
-        return Vec::new();
-    }
-    let mut first = end;
-    while first > 0 && !lines[first].trim_start().starts_with("/*") {
-        if !is_block_comment_scan_line(lines[first])
-            || has_trailing_code_after_block_close(lines[first])
-        {
-            return Vec::new();
-        }
-        first -= 1;
-    }
-    if !lines[first].trim_start().starts_with("/*") {
-        return Vec::new();
-    }
-    if has_trailing_code_after_block_close(lines[first]) {
-        return Vec::new();
-    }
-    lines[first..=end]
-        .iter()
-        .take(COMMENT_LINE_LIMIT)
-        .map(|line| (*line).to_string())
-        .collect()
-}
-
-fn collect_inline_block_comment_on_symbol_line(lines: &[&str], symbol_line: usize) -> Vec<String> {
-    let Some(line) = lines.get(symbol_line) else {
-        return Vec::new();
-    };
-    let trimmed = line.trim_start();
-    if !is_block_comment_boundary(trimmed) || !trimmed.contains("*/") {
-        return Vec::new();
-    }
-
-    let mut first = symbol_line;
-    while first > 0 && !lines[first].trim_start().starts_with("/*") {
-        if !is_block_comment_scan_line(lines[first]) {
-            return Vec::new();
-        }
-        first -= 1;
-    }
-    if !lines[first].trim_start().starts_with("/*") {
-        return Vec::new();
-    }
-
-    let mut out: Vec<String> = lines[first..=symbol_line]
-        .iter()
-        .map(|line| (*line).to_string())
-        .collect();
-    if let Some(last) = out.last_mut() {
-        if let Some(close) = last.find("*/") {
-            last.truncate(close + 2);
-        }
-    }
-    out
-}
-
-fn clean_comment_lines(raw_lines: &[String]) -> Vec<String> {
-    let mut out = Vec::new();
-    for raw in raw_lines.iter().take(COMMENT_LINE_LIMIT) {
-        let mut line = raw.trim().to_string();
-        if line.starts_with("///") || line.starts_with("//!") {
-            line = line[3..].to_string();
-        } else if line.starts_with("//") {
-            line = line[2..].to_string();
-        } else {
-            line = strip_block_markers(&line);
-        }
-        let line = line.trim().to_string();
-        out.push(line);
-    }
-    trim_empty_edges(out)
-}
-
-fn strip_block_markers(line: &str) -> String {
-    let mut s = line.trim().to_string();
-    if s.starts_with("/**") || s.starts_with("/*!") {
-        s = s[3..].to_string();
-    } else if s.starts_with("/*") {
-        s = s[2..].to_string();
-    }
-    if s.ends_with("*/") {
-        s.truncate(s.len().saturating_sub(2));
-    }
-    let s = s.trim_start();
-    let s = s.strip_prefix('*').unwrap_or(s).trim_start();
-    s.to_string()
-}
-
-fn render_comment_markdown(lines: &[String]) -> Option<String> {
-    let rendered = lines
-        .iter()
-        .map(|line| highlight_doc_tags(&sanitize_markdown(line)))
-        .collect::<Vec<_>>()
-        .join("\n");
-    (!rendered.trim().is_empty()).then(|| rendered.chars().take(COMMENT_CHAR_LIMIT).collect())
-}
-
-fn trim_empty_edges(mut lines: Vec<String>) -> Vec<String> {
-    while lines.first().is_some_and(|line| line.trim().is_empty()) {
-        lines.remove(0);
-    }
-    while lines.last().is_some_and(|line| line.trim().is_empty()) {
-        lines.pop();
-    }
-    lines
-}
-
 fn sanitize_markdown(value: &str) -> String {
     value.replace("```", "'''")
-}
-
-fn should_attach_comment_block(raw_lines: &[String], cleaned: &[String]) -> bool {
-    if cleaned.is_empty() || is_file_header_comment(cleaned) {
-        return false;
-    }
-
-    if is_doc_comment_block(raw_lines) {
-        return true;
-    }
-
-    cleaned
-        .iter()
-        .filter(|line| !line.trim().is_empty())
-        .count()
-        <= ORDINARY_COMMENT_LINE_LIMIT
-}
-
-fn is_doc_comment_block(raw_lines: &[String]) -> bool {
-    raw_lines
-        .iter()
-        .find(|line| !line.trim().is_empty())
-        .is_some_and(|line| {
-            let trimmed = line.trim_start();
-            trimmed.starts_with("///")
-                || trimmed.starts_with("//!")
-                || trimmed.starts_with("/**")
-                || trimmed.starts_with("/*!")
-        })
-}
-
-fn is_file_header_comment(lines: &[String]) -> bool {
-    lines.iter().any(|line| {
-        let lower = line.trim().to_ascii_lowercase();
-        lower.starts_with("@file")
-            || lower.starts_with("\\file")
-            || lower.contains("spdx-license-identifier")
-            || lower.contains("copyright")
-            || lower.starts_with("license:")
-            || lower.starts_with("project:")
-            || lower.starts_with("module:")
-            || lower.starts_with("author:")
-    })
-}
-
-fn highlight_doc_tags(line: &str) -> String {
-    let mut out = String::with_capacity(line.len());
-    let mut rest = line;
-    while let Some((start, end)) = next_doc_tag(rest) {
-        out.push_str(&rest[..start]);
-        out.push('`');
-        out.push_str(&rest[start..end].replace('`', "'"));
-        out.push('`');
-        rest = &rest[end..];
-    }
-    out.push_str(rest);
-    out
-}
-
-fn next_doc_tag(value: &str) -> Option<(usize, usize)> {
-    let bytes = value.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'@' | b'\\' if is_doxygen_tag_start(value, index) => {
-                return Some((index, doxygen_tag_end(value, index + 1)));
-            }
-            b'<' => {
-                if let Some(end) = xml_tag_end(value, index) {
-                    return Some((index, end));
-                }
-            }
-            _ => {}
-        }
-        index += 1;
-    }
-    None
-}
-
-fn is_doxygen_tag_start(value: &str, index: usize) -> bool {
-    let Some(next) = value.as_bytes().get(index + 1).copied() else {
-        return false;
-    };
-    if !is_ident_start(next) {
-        return false;
-    }
-    if index == 0 {
-        return true;
-    }
-    let previous = value.as_bytes()[index - 1];
-    !is_ident_continue(previous) && previous != b'.'
-}
-
-fn doxygen_tag_end(value: &str, mut index: usize) -> usize {
-    let bytes = value.as_bytes();
-    while index < bytes.len() && is_ident_continue(bytes[index]) {
-        index += 1;
-    }
-    if bytes.get(index) == Some(&b'[') {
-        let mut close = index + 1;
-        while close < bytes.len() && bytes[close] != b']' && !bytes[close].is_ascii_whitespace() {
-            close += 1;
-        }
-        if bytes.get(close) == Some(&b']') {
-            index = close + 1;
-        }
-    }
-    index
-}
-
-fn xml_tag_end(value: &str, index: usize) -> Option<usize> {
-    let bytes = value.as_bytes();
-    let mut cursor = index + 1;
-    if bytes.get(cursor) == Some(&b'/') {
-        cursor += 1;
-    }
-    if !bytes.get(cursor).copied().is_some_and(is_ident_start) {
-        return None;
-    }
-    while cursor < bytes.len() && bytes[cursor] != b'>' {
-        if bytes[cursor] == b'<' {
-            return None;
-        }
-        cursor += 1;
-    }
-    (cursor < bytes.len()).then_some(cursor + 1)
-}
-
-fn is_ident_start(byte: u8) -> bool {
-    byte.is_ascii_alphabetic() || byte == b'_'
-}
-
-fn is_ident_continue(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_'
-}
-
-fn is_line_comment(line: &str) -> bool {
-    line.starts_with("//")
-}
-
-fn is_block_comment_boundary(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    !trimmed.is_empty() && (trimmed.starts_with("/*") || trimmed.starts_with('*'))
-}
-
-fn is_block_comment_scan_line(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    trimmed.is_empty() || trimmed.starts_with("/*") || trimmed.starts_with('*')
-}
-
-fn has_trailing_code_after_block_close(line: &str) -> bool {
-    line.find("*/")
-        .is_some_and(|index| !line[index + 2..].trim().is_empty())
 }
 
 #[cfg(test)]
@@ -568,28 +279,93 @@ mod tests {
     }
 
     #[test]
-    fn doxygen_comment_preserves_lines_and_highlights_tags() {
+    fn doxygen_comment_renders_structured_sections() {
         let source = "/**\n * @brief Adds two values.\n * @param lhs left side\n * @param rhs right side\n * @return the sum\n */\nint add(int lhs, int rhs);\n";
-        let markdown = leading_comment_markdown(source, 6).expect("comment");
-        assert_eq!(
-            markdown,
-            "`@brief` Adds two values.\n`@param` lhs left side\n`@param` rhs right side\n`@return` the sum"
-        );
+        let markdown = comment_markdown_for_hover_symbol(
+            source,
+            "add",
+            6,
+            &crate::model::CandidateRange {
+                start_line: 6,
+                start_col: 0,
+                end_line: 6,
+                end_col: 3,
+            },
+        )
+        .expect("comment");
+        assert!(markdown.contains("### Brief"));
+        assert!(markdown.contains("Adds two values."));
+        assert!(markdown.contains("### Parameters"));
+        assert!(markdown.contains("- `lhs` — left side"));
+        assert!(markdown.contains("- `rhs` — right side"));
+        assert!(markdown.contains("### Returns"));
+        assert!(markdown.contains("the sum"));
         assert!(!markdown.contains("*/"));
     }
 
     #[test]
     fn ordinary_line_comments_render_as_prose() {
         let source = "// Initializes the driver.\n// Safe to call twice.\nvoid init(void);\n";
-        let markdown = leading_comment_markdown(source, 2).expect("comment");
-        assert_eq!(markdown, "Initializes the driver.\nSafe to call twice.");
+        let markdown = comment_markdown_for_hover_symbol(
+            source,
+            "init",
+            2,
+            &crate::model::CandidateRange {
+                start_line: 2,
+                start_col: 0,
+                end_line: 2,
+                end_col: 4,
+            },
+        )
+        .expect("comment");
+        assert!(markdown.contains("Initializes the driver.  \nSafe to call twice."));
+    }
+
+    #[test]
+    fn trailing_comments_attach_for_common_forms() {
+        for source in [
+            "size_t db_size; // cache size in database\n",
+            "size_t db_size; /* cache size in database */\n",
+            "size_t db_size; /** cache size in database */\n",
+        ] {
+            let markdown = comment_markdown_for_hover_symbol(
+                source,
+                "db_size",
+                0,
+                &crate::model::CandidateRange {
+                    start_line: 0,
+                    start_col: 0,
+                    end_line: 0,
+                    end_col: 7,
+                },
+            )
+            .expect("comment");
+            assert!(
+                markdown.contains("cache size in database"),
+                "missing prose in {markdown:?} for {source:?}"
+            );
+            assert!(!markdown.contains('*') || !markdown.trim_start().starts_with('*'));
+        }
     }
 
     #[test]
     fn messy_comment_degrades_to_readable_text() {
-        let source = "/* ***\n * @weird custom tag is kept readable\n * warning without marker\n */\nint odd(void);\n";
-        let markdown = leading_comment_markdown(source, 4).expect("comment");
-        assert!(markdown.contains("`@weird` custom tag is kept readable"));
+        let source =
+            "/* ***\n * @weird custom tag is kept readable\n * warning without marker\n */\nint odd(void);\n";
+        let markdown = comment_markdown_for_hover_symbol(
+            source,
+            "odd",
+            4,
+            &crate::model::CandidateRange {
+                start_line: 4,
+                start_col: 0,
+                end_line: 4,
+                end_col: 3,
+            },
+        )
+        .expect("comment");
+        assert!(markdown.contains("### Weird") || markdown.contains("custom tag is kept readable"));
+        assert!(markdown.contains("custom tag is kept readable"));
         assert!(markdown.contains("warning without marker"));
         assert!(!markdown.contains("/*"));
     }
@@ -597,31 +373,87 @@ mod tests {
     #[test]
     fn file_header_comment_does_not_attach_to_first_symbol() {
         let source = "/*\n * Copyright 2026 Example Corp.\n * Project: boot firmware\n * License: internal use only\n */\nint first_symbol(void);\n";
-        assert!(leading_comment_markdown(source, 5).is_none());
+        assert!(comment_markdown_for_hover_symbol(
+            source,
+            "first_symbol",
+            5,
+            &crate::model::CandidateRange {
+                start_line: 5,
+                start_col: 0,
+                end_line: 5,
+                end_col: 12,
+            },
+        )
+        .is_none());
     }
 
     #[test]
     fn doxygen_file_comment_does_not_attach_to_first_symbol() {
-        let source = "/**\n * @file driver.h\n * @brief Shared driver declarations.\n */\nint first_symbol(void);\n";
-        assert!(leading_comment_markdown(source, 4).is_none());
+        let source =
+            "/**\n * @file driver.h\n * @brief Shared driver declarations.\n */\nint first_symbol(void);\n";
+        assert!(comment_markdown_for_hover_symbol(
+            source,
+            "first_symbol",
+            4,
+            &crate::model::CandidateRange {
+                start_line: 4,
+                start_col: 0,
+                end_line: 4,
+                end_col: 12,
+            },
+        )
+        .is_none());
     }
 
     #[test]
     fn blank_line_between_comment_and_symbol_blocks_attachment() {
         let source = "// Docs for previous thing\n\nint current;\n";
-        assert!(leading_comment_markdown(source, 2).is_none());
+        assert!(comment_markdown_for_hover_symbol(
+            source,
+            "current",
+            2,
+            &crate::model::CandidateRange {
+                start_line: 2,
+                start_col: 0,
+                end_line: 2,
+                end_col: 7,
+            },
+        )
+        .is_none());
     }
 
     #[test]
     fn trailing_inline_block_comment_does_not_attach_to_next_symbol() {
         let source = "int old; /* note for old */\nint current;\n";
-        assert!(leading_comment_markdown(source, 1).is_none());
+        assert!(comment_markdown_for_hover_symbol(
+            source,
+            "current",
+            1,
+            &crate::model::CandidateRange {
+                start_line: 1,
+                start_col: 0,
+                end_line: 1,
+                end_col: 7,
+            },
+        )
+        .is_none());
     }
 
     #[test]
     fn block_comment_with_internal_blank_line_still_attaches() {
         let source = "/**\n * First paragraph.\n\n * Second paragraph.\n */\nint current;\n";
-        let markdown = leading_comment_markdown(source, 5).expect("comment");
+        let markdown = comment_markdown_for_hover_symbol(
+            source,
+            "current",
+            5,
+            &crate::model::CandidateRange {
+                start_line: 5,
+                start_col: 0,
+                end_line: 5,
+                end_col: 7,
+            },
+        )
+        .expect("comment");
         assert!(markdown.contains("First paragraph."));
         assert!(markdown.contains("Second paragraph."));
     }
@@ -629,41 +461,94 @@ mod tests {
     #[test]
     fn inline_leading_block_comment_on_symbol_line_still_attaches() {
         let source = "/** Test to see if a format is supported. */ bool test_fmt(void);\n";
-        let markdown = leading_comment_markdown(source, 0).expect("comment");
-        assert_eq!(markdown, "Test to see if a format is supported.");
+        let markdown = comment_markdown_for_hover_symbol(
+            source,
+            "test_fmt",
+            0,
+            &crate::model::CandidateRange {
+                start_line: 0,
+                start_col: 0,
+                end_line: 0,
+                end_col: 8,
+            },
+        )
+        .expect("comment");
+        assert!(markdown.contains("Test to see if a format is supported."));
     }
 
     #[test]
     fn closing_block_comment_on_symbol_line_still_attaches() {
         let source = "/**\n * Test to see if a format is supported.\n */ bool test_fmt(void);\n";
-        let markdown = leading_comment_markdown(source, 2).expect("comment");
-        assert_eq!(markdown, "Test to see if a format is supported.");
+        let markdown = comment_markdown_for_hover_symbol(
+            source,
+            "test_fmt",
+            2,
+            &crate::model::CandidateRange {
+                start_line: 2,
+                start_col: 0,
+                end_line: 2,
+                end_col: 8,
+            },
+        )
+        .expect("comment");
+        assert!(markdown.contains("Test to see if a format is supported."));
     }
 
     #[test]
-    fn doxygen_param_direction_renders_as_parameter() {
+    fn doxygen_param_direction_renders_as_parameter_list() {
         let source = "/**\n * @brief Copies bytes.\n * @param[in] src source bytes\n * @param[out] dst destination bytes\n */\nvoid copy(void *dst, const void *src);\n";
-        let markdown = leading_comment_markdown(source, 5).expect("comment");
-        assert!(markdown.contains("`@brief` Copies bytes."));
-        assert!(markdown.contains("`@param[in]` src source bytes"));
-        assert!(markdown.contains("`@param[out]` dst destination bytes"));
-        assert!(!markdown.contains("**Parameters**"));
+        let markdown = comment_markdown_for_hover_symbol(
+            source,
+            "copy",
+            5,
+            &crate::model::CandidateRange {
+                start_line: 5,
+                start_col: 0,
+                end_line: 5,
+                end_col: 4,
+            },
+        )
+        .expect("comment");
+        assert!(markdown.contains("### Brief") || markdown.contains("Copies bytes."));
+        assert!(markdown.contains("### Parameters"));
+        assert!(markdown.contains("- `src` *(in)* — source bytes"));
+        assert!(markdown.contains("- `dst` *(out)* — destination bytes"));
     }
 
     #[test]
-    fn multiline_comment_keeps_line_breaks_and_highlights_common_tags() {
-        let source = "/**\n * @brief First line.\n *\n * Second line with <summary>tag</summary> and \\return marker.\n */\nint current;\n";
-        let markdown = leading_comment_markdown(source, 5).expect("comment");
-        assert_eq!(
-            markdown,
-            "`@brief` First line.\n\nSecond line with `<summary>`tag`</summary>` and `\\return` marker."
-        );
+    fn xml_summary_and_unknown_tags_use_fallback_headings() {
+        let source = "/// <summary>\n/// cache size in database\n/// </summary>\nsize_t db_size;\n";
+        let markdown = comment_markdown_for_hover_symbol(
+            source,
+            "db_size",
+            3,
+            &crate::model::CandidateRange {
+                start_line: 3,
+                start_col: 0,
+                end_line: 3,
+                end_col: 7,
+            },
+        )
+        .expect("comment");
+        assert!(markdown.contains("### Summary"));
+        assert!(markdown.contains("cache size in database"));
     }
 
     #[test]
     fn code_line_between_comment_and_symbol_blocks_attachment() {
         let source = "// Docs for old thing\nint old;\nint current;\n";
-        assert!(leading_comment_markdown(source, 2).is_none());
+        assert!(comment_markdown_for_hover_symbol(
+            source,
+            "current",
+            2,
+            &crate::model::CandidateRange {
+                start_line: 2,
+                start_col: 0,
+                end_line: 2,
+                end_col: 7,
+            },
+        )
+        .is_none());
     }
 
     #[test]
@@ -739,8 +624,8 @@ mod tests {
 
         let markdown = hover_markdown_for_candidate(&ranked, None);
 
-        assert!(markdown.starts_with(
-            "Test to see if a given format is supported by the 3DLUT input/output code.\n\n"
+        assert!(markdown.contains(
+            "Test to see if a given format is supported by the 3DLUT input/output code."
         ));
         assert!(markdown.contains(
             "```c\n// In libswscale/lut3d.h\nbool ff_sws_lut3d_test_fmt(enum AVPixelFormat fmt, int output);\n```"

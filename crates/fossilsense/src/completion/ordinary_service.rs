@@ -64,6 +64,13 @@ pub(crate) struct OrdinaryCompletionItem {
     pub documentation: Option<String>,
     pub initial_sort_text: Option<String>,
     pub evidence: CandidateEvidence,
+    pub documentation_target: Option<OrdinaryCompletionDocumentationTarget>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum OrdinaryCompletionDocumentationTarget {
+    Indexed { table_index: usize, symbol_id: i64 },
+    CurrentDocument { start_line: u32 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -72,6 +79,7 @@ struct OrdinaryCompletionPresentation {
     detail: Option<String>,
     documentation: Option<String>,
     initial_sort_text: Option<String>,
+    documentation_target: Option<OrdinaryCompletionDocumentationTarget>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,6 +130,7 @@ pub(crate) fn complete_ordinary_identifier(
             hits,
             open_reason,
             table_project_context,
+            idx,
         ));
     }
 
@@ -144,7 +153,10 @@ pub(crate) fn complete_ordinary_identifier(
             )
         })
         .unwrap_or_default();
-    candidates.extend(completion_items_for_local_bindings(local_binding_hits));
+    candidates.extend(completion_items_for_local_bindings(
+        local_binding_hits,
+        &input.text,
+    ));
 
     let current_file_overlay_hits = input
         .parsed_document
@@ -167,6 +179,7 @@ pub(crate) fn complete_ordinary_identifier(
         .collect();
     candidates.extend(completion_items_for_current_file_overlay(
         current_file_overlay_hits,
+        &input.text,
     ));
     candidates.extend(completion_items_for_language_builtins(&input.prefix));
 
@@ -183,9 +196,9 @@ pub(crate) fn complete_ordinary_identifier(
         let (confidence, _reason) = resolver::confidence_reason_for(tier, false, None);
         let sort_text = format!("{:08}", 100_000_000 - word_score);
         let mut exact_indexed = Vec::new();
-        for table in &input.tables {
+        for (table_index, table) in input.tables.iter().enumerate() {
             exact_indexed.extend(exact_indexed_completion_candidates_for_local_word(
-                table.table.as_ref(),
+                (table.table.as_ref(), table_index),
                 word,
                 word_score,
                 input.scope.as_ref(),
@@ -213,6 +226,7 @@ pub(crate) fn complete_ordinary_identifier(
                 detail: None,
                 documentation: None,
                 initial_sort_text: Some(sort_text),
+                documentation_target: None,
             },
         ));
     }
@@ -243,6 +257,7 @@ pub(crate) fn complete_ordinary_identifier(
                 documentation: payload.documentation,
                 initial_sort_text: payload.initial_sort_text,
                 evidence: candidate.evidence,
+                documentation_target: payload.documentation_target,
             }
         })
         .collect();

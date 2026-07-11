@@ -36,10 +36,17 @@ presented as compiler-proven edges.
   `fossilsense.references.showRanges` to show them. Roles are syntactic guesses,
   not resolved bindings.
 - Rich Hover: hovering an indexed identifier shows a Markdown candidate view with
-  the stored signature, candidate tier/confidence/reason, and immediately leading
-  Doxygen or ordinary comments when they can be recovered. This is a ranked
-  exact-name candidate display, not type-aware semantic binding; unsupported or
-  unreadable comment sources degrade to signature-only hover.
+  the stored signature, candidate tier/confidence/reason, and best-effort nearby
+  comments. Comments may come from immediately leading lines, an inline-leading
+  block on the declaration line, or a same-line trailing `//` / `/* */` comment
+  when attachment is unambiguous. Doxygen and a small XML subset are parsed into
+  structured sections for parameters and returns; unknown tags fall back to a
+  `### Tag` heading with preserved body lines. Hard line breaks keep ordinary
+  multi-line prose readable in VS Code. This is ranked exact-name candidate
+  display and best-effort comment attachment, not type-aware semantic binding or
+  full Doxygen/XML. Unsupported, oversized, unreadable, or malformed comment
+  sources degrade to signature-only hover. `@see` links, inherited docs, and
+  declaration/definition doc merging are out of scope.
 - Lightweight Completion: index-based, current-file overlay, and current-file
   word completion for C/C++. When the cursor is inside a detected function body,
   ordinary identifier completion also adds best-effort current-function
@@ -49,6 +56,15 @@ presented as compiler-proven edges.
   record/type definitions can also participate as structured current-file
   overlay evidence. Nearby identifier usage can raise text fallback candidates,
   but raw words remain visibly textual fallback and are not semantic bindings.
+  Expanding a structured identifier or member completion item resolves and
+  renders its best-effort leading/inline/trailing source comment as Markdown.
+  Documentation is loaded through `completionItem/resolve`, so ordinary typing
+  does not add source-file reads to the per-keystroke completion hot path.
+  When a discovered project contains compatible `.h` and `.c` declarations for
+  the same symbol, completion, Hover, and Signature Help use the header as the
+  API-documentation source while preserving the source definition as the
+  implementation target. Pairing requires the same discovered project, symbol
+  kind, and normalized signature; FossilSense does not pair by name alone.
   A bounded static language-builtin source also offers common C/C++ keywords,
   builtin-style types, and literal-like constants such as `struct`, `sizeof`,
   `size_t`, `uint32_t`, and `NULL` when matching the current prefix. These items
@@ -105,10 +121,17 @@ presented as compiler-proven edges.
   and default generated-directory exclusions. Marker contents are never parsed.
 - Best-effort Signature Help: inside simple function calls, shows exact-name
   indexed function signatures ranked by the same include reachability tiers as
-  Go to Definition. Candidates are hints, not overload resolution; there is no
+  Go to Definition. The signature popup renders the candidate's nearby comment,
+  and recognized Doxygen/XML parameter descriptions are also attached to the
+  matching parameter popup. Candidates are hints, not overload resolution; there is no
   argument type matching, template or namespace lookup, function-like macro
   expansion, or function-pointer target inference. Unsupported call shapes or
   unsplittable signatures degrade to empty or whole-signature results.
+- Counterpart navigation: on a paired header declaration, Go to Definition
+  prefers the same-project source definition; on the source definition itself,
+  it prefers the header declaration instead of returning the current location.
+  Calls elsewhere still prefer the source definition, and Call Hierarchy remains
+  source-body-first. Without a discovered project, existing ranking is unchanged.
 - Limited Include Analysis (`fossilsense.includePaths`): point at external header
   directories (e.g. a MinGW/TDM-GCC or SDK include tree) to get header-path completion
   inside `#include "…"`/`<…>`, jump-to-header on an include line (ranked candidate list

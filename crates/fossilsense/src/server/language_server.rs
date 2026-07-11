@@ -24,6 +24,7 @@ impl LanguageServer for Backend {
         let completion_provider = if self.completion_enabled.load(Ordering::Relaxed) {
             Some(CompletionOptions {
                 trigger_characters: Some(completion_trigger_characters()),
+                resolve_provider: Some(true),
                 ..Default::default()
             })
         } else {
@@ -228,6 +229,17 @@ impl LanguageServer for Backend {
                 .unwrap_or_default(),
             _ => Vec::new(),
         };
+        let origin_record = live_records
+            .iter()
+            .find(|record| {
+                let line = position.position.line;
+                let column = position.position.character;
+                (record.start_line < line
+                    || (record.start_line == line && record.start_col <= column))
+                    && (line < record.end_line
+                        || (line == record.end_line && column <= record.end_col))
+            })
+            .cloned();
 
         // Reachability scope for candidate tier resolution (Current / Reachable
         // / External / Unknown / Global). A file in the set is proved reachable
@@ -238,6 +250,12 @@ impl LanguageServer for Backend {
         // workspace files then fall back to `Global`.
         let reach_scope: Option<Arc<reachability::ReachScope>> =
             self.reach_scope_for(&uri).await.map(|(_, reach)| reach);
+        let project_context = self
+            .request_context_for_root(root.clone())
+            .await
+            .engine
+            .project_context
+            .clone();
 
         // Debug-gated candidate-reason logging (default off): when on, each
         // returned candidate's tier/confidence/reason is logged to the output
@@ -261,10 +279,12 @@ impl LanguageServer for Backend {
                     records.extend(indexed_records);
                 }
                 dedup_symbol_records(&mut records);
-                let candidates = query::rank_definitions_into_candidates_with_scope(
+                let candidates = query::rank_navigation_candidates_with_scope(
                     records,
                     &current_rel,
                     reach_scope.as_deref(),
+                    origin_record.as_ref(),
+                    project_context.as_deref(),
                 );
                 let debug_lines = candidate_reason_log_lines(&candidates, debug_reasons);
                 let locations = candidates
@@ -571,10 +591,12 @@ impl LanguageServer for Backend {
             contexts
         };
         let mut tables = Vec::new();
+        let mut table_roots = Vec::new();
         let mut table_generations = Vec::new();
         for context in &contexts {
             if let Some(table) = context.engine.name_table.clone() {
                 table_generations.push((context.engine.root.clone(), context.engine.epoch));
+                table_roots.push(context.engine.root.clone());
                 tables.push(OrdinaryCompletionNameTable { table });
             }
         }
@@ -657,7 +679,8 @@ impl LanguageServer for Backend {
                     .into_iter()
                     .map(|ordinary_item| {
                         let evidence = ordinary_item.evidence;
-                        let mut item = ordinary_completion_item_to_lsp(ordinary_item);
+                        let mut item =
+                            ordinary_completion_item_to_lsp(ordinary_item, &uri, &table_roots);
                         if history_enabled {
                             if let Some(workspace_hash) = history_workspace_hash.as_deref() {
                                 attach_completion_history_accept_command(
@@ -721,6 +744,10 @@ impl LanguageServer for Backend {
         params: SignatureHelpParams,
     ) -> LspResult<Option<SignatureHelp>> {
         self.provide_signature_help(params).await
+    }
+
+    async fn completion_resolve(&self, item: CompletionItem) -> LspResult<CompletionItem> {
+        self.resolve_completion_documentation(item).await
     }
 
     async fn hover(&self, params: HoverParams) -> LspResult<Option<Hover>> {
@@ -979,7 +1006,7 @@ impl LanguageServer for Backend {
     }
 }
 
-fn live_definition_records_for_word(
+pub(super) fn live_definition_records_for_word(
     index: &FileSemanticIndex,
     word: &str,
     current_rel: &str,

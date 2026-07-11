@@ -62,6 +62,7 @@ fossilsense 单一 Rust 原生二进制 (crates/fossilsense)
 | `reachability` | include 图、可达集、有界闭包、开放原因 |
 | `resolver` | 共享作用域与排名原语，无 `tower-lsp`，可单测 |
 | `completion` | 普通补全 intent、candidate evidence、确定性 pipeline/ranking，以及 ordinary service/provider 转换 |
+| `query` | 定义/补全/Hover 等协议中立查询；`query/comments` 负责 Hover、补全和 Signature Help 共用的注释归属、清洗、Doxygen/XML 容错解析与 Markdown 渲染 |
 | `server` | tower-lsp 适配、`fossilsense/indexStatus` 通知、不可变 `EngineSnapshot` 原子发布与请求上下文 |
 
 必须复用的模型名：
@@ -142,12 +143,15 @@ Runtime snapshot 规则：
 | 状态 | `discovering -> checking -> parsing -> indexing -> finalizing -> ready`，失败为 `failed` |
 | 符号 | 工作区符号、文档大纲、跳转定义候选 |
 | 引用 | 符号级查找，按句法角色分类；提供 grouped references 命令 |
-| 补全 | 标识符、include 路径、有限成员补全 |
+| 补全 | 标识符、include 路径、有限成员补全；结构化候选通过 `completionItem/resolve` 延迟挂载对应源码注释，不在每键热路径读盘 |
 | 着色 | 宏、类型、枚举量、当前函数参数和局部变量；角色门控；成员字段不着色 |
 | include | 有限解析、跳转、可达性收窄 |
 | 外部头 | 通过 `fossilsense.includePaths` 索引和补全 |
 | 冲突扩展 | 检测 clangd / cpptools / ccls 并提示二选一 |
 | 调用关系 | 标准 LSP Call Hierarchy 与 `fossilsense.lsp.callRelations` 富结果共享同一一跳关系服务；当前正式绑定范围为 C/C++ 自由函数 |
+| Rich Hover | 索引符号的签名 + tier/confidence/reason；best-effort 挂载 leading / inline-leading / trailing 注释；Doxygen/XML 参数与返回值结构化渲染，未知 tag 走 `### Tag` fallback；源码不可读、超限或 malformed 时降级为 signature-only |
+| Signature Help | 简单调用的 exact-name 函数候选；显示对应函数注释，并将 Doxygen/XML `param` 描述挂载到匹配的参数 popup；不做重载或参数类型绑定 |
+| `.h/.c` 配对 | 仅在双方都有同一 `ProjectKey` 且名称、种类、规范化签名兼容时启用：Hover、补全与 Signature Help 优先使用头文件声明文档；普通调用点跳转和调用关系保持源文件定义优先；在声明/定义锚点上跳转则优先去对侧，避免原地跳转 |
 
 ## 6. 补全规则
 
@@ -202,7 +206,7 @@ Smart Completion 当前约定：
 | snapshot | `ProjectContextIndex` 与带 `ProjectKey` 的 `NameTable` 同代原子发布；marker 变化只重建派生读模型，不重解析未变源码 |
 | memo | engine epoch、selection epoch 和 effective project 都参与 completion memo generation；marker/选择变化不得复用旧池 |
 | fallback | project discovery 失败标记 `projectContext` degraded，ordinary completion 继续走基线；热路径只查内存，不遍历文件系统 |
-| 边界 | 仅 ordinary identifier completion 消费；definition、references、coloring、workspace symbol、hover、signature、member、include completion 不消费 |
+| 边界 | 项目上下文的召回/排序 boost 仍仅由 ordinary identifier completion 消费；definition、Hover、completion documentation 与 Signature Help 只读取 `ProjectKey` 作为严格 `.h/.c` 配对门槛，不改变跨项目召回或基础候选排名；references、coloring、workspace symbol、member/include completion 不消费 |
 
 短前缀：
 

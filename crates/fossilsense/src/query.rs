@@ -12,20 +12,27 @@ use crate::reachability::ReachScope;
 use crate::resolver::{self, ResolveContext};
 use crate::store::views::NameTableSymbolRow;
 
+mod comments;
 #[allow(dead_code)]
 mod current_file_overlay;
 mod definitions;
+mod documentation;
 mod hover;
 mod local_completion;
 mod signatures;
 mod text;
 
+pub use comments::RenderedSymbolComment;
+
 #[allow(unused_imports)]
 pub use current_file_overlay::{current_file_overlay_candidates, CurrentFileOverlayCandidate};
-pub use definitions::rank_definitions_into_candidates_with_scope;
+pub use definitions::{
+    rank_definitions_into_candidates_with_scope, rank_navigation_candidates_with_scope,
+};
+pub use documentation::{rank_documentation_candidates, DocumentationCandidate};
 pub use hover::{
-    hover_markdown_for_candidate, leading_comment_markdown, rank_hover_candidates,
-    RankedHoverCandidate, HOVER_CANDIDATE_LIMIT,
+    comment_documentation_for_candidate_symbol, hover_markdown_for_candidate,
+    rank_hover_candidates, RankedHoverCandidate, HOVER_CANDIDATE_LIMIT,
 };
 pub use local_completion::{local_completion_candidates, LocalCompletionCandidate};
 pub use signatures::{

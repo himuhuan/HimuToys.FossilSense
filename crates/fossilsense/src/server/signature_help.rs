@@ -1,8 +1,8 @@
 use anyhow::Result;
 use tower_lsp::jsonrpc::Result as LspResult;
 use tower_lsp::lsp_types::{
-    Documentation, ParameterInformation, ParameterLabel, SignatureHelp, SignatureHelpParams,
-    SignatureInformation,
+    Documentation, MarkupContent, MarkupKind, ParameterInformation, ParameterLabel, SignatureHelp,
+    SignatureHelpParams, SignatureInformation,
 };
 
 use super::{uri_to_path, Backend};
@@ -35,9 +35,16 @@ impl Backend {
             .and_then(|path| pathing::relative_slash_path(&root, &path).ok())
             .unwrap_or_default();
         let reach_scope = self.reach_scope_for(&uri).await.map(|(_, reach)| reach);
+        let project_context = self
+            .request_context_for_root(root.clone())
+            .await
+            .engine
+            .project_context
+            .clone();
         let active_argument = call.active_argument;
         let call_name = call.name;
         let limit = query::SIGNATURE_HELP_LIMIT;
+        let current_text = text;
 
         let result = tokio::task::spawn_blocking(move || -> Result<Vec<SignatureInformation>> {
             let db_path = pathing::default_index_path(&root)?;
@@ -45,15 +52,48 @@ impl Backend {
                 return Ok(Vec::new());
             }
             let store = IndexStore::open_readonly(&db_path)?;
+            let records = store.symbol_read_view().symbols_by_name(&call_name)?;
             let ranked = query::rank_function_signature_candidates(
-                store.symbol_read_view().symbols_by_name(&call_name)?,
+                records.clone(),
                 &current_rel,
                 reach_scope.as_deref(),
                 limit,
             );
+            let documentation_candidates: Vec<_> = query::rank_function_signature_candidates(
+                records,
+                &current_rel,
+                reach_scope.as_deref(),
+                32,
+            )
+            .iter()
+            .map(|candidate| query::DocumentationCandidate {
+                candidate: candidate.candidate.clone(),
+                signature: candidate.signature.clone(),
+            })
+            .collect();
             Ok(ranked
                 .iter()
-                .map(|candidate| signature_information_for(candidate, active_argument))
+                .map(|candidate| {
+                    let primary = query::DocumentationCandidate {
+                        candidate: candidate.candidate.clone(),
+                        signature: candidate.signature.clone(),
+                    };
+                    let preferred = super::completion_documentation::preferred_symbol_documentation(
+                        &root,
+                        &current_rel,
+                        &current_text,
+                        &primary,
+                        &documentation_candidates,
+                        project_context.as_deref(),
+                    );
+                    let mut presentation = candidate.clone();
+                    presentation.signature = preferred.presentation.signature;
+                    signature_information_for_with_comment(
+                        &presentation,
+                        active_argument,
+                        preferred.comment.as_ref(),
+                    )
+                })
                 .collect())
         })
         .await;
@@ -79,9 +119,18 @@ fn signature_help_from_signatures(signatures: Vec<SignatureInformation>) -> Opti
     })
 }
 
+#[cfg(test)]
 pub(super) fn signature_information_for(
     ranked: &query::RankedSignatureCandidate,
     active_argument: u32,
+) -> SignatureInformation {
+    signature_information_for_with_comment(ranked, active_argument, None)
+}
+
+fn signature_information_for_with_comment(
+    ranked: &query::RankedSignatureCandidate,
+    active_argument: u32,
+    comment: Option<&query::RenderedSymbolComment>,
 ) -> SignatureInformation {
     let parts: query::SignatureParts = if ranked.candidate.name.is_empty() {
         query::signature_parts(&ranked.signature)
@@ -96,7 +145,9 @@ pub(super) fn signature_information_for(
                 byte_offset_to_utf16(&parts.label, span.start),
                 byte_offset_to_utf16(&parts.label, span.end),
             ]),
-            documentation: None,
+            documentation: comment.and_then(|comment| {
+                parameter_comment_for_span(&parts.label, span, comment).map(markdown_documentation)
+            }),
         })
         .collect();
     let active_parameter = if parameters.is_empty() || active_argument as usize >= parameters.len()
@@ -107,15 +158,65 @@ pub(super) fn signature_information_for(
     };
     SignatureInformation {
         label: parts.label,
-        documentation: Some(Documentation::String(format!(
-            "tier: {}\nconfidence: {}\nreason: {}",
-            ranked.candidate.tier.as_str(),
-            ranked.candidate.confidence.as_str(),
-            ranked.candidate.reason.as_str()
+        documentation: Some(markdown_documentation(signature_documentation(
+            ranked, comment,
         ))),
         parameters: (!parameters.is_empty()).then_some(parameters),
         active_parameter,
     }
+}
+
+fn signature_documentation(
+    ranked: &query::RankedSignatureCandidate,
+    comment: Option<&query::RenderedSymbolComment>,
+) -> String {
+    let evidence = format!(
+        "*FossilSense: tier: {} | confidence: {} | reason: {}*",
+        ranked.candidate.tier.as_str(),
+        ranked.candidate.confidence.as_str(),
+        ranked.candidate.reason.as_str()
+    );
+    match comment {
+        Some(comment) if !comment.markdown.trim().is_empty() => {
+            format!("{}\n\n---\n\n{evidence}", comment.markdown.trim_end())
+        }
+        _ => evidence,
+    }
+}
+
+fn markdown_documentation(value: String) -> Documentation {
+    Documentation::MarkupContent(MarkupContent {
+        kind: MarkupKind::Markdown,
+        value,
+    })
+}
+
+fn parameter_comment_for_span(
+    label: &str,
+    span: &query::ParameterSpan,
+    comment: &query::RenderedSymbolComment,
+) -> Option<String> {
+    let start = (span.start as usize).min(label.len());
+    let end = (span.end as usize).min(label.len());
+    let parameter = label.get(start..end)?;
+    comment
+        .parameters
+        .iter()
+        .find(|documentation| contains_identifier(parameter, &documentation.name))
+        .map(|documentation| documentation.markdown.clone())
+}
+
+fn contains_identifier(text: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    text.match_indices(name).any(|(start, matched)| {
+        let end = start + matched.len();
+        let left = text[..start].chars().next_back();
+        let right = text[end..].chars().next();
+        !left.is_some_and(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+            && !right.is_some_and(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+    })
 }
 
 fn byte_offset_to_utf16(label: &str, byte_offset: u32) -> u32 {
@@ -197,6 +298,44 @@ mod tests {
         assert!(doc.contains("tier: external"));
         assert!(doc.contains("confidence: heuristic"));
         assert!(doc.contains("reason: external_first_layer"));
+    }
+
+    #[test]
+    fn signature_information_renders_symbol_and_parameter_comments() {
+        let source = "/**\n * @brief Copies bytes.\n * @param size number of bytes\n */\nint foo(int size);\n";
+        let comment = query::comment_documentation_for_candidate_symbol(
+            source,
+            "foo",
+            4,
+            &crate::model::CandidateRange {
+                start_line: 4,
+                start_col: 0,
+                end_line: 4,
+                end_col: 3,
+            },
+        )
+        .expect("comment");
+        let info = signature_information_for_with_comment(
+            &candidate("int foo(int size);", crate::model::ScopeTier::Reachable),
+            0,
+            Some(&comment),
+        );
+        let documentation = match info.documentation.expect("documentation") {
+            Documentation::String(value) => value,
+            Documentation::MarkupContent(markup) => markup.value,
+        };
+        assert!(documentation.contains("Copies bytes."));
+        let parameter = info
+            .parameters
+            .expect("parameters")
+            .remove(0)
+            .documentation
+            .expect("parameter documentation");
+        let parameter = match parameter {
+            Documentation::String(value) => value,
+            Documentation::MarkupContent(markup) => markup.value,
+        };
+        assert!(parameter.contains("number of bytes"));
     }
 
     #[test]

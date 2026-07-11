@@ -9,7 +9,10 @@ use tower_lsp::lsp_types::{
     Position, Url,
 };
 
-use super::{empty_completion_list, member_completion_is_incomplete, uri_to_path, Backend};
+use super::{
+    empty_completion_list, member_completion_is_incomplete, uri_to_path, Backend,
+    CompletionDocumentationData,
+};
 use crate::model;
 use crate::parser::{
     self, FactAvailability, FactGroup, FileSemanticIndex, MemberConfidence, MemberKind,
@@ -41,6 +44,7 @@ impl Backend {
         let byte_offset = query::byte_offset_at(text, position.line, position.character);
         let path = uri_to_path(uri);
         let text_owned = text.to_string();
+        let uri_owned = uri.to_string();
         let roots = self.workspace_roots.lock().await.clone();
         let limit = query::COMPLETION_LIMIT;
         let min_prefix = query::MEMBER_COMPLETION_MIN_PREFIX_LEN;
@@ -357,6 +361,12 @@ impl Backend {
                             sort_text: Some(format!("{:08}", 100_000_000 - score)),
                             detail: Some(detail),
                             documentation: Some(Documentation::String(documentation)),
+                            data: serde_json::to_value(CompletionDocumentationData::Member {
+                                uri: uri_owned.clone(),
+                                owner_path: member.owner_path,
+                                signature: member.signature,
+                            })
+                            .ok(),
                             ..Default::default()
                         },
                     ));

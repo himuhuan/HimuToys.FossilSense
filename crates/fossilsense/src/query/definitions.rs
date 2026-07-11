@@ -2,6 +2,7 @@
 use std::collections::HashSet;
 
 use crate::model::{CandidateRange, DefinitionCandidate};
+use crate::project_context::ProjectContextIndex;
 use crate::reachability::ReachScope;
 use crate::resolver::{self, ResolveContext};
 use crate::store::SymbolRecord;
@@ -239,6 +240,47 @@ pub fn rank_definitions_into_candidates_with_scope(
         .collect()
 }
 
+/// Rank goto targets with an optional declaration/definition counterpart toggle.
+/// Ordinary call sites retain the established definition-first ordering. When
+/// the cursor is on a declaration/definition anchor, a compatible counterpart
+/// in the same discovered project is moved to the front: header -> source body,
+/// source body -> header declaration.
+pub fn rank_navigation_candidates_with_scope(
+    candidates: Vec<SymbolRecord>,
+    current_rel_path: &str,
+    scope: Option<&ReachScope>,
+    origin: Option<&SymbolRecord>,
+    project_context: Option<&ProjectContextIndex>,
+) -> Vec<DefinitionCandidate> {
+    let mut ranked = rank_definition_records_with_scope(candidates, current_rel_path, scope);
+    let Some(origin) = origin else {
+        return ranked.into_iter().map(|ranked| ranked.candidate).collect();
+    };
+    let origin_is_header = super::documentation::is_header_path(&origin.path);
+    let origin_is_source = is_source_ext(&origin.path);
+    if !origin_is_header && !origin_is_source {
+        return ranked.into_iter().map(|ranked| ranked.candidate).collect();
+    }
+    ranked.sort_by_key(|ranked| {
+        let record = &ranked.record;
+        let desired_counterpart = if origin_is_header {
+            is_source_ext(&record.path) && record.role == "definition"
+        } else {
+            super::documentation::is_header_path(&record.path) && record.role == "declaration"
+        };
+        let compatible = record.name == origin.name
+            && record.kind == origin.kind
+            && super::documentation::signatures_compatible(&record.signature, &origin.signature)
+            && super::documentation::same_documentation_project(
+                &origin.path,
+                &record.path,
+                project_context,
+            );
+        !desired_counterpart || !compatible
+    });
+    ranked.into_iter().map(|ranked| ranked.candidate).collect()
+}
+
 fn is_source_ext(path: &str) -> bool {
     match path.rsplit_once('.') {
         Some((_, ext)) => matches!(
@@ -253,6 +295,23 @@ fn is_source_ext(path: &str) -> bool {
 mod tests {
     use super::*;
     use crate::model::{ResolutionConfidence, ResolutionReason};
+    use crate::project_context::{ProjectContext, ProjectKey};
+
+    fn project_index() -> ProjectContextIndex {
+        let key = ProjectKey {
+            workspace_root_id: "workspace".to_string(),
+            project_path: "lib".to_string(),
+        };
+        ProjectContextIndex::new(
+            "workspace".to_string(),
+            "test".to_string(),
+            vec![ProjectContext {
+                key,
+                workspace_name: "lib".to_string(),
+                marker_files: vec!["lib/CMakeLists.txt".to_string()],
+            }],
+        )
+    }
 
     fn record(name: &str, kind: &str, role: &str, path: &str, line: u32) -> SymbolRecord {
         record_src(name, kind, role, path, line, "workspace")
@@ -294,6 +353,54 @@ mod tests {
         let ranked = rank_definitions(candidates, "src/main.c", None);
         assert_eq!(ranked[0].role, "definition");
         assert_eq!(ranked[0].path, "src/foo.c");
+    }
+
+    #[test]
+    fn navigation_on_source_definition_prefers_header_counterpart() {
+        let mut header = record("foo", "function", "declaration", "lib/foo.h", 1);
+        header.signature = "int foo(int value);".to_string();
+        let mut source = record("foo", "function", "definition", "lib/foo.c", 10);
+        source.signature = "int foo(int value)".to_string();
+        let ranked = rank_navigation_candidates_with_scope(
+            vec![source.clone(), header],
+            "lib/foo.c",
+            None,
+            Some(&source),
+            Some(&project_index()),
+        );
+        assert_eq!(ranked[0].path, "lib/foo.h");
+    }
+
+    #[test]
+    fn navigation_on_header_declaration_prefers_source_counterpart() {
+        let mut header = record("foo", "function", "declaration", "lib/foo.h", 1);
+        header.signature = "int foo(int value);".to_string();
+        let mut source = record("foo", "function", "definition", "lib/foo.c", 10);
+        source.signature = "int foo(int value)".to_string();
+        let ranked = rank_navigation_candidates_with_scope(
+            vec![header.clone(), source],
+            "lib/foo.h",
+            None,
+            Some(&header),
+            Some(&project_index()),
+        );
+        assert_eq!(ranked[0].path, "lib/foo.c");
+    }
+
+    #[test]
+    fn navigation_without_project_model_keeps_definition_first_policy() {
+        let mut header = record("foo", "function", "declaration", "lib/foo.h", 1);
+        header.signature = "int foo(int value);".to_string();
+        let mut source = record("foo", "function", "definition", "lib/foo.c", 10);
+        source.signature = "int foo(int value)".to_string();
+        let ranked = rank_navigation_candidates_with_scope(
+            vec![header, source.clone()],
+            "lib/foo.c",
+            None,
+            Some(&source),
+            None,
+        );
+        assert_eq!(ranked[0].path, "lib/foo.c");
     }
 
     #[test]

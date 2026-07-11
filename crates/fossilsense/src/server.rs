@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tower_lsp::jsonrpc::Result as LspResult;
@@ -27,8 +28,8 @@ use tower_lsp::lsp_types::{
 use tower_lsp::{async_trait, Client, LanguageServer, LspService, Server};
 
 use crate::completion::ordinary_service::{
-    OrdinaryCompletionInput, OrdinaryCompletionItem, OrdinaryCompletionKind,
-    OrdinaryCompletionNameTable,
+    OrdinaryCompletionDocumentationTarget, OrdinaryCompletionInput, OrdinaryCompletionItem,
+    OrdinaryCompletionKind, OrdinaryCompletionNameTable,
 };
 use crate::completion::{self, CandidateEvidence};
 use crate::completion_history::{
@@ -46,6 +47,7 @@ use crate::references;
 use crate::store::IndexStore;
 
 mod call_hierarchy;
+mod completion_documentation;
 mod hover;
 mod include_completion;
 mod indexing;
@@ -95,13 +97,56 @@ fn apply_final_completion_sort_text(items: &mut [CompletionItem]) {
     }
 }
 
-fn ordinary_completion_item_to_lsp(item: OrdinaryCompletionItem) -> CompletionItem {
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum CompletionDocumentationData {
+    Indexed {
+        root: String,
+        uri: String,
+        symbol_id: i64,
+    },
+    CurrentDocument {
+        uri: String,
+        start_line: u32,
+    },
+    Member {
+        uri: String,
+        owner_path: String,
+        signature: String,
+    },
+}
+
+fn ordinary_completion_item_to_lsp(
+    item: OrdinaryCompletionItem,
+    uri: &Url,
+    table_roots: &[PathBuf],
+) -> CompletionItem {
+    let data = item.documentation_target.and_then(|target| {
+        let target = match target {
+            OrdinaryCompletionDocumentationTarget::Indexed {
+                table_index,
+                symbol_id,
+            } => CompletionDocumentationData::Indexed {
+                root: table_roots.get(table_index)?.to_string_lossy().into_owned(),
+                uri: uri.to_string(),
+                symbol_id,
+            },
+            OrdinaryCompletionDocumentationTarget::CurrentDocument { start_line } => {
+                CompletionDocumentationData::CurrentDocument {
+                    uri: uri.to_string(),
+                    start_line,
+                }
+            }
+        };
+        serde_json::to_value(target).ok()
+    });
     CompletionItem {
         label: item.label,
         kind: Some(ordinary_completion_kind_to_lsp(item.kind)),
         detail: item.detail,
         documentation: item.documentation.map(Documentation::String),
         sort_text: item.initial_sort_text,
+        data,
         ..Default::default()
     }
 }

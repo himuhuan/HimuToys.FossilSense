@@ -72,6 +72,11 @@ fn catalog_groups_variants_and_resolves_one_hop_both_directions() {
     );
     assert_eq!(catalog.len(), 2);
     assert_eq!(catalog.entity("b").unwrap().variants.len(), 2);
+    assert_eq!(
+        catalog.entity("b").unwrap().primary_anchor.path,
+        "b.c",
+        "call relations must keep the source definition as the primary anchor"
+    );
     let outgoing = catalog.outgoing("a");
     assert_eq!(outgoing.len(), 1);
     assert_eq!(outgoing[0].callee.as_ref().unwrap().entity_key, "b");

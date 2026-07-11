@@ -216,20 +216,36 @@ impl Drop for LspProcess {
 fn lsp_smoke_completion_definition_and_references() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let root = temp.path();
+    std::fs::write(root.join("CMakeLists.txt"), "project(lsp_smoke C)\n")?;
     std::fs::write(
         root.join("defs.h"),
-        "#define VALUE 1\n/// @brief Helps the smoke test.\nvoid helper(void);\n",
+        "#define VALUE 1\n/// @brief Helps the smoke test.\n/// <param name=\"unused\">structured param</param>\nvoid helper(int unused);\nint trailing_docs(void);\n",
     )?;
     let main_source =
-        "#include \"defs.h\"\nint main(void) {\n    helper();\n    return VALUE;\n}\n";
+        "#include \"defs.h\"\nint main(void) {\n    helper(0);\n    return VALUE;\n}\n";
     std::fs::write(root.join("main.c"), main_source)?;
-    let live_source = "int live_caller(void) { return helper(); }\n";
+    let live_source = "int live_caller(void) { helper(0); return 0; }\n";
     std::fs::write(root.join("live.c"), "int live_caller(void) { return 0; }\n")?;
+    std::fs::write(
+        root.join("ops_chain.h"),
+        "/** Header lookup documentation. */\nint pair_lookup(int value);\n",
+    )?;
+    let ops_disk_source =
+        "#include \"ops_chain.h\"\nint pair_lookup(int value) { return value; }\nvoid call_pair(void) { pair_lookup(1); }\nvoid use_pair(void) { pair_lookup(1); }\n";
+    std::fs::write(root.join("ops_chain.c"), ops_disk_source)?;
+    let ops_open_source =
+        "#include \"ops_chain.h\"\nint pair_lookup(int value) { return value; }\nvoid call_pair(void) { pair_lookup(1); }\nvoid use_pair(void) { pair_lo }\n";
+    // Keep trailing comments out of the on-disk declaration so indexing still
+    // records `trailing_docs`; recover them from the open buffer instead.
+    let defs_open_source =
+        "#define VALUE 1\n/// @brief Helps the smoke test.\n/// <param name=\"unused\">structured param</param>\nvoid helper(int unused);\nint trailing_docs(void); // trailing hover comment\n";
 
     let root_uri = file_uri(root)?;
     let main_uri = file_uri(&root.join("main.c"))?;
     let defs_uri = file_uri(&root.join("defs.h"))?;
     let live_uri = file_uri(&root.join("live.c"))?;
+    let ops_header_uri = file_uri(&root.join("ops_chain.h"))?;
+    let ops_source_uri = file_uri(&root.join("ops_chain.c"))?;
 
     let mut lsp = LspProcess::start()?;
     let init_id = lsp.request(
@@ -274,6 +290,14 @@ fn lsp_smoke_completion_definition_and_references() -> Result<()> {
     assert_eq!(
         initialized
             .get("capabilities")
+            .and_then(|capabilities| capabilities.get("completionProvider"))
+            .and_then(|completion| completion.get("resolveProvider"))
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        initialized
+            .get("capabilities")
             .and_then(|capabilities| capabilities.get("callHierarchyProvider"))
             .and_then(Value::as_bool),
         Some(true)
@@ -305,6 +329,187 @@ fn lsp_smoke_completion_definition_and_references() -> Result<()> {
         "textDocument/didOpen",
         json!({
             "textDocument": {
+                "uri": ops_source_uri,
+                "languageId": "c",
+                "version": 1,
+                "text": ops_open_source
+            }
+        }),
+    )?;
+    lsp.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": ops_header_uri,
+                "languageId": "c",
+                "version": 1,
+                "text": "/** Header lookup documentation. */\nint pair_lookup(int value);\n"
+            }
+        }),
+    )?;
+
+    let project_status_id = lsp.request(
+        "workspace/executeCommand",
+        json!({
+            "command": "fossilsense.lsp.projectContexts",
+            "arguments": [{ "uri": ops_source_uri }]
+        }),
+    )?;
+    let project_status = lsp.wait_response(project_status_id, Duration::from_secs(10))?;
+    assert!(
+        project_status
+            .get("activeProject")
+            .is_some_and(|value| !value.is_null()),
+        "paired documentation test requires a discovered project, got {project_status}"
+    );
+
+    let paired_completion_id = lsp.request(
+        "textDocument/completion",
+        json!({
+            "textDocument": { "uri": ops_source_uri },
+            "position": { "line": 3, "character": 29 },
+            "context": { "triggerKind": 1 }
+        }),
+    )?;
+    let paired_completion = lsp.wait_response(paired_completion_id, Duration::from_secs(10))?;
+    let paired_item = paired_completion
+        .get("items")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item.get("label").and_then(Value::as_str) == Some("pair_lookup"))
+        })
+        .cloned()
+        .context("paired completion missing pair_lookup")?;
+    let paired_resolve_id = lsp.request("completionItem/resolve", paired_item)?;
+    let paired_resolved = lsp.wait_response(paired_resolve_id, Duration::from_secs(10))?;
+    let paired_completion_docs = paired_resolved
+        .get("documentation")
+        .and_then(|documentation| documentation.get("value"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        paired_completion_docs.contains("Header lookup documentation.")
+            && paired_completion_docs.contains("// In ops_chain.h")
+            && paired_completion_docs.contains("int pair_lookup(int value);"),
+        "source-file completion should use same-project header docs, got {paired_resolved}"
+    );
+
+    let paired_hover_id = lsp.request(
+        "textDocument/hover",
+        json!({
+            "textDocument": { "uri": ops_source_uri },
+            "position": { "line": 1, "character": 6 }
+        }),
+    )?;
+    let paired_hover = lsp.wait_response(paired_hover_id, Duration::from_secs(10))?;
+    let paired_hover_value = paired_hover
+        .get("contents")
+        .and_then(|contents| contents.get("value"))
+        .and_then(Value::as_str)
+        .context("paired hover missing markdown")?;
+    assert!(paired_hover_value.contains("Header lookup documentation."));
+    assert!(paired_hover_value.contains("// In ops_chain.h"));
+
+    let paired_signature_id = lsp.request(
+        "textDocument/signatureHelp",
+        json!({
+            "textDocument": { "uri": ops_source_uri },
+            "position": { "line": 2, "character": 35 },
+            "context": { "triggerKind": 1, "isRetrigger": false }
+        }),
+    )?;
+    let paired_signature = lsp.wait_response(paired_signature_id, Duration::from_secs(10))?;
+    assert!(
+        paired_signature
+            .get("signatures")
+            .and_then(Value::as_array)
+            .and_then(|signatures| signatures.first())
+            .and_then(|signature| signature.get("documentation"))
+            .and_then(|documentation| documentation.get("value"))
+            .and_then(Value::as_str)
+            .is_some_and(|documentation| documentation.contains("Header lookup documentation.")),
+        "signature help in source should use same-project header docs, got {paired_signature}"
+    );
+    assert_eq!(
+        paired_signature
+            .get("signatures")
+            .and_then(Value::as_array)
+            .and_then(|signatures| signatures.first())
+            .and_then(|signature| signature.get("label"))
+            .and_then(Value::as_str),
+        Some("int pair_lookup(int value);")
+    );
+
+    let source_jump_id = lsp.request(
+        "textDocument/definition",
+        json!({
+            "textDocument": { "uri": ops_source_uri },
+            "position": { "line": 1, "character": 6 }
+        }),
+    )?;
+    let source_jump = lsp.wait_response(source_jump_id, Duration::from_secs(10))?;
+    assert_eq!(
+        source_jump
+            .as_array()
+            .and_then(|locations| locations.first())
+            .and_then(|location| location.get("uri"))
+            .and_then(Value::as_str),
+        Some(ops_header_uri.as_str()),
+        "goto on source definition should prefer the paired header declaration"
+    );
+
+    let header_jump_id = lsp.request(
+        "textDocument/definition",
+        json!({
+            "textDocument": { "uri": ops_header_uri },
+            "position": { "line": 1, "character": 6 }
+        }),
+    )?;
+    let header_jump = lsp.wait_response(header_jump_id, Duration::from_secs(10))?;
+    assert_eq!(
+        header_jump
+            .as_array()
+            .and_then(|locations| locations.first())
+            .and_then(|location| location.get("uri"))
+            .and_then(Value::as_str),
+        Some(ops_source_uri.as_str()),
+        "goto on header declaration should prefer the paired source definition"
+    );
+
+    let call_jump_id = lsp.request(
+        "textDocument/definition",
+        json!({
+            "textDocument": { "uri": ops_source_uri },
+            "position": { "line": 2, "character": 28 }
+        }),
+    )?;
+    let call_jump = lsp.wait_response(call_jump_id, Duration::from_secs(10))?;
+    assert_eq!(
+        call_jump
+            .as_array()
+            .and_then(|locations| locations.first())
+            .and_then(|location| location.get("uri"))
+            .and_then(Value::as_str),
+        Some(ops_source_uri.as_str()),
+        "goto from an ordinary call site should keep the source definition first"
+    );
+    lsp.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": defs_uri,
+                "languageId": "c",
+                "version": 1,
+                "text": defs_open_source
+            }
+        }),
+    )?;
+    lsp.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
                 "uri": live_uri,
                 "languageId": "c",
                 "version": 1,
@@ -326,12 +531,59 @@ fn lsp_smoke_completion_definition_and_references() -> Result<()> {
         .get("items")
         .and_then(Value::as_array)
         .context("completion response missing items")?;
+    let helper_completion = items
+        .iter()
+        .find(|item| item.get("label").and_then(Value::as_str) == Some("helper"))
+        .cloned()
+        .context("completion should include helper")?;
     assert!(
-        items
-            .iter()
-            .any(|item| item.get("label").and_then(Value::as_str) == Some("helper")),
+        helper_completion.get("data").is_some(),
         "completion should include helper, got {completion}"
     );
+
+    let completion_resolve_id = lsp.request("completionItem/resolve", helper_completion)?;
+    let resolved_completion = lsp.wait_response(completion_resolve_id, Duration::from_secs(10))?;
+    let resolved_completion_docs = resolved_completion
+        .get("documentation")
+        .and_then(|documentation| documentation.get("value"))
+        .and_then(Value::as_str)
+        .context("resolved completion missing Markdown documentation")?;
+    assert!(
+        resolved_completion_docs.contains("Helps the smoke test.")
+            && resolved_completion_docs.contains("### Parameters")
+            && resolved_completion_docs.contains("structured param"),
+        "resolved completion should render declaration comments, got {resolved_completion}"
+    );
+
+    let signature_id = lsp.request(
+        "textDocument/signatureHelp",
+        json!({
+            "textDocument": { "uri": main_uri },
+            "position": { "line": 2, "character": 11 },
+            "context": { "triggerKind": 1, "isRetrigger": false }
+        }),
+    )?;
+    let signature = lsp.wait_response(signature_id, Duration::from_secs(10))?;
+    let signature_entry = signature
+        .get("signatures")
+        .and_then(Value::as_array)
+        .and_then(|signatures| signatures.first())
+        .context("signature help missing signature")?;
+    let signature_docs = signature_entry
+        .get("documentation")
+        .and_then(|documentation| documentation.get("value"))
+        .and_then(Value::as_str)
+        .context("signature help missing Markdown documentation")?;
+    let parameter_docs = signature_entry
+        .get("parameters")
+        .and_then(Value::as_array)
+        .and_then(|parameters| parameters.first())
+        .and_then(|parameter| parameter.get("documentation"))
+        .and_then(|documentation| documentation.get("value"))
+        .and_then(Value::as_str)
+        .context("signature parameter missing Markdown documentation")?;
+    assert!(signature_docs.contains("Helps the smoke test."));
+    assert!(parameter_docs.contains("structured param"));
 
     let definition_id = lsp.request(
         "textDocument/definition",
@@ -360,11 +612,32 @@ fn lsp_smoke_completion_definition_and_references() -> Result<()> {
         .and_then(Value::as_str)
         .context("hover response missing markdown value")?;
     assert!(
-        hover_value.contains("void helper(void);")
+        hover_value.contains("void helper(int unused);")
             && hover_value.contains("Helps the smoke test.")
+            && hover_value.contains("### Parameters")
+            && hover_value.contains("- `unused` — structured param")
             && hover_value.contains("// In defs.h")
             && hover_value.contains("tier: reachable"),
-        "hover should include signature, comment, and ranking evidence, got {hover}"
+        "hover should include signature, structured comment, and ranking evidence, got {hover}"
+    );
+
+    let trailing_hover_id = lsp.request(
+        "textDocument/hover",
+        json!({
+            "textDocument": { "uri": defs_uri },
+            "position": { "line": 4, "character": 8 }
+        }),
+    )?;
+    let trailing_hover = lsp.wait_response(trailing_hover_id, Duration::from_secs(10))?;
+    let trailing_value = trailing_hover
+        .get("contents")
+        .and_then(|contents| contents.get("value"))
+        .and_then(Value::as_str)
+        .context("trailing hover response missing markdown value")?;
+    assert!(
+        trailing_value.contains("trailing hover comment")
+            && trailing_value.contains("int trailing_docs(void);"),
+        "hover should recover trailing same-line comments from the open buffer, got {trailing_hover}"
     );
 
     let references_id = lsp.request(
@@ -451,7 +724,7 @@ fn lsp_smoke_completion_definition_and_references() -> Result<()> {
         "textDocument/prepareCallHierarchy",
         json!({
             "textDocument": { "uri": defs_uri },
-            "position": { "line": 2, "character": 7 }
+            "position": { "line": 3, "character": 7 }
         }),
     )?;
     let helper_prepared = lsp.wait_response(helper_prepare_id, Duration::from_secs(10))?;
