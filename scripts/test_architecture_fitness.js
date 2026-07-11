@@ -11,6 +11,13 @@ const goldenRoot = path.join(repoRoot, "tests", "architecture_fitness", "golden"
 
 const cases = [
   {
+    name: "call relation domain boundaries",
+    fixture: "call_domain_boundary",
+    golden: "call_domain_boundary.txt",
+    expectedStatus: 1,
+    args: [],
+  },
+  {
     name: "forbidden dependency",
     fixture: "forbidden_dependency",
     golden: "forbidden_dependency.txt",

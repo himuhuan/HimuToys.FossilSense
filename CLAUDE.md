@@ -50,6 +50,7 @@ fossilsense 单一 Rust 原生二进制 (crates/fossilsense)
 | `scanner` | 文件遍历，尊重 `.gitignore` 和默认排除 |
 | `indexer` | 扫描、增量判定、解析、SQLite 写入、进度事件 |
 | `model` | 候选语义层与规范导出名 |
+| `call_model` | 调用关系领域值对象、稳定 locator、关系质量与覆盖合同；协议中立，不依赖 parser/store/server |
 | `parser` | tree-sitter C/C++ 容错解析；唯一入口 `parse()`；提供 persistent/request facts 投影与 fact availability |
 | `store` | SQLite schema、迁移、事务、清理、写入，以及 durable read views / typed rows |
 | `pathing` | Windows 路径规范化、仓库相对路径、workspace hash |
@@ -75,6 +76,9 @@ fossilsense 单一 Rust 原生二进制 (crates/fossilsense)
 | `ReachScope` | include 可达范围，携带 open 与 reason |
 | `OpenReason` | `UnresolvedInclude`、`AmbiguousInclude`、遍历上限等 |
 | `RecordCandidate` | struct / class / union record 候选 |
+| `CallableAnchor` / `CallableEntity` | 调用关系中的具体源码锚点与保守逻辑实体 |
+| `CallSiteFact` / `CallRelation` | 调用表达式事实与按调用点聚合的候选关系 |
+| `RelationConfidence` / `EvidenceLedger` | 与定义置信度分离的关系质量及可解释证据 |
 
 新增能力不得绕开这些模型另起 `smart` / `semantic` 等平行概念。
 

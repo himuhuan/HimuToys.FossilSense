@@ -1,0 +1,6 @@
+Architecture fitness report
+status severity rule file detail allowlist
+FAIL ERROR call-domain-dependency-direction crates/fossilsense/src/call_model/bad_model.rs call_model must remain a protocol-neutral leaf domain: crate::store -
+FAIL ERROR call-domain-dependency-direction crates/fossilsense/src/call_resolver/bad_resolver.rs call_resolver must depend only on protocol-neutral domain inputs: crate::parser -
+FAIL ERROR call-service-io-boundary crates/fossilsense/src/call_hierarchy/bad_service.rs call hierarchy queries must use indexed facts and must not enumerate workspace files -
+Summary: fail=3 warn=0 allowlisted=0

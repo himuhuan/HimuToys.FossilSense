@@ -10,6 +10,8 @@ const RULES = {
   ordinaryCompletionServiceIoBoundary: "ordinary-completion-service-io-boundary",
   sqliteBoundary: "sqlite-boundary",
   coreDirection: "core-dependency-direction",
+  callDomainDirection: "call-domain-dependency-direction",
+  callServiceIoBoundary: "call-service-io-boundary",
   largeFile: "large-source-file",
 };
 
@@ -230,6 +232,10 @@ function isOrdinaryCompletionService(relPath) {
   return relPath === "crates/fossilsense/src/completion/ordinary_service.rs";
 }
 
+function isCallService(relPath) {
+  return isModule(relPath, "call_hierarchy");
+}
+
 function isModule(relPath, moduleName) {
   return (
     relPath === `crates/fossilsense/src/${moduleName}.rs` ||
@@ -284,6 +290,24 @@ function checkCoreDirection(findings, relPath, text) {
     });
   }
 
+  if (isModule(relPath, "call_model")) {
+    directionRules.push({
+      owner: "call_model",
+      forbidden: ["parser", "store", "server", "indexer", "call_resolver", "call_hierarchy"],
+      detail: "call_model must remain a protocol-neutral leaf domain",
+      rule: RULES.callDomainDirection,
+    });
+  }
+
+  if (isModule(relPath, "call_resolver")) {
+    directionRules.push({
+      owner: "call_resolver",
+      forbidden: ["parser", "store", "server", "indexer"],
+      detail: "call_resolver must depend only on protocol-neutral domain inputs",
+      rule: RULES.callDomainDirection,
+    });
+  }
+
   if (isModule(relPath, "project_context")) {
     directionRules.push({
       owner: "project_context",
@@ -306,7 +330,7 @@ function checkCoreDirection(findings, relPath, text) {
         addFinding(
           findings,
           "ERROR",
-          RULES.coreDirection,
+          rule.rule ?? RULES.coreDirection,
           relPath,
           `${rule.detail}: crate::${moduleName}`
         );
@@ -382,6 +406,20 @@ function collectFindings(root, options = {}) {
         RULES.ordinaryCompletionServiceIoBoundary,
         relPath,
         "ordinary completion service must use captured in-memory project state and perform no filesystem discovery"
+      );
+    }
+
+
+    if (
+      isCallService(relPath) &&
+      (/\bstd\s*::\s*fs\b/.test(text) || /\bignore\s*::/.test(text) || usesCrateModule(text, "scanner"))
+    ) {
+      addFinding(
+        findings,
+        "ERROR",
+        RULES.callServiceIoBoundary,
+        relPath,
+        "call hierarchy queries must use indexed facts and must not enumerate workspace files"
       );
     }
 
