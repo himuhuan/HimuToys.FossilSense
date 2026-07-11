@@ -85,6 +85,39 @@ impl RelationRequestState {
 }
 
 impl Backend {
+    pub(super) async fn rich_relations_command(&self, arg: &Value) -> Option<Value> {
+        let uri = arg
+            .get("uri")
+            .and_then(Value::as_str)
+            .and_then(|value| Url::parse(value).ok())?;
+        let state = self.relation_state_for_uri(&uri).await?;
+        let entity_key = if let Some(key) = arg.get("entityKey").and_then(Value::as_str) {
+            key.to_string()
+        } else {
+            let line = arg.get("line").and_then(Value::as_u64).unwrap_or(0) as u32;
+            let character = arg.get("character").and_then(Value::as_u64).unwrap_or(0) as u32;
+            let path = uri_to_path(&uri)?;
+            let rel = catalog_path(&state.root, &path)?;
+            let entities = state
+                .catalog
+                .entities_at(&rel, SourcePosition { line, character });
+            let [entity] = entities.as_slice() else {
+                return None;
+            };
+            entity.entity_key.clone()
+        };
+        let relations = match arg.get("direction").and_then(Value::as_str) {
+            Some("incoming") => state.incoming(&entity_key),
+            _ => state.outgoing(&entity_key),
+        };
+        Some(RichRelationResponse::new(
+            state.revision,
+            relations,
+            state.catalog.coverage().clone(),
+            arg.get("cursor").and_then(Value::as_u64).unwrap_or(0) as usize,
+        ))
+    }
+
     pub(super) async fn relation_state_for_uri(&self, uri: &Url) -> Option<RelationRequestState> {
         let root = self.root_for_uri(uri).await?;
         let context = self.request_context_for_root(root.clone()).await;

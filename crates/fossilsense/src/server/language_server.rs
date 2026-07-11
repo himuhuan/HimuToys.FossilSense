@@ -847,45 +847,7 @@ impl LanguageServer for Backend {
             let Some(arg) = params.arguments.first() else {
                 return Ok(None);
             };
-            let Some(uri) = arg
-                .get("uri")
-                .and_then(Value::as_str)
-                .and_then(|value| Url::parse(value).ok())
-            else {
-                return Ok(None);
-            };
-            let Some(state) = self.relation_state_for_uri(&uri).await else {
-                return Ok(None);
-            };
-            let entity_key = if let Some(key) = arg.get("entityKey").and_then(Value::as_str) {
-                key.to_string()
-            } else {
-                let line = arg.get("line").and_then(Value::as_u64).unwrap_or(0) as u32;
-                let character = arg.get("character").and_then(Value::as_u64).unwrap_or(0) as u32;
-                let Some(path) = uri_to_path(&uri) else {
-                    return Ok(None);
-                };
-                let Some(rel) = call_hierarchy::catalog_path(&state.root, &path) else {
-                    return Ok(None);
-                };
-                let entities = state
-                    .catalog
-                    .entities_at(&rel, crate::call_model::SourcePosition { line, character });
-                let [entity] = entities.as_slice() else {
-                    return Ok(None);
-                };
-                entity.entity_key.clone()
-            };
-            let relations = match arg.get("direction").and_then(Value::as_str) {
-                Some("incoming") => state.incoming(&entity_key),
-                _ => state.outgoing(&entity_key),
-            };
-            Ok(Some(call_hierarchy::RichRelationResponse::new(
-                state.revision,
-                relations,
-                state.catalog.coverage().clone(),
-                arg.get("cursor").and_then(Value::as_u64).unwrap_or(0) as usize,
-            )))
+            Ok(self.rich_relations_command(arg).await)
         } else if params.command == GROUPED_REFERENCES_LSP_COMMAND {
             // Role-grouped find-references: same cached search as the standard
             // `references` request, but the result carries each hit's role so
