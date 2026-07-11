@@ -9,6 +9,7 @@ use tower_lsp::lsp_types::Url;
 use super::include_completion::IncludeCompletionTable;
 use super::state;
 use super::LocalWordCache;
+use crate::call_catalog::RelationCatalog;
 use crate::call_model::SemanticGeneration;
 use crate::completion_words;
 use crate::parser::FileSemanticIndex;
@@ -131,6 +132,23 @@ impl DocumentStore {
         }
     }
 
+    pub(super) async fn all_snapshots(&self) -> Vec<(Url, DocumentSnapshot)> {
+        self.open_docs
+            .lock()
+            .await
+            .iter()
+            .map(|(uri, (version, text))| {
+                (
+                    uri.clone(),
+                    DocumentSnapshot {
+                        version: *version,
+                        text: text.clone(),
+                    },
+                )
+            })
+            .collect()
+    }
+
     #[cfg(test)]
     pub(super) async fn store_live_parse_for_test(
         &self,
@@ -167,6 +185,8 @@ pub(super) struct CacheLedger {
     pub(in crate::server) reference_role_cache: Arc<references::ReferenceRoleCache>,
     pub(in crate::server) reference_search_cache: Arc<references::ReferenceSearchCache>,
     pub(in crate::server) completion_memo: Arc<Mutex<HashMap<Url, state::CompletionMemo>>>,
+    relation_overlay_cache:
+        Arc<Mutex<HashMap<PathBuf, (state::EngineEpoch, u64, Arc<RelationCatalog>)>>>,
 }
 
 pub(in crate::server) type EngineSnapshots = Arc<Mutex<HashMap<PathBuf, Arc<EngineSnapshot>>>>;
@@ -184,6 +204,7 @@ pub(in crate::server) struct EngineSnapshot {
     pub(in crate::server) include_table: Option<Arc<IncludeCompletionTable>>,
     pub(in crate::server) indexed_files: Option<Arc<Vec<(String, PathBuf)>>>,
     pub(in crate::server) project_context: Option<Arc<ProjectContextIndex>>,
+    pub(in crate::server) relation_catalog: Option<Arc<RelationCatalog>>,
     #[allow(dead_code)] // Captured now; request capability-health routing is the next phase.
     pub(in crate::server) degraded: crate::progress::DegradedCapabilities,
 }
@@ -199,6 +220,7 @@ impl EngineSnapshot {
             include_table: None,
             indexed_files: None,
             project_context: None,
+            relation_catalog: None,
             degraded: crate::progress::DegradedCapabilities::default(),
         }
     }
@@ -213,6 +235,7 @@ impl Default for CacheLedger {
             reference_role_cache: Arc::new(references::ReferenceRoleCache::new()),
             reference_search_cache: Arc::new(references::ReferenceSearchCache::new()),
             completion_memo: Arc::new(Mutex::new(HashMap::new())),
+            relation_overlay_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -305,6 +328,33 @@ impl CacheLedger {
         self.completion_memo.lock().await.clear();
     }
 
+    pub(super) async fn cached_relation_overlay(
+        &self,
+        root: &PathBuf,
+        epoch: state::EngineEpoch,
+        overlay_epoch: u64,
+    ) -> Option<Arc<RelationCatalog>> {
+        self.relation_overlay_cache.lock().await.get(root).and_then(
+            |(cached_epoch, cached_overlay, catalog)| {
+                (*cached_epoch == epoch && *cached_overlay == overlay_epoch)
+                    .then(|| catalog.clone())
+            },
+        )
+    }
+
+    pub(super) async fn store_relation_overlay(
+        &self,
+        root: PathBuf,
+        epoch: state::EngineEpoch,
+        overlay_epoch: u64,
+        catalog: Arc<RelationCatalog>,
+    ) {
+        self.relation_overlay_cache
+            .lock()
+            .await
+            .insert(root, (epoch, overlay_epoch, catalog));
+    }
+
     pub(super) async fn record_completion_memo(
         &self,
         uri: Url,
@@ -378,6 +428,7 @@ impl CacheLedger {
             include_table: current.include_table.clone(),
             indexed_files: current.indexed_files.clone(),
             project_context: current.project_context.clone(),
+            relation_catalog: current.relation_catalog.clone(),
             degraded: current.degraded.clone(),
         })
         .await;
@@ -402,6 +453,7 @@ impl CacheLedger {
             include_table: current.include_table.clone(),
             indexed_files: Some(files),
             project_context: current.project_context.clone(),
+            relation_catalog: current.relation_catalog.clone(),
             degraded: current.degraded.clone(),
         })
         .await;
@@ -422,6 +474,7 @@ impl CacheLedger {
             include_table: current.include_table.clone(),
             indexed_files: current.indexed_files.clone(),
             project_context: current.project_context.clone(),
+            relation_catalog: current.relation_catalog.clone(),
             degraded: current.degraded.clone(),
         })
         .await;

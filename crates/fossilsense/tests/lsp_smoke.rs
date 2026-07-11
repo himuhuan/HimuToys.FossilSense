@@ -223,9 +223,13 @@ fn lsp_smoke_completion_definition_and_references() -> Result<()> {
     let main_source =
         "#include \"defs.h\"\nint main(void) {\n    helper();\n    return VALUE;\n}\n";
     std::fs::write(root.join("main.c"), main_source)?;
+    let live_source = "int live_caller(void) { return helper(); }\n";
+    std::fs::write(root.join("live.c"), "int live_caller(void) { return 0; }\n")?;
 
     let root_uri = file_uri(root)?;
     let main_uri = file_uri(&root.join("main.c"))?;
+    let defs_uri = file_uri(&root.join("defs.h"))?;
+    let live_uri = file_uri(&root.join("live.c"))?;
 
     let mut lsp = LspProcess::start()?;
     let init_id = lsp.request(
@@ -267,6 +271,13 @@ fn lsp_smoke_completion_definition_and_references() -> Result<()> {
             .and_then(Value::as_bool),
         Some(true)
     );
+    assert_eq!(
+        initialized
+            .get("capabilities")
+            .and_then(|capabilities| capabilities.get("callHierarchyProvider"))
+            .and_then(Value::as_bool),
+        Some(true)
+    );
 
     lsp.notify("initialized", json!({}))?;
     let ready = lsp.wait_index_ready(Duration::from_secs(30))?;
@@ -287,6 +298,17 @@ fn lsp_smoke_completion_definition_and_references() -> Result<()> {
                 "languageId": "c",
                 "version": 1,
                 "text": main_source
+            }
+        }),
+    )?;
+    lsp.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": live_uri,
+                "languageId": "c",
+                "version": 1,
+                "text": live_source
             }
         }),
     )?;
@@ -358,6 +380,85 @@ fn lsp_smoke_completion_definition_and_references() -> Result<()> {
     assert!(
         reference_count >= 2,
         "references should include declaration and call, got {references}"
+    );
+
+    let prepare_id = lsp.request(
+        "textDocument/prepareCallHierarchy",
+        json!({
+            "textDocument": { "uri": main_uri },
+            "position": { "line": 1, "character": 5 }
+        }),
+    )?;
+    let prepared = lsp.wait_response(prepare_id, Duration::from_secs(10))?;
+    let main_item = prepared
+        .as_array()
+        .and_then(|items| items.first())
+        .cloned()
+        .context("call hierarchy should prepare main")?;
+    assert_eq!(main_item.get("name").and_then(Value::as_str), Some("main"));
+
+    let outgoing_id = lsp.request("callHierarchy/outgoingCalls", json!({ "item": main_item }))?;
+    let outgoing = lsp.wait_response(outgoing_id, Duration::from_secs(10))?;
+    assert!(
+        outgoing
+            .as_array()
+            .is_some_and(|items| items.iter().any(|call| {
+                call.get("to")
+                    .and_then(|item| item.get("name"))
+                    .and_then(Value::as_str)
+                    == Some("helper")
+            })),
+        "main should have a standard outgoing helper call, got {outgoing}"
+    );
+
+    let helper_prepare_id = lsp.request(
+        "textDocument/prepareCallHierarchy",
+        json!({
+            "textDocument": { "uri": defs_uri },
+            "position": { "line": 2, "character": 7 }
+        }),
+    )?;
+    let helper_prepared = lsp.wait_response(helper_prepare_id, Duration::from_secs(10))?;
+    let helper_item = helper_prepared
+        .as_array()
+        .and_then(|items| items.first())
+        .cloned()
+        .context("call hierarchy should prepare helper declaration")?;
+    let incoming_id = lsp.request(
+        "callHierarchy/incomingCalls",
+        json!({ "item": helper_item }),
+    )?;
+    let incoming = lsp.wait_response(incoming_id, Duration::from_secs(10))?;
+    assert!(
+        incoming
+            .as_array()
+            .is_some_and(|items| items.iter().any(|call| {
+                call.get("from")
+                    .and_then(|item| item.get("name"))
+                    .and_then(Value::as_str)
+                    == Some("live_caller")
+            })),
+        "helper should see an incoming call from another unsaved open document, got {incoming}"
+    );
+
+    let rich_id = lsp.request(
+        "workspace/executeCommand",
+        json!({
+            "command": "fossilsense.lsp.callRelations",
+            "arguments": [{ "uri": main_uri, "line": 1, "character": 5, "direction": "outgoing" }]
+        }),
+    )?;
+    let rich = lsp.wait_response(rich_id, Duration::from_secs(10))?;
+    assert_eq!(rich.get("protocolVersion").and_then(Value::as_u64), Some(1));
+    assert_eq!(rich.get("complete").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        rich.get("budgetState").and_then(Value::as_str),
+        Some("complete")
+    );
+    assert!(rich.get("coverage").is_some());
+    assert!(
+        contains_uri(&rich, "helper"),
+        "rich relations should retain target and evidence, got {rich}"
     );
 
     lsp.shutdown()?;

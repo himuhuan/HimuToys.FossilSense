@@ -8,13 +8,15 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 use tower_lsp::jsonrpc::Result as LspResult;
 use tower_lsp::lsp_types::{
-    Command, CompletionItem, CompletionItemKind, CompletionList, CompletionOptions,
-    CompletionParams, CompletionResponse, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
-    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
-    DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, Documentation,
-    ExecuteCommandParams, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams,
-    HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams, Location,
-    MessageType, OneOf, ReferenceParams, SaveOptions, SemanticTokenType, SemanticTokens,
+    CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
+    CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
+    CallHierarchyServerCapability, Command, CompletionItem, CompletionItemKind, CompletionList,
+    CompletionOptions, CompletionParams, CompletionResponse, DidChangeTextDocumentParams,
+    DidChangeWatchedFilesParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+    DidSaveTextDocumentParams, DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse,
+    Documentation, ExecuteCommandParams, GotoDefinitionParams, GotoDefinitionResponse, Hover,
+    HoverParams, HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams,
+    Location, MessageType, OneOf, ReferenceParams, SaveOptions, SemanticTokenType, SemanticTokens,
     SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions, SemanticTokensParams,
     SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult,
     SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SignatureHelp,
@@ -43,6 +45,7 @@ use crate::reachability;
 use crate::references;
 use crate::store::IndexStore;
 
+mod call_hierarchy;
 mod hover;
 mod include_completion;
 mod indexing;
@@ -128,6 +131,7 @@ pub(super) const CLEAR_COMPLETION_HISTORY_LSP_COMMAND: &str =
 const GROUPED_REFERENCES_LSP_COMMAND: &str = "fossilsense.lsp.groupedReferences";
 const PROJECT_CONTEXTS_LSP_COMMAND: &str = "fossilsense.lsp.projectContexts";
 const SET_PROJECT_CONTEXT_LSP_COMMAND: &str = "fossilsense.lsp.setProjectContext";
+const CALL_RELATIONS_LSP_COMMAND: &str = "fossilsense.lsp.callRelations";
 
 pub async fn run_stdio() -> Result<()> {
     eprintln!("FossilSense LSP starting on stdio");

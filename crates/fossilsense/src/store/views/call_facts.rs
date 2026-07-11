@@ -75,6 +75,10 @@ impl<'a> CallFactStoreView<'a> {
         self.anchor_query("", [])
     }
 
+    pub fn all_call_sites(&self) -> Result<Vec<CallSiteRow>> {
+        self.call_site_query("", [])
+    }
+
     pub fn anchors_by_name(&self, name: &str) -> Result<Vec<CallableAnchorRow>> {
         self.anchor_query("WHERE a.name = ?1", [name])
     }

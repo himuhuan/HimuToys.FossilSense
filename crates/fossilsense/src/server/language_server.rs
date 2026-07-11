@@ -94,6 +94,7 @@ impl LanguageServer for Backend {
                 completion_provider,
                 signature_help_provider: Some(signature_help_options()),
                 semantic_tokens_provider,
+                call_hierarchy_provider: Some(CallHierarchyServerCapability::Simple(true)),
                 execute_command_provider: Some(tower_lsp::lsp_types::ExecuteCommandOptions {
                     commands: vec![
                         REFRESH_INDEX_LSP_COMMAND.to_string(),
@@ -103,6 +104,7 @@ impl LanguageServer for Backend {
                         CLEAR_COMPLETION_HISTORY_LSP_COMMAND.to_string(),
                         PROJECT_CONTEXTS_LSP_COMMAND.to_string(),
                         SET_PROJECT_CONTEXT_LSP_COMMAND.to_string(),
+                        CALL_RELATIONS_LSP_COMMAND.to_string(),
                     ],
                     ..Default::default()
                 }),
@@ -128,6 +130,31 @@ impl LanguageServer for Backend {
             .log_message(MessageType::INFO, "FossilSense shutting down")
             .await;
         Ok(())
+    }
+
+    async fn prepare_call_hierarchy(
+        &self,
+        params: CallHierarchyPrepareParams,
+    ) -> LspResult<Option<Vec<CallHierarchyItem>>> {
+        let position = params.text_document_position_params;
+        Ok(self
+            .prepare_call_item(&position.text_document.uri, position.position)
+            .await
+            .map(|item| vec![item]))
+    }
+
+    async fn incoming_calls(
+        &self,
+        params: CallHierarchyIncomingCallsParams,
+    ) -> LspResult<Option<Vec<CallHierarchyIncomingCall>>> {
+        Ok(self.standard_incoming(&params.item).await)
+    }
+
+    async fn outgoing_calls(
+        &self,
+        params: CallHierarchyOutgoingCallsParams,
+    ) -> LspResult<Option<Vec<CallHierarchyOutgoingCall>>> {
+        Ok(self.standard_outgoing(&params.item).await)
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
@@ -817,6 +844,49 @@ impl LanguageServer for Backend {
                 .await;
             self.spawn_index_roots(Some(true)).await;
             Ok(None)
+        } else if params.command == CALL_RELATIONS_LSP_COMMAND {
+            let Some(arg) = params.arguments.first() else {
+                return Ok(None);
+            };
+            let Some(uri) = arg
+                .get("uri")
+                .and_then(Value::as_str)
+                .and_then(|value| Url::parse(value).ok())
+            else {
+                return Ok(None);
+            };
+            let Some(state) = self.relation_state_for_uri(&uri).await else {
+                return Ok(None);
+            };
+            let entity_key = if let Some(key) = arg.get("entityKey").and_then(Value::as_str) {
+                key.to_string()
+            } else {
+                let line = arg.get("line").and_then(Value::as_u64).unwrap_or(0) as u32;
+                let character = arg.get("character").and_then(Value::as_u64).unwrap_or(0) as u32;
+                let Some(path) = uri_to_path(&uri) else {
+                    return Ok(None);
+                };
+                let Some(rel) = call_hierarchy::catalog_path(&state.root, &path) else {
+                    return Ok(None);
+                };
+                let Some(entity) = state
+                    .catalog
+                    .entity_at(&rel, crate::call_model::SourcePosition { line, character })
+                else {
+                    return Ok(None);
+                };
+                entity.entity_key.clone()
+            };
+            let relations = match arg.get("direction").and_then(Value::as_str) {
+                Some("incoming") => state.incoming(&entity_key),
+                _ => state.outgoing(&entity_key),
+            };
+            Ok(Some(call_hierarchy::RichRelationResponse::new(
+                state.revision,
+                relations,
+                state.catalog.coverage().clone(),
+                arg.get("cursor").and_then(Value::as_u64).unwrap_or(0) as usize,
+            )))
         } else if params.command == GROUPED_REFERENCES_LSP_COMMAND {
             // Role-grouped find-references: same cached search as the standard
             // `references` request, but the result carries each hit's role so

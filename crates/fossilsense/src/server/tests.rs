@@ -1010,6 +1010,7 @@ async fn project_context_commands_validate_selection_and_outside_uri_has_no_auto
             include_table: current.include_table.clone(),
             indexed_files: current.indexed_files.clone(),
             project_context: None,
+            relation_catalog: None,
             degraded,
         })
         .await;
@@ -1374,6 +1375,7 @@ async fn reach_scope_uses_captured_request_context_graph() {
             include_table: None,
             indexed_files: None,
             project_context: None,
+            relation_catalog: None,
             degraded: crate::progress::DegradedCapabilities::default(),
         }),
         settings: super::RequestSettings {
@@ -2809,6 +2811,7 @@ fn index_status_ready_distinguishable_from_failed() {
 fn index_status_ready_carries_degraded_capabilities() {
     let stats = crate::progress::IndexStats::default();
     let degraded = crate::progress::DegradedCapabilities {
+        call_relations: false,
         reach_graph: true,
         include_table: false,
         reference_file_list: true,
@@ -2828,6 +2831,7 @@ fn index_status_ready_carries_degraded_capabilities() {
 #[test]
 fn ready_cache_message_names_degraded_capabilities() {
     let degraded = crate::progress::DegradedCapabilities {
+        call_relations: false,
         reach_graph: true,
         include_table: true,
         reference_file_list: false,

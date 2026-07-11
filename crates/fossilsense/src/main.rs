@@ -1,3 +1,4 @@
+mod call_catalog;
 mod call_model;
 mod coloring;
 mod completion;

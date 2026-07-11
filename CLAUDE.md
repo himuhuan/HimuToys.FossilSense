@@ -51,6 +51,7 @@ fossilsense 单一 Rust 原生二进制 (crates/fossilsense)
 | `indexer` | 扫描、增量判定、解析、SQLite 写入、进度事件 |
 | `model` | 候选语义层与规范导出名 |
 | `call_model` | 调用关系领域值对象、稳定 locator、关系质量与覆盖合同；协议中立，不依赖 parser/store/server |
+| `call_catalog` | 从 active call facts 构建不可变 callable 目录，缓存保守的一跳 incoming/outgoing 关系与歧义/未解析证据 |
 | `parser` | tree-sitter C/C++ 容错解析；唯一入口 `parse()`；提供 persistent/request facts 投影与 fact availability |
 | `store` | SQLite schema、迁移、事务、清理、写入，以及 durable read views / typed rows |
 | `pathing` | Windows 路径规范化、仓库相对路径、workspace hash |
@@ -125,7 +126,7 @@ Runtime snapshot 规则：
 
 | 项 | 规则 |
 |---|---|
-| `EngineSnapshot` | 每工作区一个完整不可变读模型，统一携带 name table、reach graph、include table、reference file list、project context、degraded state |
+| `EngineSnapshot` | 每工作区一个完整不可变读模型，统一携带 name table、reach graph、include table、reference file list、project context、relation catalog、degraded state |
 | publication | 所有下一代读模型在后台构建完成后，只通过一次 map 交换发布；构建期间旧快照继续服务请求 |
 | `EngineEpoch` | 每次成功发布分配显式单调 epoch；`0` 只表示尚未发布索引读模型 |
 | `SemanticGeneration` | SQLite active manifest 的持久化单调代际；marker-only 等纯派生刷新不得推进它 |
@@ -146,6 +147,7 @@ Runtime snapshot 规则：
 | include | 有限解析、跳转、可达性收窄 |
 | 外部头 | 通过 `fossilsense.includePaths` 索引和补全 |
 | 冲突扩展 | 检测 clangd / cpptools / ccls 并提示二选一 |
+| 调用关系 | 标准 LSP Call Hierarchy 与 `fossilsense.lsp.callRelations` 富结果共享同一一跳关系服务；当前正式绑定范围为 C/C++ 自由函数 |
 
 ## 6. 补全规则
 
@@ -344,6 +346,16 @@ Parser facts 合同：
 - 外部头只贡献声明锚点，不索引函数体调用点。
 - 全局初始化表达式使用 synthetic global initializer 作为 caller；lambda 内调用暂不错误归属给外层函数。
 - schema 13 为 callable anchors / call sites 建立独立 active views 和查询索引，与统一语义代际一起发布。
+
+调用关系查询合同：
+
+- `RelationCatalog` 随 `EngineSnapshot` 原子发布，发布时预计算 incoming/outgoing 一跳缓存；请求不得直接查询 SQLite。
+- dirty index 可以重建完整关系目录，因为任一声明变化都可能改变跨文件候选；失败只标记 `callRelations` degraded，不得暴露半代目录。
+- open document overlay 以完整文档版本集合和 engine epoch 缓存；`didChange` / `didClose` 改变集合签名后旧项必须自然失效。
+- overlay generation 覆盖同一 workspace 的全部 open documents，因此查询 callee incoming 时必须看到其它未保存 buffer 的调用点；缓存键使用完整文档版本集合与 engine epoch。
+- 标准 hierarchy item 携带 `CallableLocator`；entity key 失效后按 path、signature digest 与最近旧锚点保守重定位，不得只依赖瞬时数据库行号。
+- 名字、显式限定名、arity、internal linkage、same-file 与 include reachability 都只是证据；reachability 不得作为 hard filter。
+- 标准 LSP 只返回可表示的已解析候选；富协议同时返回 confidence、evidence、ambiguity、unresolved、revision、coverage 与 budget state。
 
 旧入口已移除：`FileIndex`、`ColoringTargets`、`collect_coloring_targets`、`occurrences_with_roles`。
 

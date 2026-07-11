@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use tower_lsp::lsp_types::MessageType;
 use tower_lsp::Client;
 
+use crate::call_catalog::RelationCatalog;
 use crate::call_model::SemanticGeneration;
 use crate::pathing;
 use crate::progress::DegradedCapabilities;
@@ -49,6 +50,39 @@ async fn rebuild_name_table(
         Ok(Ok(table)) => Ok(Arc::new(table)),
         Ok(Err(err)) => Err(err),
         Err(err) => Err(err.into()),
+    }
+}
+
+async fn rebuild_relation_catalog(root: PathBuf) -> Result<Arc<RelationCatalog>> {
+    let built = tokio::task::spawn_blocking(move || -> Result<RelationCatalog> {
+        let db_path = pathing::default_index_path(&root)?;
+        let store = IndexStore::open_readonly(&db_path)?;
+        let view = store.call_fact_view();
+        Ok(RelationCatalog::build_with_coverage(
+            view.all_anchors()?,
+            view.all_call_sites()?,
+            view.coverage()?,
+        ))
+    })
+    .await?;
+    built.map(Arc::new)
+}
+
+async fn rebuild_relation_catalog_or_degrade(
+    client: &Client,
+    root: PathBuf,
+) -> Option<Arc<RelationCatalog>> {
+    match rebuild_relation_catalog(root).await {
+        Ok(catalog) => Some(catalog),
+        Err(error) => {
+            client
+                .log_message(
+                    MessageType::WARNING,
+                    format!("call relation catalog build failed: {error:#}"),
+                )
+                .await;
+            None
+        }
     }
 }
 
@@ -295,12 +329,14 @@ impl CacheLedger {
         let name_table = rebuild_name_table(root.clone(), project_context.clone()).await?;
         let symbol_count = name_table.len();
         let name_table_ms = nt_started.elapsed().as_millis();
+        let relation_catalog = rebuild_relation_catalog_or_degrade(client, root.clone()).await;
 
         let rg_started = tokio::time::Instant::now();
         let reach_graph = rebuild_reach_graph(client, root.clone()).await;
         let mut degraded = DegradedCapabilities {
             reach_graph: reach_graph.is_none(),
             project_context: project_context.is_none(),
+            call_relations: relation_catalog.is_none(),
             ..Default::default()
         };
 
@@ -342,6 +378,7 @@ impl CacheLedger {
             include_table,
             indexed_files,
             project_context,
+            relation_catalog,
             degraded: degraded.clone(),
         })
         .await;
@@ -386,6 +423,9 @@ impl CacheLedger {
         .await?;
         let symbol_count = name_table.len();
         let name_table_ms = nt_started.elapsed().as_millis();
+        // Cross-file candidate sets can change when any callable is edited, so
+        // dirty publication rebuilds the immutable relation catalog.
+        let relation_catalog = rebuild_relation_catalog_or_degrade(client, root.clone()).await;
 
         let rg_started = tokio::time::Instant::now();
         let reach_graph = refresh_reach_graph_incremental(
@@ -400,6 +440,7 @@ impl CacheLedger {
         let mut degraded = DegradedCapabilities {
             reach_graph: reach_graph.is_none(),
             project_context: project_context.is_none(),
+            call_relations: relation_catalog.is_none(),
             ..Default::default()
         };
 
@@ -441,6 +482,7 @@ impl CacheLedger {
             include_table,
             indexed_files,
             project_context,
+            relation_catalog,
             degraded: degraded.clone(),
         })
         .await;
@@ -494,6 +536,7 @@ impl CacheLedger {
             include_table: previous.include_table.clone(),
             indexed_files: previous.indexed_files.clone(),
             project_context,
+            relation_catalog: previous.relation_catalog.clone(),
             degraded,
         })
         .await;
