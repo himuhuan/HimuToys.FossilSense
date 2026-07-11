@@ -464,6 +464,12 @@ pnpm run compile
 pnpm run package
 ```
 
+调用关系 UI：
+
+- `FossilSense: Show Call Relations` 从活动 C/C++ 光标加载 outgoing；Explorer 中 `FossilSense Call Relations` 可切 incoming/outgoing。
+- 选择关系必须同时导航目标并刷新 `FossilSense Call Sites & Evidence`，后者展示 coverage、confidence/evidence 和每个可跳转 call site。
+- 扩展只渲染 `fossilsense.lsp.callRelations` 富协议，不得在 TypeScript 侧重新解析或绑定源码。
+
 Release hardening gate:
 
 ```bash

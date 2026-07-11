@@ -17,6 +17,14 @@ fix.
 ## Current Capability
 
 - Go to Definition / Workspace Symbols / Document Outline.
+- One-hop Call Relations for C/C++ free functions: VS Code's standard Call
+  Hierarchy is available, and **FossilSense: Show Call Relations** opens two
+  native Explorer views. The first switches between incoming/outgoing targets;
+  selecting one navigates to it and populates the second view with exact call
+  sites, confidence, evidence, coverage, and budget state. Unsaved calls from
+  every open document in the workspace participate. Member calls, function
+  pointers, callable objects, macros, templates, and overload binding remain
+  explicit unresolved/unsupported evidence rather than fabricated targets.
 - Find All References: searches the workspace for whole-word textual matches of
   the identifier under the cursor and populates the standard References panel,
   ordered by best-effort syntactic role (definitions and declarations first). The

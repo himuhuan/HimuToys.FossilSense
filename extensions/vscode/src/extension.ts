@@ -26,6 +26,10 @@ import {
 import { mutualExclusionMessage } from './conflicts';
 import { GroupedReferenceItem, groupedReferencePickRows } from './referencesView';
 import {
+  CallRelationsController,
+  registerCallRelationViews,
+} from './callRelationsView';
+import {
   PROJECT_CONTEXTS_LSP_COMMAND,
   PROJECT_CONTEXT_WORKSPACE_STATE_KEY,
   ProjectContextPromptTracker,
@@ -72,6 +76,7 @@ const CONFLICT_EXTENSIONS = [
 let client: LanguageClient | undefined;
 let statusBar: vscode.StatusBarItem;
 let projectContextStatusBar: vscode.StatusBarItem;
+let callRelationsController: CallRelationsController;
 let output: vscode.OutputChannel;
 let configWarning: string | undefined;
 let capabilityWarning: string | undefined;
@@ -112,6 +117,7 @@ export function activate(context: vscode.ExtensionContext): void {
   projectContextStatusBar.command = SELECT_PROJECT_CONTEXT_COMMAND;
   setProjectContextStatus(undefined);
   projectContextStatusBar.show();
+  callRelationsController = registerCallRelationViews(context, () => client);
 
   context.subscriptions.push(
     output,
@@ -310,6 +316,7 @@ async function stopServer(): Promise<void> {
   currentIndexStartedWithWarning = false;
   projectContextPromptTracker.clear();
   projectContextUpdateEpoch += 1;
+  callRelationsController?.clear();
 
   if (current) {
     await current.stop();

@@ -46,8 +46,83 @@
       {
         "command": "fossilsense.selectProjectContext",
         "title": "FossilSense: Select Project Context"
+      },
+      {
+        "command": "fossilsense.showCallRelations",
+        "title": "FossilSense: Show Call Relations"
+      },
+      {
+        "command": "fossilsense.refreshCallRelations",
+        "title": "FossilSense: Refresh Call Relations",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "fossilsense.showIncomingCalls",
+        "title": "FossilSense: Show Incoming Calls",
+        "icon": "$(arrow-left)"
+      },
+      {
+        "command": "fossilsense.showOutgoingCalls",
+        "title": "FossilSense: Show Outgoing Calls",
+        "icon": "$(arrow-right)"
+      },
+      {
+        "command": "fossilsense.selectCallRelation",
+        "title": "FossilSense: Show Call Sites"
+      },
+      {
+        "command": "fossilsense.openCallSite",
+        "title": "FossilSense: Open Call Site"
       }
     ],
+    "views": {
+      "explorer": [
+        {
+          "id": "fossilsense.callRelations",
+          "name": "FossilSense Call Relations"
+        },
+        {
+          "id": "fossilsense.callSites",
+          "name": "FossilSense Call Sites & Evidence"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "fossilsense.callRelations",
+        "contents": "Place the cursor on a free function, then [Show Call Relations](command:fossilsense.showCallRelations)."
+      },
+      {
+        "view": "fossilsense.callSites",
+        "contents": "Select a relation to inspect its call sites and evidence."
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "fossilsense.showCallRelations",
+          "when": "editorLangId == c || editorLangId == cpp",
+          "group": "navigation@20"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "fossilsense.showIncomingCalls",
+          "when": "view == fossilsense.callRelations",
+          "group": "navigation@1"
+        },
+        {
+          "command": "fossilsense.showOutgoingCalls",
+          "when": "view == fossilsense.callRelations",
+          "group": "navigation@2"
+        },
+        {
+          "command": "fossilsense.refreshCallRelations",
+          "when": "view == fossilsense.callRelations",
+          "group": "navigation@3"
+        }
+      ]
+    },
     "configuration": {
       "title": "FossilSense",
       "properties": {
@@ -148,7 +223,7 @@
   },
   "scripts": {
     "compile": "tsc -p ./",
-    "test": "pnpm run compile && node out/test/config.test.js && node out/test/status.test.js && node out/test/serverPath.test.js && node out/test/conflicts.test.js && node out/test/referencesView.test.js && node out/test/completionHistory.test.js && node out/test/projectContext.test.js",
+    "test": "pnpm run compile && node out/test/config.test.js && node out/test/status.test.js && node out/test/serverPath.test.js && node out/test/conflicts.test.js && node out/test/referencesView.test.js && node out/test/callRelations.test.js && node out/test/completionHistory.test.js && node out/test/projectContext.test.js",
     "watch": "tsc -watch -p ./",
     "package": "node scripts/package.mjs"
   },
