@@ -19,10 +19,26 @@ use crate::reachability::ReachGraph;
 use crate::references;
 
 type LiveParseCache = Arc<RwLock<HashMap<Url, (i32, Arc<FileSemanticIndex>)>>>;
+type RelationOverlayCacheEntry = (state::EngineEpoch, u64, Arc<RelationCatalog>);
+type RelationOverlayCache = Arc<Mutex<HashMap<PathBuf, RelationOverlayCacheEntry>>>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RelationOverlayState {
+    Clean,
+    Unsaved,
+    SavedAwaitingGeneration(SemanticGeneration),
+}
+
+#[derive(Clone, Debug)]
+struct OpenDocument {
+    version: i32,
+    text: String,
+    relation_overlay: RelationOverlayState,
+}
 
 #[derive(Clone, Default)]
 pub(super) struct DocumentStore {
-    pub(in crate::server) open_docs: Arc<Mutex<HashMap<Url, (i32, String)>>>,
+    open_docs: Arc<Mutex<HashMap<Url, OpenDocument>>>,
     pub(in crate::server) live_parse_cache: LiveParseCache,
     pub(in crate::server) local_word_cache: LocalWordCache,
 }
@@ -31,19 +47,50 @@ pub(super) struct DocumentStore {
 pub(super) struct DocumentSnapshot {
     pub(super) version: i32,
     pub(super) text: String,
+    relation_overlay: RelationOverlayState,
+}
+
+impl DocumentSnapshot {
+    pub(super) fn needs_relation_overlay(&self, generation: SemanticGeneration) -> bool {
+        match self.relation_overlay {
+            RelationOverlayState::Clean => false,
+            RelationOverlayState::Unsaved => true,
+            RelationOverlayState::SavedAwaitingGeneration(saved_generation) => {
+                generation.0 <= saved_generation.0
+            }
+        }
+    }
 }
 
 impl DocumentStore {
     pub(super) async fn open_document(&self, uri: Url, version: i32, text: String) {
-        self.open_docs.lock().await.insert(uri, (version, text));
+        let relation_overlay = relation_overlay_state_on_open(&uri, &text).await;
+        self.open_docs.lock().await.insert(
+            uri,
+            OpenDocument {
+                version,
+                text,
+                relation_overlay,
+            },
+        );
     }
 
     pub(super) async fn change_document(&self, uri: Url, version: i32, text: String) {
-        self.open_docs
-            .lock()
-            .await
-            .insert(uri.clone(), (version, text));
+        self.open_docs.lock().await.insert(
+            uri.clone(),
+            OpenDocument {
+                version,
+                text,
+                relation_overlay: RelationOverlayState::Unsaved,
+            },
+        );
         self.clear_live_state(&uri).await;
+    }
+
+    pub(super) async fn save_document(&self, uri: &Url, generation: SemanticGeneration) {
+        if let Some(document) = self.open_docs.lock().await.get_mut(uri) {
+            document.relation_overlay = RelationOverlayState::SavedAwaitingGeneration(generation);
+        }
     }
 
     pub(super) async fn close_document(&self, uri: &Url) {
@@ -61,9 +108,10 @@ impl DocumentStore {
             .lock()
             .await
             .get(uri)
-            .map(|(version, text)| DocumentSnapshot {
-                version: *version,
-                text: text.clone(),
+            .map(|document| DocumentSnapshot {
+                version: document.version,
+                text: document.text.clone(),
+                relation_overlay: document.relation_overlay,
             })
     }
 
@@ -89,7 +137,7 @@ impl DocumentStore {
         let open_docs = self.open_docs.lock().await;
         if open_docs
             .get(uri)
-            .is_some_and(|(current_version, _)| *current_version == version)
+            .is_some_and(|document| document.version == version)
         {
             self.local_word_cache
                 .lock()
@@ -123,7 +171,7 @@ impl DocumentStore {
         let open_docs = self.open_docs.lock().await;
         if open_docs
             .get(&uri)
-            .is_some_and(|(current_version, _)| *current_version == version)
+            .is_some_and(|document| document.version == version)
         {
             self.live_parse_cache
                 .write()
@@ -137,12 +185,13 @@ impl DocumentStore {
             .lock()
             .await
             .iter()
-            .map(|(uri, (version, text))| {
+            .map(|(uri, document)| {
                 (
                     uri.clone(),
                     DocumentSnapshot {
-                        version: *version,
-                        text: text.clone(),
+                        version: document.version,
+                        text: document.text.clone(),
+                        relation_overlay: document.relation_overlay,
                     },
                 )
             })
@@ -177,6 +226,16 @@ impl DocumentStore {
     }
 }
 
+async fn relation_overlay_state_on_open(uri: &Url, text: &str) -> RelationOverlayState {
+    let Ok(path) = uri.to_file_path() else {
+        return RelationOverlayState::Unsaved;
+    };
+    match tokio::task::spawn_blocking(move || std::fs::read(path)).await {
+        Ok(Ok(bytes)) if bytes == text.as_bytes() => RelationOverlayState::Clean,
+        Ok(Ok(_)) | Ok(Err(_)) | Err(_) => RelationOverlayState::Unsaved,
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct CacheLedger {
     pub(in crate::server) engine_snapshots: EngineSnapshots,
@@ -185,8 +244,7 @@ pub(super) struct CacheLedger {
     pub(in crate::server) reference_role_cache: Arc<references::ReferenceRoleCache>,
     pub(in crate::server) reference_search_cache: Arc<references::ReferenceSearchCache>,
     pub(in crate::server) completion_memo: Arc<Mutex<HashMap<Url, state::CompletionMemo>>>,
-    relation_overlay_cache:
-        Arc<Mutex<HashMap<PathBuf, (state::EngineEpoch, u64, Arc<RelationCatalog>)>>>,
+    relation_overlay_cache: RelationOverlayCache,
 }
 
 pub(in crate::server) type EngineSnapshots = Arc<Mutex<HashMap<PathBuf, Arc<EngineSnapshot>>>>;
@@ -316,8 +374,13 @@ impl CacheLedger {
         self.reference_search_cache.clear();
     }
 
-    pub(super) fn invalidate_after_index_change(&self) {
+    pub(super) async fn invalidate_after_index_change(&self) {
         self.invalidate_references();
+        self.invalidate_relation_overlays().await;
+    }
+
+    pub(super) async fn invalidate_relation_overlays(&self) {
+        self.relation_overlay_cache.lock().await.clear();
     }
 
     pub(super) async fn clear_completion_memo(&self, uri: &Url) {
@@ -353,6 +416,11 @@ impl CacheLedger {
             .lock()
             .await
             .insert(root, (epoch, overlay_epoch, catalog));
+    }
+
+    #[cfg(test)]
+    pub(super) async fn relation_overlay_cache_len_for_test(&self) -> usize {
+        self.relation_overlay_cache.lock().await.len()
     }
 
     pub(super) async fn record_completion_memo(
@@ -510,6 +578,7 @@ impl WorkspaceSession {
 
     pub(super) async fn open_document(&self, uri: Url, version: i32, text: String) {
         self.documents.open_document(uri, version, text).await;
+        self.cache.invalidate_relation_overlays().await;
     }
 
     pub(super) async fn change_document(&self, uri: Url, version: i32, text: String) {
@@ -518,11 +587,19 @@ impl WorkspaceSession {
             .await;
         self.cache.clear_completion_memo(&uri).await;
         self.cache.invalidate_references();
+        self.cache.invalidate_relation_overlays().await;
     }
 
     pub(super) async fn close_document(&self, uri: &Url) {
         self.documents.close_document(uri).await;
         self.cache.clear_completion_memo(uri).await;
+        self.cache.invalidate_relation_overlays().await;
+    }
+
+    pub(super) async fn save_document(&self, uri: &Url, generation: SemanticGeneration) {
+        self.documents.save_document(uri, generation).await;
+        self.cache.invalidate_references();
+        self.cache.invalidate_relation_overlays().await;
     }
 
     #[cfg(test)]

@@ -816,14 +816,20 @@ impl LanguageServer for Backend {
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
-        self.session.cache.invalidate_references();
+        let uri = params.text_document.uri;
+        if let Some(root) = self.root_for_uri(&uri).await {
+            let context = self.request_context_for_root(root).await;
+            self.session
+                .save_document(&uri, context.engine.semantic_generation)
+                .await;
+        } else {
+            self.session.cache.invalidate_references();
+            self.session.cache.invalidate_relation_overlays().await;
+        }
         self.client
             .log_message(
                 MessageType::LOG,
-                format!(
-                    "saved {} (waiting for file watcher before reindex)",
-                    params.text_document.uri
-                ),
+                format!("saved {} (waiting for file watcher before reindex)", uri),
             )
             .await;
     }

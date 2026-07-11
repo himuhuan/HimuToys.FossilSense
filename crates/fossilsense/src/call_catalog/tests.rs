@@ -178,6 +178,75 @@ fn root_lookup_only_tests_variants_from_the_requested_file() {
 }
 
 #[test]
+fn compact_relation_storage_is_shared_by_both_directions_and_pages_before_materializing() {
+    let catalog = RelationCatalog::build(
+        vec![
+            anchor("a", "caller", "a.c", AnchorRole::Definition, 0),
+            anchor("b", "target", "b.c", AnchorRole::Definition, 0),
+        ],
+        vec![
+            call("a", "target", "a.c", 0),
+            call("a", "target", "a.c", 0),
+            call("a", "target", "a.c", 0),
+        ],
+    );
+
+    let stats = catalog.stats();
+    assert_eq!(stats.relations, 1);
+    assert_eq!(stats.relation_call_site_refs, 3);
+    assert_eq!(catalog.outgoing("a").len(), 1);
+    assert_eq!(catalog.incoming("b").len(), 1);
+
+    let page = catalog.relation_page(RelationDirection::Outgoing, "a", 0, 1, 2);
+    assert_eq!(page.total, 1);
+    assert!(page.site_limited);
+    assert_eq!(page.relations.len(), 1);
+    assert_eq!(page.relations[0].call_sites.len(), 2);
+}
+
+#[test]
+fn high_ambiguity_expansion_stays_compact_and_materializes_only_the_requested_page() {
+    const CANDIDATES: usize = 64;
+    const CALLS: usize = 32;
+    let mut anchors = vec![anchor(
+        "caller",
+        "caller",
+        "caller.c",
+        AnchorRole::Definition,
+        0,
+    )];
+    for index in 0..CANDIDATES {
+        anchors.push(anchor(
+            &format!("target-{index}"),
+            "shared",
+            &format!("target-{index}.c"),
+            AnchorRole::Definition,
+            0,
+        ));
+    }
+    let calls = (0..CALLS)
+        .map(|index| {
+            let mut call = call("caller", "shared", "caller.c", 0);
+            call.site_fingerprint = format!("site-{index}");
+            call
+        })
+        .collect();
+
+    let catalog = RelationCatalog::build(anchors, calls);
+    let stats = catalog.stats();
+    assert_eq!(stats.relations, CANDIDATES * CALLS);
+    assert_eq!(stats.relation_call_site_refs, CANDIDATES * CALLS);
+
+    let page = catalog.relation_page(RelationDirection::Outgoing, "caller", 0, 20, 1);
+    assert_eq!(page.total, CANDIDATES * CALLS);
+    assert_eq!(page.relations.len(), 20);
+    assert!(page
+        .relations
+        .iter()
+        .all(|relation| relation.call_sites.len() == 1));
+}
+
+#[test]
 #[ignore = "diagnostic scale benchmark; run explicitly in release mode"]
 fn benchmark_large_fan_in_catalog_and_cached_query() {
     const CALLERS: usize = 5_000;
@@ -206,10 +275,14 @@ fn benchmark_large_fan_in_catalog_and_cached_query() {
     let catalog = RelationCatalog::build(anchors, calls);
     let build_ms = build_started.elapsed().as_millis();
     let query_started = std::time::Instant::now();
-    let incoming = catalog.incoming("target");
+    let incoming = catalog.relation_page(RelationDirection::Incoming, "target", 0, 200, 200);
     let query_us = query_started.elapsed().as_micros();
+    let stats = catalog.stats();
     eprintln!(
-        "call_relation_benchmark callers={CALLERS} build_ms={build_ms} cached_incoming_us={query_us}"
+        "call_relation_benchmark callers={CALLERS} relations={} refs={} build_ms={build_ms} paged_incoming_us={query_us}",
+        stats.relations,
+        stats.relation_call_site_refs,
     );
-    assert_eq!(incoming.len(), CALLERS);
+    assert_eq!(incoming.total, CALLERS);
+    assert_eq!(incoming.relations.len(), 200);
 }

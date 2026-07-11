@@ -1,6 +1,6 @@
 # 引擎读模型与请求边界
 
-Status: current (2026-07-10)
+Status: current (2026-07-11)
 
 对于 FossilSense 的 LSP 请求路径而言，真正要保护的不是“有没有抽象”，而是**一次请求看到的索引读模型是否自洽**。索引在后台持续增量，请求却不能一边读旧 `NameTable`、一边读已经被原地改掉的 `ReachGraph`。
 
@@ -19,6 +19,7 @@ Status: current (2026-07-10)
 - include table
 - reference file list
 - project context index（与带 project key 的 name table 同代）
+- compact relation catalog
 - degraded state
 
 后台构建时，这些部件在旁路组装；只有全部就绪后，才通过一次 map 交换发布。构建期间旧快照继续服务请求。发布失败时，不能露出半更新状态。
@@ -28,6 +29,8 @@ Status: current (2026-07-10)
 SQLite 事实另有持久化 **`SemanticGeneration`**。解析批次先把不可变 file revisions 和 facts 写入 staging；文件 manifest、include edges/open counts 与 generation 只在最终短事务中一起切换。`files`、`symbols`、`includes`、record/member/alias 等 SQL 名称都是 active-only views，因此 staged rows 不会泄漏给普通查询。纯 project-context 刷新会推进 `EngineEpoch`，但不会伪造新的 `SemanticGeneration`。
 
 DB-backed 请求通过 `SemanticReadGuard` 开启 read transaction 并校验 generation。SQLite WAL 保证已经开始的旧事务在发布后仍读取完整旧代；新事务读取完整新代。关系请求会把两种代际连同文档 overlay epoch 和 resolver version 一起带入 revision。
+
+relation catalog 的不可变性不意味着复制富关系对象。callable、call site 和逻辑 relation 负载各保留一份，incoming/outgoing 邻接表共享 relation ID；请求先应用 relation page 与 call-site budget，再生成协议 DTO。普通已保存且内容与磁盘一致的 open document 直接使用基础 catalog，只有未保存或等待新 `SemanticGeneration` 发布的文档进入 overlay。请求、缓存和 `EngineSnapshot` 之间只传递 `Arc`，overlay 失效时主动释放旧代。
 
 ## dirty reach graph
 

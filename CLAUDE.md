@@ -51,7 +51,7 @@ fossilsense 单一 Rust 原生二进制 (crates/fossilsense)
 | `indexer` | 扫描、增量判定、解析、SQLite 写入、进度事件 |
 | `model` | 候选语义层与规范导出名 |
 | `call_model` | 调用关系领域值对象、稳定 locator、关系质量与覆盖合同；协议中立，不依赖 parser/store/server |
-| `call_catalog` | 从 active call facts 构建不可变 callable 目录，缓存保守的一跳 incoming/outgoing 关系与歧义/未解析证据 |
+| `call_catalog` | 从 active call facts 构建不可变 callable 目录；事实与关系负载只存一份，incoming/outgoing 使用紧凑 ID 邻接索引，请求按页物化歧义/未解析证据 |
 | `parser` | tree-sitter C/C++ 容错解析；唯一入口 `parse()`；提供 persistent/request facts 投影与 fact availability |
 | `store` | SQLite schema、迁移、事务、清理、写入，以及 durable read views / typed rows |
 | `pathing` | Windows 路径规范化、仓库相对路径、workspace hash |
@@ -350,10 +350,10 @@ Parser facts 合同：
 
 调用关系查询合同：
 
-- `RelationCatalog` 随 `EngineSnapshot` 原子发布，发布时预计算 incoming/outgoing 一跳缓存；请求不得直接查询 SQLite。
+- `RelationCatalog` 随 `EngineSnapshot` 原子发布；callable、call site 与逻辑 relation 负载各只存一份，incoming/outgoing 只保存共享 relation ID，协议 DTO 必须在分页和 call-site 上限之后物化；请求不得直接查询 SQLite 或深拷贝完整 catalog。
 - dirty index 可以重建完整关系目录，因为任一声明变化都可能改变跨文件候选；失败只标记 `callRelations` degraded，不得暴露半代目录。
-- open document overlay 以完整文档版本集合和 engine epoch 缓存；`didChange` / `didClose` 改变集合签名后旧项必须自然失效。
-- overlay generation 覆盖同一 workspace 的全部 open documents，因此查询 callee incoming 时必须看到其它未保存 buffer 的调用点；缓存键使用完整文档版本集合与 engine epoch。
+- open document overlay 只纳入内容与磁盘不同，或已保存但尚未发布更新 `SemanticGeneration` 的文档；普通 clean open document 直接复用基础 catalog。overlay 以有效文档版本集合和 engine epoch 缓存，`didOpen` / `didChange` / `didSave` / `didClose` 与索引发布必须主动释放旧项。
+- overlay generation 覆盖同一 workspace 的全部有效未同步文档，因此查询 callee incoming 时必须看到其它未保存 buffer 的调用点；缓存与请求只共享 `Arc<RelationCatalog>`，不得为读取或存储缓存深拷贝完整 catalog。
 - 标准 hierarchy item 携带 `CallableLocator`；entity key 失效后按 path、signature digest 与最近旧锚点保守重定位，不得只依赖瞬时数据库行号。
 - 名字、显式限定名、arity、internal linkage、same-file 与 include reachability 都只是证据；reachability 不得作为 hard filter。
 - 标准 LSP 只返回可表示的已解析候选；富协议同时返回 confidence、evidence、ambiguity、unresolved、revision、coverage 与 budget state。

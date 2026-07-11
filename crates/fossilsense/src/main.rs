@@ -304,12 +304,8 @@ fn run_query(kind: QueryCommand) -> Result<()> {
             let store = IndexStore::open_readonly(&db_path)?;
             let build_started = Instant::now();
             let view = store.call_fact_view();
-            let anchors = view.all_anchors()?;
-            let catalog = call_catalog::RelationCatalog::build_with_coverage(
-                anchors,
-                view.all_call_sites()?,
-                view.coverage()?,
-            );
+            let catalog = call_catalog::RelationCatalog::build_from_view(&view)?;
+            let catalog_stats = catalog.stats();
             let catalog_ms = build_started.elapsed().as_millis();
             let rel = pathing::normalize_path_string(&file);
             let position = call_model::SourcePosition {
@@ -354,6 +350,13 @@ fn run_query(kind: QueryCommand) -> Result<()> {
                 );
             }
             println!("relations: {}", relations.len());
+            println!("catalog_entities: {}", catalog_stats.entities);
+            println!("catalog_call_sites: {}", catalog_stats.call_sites);
+            println!("catalog_relations: {}", catalog_stats.relations);
+            println!(
+                "catalog_call_site_refs: {}",
+                catalog_stats.relation_call_site_refs
+            );
             println!("catalog_build_ms: {catalog_ms}");
             println!("query_us: {query_us}");
             println!("coverage: {}", serde_json::to_string(catalog.coverage())?);

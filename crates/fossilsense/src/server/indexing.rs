@@ -119,7 +119,7 @@ impl Backend {
     }
 
     pub(super) async fn spawn_dirty_files(&self, changes: Vec<RootDirtyChange>) {
-        self.session.cache.invalidate_after_index_change();
+        self.session.cache.invalidate_after_index_change().await;
         let roots = self.workspace_roots.lock().await.clone();
         let include_paths = self.include_paths.lock().await.clone();
         let client = self.client.clone();
@@ -152,7 +152,7 @@ impl Backend {
     }
 
     pub(super) async fn spawn_index_roots(&self, force: Option<bool>) {
-        self.session.cache.invalidate_after_index_change();
+        self.session.cache.invalidate_after_index_change().await;
         let roots = self.workspace_roots.lock().await.clone();
         let include_paths = self.include_paths.lock().await.clone();
         let client = self.client.clone();

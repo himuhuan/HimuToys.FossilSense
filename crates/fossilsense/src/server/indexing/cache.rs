@@ -58,11 +58,7 @@ async fn rebuild_relation_catalog(root: PathBuf) -> Result<Arc<RelationCatalog>>
         let db_path = pathing::default_index_path(&root)?;
         let store = IndexStore::open_readonly(&db_path)?;
         let view = store.call_fact_view();
-        Ok(RelationCatalog::build_with_coverage(
-            view.all_anchors()?,
-            view.all_call_sites()?,
-            view.coverage()?,
-        ))
+        RelationCatalog::build_from_view(&view)
     })
     .await?;
     built.map(Arc::new)
@@ -382,7 +378,7 @@ impl CacheLedger {
             degraded: degraded.clone(),
         })
         .await;
-        self.invalidate_after_index_change();
+        self.invalidate_after_index_change().await;
 
         Ok(CachePublishReport {
             symbol_count,
@@ -486,7 +482,7 @@ impl CacheLedger {
             degraded: degraded.clone(),
         })
         .await;
-        self.invalidate_after_index_change();
+        self.invalidate_after_index_change().await;
 
         Ok(CachePublishReport {
             symbol_count,
@@ -540,7 +536,7 @@ impl CacheLedger {
             degraded,
         })
         .await;
-        self.invalidate_after_index_change();
+        self.invalidate_after_index_change().await;
         self.completion_memo.lock().await.clear();
         Ok(project_count)
     }

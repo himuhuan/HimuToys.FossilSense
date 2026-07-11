@@ -77,6 +77,20 @@ impl<'a> CallFactStoreView<'a> {
         self.call_site_query("", [])
     }
 
+    pub fn visit_all_anchors(
+        &self,
+        visitor: impl FnMut(CallableAnchorRow) -> Result<()>,
+    ) -> Result<()> {
+        self.visit_anchors("", [], visitor)
+    }
+
+    pub fn visit_all_call_sites(
+        &self,
+        visitor: impl FnMut(CallSiteRow) -> Result<()>,
+    ) -> Result<()> {
+        self.visit_call_sites("", [], visitor)
+    }
+
     pub fn anchors_by_name(&self, name: &str) -> Result<Vec<CallableAnchorRow>> {
         self.anchor_query("WHERE a.name = ?1", [name])
     }
@@ -124,6 +138,20 @@ impl<'a> CallFactStoreView<'a> {
         predicate: &str,
         params: [&str; N],
     ) -> Result<Vec<CallableAnchorRow>> {
+        let mut output = Vec::new();
+        self.visit_anchors(predicate, params, |row| {
+            output.push(row);
+            Ok(())
+        })?;
+        Ok(output)
+    }
+
+    fn visit_anchors<const N: usize>(
+        &self,
+        predicate: &str,
+        params: [&str; N],
+        mut visitor: impl FnMut(CallableAnchorRow) -> Result<()>,
+    ) -> Result<()> {
         let sql = format!(
             "SELECT a.id, f.path, f.source, a.entity_key, a.anchor_fingerprint,
                     a.name, a.qualified_name, a.owner, a.owner_kind, a.kind, a.role,
@@ -141,7 +169,10 @@ impl<'a> CallFactStoreView<'a> {
         );
         let mut stmt = self.store.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(params), map_anchor)?;
-        collect(rows)
+        for row in rows {
+            visitor(row?)?;
+        }
+        Ok(())
     }
 
     fn call_site_query<const N: usize>(
@@ -149,6 +180,20 @@ impl<'a> CallFactStoreView<'a> {
         predicate: &str,
         params: [&str; N],
     ) -> Result<Vec<CallSiteRow>> {
+        let mut output = Vec::new();
+        self.visit_call_sites(predicate, params, |row| {
+            output.push(row);
+            Ok(())
+        })?;
+        Ok(output)
+    }
+
+    fn visit_call_sites<const N: usize>(
+        &self,
+        predicate: &str,
+        params: [&str; N],
+        mut visitor: impl FnMut(CallSiteRow) -> Result<()>,
+    ) -> Result<()> {
         let sql = format!(
             "SELECT c.id, f.path, f.source, c.caller_entity_key, c.site_fingerprint,
                     c.expression_start_byte, c.expression_end_byte, c.expression_start_line,
@@ -162,7 +207,10 @@ impl<'a> CallFactStoreView<'a> {
         );
         let mut stmt = self.store.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(params), map_call_site)?;
-        collect(rows)
+        for row in rows {
+            visitor(row?)?;
+        }
+        Ok(())
     }
 }
 
@@ -244,11 +292,4 @@ fn optional_range(row: &rusqlite::Row<'_>, start: usize) -> rusqlite::Result<Opt
             character: row.get::<_, i64>(start + 5)? as u32,
         },
     }))
-}
-
-fn collect<T>(
-    rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>>,
-) -> Result<Vec<T>> {
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(Into::into)
 }

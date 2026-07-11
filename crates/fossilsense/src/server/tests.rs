@@ -1350,8 +1350,92 @@ async fn cache_ledger_clears_reference_search_cache_after_document_and_index_cha
 
     cache.mark_reference_search_cache_for_test("root", "needle", 2);
     assert_eq!(cache.reference_search_cache_len_for_test(), 1);
-    cache.invalidate_after_index_change();
+    cache
+        .store_relation_overlay(
+            PathBuf::from("root"),
+            super::state::EngineEpoch::published(2),
+            7,
+            Arc::new(crate::call_catalog::RelationCatalog::default()),
+        )
+        .await;
+    assert_eq!(cache.relation_overlay_cache_len_for_test().await, 1);
+    cache.invalidate_after_index_change().await;
     assert_eq!(cache.reference_search_cache_len_for_test(), 0);
+    assert_eq!(cache.relation_overlay_cache_len_for_test().await, 0);
+}
+
+#[tokio::test]
+async fn workspace_document_lifecycle_drops_stale_relation_overlays() {
+    let documents = super::DocumentStore::default();
+    let cache = super::CacheLedger::default();
+    let session = super::WorkspaceSession::new(documents, cache.clone());
+    let uri = Url::parse("file:///tmp/relations.c").expect("uri");
+    let root = PathBuf::from("root");
+
+    cache
+        .store_relation_overlay(
+            root.clone(),
+            super::state::EngineEpoch::published(1),
+            1,
+            Arc::new(crate::call_catalog::RelationCatalog::default()),
+        )
+        .await;
+    session
+        .open_document(uri.clone(), 1, "void first(void);".into())
+        .await;
+    assert_eq!(cache.relation_overlay_cache_len_for_test().await, 0);
+
+    cache
+        .store_relation_overlay(
+            root.clone(),
+            super::state::EngineEpoch::published(1),
+            2,
+            Arc::new(crate::call_catalog::RelationCatalog::default()),
+        )
+        .await;
+    session
+        .change_document(uri.clone(), 2, "void second(void);".into())
+        .await;
+    assert_eq!(cache.relation_overlay_cache_len_for_test().await, 0);
+
+    cache
+        .store_relation_overlay(
+            root,
+            super::state::EngineEpoch::published(1),
+            3,
+            Arc::new(crate::call_catalog::RelationCatalog::default()),
+        )
+        .await;
+    session.close_document(&uri).await;
+    assert_eq!(cache.relation_overlay_cache_len_for_test().await, 0);
+}
+
+#[tokio::test]
+async fn relation_overlay_tracks_only_divergent_or_not_yet_indexed_documents() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("tracked.c");
+    std::fs::write(&path, "void tracked(void);\n").expect("write source");
+    let uri = Url::from_file_path(&path).expect("uri");
+    let documents = super::DocumentStore::default();
+
+    documents
+        .open_document(uri.clone(), 1, "void tracked(void);\n".into())
+        .await;
+    let clean = documents.snapshot(&uri).await.expect("clean snapshot");
+    assert!(!clean.needs_relation_overlay(crate::call_model::SemanticGeneration(4)));
+
+    documents
+        .change_document(uri.clone(), 2, "void changed(void);\n".into())
+        .await;
+    let unsaved = documents.snapshot(&uri).await.expect("unsaved snapshot");
+    assert!(unsaved.needs_relation_overlay(crate::call_model::SemanticGeneration(4)));
+
+    documents
+        .save_document(&uri, crate::call_model::SemanticGeneration(4))
+        .await;
+    let awaiting = documents.snapshot(&uri).await.expect("saved snapshot");
+    assert!(awaiting.needs_relation_overlay(crate::call_model::SemanticGeneration(4)));
+    assert!(!awaiting.needs_relation_overlay(crate::call_model::SemanticGeneration(5)));
 }
 
 #[tokio::test]

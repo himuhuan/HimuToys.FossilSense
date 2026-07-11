@@ -1,6 +1,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -10,10 +11,10 @@ use tower_lsp::lsp_types::{
 };
 
 use super::{uri_to_path, Backend};
-use crate::call_catalog::RelationCatalog;
+use crate::call_catalog::{RelationCatalog, RelationPage};
 use crate::call_model::{
-    BudgetState, CallRelation, CallableEntity, CallableLocator, CoverageSummary, RelationRevision,
-    SourcePosition, SourceRange, RELATION_PROTOCOL_VERSION,
+    BudgetState, CallRelation, CallableEntity, CallableLocator, CoverageSummary, RelationDirection,
+    RelationRevision, SourcePosition, SourceRange, RELATION_PROTOCOL_VERSION,
 };
 use crate::pathing;
 use crate::reachability::ReachGraph;
@@ -31,25 +32,36 @@ struct ItemData {
 
 pub(super) struct RelationRequestState {
     pub(super) root: PathBuf,
-    pub(super) catalog: RelationCatalog,
+    pub(super) catalog: Arc<RelationCatalog>,
     pub(super) revision: RelationRevision,
     reach_graph: Option<std::sync::Arc<ReachGraph>>,
 }
 
 impl RelationRequestState {
-    pub(super) fn outgoing(&self, entity_key: &str) -> Vec<CallRelation> {
-        self.with_reachability(self.catalog.outgoing(entity_key))
+    fn relation_page(
+        &self,
+        direction: RelationDirection,
+        entity_key: &str,
+        cursor: usize,
+        relation_limit: usize,
+        call_site_limit: usize,
+    ) -> RelationPage {
+        let mut page = self.catalog.relation_page(
+            direction,
+            entity_key,
+            cursor,
+            relation_limit,
+            call_site_limit,
+        );
+        self.with_reachability(&mut page.relations);
+        page
     }
 
-    pub(super) fn incoming(&self, entity_key: &str) -> Vec<CallRelation> {
-        self.with_reachability(self.catalog.incoming(entity_key))
-    }
-
-    fn with_reachability(&self, mut relations: Vec<CallRelation>) -> Vec<CallRelation> {
+    fn with_reachability(&self, relations: &mut [CallRelation]) {
         let Some(graph) = &self.reach_graph else {
-            return relations;
+            return;
         };
-        for relation in &mut relations {
+        for relation in relations {
             let Some(callee) = &relation.callee else {
                 continue;
             };
@@ -80,7 +92,6 @@ impl RelationRequestState {
                     .push(crate::call_model::EvidenceCode::OpenIncludeScope);
             }
         }
-        relations
     }
 }
 
@@ -106,30 +117,40 @@ impl Backend {
             };
             entity.entity_key.clone()
         };
-        let relations = match arg.get("direction").and_then(Value::as_str) {
-            Some("incoming") => state.incoming(&entity_key),
-            _ => state.outgoing(&entity_key),
+        let direction = match arg.get("direction").and_then(Value::as_str) {
+            Some("incoming") => RelationDirection::Incoming,
+            _ => RelationDirection::Outgoing,
         };
-        Some(RichRelationResponse::new(
+        let cursor = arg.get("cursor").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let page = state.relation_page(
+            direction,
+            &entity_key,
+            cursor,
+            RICH_RELATION_PAGE_SIZE,
+            CALL_SITE_LIMIT,
+        );
+        Some(RichRelationResponse::to_value(
             state.revision,
-            relations,
+            page,
             state.catalog.coverage().clone(),
-            arg.get("cursor").and_then(Value::as_u64).unwrap_or(0) as usize,
+            cursor,
         ))
     }
 
     pub(super) async fn relation_state_for_uri(&self, uri: &Url) -> Option<RelationRequestState> {
         let root = self.root_for_uri(uri).await?;
         let context = self.request_context_for_root(root.clone()).await;
-        let base = context.engine.relation_catalog.as_deref()?.clone();
+        let base = context.engine.relation_catalog.clone()?;
         let mut snapshots: Vec<_> = self
             .session
             .documents
             .all_snapshots()
             .await
             .into_iter()
-            .filter(|(document_uri, _)| {
-                uri_to_path(document_uri).is_some_and(|path| pathing::path_is_within(&root, &path))
+            .filter(|(document_uri, snapshot)| {
+                snapshot.needs_relation_overlay(context.engine.semantic_generation)
+                    && uri_to_path(document_uri)
+                        .is_some_and(|path| pathing::path_is_within(&root, &path))
             })
             .collect();
         snapshots.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
@@ -151,7 +172,7 @@ impl Backend {
             .cached_relation_overlay(&root, context.engine.epoch, overlay_epoch)
             .await
         {
-            (*cached).clone()
+            cached
         } else {
             let mut overlays = Vec::with_capacity(snapshots.len());
             for (document_uri, snapshot) in snapshots {
@@ -171,14 +192,14 @@ impl Backend {
                     parsed.call_sites.clone(),
                 ));
             }
-            let catalog = base.with_overlays(overlays);
+            let catalog = Arc::new(base.with_overlays(overlays));
             self.session
                 .cache
                 .store_relation_overlay(
                     root.clone(),
                     context.engine.epoch,
                     overlay_epoch,
-                    std::sync::Arc::new(catalog.clone()),
+                    catalog.clone(),
                 )
                 .await;
             catalog
@@ -226,9 +247,15 @@ impl Backend {
         let key = item_key(&state.catalog, item)?;
         Some(
             state
-                .incoming(&key)
+                .relation_page(
+                    RelationDirection::Incoming,
+                    &key,
+                    0,
+                    STANDARD_RELATION_LIMIT,
+                    usize::MAX,
+                )
+                .relations
                 .into_iter()
-                .take(STANDARD_RELATION_LIMIT)
                 .filter_map(|relation| {
                     Some(CallHierarchyIncomingCall {
                         from: entity_to_item(&state.root, &relation.caller)?,
@@ -251,9 +278,15 @@ impl Backend {
         let key = item_key(&state.catalog, item)?;
         Some(
             state
-                .outgoing(&key)
+                .relation_page(
+                    RelationDirection::Outgoing,
+                    &key,
+                    0,
+                    STANDARD_RELATION_LIMIT,
+                    usize::MAX,
+                )
+                .relations
                 .into_iter()
-                .take(STANDARD_RELATION_LIMIT)
                 .filter_map(|relation| {
                     Some(CallHierarchyOutgoingCall {
                         to: entity_to_item(&state.root, relation.callee.as_ref()?)?,
@@ -333,26 +366,18 @@ pub(super) struct RichRelationResponse {
 }
 
 impl RichRelationResponse {
-    pub(super) fn new(
+    pub(super) fn to_value(
         revision: RelationRevision,
-        relations: Vec<CallRelation>,
+        page: RelationPage,
         coverage: CoverageSummary,
         cursor: usize,
     ) -> Value {
-        let total = relations.len();
-        let mut relations: Vec<_> = relations
-            .into_iter()
-            .skip(cursor)
-            .take(RICH_RELATION_PAGE_SIZE)
-            .collect();
+        let RelationPage {
+            relations,
+            total,
+            site_limited,
+        } = page;
         let relation_limited = cursor.saturating_add(relations.len()) < total;
-        let mut site_limited = false;
-        for relation in &mut relations {
-            if relation.call_sites.len() > CALL_SITE_LIMIT {
-                relation.call_sites.truncate(CALL_SITE_LIMIT);
-                site_limited = true;
-            }
-        }
         let limited = relation_limited || site_limited;
         let next_cursor = relation_limited.then_some(cursor.saturating_add(relations.len()));
         serde_json::to_value(Self {
