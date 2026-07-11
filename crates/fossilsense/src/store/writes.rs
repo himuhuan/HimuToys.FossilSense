@@ -71,11 +71,14 @@ pub(super) fn stage_file_updates(
                 min_arity, max_arity, variadic,
                 name_start_byte, name_end_byte, name_start_line, name_start_col,
                 name_end_line, name_end_col, declaration_start_byte, declaration_end_byte,
-                body_start_byte, body_end_byte, guard, provenance, syntax_error_overlap
+                declaration_start_line, declaration_start_col, declaration_end_line,
+                declaration_end_col, body_start_byte, body_end_byte, body_start_line,
+                body_start_col, body_end_line, body_end_col, guard, provenance,
+                syntax_error_overlap
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                 ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25,
-                ?26, ?27, ?28, ?29
+                ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37
              )",
         )?;
         let mut call_site_stmt = tx.prepare(
@@ -306,8 +309,16 @@ pub(super) fn stage_file_updates(
                     anchor.name_range.end.character as i64,
                     anchor.declaration_range.start_byte as i64,
                     anchor.declaration_range.end_byte as i64,
+                    anchor.declaration_range.start.line as i64,
+                    anchor.declaration_range.start.character as i64,
+                    anchor.declaration_range.end.line as i64,
+                    anchor.declaration_range.end.character as i64,
                     anchor.body_range.map(|range| range.start_byte as i64),
                     anchor.body_range.map(|range| range.end_byte as i64),
+                    anchor.body_range.map(|range| range.start.line as i64),
+                    anchor.body_range.map(|range| range.start.character as i64),
+                    anchor.body_range.map(|range| range.end.line as i64),
+                    anchor.body_range.map(|range| range.end.character as i64),
                     anchor.guard.as_deref(),
                     anchor.provenance.as_str(),
                     i64::from(anchor.syntax_error_overlap),

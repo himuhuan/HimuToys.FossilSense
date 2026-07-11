@@ -34,10 +34,8 @@ fn anchor(key: &str, name: &str, path: &str, role: AnchorRole, arity: u32) -> Ca
         max_arity: Some(arity),
         variadic: false,
         name_range: range(4, 4 + name.len()),
-        declaration_start_byte: 0,
-        declaration_end_byte: 20,
-        body_start_byte: (role == AnchorRole::Definition).then_some(20),
-        body_end_byte: (role == AnchorRole::Definition).then_some(40),
+        declaration_range: range(0, 20),
+        body_range: (role == AnchorRole::Definition).then(|| range(20, 40)),
         guard: None,
         provenance: "ast".into(),
         syntax_error_overlap: false,
@@ -150,4 +148,68 @@ fn stale_entity_key_remaps_by_path_signature_and_nearest_anchor() {
         catalog.resolve_locator(&locator).unwrap().entity_key,
         "fresh"
     );
+}
+
+#[test]
+fn root_lookup_only_tests_variants_from_the_requested_file() {
+    let header = anchor("shared", "shared", "api.h", AnchorRole::Declaration, 0);
+    let mut definition = anchor("shared", "shared", "impl.c", AnchorRole::Definition, 0);
+    definition.name_range.start.line = 5;
+    definition.name_range.end.line = 5;
+    definition.declaration_range.start.line = 5;
+    definition.declaration_range.end.line = 6;
+    definition.body_range.as_mut().unwrap().start.line = 5;
+    definition.body_range.as_mut().unwrap().end.line = 6;
+    let local = anchor("local", "local", "impl.c", AnchorRole::Definition, 0);
+    let catalog = RelationCatalog::build(vec![header, definition, local], vec![]);
+    assert_eq!(
+        catalog
+            .entity_at(
+                "impl.c",
+                SourcePosition {
+                    line: 0,
+                    character: 4,
+                },
+            )
+            .unwrap()
+            .entity_key,
+        "local"
+    );
+}
+
+#[test]
+#[ignore = "diagnostic scale benchmark; run explicitly in release mode"]
+fn benchmark_large_fan_in_catalog_and_cached_query() {
+    const CALLERS: usize = 5_000;
+    let mut anchors = Vec::with_capacity(CALLERS + 1);
+    let mut calls = Vec::with_capacity(CALLERS);
+    anchors.push(anchor(
+        "target",
+        "shared_target",
+        "target.c",
+        AnchorRole::Definition,
+        0,
+    ));
+    for index in 0..CALLERS {
+        let key = format!("caller-{index}");
+        let path = format!("src/caller-{index}.c");
+        anchors.push(anchor(
+            &key,
+            &format!("caller_{index}"),
+            &path,
+            AnchorRole::Definition,
+            0,
+        ));
+        calls.push(call(&key, "shared_target", &path, 0));
+    }
+    let build_started = std::time::Instant::now();
+    let catalog = RelationCatalog::build(anchors, calls);
+    let build_ms = build_started.elapsed().as_millis();
+    let query_started = std::time::Instant::now();
+    let incoming = catalog.incoming("target");
+    let query_us = query_started.elapsed().as_micros();
+    eprintln!(
+        "call_relation_benchmark callers={CALLERS} build_ms={build_ms} cached_incoming_us={query_us}"
+    );
+    assert_eq!(incoming.len(), CALLERS);
 }

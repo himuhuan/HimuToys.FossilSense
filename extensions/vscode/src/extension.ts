@@ -282,6 +282,7 @@ async function startServer(context: vscode.ExtensionContext): Promise<void> {
   client.onNotification('fossilsense/indexStatus', (status: IndexStatus) => {
     handleIndexStatus(status);
     if (status.state === 'ready') {
+      callRelationsController.clear();
       void applyProjectContextSelectionFromState(context).then(() =>
         updateProjectContextForActiveEditor(context),
       );

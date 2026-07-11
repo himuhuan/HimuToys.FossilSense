@@ -187,6 +187,7 @@ Smart Completion 当前约定：
 | v1.3.0 | 架构健康与补全 evidence 版本；收敛 parser/store/server 边界，并加入有界 language builtin 与 project context 普通补全证据 |
 | v1.3.1 | 项目上下文补全版本；加入构建标记发现、最近祖先项目归属和同项目普通补全排序证据，并保持严格 opt-out parity |
 | v1.3.2 | 解析类型符号卫生修复；注释/字面量不再污染 type symbols，AST 精确类型名优先，关键词不可跳转，schema 11 强制重建 |
+| v1.3.3 | 有证据的一跳调用关系版本；统一代际 callable/call-site facts、标准 LSP、富协议、workspace open-document overlay 与原生双视图；schema 14 |
 | 后置能力 | auto include insertion、ML ranker、telemetry、cloud sync、完整 C++ 语义仍不属于当前版本 |
 
 项目上下文约定：
@@ -345,7 +346,7 @@ Parser facts 合同：
 - C/C++ 自由函数是关系解析的正式候选；record method、member call、函数指针和 callable object 仍持久化为显式事实，但不得伪装为已绑定关系。
 - 外部头只贡献声明锚点，不索引函数体调用点。
 - 全局初始化表达式使用 synthetic global initializer 作为 caller；lambda 内调用暂不错误归属给外层函数。
-- schema 13 为 callable anchors / call sites 建立独立 active views 和查询索引，与统一语义代际一起发布。
+- schema 14 为 callable anchors / call sites 建立独立 active views 和查询索引，并完整保存 declaration/body UTF-16 ranges，与统一语义代际一起发布。
 
 调用关系查询合同：
 
@@ -466,7 +467,7 @@ pnpm run package
 
 调用关系 UI：
 
-- `FossilSense: Show Call Relations` 从活动 C/C++ 光标加载 outgoing；Explorer 中 `FossilSense Call Relations` 可切 incoming/outgoing。
+- `FossilSense: Analyse Call Hierarchy` 从活动 C/C++ 光标默认加载 incoming；Relation Panel 中 `FossilSense Call Relations` 可切 incoming/outgoing。
 - 选择关系必须同时导航目标并刷新 `FossilSense Call Sites & Evidence`，后者展示 coverage、confidence/evidence 和每个可跳转 call site。
 - 扩展只渲染 `fossilsense.lsp.callRelations` 富协议，不得在 TypeScript 侧重新解析或绑定源码。
 

@@ -17,6 +17,9 @@ fn callable_and_call_site_facts_round_trip_through_active_views() {
     assert_eq!(helper[0].linkage_kind, "internal");
     assert_eq!(helper[0].min_arity, Some(1));
     assert_eq!(helper[0].role, "definition");
+    assert_eq!(helper[0].declaration_range.start.line, 0);
+    assert_eq!(helper[0].declaration_range.end.line, 0);
+    assert!(helper[0].body_range.is_some());
 
     let calls = store
         .call_fact_view()

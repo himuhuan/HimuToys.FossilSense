@@ -1,8 +1,8 @@
 {
   "name": "fossilsense-vscode",
   "displayName": "FossilSense",
-  "description": "FossilSense C/C++ best-effort navigation: symbols, outlines, rich hover, ranked definitions, member completion, role-grouped references, and local-only history-aware completion.",
-  "version": "1.3.2",
+  "description": "FossilSense C/C++ best-effort navigation: evidence-backed call relations, symbols, outlines, rich hover, ranked definitions, completion, and role-grouped references.",
+  "version": "1.3.3",
   "private": true,
   "license": "UNLICENSED",
   "publisher": "himutoys",
@@ -49,7 +49,7 @@
       },
       {
         "command": "fossilsense.showCallRelations",
-        "title": "FossilSense: Show Call Relations"
+        "title": "FossilSense: Analyse Call Hierarchy"
       },
       {
         "command": "fossilsense.refreshCallRelations",
@@ -75,8 +75,17 @@
         "title": "FossilSense: Open Call Site"
       }
     ],
+    "viewsContainers": {
+      "panel": [
+        {
+          "id": "fossilsense.relations",
+          "title": "FossilSense Relations",
+          "icon": "media/relations.svg"
+        }
+      ]
+    },
     "views": {
-      "explorer": [
+      "fossilsense.relations": [
         {
           "id": "fossilsense.callRelations",
           "name": "FossilSense Call Relations"
@@ -90,7 +99,7 @@
     "viewsWelcome": [
       {
         "view": "fossilsense.callRelations",
-        "contents": "Place the cursor on a free function, then [Show Call Relations](command:fossilsense.showCallRelations)."
+        "contents": "Place the cursor on a free function, then [Analyse Call Hierarchy](command:fossilsense.showCallRelations)."
       },
       {
         "view": "fossilsense.callSites",

@@ -7,19 +7,20 @@ native Rust indexing engine - no external tools (ctags / cscope / clangd) requir
 This VSIX is self-contained: the `fossilsense` engine binary ships inside the
 extension's `bin/` folder.
 
-v1.3.2 is a parser hygiene fix release. It stops trailing comments and string
-literals from becoming fake type symbols, prefers AST-exact type-name ranges
-when a usable syntax tree exists, rejects language keywords as Go to Definition
-targets, and bumps the index schema so stale polluted rows are rebuilt. Project
-context and other completion evidence remain behavior-preserving outside this
-fix.
+v1.3.3 introduces evidence-backed one-hop call relations for C/C++ free
+functions. Callable and call-site facts are published in the same immutable
+semantic generation as the rest of the index; standard LSP Call Hierarchy and
+the native FossilSense Relation Panel share one resolver, including unsaved
+workspace overlays, ambiguity, coverage, freshness, and bounded-result state.
+Unsupported C++ dispatch and indirect forms stay explicit instead of being
+presented as compiler-proven edges.
 
 ## Current Capability
 
 - Go to Definition / Workspace Symbols / Document Outline.
 - One-hop Call Relations for C/C++ free functions: VS Code's standard Call
-  Hierarchy is available, and **FossilSense: Show Call Relations** opens two
-  native Explorer views. The first switches between incoming/outgoing targets;
+  Hierarchy is available, and **FossilSense: Analyse Call Hierarchy** opens two
+  native Relation Panel views. The first switches between incoming/outgoing targets;
   selecting one navigates to it and populates the second view with exact call
   sites, confidence, evidence, coverage, and budget state. Unsaved calls from
   every open document in the workspace participate. Member calls, function

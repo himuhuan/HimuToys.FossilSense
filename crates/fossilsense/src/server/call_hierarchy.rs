@@ -25,6 +25,7 @@ const CALL_SITE_LIMIT: usize = 200;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ItemData {
+    entity_key: String,
     locator: CallableLocator,
 }
 
@@ -162,22 +163,26 @@ impl Backend {
         })
     }
 
-    pub(super) async fn prepare_call_item(
+    pub(super) async fn prepare_call_items(
         &self,
         uri: &Url,
         position: Position,
-    ) -> Option<CallHierarchyItem> {
+    ) -> Option<Vec<CallHierarchyItem>> {
         let state = self.relation_state_for_uri(uri).await?;
         let path = uri_to_path(uri)?;
         let rel = catalog_path(&state.root, &path)?;
-        let entity = state.catalog.entity_at(
+        let entities = state.catalog.entities_at(
             &rel,
             SourcePosition {
                 line: position.line,
                 character: position.character,
             },
-        )?;
-        entity_to_item(&state.root, entity)
+        );
+        let items: Vec<_> = entities
+            .into_iter()
+            .filter_map(|entity| entity_to_item(&state.root, entity))
+            .collect();
+        (!items.is_empty()).then_some(items)
     }
 
     pub(super) async fn standard_incoming(
@@ -254,6 +259,7 @@ pub(super) fn entity_to_item(root: &Path, entity: &CallableEntity) -> Option<Cal
         range: source_range(anchor.declaration_range),
         selection_range: source_range(anchor.name_range),
         data: serde_json::to_value(ItemData {
+            entity_key: entity.entity_key.clone(),
             locator: CallableLocator {
                 workspace_id: pathing::workspace_hash(root),
                 path: anchor.path.clone(),

@@ -19,6 +19,14 @@ export const SELECT_CALL_RELATION_COMMAND = 'fossilsense.selectCallRelation';
 export const OPEN_CALL_SITE_COMMAND = 'fossilsense.openCallSite';
 const CALL_RELATIONS_LSP_COMMAND = 'fossilsense.lsp.callRelations';
 
+interface PreparedCallItem {
+  name: string;
+  detail?: string;
+  uri: string;
+  selectionRange: { start: { line: number; character: number } };
+  data?: { entityKey?: string };
+}
+
 class RelationItem extends vscode.TreeItem {
   constructor(
     readonly relation: CallRelation,
@@ -94,10 +102,11 @@ export class CallRelationsController {
   private readonly siteEmitter = new vscode.EventEmitter<void>();
   private response: RichRelationResponse | undefined;
   private selected: CallRelation | undefined;
-  private direction: RelationDirection = 'outgoing';
+  private direction: RelationDirection = 'incoming';
   private lastLocation: { uri: vscode.Uri; line: number; character: number } | undefined;
   private workspaceFolder: vscode.WorkspaceFolder | undefined;
   private requestSerial = 0;
+  private rootEntityKey: string | undefined;
 
   readonly relationProvider: vscode.TreeDataProvider<RelationNode> = {
     onDidChangeTreeData: this.relationEmitter.event,
@@ -125,10 +134,10 @@ export class CallRelationsController {
             { kind: 'coverage', response: this.response } as SiteNode,
             ...(this.selected
               ? [
-            { kind: 'evidence', relation: this.selected } as SiteNode,
-            ...this.selected.callSites.map(
-              (site): SiteNode => ({ kind: 'site', relation: this.selected!, site }),
-            ),
+                  { kind: 'evidence', relation: this.selected } as SiteNode,
+                  ...this.selected.callSites.map(
+                    (site): SiteNode => ({ kind: 'site', relation: this.selected!, site }),
+                  ),
                 ]
               : []),
           ]
@@ -141,6 +150,7 @@ export class CallRelationsController {
     this.response = undefined;
     this.selected = undefined;
     this.lastLocation = undefined;
+    this.rootEntityKey = undefined;
     this.requestSerial += 1;
     this.relationEmitter.fire();
     this.siteEmitter.fire();
@@ -172,6 +182,7 @@ export class CallRelationsController {
         character: active.selection.active.character,
       };
       this.workspaceFolder = vscode.workspace.getWorkspaceFolder(active.document.uri);
+      this.rootEntityKey = undefined;
     }
     const client = this.getClient();
     if (!client || !this.lastLocation) {
@@ -182,9 +193,62 @@ export class CallRelationsController {
     const requestSerial = ++this.requestSerial;
     let response: RichRelationResponse | null;
     try {
+      if (!this.rootEntityKey) {
+        const prepared = await client.sendRequest<PreparedCallItem[] | null>(
+          'textDocument/prepareCallHierarchy',
+          {
+            textDocument: { uri: this.lastLocation.uri.toString() },
+            position: {
+              line: this.lastLocation.line,
+              character: this.lastLocation.character,
+            },
+          },
+        );
+        if (requestSerial !== this.requestSerial) {
+          return;
+        }
+        if (!prepared?.length) {
+          this.response = undefined;
+          this.selected = undefined;
+          this.relationEmitter.fire();
+          this.siteEmitter.fire();
+          void vscode.window.showInformationMessage('No callable function at the current cursor.');
+          return;
+        }
+        let selected = prepared[0];
+        if (prepared.length > 1) {
+          const pick = await vscode.window.showQuickPick(
+            prepared.map((item) => ({
+              label: item.name,
+              description: item.detail,
+              detail: `${vscode.workspace.asRelativePath(vscode.Uri.parse(item.uri), false)}:${item.selectionRange.start.line + 1}`,
+              item,
+            })),
+            {
+              placeHolder:
+                'Select the callable root; FossilSense will not guess among candidates.',
+            },
+          );
+          if (!pick || requestSerial !== this.requestSerial) {
+            return;
+          }
+          selected = pick.item;
+        }
+        this.rootEntityKey = selected.data?.entityKey;
+        if (!this.rootEntityKey) {
+          throw new Error('server returned a call hierarchy item without a stable entity key');
+        }
+      }
       response = (await client.sendRequest(ExecuteCommandRequest.type, {
         command: CALL_RELATIONS_LSP_COMMAND,
-        arguments: [{ ...this.lastLocation, uri: this.lastLocation.uri.toString(), direction }],
+        arguments: [
+          {
+            ...this.lastLocation,
+            uri: this.lastLocation.uri.toString(),
+            direction,
+            entityKey: this.rootEntityKey,
+          },
+        ],
       })) as RichRelationResponse | null;
     } catch (error) {
       if (requestSerial === this.requestSerial) {
@@ -205,6 +269,7 @@ export class CallRelationsController {
   }
 
   async refresh(): Promise<void> {
+    this.rootEntityKey = undefined;
     await this.show(this.direction, false);
   }
 
@@ -225,7 +290,7 @@ export function registerCallRelationViews(
     ),
     vscode.window.registerTreeDataProvider('fossilsense.callSites', controller.siteProvider),
     vscode.commands.registerCommand(SHOW_CALL_RELATIONS_COMMAND, () =>
-      controller.show('outgoing'),
+      controller.show('incoming'),
     ),
     vscode.commands.registerCommand(SHOW_INCOMING_CALLS_COMMAND, () =>
       controller.switchDirection('incoming'),

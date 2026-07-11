@@ -26,10 +26,8 @@ pub struct CallableAnchorRow {
     pub max_arity: Option<u32>,
     pub variadic: bool,
     pub name_range: SourceRange,
-    pub declaration_start_byte: usize,
-    pub declaration_end_byte: usize,
-    pub body_start_byte: Option<usize>,
-    pub body_end_byte: Option<usize>,
+    pub declaration_range: SourceRange,
+    pub body_range: Option<SourceRange>,
     pub guard: Option<String>,
     pub provenance: String,
     pub syntax_error_overlap: bool,
@@ -133,8 +131,11 @@ impl<'a> CallFactStoreView<'a> {
                     a.variadic, a.name_start_byte, a.name_end_byte, a.name_start_line,
                     a.name_start_col, a.name_end_line, a.name_end_col,
                     a.declaration_start_byte, a.declaration_end_byte,
-                    a.body_start_byte, a.body_end_byte, a.guard, a.provenance,
-                    a.syntax_error_overlap
+                    a.declaration_start_line, a.declaration_start_col,
+                    a.declaration_end_line, a.declaration_end_col,
+                    a.body_start_byte, a.body_end_byte, a.body_start_line,
+                    a.body_start_col, a.body_end_line, a.body_end_col,
+                    a.guard, a.provenance, a.syntax_error_overlap
              FROM callable_anchors a JOIN files f ON f.id = a.file_id {predicate}
              ORDER BY a.qualified_name, f.path, a.name_start_byte"
         );
@@ -185,13 +186,11 @@ fn map_anchor(row: &rusqlite::Row<'_>) -> rusqlite::Result<CallableAnchorRow> {
         max_arity: row.get::<_, Option<i64>>(15)?.map(|value| value as u32),
         variadic: row.get::<_, i64>(16)? != 0,
         name_range: range(row, 17)?,
-        declaration_start_byte: row.get::<_, i64>(23)? as usize,
-        declaration_end_byte: row.get::<_, i64>(24)? as usize,
-        body_start_byte: row.get::<_, Option<i64>>(25)?.map(|value| value as usize),
-        body_end_byte: row.get::<_, Option<i64>>(26)?.map(|value| value as usize),
-        guard: row.get(27)?,
-        provenance: row.get(28)?,
-        syntax_error_overlap: row.get::<_, i64>(29)? != 0,
+        declaration_range: range(row, 23)?,
+        body_range: optional_range(row, 29)?,
+        guard: row.get(35)?,
+        provenance: row.get(36)?,
+        syntax_error_overlap: row.get::<_, i64>(37)? != 0,
     })
 }
 
@@ -227,6 +226,24 @@ fn range(row: &rusqlite::Row<'_>, start: usize) -> rusqlite::Result<SourceRange>
             character: row.get::<_, i64>(start + 5)? as u32,
         },
     })
+}
+
+fn optional_range(row: &rusqlite::Row<'_>, start: usize) -> rusqlite::Result<Option<SourceRange>> {
+    let Some(start_byte) = row.get::<_, Option<i64>>(start)? else {
+        return Ok(None);
+    };
+    Ok(Some(SourceRange {
+        start_byte: start_byte as usize,
+        end_byte: row.get::<_, i64>(start + 1)? as usize,
+        start: SourcePosition {
+            line: row.get::<_, i64>(start + 2)? as u32,
+            character: row.get::<_, i64>(start + 3)? as u32,
+        },
+        end: SourcePosition {
+            line: row.get::<_, i64>(start + 4)? as u32,
+            character: row.get::<_, i64>(start + 5)? as u32,
+        },
+    }))
 }
 
 fn collect<T>(

@@ -23,6 +23,7 @@ mod store;
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -101,6 +102,23 @@ enum QueryCommand {
         line: usize,
         /// 1-based column of the cursor.
         col: usize,
+    },
+    /// Resolve cached one-hop call relations for a callable at a position.
+    Calls {
+        /// Workspace root whose index to query.
+        workspace: PathBuf,
+        /// Source file, relative to the workspace root.
+        file: PathBuf,
+        /// 1-based line number on the callable name.
+        line: usize,
+        /// 1-based column on the callable name.
+        col: usize,
+        /// Query incoming callers instead of outgoing callees.
+        #[arg(long)]
+        incoming: bool,
+        /// Override the SQLite index path (defaults to the cache location).
+        #[arg(long)]
+        db: Option<PathBuf>,
     },
 }
 
@@ -270,6 +288,86 @@ fn run_query(kind: QueryCommand) -> Result<()> {
                     hit.rel_path,
                     hit.line + 1,
                     hit.start_col_utf16 + 1
+                );
+            }
+            Ok(())
+        }
+        QueryCommand::Calls {
+            workspace,
+            file,
+            line,
+            col,
+            incoming,
+            db,
+        } => {
+            let db_path = resolve_db_path(db, &workspace)?;
+            let store = IndexStore::open_readonly(&db_path)?;
+            let build_started = Instant::now();
+            let view = store.call_fact_view();
+            let anchors = view.all_anchors()?;
+            let catalog = call_catalog::RelationCatalog::build_with_coverage(
+                anchors,
+                view.all_call_sites()?,
+                view.coverage()?,
+            );
+            let catalog_ms = build_started.elapsed().as_millis();
+            let rel = pathing::normalize_path_string(&file);
+            let position = call_model::SourcePosition {
+                line: line.checked_sub(1).context("line is 1-based")? as u32,
+                character: col.checked_sub(1).context("column is 1-based")? as u32,
+            };
+            let entity = catalog
+                .entity_at(&rel, position)
+                .with_context(|| format!("no callable at {}:{line}:{col}", file.display()))?;
+            let entity_key = entity.entity_key.clone();
+            let query_started = Instant::now();
+            let relations = if incoming {
+                catalog.incoming(&entity_key)
+            } else {
+                catalog.outgoing(&entity_key)
+            };
+            let query_us = query_started.elapsed().as_micros();
+            println!(
+                "call_relations: {}",
+                if incoming { "incoming" } else { "outgoing" }
+            );
+            println!(
+                "requested_position: {}:{}",
+                position.line + 1,
+                position.character + 1
+            );
+            println!("root: {}", entity.qualified_name);
+            println!(
+                "root_range: {}:{}-{}:{}",
+                entity.primary_anchor.name_range.start.line + 1,
+                entity.primary_anchor.name_range.start.character + 1,
+                entity.primary_anchor.name_range.end.line + 1,
+                entity.primary_anchor.name_range.end.character + 1
+            );
+            if let Some(body) = entity.primary_anchor.body_range {
+                println!(
+                    "body_range: {}:{}-{}:{}",
+                    body.start.line + 1,
+                    body.start.character + 1,
+                    body.end.line + 1,
+                    body.end.character + 1
+                );
+            }
+            println!("relations: {}", relations.len());
+            println!("catalog_build_ms: {catalog_ms}");
+            println!("query_us: {query_us}");
+            println!("coverage: {}", serde_json::to_string(catalog.coverage())?);
+            for relation in relations {
+                let target = relation
+                    .callee
+                    .as_ref()
+                    .map_or("<unresolved>", |callee| callee.qualified_name.as_str());
+                println!(
+                    "{}\t{:?}\t{} sites\t{:?}",
+                    target,
+                    relation.confidence,
+                    relation.call_sites.len(),
+                    relation.evidence
                 );
             }
             Ok(())

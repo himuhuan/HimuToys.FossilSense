@@ -178,21 +178,53 @@ impl RelationCatalog {
     }
 
     pub fn entity_at(&self, path: &str, position: SourcePosition) -> Option<&CallableEntity> {
-        self.by_path
-            .get(path)?
+        self.entities_at(path, position).into_iter().next()
+    }
+
+    pub fn entities_at(&self, path: &str, position: SourcePosition) -> Vec<&CallableEntity> {
+        let mut call_candidates = Vec::new();
+        for call in self
+            .call_sites
             .iter()
+            .filter(|call| call.path == path && position_in_range(position, call.callee_range))
+        {
+            call_candidates.extend(
+                self.resolve_call(call)
+                    .into_iter()
+                    .map(|(entity, _)| entity),
+            );
+        }
+        call_candidates.sort_by(|a, b| a.entity_key.cmp(&b.entity_key));
+        call_candidates.dedup_by(|a, b| a.entity_key == b.entity_key);
+        if !call_candidates.is_empty() {
+            return call_candidates;
+        }
+
+        let matches: Vec<_> = self
+            .by_path
+            .get(path)
+            .into_iter()
+            .flatten()
             .filter_map(|key| self.entities.get(key))
             .filter(|entity| eligible_free_function(entity))
             .filter(|entity| {
-                entity
-                    .variants
-                    .iter()
-                    .any(|anchor| position_in_range(position, anchor.declaration_range))
+                entity.variants.iter().any(|anchor| {
+                    anchor.path == path
+                        && (position_in_range(position, anchor.name_range)
+                            || anchor
+                                .body_range
+                                .is_some_and(|range| position_in_range(position, range)))
+                })
             })
+            .collect();
+        matches
+            .into_iter()
             .min_by_key(|entity| {
                 let range = entity.primary_anchor.declaration_range;
                 range.end_byte.saturating_sub(range.start_byte)
             })
+            .into_iter()
+            .collect()
     }
 
     pub fn outgoing(&self, caller_key: &str) -> Vec<CallRelation> {
@@ -449,21 +481,8 @@ fn anchor_from_row(row: CallableAnchorRow) -> CallableAnchor {
         "internal" => LinkageDomain::Internal(row.path.clone()),
         _ => LinkageDomain::Unknown,
     };
-    let declaration_range = SourceRange {
-        start_byte: row.declaration_start_byte,
-        end_byte: row.declaration_end_byte,
-        start: row.name_range.start,
-        end: row.name_range.end,
-    };
-    let body_range = row
-        .body_start_byte
-        .zip(row.body_end_byte)
-        .map(|(start_byte, end_byte)| SourceRange {
-            start_byte,
-            end_byte,
-            start: row.name_range.start,
-            end: row.name_range.end,
-        });
+    let declaration_range = row.declaration_range;
+    let body_range = row.body_range;
     CallableAnchor {
         path: row.path,
         name: row.name,

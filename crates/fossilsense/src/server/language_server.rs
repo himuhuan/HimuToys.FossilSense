@@ -138,9 +138,8 @@ impl LanguageServer for Backend {
     ) -> LspResult<Option<Vec<CallHierarchyItem>>> {
         let position = params.text_document_position_params;
         Ok(self
-            .prepare_call_item(&position.text_document.uri, position.position)
-            .await
-            .map(|item| vec![item]))
+            .prepare_call_items(&position.text_document.uri, position.position)
+            .await)
     }
 
     async fn incoming_calls(
@@ -869,10 +868,10 @@ impl LanguageServer for Backend {
                 let Some(rel) = call_hierarchy::catalog_path(&state.root, &path) else {
                     return Ok(None);
                 };
-                let Some(entity) = state
+                let entities = state
                     .catalog
-                    .entity_at(&rel, crate::call_model::SourcePosition { line, character })
-                else {
+                    .entities_at(&rel, crate::call_model::SourcePosition { line, character });
+                let [entity] = entities.as_slice() else {
                     return Ok(None);
                 };
                 entity.entity_key.clone()

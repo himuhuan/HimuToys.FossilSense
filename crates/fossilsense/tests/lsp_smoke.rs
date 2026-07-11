@@ -411,6 +411,42 @@ fn lsp_smoke_completion_definition_and_references() -> Result<()> {
         "main should have a standard outgoing helper call, got {outgoing}"
     );
 
+    let call_root_id = lsp.request(
+        "textDocument/prepareCallHierarchy",
+        json!({
+            "textDocument": { "uri": main_uri },
+            "position": { "line": 2, "character": 7 }
+        }),
+    )?;
+    let call_root = lsp.wait_response(call_root_id, Duration::from_secs(10))?;
+    assert_eq!(
+        call_root
+            .as_array()
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("name"))
+            .and_then(Value::as_str),
+        Some("helper"),
+        "callee token should prepare the called function before the enclosing caller"
+    );
+
+    let body_root_id = lsp.request(
+        "textDocument/prepareCallHierarchy",
+        json!({
+            "textDocument": { "uri": main_uri },
+            "position": { "line": 3, "character": 5 }
+        }),
+    )?;
+    let body_root = lsp.wait_response(body_root_id, Duration::from_secs(10))?;
+    assert_eq!(
+        body_root
+            .as_array()
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("name"))
+            .and_then(Value::as_str),
+        Some("main"),
+        "a function-body position should fall back to the enclosing callable"
+    );
+
     let helper_prepare_id = lsp.request(
         "textDocument/prepareCallHierarchy",
         json!({

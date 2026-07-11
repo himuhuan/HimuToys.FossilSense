@@ -1,8 +1,7 @@
-// Version 13 adds callable-anchor and call-site facts to the immutable file
-// revisions plus atomically switched active manifest introduced by version 12. All semantic read
-// names remain SQL views, so a SQLite read transaction sees one complete
-// generation even while the next generation is staged.
-pub(crate) const SCHEMA_VERSION: i64 = 13;
+// Version 14 preserves complete UTF-16 declaration/body ranges for callable
+// anchors. All semantic read names remain SQL views, so a SQLite read
+// transaction sees one complete generation while the next is staged.
+pub(crate) const SCHEMA_VERSION: i64 = 14;
 
 pub(crate) const DROP_DATA_TABLES_SQL: &str = "
     DROP TABLE IF EXISTS pending_file_revisions;
@@ -193,8 +192,16 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
         name_end_col INTEGER NOT NULL,
         declaration_start_byte INTEGER NOT NULL,
         declaration_end_byte INTEGER NOT NULL,
+        declaration_start_line INTEGER NOT NULL,
+        declaration_start_col INTEGER NOT NULL,
+        declaration_end_line INTEGER NOT NULL,
+        declaration_end_col INTEGER NOT NULL,
         body_start_byte INTEGER,
         body_end_byte INTEGER,
+        body_start_line INTEGER,
+        body_start_col INTEGER,
+        body_end_line INTEGER,
+        body_end_col INTEGER,
         guard TEXT,
         provenance TEXT NOT NULL,
         syntax_error_overlap INTEGER NOT NULL
