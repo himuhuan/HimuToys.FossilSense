@@ -192,6 +192,7 @@ Smart Completion 当前约定：
 | v1.3.1 | 项目上下文补全版本；加入构建标记发现、最近祖先项目归属和同项目普通补全排序证据，并保持严格 opt-out parity |
 | v1.3.2 | 解析类型符号卫生修复；注释/字面量不再污染 type symbols，AST 精确类型名优先，关键词不可跳转，schema 11 强制重建 |
 | v1.3.3 | 有证据的一跳调用关系版本；统一代际 callable/call-site facts、标准 LSP、富协议、workspace open-document overlay 与原生双视图；schema 14 |
+| v1.3.4 | 注释美化渲染版本；Hover / 补全文档 / Signature Help 共用注释归属与 Doxygen/XML Markdown 渲染，补全经 `completionItem/resolve` 延迟挂载，并支持严格同项目 `.h/.c` 文档配对 |
 | 后置能力 | auto include insertion、ML ranker、telemetry、cloud sync、完整 C++ 语义仍不属于当前版本 |
 
 项目上下文约定：

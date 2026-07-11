@@ -1,8 +1,8 @@
 {
   "name": "fossilsense-vscode",
   "displayName": "FossilSense",
-  "description": "FossilSense C/C++ best-effort navigation: evidence-backed call relations, symbols, outlines, rich hover, ranked definitions, completion, and role-grouped references.",
-  "version": "1.3.3",
+  "description": "FossilSense C/C++ best-effort navigation: rich comment hover, completion docs, signature help, call relations, symbols, outlines, ranked definitions, and role-grouped references.",
+  "version": "1.3.4",
   "private": true,
   "license": "UNLICENSED",
   "publisher": "himutoys",

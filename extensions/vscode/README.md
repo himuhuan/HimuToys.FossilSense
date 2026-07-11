@@ -7,13 +7,14 @@ native Rust indexing engine - no external tools (ctags / cscope / clangd) requir
 This VSIX is self-contained: the `fossilsense` engine binary ships inside the
 extension's `bin/` folder.
 
-v1.3.3 introduces evidence-backed one-hop call relations for C/C++ free
-functions. Callable and call-site facts are published in the same immutable
-semantic generation as the rest of the index; standard LSP Call Hierarchy and
-the native FossilSense Relation Panel share one resolver, including unsaved
-workspace overlays, ambiguity, coverage, freshness, and bounded-result state.
-Unsupported C++ dispatch and indirect forms stay explicit instead of being
-presented as compiler-proven edges.
+v1.3.4 focuses on beautiful comment rendering for Hover, completion
+documentation, and Signature Help. Leading, inline-leading, and unambiguous
+trailing comments are attributed best-effort, then rendered as Markdown with
+Doxygen/XML parameter and return sections when present. Structured completion
+items load docs through `completionItem/resolve` so typing stays off the
+per-keystroke disk path. When a discovered project has compatible `.h` / `.c`
+pairs, documentation prefers the header while ordinary jumps and call relations
+keep the source definition as the implementation target.
 
 ## Current Capability
 
