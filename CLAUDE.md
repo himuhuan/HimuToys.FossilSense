@@ -168,6 +168,7 @@ Smart Completion 当前约定：
 | v1.2.3 | 解析与成员补全体验修复版；多行 typedef struct 容错、匿名嵌套 record evidence、数组下标/括号/解引用的简单成员链补全，以及链解析失败后的全局 member fallback |
 | v1.3.0 | 架构健康与补全 evidence 版本；收敛 parser/store/server 边界，并加入有界 language builtin 与 project context 普通补全证据 |
 | v1.3.1 | 项目上下文补全版本；加入构建标记发现、最近祖先项目归属和同项目普通补全排序证据，并保持严格 opt-out parity |
+| v1.3.2 | 解析类型符号卫生修复；注释/字面量不再污染 type symbols，AST 精确类型名优先，关键词不可跳转，schema 11 强制重建 |
 | 后置能力 | auto include insertion、ML ranker、telemetry、cloud sync、完整 C++ 语义仍不属于当前版本 |
 
 项目上下文约定：

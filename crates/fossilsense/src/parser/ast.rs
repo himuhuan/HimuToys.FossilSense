@@ -7,6 +7,7 @@ use super::{
 
 pub(super) struct AstIndex {
     pub(super) parse_error_count: usize,
+    pub(super) type_symbols: Vec<Symbol>,
     pub(super) occurrences: Vec<Occurrence>,
     pub(super) fields: Vec<FieldDef>,
     pub(super) members: Vec<MemberDef>,
@@ -27,6 +28,7 @@ pub(super) fn collect_ast_index(
 ) -> AstIndex {
     let mut out = AstIndex {
         parse_error_count: 0,
+        type_symbols: Vec::new(),
         occurrences: Vec::new(),
         fields: Vec::new(),
         members: Vec::new(),
@@ -60,6 +62,27 @@ pub(super) fn collect_ast_index(
             collect_out_of_class_method_member(node, source, line_starts, &mut out.members);
         }
 
+        if facts.contains(ParseFacts::SYMBOLS)
+            && matches!(
+                node.kind(),
+                "struct_specifier" | "union_specifier" | "enum_specifier" | "class_specifier"
+            )
+            && node.child_by_field_name("body").is_some()
+        {
+            if let Some(name) = node.child_by_field_name("name") {
+                if let Some(symbol) = symbol_from_name_node(
+                    name,
+                    SymbolKind::Type,
+                    SymbolRole::Definition,
+                    node,
+                    source,
+                    line_starts,
+                ) {
+                    out.type_symbols.push(symbol);
+                }
+            }
+        }
+
         // Record + member collection. Gated by either bit since both are
         // extracted from the same struct/union/class body.
         if facts.intersects(ParseFacts::RECORDS | ParseFacts::FIELDS)
@@ -69,10 +92,10 @@ pub(super) fn collect_ast_index(
             )
         {
             if let Some(body) = node.child_by_field_name("body") {
-                let tag_name = node
-                    .child_by_field_name("name")
-                    .and_then(|n| node_text(n, source))
-                    .map(|s| s.to_string());
+                let name_node = node.child_by_field_name("name");
+                let tag_name = name_node
+                    .and_then(|name| node_text(name, source))
+                    .map(str::to_string);
 
                 let typedef_name = parent_typedef_name(node, source);
 
@@ -161,40 +184,53 @@ pub(super) fn collect_ast_index(
                     None,
                 ));
             }
-        } else if facts.contains(ParseFacts::ALIASES) && node.kind() == "type_definition" {
+        } else if facts.intersects(ParseFacts::SYMBOLS | ParseFacts::ALIASES)
+            && node.kind() == "type_definition"
+        {
             if let Some(type_node) = node.child_by_field_name("type") {
                 if let Some(target) = get_alias_target(type_node, source) {
-                    let start_pos = node.start_position();
-                    let end_pos = node.end_position();
-                    let start_byte = node.start_byte();
-                    let end_byte = node.end_byte();
-                    let start_line = start_pos.row;
-                    let end_line = end_pos.row;
-
-                    let start_line_byte = line_starts.get(start_line).copied().unwrap_or(0);
-                    let start_col = byte_to_utf16_col(source, start_line_byte, start_byte);
-
-                    let end_line_byte = line_starts.get(end_line).copied().unwrap_or(0);
-                    let end_col = byte_to_utf16_col(source, end_line_byte, end_byte);
-
                     let mut cursor = node.walk();
                     for decl in node.children_by_field_name("declarator", &mut cursor) {
-                        if let Some((_, alias)) = declarator_identifier(decl, source) {
+                        if let Some((alias_node, alias)) =
+                            typedef_declarator_identifier(decl, source)
+                        {
+                            if facts.contains(ParseFacts::SYMBOLS) {
+                                if let Some(symbol) = symbol_from_name_node(
+                                    alias_node,
+                                    SymbolKind::Type,
+                                    SymbolRole::Definition,
+                                    node,
+                                    source,
+                                    line_starts,
+                                ) {
+                                    out.type_symbols.push(symbol);
+                                }
+                            }
                             let is_same = match &target {
                                 AliasTarget::NamedRecord { tag, .. } => alias == tag,
                                 AliasTarget::UnresolvedTypeName(name) => alias == name,
                                 _ => false,
                             };
-                            if !is_same {
+                            if facts.contains(ParseFacts::ALIASES) && !is_same {
+                                let alias_start = alias_node.start_position();
+                                let alias_end = alias_node.end_position();
                                 out.aliases.push(TypeAlias {
                                     alias: alias.to_string(),
                                     target: target.clone(),
-                                    start_byte,
-                                    end_byte,
-                                    start_line,
-                                    start_col,
-                                    end_line,
-                                    end_col,
+                                    start_byte: alias_node.start_byte(),
+                                    end_byte: alias_node.end_byte(),
+                                    start_line: alias_start.row,
+                                    start_col: byte_to_utf16_col(
+                                        source,
+                                        line_starts.get(alias_start.row).copied().unwrap_or(0),
+                                        alias_node.start_byte(),
+                                    ),
+                                    end_line: alias_end.row,
+                                    end_col: byte_to_utf16_col(
+                                        source,
+                                        line_starts.get(alias_end.row).copied().unwrap_or(0),
+                                        alias_node.end_byte(),
+                                    ),
                                 });
                             }
                         }
@@ -229,6 +265,58 @@ pub(super) fn collect_ast_index(
         }
     }
     out
+}
+
+fn symbol_from_name_node(
+    name_node: tree_sitter::Node<'_>,
+    kind: SymbolKind,
+    role: SymbolRole,
+    declaration_node: tree_sitter::Node<'_>,
+    source: &str,
+    line_starts: &[usize],
+) -> Option<Symbol> {
+    let name = node_text(name_node, source)?;
+    if name.is_empty() || crate::language_builtins::is_language_keyword(name) {
+        return None;
+    }
+    let start = name_node.start_position();
+    let end = name_node.end_position();
+    let start_byte = name_node.start_byte();
+    let end_byte = name_node.end_byte();
+
+    // Navigation symbols carry the exact identifier token range. This makes
+    // name provenance mechanically checkable and prevents a guessed name from
+    // pointing at the beginning of an enclosing multi-line declaration.
+    if source.get(start_byte..end_byte) != Some(name) {
+        return None;
+    }
+
+    Some(Symbol {
+        name: name.to_string(),
+        kind,
+        role,
+        start_byte,
+        end_byte,
+        start_line: start.row,
+        start_col: byte_to_utf16_col(
+            source,
+            line_starts.get(start.row).copied().unwrap_or(0),
+            start_byte,
+        ),
+        end_line: end.row,
+        end_col: byte_to_utf16_col(
+            source,
+            line_starts.get(end.row).copied().unwrap_or(0),
+            end_byte,
+        ),
+        signature: compact_whitespace(
+            declaration_node
+                .utf8_text(source.as_bytes())
+                .unwrap_or(name),
+        ),
+        guard: None,
+        container: None,
+    })
 }
 
 /// Infer the record type of `receiver_name` from the nearest record-typed local
@@ -929,6 +1017,21 @@ fn declarator_identifier<'a>(
             .and_then(|inner| declarator_identifier(inner, source))
             .or_else(|| declarator_identifier_deep(node, source)),
     }
+}
+
+/// Tree-sitter C classifies names from its built-in typedef set (for example
+/// `size_t`) as `primitive_type` even when that token is the declarator being
+/// defined. Accept that grammar-specific shape only at a typedef declarator
+/// boundary; the shared declaration walker must not treat arbitrary primitive
+/// type nodes as bindings.
+fn typedef_declarator_identifier<'a>(
+    node: tree_sitter::Node<'a>,
+    source: &'a str,
+) -> Option<(tree_sitter::Node<'a>, &'a str)> {
+    if node.kind() == "primitive_type" {
+        return node_text(node, source).map(|text| (node, text));
+    }
+    declarator_identifier(node, source)
 }
 
 fn declarator_identifier_deep<'a>(

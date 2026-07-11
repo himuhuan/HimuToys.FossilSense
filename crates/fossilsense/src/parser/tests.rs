@@ -272,6 +272,55 @@ fn extracts_multiline_typedef_struct_when_member_comments_contain_braces() {
 }
 
 #[test]
+fn trailing_comments_cannot_create_type_symbols() {
+    let source = r#"typedef struct AVTextWriter {
+    const AVClass *priv_class;      ///< private class of the writer, if any
+    int priv_size;                  ///< private size for the writer private class
+    const char *name;
+} AVTextWriter;
+"#;
+    let index = parse(Path::new("checkpoint.h"), source);
+    let mut types: Vec<_> = index
+        .symbols
+        .iter()
+        .filter(|symbol| symbol.kind == SymbolKind::Type)
+        .collect();
+    types.sort_by_key(|symbol| symbol.start_byte);
+
+    assert_eq!(
+        types
+            .iter()
+            .map(|symbol| symbol.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["AVTextWriter", "AVTextWriter"]
+    );
+    assert!(types.iter().all(|symbol| {
+        source.get(symbol.start_byte..symbol.end_byte) == Some(symbol.name.as_str())
+    }));
+    assert_eq!((types[0].start_line, types[0].start_col), (0, 15));
+    assert_eq!((types[1].start_line, types[1].start_col), (4, 2));
+    assert!(!index.symbols.iter().any(|symbol| symbol.name == "const"));
+    assert!(!index.symbols.iter().any(|symbol| symbol.name == "of"));
+}
+
+#[test]
+fn builtin_like_typedef_remains_a_navigable_ast_symbol() {
+    let source = "typedef unsigned long size_t;\n";
+    let index = parse(Path::new("stddef.h"), source);
+    let symbol = index
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "size_t")
+        .expect("size_t typedef symbol");
+
+    assert_eq!(symbol.kind, SymbolKind::Type);
+    assert_eq!(
+        source.get(symbol.start_byte..symbol.end_byte),
+        Some("size_t")
+    );
+}
+
+#[test]
 fn multiline_macro_with_braces_does_not_swallow_following_typedef_struct() {
     let source = r#"#define FREE(ptr)                                                              \
     do                                                                         \

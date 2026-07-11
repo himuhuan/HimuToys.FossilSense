@@ -184,6 +184,9 @@ impl LanguageServer for Backend {
         let Some(word) = query::word_at(line_text, position.position.character) else {
             return Ok(None);
         };
+        if crate::language_builtins::is_language_keyword(&word) {
+            return Ok(None);
+        }
 
         let Some(root) = self.root_for_uri(&uri).await else {
             return Ok(None);

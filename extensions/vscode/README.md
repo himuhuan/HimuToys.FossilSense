@@ -7,10 +7,12 @@ native Rust indexing engine - no external tools (ctags / cscope / clangd) requir
 This VSIX is self-contained: the `fossilsense` engine binary ships inside the
 extension's `bin/` folder.
 
-v1.3.1 is a project-context completion release. It adds bounded build-marker
-discovery and same-project evidence to ordinary completion, while preserving
-FossilSense's best-effort candidate model and keeping those signals out of
-definition, references, coloring, member, and include queries.
+v1.3.2 is a parser hygiene fix release. It stops trailing comments and string
+literals from becoming fake type symbols, prefers AST-exact type-name ranges
+when a usable syntax tree exists, rejects language keywords as Go to Definition
+targets, and bumps the index schema so stale polluted rows are rebuilt. Project
+context and other completion evidence remain behavior-preserving outside this
+fix.
 
 ## Current Capability
 

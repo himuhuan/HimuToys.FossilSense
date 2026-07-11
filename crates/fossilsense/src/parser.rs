@@ -633,8 +633,15 @@ pub fn parse_with_handle(
 
     let ast = collect_ast_index(tree.root_node(), source, &line_starts, facts);
 
-    let mut symbols = symbols;
-    symbols.reserve(ast.enum_constants.len());
+    // A usable syntax tree is authoritative for type definitions. The lexical
+    // pass remains the fallback source when tree-sitter cannot produce a tree,
+    // but its broad tag regex must not compete with exact AST name nodes.
+    let mut symbols: Vec<_> = symbols
+        .into_iter()
+        .filter(|symbol| symbol.kind != SymbolKind::Type)
+        .collect();
+    symbols.reserve(ast.type_symbols.len() + ast.enum_constants.len());
+    symbols.extend(ast.type_symbols);
     symbols.extend(ast.enum_constants);
 
     FileSemanticIndex {

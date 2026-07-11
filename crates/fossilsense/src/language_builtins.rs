@@ -129,3 +129,22 @@ pub(crate) fn language_builtins() -> &'static [LanguageBuiltin] {
 pub(crate) fn reserved_word_labels() -> impl Iterator<Item = &'static str> {
     LANGUAGE_BUILTINS.iter().map(|builtin| builtin.label)
 }
+
+pub(crate) fn is_language_keyword(label: &str) -> bool {
+    LANGUAGE_BUILTINS.iter().any(|builtin| {
+        builtin.category == LanguageBuiltinCategory::Keyword && builtin.label == label
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_language_keyword;
+
+    #[test]
+    fn keyword_gate_does_not_reject_builtin_like_typedef_names() {
+        assert!(is_language_keyword("const"));
+        assert!(is_language_keyword("class"));
+        assert!(!is_language_keyword("size_t"));
+        assert!(!is_language_keyword("AVTextWriter"));
+    }
+}

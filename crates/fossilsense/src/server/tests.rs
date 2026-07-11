@@ -200,8 +200,34 @@ async fn goto_definition_uses_live_current_document_typedef_when_index_is_stale(
     assert!(
         locations
             .iter()
-            .any(|location| location.uri == uri && location.range.start.line == 0),
+            .any(|location| location.uri == uri && location.range.start.line == 2),
         "live typedef definition should be returned even when the persisted index is stale"
+    );
+}
+
+#[tokio::test]
+async fn goto_definition_rejects_keyword_polluted_by_trailing_comments() {
+    let (_dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[],
+        "checkpoint.h",
+        r#"typedef struct AVTextWriter {
+    const/*cursor*/ AVClass *priv_class; ///< private class of the writer, if any
+    int priv_size;                       ///< writer private class
+    const char *name;
+} AVTextWriter;
+"#,
+    )
+    .await;
+
+    let response = service
+        .inner()
+        .goto_definition(goto_definition_params(uri, line, character))
+        .await
+        .expect("goto definition request");
+
+    assert!(
+        response.is_none(),
+        "language keywords must never be jump targets"
     );
 }
 
@@ -246,7 +272,7 @@ void use_type(void) {
     assert!(
         locations
             .iter()
-            .any(|location| location.uri == uri && location.range.start.line == 10),
+            .any(|location| location.uri == uri && location.range.start.line == 12),
         "indexed typedef immediately after multiline macro should be a goto-definition target"
     );
 }

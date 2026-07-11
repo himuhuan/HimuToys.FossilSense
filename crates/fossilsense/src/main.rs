@@ -216,6 +216,11 @@ fn run_query(kind: QueryCommand) -> Result<()> {
             let character = col.saturating_sub(1) as u32;
             let word = query::word_at(line_text, character)
                 .with_context(|| format!("no identifier at {}:{}:{}", file.display(), line, col))?;
+            if language_builtins::is_language_keyword(&word) {
+                println!("identifier: {word}");
+                println!("candidates: 0");
+                return Ok(());
+            }
 
             let store = IndexStore::open_readonly(&db_path)?;
             let rel = pathing::normalize_path_string(&file);

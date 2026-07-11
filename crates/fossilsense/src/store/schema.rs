@@ -1,4 +1,7 @@
-pub(crate) const SCHEMA_VERSION: i64 = 10;
+// Version 11 invalidates symbols produced before AST-exact type-name ranges and
+// comment-safe lexical fallback. Rebuilding is required even though the SQL
+// shape is unchanged, otherwise stale keyword/type rows can survive forever.
+pub(crate) const SCHEMA_VERSION: i64 = 11;
 
 pub(crate) const DROP_DATA_TABLES_SQL: &str = "
     DROP TABLE IF EXISTS type_aliases;

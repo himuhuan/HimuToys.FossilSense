@@ -146,7 +146,13 @@ fn capture_statement_symbols(
     source: &str,
     guard: Option<String>,
 ) -> Vec<Symbol> {
-    let compact = compact_whitespace(&statement.text);
+    // All regex classification must see code only. In particular, flattening a
+    // multi-line record before removing `//` comments can turn
+    // `// ... class\nconst char *name;` into the false tag declaration
+    // `class const`. Keep the original statement for signatures and ranges,
+    // but mask comments and literals before any name-producing regex runs.
+    let code_only = mask_comments_and_literals(&statement.text);
+    let compact = compact_whitespace(&code_only);
     let mut symbols = Vec::new();
 
     if let Some(symbol) = capture_function(statement, &compact, line_starts, source, guard.clone())
@@ -179,6 +185,98 @@ fn capture_statement_symbols(
     }
 
     symbols
+}
+
+/// Replace comment and literal bytes with ASCII spaces while preserving newlines
+/// and byte offsets. This is a lexical safety boundary for the regex fallback,
+/// not a C/C++ parser: normal parsing derives type symbols from tree-sitter.
+fn mask_comments_and_literals(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = bytes.to_vec();
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+            let start = i;
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            mask_non_newlines(&mut out, start, i);
+            continue;
+        }
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            let start = i;
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+            mask_non_newlines(&mut out, start, i);
+            continue;
+        }
+
+        // C++ raw string literal: recognize the `R"delimiter(` core even when
+        // preceded by an encoding prefix (`u8`, `u`, `U`, or `L`).
+        if bytes[i] == b'R' && bytes.get(i + 1) == Some(&b'"') {
+            if let Some(end) = raw_string_end(bytes, i) {
+                mask_non_newlines(&mut out, i, end);
+                i = end;
+                continue;
+            }
+        }
+
+        if bytes[i] == b'"' || bytes[i] == b'\'' {
+            let start = i;
+            i = skip_quoted_bytes(bytes, i);
+            mask_non_newlines(&mut out, start, i);
+            continue;
+        }
+        i += 1;
+    }
+
+    // Code bytes are copied unchanged and masked bytes are ASCII, so valid
+    // UTF-8 input remains valid UTF-8.
+    String::from_utf8(out).expect("masking preserves UTF-8")
+}
+
+fn mask_non_newlines(out: &mut [u8], start: usize, end: usize) {
+    for byte in &mut out[start..end] {
+        if !matches!(*byte, b'\n' | b'\r') {
+            *byte = b' ';
+        }
+    }
+}
+
+fn raw_string_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let delimiter_start = start + 2;
+    let open_rel = bytes
+        .get(delimiter_start..)?
+        .iter()
+        .position(|byte| *byte == b'(')?;
+    if open_rel > 16 {
+        return None;
+    }
+    let open = delimiter_start + open_rel;
+    let delimiter = &bytes[delimiter_start..open];
+    if delimiter
+        .iter()
+        .any(|byte| byte.is_ascii_whitespace() || matches!(*byte, b'(' | b')' | b'\\'))
+    {
+        return None;
+    }
+
+    let mut i = open + 1;
+    while i < bytes.len() {
+        if bytes[i] == b')'
+            && bytes.get(i + 1..i + 1 + delimiter.len()) == Some(delimiter)
+            && bytes.get(i + 1 + delimiter.len()) == Some(&b'"')
+        {
+            return Some(i + delimiter.len() + 2);
+        }
+        i += 1;
+    }
+    Some(bytes.len())
 }
 
 fn capture_function(
@@ -899,4 +997,46 @@ fn global_var_regex() -> &'static Regex {
         Regex::new(r#"([A-Za-z_][A-Za-z0-9_]*)\s*(?:\[[^\]]*\])?\s*(?:=[^;]*)?;"#)
             .expect("global variable regex")
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{extract_symbols_and_includes, mask_comments_and_literals};
+
+    #[test]
+    fn masking_keeps_comment_and_literal_words_out_of_regex_input() {
+        let source = "struct Real { int x; // class const\n".to_string()
+            + "const char *s = R\"tag(union Phantom)tag\"; /* enum Ghost */\n};";
+        let masked = mask_comments_and_literals(&source);
+
+        assert!(masked.contains("struct Real"));
+        assert!(masked.contains("const char *s"));
+        assert!(!masked.contains("class const"));
+        assert!(!masked.contains("union Phantom"));
+        assert!(!masked.contains("enum Ghost"));
+        assert_eq!(masked.len(), source.len());
+        assert_eq!(masked.matches('\n').count(), source.matches('\n').count());
+    }
+
+    #[test]
+    fn lexical_fallback_does_not_extract_types_from_trailing_comments() {
+        let source = "typedef struct AVTextWriter {\n\
+            const AVClass *priv_class; ///< private class of the writer, if any\n\
+            int priv_size; ///< writer private class\n\
+            const char *name;\n\
+            } AVTextWriter;\n";
+        let mut line_starts = vec![0];
+        line_starts.extend(
+            source
+                .match_indices('\n')
+                .map(|(index, _)| index + 1)
+                .filter(|index| *index < source.len()),
+        );
+        let (symbols, _) = extract_symbols_and_includes(source, &line_starts);
+        let names: Vec<_> = symbols.iter().map(|symbol| symbol.name.as_str()).collect();
+
+        assert_eq!(names, vec!["AVTextWriter", "AVTextWriter"]);
+        assert!(!names.contains(&"const"));
+        assert!(!names.contains(&"of"));
+    }
 }
