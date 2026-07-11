@@ -4,6 +4,7 @@ use std::sync::Arc;
 use crate::completion_history::CompletionHistorySnapshot;
 use crate::model;
 use crate::parser::{FactAvailability, FactGroup, FileSemanticIndex};
+use crate::project_context::ProjectKey;
 use crate::query::{self, NameTable};
 use crate::resolver;
 
@@ -31,6 +32,7 @@ pub(crate) struct OrdinaryCompletionInput {
     pub local_words: Arc<HashSet<String>>,
     pub tables: Vec<OrdinaryCompletionNameTable>,
     pub scope: Option<query::CompletionScope>,
+    pub active_project_context: Option<ProjectKey>,
     pub prior_pools: Vec<Option<Vec<usize>>>,
     pub intent: CompletionIntent,
     pub history_enabled: bool,
@@ -92,18 +94,35 @@ pub(crate) fn complete_ordinary_identifier(
     let mut new_pools: Vec<Vec<usize>> = Vec::with_capacity(input.tables.len());
     let mut recall_channels = query::CompletionRecallMetrics::default();
 
-    let quotas = query::CompletionRecallQuotas::default_for_completion_limit(input.limit);
     for (idx, table) in input.tables.iter().enumerate() {
+        // A manual/automatic key belongs to exactly one workspace root. Only
+        // that root receives the additional same-project recall budget; other
+        // tables must keep their baseline cap instead of admitting unrelated
+        // tail candidates in multi-root workspaces.
+        let table_project_context = input
+            .active_project_context
+            .as_ref()
+            .filter(|key| table.table.project_indices(key).is_some());
+        let quotas = if table_project_context.is_some() {
+            query::CompletionRecallQuotas::with_project_context(input.limit)
+        } else {
+            query::CompletionRecallQuotas::default_for_completion_limit(input.limit)
+        };
         let prior = input.prior_pools.get(idx).and_then(|pool| pool.as_deref());
-        let (hits, pool, metrics) = table.table.search_completion_recall_pooled(
+        let (hits, pool, metrics) = table.table.search_completion_recall_pooled_with_project(
             &input.prefix,
             quotas,
             input.scope.as_ref(),
+            table_project_context,
             prior,
         );
         recall_channels.merge_from(metrics);
         new_pools.push(pool);
-        candidates.extend(completion_items_for_indexed_hits(hits, open_reason));
+        candidates.extend(completion_items_for_indexed_hits(
+            hits,
+            open_reason,
+            table_project_context,
+        ));
     }
 
     let local_binding_hits = input
@@ -170,6 +189,7 @@ pub(crate) fn complete_ordinary_identifier(
                 word,
                 word_score,
                 input.scope.as_ref(),
+                input.active_project_context.as_ref(),
                 open_reason,
                 input.limit,
             ));
@@ -246,6 +266,7 @@ mod tests {
     use crate::completion_history::CompletionHistorySnapshot;
     use crate::model::ScopeTier;
     use crate::parser;
+    use crate::project_context::{ProjectContext, ProjectContextIndex, ProjectKey};
     use crate::query::{CompletionScope, NameTable, COMPLETION_LIMIT, COMPLETION_LOCALITY_BONUS};
     use crate::reachability::{OpenReason, ReachScope};
 
@@ -337,6 +358,7 @@ mod tests {
             local_words,
             tables: vec![OrdinaryCompletionNameTable { table }],
             scope: Some(scope),
+            active_project_context: None,
             prior_pools: vec![None],
             intent,
             history_enabled: true,
@@ -414,6 +436,7 @@ mod tests {
                 table: Arc::new(NameTable::build_with_paths(Vec::new())),
             }],
             scope: None,
+            active_project_context: None,
             prior_pools: vec![None],
             intent: CompletionIntent::default(),
             history_enabled: false,
@@ -446,6 +469,7 @@ mod tests {
                     table: Arc::new(NameTable::build_with_paths(Vec::new())),
                 }],
                 scope: None,
+                active_project_context: None,
                 prior_pools: vec![None],
                 intent: CompletionIntent::default(),
                 history_enabled: false,
@@ -486,6 +510,7 @@ mod tests {
                 )])),
             }],
             scope: None,
+            active_project_context: None,
             prior_pools: vec![None],
             intent: CompletionIntent::default(),
             history_enabled: false,
@@ -531,6 +556,7 @@ mod tests {
                 table: Arc::new(NameTable::build_with_paths(Vec::new())),
             }],
             scope: None,
+            active_project_context: None,
             prior_pools: vec![None],
             intent: CompletionIntent::default(),
             history_enabled: false,
@@ -569,6 +595,7 @@ mod tests {
                 table: Arc::new(NameTable::build_with_paths(Vec::new())),
             }],
             scope: None,
+            active_project_context: None,
             prior_pools: vec![None],
             intent: crate::completion::classify_completion_intent("int si", 6, "si"),
             history_enabled: false,
@@ -639,6 +666,7 @@ mod tests {
                     reason: None,
                 },
             }),
+            active_project_context: None,
             prior_pools: vec![None],
             intent: CompletionIntent::default(),
             history_enabled: false,
@@ -657,5 +685,331 @@ mod tests {
             vec!["fs_exact_prefix", "noise_fs_substring"]
         );
         assert_eq!(output.items[0].evidence.tier, ScopeTier::Current);
+    }
+
+    fn duplicate_project_fixture() -> (Arc<NameTable>, ProjectKey, ProjectKey) {
+        let root_id = "root".to_string();
+        let server_key = ProjectKey {
+            workspace_root_id: root_id.clone(),
+            project_path: "https/server".to_string(),
+        };
+        let library_key = ProjectKey {
+            workspace_root_id: root_id.clone(),
+            project_path: "third_party/libxxxx".to_string(),
+        };
+        let context = |key: ProjectKey, marker: &str| ProjectContext {
+            key,
+            workspace_name: "workspace".to_string(),
+            marker_files: vec![marker.to_string()],
+        };
+        let projects = ProjectContextIndex::new(
+            root_id,
+            "workspace".to_string(),
+            vec![
+                context(server_key.clone(), "Makefile"),
+                context(library_key.clone(), "CMakeLists.txt"),
+            ],
+        );
+        let table = NameTable::build_with_paths_and_project_context(
+            vec![
+                (
+                    1,
+                    "get_xxx".to_string(),
+                    false,
+                    "https/server/src/server.h".to_string(),
+                    "function".to_string(),
+                    false,
+                ),
+                (
+                    2,
+                    "get_xxx".to_string(),
+                    false,
+                    "third_party/libxxxx/src/xxx.h".to_string(),
+                    "macro".to_string(),
+                    false,
+                ),
+            ],
+            &projects,
+        );
+        (Arc::new(table), server_key, library_key)
+    }
+
+    fn complete_duplicate_fixture(
+        table: Arc<NameTable>,
+        active_project_context: Option<ProjectKey>,
+        scope: Option<CompletionScope>,
+    ) -> super::OrdinaryCompletionOutput {
+        complete_ordinary_identifier(OrdinaryCompletionInput {
+            prefix: "get".to_string(),
+            text: "get".to_string(),
+            line: 0,
+            character: 3,
+            parsed_document: None,
+            local_words: Arc::new(HashSet::new()),
+            tables: vec![OrdinaryCompletionNameTable { table }],
+            scope,
+            active_project_context,
+            prior_pools: vec![None],
+            intent: CompletionIntent::default(),
+            history_enabled: false,
+            history: CompletionHistorySnapshot::default(),
+            prefix_bucket: "get".to_string(),
+            limit: COMPLETION_LIMIT,
+            locality_bonus: COMPLETION_LOCALITY_BONUS,
+        })
+    }
+
+    #[test]
+    fn project_context_selects_function_or_macro_presentation_for_duplicate_label() {
+        let (table, server_key, library_key) = duplicate_project_fixture();
+        let server = complete_duplicate_fixture(table.clone(), Some(server_key), None);
+        let library = complete_duplicate_fixture(table, Some(library_key), None);
+
+        assert_eq!(server.items.len(), 1);
+        assert_eq!(server.items[0].label, "get_xxx");
+        assert_eq!(server.items[0].kind, OrdinaryCompletionKind::Function);
+        assert_eq!(server.metrics.project_boosted, 1);
+        assert_eq!(library.items.len(), 1);
+        assert_eq!(library.items[0].kind, OrdinaryCompletionKind::Macro);
+        assert_eq!(
+            library.items[0].evidence.kind,
+            crate::completion::CompletionCandidateKind::Macro
+        );
+        assert_eq!(library.metrics.project_boosted, 1);
+    }
+
+    #[test]
+    fn project_context_promotes_a_comparable_global_name_and_keeps_cross_project_results() {
+        let root_id = "root".to_string();
+        let selected_key = ProjectKey {
+            workspace_root_id: root_id.clone(),
+            project_path: "selected".to_string(),
+        };
+        let projects = ProjectContextIndex::new(
+            root_id,
+            "workspace".to_string(),
+            vec![ProjectContext {
+                key: selected_key.clone(),
+                workspace_name: "workspace".to_string(),
+                marker_files: vec!["Makefile".to_string()],
+            }],
+        );
+        let table = Arc::new(NameTable::build_with_paths_and_project_context(
+            vec![
+                (
+                    1,
+                    "api_alpha".to_string(),
+                    false,
+                    "other/api.c".to_string(),
+                    "function".to_string(),
+                    false,
+                ),
+                (
+                    2,
+                    "api_zebra".to_string(),
+                    false,
+                    "selected/api.c".to_string(),
+                    "function".to_string(),
+                    false,
+                ),
+            ],
+            &projects,
+        ));
+
+        let output = complete_ordinary_identifier(OrdinaryCompletionInput {
+            prefix: "api".to_string(),
+            text: "api".to_string(),
+            line: 0,
+            character: 3,
+            parsed_document: None,
+            local_words: Arc::new(HashSet::new()),
+            tables: vec![OrdinaryCompletionNameTable { table }],
+            scope: None,
+            active_project_context: Some(selected_key),
+            prior_pools: vec![None],
+            intent: CompletionIntent::default(),
+            history_enabled: false,
+            history: CompletionHistorySnapshot::default(),
+            prefix_bucket: "api".to_string(),
+            limit: COMPLETION_LIMIT,
+            locality_bonus: COMPLETION_LOCALITY_BONUS,
+        });
+
+        assert_eq!(
+            output
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["api_zebra", "api_alpha"]
+        );
+        assert_eq!(output.metrics.project_boosted, 1);
+        assert_eq!(output.metrics.recall_channels.same_project, 1);
+    }
+
+    #[test]
+    fn project_context_does_not_expand_unrelated_workspace_recall() {
+        let root_id = "selected-root".to_string();
+        let selected_key = ProjectKey {
+            workspace_root_id: root_id.clone(),
+            project_path: "selected".to_string(),
+        };
+        let projects = ProjectContextIndex::new(
+            root_id,
+            "selected-workspace".to_string(),
+            vec![ProjectContext {
+                key: selected_key.clone(),
+                workspace_name: "selected-workspace".to_string(),
+                marker_files: vec!["Makefile".to_string()],
+            }],
+        );
+        let selected_table = Arc::new(NameTable::build_with_paths_and_project_context(
+            vec![(
+                1,
+                "api_selected".to_string(),
+                false,
+                "selected/api.c".to_string(),
+                "function".to_string(),
+                false,
+            )],
+            &projects,
+        ));
+        let unrelated_table = Arc::new(NameTable::build_with_paths(
+            (0..7)
+                .map(|index| {
+                    (
+                        index + 10,
+                        format!("api_other_{index}"),
+                        false,
+                        format!("other/{index}.c"),
+                        "function".to_string(),
+                        false,
+                    )
+                })
+                .collect(),
+        ));
+
+        let output = complete_ordinary_identifier(OrdinaryCompletionInput {
+            prefix: "api".to_string(),
+            text: "api".to_string(),
+            line: 0,
+            character: 3,
+            parsed_document: None,
+            local_words: Arc::new(HashSet::new()),
+            tables: vec![
+                OrdinaryCompletionNameTable {
+                    table: selected_table,
+                },
+                OrdinaryCompletionNameTable {
+                    table: unrelated_table,
+                },
+            ],
+            scope: None,
+            active_project_context: Some(selected_key),
+            prior_pools: vec![None, None],
+            intent: CompletionIntent::default(),
+            history_enabled: false,
+            history: CompletionHistorySnapshot::default(),
+            prefix_bucket: "api".to_string(),
+            limit: 2,
+            locality_bonus: COMPLETION_LOCALITY_BONUS,
+        });
+
+        // The selected table contributes one project candidate. The unrelated
+        // table retains the baseline 3x-limit cap (six), not the project-aware
+        // seven-candidate cap.
+        assert_eq!(output.metrics.recall_channels.indexed_returned, 7);
+        assert_eq!(output.metrics.recall_channels.same_project, 1);
+    }
+
+    #[test]
+    fn stronger_reachability_beats_project_tie_break_for_duplicate_presentation() {
+        let (table, _server_key, library_key) = duplicate_project_fixture();
+        let output = complete_duplicate_fixture(
+            table,
+            Some(library_key),
+            Some(CompletionScope {
+                current_path: Some("https/server/src/server.c".to_string()),
+                reach: ReachScope {
+                    files: HashSet::from([
+                        "https/server/src/server.c".to_string(),
+                        "https/server/src/server.h".to_string(),
+                    ]),
+                    open: false,
+                    reason: None,
+                },
+            }),
+        );
+
+        assert_eq!(output.items[0].kind, OrdinaryCompletionKind::Function);
+        assert_eq!(output.items[0].evidence.tier, ScopeTier::Reachable);
+    }
+
+    #[test]
+    fn every_no_project_state_matches_untagged_baseline_items_and_metrics() {
+        let (tagged, _, _) = duplicate_project_fixture();
+        let untagged = Arc::new(NameTable::build_with_paths(vec![
+            (
+                1,
+                "get_xxx".to_string(),
+                false,
+                "https/server/src/server.h".to_string(),
+                "function".to_string(),
+                false,
+            ),
+            (
+                2,
+                "get_xxx".to_string(),
+                false,
+                "third_party/libxxxx/src/xxx.h".to_string(),
+                "macro".to_string(),
+                false,
+            ),
+        ]));
+
+        let empty_projects =
+            ProjectContextIndex::new("root".to_string(), "workspace".to_string(), Vec::new());
+        let no_marker = Arc::new(NameTable::build_with_paths_and_project_context(
+            vec![
+                (
+                    1,
+                    "get_xxx".to_string(),
+                    false,
+                    "https/server/src/server.h".to_string(),
+                    "function".to_string(),
+                    false,
+                ),
+                (
+                    2,
+                    "get_xxx".to_string(),
+                    false,
+                    "third_party/libxxxx/src/xxx.h".to_string(),
+                    "macro".to_string(),
+                    false,
+                ),
+            ],
+            &empty_projects,
+        ));
+        let baseline = complete_duplicate_fixture(untagged.clone(), None, None);
+        let cases = [
+            ("unspecified", tagged.clone()),
+            ("off", tagged),
+            ("no-marker", no_marker),
+            ("unavailable-model", untagged.clone()),
+            ("project-context-disabled-baseline", untagged),
+        ];
+
+        for (case, table) in cases {
+            let actual = complete_duplicate_fixture(table, None, None);
+            assert_eq!(actual.items, baseline.items, "items differ for {case}");
+            assert_eq!(
+                actual.new_pools, baseline.new_pools,
+                "recall pools differ for {case}"
+            );
+            assert_eq!(
+                actual.metrics, baseline.metrics,
+                "metrics differ for {case}"
+            );
+        }
     }
 }

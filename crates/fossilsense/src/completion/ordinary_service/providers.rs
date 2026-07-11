@@ -1,7 +1,9 @@
+use crate::completion::PROJECT_CONTEXT_MAX_BOOST;
 use crate::completion_history::candidate_hash_key;
 use crate::language_builtins::{LanguageBuiltin, LanguageBuiltinCategory};
 use crate::model;
 use crate::parser;
+use crate::project_context::ProjectKey;
 use crate::query::{self, NameTable};
 use crate::reachability;
 use crate::resolver;
@@ -156,6 +158,7 @@ pub(super) fn completion_items_for_current_file_overlay(
 pub(super) fn completion_items_for_indexed_hits(
     hits: Vec<query::RankedNameHit>,
     open_reason: Option<reachability::OpenReason>,
+    active_project_context: Option<&ProjectKey>,
 ) -> Vec<OrdinaryPipelineCandidate> {
     hits.into_iter()
         .map(|hit| {
@@ -165,6 +168,11 @@ pub(super) fn completion_items_for_indexed_hits(
             let mut evidence =
                 CandidateEvidence::new(CandidateSource::Indexed, hit.tier, confidence, hit.score);
             evidence.match_score = hit.base_match;
+            if active_project_context.is_some()
+                && hit.project_key.as_ref() == active_project_context
+            {
+                evidence.project_score = PROJECT_CONTEXT_MAX_BOOST;
+            }
             evidence.kind = completion_candidate_kind_from_parser(hit.kind);
             set_completion_history_key(&mut evidence, &hit.name);
             OrdinaryPipelineCandidate::new(
@@ -186,6 +194,7 @@ pub(super) fn exact_indexed_completion_candidates_for_local_word(
     word: &str,
     local_score: i32,
     scope: Option<&query::CompletionScope>,
+    active_project_context: Option<&ProjectKey>,
     open_reason: Option<reachability::OpenReason>,
     limit: usize,
 ) -> Vec<OrdinaryPipelineCandidate> {
@@ -199,6 +208,11 @@ pub(super) fn exact_indexed_completion_candidates_for_local_word(
             let mut evidence =
                 CandidateEvidence::new(CandidateSource::Indexed, hit.tier, confidence, local_score);
             evidence.match_score = hit.base_match;
+            if active_project_context.is_some()
+                && hit.project_key.as_ref() == active_project_context
+            {
+                evidence.project_score = PROJECT_CONTEXT_MAX_BOOST;
+            }
             evidence.kind = completion_candidate_kind_from_parser(hit.kind);
             set_completion_history_key(&mut evidence, &hit.name);
             OrdinaryPipelineCandidate::new(

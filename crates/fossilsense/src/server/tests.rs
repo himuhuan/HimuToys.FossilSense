@@ -7,13 +7,13 @@ use super::{
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex as StdMutex};
 use tempfile::tempdir;
 use tower_lsp::lsp_types::{
     CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse, Documentation,
-    ExecuteCommandParams, GotoDefinitionParams, GotoDefinitionResponse, Position,
-    TextDocumentIdentifier, TextDocumentPositionParams, Url,
+    ExecuteCommandParams, FileChangeType, FileEvent, GotoDefinitionParams, GotoDefinitionResponse,
+    InitializeParams, Position, TextDocumentIdentifier, TextDocumentPositionParams, Url,
 };
 use tower_lsp::{LanguageServer as _, LspService};
 
@@ -35,6 +35,10 @@ fn test_backend_service() -> LspService<super::Backend> {
             crate::completion_history::CompletionHistoryMode::Auto,
         )),
         completion_history: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        project_context_selection: Arc::new(tokio::sync::Mutex::new(
+            crate::project_context::ProjectContextSelection::Auto,
+        )),
+        project_context_selection_epoch: AtomicU64::new(1),
         debug_candidate_reasons: AtomicBool::new(false),
         perf_logging_enabled: AtomicBool::new(false),
         config_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -470,6 +474,7 @@ async fn cache_ledger_publishes_full_and_dirty_read_models_with_generations() {
     assert!(full_context.engine.reach_graph.is_some());
     assert!(full_context.engine.include_table.is_some());
     assert!(full_context.engine.indexed_files.is_some());
+    assert!(full_context.engine.project_context.is_some());
     assert_ne!(full_context.engine.epoch.as_u64(), 0);
 
     write_workspace_file(
@@ -517,6 +522,689 @@ async fn cache_ledger_publishes_full_and_dirty_read_models_with_generations() {
             .expect("table")
             .len(),
         2
+    );
+}
+
+#[tokio::test]
+async fn marker_only_refresh_retags_names_publishes_epoch_and_clears_memos() {
+    let root = tempdir().expect("root");
+    let root_path = root.path().to_path_buf();
+    write_workspace_file(root.path(), "app/src/main.c", "int project_symbol;\n");
+    crate::indexer::index_workspace(
+        root.path(),
+        crate::indexer::IndexOptions {
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("index");
+    let service = test_backend_service();
+    service
+        .inner()
+        .session
+        .cache
+        .publish_full_index(&service.inner().client, root_path.clone())
+        .await
+        .expect("publish");
+    let before = service
+        .inner()
+        .session
+        .request_context_for_root(root_path.clone())
+        .await;
+    assert!(before
+        .engine
+        .project_context
+        .as_ref()
+        .expect("available")
+        .projects()
+        .is_empty());
+    let published_symbol_count = before
+        .engine
+        .name_table
+        .as_ref()
+        .expect("published name table")
+        .len();
+    // Marker-only publication must be derived exclusively from the immutable
+    // published generation. Removing SQLite proves the refresh cannot observe
+    // a concurrent writer's partial committed state.
+    fs::remove_file(crate::pathing::default_index_path(root.path()).expect("db path"))
+        .expect("remove index database");
+    let uri = Url::from_file_path(root.path().join("app/src/main.c")).expect("uri");
+    service
+        .inner()
+        .session
+        .cache
+        .record_completion_memo(uri.clone(), "pro".into(), 7, vec![vec![0]])
+        .await;
+
+    write_workspace_file(root.path(), "app/Makefile", "all:\n");
+    let count = service
+        .inner()
+        .session
+        .cache
+        .refresh_project_context(&service.inner().client, root_path.clone())
+        .await
+        .expect("refresh");
+    assert_eq!(count, 1);
+    let after_create = service
+        .inner()
+        .session
+        .request_context_for_root(root_path.clone())
+        .await;
+    assert_ne!(before.engine.epoch, after_create.engine.epoch);
+    assert_eq!(
+        after_create
+            .engine
+            .name_table
+            .as_ref()
+            .expect("retagged table")
+            .len(),
+        published_symbol_count
+    );
+    let project = after_create
+        .engine
+        .project_context
+        .as_ref()
+        .and_then(|index| index.nearest_for_file("app/src/main.c"))
+        .expect("project");
+    let hit = after_create
+        .engine
+        .name_table
+        .as_ref()
+        .expect("table")
+        .search_ranked("project_symbol", 10)
+        .into_iter()
+        .next()
+        .expect("hit");
+    assert_eq!(hit.project_key, Some(project));
+    assert!(service
+        .inner()
+        .session
+        .cache
+        .completion_memo_for_test(&uri)
+        .await
+        .is_none());
+
+    fs::remove_file(root.path().join("app/Makefile")).expect("delete marker");
+    service
+        .inner()
+        .session
+        .cache
+        .refresh_project_context(&service.inner().client, root_path.clone())
+        .await
+        .expect("refresh delete");
+    let after_delete = service
+        .inner()
+        .session
+        .request_context_for_root(root_path)
+        .await;
+    assert_ne!(after_create.engine.epoch, after_delete.engine.epoch);
+    assert!(after_delete
+        .engine
+        .project_context
+        .as_ref()
+        .expect("available")
+        .projects()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn nested_marker_refresh_reassigns_name_ownership_and_removal_restores_parent() {
+    let root = tempdir().expect("root");
+    let root_path = root.path().to_path_buf();
+    write_workspace_file(root.path(), "Makefile", "all:\n");
+    write_workspace_file(root.path(), "app/src/main.c", "int nested_symbol;\n");
+    crate::indexer::index_workspace(
+        root.path(),
+        crate::indexer::IndexOptions {
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("index");
+    let service = test_backend_service();
+    service
+        .inner()
+        .session
+        .cache
+        .publish_full_index(&service.inner().client, root_path.clone())
+        .await
+        .expect("publish");
+
+    let project_path_for_symbol = |context: &super::RequestContext| {
+        context
+            .engine
+            .name_table
+            .as_ref()
+            .expect("table")
+            .search_ranked("nested_symbol", 10)
+            .into_iter()
+            .next()
+            .and_then(|hit| hit.project_key)
+            .map(|key| key.project_path)
+    };
+    let parent = service
+        .inner()
+        .session
+        .request_context_for_root(root_path.clone())
+        .await;
+    assert_eq!(project_path_for_symbol(&parent).as_deref(), Some(""));
+
+    write_workspace_file(root.path(), "app/CMakeLists.txt", "");
+    service
+        .inner()
+        .session
+        .cache
+        .refresh_project_context(&service.inner().client, root_path.clone())
+        .await
+        .expect("nested refresh");
+    let nested = service
+        .inner()
+        .session
+        .request_context_for_root(root_path.clone())
+        .await;
+    assert_eq!(project_path_for_symbol(&nested).as_deref(), Some("app"));
+
+    fs::remove_file(root.path().join("app/CMakeLists.txt")).expect("remove nested marker");
+    service
+        .inner()
+        .session
+        .cache
+        .refresh_project_context(&service.inner().client, root_path.clone())
+        .await
+        .expect("parent refresh");
+    let restored = service
+        .inner()
+        .session
+        .request_context_for_root(root_path)
+        .await;
+    assert_eq!(project_path_for_symbol(&restored).as_deref(), Some(""));
+}
+
+#[tokio::test]
+async fn marker_watcher_classifies_supported_and_ignores_excluded_or_fragment_files() {
+    let root = tempdir().expect("root");
+    fs::create_dir_all(root.path().join("app")).expect("app");
+    fs::create_dir_all(root.path().join("build")).expect("build");
+    let roots = vec![root.path().to_path_buf()];
+    let cache = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let event = |path: &std::path::Path, typ| FileEvent {
+        uri: Url::from_file_path(path).expect("uri"),
+        typ,
+    };
+
+    let marker = super::watched_change_in_scope(
+        &roots,
+        &event(&root.path().join("app/Makefile"), FileChangeType::CREATED),
+        &cache,
+    )
+    .await;
+    assert!(matches!(
+        marker,
+        Some(super::WatchDecision::ProjectContext(_))
+    ));
+
+    let excluded = super::watched_change_in_scope(
+        &roots,
+        &event(
+            &root.path().join("build/build.ninja"),
+            FileChangeType::CREATED,
+        ),
+        &cache,
+    )
+    .await;
+    assert!(excluded.is_none());
+
+    let fragment = super::watched_change_in_scope(
+        &roots,
+        &event(
+            &root.path().join("app/rules.ninja"),
+            FileChangeType::CREATED,
+        ),
+        &cache,
+    )
+    .await;
+    assert!(fragment.is_none());
+
+    let renamed_away = super::watched_change_in_scope(
+        &roots,
+        &event(&root.path().join("app/Makefile"), FileChangeType::DELETED),
+        &cache,
+    )
+    .await;
+    assert!(matches!(
+        renamed_away,
+        Some(super::WatchDecision::ProjectContext(_))
+    ));
+}
+
+#[tokio::test]
+async fn watcher_routes_nested_workspace_changes_to_the_most_specific_root() {
+    let outer = tempdir().expect("outer");
+    let inner = outer.path().join("nested");
+    fs::create_dir_all(inner.join("src")).expect("inner tree");
+    let outer_root = outer.path().to_path_buf();
+    let roots = vec![outer_root.clone(), inner.clone()];
+    let cache = Arc::new(tokio::sync::Mutex::new(HashMap::from([
+        (
+            outer_root.clone(),
+            crate::config::WorkspaceConfig::default(),
+        ),
+        (inner.clone(), crate::config::WorkspaceConfig::default()),
+    ])));
+    let event = |path: &std::path::Path, typ| FileEvent {
+        uri: Url::from_file_path(path).expect("uri"),
+        typ,
+    };
+
+    let marker = super::watched_change_in_scope(
+        &roots,
+        &event(&inner.join("CMakeLists.txt"), FileChangeType::CREATED),
+        &cache,
+    )
+    .await;
+    match marker {
+        Some(super::WatchDecision::ProjectContext(root)) => assert_eq!(root, inner),
+        _ => panic!("nested marker should refresh the nested workspace"),
+    }
+
+    let source = super::watched_change_in_scope(
+        &roots,
+        &event(&inner.join("src/main.c"), FileChangeType::CHANGED),
+        &cache,
+    )
+    .await;
+    match source {
+        Some(super::WatchDecision::Dirty(change)) => assert_eq!(change.root, inner),
+        _ => panic!("nested source should dirty the nested workspace"),
+    }
+
+    let config = super::watched_change_in_scope(
+        &roots,
+        &event(&inner.join("fossilsense.json"), FileChangeType::CHANGED),
+        &cache,
+    )
+    .await;
+    assert!(matches!(config, Some(super::WatchDecision::Full)));
+    let cached = cache.lock().await;
+    assert!(cached.contains_key(&outer_root));
+    assert!(!cached.contains_key(&inner));
+}
+
+#[tokio::test]
+async fn project_context_commands_validate_selection_and_outside_uri_has_no_automatic_project() {
+    let root = tempdir().expect("root");
+    let other = tempdir().expect("outside");
+    let root_path = root.path().to_path_buf();
+    write_workspace_file(root.path(), "server/Makefile", "all:\n");
+    write_workspace_file(root.path(), "server/main.c", "int server_api;\n");
+    write_workspace_file(root.path(), "lib/CMakeLists.txt", "");
+    crate::indexer::index_workspace(
+        root.path(),
+        crate::indexer::IndexOptions {
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("index");
+    let service = test_backend_service();
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(root_path.clone());
+    service
+        .inner()
+        .session
+        .cache
+        .publish_full_index(&service.inner().client, root_path.clone())
+        .await
+        .expect("publish");
+    let uri = Url::from_file_path(root.path().join("server/main.c")).expect("uri");
+    let value = service
+        .inner()
+        .execute_command(ExecuteCommandParams {
+            command: super::PROJECT_CONTEXTS_LSP_COMMAND.to_string(),
+            arguments: vec![serde_json::json!({"uri": uri})],
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .expect("status")
+        .expect("value");
+    let status: crate::project_context::ProjectContextStatus =
+        serde_json::from_value(value).expect("status dto");
+    assert!(status.available);
+    assert_eq!(status.projects.len(), 2);
+    assert_eq!(
+        status
+            .automatic_project
+            .as_ref()
+            .expect("automatic")
+            .project_path,
+        "server"
+    );
+
+    let manual = status
+        .projects
+        .iter()
+        .find(|project| project.key.project_path == "lib")
+        .expect("lib")
+        .key
+        .clone();
+    let manual_with_stale_case = crate::project_context::ProjectKey {
+        project_path: manual.project_path.to_ascii_uppercase(),
+        ..manual.clone()
+    };
+    let memo_uri = uri.clone();
+    service
+        .inner()
+        .session
+        .cache
+        .record_completion_memo(memo_uri.clone(), "ser".into(), 9, vec![vec![0]])
+        .await;
+    let value = service
+        .inner()
+        .execute_command(ExecuteCommandParams {
+            command: super::SET_PROJECT_CONTEXT_LSP_COMMAND.to_string(),
+            arguments: vec![serde_json::json!({
+                "uri": uri,
+                "selection": {"kind": "manual", "key": manual_with_stale_case}
+            })],
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .expect("set")
+        .expect("value");
+    let manual_status: crate::project_context::ProjectContextStatus =
+        serde_json::from_value(value).expect("manual status");
+    assert!(matches!(
+        manual_status.selection,
+        crate::project_context::ProjectContextSelection::Manual { .. }
+    ));
+    assert_eq!(manual_status.active_project, Some(manual));
+    assert!(service
+        .inner()
+        .session
+        .cache
+        .completion_memo_for_test(&memo_uri)
+        .await
+        .is_none());
+
+    let outside = Url::from_file_path(other.path().join("outside.c")).expect("outside uri");
+    let outside_status = service.inner().project_context_status(Some(&outside)).await;
+    assert!(outside_status.available);
+    assert!(outside_status.automatic_project.is_none());
+
+    let unmarked_uri =
+        Url::from_file_path(root.path().join("unmarked/file.c")).expect("unmarked uri");
+    let unmarked_status = service
+        .inner()
+        .set_project_context_selection(
+            crate::project_context::ProjectContextSelection::Auto,
+            Some(&unmarked_uri),
+        )
+        .await;
+    assert!(unmarked_status.available);
+    assert!(unmarked_status.active_project.is_none());
+
+    let unspecified_status = service
+        .inner()
+        .set_project_context_selection(
+            crate::project_context::ProjectContextSelection::Unspecified,
+            Some(&Url::from_file_path(root.path().join("server/main.c")).expect("server uri")),
+        )
+        .await;
+    assert!(unspecified_status.active_project.is_none());
+
+    let current = service
+        .inner()
+        .session
+        .cache
+        .current_engine_snapshot(&root_path)
+        .await
+        .expect("current snapshot");
+    let mut degraded = current.degraded.clone();
+    degraded.project_context = true;
+    service
+        .inner()
+        .session
+        .cache
+        .publish_engine_snapshot(super::workspace::EngineSnapshot {
+            root: root_path,
+            epoch: service.inner().session.cache.allocate_engine_epoch(),
+            name_table: current.name_table.clone(),
+            reach_graph: current.reach_graph.clone(),
+            include_table: current.include_table.clone(),
+            indexed_files: current.indexed_files.clone(),
+            project_context: None,
+            degraded,
+        })
+        .await;
+    let unavailable_status = service
+        .inner()
+        .project_context_status(Some(
+            &Url::from_file_path(root.path().join("server/main.c")).expect("server uri"),
+        ))
+        .await;
+    assert!(!unavailable_status.available);
+    assert!(unavailable_status.projects.is_empty());
+    assert!(unavailable_status.active_project.is_none());
+}
+
+#[tokio::test]
+async fn automatic_project_uses_the_most_specific_containing_workspace_root() {
+    let outer = tempdir().expect("outer");
+    let inner = outer.path().join("nested");
+    fs::create_dir_all(inner.join("src")).expect("inner tree");
+    write_workspace_file(outer.path(), "Makefile", "all:\n");
+    write_workspace_file(&inner, "CMakeLists.txt", "");
+    write_workspace_file(&inner, "src/main.c", "int nested_api;\n");
+    for root in [outer.path(), inner.as_path()] {
+        crate::indexer::index_workspace(
+            root,
+            crate::indexer::IndexOptions {
+                force: true,
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .expect("index root");
+    }
+
+    let service = test_backend_service();
+    let roots = vec![outer.path().to_path_buf(), inner.clone()];
+    *service.inner().workspace_roots.lock().await = roots.clone();
+    for root in roots {
+        service
+            .inner()
+            .session
+            .cache
+            .publish_full_index(&service.inner().client, root)
+            .await
+            .expect("publish root");
+    }
+    let uri = Url::from_file_path(inner.join("src/main.c")).expect("uri");
+    assert_eq!(
+        service.inner().root_for_uri(&uri).await,
+        Some(inner.clone())
+    );
+    let status = service.inner().project_context_status(Some(&uri)).await;
+    let automatic = status.automatic_project.expect("automatic project");
+    assert_eq!(automatic.project_path, "");
+    assert_eq!(
+        automatic.workspace_root_id,
+        crate::pathing::workspace_hash(&inner.canonicalize().expect("canonical inner"))
+    );
+    assert!(status
+        .projects
+        .iter()
+        .any(|project| project.key.project_path == "nested"));
+    assert!(status
+        .projects
+        .iter()
+        .any(|project| project.key == automatic));
+}
+
+#[tokio::test]
+async fn project_selector_remains_available_when_another_root_model_is_degraded() {
+    let available = tempdir().expect("available root");
+    let degraded = tempdir().expect("degraded root");
+    write_workspace_file(available.path(), "app/Makefile", "all:\n");
+    write_workspace_file(available.path(), "app/main.c", "int available_api;\n");
+    crate::indexer::index_workspace(
+        available.path(),
+        crate::indexer::IndexOptions {
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("index available root");
+
+    let service = test_backend_service();
+    *service.inner().workspace_roots.lock().await = vec![
+        available.path().to_path_buf(),
+        degraded.path().to_path_buf(),
+    ];
+    service
+        .inner()
+        .session
+        .cache
+        .publish_full_index(&service.inner().client, available.path().to_path_buf())
+        .await
+        .expect("publish available root");
+
+    let degraded_uri = Url::from_file_path(degraded.path().join("main.c")).expect("degraded uri");
+    let status = service
+        .inner()
+        .project_context_status(Some(&degraded_uri))
+        .await;
+    assert!(status.available);
+    assert_eq!(status.projects.len(), 1);
+    assert!(status.automatic_project.is_none());
+    assert!(status.active_project.is_none());
+}
+
+#[tokio::test]
+async fn automatic_and_manual_project_selection_change_duplicate_completion_immediately() {
+    let root = tempdir().expect("root");
+    write_workspace_file(root.path(), "server/Makefile", "all:\n");
+    write_workspace_file(root.path(), "server/server.h", "int get_xxx(void);\n");
+    write_workspace_file(root.path(), "lib/CMakeLists.txt", "");
+    write_workspace_file(root.path(), "lib/xxx.h", "#define get_xxx 1\n");
+    let (source, line, character) =
+        text_and_position("void use_api(void) {\n    get/*cursor*/\n}\n");
+    write_workspace_file(root.path(), "server/server.c", &source);
+    crate::indexer::index_workspace(
+        root.path(),
+        crate::indexer::IndexOptions {
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("index");
+
+    let service = test_backend_service();
+    let root_path = root.path().to_path_buf();
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(root_path.clone());
+    service
+        .inner()
+        .session
+        .cache
+        .publish_full_index(&service.inner().client, root_path)
+        .await
+        .expect("publish");
+    let uri = Url::from_file_path(root.path().join("server/server.c")).expect("uri");
+    open_test_document(&service, uri.clone(), 1, source).await;
+
+    let auto_items = completion_items(
+        service
+            .inner()
+            .completion(completion_params(uri.clone(), line, character))
+            .await
+            .expect("auto completion")
+            .expect("auto response"),
+    );
+    let auto = auto_items
+        .iter()
+        .find(|item| item.label == "get_xxx")
+        .expect("auto item");
+    assert_eq!(auto.kind, Some(CompletionItemKind::FUNCTION));
+
+    let status = service.inner().project_context_status(Some(&uri)).await;
+    let library_key = status
+        .projects
+        .iter()
+        .find(|project| project.key.project_path == "lib")
+        .expect("library project")
+        .key
+        .clone();
+    service
+        .inner()
+        .set_project_context_selection(
+            crate::project_context::ProjectContextSelection::Manual { key: library_key },
+            Some(&uri),
+        )
+        .await;
+    let manual_items = completion_items(
+        service
+            .inner()
+            .completion(completion_params(uri, line, character))
+            .await
+            .expect("manual completion")
+            .expect("manual response"),
+    );
+    let manual = manual_items
+        .iter()
+        .find(|item| item.label == "get_xxx")
+        .expect("manual item");
+    assert_eq!(manual.kind, Some(CompletionItemKind::CONSTANT));
+}
+
+#[tokio::test]
+async fn initialize_advertises_project_context_commands() {
+    let service = test_backend_service();
+    let initialized = service
+        .inner()
+        .initialize(InitializeParams::default())
+        .await
+        .expect("initialize");
+    let commands = initialized
+        .capabilities
+        .execute_command_provider
+        .expect("commands")
+        .commands;
+    assert!(commands.contains(&super::PROJECT_CONTEXTS_LSP_COMMAND.to_string()));
+    assert!(commands.contains(&super::SET_PROJECT_CONTEXT_LSP_COMMAND.to_string()));
+}
+
+#[tokio::test]
+async fn initialize_project_context_off_is_effective_before_extension_state_restore() {
+    let service = test_backend_service();
+    service
+        .inner()
+        .initialize(InitializeParams {
+            initialization_options: Some(serde_json::json!({
+                "fossilsense": { "projectContext": { "mode": "off" } }
+            })),
+            ..Default::default()
+        })
+        .await
+        .expect("initialize");
+
+    assert_eq!(
+        *service.inner().project_context_selection.lock().await,
+        crate::project_context::ProjectContextSelection::Unspecified
     );
 }
 
@@ -655,6 +1343,7 @@ async fn reach_scope_uses_captured_request_context_graph() {
             reach_graph: Some(captured_graph),
             include_table: None,
             indexed_files: None,
+            project_context: None,
             degraded: crate::progress::DegradedCapabilities::default(),
         }),
         settings: super::RequestSettings {
@@ -1588,15 +2277,27 @@ fn engine_epoch_reserves_zero_for_missing_state() {
 }
 
 #[test]
-fn combined_workspace_generation_changes_when_engine_epoch_changes() {
+fn combined_completion_generation_changes_with_engine_selection_or_project() {
     let root = PathBuf::from("workspace");
     let first = super::state::EngineEpoch::published(1);
     let second = super::state::EngineEpoch::published(2);
+    let project = crate::project_context::ProjectKey {
+        workspace_root_id: "root".into(),
+        project_path: "app".into(),
+    };
 
-    let combined_first = super::state::combine_workspace_generations(&[(root.clone(), first)]);
-    let combined_second = super::state::combine_workspace_generations(&[(root, second)]);
+    let combined_first =
+        super::state::combine_completion_generation(&[(root.clone(), first)], 1, None);
+    let combined_second =
+        super::state::combine_completion_generation(&[(root.clone(), second)], 1, None);
+    let combined_selection =
+        super::state::combine_completion_generation(&[(root.clone(), first)], 2, None);
+    let combined_project =
+        super::state::combine_completion_generation(&[(root, first)], 1, Some(&project));
 
     assert_ne!(combined_first, combined_second);
+    assert_ne!(combined_first, combined_selection);
+    assert_ne!(combined_first, combined_project);
 }
 
 // --- R7: local word vs indexed candidate tier ordering --------------------
@@ -2081,6 +2782,7 @@ fn index_status_ready_carries_degraded_capabilities() {
         reach_graph: true,
         include_table: false,
         reference_file_list: true,
+        project_context: false,
     };
     let ready =
         crate::progress::IndexStatus::ready_with_degraded("/workspace".into(), &stats, degraded);
@@ -2099,6 +2801,7 @@ fn ready_cache_message_names_degraded_capabilities() {
         reach_graph: true,
         include_table: true,
         reference_file_list: false,
+        project_context: false,
     };
 
     let message = super::ready_cache_message("name table ready", 7, 3, 2, 11, 13, &degraded);

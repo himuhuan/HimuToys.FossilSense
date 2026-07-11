@@ -133,6 +133,62 @@ fn unscoped_search_is_unchanged_by_scoping_path() {
     assert_eq!(with_none, legacy);
 }
 
+#[test]
+fn name_table_tags_workspace_entries_and_keeps_external_entries_unowned() {
+    use crate::project_context::{ProjectContext, ProjectContextIndex, ProjectKey};
+
+    let root_id = "root-a".to_string();
+    let key = ProjectKey {
+        workspace_root_id: root_id.clone(),
+        project_path: "app".to_string(),
+    };
+    let projects = ProjectContextIndex::new(
+        root_id,
+        "workspace".to_string(),
+        vec![ProjectContext {
+            key: key.clone(),
+            workspace_name: "workspace".to_string(),
+            marker_files: vec!["Makefile".to_string()],
+        }],
+    );
+    let table = NameTable::build_with_paths_and_project_context(
+        vec![
+            (
+                1,
+                "project_api".to_string(),
+                false,
+                "app/src/api.c".to_string(),
+                "function".to_string(),
+                false,
+            ),
+            (
+                2,
+                "external_api".to_string(),
+                true,
+                "C:/sdk/api.h".to_string(),
+                "function".to_string(),
+                true,
+            ),
+        ],
+        &projects,
+    );
+
+    let hits = table.search_ranked("api", 10);
+    assert_eq!(
+        hits.iter()
+            .find(|hit| hit.id == 1)
+            .and_then(|hit| hit.project_key.as_ref()),
+        Some(&key)
+    );
+    assert!(hits
+        .iter()
+        .find(|hit| hit.id == 2)
+        .expect("external")
+        .project_key
+        .is_none());
+    assert_eq!(table.project_indices(&key).map(<[usize]>::len), Some(1));
+}
+
 // --- Prefix index + incremental narrowing (completion performance) --------
 
 #[test]
@@ -265,6 +321,7 @@ fn channel_recall_keeps_reachable_and_global_representation() {
         external: 1,
         unknown: 1,
         global: 2,
+        same_project: 0,
     };
 
     let (hits, pool, metrics) =
@@ -310,6 +367,62 @@ fn channel_recall_narrowing_matches_cold_scan() {
         .0;
 
     assert_eq!(narrowed, cold);
+}
+
+#[test]
+fn same_project_quota_adds_a_representative_without_filtering_global() {
+    use crate::project_context::{ProjectContext, ProjectContextIndex, ProjectKey};
+
+    let root_id = "root".to_string();
+    let key = ProjectKey {
+        workspace_root_id: root_id.clone(),
+        project_path: "selected".to_string(),
+    };
+    let projects = ProjectContextIndex::new(
+        root_id,
+        "workspace".to_string(),
+        vec![ProjectContext {
+            key: key.clone(),
+            workspace_name: "workspace".to_string(),
+            marker_files: vec!["Makefile".to_string()],
+        }],
+    );
+    let table = NameTable::build_with_paths_and_project_context(
+        vec![
+            (
+                1,
+                "api_alpha".to_string(),
+                false,
+                "other/a.c".to_string(),
+                "function".to_string(),
+                false,
+            ),
+            (
+                2,
+                "api_selected".to_string(),
+                false,
+                "selected/z.c".to_string(),
+                "function".to_string(),
+                false,
+            ),
+        ],
+        &projects,
+    );
+    let quotas = CompletionRecallQuotas {
+        total_indexed: 2,
+        reachable: 0,
+        external: 0,
+        unknown: 0,
+        global: 1,
+        same_project: 1,
+    };
+    let (hits, _, metrics) =
+        table.search_completion_recall_pooled_with_project("api", quotas, None, Some(&key), None);
+
+    assert_eq!(hits.len(), 2);
+    assert!(hits.iter().any(|hit| hit.name == "api_alpha"));
+    assert!(hits.iter().any(|hit| hit.name == "api_selected"));
+    assert_eq!(metrics.same_project, 1);
 }
 
 #[test]

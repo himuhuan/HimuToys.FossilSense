@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use anyhow::Result;
@@ -37,6 +37,7 @@ use crate::config::WorkspaceConfig;
 use crate::includes::{self, IncludeForm};
 use crate::parser::{self, FileSemanticIndex};
 use crate::pathing;
+use crate::project_context::ProjectContextSelection;
 use crate::query::{self, NameTable};
 use crate::reachability;
 use crate::references;
@@ -49,6 +50,7 @@ mod language_server;
 mod lsp_adapters;
 mod member_completion;
 mod options;
+mod project_context_commands;
 mod semantic_tokens;
 mod signature_help;
 mod state;
@@ -72,7 +74,8 @@ use options::{
     candidate_reason_log_lines, completion_trigger_characters, empty_completion_list,
     member_completion_is_incomplete, parse_completion_history_mode, parse_completion_mode,
     parse_debug_candidate_reasons, parse_debug_perf_logs, parse_include_paths,
-    parse_include_scoping_enabled, parse_semantic_coloring_mode, signature_help_options,
+    parse_include_scoping_enabled, parse_initial_project_context_selection,
+    parse_semantic_coloring_mode, signature_help_options,
 };
 use workspace::{
     CacheLedger, CachePublishReport, DocumentStore, RequestContext, RequestSettings,
@@ -123,6 +126,8 @@ pub(super) const CLEAR_COMPLETION_HISTORY_LSP_COMMAND: &str =
 /// `{ uri, line, character }` and returns the role-labeled hits the standard
 /// `textDocument/references` cannot carry over the wire.
 const GROUPED_REFERENCES_LSP_COMMAND: &str = "fossilsense.lsp.groupedReferences";
+const PROJECT_CONTEXTS_LSP_COMMAND: &str = "fossilsense.lsp.projectContexts";
+const SET_PROJECT_CONTEXT_LSP_COMMAND: &str = "fossilsense.lsp.setProjectContext";
 
 pub async fn run_stdio() -> Result<()> {
     eprintln!("FossilSense LSP starting on stdio");
@@ -141,6 +146,8 @@ pub async fn run_stdio() -> Result<()> {
         scoping_enabled: AtomicBool::new(true),
         completion_history_mode: Arc::new(Mutex::new(CompletionHistoryMode::Auto)),
         completion_history: Arc::new(Mutex::new(HashMap::new())),
+        project_context_selection: Arc::new(Mutex::new(ProjectContextSelection::Auto)),
+        project_context_selection_epoch: AtomicU64::new(1),
         debug_candidate_reasons: AtomicBool::new(false),
         perf_logging_enabled: AtomicBool::new(false),
         config_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -174,6 +181,12 @@ struct Backend {
     /// Workspace-local completion history stores, keyed by their cache file
     /// path so multi-root workspaces remain separate on disk.
     completion_history: Arc<Mutex<HashMap<PathBuf, CompletionHistoryStore>>>,
+    /// User-selected completion project policy. The extension persists the
+    /// choice; the server validates it against current immutable snapshots.
+    project_context_selection: Arc<Mutex<ProjectContextSelection>>,
+    /// Changes whenever selection changes so completion memo pools cannot be
+    /// reused under a different effective project.
+    project_context_selection_epoch: AtomicU64,
     /// Whether goto-definition logs each candidate's scope reasoning
     /// (tier/confidence/reason) to the output panel. Off by default; gated by
     /// `fossilsense.debug.candidateReasons`. A debug aid, not a user contract.
@@ -441,12 +454,19 @@ impl Backend {
         Some(self.request_context_for_root(root).await)
     }
 
-    /// Workspace root containing `uri`, falling back to the first root.
+    /// Most-specific workspace root containing `uri`, falling back to the first
+    /// root for the legacy outside-workspace behavior.
     async fn root_for_uri(&self, uri: &Url) -> Option<PathBuf> {
         let roots = self.workspace_roots.lock().await;
         let path = uri_to_path(uri);
         path.as_ref()
-            .and_then(|path| roots.iter().find(|root| path.starts_with(root)).cloned())
+            .and_then(|path| {
+                roots
+                    .iter()
+                    .filter(|root| pathing::path_is_within(root, path))
+                    .max_by_key(|root| root.components().count())
+                    .cloned()
+            })
             .or_else(|| roots.first().cloned())
     }
 

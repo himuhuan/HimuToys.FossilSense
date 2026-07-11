@@ -18,6 +18,8 @@ impl LanguageServer for Backend {
         self.completion_enabled
             .store(completion_mode.is_enabled(), Ordering::Relaxed);
         *self.completion_history_mode.lock().await = parse_completion_history_mode(&params);
+        *self.project_context_selection.lock().await =
+            parse_initial_project_context_selection(&params);
 
         let completion_provider = if self.completion_enabled.load(Ordering::Relaxed) {
             Some(CompletionOptions {
@@ -99,6 +101,8 @@ impl LanguageServer for Backend {
                         GROUPED_REFERENCES_LSP_COMMAND.to_string(),
                         COMPLETION_ACCEPTED_LSP_COMMAND.to_string(),
                         CLEAR_COMPLETION_HISTORY_LSP_COMMAND.to_string(),
+                        PROJECT_CONTEXTS_LSP_COMMAND.to_string(),
+                        SET_PROJECT_CONTEXT_LSP_COMMAND.to_string(),
                     ],
                     ..Default::default()
                 }),
@@ -545,6 +549,8 @@ impl LanguageServer for Backend {
                 tables.push(OrdinaryCompletionNameTable { table });
             }
         }
+        let (active_project_context, project_selection_epoch) =
+            self.effective_project_for_uri(&uri, &contexts).await;
 
         // Limited include-reachability scope: re-ranks candidates by their
         // `ScopeTier` (current / reachable / first-layer external / unknown /
@@ -568,7 +574,11 @@ impl LanguageServer for Backend {
         // the new prefix extends it and the same name-table generation is in
         // play. A shortened/changed prefix or a rebuilt table generation resets
         // to a full scan.
-        let completion_generation = state::combine_workspace_generations(&table_generations);
+        let completion_generation = state::combine_completion_generation(
+            &table_generations,
+            project_selection_epoch,
+            active_project_context.as_ref(),
+        );
         let completion_started = tokio::time::Instant::now();
         let memo_lookup = self
             .session
@@ -589,6 +599,7 @@ impl LanguageServer for Backend {
             local_words,
             tables,
             scope,
+            active_project_context,
             prior_pools,
             intent,
             history_enabled,
@@ -718,6 +729,7 @@ impl LanguageServer for Backend {
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
         let roots = self.workspace_roots.lock().await.clone();
         let mut dirty_changes = Vec::new();
+        let mut project_context_roots = Vec::new();
         let mut needs_full = false;
 
         // Ensure the config cache is populated for each root (on first event)
@@ -737,12 +749,14 @@ impl LanguageServer for Backend {
         for change in &params.changes {
             match watched_change_in_scope(&roots, change, &self.config_cache).await {
                 Some(WatchDecision::Full) => needs_full = true,
+                Some(WatchDecision::ProjectContext(root)) => project_context_roots.push(root),
                 Some(WatchDecision::Dirty(dirty)) => dirty_changes.push(dirty),
                 None => {}
             }
         }
 
-        let relevant_changes = dirty_changes.len() + usize::from(needs_full);
+        let relevant_changes =
+            dirty_changes.len() + project_context_roots.len() + usize::from(needs_full);
         let dirty_count = dirty_changes.len();
         if relevant_changes > 0 {
             self.session.cache.invalidate_references();
@@ -761,8 +775,14 @@ impl LanguageServer for Backend {
 
         if needs_full {
             self.spawn_index_roots(None).await;
-        } else if !dirty_changes.is_empty() {
-            self.spawn_dirty_files(dirty_changes).await;
+        } else {
+            if !dirty_changes.is_empty() {
+                self.spawn_dirty_files(dirty_changes).await;
+            }
+            if !project_context_roots.is_empty() {
+                self.refresh_project_context_roots(project_context_roots)
+                    .await;
+            }
         }
     }
 
@@ -866,6 +886,21 @@ impl LanguageServer for Backend {
                 }
                 None => Ok(None),
             }
+        } else if params.command == PROJECT_CONTEXTS_LSP_COMMAND {
+            let uri =
+                project_context_commands::project_context_command_uri(params.arguments.first());
+            let status = self.project_context_status(uri.as_ref()).await;
+            Ok(serde_json::to_value(status).ok())
+        } else if params.command == SET_PROJECT_CONTEXT_LSP_COMMAND {
+            let uri =
+                project_context_commands::project_context_command_uri(params.arguments.first());
+            let selection =
+                project_context_commands::project_context_selection_arg(params.arguments.first())
+                    .unwrap_or(ProjectContextSelection::Auto);
+            let status = self
+                .set_project_context_selection(selection, uri.as_ref())
+                .await;
+            Ok(serde_json::to_value(status).ok())
         } else if params.command == COMPLETION_ACCEPTED_LSP_COMMAND {
             if let Some(event) = completion_accept_event_from_arg(params.arguments.first()) {
                 if self.record_completion_accept(event).await.is_err() {

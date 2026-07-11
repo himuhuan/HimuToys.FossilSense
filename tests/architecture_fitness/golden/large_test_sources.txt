@@ -1,0 +1,3 @@
+Architecture fitness report
+status severity rule file detail allowlist
+Summary: fail=0 warn=0 allowlisted=0

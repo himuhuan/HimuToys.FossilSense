@@ -2,6 +2,7 @@ export interface DegradedCapabilities {
   reachGraph?: boolean;
   includeTable?: boolean;
   referenceFileList?: boolean;
+  projectContext?: boolean;
 }
 
 export function degradedCapabilityWarning(degraded?: DegradedCapabilities): string | undefined {
@@ -14,6 +15,9 @@ export function degradedCapabilityWarning(degraded?: DegradedCapabilities): stri
   }
   if (degraded?.referenceFileList) {
     labels.push('referenceFileList');
+  }
+  if (degraded?.projectContext) {
+    labels.push('projectContext');
   }
   return labels.length ? labels.join(', ') : undefined;
 }

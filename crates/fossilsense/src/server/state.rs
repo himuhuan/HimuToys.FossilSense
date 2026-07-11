@@ -2,6 +2,8 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
+use crate::project_context::ProjectKey;
+
 /// Narrowing state for one document's in-flight completion. `generation`
 /// identifies the indexed workspace-state instances the `pools` index into;
 /// rebuilding any derived state for those roots invalidates the memo.
@@ -32,12 +34,18 @@ impl EngineEpoch {
     }
 }
 
-pub(super) fn combine_workspace_generations(generations: &[(PathBuf, EngineEpoch)]) -> u64 {
+pub(super) fn combine_completion_generation(
+    generations: &[(PathBuf, EngineEpoch)],
+    selection_epoch: u64,
+    effective_project: Option<&ProjectKey>,
+) -> u64 {
     let mut hasher = DefaultHasher::new();
     for (root, generation) in generations {
         root.hash(&mut hasher);
         generation.as_u64().hash(&mut hasher);
     }
+    selection_epoch.hash(&mut hasher);
+    effective_project.hash(&mut hasher);
     hasher.finish()
 }
 

@@ -52,6 +52,7 @@ const INTENT_BOUNDED_DEMOTION: i32 = -450;
 const DECLARATION_GLOBAL_REUSE_DEMOTION: i32 = -5_000;
 const HISTORY_MAX_BOOST: i32 = 700;
 const HISTORY_REPEAT_STEP: i32 = 120;
+pub(crate) const PROJECT_CONTEXT_MAX_BOOST: i32 = 350;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CompletionCandidateKind {
@@ -191,6 +192,7 @@ pub(crate) struct CandidateEvidence {
     pub match_score: i32,
     pub locality_score: i32,
     pub proximity_score: i32,
+    pub project_score: i32,
     pub kind: CompletionCandidateKind,
     pub history_key: Option<u64>,
     pub history_score: i32,
@@ -213,6 +215,7 @@ impl CandidateEvidence {
             match_score: score,
             locality_score: 0,
             proximity_score: 0,
+            project_score: 0,
             kind: CompletionCandidateKind::Unknown,
             history_key: None,
             history_score: 0,
@@ -221,6 +224,7 @@ impl CandidateEvidence {
 
     #[allow(dead_code)]
     fn merge_from(&mut self, other: CandidateEvidence) {
+        let same_primary_source = self.primary_source == other.primary_source;
         self.sources.merge(other.sources);
         if candidate_beats(other, *self) {
             self.primary_source = other.primary_source;
@@ -232,7 +236,10 @@ impl CandidateEvidence {
         self.match_score = self.match_score.max(other.match_score);
         self.locality_score = self.locality_score.max(other.locality_score);
         self.proximity_score = self.proximity_score.max(other.proximity_score);
-        if other.kind.priority() > self.kind.priority() {
+        self.project_score = self.project_score.max(other.project_score);
+        // Same-source duplicates already chose their presentation winner;
+        // cross-source merges retain the established structured-kind upgrade.
+        if !same_primary_source && other.kind.priority() > self.kind.priority() {
             self.kind = other.kind;
         }
         if self.history_key.is_none() {
@@ -305,6 +312,8 @@ pub(crate) struct CompletionPipelineMetrics {
     pub history_enabled: bool,
     pub history_boosted: usize,
     pub history_max_boost: i32,
+    pub project_boosted: usize,
+    pub project_max_boost: i32,
     pub recall_channels: crate::query::CompletionRecallMetrics,
 }
 
@@ -323,6 +332,8 @@ impl Default for CompletionPipelineMetrics {
             history_enabled: false,
             history_boosted: 0,
             history_max_boost: 0,
+            project_boosted: 0,
+            project_max_boost: 0,
             recall_channels: crate::query::CompletionRecallMetrics::default(),
         }
     }
@@ -410,6 +421,8 @@ pub(crate) fn run_evidence_aware_pipeline_with_context<T>(
     let mut guarded_low_trust = 0;
     let mut history_boosted = 0;
     let mut history_max_boost = 0;
+    let mut project_boosted = 0;
+    let mut project_max_boost = 0;
     for candidate in &mut kept {
         candidate.evidence.history_score =
             history_adjustment(&candidate.name, candidate.evidence, &context);
@@ -417,10 +430,21 @@ pub(crate) fn run_evidence_aware_pipeline_with_context<T>(
             history_boosted += 1;
             history_max_boost = history_max_boost.max(candidate.evidence.history_score);
         }
+        if candidate.evidence.project_score > 0 {
+            project_boosted += 1;
+            project_max_boost = project_max_boost.max(candidate.evidence.project_score);
+        }
         let rank = final_rank_score(candidate.evidence, &context);
         if is_guarded_low_trust(candidate.evidence) {
             guarded_low_trust += 1;
-            candidate.evidence.score = rank.min(LOW_TRUST_GLOBAL_TEXT_CAP_BELOW_REACHABLE);
+            // Keep the bounded project distinction below reachable evidence;
+            // zero project evidence preserves the exact pre-feature cap.
+            let project_cap = candidate
+                .evidence
+                .project_score
+                .clamp(0, PROJECT_CONTEXT_MAX_BOOST);
+            let cap = LOW_TRUST_GLOBAL_TEXT_CAP_BELOW_REACHABLE + project_cap;
+            candidate.evidence.score = rank.min(cap);
         } else {
             candidate.evidence.score = rank;
         }
@@ -428,6 +452,8 @@ pub(crate) fn run_evidence_aware_pipeline_with_context<T>(
     metrics.final_rank = FinalRankSummary { guarded_low_trust };
     metrics.history_boosted = history_boosted;
     metrics.history_max_boost = history_max_boost;
+    metrics.project_boosted = project_boosted;
+    metrics.project_max_boost = project_max_boost;
 
     kept.sort_by(|a, b| {
         b.evidence
@@ -536,7 +562,9 @@ fn candidate_beats(current: CandidateEvidence, previous: CandidateEvidence) -> b
         || (rank == prev_rank
             && ((current.tier, current.confidence) > (previous.tier, previous.confidence)
                 || ((current.tier, current.confidence) == (previous.tier, previous.confidence)
-                    && current.score > previous.score)))
+                    && (current.project_score > previous.project_score
+                        || (current.project_score == previous.project_score
+                            && current.score > previous.score)))))
 }
 
 #[allow(dead_code)]
@@ -559,6 +587,7 @@ fn final_rank_score(evidence: CandidateEvidence, context: &CompletionRankContext
         + confidence_prior(evidence.confidence)
         + evidence.match_score
         + evidence.proximity_score.clamp(0, PROXIMITY_SCORE_CAP)
+        + evidence.project_score.clamp(0, PROJECT_CONTEXT_MAX_BOOST)
         + intent_adjustment(evidence, context.intent)
         + evidence.history_score
 }
@@ -627,10 +656,9 @@ fn intent_adjustment(evidence: CandidateEvidence, intent: CompletionIntent) -> i
                 || evidence.primary_source == CandidateSource::LocalWord
             {
                 INTENT_MEDIUM_MATCH
-            } else if evidence.primary_source == CandidateSource::LanguageBuiltin {
-                DECLARATION_GLOBAL_REUSE_DEMOTION
-            } else if evidence.primary_source == CandidateSource::Indexed
-                && evidence.tier == ScopeTier::Global
+            } else if evidence.primary_source == CandidateSource::LanguageBuiltin
+                || (evidence.primary_source == CandidateSource::Indexed
+                    && evidence.tier == ScopeTier::Global)
             {
                 DECLARATION_GLOBAL_REUSE_DEMOTION
             } else {
@@ -728,7 +756,7 @@ pub(crate) fn completion_perf_summary(
 ) -> String {
     let shadow = metrics.shadow.unwrap_or_default();
     format!(
-        "[perf] completion total={}ms context={}ms recall={}ms merge_rank={}ms render={}ms document_version={} engine_generation={} prefix_len={} hit={} intent={} intent_confidence={} history_enabled={} history_boosted={} history_max_boost={} candidates_in={} after_dedup={} returned={} indexed={} local_binding={} current_file_overlay={} language_builtin={} local_word={} returned_indexed={} returned_local_binding={} returned_current_file_overlay={} returned_language_builtin={} returned_local_word={} recall_reachable={} recall_external={} recall_unknown={} recall_global={} recall_pool={} guarded_low_trust={} shadow_moved={} shadow_max_delta={}",
+        "[perf] completion total={}ms context={}ms recall={}ms merge_rank={}ms render={}ms document_version={} engine_generation={} prefix_len={} hit={} intent={} intent_confidence={} history_enabled={} history_boosted={} history_max_boost={} project_boosted={} project_max_boost={} candidates_in={} after_dedup={} returned={} indexed={} local_binding={} current_file_overlay={} language_builtin={} local_word={} returned_indexed={} returned_local_binding={} returned_current_file_overlay={} returned_language_builtin={} returned_local_word={} recall_reachable={} recall_external={} recall_unknown={} recall_global={} recall_same_project={} recall_pool={} guarded_low_trust={} shadow_moved={} shadow_max_delta={}",
         timings.total_ms,
         timings.context_ms,
         timings.recall_ms,
@@ -743,6 +771,8 @@ pub(crate) fn completion_perf_summary(
         metrics.history_enabled,
         metrics.history_boosted,
         metrics.history_max_boost,
+        metrics.project_boosted,
+        metrics.project_max_boost,
         metrics.input_total,
         metrics.after_dedup_total,
         metrics.returned_total,
@@ -760,6 +790,7 @@ pub(crate) fn completion_perf_summary(
         metrics.recall_channels.external,
         metrics.recall_channels.unknown,
         metrics.recall_channels.global,
+        metrics.recall_channels.same_project,
         metrics.recall_channels.pool_total,
         metrics.final_rank.guarded_low_trust,
         shadow.moved,

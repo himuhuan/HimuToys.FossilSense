@@ -317,8 +317,28 @@ impl WorkspaceConfig {
     }
 
     pub fn is_in_scope(&self, rel_slash_path: &str) -> bool {
+        if !self.is_path_allowed_by_scope_without_extension(rel_slash_path) {
+            return false;
+        }
+
+        let path_lower = rel_slash_path.to_ascii_lowercase();
+        extension_from_slash_path_lower(&path_lower)
+            .is_some_and(|ext_lower| self.matchers.extension_set.contains(ext_lower))
+    }
+
+    /// Apply the workspace include/exclude policy without requiring a source
+    /// extension. Build-marker discovery uses this after the shared traversal
+    /// filter has pruned default-excluded directories.
+    pub fn is_path_allowed_by_scope_without_extension(&self, rel_slash_path: &str) -> bool {
         // Lowercase once for all sub-checks.
         let path_lower = rel_slash_path.to_ascii_lowercase();
+
+        if path_lower
+            .split('/')
+            .any(|segment| self.matchers.excluded_dirs_set.contains(segment))
+        {
+            return false;
+        }
 
         // Include check via precomputed matchers.
         if !self.include.is_empty() {
@@ -354,9 +374,39 @@ impl WorkspaceConfig {
             return false;
         }
 
-        // Extension check via precomputed HashSet.
-        extension_from_slash_path_lower(&path_lower)
-            .is_some_and(|ext_lower| self.matchers.extension_set.contains(ext_lower))
+        true
+    }
+
+    /// Decide whether a build marker may contribute a project root. A marker
+    /// directory can be either inside the selected source scope or an ancestor
+    /// of it (for example a root `CMakeLists.txt` with `include = ["src"]`).
+    /// Full-path exclusion and default excluded-directory rules still apply.
+    pub fn is_project_marker_in_scope(&self, rel_slash_path: &str) -> bool {
+        let path_lower = rel_slash_path.to_ascii_lowercase();
+        if path_lower
+            .split('/')
+            .any(|segment| self.matchers.excluded_dirs_set.contains(segment))
+        {
+            return false;
+        }
+        if self
+            .matchers
+            .exclude_lower
+            .iter()
+            .any(|entry_lower| path_matches_entry_lower(&path_lower, entry_lower))
+            || self
+                .matchers
+                .exclude_glob_entries
+                .iter()
+                .any(|entry| path_matches_glob_entry(rel_slash_path, entry))
+        {
+            return false;
+        }
+
+        let parent = rel_slash_path
+            .rsplit_once('/')
+            .map_or("", |(parent, _)| parent);
+        self.keep_during_walk(parent, true)
     }
 
     /// Rebuild `matchers` from the current config fields. Needed after

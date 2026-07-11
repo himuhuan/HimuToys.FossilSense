@@ -1,0 +1,4 @@
+Architecture fitness report
+status severity rule file detail allowlist
+WARN WARN large-source-file crates/fossilsense/src/example.rs 11 lines exceeds warning threshold 6 -
+Summary: fail=0 warn=1 allowlisted=0

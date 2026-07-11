@@ -11,6 +11,7 @@ use super::state;
 use super::LocalWordCache;
 use crate::completion_words;
 use crate::parser::FileSemanticIndex;
+use crate::project_context::ProjectContextIndex;
 use crate::query::NameTable;
 use crate::reachability::ReachGraph;
 use crate::references;
@@ -180,6 +181,7 @@ pub(in crate::server) struct EngineSnapshot {
     pub(in crate::server) reach_graph: Option<Arc<ReachGraph>>,
     pub(in crate::server) include_table: Option<Arc<IncludeCompletionTable>>,
     pub(in crate::server) indexed_files: Option<Arc<Vec<(String, PathBuf)>>>,
+    pub(in crate::server) project_context: Option<Arc<ProjectContextIndex>>,
     #[allow(dead_code)] // Captured now; request capability-health routing is the next phase.
     pub(in crate::server) degraded: crate::progress::DegradedCapabilities,
 }
@@ -193,6 +195,7 @@ impl EngineSnapshot {
             reach_graph: None,
             include_table: None,
             indexed_files: None,
+            project_context: None,
             degraded: crate::progress::DegradedCapabilities::default(),
         }
     }
@@ -295,6 +298,10 @@ impl CacheLedger {
         self.completion_memo.lock().await.remove(uri);
     }
 
+    pub(super) async fn clear_all_completion_memos(&self) {
+        self.completion_memo.lock().await.clear();
+    }
+
     pub(super) async fn record_completion_memo(
         &self,
         uri: Url,
@@ -366,6 +373,7 @@ impl CacheLedger {
             reach_graph: current.reach_graph.clone(),
             include_table: current.include_table.clone(),
             indexed_files: current.indexed_files.clone(),
+            project_context: current.project_context.clone(),
             degraded: current.degraded.clone(),
         })
         .await;
@@ -388,6 +396,7 @@ impl CacheLedger {
             reach_graph: current.reach_graph.clone(),
             include_table: current.include_table.clone(),
             indexed_files: Some(files),
+            project_context: current.project_context.clone(),
             degraded: current.degraded.clone(),
         })
         .await;
@@ -406,6 +415,7 @@ impl CacheLedger {
             reach_graph: Some(graph),
             include_table: current.include_table.clone(),
             indexed_files: current.indexed_files.clone(),
+            project_context: current.project_context.clone(),
             degraded: current.degraded.clone(),
         })
         .await;

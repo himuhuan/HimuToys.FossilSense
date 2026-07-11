@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use crate::model::ScopeTier;
 use crate::parser::SymbolKind as ParserKind;
+use crate::project_context::{ProjectContextIndex, ProjectKey};
 use crate::reachability::ReachScope;
 use crate::resolver::{self, ResolveContext};
 use crate::store::views::NameTableSymbolRow;
@@ -63,6 +64,8 @@ pub struct RankedNameHit {
     pub name_len: usize,
     pub name: String,
     pub kind: ParserKind,
+    /// Best-effort build-marker ownership for ordinary completion only.
+    pub project_key: Option<ProjectKey>,
 }
 
 // ===========================================================================
@@ -81,6 +84,7 @@ struct NameEntry {
     directly_included: bool,
     path: String,
     kind: ParserKind,
+    project_key: Option<ProjectKey>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -99,6 +103,7 @@ pub struct CompletionRecallQuotas {
     pub external: usize,
     pub unknown: usize,
     pub global: usize,
+    pub same_project: usize,
 }
 
 impl CompletionRecallQuotas {
@@ -109,7 +114,15 @@ impl CompletionRecallQuotas {
             external: limit / 2,
             unknown: limit / 2,
             global: limit,
+            same_project: 0,
         }
+    }
+
+    pub fn with_project_context(limit: usize) -> Self {
+        let mut quotas = Self::default_for_completion_limit(limit);
+        quotas.same_project = limit / 2;
+        quotas.total_indexed = quotas.total_indexed.saturating_add(quotas.same_project);
+        quotas
     }
 }
 
@@ -119,6 +132,7 @@ pub struct CompletionRecallMetrics {
     pub external: usize,
     pub unknown: usize,
     pub global: usize,
+    pub same_project: usize,
     pub pool_total: usize,
     pub indexed_returned: usize,
 }
@@ -129,6 +143,7 @@ impl CompletionRecallMetrics {
         self.external += other.external;
         self.unknown += other.unknown;
         self.global += other.global;
+        self.same_project += other.same_project;
         self.pool_total += other.pool_total;
         self.indexed_returned += other.indexed_returned;
     }
@@ -166,6 +181,9 @@ pub struct NameTable {
     /// Entry indices sorted by lowercased name, enabling binary-search retrieval
     /// of the exact/prefix tiers without a full scan.
     sorted: Vec<usize>,
+    /// Candidate indices grouped by derived build-marker project. This is a
+    /// completion recall index, not a semantic scope.
+    by_project: HashMap<ProjectKey, Vec<usize>>,
     /// Cached unscoped coloring fallback: all workspace files in a closed
     /// reachability set. Reused by `colorable_kind_counts(None)` instead of
     /// rebuilding the same path set on every semantic-token request.
@@ -215,17 +233,53 @@ impl NameTable {
         Self::from_entries(entries)
     }
 
+    #[cfg(test)]
+    pub fn build_with_paths_and_project_context(
+        names: Vec<(i64, String, bool, String, String, bool)>,
+        project_context: &ProjectContextIndex,
+    ) -> Self {
+        let entries = names
+            .into_iter()
+            .map(name_entry)
+            .map(|mut entry| {
+                if !entry.external {
+                    entry.project_key = project_context.nearest_for_file(&entry.path);
+                }
+                entry
+            })
+            .collect();
+        Self::from_entries(entries)
+    }
+
     pub fn build_from_rows(rows: Vec<NameTableSymbolRow>) -> Self {
         let entries: Vec<NameEntry> = rows.into_iter().map(name_entry_from_row).collect();
         Self::from_entries(entries)
     }
 
+    pub fn build_from_rows_with_project_context(
+        rows: Vec<NameTableSymbolRow>,
+        project_context: Option<&ProjectContextIndex>,
+    ) -> Self {
+        let entries = rows
+            .into_iter()
+            .map(|row| name_entry_from_row_with_project_context(row, project_context))
+            .collect();
+        Self::from_entries(entries)
+    }
+
     fn from_entries(entries: Vec<NameEntry>) -> Self {
         let sorted = sorted_indices(&entries);
+        let mut by_project: HashMap<ProjectKey, Vec<usize>> = HashMap::new();
+        for (index, entry) in entries.iter().enumerate() {
+            if let Some(key) = &entry.project_key {
+                by_project.entry(key.clone()).or_default().push(index);
+            }
+        }
         let all_workspace_reach = Arc::new(all_workspace_reach(&entries));
         Self {
             entries,
             sorted,
+            by_project,
             all_workspace_reach,
         }
     }
@@ -240,6 +294,7 @@ impl NameTable {
         self.with_updated_entries(paths, fresh_entries)
     }
 
+    #[allow(dead_code)]
     pub fn with_updated_path_rows(
         &self,
         paths: &HashSet<String>,
@@ -247,6 +302,43 @@ impl NameTable {
     ) -> Self {
         let fresh_entries = rows.into_iter().map(name_entry_from_row);
         self.with_updated_entries(paths, fresh_entries)
+    }
+
+    pub fn with_updated_path_rows_with_project_context(
+        &self,
+        paths: &HashSet<String>,
+        rows: Vec<NameTableSymbolRow>,
+        project_context: Option<&ProjectContextIndex>,
+    ) -> Self {
+        let fresh_entries = rows
+            .into_iter()
+            .map(|row| name_entry_from_row_with_project_context(row, project_context));
+        self.with_updated_entries(paths, fresh_entries)
+    }
+
+    pub fn project_indices(&self, key: &ProjectKey) -> Option<&[usize]> {
+        self.by_project.get(key).map(Vec::as_slice)
+    }
+
+    /// Re-derive build-marker ownership over this already-published name
+    /// generation. Marker-only refreshes use this instead of reopening SQLite,
+    /// so an overlapping index writer cannot leak partially committed rows into
+    /// the runtime snapshot.
+    pub fn with_project_context(&self, project_context: Option<&ProjectContextIndex>) -> Self {
+        let entries = self
+            .entries
+            .iter()
+            .cloned()
+            .map(|mut entry| {
+                entry.project_key = if entry.external {
+                    None
+                } else {
+                    project_context.and_then(|index| index.nearest_for_file(&entry.path))
+                };
+                entry
+            })
+            .collect();
+        Self::from_entries(entries)
     }
 
     fn with_updated_entries(
@@ -503,6 +595,7 @@ impl NameTable {
                     name_len: candidate.name_len,
                     name: entry.name.clone(),
                     kind: entry.kind,
+                    project_key: entry.project_key.clone(),
                 })
                 .collect();
             // An empty query establishes no usable narrowing base.
@@ -543,11 +636,23 @@ impl NameTable {
         (hits, pool)
     }
 
+    #[allow(dead_code)]
     pub fn search_completion_recall_pooled(
         &self,
         query: &str,
         quotas: CompletionRecallQuotas,
         scope: Option<&CompletionScope>,
+        prior_pool: Option<&[usize]>,
+    ) -> (Vec<RankedNameHit>, Vec<usize>, CompletionRecallMetrics) {
+        self.search_completion_recall_pooled_with_project(query, quotas, scope, None, prior_pool)
+    }
+
+    pub fn search_completion_recall_pooled_with_project(
+        &self,
+        query: &str,
+        quotas: CompletionRecallQuotas,
+        scope: Option<&CompletionScope>,
+        active_project: Option<&ProjectKey>,
         prior_pool: Option<&[usize]>,
     ) -> (Vec<RankedNameHit>, Vec<usize>, CompletionRecallMetrics) {
         let total_limit = quotas.total_indexed;
@@ -560,6 +665,14 @@ impl NameTable {
             &scored,
             ScopeChannel::Reachable,
             quotas.reachable,
+            &mut selected_indices,
+            &mut selected,
+        );
+        take_same_project(
+            self,
+            &scored,
+            active_project,
+            quotas.same_project,
             &mut selected_indices,
             &mut selected,
         );
@@ -597,7 +710,7 @@ impl NameTable {
         sort_scored(&mut selected, &self.entries);
         selected.truncate(total_limit);
         let hits = self.scored_to_hits(selected);
-        let metrics = recall_metrics(&hits, pool.len());
+        let metrics = recall_metrics(&hits, pool.len(), active_project);
         (hits, pool, metrics)
     }
 
@@ -740,6 +853,7 @@ impl NameTable {
                     name_len: candidate.name_len,
                     name: entry.name.clone(),
                     kind: entry.kind,
+                    project_key: entry.project_key.clone(),
                 }
             })
             .collect()
@@ -788,6 +902,38 @@ fn take_channel(
     }
 }
 
+fn take_same_project(
+    table: &NameTable,
+    scored: &[ScoredCandidate],
+    active_project: Option<&ProjectKey>,
+    quota: usize,
+    selected_indices: &mut HashSet<usize>,
+    selected: &mut Vec<ScoredCandidate>,
+) {
+    let Some(key) = active_project else {
+        return;
+    };
+    let Some(project_indices) = table.project_indices(key) else {
+        return;
+    };
+    if quota == 0 {
+        return;
+    }
+    let mut taken = 0;
+    for candidate in scored {
+        if taken >= quota {
+            break;
+        }
+        if project_indices.binary_search(&candidate.index).is_err() {
+            continue;
+        }
+        if selected_indices.insert(candidate.index) {
+            selected.push(*candidate);
+            taken += 1;
+        }
+    }
+}
+
 fn sort_scored(scored: &mut [ScoredCandidate], entries: &[NameEntry]) {
     scored.sort_by(|a, b| {
         b.score
@@ -797,7 +943,11 @@ fn sort_scored(scored: &mut [ScoredCandidate], entries: &[NameEntry]) {
     });
 }
 
-fn recall_metrics(hits: &[RankedNameHit], pool_total: usize) -> CompletionRecallMetrics {
+fn recall_metrics(
+    hits: &[RankedNameHit],
+    pool_total: usize,
+    active_project: Option<&ProjectKey>,
+) -> CompletionRecallMetrics {
     let mut metrics = CompletionRecallMetrics {
         pool_total,
         indexed_returned: hits.len(),
@@ -810,6 +960,9 @@ fn recall_metrics(hits: &[RankedNameHit], pool_total: usize) -> CompletionRecall
             ScopeChannel::Unknown => metrics.unknown += 1,
             ScopeChannel::Global => metrics.global += 1,
         }
+        if active_project.is_some() && hit.project_key.as_ref() == active_project {
+            metrics.same_project += 1;
+        }
     }
     metrics
 }
@@ -820,10 +973,22 @@ fn recall_metrics(hits: &[RankedNameHit], pool_total: usize) -> CompletionRecall
 fn name_entry(
     (id, name, external, path, kind, directly_included): (i64, String, bool, String, String, bool),
 ) -> NameEntry {
-    name_entry_parts(id, name, external, path, kind, directly_included)
+    name_entry_parts(id, name, external, path, kind, directly_included, None)
 }
 
 fn name_entry_from_row(row: NameTableSymbolRow) -> NameEntry {
+    name_entry_from_row_with_project_context(row, None)
+}
+
+fn name_entry_from_row_with_project_context(
+    row: NameTableSymbolRow,
+    project_context: Option<&ProjectContextIndex>,
+) -> NameEntry {
+    let project_key = if row.external {
+        None
+    } else {
+        project_context.and_then(|index| index.nearest_for_file(&row.path))
+    };
     name_entry_parts(
         row.symbol_id,
         row.label,
@@ -831,6 +996,7 @@ fn name_entry_from_row(row: NameTableSymbolRow) -> NameEntry {
         row.path,
         row.kind,
         row.directly_included,
+        project_key,
     )
 }
 
@@ -841,6 +1007,7 @@ fn name_entry_parts(
     path: String,
     kind: String,
     directly_included: bool,
+    project_key: Option<ProjectKey>,
 ) -> NameEntry {
     let lower = name.to_ascii_lowercase();
     NameEntry {
@@ -851,6 +1018,7 @@ fn name_entry_parts(
         directly_included,
         path,
         kind: crate::parser::kind_from_str(&kind),
+        project_key,
     }
 }
 

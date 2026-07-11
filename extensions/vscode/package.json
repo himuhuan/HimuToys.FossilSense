@@ -2,7 +2,7 @@
   "name": "fossilsense-vscode",
   "displayName": "FossilSense",
   "description": "FossilSense C/C++ best-effort navigation: symbols, outlines, rich hover, ranked definitions, member completion, role-grouped references, and local-only history-aware completion.",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "private": true,
   "license": "UNLICENSED",
   "publisher": "himutoys",
@@ -42,6 +42,10 @@
       {
         "command": "fossilsense.clearCompletionHistory",
         "title": "FossilSense: Clear Completion History"
+      },
+      {
+        "command": "fossilsense.selectProjectContext",
+        "title": "FossilSense: Select Project Context"
       }
     ],
     "configuration": {
@@ -81,6 +85,16 @@
           ],
           "default": "auto",
           "description": "Controls local-only accepted-completion history used as a bounded positive-feedback ranking signal. 'auto' and 'on' record anonymous candidate hashes/buckets and use them for ranking; 'off' disables both. Use 'FossilSense: Clear Completion History' to remove local workspace history."
+        },
+        "fossilsense.projectContext.mode": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "promptOnAmbiguous",
+            "off"
+          ],
+          "default": "auto",
+          "markdownDescription": "Controls build-marker project evidence for ordinary identifier completion. `auto` uses the completion file's nearest in-scope marker; `promptOnAmbiguous` also prompts once when an active C/C++ file cannot be assigned while projects are available; `off` enforces baseline completion. Project context never filters candidates or changes navigation, references, coloring, member completion, or include completion."
         },
         "fossilsense.semanticColoring.mode": {
           "type": "string",
@@ -134,7 +148,7 @@
   },
   "scripts": {
     "compile": "tsc -p ./",
-    "test": "pnpm run compile && node out/test/config.test.js && node out/test/status.test.js && node out/test/serverPath.test.js && node out/test/conflicts.test.js && node out/test/referencesView.test.js && node out/test/completionHistory.test.js",
+    "test": "pnpm run compile && node out/test/config.test.js && node out/test/status.test.js && node out/test/serverPath.test.js && node out/test/conflicts.test.js && node out/test/referencesView.test.js && node out/test/completionHistory.test.js && node out/test/projectContext.test.js",
     "watch": "tsc -watch -p ./",
     "package": "node scripts/package.mjs"
   },

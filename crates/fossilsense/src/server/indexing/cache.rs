@@ -2,12 +2,13 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tower_lsp::lsp_types::MessageType;
 use tower_lsp::Client;
 
 use crate::pathing;
 use crate::progress::DegradedCapabilities;
+use crate::project_context::{self, ProjectContextIndex};
 use crate::query::NameTable;
 use crate::reachability::ReachGraph;
 use crate::server::workspace::EngineSnapshot;
@@ -17,12 +18,16 @@ use crate::store::IndexStore;
 /// Build the in-memory fuzzy name table for `root` from one committed SQLite
 /// view. The result remains private until the complete engine snapshot is
 /// atomically published.
-async fn rebuild_name_table(root: PathBuf) -> Result<Arc<NameTable>> {
+async fn rebuild_name_table(
+    root: PathBuf,
+    project_context: Option<Arc<ProjectContextIndex>>,
+) -> Result<Arc<NameTable>> {
     let built = tokio::task::spawn_blocking(move || -> Result<NameTable> {
         let db_path = pathing::default_index_path(&root)?;
         let store = IndexStore::open_readonly(&db_path)?;
-        Ok(NameTable::build_from_rows(
+        Ok(NameTable::build_from_rows_with_project_context(
             store.name_table_view().symbol_rows()?,
+            project_context.as_deref(),
         ))
     })
     .await;
@@ -38,9 +43,10 @@ async fn update_name_table_paths(
     previous: Option<&NameTable>,
     root: PathBuf,
     paths: &[String],
+    project_context: Option<Arc<ProjectContextIndex>>,
 ) -> Result<Arc<NameTable>> {
     let Some(previous) = previous else {
-        return rebuild_name_table(root).await;
+        return rebuild_name_table(root, project_context).await;
     };
 
     let paths_vec = paths.to_vec();
@@ -60,8 +66,46 @@ async fn update_name_table_paths(
     };
     let path_set: HashSet<String> = paths.iter().cloned().collect();
     Ok(Arc::new(
-        previous.with_updated_path_rows(&path_set, fresh_names),
+        previous.with_updated_path_rows_with_project_context(
+            &path_set,
+            fresh_names,
+            project_context.as_deref(),
+        ),
     ))
+}
+
+async fn rebuild_project_context(
+    client: &Client,
+    root: PathBuf,
+) -> Option<Arc<ProjectContextIndex>> {
+    let build_root = root.clone();
+    let built = tokio::task::spawn_blocking(move || -> Result<ProjectContextIndex> {
+        let (config, _) = crate::config::WorkspaceConfig::load(&build_root);
+        project_context::discover_project_contexts(&build_root, &config)
+    })
+    .await;
+
+    match built {
+        Ok(Ok(index)) => Some(Arc::new(index)),
+        Ok(Err(err)) => {
+            client
+                .log_message(
+                    MessageType::WARNING,
+                    format!("project context discovery failed: {err:#}"),
+                )
+                .await;
+            None
+        }
+        Err(err) => {
+            client
+                .log_message(
+                    MessageType::WARNING,
+                    format!("project context task failed: {err}"),
+                )
+                .await;
+            None
+        }
+    }
 }
 
 async fn load_reach_graph(root: PathBuf) -> Result<Arc<ReachGraph>> {
@@ -233,7 +277,8 @@ impl CacheLedger {
         let _publish_guard = self.publish_gate.lock().await;
 
         let nt_started = tokio::time::Instant::now();
-        let name_table = rebuild_name_table(root.clone()).await?;
+        let project_context = rebuild_project_context(client, root.clone()).await;
+        let name_table = rebuild_name_table(root.clone(), project_context.clone()).await?;
         let symbol_count = name_table.len();
         let name_table_ms = nt_started.elapsed().as_millis();
 
@@ -241,6 +286,7 @@ impl CacheLedger {
         let reach_graph = rebuild_reach_graph(client, root.clone()).await;
         let mut degraded = DegradedCapabilities {
             reach_graph: reach_graph.is_none(),
+            project_context: project_context.is_none(),
             ..Default::default()
         };
 
@@ -275,6 +321,7 @@ impl CacheLedger {
             reach_graph,
             include_table,
             indexed_files,
+            project_context,
             degraded: degraded.clone(),
         })
         .await;
@@ -302,6 +349,9 @@ impl CacheLedger {
     ) -> Result<CachePublishReport> {
         let _publish_guard = self.publish_gate.lock().await;
         let previous = self.current_engine_snapshot(&root).await;
+        let project_context = previous
+            .as_ref()
+            .and_then(|snapshot| snapshot.project_context.clone());
 
         let nt_started = tokio::time::Instant::now();
         let name_table = update_name_table_paths(
@@ -310,6 +360,7 @@ impl CacheLedger {
                 .and_then(|snapshot| snapshot.name_table.as_deref()),
             root.clone(),
             rel_paths,
+            project_context.clone(),
         )
         .await?;
         let symbol_count = name_table.len();
@@ -327,6 +378,7 @@ impl CacheLedger {
         .await;
         let mut degraded = DegradedCapabilities {
             reach_graph: reach_graph.is_none(),
+            project_context: project_context.is_none(),
             ..Default::default()
         };
 
@@ -361,6 +413,7 @@ impl CacheLedger {
             reach_graph,
             include_table,
             indexed_files,
+            project_context,
             degraded: degraded.clone(),
         })
         .await;
@@ -377,5 +430,47 @@ impl CacheLedger {
             include_table_error,
             reference_file_list_error,
         })
+    }
+
+    /// Refresh build-marker ownership without re-indexing or reparsing source
+    /// files. The prior snapshot remains visible until the replacement project
+    /// index and tagged NameTable are both ready.
+    pub(in crate::server) async fn refresh_project_context(
+        &self,
+        client: &Client,
+        root: PathBuf,
+    ) -> Result<usize> {
+        let _publish_guard = self.publish_gate.lock().await;
+        let previous = self
+            .current_engine_snapshot(&root)
+            .await
+            .context("project context refresh requires a published engine snapshot")?;
+        let project_context = rebuild_project_context(client, root.clone()).await;
+        let project_count = project_context
+            .as_ref()
+            .map_or(0, |index| index.projects().len());
+        let previous_name_table = previous
+            .name_table
+            .as_ref()
+            .context("project context refresh requires a published name table")?;
+        let name_table =
+            Arc::new(previous_name_table.with_project_context(project_context.as_deref()));
+        let mut degraded = previous.degraded.clone();
+        degraded.project_context = project_context.is_none();
+
+        self.publish_engine_snapshot(EngineSnapshot {
+            root,
+            epoch: self.allocate_engine_epoch(),
+            name_table: Some(name_table),
+            reach_graph: previous.reach_graph.clone(),
+            include_table: previous.include_table.clone(),
+            indexed_files: previous.indexed_files.clone(),
+            project_context,
+            degraded,
+        })
+        .await;
+        self.invalidate_after_index_change();
+        self.completion_memo.lock().await.clear();
+        Ok(project_count)
     }
 }

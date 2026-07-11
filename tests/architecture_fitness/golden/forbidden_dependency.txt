@@ -1,7 +1,8 @@
 Architecture fitness report
 status severity rule file detail allowlist
 FAIL ERROR core-dependency-direction crates/fossilsense/src/parser/bad_parser.rs parser must not depend on store/server/indexer details: crate::store -
+FAIL ERROR core-dependency-direction crates/fossilsense/src/project_context/bad_project_context.rs project_context core must not depend on store/server/indexer details: crate::server -
 FAIL ERROR core-dependency-direction crates/fossilsense/src/resolver/bad_resolver.rs resolver must not depend on parser/store/server/indexer details: crate::server -
 FAIL ERROR lsp-boundary crates/fossilsense/src/query/bad_lsp.rs tower_lsp usage is limited to server and LSP adapter boundaries -
 FAIL ERROR sqlite-boundary crates/fossilsense/src/query/bad_sqlite.rs rusqlite usage is limited to store/persistence modules -
-Summary: fail=4 warn=0 allowlisted=0
+Summary: fail=5 warn=0 allowlisted=0

@@ -7,6 +7,7 @@ const DEFAULT_LARGE_THRESHOLD = 800;
 const RULES = {
   lspBoundary: "lsp-boundary",
   ordinaryCompletionServiceLspBoundary: "ordinary-completion-service-lsp-boundary",
+  ordinaryCompletionServiceIoBoundary: "ordinary-completion-service-io-boundary",
   sqliteBoundary: "sqlite-boundary",
   coreDirection: "core-dependency-direction",
   largeFile: "large-source-file",
@@ -91,45 +92,126 @@ function stripLineComments(text) {
 
 function stripCfgTestSections(text) {
   let result = "";
-  let index = 0;
-  const marker = "#[cfg(test)]";
+  let copiedThrough = 0;
+  const testModule = /#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]\s*mod\s+tests\s*\{/g;
+  let match;
 
-  while (index < text.length) {
-    const markerIndex = text.indexOf(marker, index);
-    if (markerIndex === -1) {
-      result += text.slice(index);
-      break;
+  while ((match = testModule.exec(text)) !== null) {
+    const braceIndex = match.index + match[0].lastIndexOf("{");
+    const end = matchingRustBraceEnd(text, braceIndex);
+    if (end === -1) {
+      testModule.lastIndex = braceIndex + 1;
+      continue;
     }
+    result += text.slice(copiedThrough, match.index);
+    copiedThrough = end;
+    testModule.lastIndex = end;
+  }
+  return result + text.slice(copiedThrough);
+}
 
-    result += text.slice(index, markerIndex);
-    const modIndex = text.indexOf("mod tests", markerIndex);
-    const braceIndex = modIndex === -1 ? -1 : text.indexOf("{", modIndex);
-    if (modIndex === -1 || braceIndex === -1) {
-      index = markerIndex + marker.length;
+function matchingRustBraceEnd(text, openingBrace) {
+  let depth = 0;
+  let blockCommentDepth = 0;
+  let state = "code";
+  let rawTerminator = "";
+
+  for (let index = openingBrace; index < text.length; index += 1) {
+    const char = text[index];
+    const next = text[index + 1];
+
+    if (state === "line-comment") {
+      if (char === "\n") state = "code";
+      continue;
+    }
+    if (state === "block-comment") {
+      if (char === "/" && next === "*") {
+        blockCommentDepth += 1;
+        index += 1;
+      } else if (char === "*" && next === "/") {
+        blockCommentDepth -= 1;
+        index += 1;
+        if (blockCommentDepth === 0) state = "code";
+      }
+      continue;
+    }
+    if (state === "string" || state === "char") {
+      if (char === "\\") {
+        index += 1;
+      } else if ((state === "string" && char === '"') || (state === "char" && char === "'")) {
+        state = "code";
+      }
+      continue;
+    }
+    if (state === "raw-string") {
+      if (text.startsWith(rawTerminator, index)) {
+        index += rawTerminator.length - 1;
+        state = "code";
+      }
       continue;
     }
 
-    let depth = 0;
-    let end = braceIndex;
-    for (; end < text.length; end += 1) {
-      if (text[end] === "{") {
+    if (char === "/" && next === "/") {
+      state = "line-comment";
+      index += 1;
+    } else if (char === "/" && next === "*") {
+      state = "block-comment";
+      blockCommentDepth = 1;
+      index += 1;
+    } else {
+      const rawMatch = text.slice(index).match(/^(?:br|r)(#*)"/);
+      if (rawMatch) {
+        rawTerminator = `"${rawMatch[1]}`;
+        state = "raw-string";
+        index += rawMatch[0].length - 1;
+      } else if (char === '"') {
+        state = "string";
+      } else if (char === "'" && rustCharLiteralEndsOnLine(text, index)) {
+        state = "char";
+      } else if (char === "{") {
         depth += 1;
-      } else if (text[end] === "}") {
+      } else if (char === "}") {
         depth -= 1;
-        if (depth === 0) {
-          end += 1;
-          break;
-        }
+        if (depth === 0) return index + 1;
       }
     }
-    index = end;
   }
+  return -1;
+}
 
-  return result;
+function rustCharLiteralEndsOnLine(text, openingQuote) {
+  for (let index = openingQuote + 1; index < text.length && text[index] !== "\n"; index += 1) {
+    if (text[index] === "\\") {
+      index += 1;
+    } else if (text[index] === "'") {
+      return true;
+    }
+  }
+  return false;
 }
 
 function scanText(text) {
-  return stripLineComments(stripBlockComments(stripCfgTestSections(text)));
+  return stripLineComments(stripBlockComments(text));
+}
+
+function isTestSource(relPath) {
+  const normalized = relPath.replace(/\\/g, "/");
+  const base = path.posix.basename(normalized);
+  return (
+    normalized.includes("/test/") ||
+    normalized.includes("/tests/") ||
+    base === "tests.rs" ||
+    base.endsWith(".test.ts") ||
+    base.endsWith(".test.tsx")
+  );
+}
+
+function sourceLineCount(text) {
+  const lines = text.length === 0 ? [] : text.split(/\r?\n/);
+  if (lines.length > 0 && lines[lines.length - 1] === "") {
+    lines.pop();
+  }
+  return lines.length;
 }
 
 function isRustSource(relPath) {
@@ -202,6 +284,14 @@ function checkCoreDirection(findings, relPath, text) {
     });
   }
 
+  if (isModule(relPath, "project_context")) {
+    directionRules.push({
+      owner: "project_context",
+      forbidden: ["store", "server", "indexer"],
+      detail: "project_context core must not depend on store/server/indexer details",
+    });
+  }
+
   if (isModule(relPath, "store")) {
     directionRules.push({
       owner: "store",
@@ -239,13 +329,14 @@ function collectFindings(root, options = {}) {
   for (const filePath of sourceFiles) {
     const relPath = toRepoPath(root, filePath);
     const raw = fs.readFileSync(filePath, "utf8");
-    const lines = raw.length === 0 ? [] : raw.split(/\r?\n/);
-    if (lines.length > 0 && lines[lines.length - 1] === "") {
-      lines.pop();
-    }
-    const lineCount = lines.length;
+    // File-size fitness measures production architecture only. Dedicated test
+    // sources are exempt, and inline Rust `#[cfg(test)] mod tests { ... }`
+    // sections are removed before counting. The same files remain subject to
+    // dependency and hot-path boundary checks below.
+    const largeFileText = isRustSource(relPath) ? stripCfgTestSections(raw) : raw;
+    const lineCount = sourceLineCount(largeFileText);
 
-    if (lineCount > largeThreshold) {
+    if (!isTestSource(relPath) && lineCount > largeThreshold) {
       addFinding(
         findings,
         "WARN",
@@ -278,6 +369,20 @@ function collectFindings(root, options = {}) {
           "tower_lsp usage is limited to server and LSP adapter boundaries"
         );
       }
+    }
+
+
+    if (
+      isOrdinaryCompletionService(relPath) &&
+      (/\bstd\s*::\s*fs\b/.test(text) || /\bignore\s*::/.test(text) || /\bdiscover_project_contexts\b/.test(text))
+    ) {
+      addFinding(
+        findings,
+        "ERROR",
+        RULES.ordinaryCompletionServiceIoBoundary,
+        relPath,
+        "ordinary completion service must use captured in-memory project state and perform no filesystem discovery"
+      );
     }
 
     if (/\brusqlite\b/.test(text) && !isStoreBoundary(relPath)) {

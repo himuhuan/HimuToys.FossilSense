@@ -4,6 +4,7 @@ use tower_lsp::lsp_types::{
 
 use crate::completion_history::CompletionHistoryMode;
 use crate::model;
+use crate::project_context::ProjectContextSelection;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CompletionMode {
@@ -55,6 +56,30 @@ pub(super) fn parse_completion_history_mode(params: &InitializeParams) -> Comple
         "on" => CompletionHistoryMode::On,
         "off" => CompletionHistoryMode::Off,
         _ => CompletionHistoryMode::Auto,
+    }
+}
+
+/// Initial project selection policy. The extension still restores validated
+/// workspace-state choices after initialization, but `off` must be effective
+/// before the first completion request can race that restore.
+pub(super) fn parse_initial_project_context_selection(
+    params: &InitializeParams,
+) -> ProjectContextSelection {
+    let mode = params
+        .initialization_options
+        .as_ref()
+        .and_then(|opts| opts.as_object())
+        .and_then(|object| object.get("fossilsense"))
+        .and_then(|value| value.as_object())
+        .and_then(|object| object.get("projectContext"))
+        .and_then(|value| value.as_object())
+        .and_then(|object| object.get("mode"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("auto");
+    if mode == "off" {
+        ProjectContextSelection::Unspecified
+    } else {
+        ProjectContextSelection::Auto
     }
 }
 
@@ -343,6 +368,24 @@ mod tests {
         assert!(
             !parse_completion_history_mode(&params_with_completion_history_mode(Some("off")))
                 .is_enabled()
+        );
+    }
+
+    #[test]
+    fn project_context_off_is_unspecified_from_initialize() {
+        let off = InitializeParams {
+            initialization_options: Some(serde_json::json!({
+                "fossilsense": { "projectContext": { "mode": "off" } }
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            parse_initial_project_context_selection(&off),
+            ProjectContextSelection::Unspecified
+        );
+        assert_eq!(
+            parse_initial_project_context_selection(&InitializeParams::default()),
+            ProjectContextSelection::Auto
         );
     }
 

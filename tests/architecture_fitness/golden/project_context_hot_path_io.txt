@@ -1,0 +1,4 @@
+Architecture fitness report
+status severity rule file detail allowlist
+FAIL ERROR ordinary-completion-service-io-boundary crates/fossilsense/src/completion/ordinary_service.rs ordinary completion service must use captured in-memory project state and perform no filesystem discovery -
+Summary: fail=1 warn=0 allowlisted=0

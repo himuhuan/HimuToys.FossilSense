@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use tokio::time::{sleep, Duration};
 use tower_lsp::lsp_types::notification::Notification;
 use tower_lsp::lsp_types::{FileChangeType, FileEvent, MessageType};
@@ -41,6 +42,7 @@ pub(super) struct RootDirtyChange {
 
 pub(super) enum WatchDecision {
     Full,
+    ProjectContext(PathBuf),
     Dirty(RootDirtyChange),
 }
 
@@ -56,7 +58,66 @@ impl Notification for IndexStatusNotification {
     const METHOD: &'static str = "fossilsense/indexStatus";
 }
 
+enum ProjectContextChangedNotification {}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectContextChanged {
+    workspace_root_id: String,
+    project_count: usize,
+}
+
+impl Notification for ProjectContextChangedNotification {
+    type Params = ProjectContextChanged;
+    const METHOD: &'static str = "fossilsense/projectContextChanged";
+}
+
 impl Backend {
+    pub(super) async fn refresh_project_context_roots(&self, mut roots: Vec<PathBuf>) {
+        roots.sort();
+        roots.dedup();
+        for root in roots {
+            match self
+                .session
+                .cache
+                .refresh_project_context(&self.client, root.clone())
+                .await
+            {
+                Ok(count) => {
+                    self.client
+                        .log_message(
+                            MessageType::INFO,
+                            format!(
+                                "project context refreshed for {}: {} projects",
+                                root.display(),
+                                count
+                            ),
+                        )
+                        .await;
+                    self.client
+                        .send_notification::<ProjectContextChangedNotification>(
+                            ProjectContextChanged {
+                                workspace_root_id: pathing::workspace_hash(&root),
+                                project_count: count,
+                            },
+                        )
+                        .await;
+                }
+                Err(err) => {
+                    self.client
+                        .log_message(
+                            MessageType::WARNING,
+                            format!(
+                                "project context refresh failed for {}: {err:#}",
+                                root.display()
+                            ),
+                        )
+                        .await;
+                }
+            }
+        }
+    }
+
     pub(super) async fn spawn_dirty_files(&self, changes: Vec<RootDirtyChange>) {
         self.session.cache.invalidate_after_index_change();
         let roots = self.workspace_roots.lock().await.clone();

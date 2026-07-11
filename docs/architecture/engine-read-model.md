@@ -18,6 +18,7 @@ Status: current (2026-07-10)
 - reach graph
 - include table
 - reference file list
+- project context index（与带 project key 的 name table 同代）
 - degraded state
 
 后台构建时，这些部件在旁路组装；只有全部就绪后，才通过一次 map 交换发布。构建期间旧快照继续服务请求。发布失败时，不能露出半更新状态。

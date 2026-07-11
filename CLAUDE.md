@@ -54,6 +54,7 @@ fossilsense 单一 Rust 原生二进制 (crates/fossilsense)
 | `store` | SQLite schema、迁移、事务、清理、写入，以及 durable read views / typed rows |
 | `pathing` | Windows 路径规范化、仓库相对路径、workspace hash |
 | `progress` | CLI / LSP 共用索引状态 |
+| `project_context` | 构建标记发现、规范化 `ProjectKey`、最近祖先项目推断与协议中立 DTO；项目只是补全 evidence，不是绑定 |
 | `coloring` | 语义着色分类与 LSP 相对编码 |
 | `includes` | include 解析、规范化、补全上下文 |
 | `reachability` | include 图、可达集、有界闭包、开放原因 |
@@ -109,7 +110,7 @@ Runtime snapshot 规则：
 
 | 项 | 规则 |
 |---|---|
-| `EngineSnapshot` | 每工作区一个完整不可变读模型，统一携带 name table、reach graph、include table、reference file list、degraded state |
+| `EngineSnapshot` | 每工作区一个完整不可变读模型，统一携带 name table、reach graph、include table、reference file list、project context、degraded state |
 | publication | 所有下一代读模型在后台构建完成后，只通过一次 map 交换发布；构建期间旧快照继续服务请求 |
 | `EngineEpoch` | 每次成功发布分配显式单调 epoch；`0` 只表示尚未发布索引读模型 |
 | `RequestContext` | 请求开始时捕获一个 `Arc<EngineSnapshot>` 和 request settings；请求期间不得重新逐项读取缓存 |
@@ -152,19 +153,36 @@ Smart Completion 当前约定：
 | 排序 | 普通标识符补全使用 deterministic evidence-aware ranker；`ScopeTier` 是 soft prior，并通过 guard band 防止低置信 global/text 噪音反超 |
 | strict policy | `resolver::pack_score` 仍可用于跳转、着色、workspace symbol、`NameTable` recall 和兼容测试；不再作为普通补全最终 displayed ranking |
 | evidence merge | 同名候选合并 indexed、local binding、current-file overlay、language builtin、local word evidence，优先保留更结构化的 LSP kind/detail |
+| project context | 普通标识符补全可使用构建标记推断的同项目召回与有界排序 evidence；不得新增 `ScopeTier`、过滤跨项目候选或影响其它语言功能 |
+| strict opt-out | `Unspecified`、`projectContext.mode=off`、无祖先标记或 project model unavailable 时，召回预算、顺序、kind/detail/documentation 与无此能力的基线一致 |
 | current overlay | 当前 open document 的宏、typedef/using alias、枚举常量、函数声明/定义、record/type 定义和附近 identifier 使用可作为普通补全 evidence；raw text fallback 仍标为 `text` |
 | language builtin | 静态 C/C++ 关键词、内置类型和常量可作为低置信 fallback 补全 evidence；显示为 `keyword` / `builtin type` / `builtin constant`，不写入索引，不参与跳转、workspace symbol 或着色 |
 | intent | 普通补全使用轻量规则式 intent ranking，覆盖 type、expression、call、macro preprocessor、declaration-name；intent 只是排序证据，不做类型推断或绑定，不硬过滤 |
-| recall | 普通补全 indexed recall 使用 bounded multi-channel quotas，在 current/local、reachable、external、unknown/open-scope、global、text evidence 间保留有限代表性后再统一 rerank |
+| recall | 普通补全 indexed recall 使用 bounded multi-channel quotas，在 current/local、reachable、external、unknown/open-scope、global、可选 same-project、text evidence 间保留有限代表性后再统一 rerank |
 | include ranking | include path completion 保留 quote/angle source prior，并增加 same-directory、sibling/component edge、recent include、basename frequency、path depth 二级 evidence |
-| metrics | verbose/perf 日志只输出分阶段耗时、候选来源/返回计数（含 language_builtin 聚合计数）、intent bucket、recall channel counts、guard 摘要、shadow rank 摘要和 include ranking 计数 |
+| metrics | verbose/perf 日志只输出分阶段耗时、候选来源/返回计数（含 language_builtin/project 聚合计数）、intent bucket、recall channel counts、guard 摘要、shadow rank 摘要和 include ranking 计数 |
 | 隐私 | 默认 debug/perf summary 不输出候选名、源码片段或用户代码内容 |
 | shadow | shadow ranking 只作 ranker 对比和回归观测；不得改变返回内容 |
 | v1.2.1 Phase 7-8 | member evidence 覆盖字段和第一版 C++ 方法；ordinary completion 可使用本地 accepted-completion history 作为有界排序证据 |
 | v1.2.2 Phase A-D/H | 行为保持型架构健康发布；新增架构基线、fitness functions、WorkspaceSession/CacheLedger/DocumentStore 边界、ordinary completion service 边界和 release hardening 门禁 |
 | v1.2.3 | 解析与成员补全体验修复版；多行 typedef struct 容错、匿名嵌套 record evidence、数组下标/括号/解引用的简单成员链补全，以及链解析失败后的全局 member fallback |
 | v1.3.0 | 架构健康与补全 evidence 版本；收敛 parser/store/server 边界，并加入有界 language builtin 与 project context 普通补全证据 |
+| v1.3.1 | 项目上下文补全版本；加入构建标记发现、最近祖先项目归属和同项目普通补全排序证据，并保持严格 opt-out parity |
 | 后置能力 | auto include insertion、ML ranker、telemetry、cloud sync、完整 C++ 语义仍不属于当前版本 |
+
+项目上下文约定：
+
+| 项 | 规则 |
+|---|---|
+| 默认标记 | `Makefile` / `GNUmakefile`、`CMakeLists.txt`、QMake `*.pro`、Ninja `build.ninja`、`*.sln` / `*.vcxproj` / `*.vcproj`、`meson.build`、Bazel `BUILD` / `WORKSPACE` 主文件；Windows 大小写不敏感 |
+| 排除 | 不把任意 `*.mk` / `*.pri` / `*.ninja`、`compile_commands.json` 或 CMake cache 当项目根；发现尊重 `.gitignore`、默认 `build/out/target` 等排除和 `fossilsense.json` scope |
+| 自动归属 | 请求 URI 所在的最具体 workspace root 内，最近祖先 marker 目录获胜；同目录 marker 合并，嵌套项目保持独立 |
+| 选择 | 状态栏提供 `Current Project (Auto)`、所有发现路径和 `Unspecified`；显式选择只存 VS Code `workspaceState` |
+| 配置 | `fossilsense.projectContext.mode = auto / promptOnAmbiguous / off`；prompt 只在有可选项目且活动本地 C/C++ 文件无法归属时每 URI/会话提示一次 |
+| snapshot | `ProjectContextIndex` 与带 `ProjectKey` 的 `NameTable` 同代原子发布；marker 变化只重建派生读模型，不重解析未变源码 |
+| memo | engine epoch、selection epoch 和 effective project 都参与 completion memo generation；marker/选择变化不得复用旧池 |
+| fallback | project discovery 失败标记 `projectContext` degraded，ordinary completion 继续走基线；热路径只查内存，不遍历文件系统 |
+| 边界 | 仅 ordinary identifier completion 消费；definition、references、coloring、workspace symbol、hover、signature、member、include completion 不消费 |
 
 短前缀：
 
@@ -374,6 +392,7 @@ alias 规则：递归解析必须防环；不收敛成单一全局赢家；同 t
 | 补全文档 | 显示完整 `tier`、`confidence`、`reason` |
 | 跳转定义调试 | `fossilsense.debug.candidateReasons = true` 时输出候选理由 |
 | 引用 | grouped references 命令显示 role |
+| 项目上下文 | 独立状态栏显示 Auto / manual / Unspecified / Off / unavailable；tooltip 显示 workspace-relative path、marker 和“只作补全排序”限制 |
 
 降噪：
 
@@ -483,6 +502,9 @@ dist/fossilsense-vscode-<version>_BUILD<YYYYMMDD_HHMMSS>.vsix
 | include | ambiguous、unresolved、可达性开放 |
 | 增量 | `NameTable` / `ReachGraph` 失效 |
 | watcher/debounce | 合并和二次调度 |
+| project context | marker family/exclusion、nested/multi-root、原子发布、marker/selection 失效、同项目召回/排序、重复 label 展示、严格 opt-out parity、无热路径 IO |
+
+Architecture fitness 的 large-source-file 只统计生产代码：专用测试文件和 Rust 内联 `#[cfg(test)] mod tests` 体积不产生大文件警告；测试代码仍受依赖方向、LSP/SQLite 边界和热路径 IO 规则约束。
 
 ## 17. 明确不做
 
@@ -492,6 +514,7 @@ dist/fossilsense-vscode-<version>_BUILD<YYYYMMDD_HHMMSS>.vsix
 - 不把 best-effort 名字候选伪装成精确语义绑定。
 - 不实现完整 C++ 语义：继承、重载、模板、命名空间、访问控制、表达式类型推断等。
 - 不上传 completion history，不做匿名 telemetry、cloud sync、ML ranker 或自动 include 插入。
+- 不解析 Make/CMake/QMake/Ninja/Visual Studio/Meson/Bazel 内容来推断 target、编译参数、宏或链接关系；构建文件只作 best-effort 项目标记。
 
 ## 18. 验收样本
 

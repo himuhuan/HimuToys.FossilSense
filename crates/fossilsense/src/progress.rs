@@ -37,11 +37,12 @@ pub struct DegradedCapabilities {
     pub reach_graph: bool,
     pub include_table: bool,
     pub reference_file_list: bool,
+    pub project_context: bool,
 }
 
 impl DegradedCapabilities {
     pub fn any(&self) -> bool {
-        self.reach_graph || self.include_table || self.reference_file_list
+        self.reach_graph || self.include_table || self.reference_file_list || self.project_context
     }
 
     pub fn labels(&self) -> Vec<&'static str> {
@@ -54,6 +55,9 @@ impl DegradedCapabilities {
         }
         if self.reference_file_list {
             labels.push("referenceFileList");
+        }
+        if self.project_context {
+            labels.push("projectContext");
         }
         labels
     }

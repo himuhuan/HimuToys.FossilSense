@@ -8,8 +8,9 @@ assert.strictEqual(
     reachGraph: true,
     includeTable: true,
     referenceFileList: true,
+    projectContext: true,
   }),
-  'reachGraph, includeTable, referenceFileList',
+  'reachGraph, includeTable, referenceFileList, projectContext',
 );
 
 assert.strictEqual(

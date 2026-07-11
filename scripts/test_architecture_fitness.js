@@ -31,6 +31,27 @@ const cases = [
     expectedStatus: 1,
     args: [],
   },
+  {
+    name: "ordinary completion service rejects project discovery IO",
+    fixture: "project_context_hot_path_io",
+    golden: "project_context_hot_path_io.txt",
+    expectedStatus: 1,
+    args: [],
+  },
+  {
+    name: "large test sources do not create production size warnings",
+    fixture: "large_test_sources",
+    golden: "large_test_sources.txt",
+    expectedStatus: 0,
+    args: ["--large-threshold", "3"],
+  },
+  {
+    name: "cfg test helpers cannot hide production source size",
+    fixture: "cfg_test_boundary",
+    golden: "cfg_test_boundary.txt",
+    expectedStatus: 0,
+    args: ["--large-threshold", "6"],
+  },
 ];
 
 for (const testCase of cases) {

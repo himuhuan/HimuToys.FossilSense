@@ -7,10 +7,10 @@ native Rust indexing engine - no external tools (ctags / cscope / clangd) requir
 This VSIX is self-contained: the `fossilsense` engine binary ships inside the
 extension's `bin/` folder.
 
-v1.3.0 is an architecture-health and completion-evidence release. It adds
-bounded language-builtin and project-context evidence to ordinary completion,
-while preserving FossilSense's best-effort candidate model and keeping those
-signals out of definition, references, coloring, member, and include queries.
+v1.3.1 is a project-context completion release. It adds bounded build-marker
+discovery and same-project evidence to ordinary completion, while preserving
+FossilSense's best-effort candidate model and keeping those signals out of
+definition, references, coloring, member, and include queries.
 
 ## Current Capability
 
@@ -79,6 +79,19 @@ signals out of definition, references, coloring, member, and include queries.
   by anonymous candidate hash, kind, intent, and prefix bucket. It is workspace
   local, clearable, disableable, and records positive accept feedback only. No
   telemetry, cloud sync, ML ranking, or auto-include insertion is enabled.
+  Build-marker project context adds a separate bounded indexed recall/ranking
+  signal. Automatic mode uses the completion URI's nearest ancestor project;
+  duplicate labels can take their function/macro/type presentation from that
+  project when stronger source/scope/confidence evidence is equal. Cross-project
+  candidates remain eligible, and `Unspecified`, `off`, no-marker, or unavailable
+  project models preserve baseline completion items and ordering.
+- Project Context Status: a dedicated status item shows Auto, a manual project,
+  Unspecified, Off, none, or unavailable. Its selector offers **Current Project
+  (Auto)**, every discovered workspace-relative project, and **Unspecified**.
+  Supported markers are Make/GNUmake, CMakeLists, QMake `.pro`, main
+  `build.ninja`, Visual Studio solution/project files, `meson.build`, and Bazel
+  BUILD/WORKSPACE main files. Discovery respects `.gitignore`, workspace scope,
+  and default generated-directory exclusions. Marker contents are never parsed.
 - Best-effort Signature Help: inside simple function calls, shows exact-name
   indexed function signatures ranked by the same include reachability tiers as
   Go to Definition. Candidates are hints, not overload resolution; there is no
@@ -178,6 +191,14 @@ because FossilSense returns ranked text/index candidates.
   rank with history). History stays in the local workspace cache, is bounded, stores
   anonymous candidate hashes/buckets rather than raw labels or source, and can be removed
   with **FossilSense: Clear Completion History**.
+- `fossilsense.projectContext.mode` - controls build-marker project evidence for
+  ordinary identifier completion: `"auto"` (default), `"promptOnAmbiguous"`
+  (prompt once per active local C/C++ URI when projects exist but Auto cannot
+  resolve one), or `"off"` (strict baseline behavior). Status-bar choices are
+  workspace-local and survive reload; `off` temporarily overrides but does not
+  erase a saved valid choice. This setting does not affect definitions,
+  references, coloring, workspace symbols, Hover, Signature Help, member, or
+  include completion.
 - `fossilsense.semanticColoring.mode` - controls FossilSense semantic coloring of macros,
   types, and enum constants: `"auto"` (default, enabled), `"on"` (enabled), `"off"`
   (never enabled). C/C++ language-server conflicts are reported by `fossilsense.mode`,
