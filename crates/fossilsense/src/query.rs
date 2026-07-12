@@ -10,7 +10,7 @@ use crate::parser::SymbolKind as ParserKind;
 use crate::project_context::{ProjectContextIndex, ProjectKey};
 use crate::reachability::ReachScope;
 use crate::resolver::{self, ResolveContext};
-use crate::store::views::NameTableSymbolRow;
+use crate::store::views::{NameTableStoreView, NameTableSymbolRow};
 
 mod comments;
 #[allow(dead_code)]
@@ -19,6 +19,7 @@ mod definitions;
 mod documentation;
 mod hover;
 mod local_completion;
+mod name_index_builder;
 mod signatures;
 mod text;
 
@@ -266,26 +267,46 @@ impl NameTable {
         Self::from_entries(entries)
     }
 
-    pub fn build_from_rows(rows: Vec<NameTableSymbolRow>) -> Self {
-        let entries: Vec<NameEntry> = rows.into_iter().map(name_entry_from_row).collect();
-        Self::from_entries(entries)
-    }
-
+    #[cfg(test)]
     pub fn build_from_rows_with_project_context(
         rows: Vec<NameTableSymbolRow>,
         project_context: Option<&ProjectContextIndex>,
     ) -> Self {
-        let entries = rows
-            .into_iter()
-            .map(|row| name_entry_from_row_with_project_context(row, project_context))
-            .collect();
+        let entries = name_entries_from_rows_with_project_context(rows, project_context);
         Self::from_entries(entries)
+    }
+
+    pub(crate) fn build_from_store_view(
+        view: &NameTableStoreView<'_>,
+        project_context: Option<&ProjectContextIndex>,
+    ) -> anyhow::Result<Self> {
+        let mut builder = name_index_builder::NameIndexBuilder::new(project_context);
+        view.visit_symbol_rows(|row| {
+            builder.push(row);
+            Ok(())
+        })?;
+        Ok(builder.finish())
     }
 
     fn from_entries(entries: Vec<NameEntry>) -> Self {
         let all_workspace_reach = Arc::new(all_workspace_reach(&entries));
         let active_len = entries.len();
         let base = Arc::new(NameSegment::from_entries(entries));
+        Self {
+            base,
+            deltas: Arc::new(Vec::new()),
+            path_overrides: Arc::new(HashMap::new()),
+            delta_offsets: Arc::new(Vec::new()),
+            active_len,
+            slot_len: active_len,
+            all_workspace_reach,
+        }
+    }
+
+    fn from_interned_entries(entries: Vec<NameEntry>) -> Self {
+        let all_workspace_reach = Arc::new(all_workspace_reach(&entries));
+        let active_len = entries.len();
+        let base = Arc::new(NameSegment::from_interned_entries(entries));
         Self {
             base,
             deltas: Arc::new(Vec::new()),
@@ -390,6 +411,10 @@ impl NameSegment {
             entry.name = intern_arc(&mut names, entry.name.clone());
             entry.lower = intern_arc(&mut lowers, entry.lower.clone());
         }
+        Self::from_interned_entries(entries)
+    }
+
+    fn from_interned_entries(entries: Vec<NameEntry>) -> Self {
         let sorted = sorted_indices(&entries);
         let mut by_project: HashMap<ProjectKey, Vec<usize>> = HashMap::new();
         for (index, entry) in entries.iter().enumerate() {
@@ -437,9 +462,7 @@ impl NameTable {
         rows: Vec<NameTableSymbolRow>,
         project_context: Option<&ProjectContextIndex>,
     ) -> Self {
-        let fresh_entries = rows
-            .into_iter()
-            .map(|row| name_entry_from_row_with_project_context(row, project_context));
+        let fresh_entries = name_entries_from_rows_with_project_context(rows, project_context);
         self.with_updated_entries(paths, fresh_entries)
     }
 
@@ -472,14 +495,20 @@ impl NameTable {
     /// so an overlapping index writer cannot leak partially committed rows into
     /// the runtime snapshot.
     pub fn with_project_context(&self, project_context: Option<&ProjectContextIndex>) -> Self {
+        let mut project_by_path = HashMap::<Arc<str>, Option<ProjectKey>>::new();
         let entries = self
             .active_indices()
             .map(|index| self.entry(index).clone())
             .map(|mut entry| {
                 entry.project_key = if entry.external {
                     None
+                } else if let Some(project) = project_by_path.get(entry.path.as_ref()) {
+                    project.clone()
                 } else {
-                    project_context.and_then(|index| index.nearest_for_file(&entry.path))
+                    let project =
+                        project_context.and_then(|index| index.nearest_for_file(&entry.path));
+                    project_by_path.insert(entry.path.clone(), project.clone());
+                    project
                 };
                 entry
             })
@@ -1226,6 +1255,35 @@ fn name_entry_from_row_with_project_context(
         row.directly_included,
         project_key,
     )
+}
+
+fn name_entries_from_rows_with_project_context(
+    rows: Vec<NameTableSymbolRow>,
+    project_context: Option<&ProjectContextIndex>,
+) -> Vec<NameEntry> {
+    let mut project_by_path = HashMap::<String, Option<ProjectKey>>::new();
+    rows.into_iter()
+        .map(|row| {
+            let project_key = if row.external {
+                None
+            } else if let Some(project) = project_by_path.get(&row.path) {
+                project.clone()
+            } else {
+                let project = project_context.and_then(|index| index.nearest_for_file(&row.path));
+                project_by_path.insert(row.path.clone(), project.clone());
+                project
+            };
+            name_entry_parts(
+                row.symbol_id,
+                row.label,
+                row.external,
+                row.path,
+                row.kind,
+                row.directly_included,
+                project_key,
+            )
+        })
+        .collect()
 }
 
 fn name_entry_parts(

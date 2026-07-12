@@ -36,30 +36,23 @@ fn benchmark_large_name_table_build_and_dirty_update() {
         .expect("set FOSSILSENSE_BENCH_DB to a schema-15 benchmark database");
     let store = crate::store::IndexStore::open_readonly(&db).expect("benchmark database");
 
-    let load_started = std::time::Instant::now();
-    let rows = store
+    let build_started = std::time::Instant::now();
+    let mut table = NameTable::build_from_store_view(&store.name_table_view(), None)
+        .expect("stream name rows into index");
+    let stream_build_ms = build_started.elapsed().as_millis();
+    let expected_len = table.len();
+
+    let changed_path = store
         .name_table_view()
-        .symbol_rows()
-        .expect("load name rows");
-    let load_ms = load_started.elapsed().as_millis();
-    let mut counts = std::collections::HashMap::<&str, usize>::new();
-    for row in &rows {
-        *counts.entry(&row.path).or_default() += 1;
-    }
-    let changed_path = counts
-        .into_iter()
-        .max_by_key(|(_, count)| *count)
-        .map(|(path, _)| path.to_string())
+        .largest_symbol_path()
+        .expect("largest symbol path")
+        .map(|(path, _)| path)
         .expect("at least one symbol row");
     let fresh_rows = store
         .name_table_view()
         .symbol_rows_for_paths(std::slice::from_ref(&changed_path))
         .expect("load changed path rows");
 
-    let build_started = std::time::Instant::now();
-    let mut table = NameTable::build_from_rows(rows);
-    let build_ms = build_started.elapsed().as_millis();
-    let expected_len = table.len();
     let paths = std::collections::HashSet::from([changed_path]);
     let mut dirty_us = Vec::new();
     let private_before = current_private_bytes();
@@ -122,8 +115,7 @@ fn benchmark_large_name_table_build_and_dirty_update() {
 
     println!("name_rows: {expected_len}");
     println!("name_changed_rows: {}", fresh_rows.len());
-    println!("name_load_ms: {load_ms}");
-    println!("name_build_ms: {build_ms}");
+    println!("name_stream_build_ms: {stream_build_ms}");
     println!("name_dirty_update_us: {}", dirty_us[dirty_us.len() / 2]);
     println!(
         "name_dirty_private_delta_bytes: {}",
@@ -1002,8 +994,8 @@ fn build_table_and_scope_with_options(
     crate::indexer::index_workspace(dir, options, |_| {}).expect("index");
 
     let store = crate::store::IndexStore::open_readonly(&db).expect("readonly");
-    let names = store.load_symbol_names_with_paths().expect("names");
-    let table = NameTable::build_with_paths(names);
+    let table = NameTable::build_from_store_view(&store.name_table_view(), None)
+        .expect("streamed name table");
 
     let edges = store.load_include_edge_paths().expect("edges");
     let unresolved: Vec<String> = store.open_include_file_paths().unwrap_or_default();
@@ -1011,6 +1003,61 @@ fn build_table_and_scope_with_options(
     let graph = crate::reachability::ReachGraph::new(edges, unresolved, ambiguous);
 
     (table, graph)
+}
+
+#[test]
+fn streamed_name_index_matches_typed_row_builder_with_project_context() {
+    use crate::project_context::{ProjectContext, ProjectContextIndex, ProjectKey};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+    for (path, source) in [
+        (
+            "app/src/main.c",
+            "#define APP_FLAG 1\nint project_api(void) { return APP_FLAG; }\n",
+        ),
+        ("other/helper.c", "int helper_api(void) { return 2; }\n"),
+    ] {
+        let absolute = dir.path().join(path);
+        std::fs::create_dir_all(absolute.parent().expect("parent")).expect("mkdir");
+        std::fs::write(absolute, source).expect("write source");
+    }
+    let options = crate::indexer::IndexOptions {
+        db_path: Some(db.clone()),
+        ..Default::default()
+    };
+    crate::indexer::index_workspace(dir.path(), options, |_| {}).expect("index");
+    let store = crate::store::IndexStore::open_readonly(&db).expect("readonly");
+    let key = ProjectKey {
+        workspace_root_id: "root".to_string(),
+        project_path: "app".to_string(),
+    };
+    let projects = ProjectContextIndex::new(
+        "root".to_string(),
+        "workspace".to_string(),
+        vec![ProjectContext {
+            key: key.clone(),
+            workspace_name: "workspace".to_string(),
+            marker_files: vec!["app/Makefile".to_string()],
+        }],
+    );
+
+    let legacy = NameTable::build_from_rows_with_project_context(
+        store.name_table_view().symbol_rows().expect("typed rows"),
+        Some(&projects),
+    );
+    let streamed = NameTable::build_from_store_view(&store.name_table_view(), Some(&projects))
+        .expect("streamed rows");
+
+    assert_eq!(streamed.len(), legacy.len());
+    for query in ["api", "APP", "helper", "project"] {
+        assert_eq!(
+            streamed.search_ranked(query, 100),
+            legacy.search_ranked(query, 100),
+            "streamed and typed-row builders diverged for {query}"
+        );
+    }
+    assert_eq!(streamed.project_indices(&key), legacy.project_indices(&key));
 }
 
 #[test]

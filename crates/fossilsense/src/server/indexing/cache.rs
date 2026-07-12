@@ -39,10 +39,7 @@ async fn rebuild_name_table(
     let built = tokio::task::spawn_blocking(move || -> Result<NameTable> {
         let db_path = pathing::default_index_path(&root)?;
         let store = IndexStore::open_readonly(&db_path)?;
-        Ok(NameTable::build_from_rows_with_project_context(
-            store.name_table_view().symbol_rows()?,
-            project_context.as_deref(),
-        ))
+        NameTable::build_from_store_view(&store.name_table_view(), project_context.as_deref())
     })
     .await;
 

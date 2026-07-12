@@ -220,7 +220,7 @@ fn run_query(kind: QueryCommand) -> Result<()> {
         } => {
             let db_path = resolve_db_path(db, &workspace)?;
             let store = IndexStore::open_readonly(&db_path)?;
-            let table = query::NameTable::build_from_rows(store.name_table_view().symbol_rows()?);
+            let table = query::NameTable::build_from_store_view(&store.name_table_view(), None)?;
             let ids: Vec<i64> = table.search(&text, query::WORKSPACE_SYMBOL_LIMIT);
             let records = store.symbol_read_view().symbols_by_ids(&ids)?;
 

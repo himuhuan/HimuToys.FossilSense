@@ -110,7 +110,7 @@ Store read-view 规则：
 
 | 项 | 规则 |
 |---|---|
-| read views | 跨模块 durable reads 通过 `store::views` 的窄视图：name table、reach graph、include table、symbol/reference file、member、call facts |
+| read views | 跨模块 durable reads 通过 `store::views` 的窄视图：name table、reach graph、include table、symbol/reference file、member、call facts；name table 冷构建使用 borrowed-row visitor 直接 intern，不先物化全库 owned typed-row `Vec` |
 | typed rows | read-model builder 输入使用 typed row / DTO，不依赖 SQL tuple column order |
 | SQL ownership | `rusqlite` 与 SQL-to-domain 转换留在 `store` / persistence 边界 |
 | compatibility | 旧 `IndexStore` query wrapper 可作为兼容/测试 oracle 保留，但应委托 read views 或共享 typed loader |

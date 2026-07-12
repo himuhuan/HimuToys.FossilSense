@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
+#[cfg(test)]
+use rusqlite::OptionalExtension;
 
 use crate::reachability::OpenReason;
 
@@ -22,6 +24,19 @@ pub struct NameTableSymbolRow {
     pub external: bool,
     pub path: String,
     pub kind: String,
+    pub directly_included: bool,
+}
+
+/// Borrowed projection used by cold name-index construction. The callback may
+/// intern the SQLite text directly, avoiding a workspace-sized temporary
+/// `Vec<NameTableSymbolRow>` and its four owned strings per symbol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NameTableSymbolRef<'a> {
+    pub symbol_id: i64,
+    pub label: &'a str,
+    pub external: bool,
+    pub path: &'a str,
+    pub kind: &'a str,
     pub directly_included: bool,
 }
 
@@ -106,6 +121,50 @@ impl<'a> NameTableStoreView<'a> {
         )?;
         let rows = stmt.query_map([], name_table_symbol_row)?;
         collect_rows(rows)
+    }
+
+    pub fn visit_symbol_rows<F>(&self, mut visitor: F) -> Result<usize>
+    where
+        F: for<'row> FnMut(NameTableSymbolRef<'row>) -> Result<()>,
+    {
+        let mut stmt = self.store.conn.prepare(
+            "SELECT s.id, s.name, f.source, f.path, s.kind, f.directly_included FROM symbols s JOIN files f ON f.id = s.file_id \
+             WHERE s.kind != 'field'",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut count = 0;
+        while let Some(row) = rows.next()? {
+            let label = row.get_ref(1)?.as_str()?;
+            let source = row.get_ref(2)?.as_str()?;
+            let path = row.get_ref(3)?.as_str()?;
+            let kind = row.get_ref(4)?.as_str()?;
+            visitor(NameTableSymbolRef {
+                symbol_id: row.get(0)?,
+                label,
+                external: source == "external",
+                path,
+                kind,
+                directly_included: row.get(5)?,
+            })?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    #[cfg(test)]
+    pub fn largest_symbol_path(&self) -> Result<Option<(String, usize)>> {
+        let row: Option<(String, i64)> = self
+            .store
+            .conn
+            .query_row(
+                "SELECT f.path, COUNT(*) AS symbol_count FROM symbols s JOIN files f ON f.id = s.file_id \
+                 WHERE s.kind != 'field' GROUP BY f.id ORDER BY symbol_count DESC, f.path ASC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(anyhow::Error::from)?;
+        Ok(row.map(|(path, count)| (path, count.max(0) as usize)))
     }
 
     pub fn symbol_rows_for_paths(&self, paths: &[String]) -> Result<Vec<NameTableSymbolRow>> {

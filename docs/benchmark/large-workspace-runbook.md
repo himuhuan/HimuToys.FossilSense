@@ -85,7 +85,7 @@ High-ambiguity budget and pagination become hard CI gates in the lazy service ph
 
 ## Name-index publication benchmark
 
-The ignored release benchmark measures schema-15 row loading, cold in-memory name-index construction, and repeated replacement of the single file with the most symbol rows. It prints aggregate counts/timings only:
+The ignored release benchmark measures schema-15 SQLite-to-name-index streaming construction and repeated replacement of the single file with the most symbol rows. It prints aggregate counts/timings only:
 
 ```powershell
 $env:FOSSILSENSE_BENCH_DB = (Resolve-Path 'target/benchmark/index-wine-rebuild.sqlite').Path
@@ -94,4 +94,4 @@ cargo test --release -p fossilsense `
   --ignored --exact --nocapture
 ```
 
-On Windows the test samples its own Private Bytes every millisecond around dirty replacement. `name_dirty_private_delta_bytes` is the process peak above the fully built base table, not an allocator estimate. After preserving the five-update dirty measurement, the test accumulates worst-case replacements until the background-compaction threshold is reached and reports `name_compaction_input_segments`, `name_compaction_ms`, and `name_compaction_private_delta_bytes` independently.
+`name_stream_build_ms` covers the complete borrowed SQLite visitor plus final immutable index construction; there is no separate owned-row load phase. On Windows the test samples its own Private Bytes every millisecond around dirty replacement. `name_dirty_private_delta_bytes` is the process peak above the fully built base table, not an allocator estimate. After preserving the five-update dirty measurement, the test accumulates worst-case replacements until the background-compaction threshold is reached and reports `name_compaction_input_segments`, `name_compaction_ms`, and `name_compaction_private_delta_bytes` independently.
