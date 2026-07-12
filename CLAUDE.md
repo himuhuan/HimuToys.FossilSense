@@ -51,7 +51,8 @@ fossilsense 单一 Rust 原生二进制 (crates/fossilsense)
 | `indexer` | 扫描、增量判定、解析、SQLite 写入、进度事件 |
 | `model` | 候选语义层与规范导出名 |
 | `call_model` | 调用关系领域值对象、稳定 locator、关系质量与覆盖合同；协议中立，不依赖 parser/store/server |
-| `call_catalog` | 从 active call facts 构建不可变 callable 目录；事实与关系负载只存一份，incoming/outgoing 使用紧凑 ID 邻接索引，请求按页物化歧义/未解析证据 |
+| `call_catalog` | 请求期候选解析、evidence、grouping 与分页物化；只处理一次窄查询命中的 facts，不持有 workspace 全量目录 |
+| `call_service` | generation-pinned Call facts 窄查询、base/dirty-document delta 合并与一跳关系请求编排；SQLite 读取在 blocking worker 执行 |
 | `parser` | tree-sitter C/C++ 容错解析；唯一入口 `parse()`；提供 persistent/request facts 投影与 fact availability |
 | `semantic_model` | parser/store 中立的共享语义事实；不得依赖 parser/store/server/indexer |
 | `store` | SQLite schema、迁移、事务、清理、写入，以及 durable read views / typed rows |
@@ -129,7 +130,7 @@ Runtime snapshot 规则：
 
 | 项 | 规则 |
 |---|---|
-| `EngineSnapshot` | 每工作区一个完整不可变读模型，统一携带 name table、reach graph、include table、reference file list、project context、relation catalog、degraded state |
+| `EngineSnapshot` | 每工作区一个完整不可变读模型，统一携带 name table、reach graph、include table、reference file list、project context、轻量 `CallReadHandle`、degraded state；不得持有全库 call sites/relations |
 | publication | 所有下一代读模型在后台构建完成后，只通过一次 map 交换发布；构建期间旧快照继续服务请求 |
 | `EngineEpoch` | 每次成功发布分配显式单调 epoch；`0` 只表示尚未发布索引读模型 |
 | `SemanticGeneration` | SQLite active manifest 的持久化单调代际；marker-only 等纯派生刷新不得推进它 |
@@ -359,10 +360,13 @@ Parser facts 合同：
 
 调用关系查询合同：
 
-- `RelationCatalog` 随 `EngineSnapshot` 原子发布；callable、call site 与逻辑 relation 负载各只存一份，incoming/outgoing 只保存共享 relation ID，协议 DTO 必须在分页和 call-site 上限之后物化；请求不得直接查询 SQLite 或深拷贝完整 catalog。
-- dirty index 可以重建完整关系目录，因为任一声明变化都可能改变跨文件候选；失败只标记 `callRelations` degraded，不得暴露半代目录。
-- open document overlay 只纳入内容与磁盘不同，或已保存但尚未发布更新 `SemanticGeneration` 的文档；普通 clean open document 直接复用基础 catalog。overlay 以有效文档版本集合和 engine epoch 缓存，`didOpen` / `didChange` / `didSave` / `didClose` 与索引发布必须主动释放旧项。
-- overlay generation 覆盖同一 workspace 的全部有效未同步文档，因此查询 callee incoming 时必须看到其它未保存 buffer 的调用点；缓存与请求只共享 `Arc<RelationCatalog>`，不得为读取或存储缓存深拷贝完整 catalog。
+- `EngineSnapshot` 只发布 generation-pinned `CallReadHandle` 与 capability state；full/dirty publication 都不得读取、复制或解析全库 call sites/relations。
+- `CallRelationService` 通过 `CallFactStoreView` 的 path/position、caller 和 callee 窄查询读取 schema 14 facts，并在 `SemanticReadGuard` 内校验 generation；请求结束前不得混入新代。
+- relation 只在请求期从命中 facts 派生；候选解析、grouping、relation page 和 call-site cap 完成后才物化协议 DTO。精确全库 fact count 不属于请求 coverage 热路径。
+- open document overlay 只纳入内容与磁盘不同，或已保存但尚未发布同路径 content hash 的文档；使用 `ParseFacts::CALL_RELATIONS` 生成 per-file delta。基础 SQL 行按 shadowed path 跳过，再合并相关 overlay facts，不存在 overlay catalog 或基础图复制。
+- overlay generation 覆盖同一 workspace 的全部有效未同步文档，因此查询 callee incoming 时必须看到其它未保存 buffer 的调用点；clean open document 不生成 delta。
+- 富协议固定为 v2：entity dictionary + ID relation、generation/overlay/resolver 绑定的 opaque cursor、非精确 total、显式 page/site/scan/candidate/time/cancelled budget state，以及携带 generation/incomplete reason 的 coverage。扩展与 server 同版本发布，不保留 v1 adapter。
+- 标准 Call Hierarchy 使用确定性的 relation、per-relation site 和 raw scan 上限；达到上限时不伪装为完整结果。富面板通过 `budgetState`、`coverage.incompleteReason` 和可用的 `nextCursor` 展示 partial/continue。
 - 标准 hierarchy item 携带 `CallableLocator`；entity key 失效后按 path、signature digest 与最近旧锚点保守重定位，不得只依赖瞬时数据库行号。
 - 名字、显式限定名、arity、internal linkage、same-file 与 include reachability 都只是证据；reachability 不得作为 hard filter。
 - 标准 LSP 只返回可表示的已解析候选；富协议同时返回 confidence、evidence、ambiguity、unresolved、revision、coverage 与 budget state。

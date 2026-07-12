@@ -6,8 +6,10 @@ import {
   CallSiteFact,
   RelationDirection,
   RichRelationResponse,
+  RichRelationWireResponse,
   coverageSummary,
   evidenceSummary,
+  normalizeRichRelationResponse,
   relationEntity,
 } from './callRelationsModel';
 
@@ -17,6 +19,7 @@ export const SHOW_INCOMING_CALLS_COMMAND = 'fossilsense.showIncomingCalls';
 export const SHOW_OUTGOING_CALLS_COMMAND = 'fossilsense.showOutgoingCalls';
 export const SELECT_CALL_RELATION_COMMAND = 'fossilsense.selectCallRelation';
 export const OPEN_CALL_SITE_COMMAND = 'fossilsense.openCallSite';
+export const LOAD_MORE_CALL_RELATIONS_COMMAND = 'fossilsense.loadMoreCallRelations';
 const CALL_RELATIONS_LSP_COMMAND = 'fossilsense.lsp.callRelations';
 
 interface PreparedCallItem {
@@ -58,6 +61,12 @@ class RelationStatusItem extends vscode.TreeItem {
     this.description = response.complete ? 'complete' : response.budgetState;
     this.tooltip = coverageSummary(response.coverage);
     this.iconPath = new vscode.ThemeIcon(direction === 'incoming' ? 'arrow-left' : 'arrow-right');
+    if (response.nextCursor) {
+      this.command = {
+        command: LOAD_MORE_CALL_RELATIONS_COMMAND,
+        title: 'Load More Call Relations',
+      };
+    }
   }
 }
 
@@ -239,7 +248,7 @@ export class CallRelationsController {
           throw new Error('server returned a call hierarchy item without a stable entity key');
         }
       }
-      response = (await client.sendRequest(ExecuteCommandRequest.type, {
+      const wire = (await client.sendRequest(ExecuteCommandRequest.type, {
         command: CALL_RELATIONS_LSP_COMMAND,
         arguments: [
           {
@@ -249,7 +258,8 @@ export class CallRelationsController {
             entityKey: this.rootEntityKey,
           },
         ],
-      })) as RichRelationResponse | null;
+      })) as RichRelationWireResponse | null;
+      response = wire ? normalizeRichRelationResponse(wire) : null;
     } catch (error) {
       if (requestSerial === this.requestSerial) {
         void vscode.window.showWarningMessage(`FossilSense call relations failed: ${String(error)}`);
@@ -271,6 +281,46 @@ export class CallRelationsController {
   async refresh(): Promise<void> {
     this.rootEntityKey = undefined;
     await this.show(this.direction, false);
+  }
+
+  async loadMore(): Promise<void> {
+    const client = this.getClient();
+    const cursor = this.response?.nextCursor;
+    if (!client || !cursor || !this.lastLocation || !this.rootEntityKey) {
+      return;
+    }
+    const requestSerial = ++this.requestSerial;
+    try {
+      const wire = (await client.sendRequest(ExecuteCommandRequest.type, {
+        command: CALL_RELATIONS_LSP_COMMAND,
+        arguments: [
+          {
+            ...this.lastLocation,
+            uri: this.lastLocation.uri.toString(),
+            direction: this.direction,
+            entityKey: this.rootEntityKey,
+            cursor,
+          },
+        ],
+      })) as RichRelationWireResponse | null;
+      if (!wire || requestSerial !== this.requestSerial) {
+        return;
+      }
+      const next = normalizeRichRelationResponse(wire);
+      this.response = {
+        ...next,
+        relations: [...(this.response?.relations ?? []), ...next.relations],
+      };
+      this.selected ??= next.relations[0];
+      this.relationEmitter.fire();
+      this.siteEmitter.fire();
+    } catch (error) {
+      if (requestSerial === this.requestSerial) {
+        void vscode.window.showWarningMessage(
+          `FossilSense call relation continuation failed: ${String(error)}`,
+        );
+      }
+    }
   }
 
   async switchDirection(direction: RelationDirection): Promise<void> {
@@ -299,6 +349,7 @@ export function registerCallRelationViews(
       controller.switchDirection('outgoing'),
     ),
     vscode.commands.registerCommand(REFRESH_CALL_RELATIONS_COMMAND, () => controller.refresh()),
+    vscode.commands.registerCommand(LOAD_MORE_CALL_RELATIONS_COMMAND, () => controller.loadMore()),
     vscode.commands.registerCommand(SELECT_CALL_RELATION_COMMAND, (relation: CallRelation) =>
       controller.select(relation),
     ),

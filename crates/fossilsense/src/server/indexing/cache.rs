@@ -6,8 +6,8 @@ use anyhow::{Context, Result};
 use tower_lsp::lsp_types::MessageType;
 use tower_lsp::Client;
 
-use crate::call_catalog::RelationCatalog;
 use crate::call_model::SemanticGeneration;
+use crate::call_service::CallReadHandle;
 use crate::pathing;
 use crate::progress::DegradedCapabilities;
 use crate::project_context::{self, ProjectContextIndex};
@@ -53,33 +53,14 @@ async fn rebuild_name_table(
     }
 }
 
-async fn rebuild_relation_catalog(root: PathBuf) -> Result<Arc<RelationCatalog>> {
-    let built = tokio::task::spawn_blocking(move || -> Result<RelationCatalog> {
-        let db_path = pathing::default_index_path(&root)?;
-        let store = IndexStore::open_readonly(&db_path)?;
-        let view = store.call_fact_view();
-        RelationCatalog::build_from_view(&view)
-    })
-    .await?;
-    built.map(Arc::new)
-}
-
-async fn rebuild_relation_catalog_or_degrade(
-    client: &Client,
-    root: PathBuf,
-) -> Option<Arc<RelationCatalog>> {
-    match rebuild_relation_catalog(root).await {
-        Ok(catalog) => Some(catalog),
-        Err(error) => {
-            client
-                .log_message(
-                    MessageType::WARNING,
-                    format!("call relation catalog build failed: {error:#}"),
-                )
-                .await;
-            None
-        }
-    }
+fn capture_call_read_handle(
+    root: &PathBuf,
+    generation: SemanticGeneration,
+) -> Result<Arc<CallReadHandle>> {
+    Ok(Arc::new(CallReadHandle::at_generation(
+        pathing::default_index_path(root)?,
+        generation,
+    )))
 }
 
 async fn update_name_table_paths(
@@ -357,14 +338,14 @@ impl CacheLedger {
         let name_table = rebuild_name_table(root.clone(), project_context.clone()).await?;
         let symbol_count = name_table.len();
         let name_table_ms = nt_started.elapsed().as_millis();
-        let relation_catalog = rebuild_relation_catalog_or_degrade(client, root.clone()).await;
+        let call_read_handle = capture_call_read_handle(&root, semantic_generation)?;
 
         let rg_started = tokio::time::Instant::now();
         let reach_graph = rebuild_reach_graph(client, root.clone()).await;
         let mut degraded = DegradedCapabilities {
             reach_graph: reach_graph.is_none(),
             project_context: project_context.is_none(),
-            call_relations: relation_catalog.is_none(),
+            call_relations: false,
             ..Default::default()
         };
 
@@ -406,7 +387,7 @@ impl CacheLedger {
             include_table,
             indexed_files,
             project_context,
-            relation_catalog,
+            call_read_handle: Some(call_read_handle),
             degraded: degraded.clone(),
         })
         .await;
@@ -452,9 +433,7 @@ impl CacheLedger {
         .await?;
         let symbol_count = name_table.len();
         let name_table_ms = nt_started.elapsed().as_millis();
-        // Cross-file candidate sets can change when any callable is edited, so
-        // dirty publication rebuilds the immutable relation catalog.
-        let relation_catalog = rebuild_relation_catalog_or_degrade(client, root.clone()).await;
+        let call_read_handle = capture_call_read_handle(&root, semantic_generation)?;
 
         let rg_started = tokio::time::Instant::now();
         let reach_graph = refresh_reach_graph_incremental(
@@ -469,7 +448,7 @@ impl CacheLedger {
         let mut degraded = DegradedCapabilities {
             reach_graph: reach_graph.is_none(),
             project_context: project_context.is_none(),
-            call_relations: relation_catalog.is_none(),
+            call_relations: false,
             ..Default::default()
         };
 
@@ -519,7 +498,7 @@ impl CacheLedger {
             include_table,
             indexed_files,
             project_context,
-            relation_catalog,
+            call_read_handle: Some(call_read_handle),
             degraded: degraded.clone(),
         })
         .await;
@@ -574,7 +553,7 @@ impl CacheLedger {
             include_table: previous.include_table.clone(),
             indexed_files: previous.indexed_files.clone(),
             project_context,
-            relation_catalog: previous.relation_catalog.clone(),
+            call_read_handle: previous.call_read_handle.clone(),
             degraded,
         })
         .await;

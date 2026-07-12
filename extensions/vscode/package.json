@@ -73,6 +73,10 @@
       {
         "command": "fossilsense.openCallSite",
         "title": "FossilSense: Open Call Site"
+      },
+      {
+        "command": "fossilsense.loadMoreCallRelations",
+        "title": "FossilSense: Load More Call Relations"
       }
     ],
     "viewsContainers": {

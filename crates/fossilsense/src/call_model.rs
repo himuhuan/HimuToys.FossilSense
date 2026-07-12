@@ -10,7 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const RELATION_PROTOCOL_VERSION: u32 = 1;
+pub const RELATION_PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -342,6 +342,8 @@ pub struct CallRelation {
 pub enum BudgetState {
     Complete,
     PageLimited,
+    ScanLimited,
+    CandidateLimited,
     TimeLimited,
     Cancelled,
 }

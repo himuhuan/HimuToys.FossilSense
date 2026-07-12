@@ -1,5 +1,6 @@
 mod call_catalog;
 mod call_model;
+mod call_service;
 mod coloring;
 mod completion;
 mod completion_history;
@@ -306,29 +307,32 @@ fn run_query(kind: QueryCommand) -> Result<()> {
             db,
         } => {
             let db_path = resolve_db_path(db, &workspace)?;
-            let store = IndexStore::open_readonly(&db_path)?;
             let build_started = Instant::now();
-            let view = store.call_fact_view();
-            let catalog = call_catalog::RelationCatalog::build_from_view(&view)?;
-            let catalog_stats = catalog.stats();
-            let catalog_metrics = catalog.build_metrics();
-            let catalog_ms = build_started.elapsed().as_millis();
+            let handle = call_service::CallReadHandle::capture(db_path)?;
             let rel = pathing::normalize_path_string(&file);
             let position = call_model::SourcePosition {
                 line: line.checked_sub(1).context("line is 1-based")? as u32,
                 character: col.checked_sub(1).context("column is 1-based")? as u32,
             };
-            let entity = catalog
-                .entity_at(&rel, position)
-                .with_context(|| format!("no callable at {}:{line}:{col}", file.display()))?;
-            let entity_key = entity.entity_key.clone();
             let query_started = Instant::now();
-            let relations = if incoming {
-                catalog.incoming(&entity_key)
+            let direction = if incoming {
+                call_model::RelationDirection::Incoming
             } else {
-                catalog.outgoing(&entity_key)
+                call_model::RelationDirection::Outgoing
             };
+            let (catalog, entity_key, page) = call_service::CallRelationService::new(&handle)
+                .query_at(&rel, position, direction, 0, 200, 200)
+                .with_context(|| format!("no callable at {}:{line}:{col}", file.display()))?;
+            let entity = catalog
+                .entity(&entity_key)
+                .context("resolved callable missing")?;
+            let relation_total_in_scan = page.total;
+            let scan_limited = page.scan_limited;
+            let relations = page.relations;
             let query_us = query_started.elapsed().as_micros();
+            let catalog_ms = build_started.elapsed().as_millis();
+            let catalog_stats = catalog.stats();
+            let catalog_metrics = catalog.build_metrics();
             println!(
                 "call_relations: {}",
                 if incoming { "incoming" } else { "outgoing" }
@@ -356,6 +360,8 @@ fn run_query(kind: QueryCommand) -> Result<()> {
                 );
             }
             println!("relations: {}", relations.len());
+            println!("relations_total_in_scan: {relation_total_in_scan}");
+            println!("scan_limited: {scan_limited}");
             println!("catalog_entities: {}", catalog_stats.entities);
             println!("catalog_call_sites: {}", catalog_stats.call_sites);
             println!("catalog_relations: {}", catalog_stats.relations);

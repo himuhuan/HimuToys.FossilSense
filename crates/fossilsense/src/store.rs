@@ -588,7 +588,6 @@ impl IndexStore {
         views::MemberStoreView::new(self)
     }
 
-    #[allow(dead_code)] // Consumed by the relation catalog in the next stage.
     pub fn call_fact_view(&self) -> views::CallFactStoreView<'_> {
         views::CallFactStoreView::new(self)
     }

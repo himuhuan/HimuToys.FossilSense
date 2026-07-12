@@ -24,7 +24,10 @@ keep the source definition as the implementation target.
   native Relation Panel views. The first switches between incoming/outgoing targets;
   selecting one navigates to it and populates the second view with exact call
   sites, confidence, evidence, coverage, and budget state. Unsaved calls from
-  every open document in the workspace participate. Member calls, function
+  every open document in the workspace participate without copying the base
+  call graph. Large/high-ambiguity results are explicitly partial: the panel
+  shows the scan/page/site budget reason and offers continuation when a stable
+  next page exists. Member calls, function
   pointers, callable objects, macros, templates, and overload binding remain
   explicit unresolved/unsupported evidence rather than fabricated targets.
 - Find All References: searches the workspace for whole-word textual matches of

@@ -1,9 +1,10 @@
 //! Immutable, protocol-neutral read model for one-hop call relations.
 
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::Instant;
 
+#[cfg(test)]
 use anyhow::Result;
 
 use crate::call_model::{
@@ -11,16 +12,16 @@ use crate::call_model::{
     CallableLocator, CoverageSummary, EvidenceCode, FactProvenance, LinkageDomain, OwnerKindHint,
     RelationConfidence, RelationDirection, SignatureShape, SourcePosition, SourceRange,
 };
-use crate::store::views::CallFactStoreView;
 #[cfg(test)]
-use crate::store::views::{CallCoverageRow, CallSiteRow, CallableAnchorRow};
+use crate::store::views::{CallCoverageRow, CallFactStoreView, CallSiteRow, CallableAnchorRow};
 
 mod compact;
-mod rows;
+pub(crate) mod rows;
 use compact::{
     CompactRelation, CompactRelationKey, EvidenceBits, RelationBuilder, StoredCallSite, StringId,
     StringPool,
 };
+#[cfg(test)]
 use rows::{anchor_from_row, call_from_row};
 
 type EntityId = u32;
@@ -49,6 +50,8 @@ pub struct RelationPage {
     pub relations: Vec<CallRelation>,
     pub total: usize,
     pub site_limited: bool,
+    pub scan_limited: bool,
+    pub candidate_limited: bool,
 }
 
 #[derive(Debug, Default)]
@@ -71,7 +74,7 @@ pub struct RelationCatalog {
 impl RelationCatalog {
     #[cfg(test)]
     pub fn build(anchors: Vec<CallableAnchorRow>, calls: Vec<CallSiteRow>) -> Self {
-        Self::build_with_coverage(
+        Self::build_from_rows(
             anchors,
             calls,
             CallCoverageRow {
@@ -85,12 +88,21 @@ impl RelationCatalog {
     }
 
     #[cfg(test)]
-    pub fn build_with_coverage(
+    pub(crate) fn build_from_rows(
         anchors: Vec<CallableAnchorRow>,
         calls: Vec<CallSiteRow>,
         coverage: CallCoverageRow,
     ) -> Self {
-        Self::from_facts(
+        Self::build_with_coverage(anchors, calls, coverage)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn build_with_coverage(
+        anchors: Vec<CallableAnchorRow>,
+        calls: Vec<CallSiteRow>,
+        coverage: CallCoverageRow,
+    ) -> Self {
+        Self::build_from_facts(
             anchors.into_iter().map(anchor_from_row).collect(),
             calls.into_iter().map(call_from_row),
             CoverageSummary {
@@ -102,6 +114,7 @@ impl RelationCatalog {
         )
     }
 
+    #[cfg(test)]
     pub fn build_from_view(view: &CallFactStoreView<'_>) -> Result<Self> {
         let coverage = view.coverage()?;
         let anchor_started = Instant::now();
@@ -139,37 +152,11 @@ impl RelationCatalog {
         ))
     }
 
-    pub fn with_overlays(
-        &self,
-        mut overlays: Vec<(String, Vec<CallableAnchor>, Vec<CallSiteFact>)>,
-    ) -> Self {
-        let shadowed: HashSet<String> = overlays.iter().map(|(path, _, _)| path.clone()).collect();
-        let mut all_anchors: Vec<_> = self
-            .entities
-            .iter()
-            .flat_map(|entity| entity.variants.iter().cloned())
-            .filter(|anchor| !shadowed.contains(&anchor.path))
-            .collect();
-        let mut all_calls: Vec<_> = self
-            .call_sites
-            .iter()
-            .filter(|call| !shadowed.contains(self.strings.get(call.path)))
-            .map(|call| call.materialize(&self.strings))
-            .collect();
-        for (path, anchors, calls) in &mut overlays {
-            for anchor in anchors.iter_mut() {
-                anchor.path = path.clone();
-            }
-            for call in calls.iter_mut() {
-                call.path = path.clone();
-            }
-            all_anchors.append(anchors);
-            all_calls.append(calls);
-        }
-        Self::from_facts(all_anchors, all_calls, self.coverage.clone())
-    }
-
-    fn from_facts<I>(anchors: Vec<CallableAnchor>, call_sites: I, coverage: CoverageSummary) -> Self
+    pub(crate) fn build_from_facts<I>(
+        anchors: Vec<CallableAnchor>,
+        call_sites: I,
+        coverage: CoverageSummary,
+    ) -> Self
     where
         I: IntoIterator<Item = CallSiteFact>,
     {
@@ -377,7 +364,6 @@ impl RelationCatalog {
         catalog
     }
 
-    #[cfg(test)]
     pub fn entity(&self, key: &str) -> Option<&CallableEntity> {
         self.entity_by_key
             .get(key)
@@ -439,6 +425,7 @@ impl RelationCatalog {
             .collect()
     }
 
+    #[cfg(test)]
     pub fn outgoing(&self, caller_key: &str) -> Vec<CallRelation> {
         self.relation_page(
             RelationDirection::Outgoing,
@@ -450,6 +437,7 @@ impl RelationCatalog {
         .relations
     }
 
+    #[cfg(test)]
     pub fn incoming(&self, callee_key: &str) -> Vec<CallRelation> {
         self.relation_page(
             RelationDirection::Incoming,
@@ -474,6 +462,8 @@ impl RelationCatalog {
                 relations: Vec::new(),
                 total: 0,
                 site_limited: false,
+                scan_limited: false,
+                candidate_limited: false,
             };
         };
         let relation_ids = match direction {
@@ -499,6 +489,8 @@ impl RelationCatalog {
             relations,
             total,
             site_limited,
+            scan_limited: false,
+            candidate_limited: false,
         }
     }
 

@@ -124,7 +124,7 @@ async fn workspace_folder_removal_drops_root_and_published_snapshot() {
             include_table: None,
             indexed_files: None,
             project_context: None,
-            relation_catalog: None,
+            call_read_handle: None,
             degraded: Default::default(),
         })
         .await;
@@ -1145,7 +1145,7 @@ async fn project_context_commands_validate_selection_and_outside_uri_has_no_auto
             include_table: current.include_table.clone(),
             indexed_files: current.indexed_files.clone(),
             project_context: None,
-            relation_catalog: None,
+            call_read_handle: None,
             degraded,
         })
         .await;
@@ -1485,64 +1485,8 @@ async fn cache_ledger_clears_reference_search_cache_after_document_and_index_cha
 
     cache.mark_reference_search_cache_for_test("root", "needle", 2);
     assert_eq!(cache.reference_search_cache_len_for_test(), 1);
-    cache
-        .store_relation_overlay(
-            PathBuf::from("root"),
-            super::state::EngineEpoch::published(2),
-            7,
-            Arc::new(crate::call_catalog::RelationCatalog::default()),
-        )
-        .await;
-    assert_eq!(cache.relation_overlay_cache_len_for_test().await, 1);
     cache.invalidate_after_index_change().await;
     assert_eq!(cache.reference_search_cache_len_for_test(), 0);
-    assert_eq!(cache.relation_overlay_cache_len_for_test().await, 0);
-}
-
-#[tokio::test]
-async fn workspace_document_lifecycle_drops_stale_relation_overlays() {
-    let documents = super::DocumentStore::default();
-    let cache = super::CacheLedger::default();
-    let session = super::WorkspaceSession::new(documents, cache.clone());
-    let uri = Url::parse("file:///tmp/relations.c").expect("uri");
-    let root = PathBuf::from("root");
-
-    cache
-        .store_relation_overlay(
-            root.clone(),
-            super::state::EngineEpoch::published(1),
-            1,
-            Arc::new(crate::call_catalog::RelationCatalog::default()),
-        )
-        .await;
-    session
-        .open_document(uri.clone(), 1, "void first(void);".into())
-        .await;
-    assert_eq!(cache.relation_overlay_cache_len_for_test().await, 0);
-
-    cache
-        .store_relation_overlay(
-            root.clone(),
-            super::state::EngineEpoch::published(1),
-            2,
-            Arc::new(crate::call_catalog::RelationCatalog::default()),
-        )
-        .await;
-    session
-        .change_document(uri.clone(), 2, "void second(void);".into())
-        .await;
-    assert_eq!(cache.relation_overlay_cache_len_for_test().await, 0);
-
-    cache
-        .store_relation_overlay(
-            root,
-            super::state::EngineEpoch::published(1),
-            3,
-            Arc::new(crate::call_catalog::RelationCatalog::default()),
-        )
-        .await;
-    session.close_document(&uri).await;
-    assert_eq!(cache.relation_overlay_cache_len_for_test().await, 0);
 }
 
 #[tokio::test]
@@ -1614,7 +1558,7 @@ async fn reach_scope_uses_captured_request_context_graph() {
             include_table: None,
             indexed_files: None,
             project_context: None,
-            relation_catalog: None,
+            call_read_handle: None,
             degraded: crate::progress::DegradedCapabilities::default(),
         }),
         settings: super::RequestSettings {

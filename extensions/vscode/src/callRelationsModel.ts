@@ -63,9 +63,21 @@ export interface CoverageSummary {
   analyzedFiles: number;
   fallbackFiles: number;
   externalBodiesLimited: boolean;
+  semanticGeneration: number;
+  incompleteReason?: string;
 }
 
-export interface RichRelationResponse {
+export interface CompactCallRelation {
+  callerId: number;
+  calleeId?: number;
+  direction: RelationDirection;
+  callSites: CallSiteFact[];
+  confidence: string;
+  evidence: EvidenceLedger;
+  ambiguitySetId?: string;
+}
+
+export interface RichRelationWireResponse {
   protocolVersion: number;
   revision: {
     engineEpoch: number;
@@ -73,11 +85,44 @@ export interface RichRelationResponse {
     overlayEpoch: number;
     resolverVersion: number;
   };
-  relations: CallRelation[];
+  entities: Record<string, CallableEntity>;
+  relations: CompactCallRelation[];
   complete: boolean;
   budgetState: string;
   coverage: CoverageSummary;
-  nextCursor?: number;
+  nextCursor?: string;
+}
+
+export interface RichRelationResponse extends Omit<RichRelationWireResponse, 'relations'> {
+  relations: CallRelation[];
+}
+
+export function normalizeRichRelationResponse(
+  response: RichRelationWireResponse,
+): RichRelationResponse {
+  if (response.protocolVersion !== 2) {
+    throw new Error(`unsupported call relation protocol ${response.protocolVersion}; expected 2`);
+  }
+  const relations = response.relations.map((relation): CallRelation => {
+    const caller = response.entities[String(relation.callerId)];
+    const callee =
+      relation.calleeId === undefined
+        ? undefined
+        : response.entities[String(relation.calleeId)];
+    if (!caller || (relation.calleeId !== undefined && !callee)) {
+      throw new Error('call relation response references a missing entity dictionary entry');
+    }
+    return {
+      caller,
+      callee,
+      direction: relation.direction,
+      callSites: relation.callSites,
+      confidence: relation.confidence,
+      evidence: relation.evidence,
+      ambiguitySetId: relation.ambiguitySetId,
+    };
+  });
+  return { ...response, relations };
 }
 
 export function relationEntity(
