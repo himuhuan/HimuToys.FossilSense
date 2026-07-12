@@ -96,11 +96,14 @@ impl<'a> CallFactStoreView<'a> {
     }
 
     pub fn anchors_by_name(&self, name: &str) -> Result<Vec<CallableAnchorRow>> {
-        self.anchor_query("WHERE a.name = ?1", [name])
+        self.anchor_query(
+            "WHERE a.name_id = (SELECT id FROM call_strings WHERE text = ?1)",
+            [name],
+        )
     }
 
     pub fn anchors_by_entity_key(&self, entity_key: &str) -> Result<Vec<CallableAnchorRow>> {
-        self.anchor_query("WHERE a.entity_key = ?1", [entity_key])
+        self.anchor_query("WHERE a.entity_digest = unhex(?1)", [entity_key])
     }
 
     pub fn anchors_by_path(&self, path: &str) -> Result<Vec<CallableAnchorRow>> {
@@ -131,15 +134,15 @@ impl<'a> CallFactStoreView<'a> {
     }
 
     pub fn anchors_by_names(&self, names: &[String]) -> Result<Vec<CallableAnchorRow>> {
-        self.anchors_by_values("a.name", names)
+        self.anchors_by_values("name_text.text", names, false)
     }
 
     pub fn anchors_by_entity_keys(&self, keys: &[String]) -> Result<Vec<CallableAnchorRow>> {
-        self.anchors_by_values("a.entity_key", keys)
+        self.anchors_by_values("a.entity_digest", keys, true)
     }
 
     pub fn call_sites_by_caller(&self, entity_key: &str) -> Result<Vec<CallSiteRow>> {
-        self.call_site_query("WHERE c.caller_entity_key = ?1", [entity_key])
+        self.call_site_query("WHERE caller.entity_digest = unhex(?1)", [entity_key])
     }
 
     pub fn call_sites_by_caller_limited(
@@ -147,11 +150,18 @@ impl<'a> CallFactStoreView<'a> {
         entity_key: &str,
         limit: usize,
     ) -> Result<(Vec<CallSiteRow>, bool)> {
-        self.call_site_query_limited("WHERE c.caller_entity_key = ?1", [entity_key], limit)
+        self.call_site_query_limited(
+            "WHERE caller.entity_digest = unhex(?1)",
+            [entity_key],
+            limit,
+        )
     }
 
     pub fn call_sites_by_callee(&self, name: &str) -> Result<Vec<CallSiteRow>> {
-        self.call_site_query("WHERE c.callee_name = ?1", [name])
+        self.call_site_query(
+            "WHERE c.callee_name_id = (SELECT id FROM call_strings WHERE text = ?1)",
+            [name],
+        )
     }
 
     pub fn call_sites_by_callee_limited(
@@ -159,7 +169,11 @@ impl<'a> CallFactStoreView<'a> {
         name: &str,
         limit: usize,
     ) -> Result<(Vec<CallSiteRow>, bool)> {
-        self.call_site_query_limited("WHERE c.callee_name = ?1", [name], limit)
+        self.call_site_query_limited(
+            "WHERE c.callee_name_id = (SELECT id FROM call_strings WHERE text = ?1)",
+            [name],
+            limit,
+        )
     }
 
     pub fn call_sites_by_path(&self, path: &str) -> Result<Vec<CallSiteRow>> {
@@ -181,10 +195,16 @@ impl<'a> CallFactStoreView<'a> {
         )
     }
 
-    fn anchors_by_values(&self, column: &str, values: &[String]) -> Result<Vec<CallableAnchorRow>> {
+    fn anchors_by_values(
+        &self,
+        column: &str,
+        values: &[String],
+        hex_values: bool,
+    ) -> Result<Vec<CallableAnchorRow>> {
         let mut output = Vec::new();
         for chunk in values.chunks(400) {
-            let placeholders = vec!["?"; chunk.len()].join(",");
+            let placeholder = if hex_values { "unhex(?)" } else { "?" };
+            let placeholders = vec![placeholder; chunk.len()].join(",");
             let predicate = format!("WHERE {column} IN ({placeholders})");
             let params: Vec<&str> = chunk.iter().map(String::as_str).collect();
             self.visit_anchors(&predicate, &params, |row| {
@@ -267,9 +287,19 @@ impl<'a> CallFactStoreView<'a> {
         mut visitor: impl FnMut(CallableAnchorRow) -> Result<()>,
     ) -> Result<()> {
         let sql = format!(
-            "SELECT a.id, f.path, f.source, a.entity_key, a.anchor_fingerprint,
-                    a.name, a.qualified_name, a.owner, a.owner_kind, a.kind, a.role,
-                    a.linkage_kind, a.linkage_file, a.signature, a.min_arity, a.max_arity,
+            "SELECT a.id, f.path, f.source, lower(hex(a.entity_digest)),
+                    lower(hex(a.anchor_digest)), name_text.text, qualified_text.text,
+                    owner_text.text,
+                    CASE a.owner_kind WHEN 1 THEN 'namespace' WHEN 2 THEN 'record'
+                         WHEN 0 THEN 'unknown' END,
+                    CASE a.kind WHEN 1 THEN 'synthetic_global_initializer'
+                         WHEN 2 THEN 'synthetic_lambda' WHEN 3 THEN 'function_like_macro'
+                         ELSE 'function' END,
+                    CASE a.role WHEN 1 THEN 'definition' WHEN 2 THEN 'synthetic'
+                         ELSE 'declaration' END,
+                    CASE a.linkage_kind WHEN 1 THEN 'external' WHEN 2 THEN 'internal'
+                         ELSE 'unknown' END,
+                    linkage_text.text, signature_text.text, a.min_arity, a.max_arity,
                     a.variadic, a.name_start_byte, a.name_end_byte, a.name_start_line,
                     a.name_start_col, a.name_end_line, a.name_end_col,
                     a.declaration_start_byte, a.declaration_end_byte,
@@ -277,9 +307,20 @@ impl<'a> CallFactStoreView<'a> {
                     a.declaration_end_line, a.declaration_end_col,
                     a.body_start_byte, a.body_end_byte, a.body_start_line,
                     a.body_start_col, a.body_end_line, a.body_end_col,
-                    a.guard, a.provenance, a.syntax_error_overlap
-             FROM callable_anchors a JOIN files f ON f.id = a.file_id {predicate}
-             ORDER BY a.qualified_name, f.path, a.name_start_byte"
+                    guard_text.text,
+                    CASE (a.flags & 255) WHEN 1 THEN 'lexical_fallback'
+                         WHEN 2 THEN 'synthetic' ELSE 'ast' END,
+                    ((a.flags & 256) != 0)
+             FROM callable_anchors a
+             JOIN files f ON f.id = a.file_id
+             JOIN call_strings name_text ON name_text.id = a.name_id
+             JOIN call_strings qualified_text ON qualified_text.id = a.qualified_name_id
+             JOIN call_strings signature_text ON signature_text.id = a.signature_id
+             LEFT JOIN call_strings owner_text ON owner_text.id = a.owner_id
+             LEFT JOIN call_strings linkage_text ON linkage_text.id = a.linkage_file_id
+             LEFT JOIN call_strings guard_text ON guard_text.id = a.guard_id
+             {predicate}
+             ORDER BY qualified_text.text, f.path, a.name_start_byte"
         );
         let mut stmt = self.store.conn.prepare(&sql)?;
         let rows = stmt.query_map(
@@ -330,14 +371,29 @@ impl<'a> CallFactStoreView<'a> {
     ) -> Result<()> {
         let limit_clause = limit.map_or_else(String::new, |limit| format!(" LIMIT {limit}"));
         let sql = format!(
-            "SELECT c.id, f.path, f.source, c.caller_entity_key, c.site_fingerprint,
-                    c.expression_start_byte, c.expression_end_byte, c.expression_start_line,
-                    c.expression_start_col, c.expression_end_line, c.expression_end_col,
+            "SELECT c.id, f.path, f.source, lower(hex(caller.entity_digest)),
+                    printf('%s@%d', f.path, c.callee_start_byte),
+                    c.expression_start_byte, c.expression_end_byte, c.callee_start_line,
+                    c.callee_start_col, c.callee_end_line, c.callee_end_col,
                     c.callee_start_byte, c.callee_end_byte, c.callee_start_line,
                     c.callee_start_col, c.callee_end_line, c.callee_end_col,
-                    c.callee_name, c.qualified_name, c.call_form, c.argument_count,
-                    c.guard, c.provenance, c.syntax_error_overlap
-             FROM call_sites c JOIN files f ON f.id = c.file_id {predicate}
+                    callee_text.text, qualified_text.text,
+                    CASE c.call_form WHEN 0 THEN 'direct_name' WHEN 1 THEN 'qualified_name'
+                         WHEN 2 THEN 'parenthesized_name' WHEN 3 THEN 'member_dot'
+                         WHEN 4 THEN 'member_arrow' WHEN 5 THEN 'static_member'
+                         WHEN 6 THEN 'function_pointer' WHEN 7 THEN 'callable_object'
+                         WHEN 8 THEN 'explicit_construction' ELSE 'unsupported' END,
+                    c.argument_count, guard_text.text,
+                    CASE (c.flags & 255) WHEN 1 THEN 'lexical_fallback'
+                         WHEN 2 THEN 'synthetic' ELSE 'ast' END,
+                    ((c.flags & 256) != 0)
+             FROM call_sites c
+             JOIN files f ON f.id = c.file_id
+             JOIN callable_anchor_facts caller ON caller.id = c.caller_anchor_id
+             LEFT JOIN call_strings callee_text ON callee_text.id = c.callee_name_id
+             LEFT JOIN call_strings qualified_text ON qualified_text.id = c.qualified_name_id
+             LEFT JOIN call_strings guard_text ON guard_text.id = c.guard_id
+             {predicate}
              ORDER BY c.id{limit_clause}"
         );
         let mut stmt = self.store.conn.prepare(&sql)?;

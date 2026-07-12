@@ -356,12 +356,12 @@ Parser facts 合同：
 - C/C++ 自由函数是关系解析的正式候选；record method、member call、函数指针和 callable object 仍持久化为显式事实，但不得伪装为已绑定关系。
 - 外部头只贡献声明锚点，不索引函数体调用点。
 - 全局初始化表达式使用 synthetic global initializer 作为 caller；lambda 内调用暂不错误归属给外层函数。
-- schema 14 为 callable anchors / call sites 建立独立 active views 和查询索引，并完整保存 declaration/body UTF-16 ranges，与统一语义代际一起发布。
+- schema 15 为 callable anchors / call sites 建立独立 active views 和查询索引；重复文本使用整数 ID，96-bit digest 使用 BLOB，枚举/布尔量使用整数 flags，call site 只持久化 expression byte offsets 与 callee UTF-16 range，并与统一语义代际一起发布。
 
 调用关系查询合同：
 
 - `EngineSnapshot` 只发布 generation-pinned `CallReadHandle` 与 capability state；full/dirty publication 都不得读取、复制或解析全库 call sites/relations。
-- `CallRelationService` 通过 `CallFactStoreView` 的 path/position、caller 和 callee 窄查询读取 schema 14 facts，并在 `SemanticReadGuard` 内校验 generation；请求结束前不得混入新代。
+- `CallRelationService` 通过 `CallFactStoreView` 的 path/position、caller 和 callee 窄查询读取 schema 15 facts，并在 `SemanticReadGuard` 内校验 generation；请求结束前不得混入新代。
 - relation 只在请求期从命中 facts 派生；候选解析、grouping、relation page 和 call-site cap 完成后才物化协议 DTO。精确全库 fact count 不属于请求 coverage 热路径。
 - open document overlay 只纳入内容与磁盘不同，或已保存但尚未发布同路径 content hash 的文档；使用 `ParseFacts::CALL_RELATIONS` 生成 per-file delta。基础 SQL 行按 shadowed path 跳过，再合并相关 overlay facts，不存在 overlay catalog 或基础图复制。
 - overlay generation 覆盖同一 workspace 的全部有效未同步文档，因此查询 callee incoming 时必须看到其它未保存 buffer 的调用点；clean open document 不生成 delta。

@@ -437,7 +437,7 @@ mod tests {
     use crate::indexer::{index_workspace, IndexOptions};
 
     #[test]
-    fn lazy_schema14_query_matches_full_catalog_oracle() {
+    fn lazy_store_query_matches_full_catalog_oracle() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();

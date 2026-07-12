@@ -283,3 +283,66 @@ fn current_schema_migrate_by_drop_clears_old_data() {
     assert!(columns.contains(&"target_normalized".to_string()));
     assert!(columns.contains(&"target_basename".to_string()));
 }
+
+#[test]
+fn opening_schema_14_drops_text_call_facts_for_schema_15_rebuild() {
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+    {
+        let conn = rusqlite::Connection::open(&db).expect("conn");
+        conn.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);
+             INSERT INTO meta (key, value) VALUES ('schema_version', '14');
+             CREATE TABLE callable_anchor_facts (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 entity_key TEXT NOT NULL,
+                 name TEXT NOT NULL
+             );
+             CREATE TABLE call_site_facts (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 caller_entity_key TEXT NOT NULL,
+                 site_fingerprint TEXT NOT NULL
+             );
+             INSERT INTO callable_anchor_facts (entity_key, name) VALUES ('old-key', 'old');
+             INSERT INTO call_site_facts (caller_entity_key, site_fingerprint)
+             VALUES ('old-key', 'old-site');
+             CREATE VIEW callable_anchors AS SELECT * FROM callable_anchor_facts;
+             CREATE VIEW call_sites AS SELECT * FROM call_site_facts;",
+        )
+        .expect("seed schema 14 call facts");
+    }
+
+    let store = IndexStore::open(&db, dir.path()).expect("open schema 15");
+    let version: String = store
+        .conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("schema version");
+    assert_eq!(version, "15");
+
+    let anchor_count: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM callable_anchor_facts", [], |row| {
+            row.get(0)
+        })
+        .expect("anchor count");
+    let site_count: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM call_site_facts", [], |row| row.get(0))
+        .expect("site count");
+    assert_eq!((anchor_count, site_count), (0, 0));
+
+    let anchor_columns: Vec<String> = store
+        .conn
+        .prepare("PRAGMA table_info(callable_anchor_facts)")
+        .unwrap()
+        .query_map([], |row| row.get(1))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert!(anchor_columns.contains(&"entity_digest".to_string()));
+    assert!(!anchor_columns.contains(&"entity_key".to_string()));
+}

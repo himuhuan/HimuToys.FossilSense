@@ -43,6 +43,95 @@ fn callable_and_call_site_facts_round_trip_through_active_views() {
 }
 
 #[test]
+fn schema_15_persists_compact_typed_call_facts() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("index.sqlite");
+    let mut store = IndexStore::open(&db, dir.path()).unwrap();
+    upsert_source(
+        &mut store,
+        "src/main.c",
+        "static int helper(int v) { return v; }\nint caller(void) { return helper(3); }\n",
+    );
+
+    let version: String = store
+        .conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, "15");
+
+    let anchor_columns: Vec<(String, String)> = store
+        .conn
+        .prepare("PRAGMA table_info(callable_anchor_facts)")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert!(anchor_columns.contains(&("entity_digest".into(), "BLOB".into())));
+    assert!(anchor_columns.contains(&("name_id".into(), "INTEGER".into())));
+    assert!(anchor_columns.contains(&("flags".into(), "INTEGER".into())));
+    assert!(!anchor_columns.iter().any(|(name, _)| name == "entity_key"));
+
+    let site_columns: Vec<(String, String)> = store
+        .conn
+        .prepare("PRAGMA table_info(call_site_facts)")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert!(site_columns.contains(&("caller_anchor_id".into(), "INTEGER".into())));
+    assert!(site_columns.contains(&("callee_name_id".into(), "INTEGER".into())));
+    for removed in [
+        "caller_entity_key",
+        "site_fingerprint",
+        "expression_start_line",
+        "expression_start_col",
+        "expression_end_line",
+        "expression_end_col",
+    ] {
+        assert!(!site_columns.iter().any(|(name, _)| name == removed));
+    }
+
+    let (entity_type, entity_bytes, caller_type, form_type, joined): (
+        String,
+        i64,
+        String,
+        String,
+        i64,
+    ) = store
+        .conn
+        .query_row(
+            "SELECT typeof(a.entity_digest), length(a.entity_digest),
+                    typeof(c.caller_anchor_id), typeof(c.call_form),
+                    (a.id = c.caller_anchor_id)
+             FROM call_site_facts c
+             JOIN callable_anchor_facts a ON a.id = c.caller_anchor_id
+             LIMIT 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(entity_type, "blob");
+    assert_eq!(entity_bytes, 12);
+    assert_eq!(caller_type, "integer");
+    assert_eq!(form_type, "integer");
+    assert_eq!(joined, 1);
+}
+
+#[test]
 fn dirty_revision_replaces_old_call_facts_without_leaking_stale_rows() {
     let dir = tempdir().unwrap();
     let db = dir.path().join("index.sqlite");

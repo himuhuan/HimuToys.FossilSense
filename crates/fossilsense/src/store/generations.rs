@@ -228,7 +228,7 @@ impl IndexStore {
         )?;
         tx.commit()?;
         let cleanup_warning = self
-            .collect_inactive_revisions()
+            .collect_inactive_revisions(build.full_rebuild)
             .err()
             .map(|error| format!("post-publication cleanup failed: {error:#}"));
         Ok(IndexCommitOutcome {
@@ -237,7 +237,7 @@ impl IndexStore {
         })
     }
 
-    fn collect_inactive_revisions(&mut self) -> Result<()> {
+    fn collect_inactive_revisions(&mut self, collect_call_strings: bool) -> Result<()> {
         self.conn.execute(
             "DELETE FROM file_revisions
              WHERE id NOT IN (SELECT revision_id FROM active_file_revisions)
@@ -252,6 +252,22 @@ impl IndexStore {
                AND id NOT IN (SELECT file_id FROM pending_file_revisions)",
             [],
         )?;
+        if collect_call_strings {
+            self.conn.execute(
+                "DELETE FROM call_strings WHERE id NOT IN (
+                    SELECT name_id FROM callable_anchor_facts
+                    UNION SELECT qualified_name_id FROM callable_anchor_facts
+                    UNION SELECT owner_id FROM callable_anchor_facts WHERE owner_id IS NOT NULL
+                    UNION SELECT linkage_file_id FROM callable_anchor_facts WHERE linkage_file_id IS NOT NULL
+                    UNION SELECT signature_id FROM callable_anchor_facts
+                    UNION SELECT guard_id FROM callable_anchor_facts WHERE guard_id IS NOT NULL
+                    UNION SELECT callee_name_id FROM call_site_facts WHERE callee_name_id IS NOT NULL
+                    UNION SELECT qualified_name_id FROM call_site_facts WHERE qualified_name_id IS NOT NULL
+                    UNION SELECT guard_id FROM call_site_facts WHERE guard_id IS NOT NULL
+                 )",
+                [],
+            )?;
+        }
         Ok(())
     }
 }
