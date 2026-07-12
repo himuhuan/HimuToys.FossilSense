@@ -63,6 +63,7 @@ impl Backend {
                 root,
                 uri,
                 symbol_id,
+                semantic_generation,
             } => {
                 let root = PathBuf::from(root);
                 if !self.is_workspace_root(&root).await {
@@ -71,65 +72,69 @@ impl Backend {
                     let (current_rel, current_text) =
                         self.current_document_for_root(&uri, &root).await;
                     let request_uri = Url::parse(&uri).ok();
-                    let reach_scope = match request_uri.as_ref() {
-                        Some(uri) => self.reach_scope_for(uri).await.map(|(_, reach)| reach),
-                        None => None,
-                    };
-                    let project_context = self
-                        .request_context_for_root(root.clone())
-                        .await
-                        .engine
-                        .project_context
-                        .clone();
+                    let context = self.request_context_for_root(root.clone()).await;
+                    // The completion item is a locator into the generation that
+                    // produced it. If publication advanced before resolve, the
+                    // guarded read below returns stale rather than mixing rows.
+                    let reach_scope = request_uri.as_ref().and_then(|uri| {
+                        self.reach_scope_from_context(uri, &context)
+                            .map(|(_, reach)| reach)
+                    });
+                    let project_context = context.engine.project_context.clone();
                     let root_for_query = root.clone();
                     let result = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
                         let db_path = pathing::default_index_path(&root_for_query)?;
                         if !db_path.exists() {
                             return Ok(None);
                         }
-                        let store = crate::store::IndexStore::open_readonly(&db_path)?;
-                        let Some(record) = store
-                            .symbol_read_view()
-                            .symbols_by_ids(&[symbol_id])?
-                            .into_iter()
-                            .next()
-                        else {
-                            return Ok(None);
-                        };
-                        let primary_ranked = query::rank_hover_candidates(
-                            vec![record.clone()],
-                            &current_rel,
-                            reach_scope.as_deref(),
-                            1,
-                        );
-                        let Some(primary_ranked) = primary_ranked.into_iter().next() else {
-                            return Ok(None);
-                        };
-                        let primary = query::DocumentationCandidate {
-                            candidate: primary_ranked.candidate,
-                            signature: primary_ranked.signature,
-                        };
-                        let candidates: Vec<_> = query::rank_hover_candidates(
-                            store.symbol_read_view().symbols_by_name(&record.name)?,
-                            &current_rel,
-                            reach_scope.as_deref(),
-                            32,
+                        crate::store::IndexStore::read_at_generation(
+                            &db_path,
+                            semantic_generation,
+                            |store| {
+                                let Some(record) = store
+                                    .symbol_read_view()
+                                    .symbols_by_ids(&[symbol_id])?
+                                    .into_iter()
+                                    .next()
+                                else {
+                                    return Ok(None);
+                                };
+                                let primary_ranked = query::rank_hover_candidates(
+                                    vec![record.clone()],
+                                    &current_rel,
+                                    reach_scope.as_deref(),
+                                    1,
+                                );
+                                let Some(primary_ranked) = primary_ranked.into_iter().next() else {
+                                    return Ok(None);
+                                };
+                                let primary = query::DocumentationCandidate {
+                                    candidate: primary_ranked.candidate,
+                                    signature: primary_ranked.signature,
+                                };
+                                let candidates: Vec<_> = query::rank_hover_candidates(
+                                    store.symbol_read_view().symbols_by_name(&record.name)?,
+                                    &current_rel,
+                                    reach_scope.as_deref(),
+                                    32,
+                                )
+                                .into_iter()
+                                .map(|candidate| query::DocumentationCandidate {
+                                    candidate: candidate.candidate,
+                                    signature: candidate.signature,
+                                })
+                                .collect();
+                                let preferred = preferred_symbol_documentation(
+                                    &root_for_query,
+                                    &current_rel,
+                                    &current_text,
+                                    &primary,
+                                    &candidates,
+                                    project_context.as_deref(),
+                                );
+                                Ok(completion_popup_markdown(preferred))
+                            },
                         )
-                        .into_iter()
-                        .map(|candidate| query::DocumentationCandidate {
-                            candidate: candidate.candidate,
-                            signature: candidate.signature,
-                        })
-                        .collect();
-                        let preferred = preferred_symbol_documentation(
-                            &root_for_query,
-                            &current_rel,
-                            &current_text,
-                            &primary,
-                            &candidates,
-                            project_context.as_deref(),
-                        );
-                        Ok(completion_popup_markdown(preferred))
                     })
                     .await;
                     self.unwrap_query("completion documentation", result)
@@ -165,13 +170,12 @@ impl Backend {
                     let path = super::uri_to_path(&uri).unwrap_or_else(|| root.clone());
                     let current_rel =
                         pathing::relative_slash_path(&root, &path).unwrap_or_default();
-                    let reach_scope = self.reach_scope_for(&uri).await.map(|(_, reach)| reach);
-                    let project_context = self
-                        .request_context_for_root(root.clone())
-                        .await
-                        .engine
-                        .project_context
-                        .clone();
+                    let context = self.request_context_for_root(root.clone()).await;
+                    let reach_scope = self
+                        .reach_scope_from_context(&uri, &context)
+                        .map(|(_, reach)| reach);
+                    let project_context = context.engine.project_context.clone();
+                    let semantic_generation = context.engine.semantic_generation.0;
                     let label = item.label.clone();
                     let result = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
                         let parsed = crate::parser::parse(&path, &text);
@@ -215,10 +219,14 @@ impl Backend {
                         let mut candidates = vec![primary.clone()];
                         let db_path = pathing::default_index_path(&root)?;
                         if db_path.exists() {
-                            let store = crate::store::IndexStore::open_readonly(&db_path)?;
+                            let indexed = crate::store::IndexStore::read_at_generation(
+                                &db_path,
+                                semantic_generation,
+                                |store| store.symbol_read_view().symbols_by_name(&label),
+                            )?;
                             candidates.extend(
                                 query::rank_hover_candidates(
-                                    store.symbol_read_view().symbols_by_name(&label)?,
+                                    indexed,
                                     &current_rel,
                                     reach_scope.as_deref(),
                                     32,
@@ -299,7 +307,7 @@ impl Backend {
                                 (
                                     pathing::relative_slash_path(&root, uri_path)
                                         .unwrap_or_default(),
-                                    text.as_str(),
+                                    text.as_ref(),
                                 )
                             })
                             .unwrap_or_else(|| (String::new(), ""));
@@ -375,7 +383,7 @@ impl Backend {
             .await
             .map(|(_version, text)| text)
             .unwrap_or_default();
-        (current_rel, text)
+        (current_rel, text.to_string())
     }
 }
 

@@ -12,6 +12,43 @@ fn table() -> NameTable {
 }
 
 #[test]
+fn bounded_top_selection_matches_full_sort_at_scale() {
+    let names = (0..10_000)
+        .map(|index| {
+            (
+                index as i64,
+                format!("symbol_{:05}", (index * 7919) % 10_000),
+                false,
+            )
+        })
+        .collect();
+    let table = NameTable::build(names);
+    let candidates: Vec<ScoredCandidate> = (0..table.entries.len())
+        .map(|index| ScoredCandidate {
+            score: ((index * 104_729) % 50_000) as i32,
+            name_len: table.entries[index].name.len(),
+            index,
+            tier: ScopeTier::Global,
+            base_match: 0,
+        })
+        .collect();
+    let mut oracle = candidates.clone();
+    sort_scored(&mut oracle, &table.entries);
+    oracle.truncate(200);
+
+    assert_eq!(
+        top_scored(candidates, 200, &table.entries)
+            .into_iter()
+            .map(|candidate| candidate.index)
+            .collect::<Vec<_>>(),
+        oracle
+            .into_iter()
+            .map(|candidate| candidate.index)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn exact_and_prefix_rank_above_subsequence() {
     let table = table();
     let hits = table.search("hello", 10);

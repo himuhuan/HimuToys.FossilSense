@@ -289,6 +289,38 @@ pub(in crate::server) async fn rebuild_indexed_file_list(
     }
 }
 
+async fn update_indexed_file_list(
+    previous: Option<Arc<Vec<(String, PathBuf)>>>,
+    root: PathBuf,
+    paths: &[String],
+) -> Result<Arc<Vec<(String, PathBuf)>>> {
+    let Some(previous) = previous else {
+        return rebuild_indexed_file_list(root).await;
+    };
+    let changed = paths.to_vec();
+    let load_root = root.clone();
+    let rows = tokio::task::spawn_blocking(move || -> Result<_> {
+        let db_path = pathing::default_index_path(&load_root)?;
+        let store = IndexStore::open_readonly(&db_path)?;
+        store
+            .reference_file_view()
+            .indexed_workspace_files_for_paths(&changed)
+    })
+    .await??;
+    let changed: HashSet<&str> = paths.iter().map(String::as_str).collect();
+    let mut files: Vec<(String, PathBuf)> = previous
+        .iter()
+        .filter(|(path, _)| !changed.contains(path.as_str()))
+        .cloned()
+        .collect();
+    files.extend(rows.into_iter().map(|row| {
+        let absolute = root.join(row.path.replace('/', std::path::MAIN_SEPARATOR_STR));
+        (row.path, absolute)
+    }));
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(Arc::new(files))
+}
+
 pub(in crate::server) fn ready_cache_message(
     prefix: &str,
     symbol_count: usize,
@@ -381,6 +413,7 @@ impl CacheLedger {
         self.invalidate_after_index_change().await;
 
         Ok(CachePublishReport {
+            semantic_generation,
             symbol_count,
             include_count,
             reference_file_count,
@@ -452,7 +485,15 @@ impl CacheLedger {
         let include_count = include_table.as_ref().map_or(0, |table| table.len());
 
         let mut reference_file_list_error = None;
-        let indexed_files = match rebuild_indexed_file_list(root.clone()).await {
+        let indexed_files = match update_indexed_file_list(
+            previous
+                .as_ref()
+                .and_then(|snapshot| snapshot.indexed_files.clone()),
+            root.clone(),
+            rel_paths,
+        )
+        .await
+        {
             Ok(files) => Some(files),
             Err(err) => {
                 degraded.reference_file_list = true;
@@ -485,6 +526,7 @@ impl CacheLedger {
         self.invalidate_after_index_change().await;
 
         Ok(CachePublishReport {
+            semantic_generation,
             symbol_count,
             include_count,
             reference_file_count,

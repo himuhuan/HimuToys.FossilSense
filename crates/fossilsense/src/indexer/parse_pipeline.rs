@@ -1,5 +1,6 @@
 use std::env;
 use std::fs;
+use std::sync::mpsc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -14,7 +15,7 @@ use crate::store::{FileIndexPayload, FileIndexUpdate, FileSource, IndexBuild, In
 
 const DEFAULT_MAX_PARSE_THREADS: usize = 8;
 const PARSER_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
-const WRITE_BATCH_SIZE: usize = 512;
+const WRITE_BATCH_SIZE: usize = 128;
 
 #[derive(Debug)]
 struct ParsedFile {
@@ -49,54 +50,100 @@ pub(super) fn parse_and_write_changed(
         .thread_name(|idx| format!("fossilsense-parser-{idx}"))
         .build()
         .context("failed to create parser thread pool")?;
-    let parsed_files: Vec<ParsedFile> =
-        pool.install(|| changed.into_par_iter().map(parse_candidate).collect());
-    stats.parse_ms = parse_started.elapsed().as_millis();
-
-    progress(IndexStatus::indexing_phase(
-        workspace_display.to_string(),
-        stats,
-        "indexing",
-    ));
+    let channel_capacity = parse_threads.saturating_mul(2).max(1);
+    let (sender, receiver) = mpsc::sync_channel::<ParsedFile>(channel_capacity);
     let mut index_progress = ProgressLimiter::new();
-    let write_result = (|| -> Result<()> {
-        for chunk in parsed_files.chunks(WRITE_BATCH_SIZE) {
-            let mut updates = Vec::with_capacity(chunk.len());
-            let mut chunk_symbols = 0usize;
-            for parsed in chunk {
-                match &parsed.result {
-                    Ok(index) => {
-                        chunk_symbols += index.persistent_facts().symbols.len();
-                        updates.push(FileIndexUpdate {
-                            fingerprint: &parsed.fingerprint,
-                            source: parsed.source,
-                            payload: FileIndexPayload::Ok(index),
-                        });
-                    }
-                    Err(error) => {
-                        updates.push(FileIndexUpdate {
-                            fingerprint: &parsed.fingerprint,
-                            source: parsed.source,
-                            payload: FileIndexPayload::Error(error.as_str()),
-                        });
-                    }
-                }
-            }
+    std::thread::scope(|scope| -> Result<()> {
+        let producer = scope.spawn(move || {
+            pool.install(|| {
+                changed
+                    .into_par_iter()
+                    .for_each_with(sender, |sender, candidate| {
+                        // A closed receiver means the SQLite consumer failed; stop
+                        // retaining parsed products and let the producer drain.
+                        let _ = sender.send(parse_candidate(candidate));
+                    });
+            });
+        });
 
-            let write_started = Instant::now();
-            store.stage_file_updates(build, &updates)?;
-            stats.write_ms = stats
-                .write_ms
-                .saturating_add(write_started.elapsed().as_millis());
-            stats.symbols += chunk_symbols;
-            stats.indexed_files += chunk.len();
-            stats.processed_files += chunk.len();
-            index_progress.maybe_emit(progress, workspace_display, stats, "indexing");
+        let mut batch = Vec::with_capacity(WRITE_BATCH_SIZE);
+        for parsed in receiver {
+            batch.push(parsed);
+            if batch.len() == WRITE_BATCH_SIZE {
+                write_parsed_batch(
+                    &batch,
+                    build,
+                    store,
+                    workspace_display,
+                    stats,
+                    progress,
+                    &mut index_progress,
+                )?;
+                batch.clear();
+            }
         }
+        if !batch.is_empty() {
+            write_parsed_batch(
+                &batch,
+                build,
+                store,
+                workspace_display,
+                stats,
+                progress,
+                &mut index_progress,
+            )?;
+        }
+        producer
+            .join()
+            .map_err(|_| anyhow::anyhow!("parser producer thread panicked"))?;
         Ok(())
-    })();
-    write_result?;
+    })?;
+    stats.parse_ms = parse_started
+        .elapsed()
+        .as_millis()
+        .saturating_sub(stats.write_ms);
     index_progress.emit_if_changed(progress, workspace_display, stats, "indexing");
+    Ok(())
+}
+
+fn write_parsed_batch(
+    batch: &[ParsedFile],
+    build: IndexBuild,
+    store: &mut IndexStore,
+    workspace_display: &str,
+    stats: &mut IndexStats,
+    progress: &mut impl FnMut(IndexStatus),
+    index_progress: &mut ProgressLimiter,
+) -> Result<()> {
+    let mut updates = Vec::with_capacity(batch.len());
+    let mut chunk_symbols = 0usize;
+    for parsed in batch {
+        match &parsed.result {
+            Ok(index) => {
+                chunk_symbols += index.persistent_facts().symbols.len();
+                updates.push(FileIndexUpdate {
+                    fingerprint: &parsed.fingerprint,
+                    source: parsed.source,
+                    payload: FileIndexPayload::Ok(index),
+                });
+            }
+            Err(error) => updates.push(FileIndexUpdate {
+                fingerprint: &parsed.fingerprint,
+                source: parsed.source,
+                payload: FileIndexPayload::Error(error.as_str()),
+            }),
+        }
+    }
+
+    let write_started = Instant::now();
+    store.stage_file_updates(build, &updates)?;
+    stats.write_ms = stats
+        .write_ms
+        .saturating_add(write_started.elapsed().as_millis());
+    stats.symbols += chunk_symbols;
+    stats.indexed_files += batch.len();
+    stats.processed_files += batch.len();
+    index_progress.maybe_emit(progress, workspace_display, stats, "indexing");
     Ok(())
 }
 

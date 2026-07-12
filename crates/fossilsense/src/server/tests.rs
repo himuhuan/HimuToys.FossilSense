@@ -11,9 +11,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex as StdMutex};
 use tempfile::tempdir;
 use tower_lsp::lsp_types::{
-    CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse, Documentation,
-    ExecuteCommandParams, FileChangeType, FileEvent, GotoDefinitionParams, GotoDefinitionResponse,
-    InitializeParams, Position, TextDocumentIdentifier, TextDocumentPositionParams, Url,
+    CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse,
+    DidChangeWorkspaceFoldersParams, Documentation, ExecuteCommandParams, FileChangeType,
+    FileEvent, GotoDefinitionParams, GotoDefinitionResponse, InitializeParams, Position,
+    TextDocumentIdentifier, TextDocumentPositionParams, Url, WorkspaceFolder,
+    WorkspaceFoldersChangeEvent,
 };
 use tower_lsp::{LanguageServer as _, LspService};
 
@@ -35,6 +37,7 @@ fn test_backend_service() -> LspService<super::Backend> {
             crate::completion_history::CompletionHistoryMode::Auto,
         )),
         completion_history: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        completion_history_write_gate: Arc::new(tokio::sync::Mutex::new(())),
         project_context_selection: Arc::new(tokio::sync::Mutex::new(
             crate::project_context::ProjectContextSelection::Auto,
         )),
@@ -97,6 +100,58 @@ fn text_and_position(marked: &str) -> (String, u32, u32) {
     (text, line, character)
 }
 
+#[tokio::test]
+async fn workspace_folder_removal_drops_root_and_published_snapshot() {
+    let service = test_backend_service();
+    let dir = tempdir().expect("root");
+    let root = dir.path().to_path_buf();
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(root.clone());
+    service
+        .inner()
+        .session
+        .cache
+        .publish_engine_snapshot(super::workspace::EngineSnapshot {
+            root: root.clone(),
+            epoch: super::state::EngineEpoch::published(1),
+            semantic_generation: crate::call_model::SemanticGeneration(1),
+            name_table: None,
+            reach_graph: None,
+            include_table: None,
+            indexed_files: None,
+            project_context: None,
+            relation_catalog: None,
+            degraded: Default::default(),
+        })
+        .await;
+
+    service
+        .inner()
+        .did_change_workspace_folders(DidChangeWorkspaceFoldersParams {
+            event: WorkspaceFoldersChangeEvent {
+                added: Vec::new(),
+                removed: vec![WorkspaceFolder {
+                    uri: Url::from_file_path(&root).expect("uri"),
+                    name: "removed".to_string(),
+                }],
+            },
+        })
+        .await;
+
+    assert!(service.inner().workspace_roots.lock().await.is_empty());
+    assert!(service
+        .inner()
+        .session
+        .cache
+        .current_engine_snapshot(&root)
+        .await
+        .is_none());
+}
+
 fn write_workspace_file(root: &std::path::Path, rel: &str, text: &str) {
     let path = root.join(rel);
     if let Some(parent) = path.parent() {
@@ -147,6 +202,13 @@ async fn indexed_backend_with_open_doc(
         .lock()
         .await
         .push(dir.path().to_path_buf());
+    service
+        .inner()
+        .session
+        .cache
+        .publish_full_index(&service.inner().client, dir.path().to_path_buf())
+        .await
+        .expect("publish test index");
     open_test_document(&service, uri.clone(), 1, open_text).await;
     (dir, service, uri, line, character)
 }
@@ -173,6 +235,13 @@ async fn goto_definition_uses_live_current_document_typedef_when_index_is_stale(
         .lock()
         .await
         .push(dir.path().to_path_buf());
+    service
+        .inner()
+        .session
+        .cache
+        .publish_full_index(&service.inner().client, dir.path().to_path_buf())
+        .await
+        .expect("publish test index");
 
     let (src, line, character) = text_and_position(
         "typedef struct {\n\
@@ -337,14 +406,80 @@ async fn workspace_session_change_invalidates_live_document_caches() {
         "did_change must invalidate local words so completion sees the new text"
     );
     assert!(
-        cache.completion_memo_for_test(&uri).await.is_none(),
-        "did_change must clear per-document completion narrowing state"
+        cache.completion_memo_for_test(&uri).await.is_some(),
+        "document edits retain indexed candidate pools; prefix validation decides reuse"
     );
     assert_eq!(
         cache.reference_search_cache_len_for_test(),
         0,
         "document changes must clear complete reference search results"
     );
+}
+
+#[tokio::test]
+async fn incremental_document_changes_apply_sequentially_with_utf16_positions() {
+    use tower_lsp::lsp_types::{Position, Range, TextDocumentContentChangeEvent};
+
+    let documents = super::DocumentStore::default();
+    let uri = Url::parse("file:///tmp/incremental.c").expect("uri");
+    documents
+        .open_document(uri.clone(), 1, "a😀bc\nsecond\n".to_string())
+        .await;
+
+    let applied = documents
+        .apply_document_changes(
+            &uri,
+            2,
+            vec![
+                TextDocumentContentChangeEvent {
+                    range: Some(Range::new(Position::new(0, 3), Position::new(0, 4))),
+                    range_length: Some(1),
+                    text: "B".to_string(),
+                },
+                TextDocumentContentChangeEvent {
+                    range: Some(Range::new(Position::new(1, 0), Position::new(1, 6))),
+                    range_length: Some(6),
+                    text: "next".to_string(),
+                },
+            ],
+        )
+        .await;
+
+    assert!(applied);
+    let snapshot = documents.snapshot(&uri).await.expect("snapshot");
+    assert_eq!(snapshot.version, 2);
+    assert_eq!(snapshot.text.as_ref(), "a😀Bc\nnext\n");
+}
+
+#[tokio::test]
+async fn document_change_cancels_obsolete_live_parse_work() {
+    use std::sync::atomic::Ordering;
+    use tower_lsp::lsp_types::TextDocumentContentChangeEvent;
+
+    let documents = super::DocumentStore::default();
+    let uri = Url::parse("file:///tmp/cancel-parse.c").expect("uri");
+    documents
+        .open_document(uri.clone(), 1, "int old_name;\n".to_string())
+        .await;
+    let old = documents.live_parse_cancellation(&uri, 1).await;
+    assert!(!old.load(Ordering::Relaxed));
+
+    assert!(
+        documents
+            .apply_document_changes(
+                &uri,
+                2,
+                vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: "int new_name;\n".to_string(),
+                }],
+            )
+            .await
+    );
+    assert!(old.load(Ordering::Relaxed));
+    let current = documents.live_parse_cancellation(&uri, 2).await;
+    assert!(!current.load(Ordering::Relaxed));
 }
 
 #[tokio::test]
@@ -376,7 +511,7 @@ async fn stale_document_work_cannot_overwrite_latest_revision_caches() {
         .await;
     assert!(Arc::ptr_eq(
         &documents
-            .cached_live_parse(&uri, 2)
+            .cached_live_parse(&uri, 2, crate::parser::ParseFacts::ALL)
             .await
             .expect("current parse"),
         &current_parse
@@ -1435,7 +1570,27 @@ async fn relation_overlay_tracks_only_divergent_or_not_yet_indexed_documents() {
         .await;
     let awaiting = documents.snapshot(&uri).await.expect("saved snapshot");
     assert!(awaiting.needs_relation_overlay(crate::call_model::SemanticGeneration(4)));
-    assert!(!awaiting.needs_relation_overlay(crate::call_model::SemanticGeneration(5)));
+    assert!(awaiting.needs_relation_overlay(crate::call_model::SemanticGeneration(5)));
+
+    // An unrelated generation advance must not clear this file's overlay. It
+    // becomes clean only after the active revision proves that the saved bytes
+    // for this exact path were published.
+    std::fs::write(&path, "void changed(void);\n").expect("save changed source");
+    crate::indexer::index_workspace(dir.path(), crate::indexer::IndexOptions::default(), |_| {})
+        .expect("index saved source");
+    let db_path = crate::pathing::default_index_path(dir.path()).expect("index path");
+    let generation = crate::store::IndexStore::open_readonly(&db_path)
+        .and_then(|store| store.semantic_generation())
+        .expect("active generation");
+    documents
+        .reconcile_published_files(
+            dir.path().to_path_buf(),
+            Some(vec!["tracked.c".to_string()]),
+            crate::call_model::SemanticGeneration(generation),
+        )
+        .await;
+    let published = documents.snapshot(&uri).await.expect("published snapshot");
+    assert!(!published.needs_relation_overlay(crate::call_model::SemanticGeneration(generation)));
 }
 
 #[tokio::test]

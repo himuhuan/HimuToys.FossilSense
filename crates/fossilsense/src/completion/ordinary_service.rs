@@ -25,7 +25,7 @@ type OrdinaryPipelineCandidate = PipelineCandidate<OrdinaryCompletionPresentatio
 #[derive(Clone)]
 pub(crate) struct OrdinaryCompletionInput {
     pub prefix: String,
-    pub text: String,
+    pub text: Arc<str>,
     pub line: u32,
     pub character: u32,
     pub parsed_document: Option<Arc<FileSemanticIndex>>,
@@ -366,7 +366,7 @@ mod tests {
 
         let output = complete_ordinary_identifier(OrdinaryCompletionInput {
             prefix: "fs".to_string(),
-            text,
+            text: text.into(),
             line,
             character,
             parsed_document: Some(parsed),
@@ -442,7 +442,7 @@ mod tests {
     fn service_empty_result_still_returns_metrics_for_incomplete_lsp_adapter() {
         let output = complete_ordinary_identifier(OrdinaryCompletionInput {
             prefix: "zz_absent".to_string(),
-            text: "int main(void) { zz_absent }".to_string(),
+            text: Arc::from("int main(void) { zz_absent }"),
             line: 0,
             character: 26,
             parsed_document: None,
@@ -475,7 +475,7 @@ mod tests {
         ] {
             let output = complete_ordinary_identifier(OrdinaryCompletionInput {
                 prefix: prefix.to_string(),
-                text: prefix.to_string(),
+                text: Arc::from(prefix),
                 line: 0,
                 character: prefix.len() as u32,
                 parsed_document: None,
@@ -509,7 +509,7 @@ mod tests {
     fn service_dedups_indexed_size_t_over_language_builtin_fallback() {
         let output = complete_ordinary_identifier(OrdinaryCompletionInput {
             prefix: "si".to_string(),
-            text: "si".to_string(),
+            text: Arc::from("si"),
             line: 0,
             character: 2,
             parsed_document: None,
@@ -562,7 +562,7 @@ mod tests {
         let parsed = Arc::new(parser::parse(&PathBuf::from("src/main.c"), &text));
         let output = complete_ordinary_identifier(OrdinaryCompletionInput {
             prefix: "si".to_string(),
-            text,
+            text: text.into(),
             line,
             character,
             parsed_document: Some(parsed),
@@ -601,7 +601,7 @@ mod tests {
     fn service_demotes_language_builtins_for_declaration_names() {
         let output = complete_ordinary_identifier(OrdinaryCompletionInput {
             prefix: "si".to_string(),
-            text: "int si".to_string(),
+            text: Arc::from("int si"),
             line: 0,
             character: 6,
             parsed_document: None,
@@ -640,7 +640,7 @@ mod tests {
     fn service_short_prefix_fixture_preserves_representative_candidates() {
         let output = complete_ordinary_identifier(OrdinaryCompletionInput {
             prefix: "fs".to_string(),
-            text: "fs".to_string(),
+            text: Arc::from("fs"),
             line: 0,
             character: 2,
             parsed_document: None,
@@ -756,7 +756,7 @@ mod tests {
     ) -> super::OrdinaryCompletionOutput {
         complete_ordinary_identifier(OrdinaryCompletionInput {
             prefix: "get".to_string(),
-            text: "get".to_string(),
+            text: Arc::from("get"),
             line: 0,
             character: 3,
             parsed_document: None,
@@ -833,7 +833,7 @@ mod tests {
 
         let output = complete_ordinary_identifier(OrdinaryCompletionInput {
             prefix: "api".to_string(),
-            text: "api".to_string(),
+            text: Arc::from("api"),
             line: 0,
             character: 3,
             parsed_document: None,
@@ -906,7 +906,7 @@ mod tests {
 
         let output = complete_ordinary_identifier(OrdinaryCompletionInput {
             prefix: "api".to_string(),
-            text: "api".to_string(),
+            text: Arc::from("api"),
             line: 0,
             character: 3,
             parsed_document: None,

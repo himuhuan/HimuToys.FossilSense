@@ -96,6 +96,10 @@ pub struct IndexStats {
     pub include_edge_sources_rebuilt: Vec<String>,
     pub name_table_ms: u128,
     pub reach_graph_ms: u128,
+    /// Non-fatal maintenance warning emitted after the semantic generation was
+    /// already committed. Internal status for CLI/LSP logging; publication and
+    /// ready state must continue.
+    pub maintenance_warning: Option<String>,
 }
 
 impl IndexStatus {

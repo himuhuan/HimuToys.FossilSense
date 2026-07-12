@@ -8,7 +8,10 @@ use tower_lsp::lsp_types::notification::Notification;
 use tower_lsp::lsp_types::{FileChangeType, FileEvent, MessageType};
 use tower_lsp::Client;
 
-use super::{emit_perf_log, uri_to_path, Backend, CacheLedger, CachePublishReport, IndexSchedule};
+use super::{
+    emit_perf_log, uri_to_path, Backend, CacheLedger, CachePublishReport, DocumentStore,
+    IndexSchedule,
+};
 use crate::indexer::{self, IndexOptions};
 use crate::pathing;
 use crate::progress::{IndexState, IndexStatus};
@@ -49,6 +52,12 @@ pub(super) enum WatchDecision {
 enum ScheduledIndex {
     Full { force: bool },
     Dirty(Vec<RootDirtyChange>),
+}
+
+#[derive(Clone)]
+struct IndexWorkspaceState {
+    documents: DocumentStore,
+    roots: Arc<tokio::sync::Mutex<Vec<PathBuf>>>,
 }
 
 enum IndexStatusNotification {}
@@ -120,7 +129,10 @@ impl Backend {
 
     pub(super) async fn spawn_dirty_files(&self, changes: Vec<RootDirtyChange>) {
         self.session.cache.invalidate_after_index_change().await;
-        let roots = self.workspace_roots.lock().await.clone();
+        let workspace_state = IndexWorkspaceState {
+            documents: self.session.documents.clone(),
+            roots: self.workspace_roots.clone(),
+        };
         let include_paths = self.include_paths.lock().await.clone();
         let client = self.client.clone();
         let index_schedule = self.index_schedule.clone();
@@ -141,7 +153,7 @@ impl Backend {
         tokio::spawn(async move {
             run_scheduled_indexes(
                 client,
-                roots,
+                workspace_state,
                 include_paths,
                 cache,
                 index_schedule,
@@ -153,7 +165,10 @@ impl Backend {
 
     pub(super) async fn spawn_index_roots(&self, force: Option<bool>) {
         self.session.cache.invalidate_after_index_change().await;
-        let roots = self.workspace_roots.lock().await.clone();
+        let workspace_state = IndexWorkspaceState {
+            documents: self.session.documents.clone(),
+            roots: self.workspace_roots.clone(),
+        };
         let include_paths = self.include_paths.lock().await.clone();
         let client = self.client.clone();
         let index_schedule = self.index_schedule.clone();
@@ -177,7 +192,7 @@ impl Backend {
         tokio::spawn(async move {
             run_scheduled_indexes(
                 client,
-                roots,
+                workspace_state,
                 include_paths,
                 cache,
                 index_schedule,
@@ -190,7 +205,7 @@ impl Backend {
 
 async fn run_scheduled_indexes(
     client: Client,
-    roots: Vec<PathBuf>,
+    workspace_state: IndexWorkspaceState,
     include_paths: Vec<String>,
     cache: CacheLedger,
     index_schedule: IndexSchedule,
@@ -218,11 +233,13 @@ async fn run_scheduled_indexes(
 
         match scheduled {
             ScheduledIndex::Full { force } => {
+                let roots = workspace_state.roots.lock().await.clone();
                 index_roots(
                     client.clone(),
                     roots.clone(),
                     include_paths.clone(),
                     cache.clone(),
+                    workspace_state.clone(),
                     force,
                     perf_logging_enabled,
                 )
@@ -233,6 +250,7 @@ async fn run_scheduled_indexes(
                     client.clone(),
                     include_paths.clone(),
                     cache.clone(),
+                    workspace_state.clone(),
                     changes,
                     perf_logging_enabled,
                 )
@@ -263,6 +281,7 @@ async fn index_roots(
     roots: Vec<PathBuf>,
     include_paths: Vec<String>,
     cache: CacheLedger,
+    workspace_state: IndexWorkspaceState,
     force: bool,
     perf_logging_enabled: bool,
 ) {
@@ -321,6 +340,11 @@ async fn index_roots(
 
         match result.await {
             Ok(Ok(mut stats)) => {
+                if let Some(warning) = &stats.maintenance_warning {
+                    client
+                        .log_message(MessageType::WARNING, warning.clone())
+                        .await;
+                }
                 client
                     .log_message(
                         MessageType::INFO,
@@ -340,6 +364,20 @@ async fn index_roots(
                     .await;
                 match cache.publish_full_index(&client, root.clone()).await {
                     Ok(report) => {
+                        if !workspace_state.roots.lock().await.contains(&root) {
+                            cache
+                                .remove_workspace_roots(std::slice::from_ref(&root))
+                                .await;
+                            continue;
+                        }
+                        workspace_state
+                            .documents
+                            .reconcile_published_files(
+                                root.clone(),
+                                None,
+                                report.semantic_generation,
+                            )
+                            .await;
                         stats.name_table_ms = report.name_table_ms;
                         stats.reach_graph_ms = report.reach_graph_ms;
                         let _published_epoch = report.epoch;
@@ -442,6 +480,7 @@ async fn index_dirty_roots(
     client: Client,
     include_paths: Vec<String>,
     cache: CacheLedger,
+    workspace_state: IndexWorkspaceState,
     changes: Vec<RootDirtyChange>,
     perf_logging_enabled: bool,
 ) {
@@ -456,6 +495,9 @@ async fn index_dirty_roots(
     }
 
     for (root, changes) in by_root {
+        if !workspace_state.roots.lock().await.contains(&root) {
+            continue;
+        }
         let display_root = root.display().to_string();
         let rel_paths: Vec<String> = changes
             .iter()
@@ -511,6 +553,11 @@ async fn index_dirty_roots(
 
         match result.await {
             Ok(Ok(mut stats)) => {
+                if let Some(warning) = &stats.maintenance_warning {
+                    client
+                        .log_message(MessageType::WARNING, warning.clone())
+                        .await;
+                }
                 client
                     .log_message(
                         MessageType::INFO,
@@ -539,6 +586,20 @@ async fn index_dirty_roots(
                     .await
                 {
                     Ok(report) => {
+                        if !workspace_state.roots.lock().await.contains(&root) {
+                            cache
+                                .remove_workspace_roots(std::slice::from_ref(&root))
+                                .await;
+                            continue;
+                        }
+                        workspace_state
+                            .documents
+                            .reconcile_published_files(
+                                root.clone(),
+                                Some(rel_paths.clone()),
+                                report.semantic_generation,
+                            )
+                            .await;
                         stats.name_table_ms = report.name_table_ms;
                         stats.reach_graph_ms = report.reach_graph_ms;
                         let _published_epoch = report.epoch;

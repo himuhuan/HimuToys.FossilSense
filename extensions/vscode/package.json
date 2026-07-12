@@ -232,7 +232,7 @@
   },
   "scripts": {
     "compile": "tsc -p ./",
-    "test": "pnpm run compile && node out/test/config.test.js && node out/test/status.test.js && node out/test/serverPath.test.js && node out/test/conflicts.test.js && node out/test/referencesView.test.js && node out/test/callRelations.test.js && node out/test/completionHistory.test.js && node out/test/projectContext.test.js",
+    "test": "pnpm run compile && node scripts/run-tests.mjs",
     "watch": "tsc -watch -p ./",
     "package": "node scripts/package.mjs"
   },

@@ -59,6 +59,7 @@ pub(super) fn resolve_include_paths(
     workspace_root: Option<&Path>,
     include_roots: &[String],
     db_path: Option<&Path>,
+    expected_generation: Option<u64>,
 ) -> Result<Vec<PathBuf>> {
     let dir_candidate: Vec<PathBuf> = current_dir.map(|dir| dir.join(rel)).into_iter().collect();
     let root_candidates: Vec<PathBuf> = include_roots
@@ -67,10 +68,13 @@ pub(super) fn resolve_include_paths(
         .collect();
     let ws_candidates: Vec<PathBuf> = match (workspace_root, db_path) {
         (Some(ws), Some(db)) if db.exists() => {
-            let store = IndexStore::open_readonly(db)?;
-            store
-                .include_table_view()
-                .workspace_files_by_suffix(rel)?
+            let paths = match expected_generation {
+                Some(generation) => IndexStore::read_at_generation(db, generation, |store| {
+                    store.include_table_view().workspace_files_by_suffix(rel)
+                })?,
+                None => Vec::new(),
+            };
+            paths
                 .into_iter()
                 .map(|rel| ws.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR)))
                 .collect()
@@ -142,7 +146,12 @@ pub(super) fn collect_include_candidates(
     db_path: Option<&Path>,
     limit: usize,
 ) -> Vec<CompletionItem> {
-    collect_include_candidates_with_table(
+    let expected_generation = db_path.and_then(|path| {
+        IndexStore::open_readonly(path)
+            .and_then(|store| store.semantic_generation())
+            .ok()
+    });
+    collect_include_candidates_with_table_and_evidence(
         form,
         dir_part,
         seg,
@@ -150,10 +159,14 @@ pub(super) fn collect_include_candidates(
         workspace_root,
         include_roots,
         db_path,
+        expected_generation,
+        None,
+        None,
         None,
         None,
         limit,
     )
+    .0
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -178,6 +191,7 @@ pub(super) fn collect_include_candidates_with_table(
         workspace_root,
         include_roots,
         db_path,
+        None,
         include_table,
         external_cache,
         None,
@@ -196,6 +210,7 @@ pub(super) fn collect_include_candidates_with_table_and_evidence(
     workspace_root: Option<&Path>,
     include_roots: &[String],
     db_path: Option<&Path>,
+    expected_generation: Option<u64>,
     include_table: Option<&IncludeCompletionTable>,
     external_cache: Option<&ExternalIncludeDirCache>,
     current_rel_dir: Option<&str>,
@@ -238,6 +253,7 @@ pub(super) fn collect_include_candidates_with_table_and_evidence(
             }
             collect_workspace_include_candidates(
                 db_path,
+                expected_generation,
                 include_table,
                 dir_part,
                 &seg_lower,
@@ -288,6 +304,7 @@ pub(super) fn collect_include_candidates_with_table_and_evidence(
             }
             collect_workspace_include_candidates(
                 db_path,
+                expected_generation,
                 include_table,
                 dir_part,
                 &seg_lower,
@@ -425,6 +442,7 @@ fn cached_dir_entries(dir: &Path, cache: &ExternalIncludeDirCache) -> Option<Vec
 #[allow(clippy::too_many_arguments)]
 fn collect_workspace_include_candidates(
     db_path: Option<&Path>,
+    expected_generation: Option<u64>,
     include_table: Option<&IncludeCompletionTable>,
     dir_part: &str,
     seg_lower: &str,
@@ -454,10 +472,12 @@ fn collect_workspace_include_candidates(
     let Some(db_path) = db_path.filter(|path| path.exists()) else {
         return;
     };
-    let Ok(store) = IndexStore::open_readonly(db_path) else {
+    let Some(generation) = expected_generation else {
         return;
     };
-    let Ok(paths) = store.include_table_view().workspace_file_paths() else {
+    let Ok(paths) = IndexStore::read_at_generation(db_path, generation, |store| {
+        store.include_table_view().workspace_file_paths()
+    }) else {
         return;
     };
     for path in paths {
@@ -477,6 +497,7 @@ fn collect_workspace_include_candidates(
 #[derive(Debug, Clone)]
 struct IndexedIncludeCandidate {
     name: String,
+    name_lower: String,
     is_dir: bool,
     rel_path: String,
 }
@@ -494,6 +515,7 @@ fn indexed_workspace_include_candidates(
             if !first.is_empty() && first.to_ascii_lowercase().starts_with(seg_lower) {
                 out.push(IndexedIncludeCandidate {
                     name: first.to_string(),
+                    name_lower: first.to_ascii_lowercase(),
                     is_dir: true,
                     rel_path: first.to_string(),
                 });
@@ -506,6 +528,7 @@ fn indexed_workspace_include_candidates(
             {
                 out.push(IndexedIncludeCandidate {
                     name: name.to_string(),
+                    name_lower: name.to_ascii_lowercase(),
                     is_dir: false,
                     rel_path: rel.clone(),
                 });
@@ -540,6 +563,7 @@ fn indexed_workspace_include_candidates(
         };
         out.push(IndexedIncludeCandidate {
             name: name.to_string(),
+            name_lower: name.to_ascii_lowercase(),
             is_dir,
             rel_path: candidate_path,
         });
@@ -662,6 +686,7 @@ mod tests {
             None,
             &[root_str],
             None,
+            None,
         )
         .expect("resolve");
 
@@ -684,6 +709,7 @@ mod tests {
             None,
             &[root_str],
             None,
+            None,
         )
         .expect("resolve");
 
@@ -693,9 +719,16 @@ mod tests {
 
     #[test]
     fn resolve_include_unresolved_is_empty() {
-        let resolved =
-            resolve_include_paths(IncludeForm::Angle, "nope/missing.h", None, None, &[], None)
-                .expect("resolve");
+        let resolved = resolve_include_paths(
+            IncludeForm::Angle,
+            "nope/missing.h",
+            None,
+            None,
+            &[],
+            None,
+            None,
+        )
+        .expect("resolve");
         assert!(resolved.is_empty());
     }
 
@@ -1010,6 +1043,7 @@ mod tests {
             None,
             &[root_str],
             None,
+            None,
             Some(&table),
             None,
             Some("src/driver"),
@@ -1046,6 +1080,7 @@ mod tests {
             Some(current.path()),
             None,
             &[],
+            None,
             None,
             Some(&table),
             None,

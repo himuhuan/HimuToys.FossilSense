@@ -272,3 +272,31 @@ fn missing_include_path_is_not_fatal() {
     .expect("index should still succeed");
     assert_eq!(stats.total_files, 1);
 }
+
+#[test]
+fn bounded_parse_write_pipeline_crosses_multiple_batches() {
+    let ws = tempdir().expect("ws");
+    for index in 0..300 {
+        fs::write(
+            ws.path().join(format!("file_{index:03}.c")),
+            format!("int function_{index:03}(void) {{ return {index}; }}\n"),
+        )
+        .expect("source");
+    }
+    let db = ws.path().join("index.sqlite");
+    let stats = index_workspace(
+        ws.path(),
+        IndexOptions {
+            db_path: Some(db),
+            force: true,
+            parse_threads: Some(2),
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("bounded pipeline index");
+
+    assert_eq!(stats.indexed_files, 300);
+    assert_eq!(stats.total_files, 300);
+    assert_eq!(stats.symbols, 300);
+}

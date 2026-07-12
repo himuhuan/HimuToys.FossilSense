@@ -184,6 +184,7 @@ impl Backend {
                         &absolute,
                         snapshot.version,
                         &snapshot.text,
+                        crate::parser::ParseFacts::INDEX,
                     )
                     .await?;
                 overlays.push((

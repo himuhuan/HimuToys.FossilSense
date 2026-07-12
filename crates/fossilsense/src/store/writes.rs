@@ -1,7 +1,7 @@
 use anyhow::Result;
 use rusqlite::{params, Connection};
 
-use crate::parser::AliasTarget;
+use crate::semantic_model::AliasTarget;
 
 use super::{
     include_normalized_metadata, member_confidence_to_str, member_kind_to_str, now_unix_secs,
@@ -102,9 +102,9 @@ pub(super) fn stage_file_updates(
                 FileIndexPayload::Ok(index) => (
                     "ok",
                     None,
-                    index.diagnostics.requested_facts.bits() as i64,
-                    index.diagnostics.parse_error_count as i64,
-                    i64::from(index.diagnostics.fallback_used),
+                    index.persistence_diagnostics().fact_mask as i64,
+                    index.persistence_diagnostics().parse_error_count as i64,
+                    i64::from(index.persistence_diagnostics().fallback_used),
                 ),
                 FileIndexPayload::Error(error) => ("error", Some(error), 0, 0, 0),
             };

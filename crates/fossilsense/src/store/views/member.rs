@@ -15,7 +15,7 @@ pub struct RecordReadRow {
     pub display_name: String,
     pub tag_name: Option<String>,
     pub typedef_name: Option<String>,
-    pub kind: crate::parser::RecordKind,
+    pub kind: crate::semantic_model::RecordKind,
     pub path: String,
     pub external: bool,
     pub directly_included: bool,
@@ -25,7 +25,7 @@ pub struct RecordReadRow {
     pub start_col: usize,
     pub end_line: usize,
     pub end_col: usize,
-    pub confidence: crate::parser::RecordConfidence,
+    pub confidence: crate::semantic_model::RecordConfidence,
     pub signature: String,
 }
 
@@ -55,9 +55,9 @@ impl RecordReadRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberReadRow {
     pub name: String,
-    pub kind: crate::parser::MemberKind,
+    pub kind: crate::semantic_model::MemberKind,
     pub signature: String,
-    pub confidence: crate::parser::MemberConfidence,
+    pub confidence: crate::semantic_model::MemberConfidence,
     pub type_name: Option<String>,
     pub owner_path: String,
     pub external: bool,
@@ -161,7 +161,7 @@ impl<'a> MemberStoreView<'a> {
             freq: usize,
         }
 
-        let mut by_member: HashMap<(String, crate::parser::MemberKind), MemberMeta> =
+        let mut by_member: HashMap<(String, crate::semantic_model::MemberKind), MemberMeta> =
             HashMap::new();
         for row in rows {
             let candidate = row?.into_candidate(ctx);
@@ -401,17 +401,17 @@ impl<'a> MemberStoreView<'a> {
 fn record_read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RecordReadRow> {
     let kind_str: String = row.get(4)?;
     let kind = match kind_str.as_str() {
-        "union" => crate::parser::RecordKind::Union,
-        "class" => crate::parser::RecordKind::Class,
-        _ => crate::parser::RecordKind::Struct,
+        "union" => crate::semantic_model::RecordKind::Union,
+        "class" => crate::semantic_model::RecordKind::Class,
+        _ => crate::semantic_model::RecordKind::Struct,
     };
     let source_str: String = row.get(6)?;
     let directly_included: i64 = row.get(7)?;
     let confidence_str: String = row.get(14)?;
     let confidence = match confidence_str.as_str() {
-        "named_tag" => crate::parser::RecordConfidence::NamedTag,
-        "anonymous_typedef" => crate::parser::RecordConfidence::AnonymousTypedef,
-        _ => crate::parser::RecordConfidence::Heuristic,
+        "named_tag" => crate::semantic_model::RecordConfidence::NamedTag,
+        "anonymous_typedef" => crate::semantic_model::RecordConfidence::AnonymousTypedef,
+        _ => crate::semantic_model::RecordConfidence::Heuristic,
     };
 
     Ok(RecordReadRow {
@@ -451,29 +451,29 @@ fn member_read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemberReadRow> {
     })
 }
 
-fn member_kind_from_str(kind: &str) -> crate::parser::MemberKind {
+fn member_kind_from_str(kind: &str) -> crate::semantic_model::MemberKind {
     match kind {
-        "method" => crate::parser::MemberKind::Method,
-        "static_method" => crate::parser::MemberKind::StaticMethod,
-        "nested_type" => crate::parser::MemberKind::NestedType,
-        _ => crate::parser::MemberKind::Field,
+        "method" => crate::semantic_model::MemberKind::Method,
+        "static_method" => crate::semantic_model::MemberKind::StaticMethod,
+        "nested_type" => crate::semantic_model::MemberKind::NestedType,
+        _ => crate::semantic_model::MemberKind::Field,
     }
 }
 
-fn member_confidence_from_str(confidence: &str) -> crate::parser::MemberConfidence {
+fn member_confidence_from_str(confidence: &str) -> crate::semantic_model::MemberConfidence {
     match confidence {
-        "out_of_class_owner" => crate::parser::MemberConfidence::OutOfClassOwner,
-        "heuristic" => crate::parser::MemberConfidence::Heuristic,
-        _ => crate::parser::MemberConfidence::InBody,
+        "out_of_class_owner" => crate::semantic_model::MemberConfidence::OutOfClassOwner,
+        "heuristic" => crate::semantic_model::MemberConfidence::Heuristic,
+        _ => crate::semantic_model::MemberConfidence::InBody,
     }
 }
 
-fn member_kind_rank(kind: crate::parser::MemberKind) -> i32 {
+fn member_kind_rank(kind: crate::semantic_model::MemberKind) -> i32 {
     match kind {
-        crate::parser::MemberKind::Field => 0,
-        crate::parser::MemberKind::Method => 1,
-        crate::parser::MemberKind::StaticMethod => 2,
-        crate::parser::MemberKind::NestedType => 3,
+        crate::semantic_model::MemberKind::Field => 0,
+        crate::semantic_model::MemberKind::Method => 1,
+        crate::semantic_model::MemberKind::StaticMethod => 2,
+        crate::semantic_model::MemberKind::NestedType => 3,
     }
 }
 

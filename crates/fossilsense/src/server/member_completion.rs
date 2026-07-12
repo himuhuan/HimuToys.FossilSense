@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -13,6 +13,7 @@ use super::{
     empty_completion_list, member_completion_is_incomplete, uri_to_path, Backend,
     CompletionDocumentationData,
 };
+use crate::call_model::SemanticGeneration;
 use crate::model;
 use crate::parser::{
     self, FactAvailability, FactGroup, FileSemanticIndex, MemberConfidence, MemberKind,
@@ -46,6 +47,16 @@ impl Backend {
         let text_owned = text.to_string();
         let uri_owned = uri.to_string();
         let roots = self.workspace_roots.lock().await.clone();
+        let mut db_generations = HashMap::new();
+        for root in &roots {
+            let context = self.request_context_for_root(root.clone()).await;
+            db_generations.insert(
+                pathing::default_index_path(root).map_err(|error| {
+                    tower_lsp::jsonrpc::Error::invalid_params(error.to_string())
+                })?,
+                context.engine.semantic_generation,
+            );
+        }
         let limit = query::COMPLETION_LIMIT;
         let min_prefix = query::MEMBER_COMPLETION_MIN_PREFIX_LEN;
 
@@ -69,8 +80,14 @@ impl Backend {
         // symbols.
         let cached_index: Option<Arc<FileSemanticIndex>> = match (&receiver, &path) {
             (Some(_), Some(path)) => {
-                self.get_or_parse_document(uri, path, version, &text_owned)
-                    .await
+                self.get_or_parse_document(
+                    uri,
+                    path,
+                    version,
+                    &text_owned,
+                    parser::ParseFacts::MEMBER,
+                )
+                .await
             }
             _ => None,
         };
@@ -105,23 +122,31 @@ impl Backend {
                     for root in &roots {
                         let db_path = pathing::default_index_path(root)?;
                         if db_path.exists() {
-                            let store = IndexStore::open_readonly(&db_path)?;
                             let ctx = crate::resolver::ResolveContext {
                                 current_path: current_rel_path.as_deref(),
                                 reach: member_reach.as_ref(),
                             };
-                            let mut candidates = store
-                                .member_view()
-                                .resolve_record_candidates(&[key.as_str()], Some(&ctx))?;
+                            let mut candidates =
+                                read_member_at_generation(&db_path, &db_generations, |store| {
+                                    store
+                                        .member_view()
+                                        .resolve_record_candidates(&[key.as_str()], Some(&ctx))
+                                })?;
 
                             if candidates.is_empty() && member_reach.is_some() {
                                 let ctx_unscoped = crate::resolver::ResolveContext {
                                     current_path: current_rel_path.as_deref(),
                                     reach: None,
                                 };
-                                candidates = store.member_view().resolve_record_candidates(
-                                    &[key.as_str()],
-                                    Some(&ctx_unscoped),
+                                candidates = read_member_at_generation(
+                                    &db_path,
+                                    &db_generations,
+                                    |store| {
+                                        store.member_view().resolve_record_candidates(
+                                            &[key.as_str()],
+                                            Some(&ctx_unscoped),
+                                        )
+                                    },
                                 )?;
                             }
 
@@ -148,14 +173,19 @@ impl Backend {
                         for root in &roots {
                             let db_path = pathing::default_index_path(root)?;
                             if db_path.exists() {
-                                let store = IndexStore::open_readonly(&db_path)?;
                                 let ctx = crate::resolver::ResolveContext {
                                     current_path: current_rel_path.as_deref(),
                                     reach: member_reach.as_ref(),
                                 };
-                                let candidates = store
-                                    .member_view()
-                                    .resolve_record_candidates(&lookup_refs, Some(&ctx))?;
+                                let candidates = read_member_at_generation(
+                                    &db_path,
+                                    &db_generations,
+                                    |store| {
+                                        store
+                                            .member_view()
+                                            .resolve_record_candidates(&lookup_refs, Some(&ctx))
+                                    },
+                                )?;
                                 if !candidates.is_empty() {
                                     all_candidates.extend(candidates.iter().cloned());
                                     weak_candidates_by_db.push((db_path, candidates));
@@ -196,6 +226,7 @@ impl Backend {
                             &member_name,
                             current_rel_path.as_deref(),
                             member_reach.as_ref(),
+                            &db_generations,
                         )?;
                         if type_names.is_empty() {
                             record_candidates_by_db.clear();
@@ -207,6 +238,7 @@ impl Backend {
                             &type_names,
                             current_rel_path.as_deref(),
                             member_reach.as_ref(),
+                            &db_generations,
                         )?;
                         if record_candidates_by_db.is_empty() {
                             break;
@@ -231,15 +263,17 @@ impl Backend {
                             .map(|candidate| candidate.id)
                             .collect();
                         if !record_ids.is_empty() {
-                            let store = IndexStore::open_readonly(db_path)?;
-                            let members = store.member_view().members_for_records(
-                                &record_ids,
-                                None,
-                                Some(&crate::resolver::ResolveContext {
-                                    current_path: current_rel_path.as_deref(),
-                                    reach: member_reach.as_ref(),
-                                }),
-                            )?;
+                            let members =
+                                read_member_at_generation(db_path, &db_generations, |store| {
+                                    store.member_view().members_for_records(
+                                        &record_ids,
+                                        None,
+                                        Some(&crate::resolver::ResolveContext {
+                                            current_path: current_rel_path.as_deref(),
+                                            reach: member_reach.as_ref(),
+                                        }),
+                                    )
+                                })?;
                             for member in members {
                                 remember_member(&mut member_to_best, member, weak_owner_used);
                             }
@@ -252,15 +286,17 @@ impl Backend {
                         let record_ids: Vec<i64> =
                             candidates.iter().map(|candidate| candidate.id).collect();
                         if !record_ids.is_empty() {
-                            let store = IndexStore::open_readonly(db_path)?;
-                            let members = store.member_view().members_for_records(
-                                &record_ids,
-                                None,
-                                Some(&crate::resolver::ResolveContext {
-                                    current_path: current_rel_path.as_deref(),
-                                    reach: member_reach.as_ref(),
-                                }),
-                            )?;
+                            let members =
+                                read_member_at_generation(db_path, &db_generations, |store| {
+                                    store.member_view().members_for_records(
+                                        &record_ids,
+                                        None,
+                                        Some(&crate::resolver::ResolveContext {
+                                            current_path: current_rel_path.as_deref(),
+                                            reach: member_reach.as_ref(),
+                                        }),
+                                    )
+                                })?;
                             for member in members {
                                 remember_member(&mut member_to_best, member, weak_owner_used);
                             }
@@ -287,20 +323,25 @@ impl Backend {
                     for root in &roots {
                         let db_path = pathing::default_index_path(root)?;
                         if db_path.exists() {
-                            let store = IndexStore::open_readonly(&db_path)?;
                             let ctx = crate::resolver::ResolveContext {
                                 current_path: current_rel_path.as_deref(),
                                 reach: member_reach.as_ref(),
                             };
                             fallback.extend(
-                                store
-                                    .member_view()
-                                    .fallback_member_candidates(&prefix, limit, Some(&ctx))?
-                                    .into_iter()
-                                    .map(|candidate| MemberPresentation {
+                                read_member_at_generation(&db_path, &db_generations, |store| {
+                                    store.member_view().fallback_member_candidates(
+                                        &prefix,
+                                        limit,
+                                        Some(&ctx),
+                                    )
+                                })?
+                                .into_iter()
+                                .map(|candidate| {
+                                    MemberPresentation {
                                         candidate,
                                         weak_receiver: false,
-                                    }),
+                                    }
+                                }),
                             );
                         }
                     }
@@ -565,6 +606,7 @@ fn member_type_names_for_segment(
     member_name: &str,
     current_rel_path: Option<&str>,
     member_reach: Option<&crate::reachability::ReachScope>,
+    db_generations: &HashMap<PathBuf, SemanticGeneration>,
 ) -> Result<Vec<String>> {
     let mut names = Vec::new();
     for (db_path, candidates) in record_candidates_by_db {
@@ -583,15 +625,16 @@ fn member_type_names_for_segment(
         if record_ids.is_empty() {
             continue;
         }
-        let store = IndexStore::open_readonly(db_path)?;
-        let members = store.member_view().members_for_records(
-            &record_ids,
-            Some(member_name),
-            Some(&crate::resolver::ResolveContext {
-                current_path: current_rel_path,
-                reach: member_reach,
-            }),
-        )?;
+        let members = read_member_at_generation(db_path, db_generations, |store| {
+            store.member_view().members_for_records(
+                &record_ids,
+                Some(member_name),
+                Some(&crate::resolver::ResolveContext {
+                    current_path: current_rel_path,
+                    reach: member_reach,
+                }),
+            )
+        })?;
         for member in members {
             if member.kind == MemberKind::Field && member.name == member_name {
                 if let Some(type_name) = member.type_name {
@@ -610,6 +653,7 @@ fn resolve_record_names_across_roots(
     type_names: &[String],
     current_rel_path: Option<&str>,
     member_reach: Option<&crate::reachability::ReachScope>,
+    db_generations: &HashMap<PathBuf, SemanticGeneration>,
 ) -> Result<Vec<(PathBuf, Vec<crate::model::RecordCandidate>)>> {
     let lookup_refs: Vec<&str> = type_names.iter().map(String::as_str).collect();
     let mut by_db = Vec::new();
@@ -618,28 +662,42 @@ fn resolve_record_names_across_roots(
         if !db_path.exists() {
             continue;
         }
-        let store = IndexStore::open_readonly(&db_path)?;
         let ctx = crate::resolver::ResolveContext {
             current_path: current_rel_path,
             reach: member_reach,
         };
-        let mut candidates = store
-            .member_view()
-            .resolve_record_candidates(&lookup_refs, Some(&ctx))?;
+        let mut candidates = read_member_at_generation(&db_path, db_generations, |store| {
+            store
+                .member_view()
+                .resolve_record_candidates(&lookup_refs, Some(&ctx))
+        })?;
         if candidates.is_empty() && member_reach.is_some() {
             let ctx_unscoped = crate::resolver::ResolveContext {
                 current_path: current_rel_path,
                 reach: None,
             };
-            candidates = store
-                .member_view()
-                .resolve_record_candidates(&lookup_refs, Some(&ctx_unscoped))?;
+            candidates = read_member_at_generation(&db_path, db_generations, |store| {
+                store
+                    .member_view()
+                    .resolve_record_candidates(&lookup_refs, Some(&ctx_unscoped))
+            })?;
         }
         if !candidates.is_empty() {
             by_db.push((db_path, candidates));
         }
     }
     Ok(by_db)
+}
+
+fn read_member_at_generation<T>(
+    db_path: &Path,
+    db_generations: &HashMap<PathBuf, SemanticGeneration>,
+    read: impl FnOnce(&IndexStore) -> Result<T>,
+) -> Result<T> {
+    let generation = db_generations
+        .get(db_path)
+        .ok_or_else(|| anyhow::anyhow!("missing request generation for {}", db_path.display()))?;
+    IndexStore::read_at_generation(db_path, generation.0, read)
 }
 
 fn weak_receiver_lookup_names(receiver_name: &str) -> Vec<String> {

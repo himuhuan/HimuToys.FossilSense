@@ -82,14 +82,14 @@ pub struct RankedNameHit {
 #[derive(Clone)]
 struct NameEntry {
     id: i64,
-    name: String,
-    lower: String,
+    name: Arc<str>,
+    lower: Arc<str>,
     external: bool,
     /// First-layer external header (`#include`d directly by a workspace file).
     /// Carried so in-memory coloring can reproduce the SQL unscoped fallback's
     /// `workspace OR directly_included` filter; always `false` for workspace.
     directly_included: bool,
-    path: String,
+    path: Arc<str>,
     kind: ParserKind,
     project_key: Option<ProjectKey>,
 }
@@ -214,7 +214,7 @@ fn all_workspace_reach(entries: &[NameEntry]) -> ReachScope {
         files: entries
             .iter()
             .filter(|entry| !entry.external)
-            .map(|entry| entry.path.clone())
+            .map(|entry| entry.path.to_string())
             .collect(),
         open: false,
         reason: None,
@@ -274,7 +274,19 @@ impl NameTable {
         Self::from_entries(entries)
     }
 
-    fn from_entries(entries: Vec<NameEntry>) -> Self {
+    fn from_entries(mut entries: Vec<NameEntry>) -> Self {
+        // Symbols commonly repeat both their file path and spelling. Intern
+        // those immutable strings within one published table so a large file
+        // contributes one path allocation rather than one per symbol. Dirty
+        // rebuilds clone these Arcs for unchanged entries.
+        let mut paths: HashMap<Arc<str>, Arc<str>> = HashMap::new();
+        let mut names: HashMap<Arc<str>, Arc<str>> = HashMap::new();
+        let mut lowers: HashMap<Arc<str>, Arc<str>> = HashMap::new();
+        for entry in &mut entries {
+            entry.path = intern_arc(&mut paths, entry.path.clone());
+            entry.name = intern_arc(&mut names, entry.name.clone());
+            entry.lower = intern_arc(&mut lowers, entry.lower.clone());
+        }
         let sorted = sorted_indices(&entries);
         let mut by_project: HashMap<ProjectKey, Vec<usize>> = HashMap::new();
         for (index, entry) in entries.iter().enumerate() {
@@ -356,7 +368,7 @@ impl NameTable {
         let mut entries: Vec<NameEntry> = self
             .entries
             .iter()
-            .filter(|entry| !paths.contains(&entry.path))
+            .filter(|entry| !paths.contains(entry.path.as_ref()))
             .cloned()
             .collect();
         entries.extend(fresh_entries);
@@ -372,7 +384,7 @@ impl NameTable {
         }
         let start = self
             .sorted
-            .partition_point(|&i| self.entries[i].lower.as_str() < needle_lower);
+            .partition_point(|&i| self.entries[i].lower.as_ref() < needle_lower);
         let mut out = Vec::new();
         for &i in &self.sorted[start..] {
             if self.entries[i].lower.starts_with(needle_lower) {
@@ -396,10 +408,10 @@ impl NameTable {
         let needle = name.to_ascii_lowercase();
         let start = self
             .sorted
-            .partition_point(|&i| self.entries[i].lower.as_str() < needle.as_str());
+            .partition_point(|&i| self.entries[i].lower.as_ref() < needle.as_str());
         let mut indices = Vec::new();
         for &i in &self.sorted[start..] {
-            match self.entries[i].lower.as_str().cmp(needle.as_str()) {
+            match self.entries[i].lower.as_ref().cmp(needle.as_str()) {
                 std::cmp::Ordering::Equal => indices.push(i),
                 std::cmp::Ordering::Greater => break,
                 std::cmp::Ordering::Less => {}
@@ -464,7 +476,7 @@ impl NameTable {
                 // Non-colorable kinds never affect `resolve_kind`; skip them.
                 _ => continue,
             };
-            if !names.contains(entry.name.as_str()) {
+            if !names.contains(entry.name.as_ref()) {
                 continue;
             }
             let tier = resolver::scope_tier(
@@ -483,7 +495,7 @@ impl NameTable {
                 continue;
             }
             *counts
-                .entry(entry.name.clone())
+                .entry(entry.name.to_string())
                 .or_default()
                 .entry(kind.to_string())
                 .or_insert(0) += 1;
@@ -560,7 +572,7 @@ impl NameTable {
             // Empty query: rank by tier first, then name. The packed score
             // encodes (tier, 0, locality) so sorting by score desc reproduces
             // the strict-tier order; ties on tier break by name asc.
-            let mut entries: Vec<(ScoredCandidate, &NameEntry)> = self
+            let scored: Vec<ScoredCandidate> = self
                 .entries
                 .iter()
                 .enumerate()
@@ -573,38 +585,16 @@ impl NameTable {
                     );
                     let loc = resolver::locality(&entry.path, ctx_ref.and_then(|c| c.current_path));
                     let score = resolver::pack_score(tier, 0, loc);
-                    (
-                        ScoredCandidate {
-                            score,
-                            name_len: entry.name.len(),
-                            index,
-                            tier,
-                            base_match: 0,
-                        },
-                        entry,
-                    )
+                    ScoredCandidate {
+                        score,
+                        name_len: entry.name.len(),
+                        index,
+                        tier,
+                        base_match: 0,
+                    }
                 })
                 .collect();
-            entries.sort_by(|a, b| {
-                b.0.score
-                    .cmp(&a.0.score)
-                    .then(a.0.name_len.cmp(&b.0.name_len))
-                    .then_with(|| a.1.name.cmp(&b.1.name))
-            });
-            let hits = entries
-                .into_iter()
-                .take(limit)
-                .map(|(candidate, entry)| RankedNameHit {
-                    id: entry.id,
-                    score: candidate.score,
-                    tier: candidate.tier,
-                    base_match: candidate.base_match,
-                    name_len: candidate.name_len,
-                    name: entry.name.clone(),
-                    kind: entry.kind,
-                    project_key: entry.project_key.clone(),
-                })
-                .collect();
+            let hits = self.scored_to_hits(top_scored(scored, limit, &self.entries));
             // An empty query establishes no usable narrowing base.
             return (hits, Vec::new());
         }
@@ -663,49 +653,83 @@ impl NameTable {
         prior_pool: Option<&[usize]>,
     ) -> (Vec<RankedNameHit>, Vec<usize>, CompletionRecallMetrics) {
         let total_limit = quotas.total_indexed;
-        let (mut scored, pool) = self.scored_pool_for_query(query, scope, prior_pool);
-        sort_scored(&mut scored, &self.entries);
+        let (scored, pool) = self.scored_pool_for_query(query, scope, prior_pool);
+        let reserved = quotas
+            .reachable
+            .saturating_add(quotas.external)
+            .saturating_add(quotas.unknown)
+            .saturating_add(quotas.global)
+            .saturating_add(quotas.same_project);
+        let global_top = top_scored(
+            scored.clone(),
+            total_limit.saturating_add(reserved),
+            &self.entries,
+        );
 
         let mut selected_indices = HashSet::new();
         let mut selected = Vec::new();
+        let reachable = top_scored(
+            scored
+                .iter()
+                .copied()
+                .filter(|candidate| channel_for_tier(candidate.tier) == ScopeChannel::Reachable)
+                .collect(),
+            quotas.reachable,
+            &self.entries,
+        );
         take_channel(
-            &scored,
+            &reachable,
             ScopeChannel::Reachable,
             quotas.reachable,
             &mut selected_indices,
             &mut selected,
         );
+        let same_project = active_project
+            .and_then(|key| self.project_indices(key))
+            .map(|indices| {
+                top_scored(
+                    scored
+                        .iter()
+                        .copied()
+                        .filter(|candidate| indices.binary_search(&candidate.index).is_ok())
+                        .collect(),
+                    quotas.same_project,
+                    &self.entries,
+                )
+            })
+            .unwrap_or_default();
         take_same_project(
             self,
-            &scored,
+            &same_project,
             active_project,
             quotas.same_project,
             &mut selected_indices,
             &mut selected,
         );
-        take_channel(
-            &scored,
-            ScopeChannel::External,
-            quotas.external,
-            &mut selected_indices,
-            &mut selected,
-        );
-        take_channel(
-            &scored,
-            ScopeChannel::Unknown,
-            quotas.unknown,
-            &mut selected_indices,
-            &mut selected,
-        );
-        take_channel(
-            &scored,
-            ScopeChannel::Global,
-            quotas.global,
-            &mut selected_indices,
-            &mut selected,
-        );
+        for (channel, quota) in [
+            (ScopeChannel::External, quotas.external),
+            (ScopeChannel::Unknown, quotas.unknown),
+            (ScopeChannel::Global, quotas.global),
+        ] {
+            let channel_top = top_scored(
+                scored
+                    .iter()
+                    .copied()
+                    .filter(|candidate| channel_for_tier(candidate.tier) == channel)
+                    .collect(),
+                quota,
+                &self.entries,
+            );
+            take_channel(
+                &channel_top,
+                channel,
+                quota,
+                &mut selected_indices,
+                &mut selected,
+            );
+        }
 
-        for candidate in &scored {
+        for candidate in &global_top {
             if selected.len() >= total_limit {
                 break;
             }
@@ -780,13 +804,11 @@ impl NameTable {
     /// re-deriving the tier.
     fn rank_scored(
         &self,
-        mut scored: Vec<ScoredCandidate>,
+        scored: Vec<ScoredCandidate>,
         limit: usize,
         _ctx: Option<&ResolveContext<'_>>,
     ) -> Vec<RankedNameHit> {
-        sort_scored(&mut scored, &self.entries);
-        scored.truncate(limit);
-        self.scored_to_hits(scored)
+        self.scored_to_hits(top_scored(scored, limit, &self.entries))
     }
 
     fn scored_pool_for_query(
@@ -858,13 +880,21 @@ impl NameTable {
                     tier: candidate.tier,
                     base_match: candidate.base_match,
                     name_len: candidate.name_len,
-                    name: entry.name.clone(),
+                    name: entry.name.to_string(),
                     kind: entry.kind,
                     project_key: entry.project_key.clone(),
                 }
             })
             .collect()
     }
+}
+
+fn intern_arc(pool: &mut HashMap<Arc<str>, Arc<str>>, value: Arc<str>) -> Arc<str> {
+    if let Some(existing) = pool.get(value.as_ref()) {
+        return existing.clone();
+    }
+    pool.insert(value.clone(), value.clone());
+    value
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -942,12 +972,34 @@ fn take_same_project(
 }
 
 fn sort_scored(scored: &mut [ScoredCandidate], entries: &[NameEntry]) {
-    scored.sort_by(|a, b| {
-        b.score
-            .cmp(&a.score)
-            .then(a.name_len.cmp(&b.name_len))
-            .then_with(|| entries[a.index].name.cmp(&entries[b.index].name))
-    });
+    scored.sort_by(|a, b| scored_order(a, b, entries));
+}
+
+fn scored_order(
+    a: &ScoredCandidate,
+    b: &ScoredCandidate,
+    entries: &[NameEntry],
+) -> std::cmp::Ordering {
+    b.score
+        .cmp(&a.score)
+        .then(a.name_len.cmp(&b.name_len))
+        .then_with(|| entries[a.index].name.cmp(&entries[b.index].name))
+}
+
+fn top_scored(
+    mut scored: Vec<ScoredCandidate>,
+    limit: usize,
+    entries: &[NameEntry],
+) -> Vec<ScoredCandidate> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    if scored.len() > limit {
+        scored.select_nth_unstable_by(limit, |a, b| scored_order(a, b, entries));
+        scored.truncate(limit);
+    }
+    sort_scored(&mut scored, entries);
+    scored
 }
 
 fn recall_metrics(
@@ -1019,11 +1071,11 @@ fn name_entry_parts(
     let lower = name.to_ascii_lowercase();
     NameEntry {
         id,
-        name,
-        lower,
+        name: Arc::from(name),
+        lower: Arc::from(lower),
         external,
         directly_included,
-        path,
+        path: Arc::from(path),
         kind: crate::parser::kind_from_str(&kind),
         project_key,
     }
@@ -1032,7 +1084,7 @@ fn name_entry_parts(
 /// Score a single name against an already-lowercased query. `None` means no
 /// match (not even a subsequence). Higher is better.
 fn score_match(needle: &str, entry: &NameEntry) -> Option<i32> {
-    let hay = entry.lower.as_str();
+    let hay = entry.lower.as_ref();
 
     if hay == needle {
         return Some(1000);

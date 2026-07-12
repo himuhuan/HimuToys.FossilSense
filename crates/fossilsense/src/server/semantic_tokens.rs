@@ -6,7 +6,7 @@ use tower_lsp::lsp_types::{Range, SemanticToken, Url};
 
 use super::{uri_to_path, Backend};
 use crate::coloring;
-use crate::parser::{FactAvailability, FactGroup, FileSemanticIndex};
+use crate::parser::{FactAvailability, FactGroup, FileSemanticIndex, ParseFacts};
 use crate::query;
 
 impl Backend {
@@ -55,7 +55,9 @@ impl Backend {
                 reach: (*reach).clone(),
             });
 
-        let cached = self.get_or_parse_document(uri, &path, version, &text).await;
+        let cached = self
+            .get_or_parse_document(uri, &path, version, &text, ParseFacts::COLOR_LIVE)
+            .await;
         let index: Option<Arc<FileSemanticIndex>> = cached;
         let index = index?;
 

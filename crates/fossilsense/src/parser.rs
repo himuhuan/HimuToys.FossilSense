@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use crate::config::normalized_extension;
@@ -64,6 +65,16 @@ bitflags::bitflags! {
                             | Self::FIELDS.bits()
                             | Self::ALIASES.bits();
 
+        /// Ordinary identifier completion: lexical symbols plus local and
+        /// parameter bindings, without records, fields, occurrences, or calls.
+        const COMPLETION    = Self::SYMBOLS.bits()
+                            | Self::INCLUDES.bits()
+                            | Self::LOCAL_DECLS.bits();
+
+        /// Semantic coloring: identifier occurrences plus local bindings.
+        const COLOR_LIVE    = Self::COLOR_REF.bits()
+                            | Self::LOCAL_DECLS.bits();
+
         /// Everything (backward-compatible default).
         const ALL           = !0;
     }
@@ -101,18 +112,7 @@ pub struct FileSemanticIndex {
 ///
 /// This is a borrowed view so existing `FileSemanticIndex` ownership and field
 /// access remain unchanged while parser consumers migrate incrementally.
-#[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
-pub struct PersistentFacts<'a> {
-    pub symbols: &'a [Symbol],
-    pub includes: &'a [Include],
-    pub records: &'a [RecordDef],
-    pub fields: &'a [FieldDef],
-    pub members: &'a [MemberDef],
-    pub aliases: &'a [TypeAlias],
-    pub callable_anchors: &'a [crate::call_model::CallableAnchor],
-    pub call_sites: &'a [crate::call_model::CallSiteFact],
-}
+pub use crate::semantic_model::PersistentFacts;
 
 /// Request-time AST facts used by live features such as coloring, references,
 /// member completion receiver inference, and local completion evidence.
@@ -348,218 +348,15 @@ impl ParseDiagnostics {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Symbol {
-    pub name: String,
-    pub kind: SymbolKind,
-    pub role: SymbolRole,
-    pub start_byte: usize,
-    pub end_byte: usize,
-    pub start_line: usize,
-    pub start_col: usize,
-    pub end_line: usize,
-    pub end_col: usize,
-    pub signature: String,
-    pub guard: Option<String>,
-    /// For `Field` symbols, the enclosing record key (struct/union tag, or the
-    /// typedef alias of an anonymous record). `None` for every other kind.
-    pub container: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SymbolKind {
-    Function,
-    Macro,
-    Type,
-    EnumConstant,
-    GlobalVariable,
-    /// A struct/union member; carries its enclosing record in `Symbol::container`.
-    Field,
-}
-
-/// Reverse of the storage mapping (`store::symbol_kind`): parse a stored kind
-/// string back into the `SymbolKind` enum. Used when building the in-memory
-/// `NameTable` from SQLite rows so the completion hot path can map to an LSP
-/// completion item kind without re-opening the database. Unknown strings fall
-/// back to `GlobalVariable` so a future/new kind never panics the name table.
-pub fn kind_from_str(s: &str) -> SymbolKind {
-    match s {
-        "function" => SymbolKind::Function,
-        "macro" => SymbolKind::Macro,
-        "type" => SymbolKind::Type,
-        "enum_constant" => SymbolKind::EnumConstant,
-        "global_variable" => SymbolKind::GlobalVariable,
-        "field" => SymbolKind::Field,
-        _ => SymbolKind::GlobalVariable,
-    }
-}
+pub use crate::semantic_model::{
+    kind_from_str, AliasTarget, FieldDef, Include, MemberConfidence, MemberDef, MemberKind,
+    Occurrence, RecordConfidence, RecordDef, RecordKind, Symbol, SymbolKind, SymbolRole,
+    SyntacticRole, TypeAlias,
+};
 
 /// A typedef alias mapping a new name to an underlying record tag, e.g.
 /// `typedef struct Foo FooT;` records `FooT -> Foo`. Lets member completion
 /// resolve a receiver typed with the alias back to the tag that owns the fields.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecordKind {
-    Struct,
-    Union,
-    Class,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecordConfidence {
-    NamedTag,
-    AnonymousTypedef,
-    Heuristic,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RecordDef {
-    pub record_key: String,
-    pub display_name: String,
-    pub tag_name: Option<String>,
-    pub typedef_name: Option<String>,
-    pub kind: RecordKind,
-    pub start_byte: usize,
-    pub end_byte: usize,
-    pub start_line: usize,
-    pub start_col: usize,
-    pub end_line: usize,
-    pub end_col: usize,
-    pub confidence: RecordConfidence,
-    pub signature: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FieldDef {
-    pub record_key: String,
-    pub name: String,
-    pub start_byte: usize,
-    pub end_byte: usize,
-    pub start_line: usize,
-    pub start_col: usize,
-    pub end_line: usize,
-    pub end_col: usize,
-    pub signature: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum MemberKind {
-    Field,
-    Method,
-    StaticMethod,
-    NestedType,
-}
-
-impl MemberKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            MemberKind::Field => "field",
-            MemberKind::Method => "method",
-            MemberKind::StaticMethod => "static_method",
-            MemberKind::NestedType => "nested_type",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum MemberConfidence {
-    InBody,
-    OutOfClassOwner,
-    Heuristic,
-}
-
-impl MemberConfidence {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            MemberConfidence::InBody => "in_body",
-            MemberConfidence::OutOfClassOwner => "out_of_class_owner",
-            MemberConfidence::Heuristic => "heuristic",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MemberDef {
-    pub record_key: String,
-    pub name: String,
-    pub kind: MemberKind,
-    pub confidence: MemberConfidence,
-    pub type_name: Option<String>,
-    pub start_byte: usize,
-    pub end_byte: usize,
-    pub start_line: usize,
-    pub start_col: usize,
-    pub end_line: usize,
-    pub end_col: usize,
-    pub signature: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AliasTarget {
-    RecordKey(String),
-    NamedRecord { tag: String, kind: RecordKind },
-    UnresolvedTypeName(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TypeAlias {
-    pub alias: String,
-    pub target: AliasTarget,
-    pub start_byte: usize,
-    pub end_byte: usize,
-    pub start_line: usize,
-    pub start_col: usize,
-    pub end_line: usize,
-    pub end_col: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SymbolRole {
-    Definition,
-    Declaration,
-}
-
-/// The syntactic role of a single identifier *occurrence* (as opposed to the
-/// `SymbolRole` of a definition). Derived purely from the occurrence's position
-/// in the tree-sitter tree — best-effort and never semantic. Anything we cannot
-/// confidently classify falls back to `Read`; we never emit a confident-but-
-/// wrong role. Shared by semantic coloring (role-gated) and reference
-/// classification (grouped by role).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SyntacticRole {
-    /// Defining site of a macro, enum constant, or a function body.
-    Definition,
-    /// A binding declaration (variable / parameter / function prototype name).
-    Declaration,
-    /// The function position of a call expression.
-    Call,
-    /// The left-hand side of an assignment or an increment/decrement target.
-    Write,
-    /// A plain value-position use, or any occurrence we cannot classify.
-    Read,
-    /// An identifier used in type position (`type_identifier`).
-    TypeUse,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Include {
-    pub line: usize,
-    pub target_text: String,
-}
-
-/// A single identifier token occurrence (name + zero-based position), used by
-/// semantic coloring. Columns/length are UTF-16 code units as required by LSP.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Occurrence {
-    pub name: String,
-    pub start_byte: usize,
-    pub line: u32,
-    pub start_col: u32,
-    pub length: u32,
-    /// Best-effort syntactic role of this occurrence (coloring gate / reference
-    /// grouping). `Read` when unclassifiable.
-    pub role: SyntacticRole,
-}
-
 /// Parse `source` into the single `FileSemanticIndex` product: lexical symbols
 /// and includes, plus the AST-derived occurrences, records, fields, aliases, enum
 /// constants, and record-typed local declarations — one tree-sitter parse and one
@@ -613,6 +410,30 @@ impl ParserHandle {
         }
         Ok(state.parser.parse(source, old_tree))
     }
+
+    fn parse_with_language_cancel(
+        &self,
+        lang: tree_sitter::Language,
+        source: &str,
+        cancel: &AtomicBool,
+    ) -> Result<Option<tree_sitter::Tree>, ()> {
+        let mut state = self.state.lock().unwrap();
+        if state
+            .current_lang
+            .as_ref()
+            .is_none_or(|current| *current != lang)
+        {
+            state.parser.set_language(&lang).map_err(|_| ())?;
+            state.current_lang = Some(lang);
+        }
+        let bytes = source.as_bytes();
+        let mut input = |offset: usize, _| bytes.get(offset..).unwrap_or_default();
+        let mut progress = |_: &tree_sitter::ParseState| cancel.load(Ordering::Relaxed);
+        let options = tree_sitter::ParseOptions::new().progress_callback(&mut progress);
+        Ok(state
+            .parser
+            .parse_with_options(&mut input, None, Some(options)))
+    }
 }
 
 /// Single best-effort parse of `source` into a `FileSemanticIndex`.
@@ -638,6 +459,16 @@ pub fn parse_with_handle(
     handle: Option<&ParserHandle>,
     facts: ParseFacts,
 ) -> FileSemanticIndex {
+    parse_with_handle_control(path, source, handle, facts, None)
+}
+
+fn parse_with_handle_control(
+    path: &Path,
+    source: &str,
+    handle: Option<&ParserHandle>,
+    facts: ParseFacts,
+    cancel: Option<&AtomicBool>,
+) -> FileSemanticIndex {
     let line_starts = line_starts(source);
     let (symbols, includes) = extract_symbols_and_includes(source, &line_starts);
 
@@ -653,7 +484,11 @@ pub fn parse_with_handle(
         }
     };
 
-    let tree = match active_handle.parse_with_language(language, source, None) {
+    let parsed_tree = match cancel {
+        Some(cancel) => active_handle.parse_with_language_cancel(language, source, cancel),
+        None => active_handle.parse_with_language(language, source, None),
+    };
+    let tree = match parsed_tree {
         Ok(Some(tree)) => tree,
         Ok(None) | Err(()) => return lexical_fallback_with_facts(symbols, includes, facts),
     };
@@ -716,6 +551,18 @@ pub fn parse_thread_local_with_facts(
     TL_PARSER_HANDLE.with(|cell| {
         let handle = cell.borrow();
         parse_with_handle(path, source, Some(&*handle), facts)
+    })
+}
+
+pub fn parse_thread_local_with_facts_cancel(
+    path: &Path,
+    source: &str,
+    facts: ParseFacts,
+    cancel: &AtomicBool,
+) -> FileSemanticIndex {
+    TL_PARSER_HANDLE.with(|cell| {
+        let handle = cell.borrow();
+        parse_with_handle_control(path, source, Some(&*handle), facts, Some(cancel))
     })
 }
 

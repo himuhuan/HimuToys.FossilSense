@@ -381,6 +381,29 @@ impl<'a> ReferenceFileStoreView<'a> {
                     .collect()
             })
     }
+
+    pub fn indexed_workspace_files_for_paths(
+        &self,
+        paths: &[String],
+    ) -> Result<Vec<ReferenceFileRow>> {
+        let mut files = Vec::new();
+        for chunk in paths.chunks(400) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "SELECT path FROM files WHERE source = 'workspace' AND path IN ({placeholders}) ORDER BY path"
+            );
+            let mut stmt = self.store.conn.prepare(&sql)?;
+            let rows = stmt.query_map(
+                rusqlite::params_from_iter(chunk.iter().map(String::as_str)),
+                |row| Ok(ReferenceFileRow { path: row.get(0)? }),
+            )?;
+            files.extend(collect_rows(rows)?);
+        }
+        Ok(files)
+    }
 }
 
 fn name_table_symbol_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NameTableSymbolRow> {

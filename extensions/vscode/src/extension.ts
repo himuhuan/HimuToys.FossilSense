@@ -18,6 +18,7 @@ import {
   completionHistoryInitializationOptions,
 } from './completionHistory';
 import { resolveServerPathFromCandidates } from './serverPath';
+import { extensionsFromConfigText, sourceWatchGlob } from './watchPlan';
 import {
   DegradedCapabilities,
   degradedCapabilityWarning,
@@ -82,6 +83,8 @@ let configWarning: string | undefined;
 let capabilityWarning: string | undefined;
 let currentIndexStartedWithWarning = false;
 let mutualExclusionWarningShown = false;
+let watchPlanRestarting = false;
+let watchPlanListeners: vscode.Disposable[] = [];
 const projectContextPromptTracker = new ProjectContextPromptTracker();
 let projectContextUpdateEpoch = 0;
 
@@ -166,6 +169,16 @@ export function activate(context: vscode.ExtensionContext): void {
         await startServer(context);
       }
     }),
+    vscode.workspace.onDidChangeWorkspaceFolders(async () => {
+      if (!client) {
+        return;
+      }
+      output.appendLine('Workspace folders changed; restarting to refresh file watchers.');
+      await stopServer();
+      if (vscode.workspace.workspaceFolders?.length) {
+        await startServer(context);
+      }
+    }),
   );
 
   // Auto-start when a workspace is open; the manual command stays as a fallback.
@@ -224,13 +237,21 @@ async function startServer(context: vscode.ExtensionContext): Promise<void> {
     },
   };
 
-  const fileEvents = [
-    vscode.workspace.createFileSystemWatcher('**/*.{c,h,cpp,hpp,cc,hh,cxx,hxx,inl}'),
-    ...workspaceFolders.map((folder) =>
-      vscode.workspace.createFileSystemWatcher(
-        new vscode.RelativePattern(folder, 'fossilsense.json'),
-      ),
+  const configWatchers = workspaceFolders.map((folder) =>
+    vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(folder, 'fossilsense.json'),
     ),
+  );
+  const fileEvents = [
+    ...workspaceFolders.flatMap((folder) => {
+      const configPath = vscode.Uri.joinPath(folder.uri, 'fossilsense.json').fsPath;
+      const configText = fs.existsSync(configPath) ? fs.readFileSync(configPath, 'utf8') : undefined;
+      const sourceGlob = sourceWatchGlob(extensionsFromConfigText(configText));
+      return sourceGlob
+        ? [vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(folder, sourceGlob))]
+        : [];
+    }),
+    ...configWatchers,
     ...workspaceFolders.flatMap((folder) =>
       PROJECT_CONTEXT_MARKER_PATTERNS.map((pattern) =>
         vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(folder, pattern)),
@@ -278,6 +299,13 @@ async function startServer(context: vscode.ExtensionContext): Promise<void> {
   };
 
   client = new LanguageClient('fossilsense', 'FossilSense', serverOptions, clientOptions);
+  for (const watcher of configWatchers) {
+    watchPlanListeners.push(
+      watcher.onDidCreate(() => scheduleWatchPlanRestart(context)),
+      watcher.onDidChange(() => scheduleWatchPlanRestart(context)),
+      watcher.onDidDelete(() => scheduleWatchPlanRestart(context)),
+    );
+  }
   client.setTrace(traceFromConfig());
   client.onNotification('fossilsense/indexStatus', (status: IndexStatus) => {
     handleIndexStatus(status);
@@ -318,6 +346,9 @@ async function stopServer(): Promise<void> {
   projectContextPromptTracker.clear();
   projectContextUpdateEpoch += 1;
   callRelationsController?.clear();
+  for (const listener of watchPlanListeners.splice(0)) {
+    listener.dispose();
+  }
 
   if (current) {
     await current.stop();
@@ -325,6 +356,26 @@ async function stopServer(): Promise<void> {
 
   setStatus('stopped');
   setProjectContextStatus(undefined);
+}
+
+function scheduleWatchPlanRestart(context: vscode.ExtensionContext): void {
+  if (watchPlanRestarting) {
+    return;
+  }
+  watchPlanRestarting = true;
+  setTimeout(() => {
+    void (async () => {
+      try {
+        output.appendLine('fossilsense.json changed; refreshing source-extension watchers.');
+        await stopServer();
+        if (vscode.workspace.workspaceFolders?.length) {
+          await startServer(context);
+        }
+      } finally {
+        watchPlanRestarting = false;
+      }
+    })();
+  }, 150);
 }
 
 async function refreshIndex(): Promise<void> {

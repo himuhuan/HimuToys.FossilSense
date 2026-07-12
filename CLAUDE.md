@@ -53,7 +53,9 @@ fossilsense 单一 Rust 原生二进制 (crates/fossilsense)
 | `call_model` | 调用关系领域值对象、稳定 locator、关系质量与覆盖合同；协议中立，不依赖 parser/store/server |
 | `call_catalog` | 从 active call facts 构建不可变 callable 目录；事实与关系负载只存一份，incoming/outgoing 使用紧凑 ID 邻接索引，请求按页物化歧义/未解析证据 |
 | `parser` | tree-sitter C/C++ 容错解析；唯一入口 `parse()`；提供 persistent/request facts 投影与 fact availability |
+| `semantic_model` | parser/store 中立的共享语义事实；不得依赖 parser/store/server/indexer |
 | `store` | SQLite schema、迁移、事务、清理、写入，以及 durable read views / typed rows |
+| `store_parser_adapter` | `FileSemanticIndex` 到 store ingestion port 的唯一适配层；store 本体不得依赖 parser |
 | `pathing` | Windows 路径规范化、仓库相对路径、workspace hash |
 | `progress` | CLI / LSP 共用索引状态 |
 | `project_context` | 构建标记发现、规范化 `ProjectKey`、最近祖先项目推断与协议中立 DTO；项目只是补全 evidence，不是绑定 |
@@ -132,6 +134,8 @@ Runtime snapshot 规则：
 | `EngineEpoch` | 每次成功发布分配显式单调 epoch；`0` 只表示尚未发布索引读模型 |
 | `SemanticGeneration` | SQLite active manifest 的持久化单调代际；marker-only 等纯派生刷新不得推进它 |
 | `RequestContext` | 请求开始时捕获一个 `Arc<EngineSnapshot>` 和 request settings；请求期间不得重新逐项读取缓存 |
+| open document | LSP 使用 incremental sync；文本快照用 `Arc<str>` 共享；live parse 按事实掩码 singleflight，版本推进取消旧解析且 latest revision wins |
+| saved overlay | 不能用全局 generation 推断单文件已发布；只在 active revision 的同路径内容哈希匹配时清除 |
 | dirty reach graph | 增量 include edge 更新生成新的 `ReachGraph`，不得原地修改旧快照持有的图 |
 | publisher | snapshot publisher 串行协调；发布失败不得暴露半更新状态 |
 

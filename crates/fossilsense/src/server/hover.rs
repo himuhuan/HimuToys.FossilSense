@@ -33,13 +33,12 @@ impl Backend {
         let current_rel = uri_to_path(&uri)
             .and_then(|path| pathing::relative_slash_path(&root, &path).ok())
             .unwrap_or_default();
-        let reach_scope = self.reach_scope_for(&uri).await.map(|(_, reach)| reach);
-        let project_context = self
-            .request_context_for_root(root.clone())
-            .await
-            .engine
-            .project_context
-            .clone();
+        let context = self.request_context_for_root(root.clone()).await;
+        let reach_scope = self
+            .reach_scope_from_context(&uri, &context)
+            .map(|(_, reach)| reach);
+        let project_context = context.engine.project_context.clone();
+        let semantic_generation = context.engine.semantic_generation.0;
         let current_text = Arc::new(text);
 
         let result = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
@@ -47,9 +46,10 @@ impl Backend {
             if !db_path.exists() {
                 return Ok(None);
             }
-            let store = IndexStore::open_readonly(&db_path)?;
             let documentation_ranked = query::rank_hover_candidates(
-                store.symbol_read_view().symbols_by_name(&word)?,
+                IndexStore::read_at_generation(&db_path, semantic_generation, |store| {
+                    store.symbol_read_view().symbols_by_name(&word)
+                })?,
                 &current_rel,
                 reach_scope.as_deref(),
                 32,

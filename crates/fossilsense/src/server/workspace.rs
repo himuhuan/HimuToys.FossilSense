@@ -1,10 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::{Mutex, RwLock};
-use tower_lsp::lsp_types::Url;
+use tower_lsp::lsp_types::{Position, TextDocumentContentChangeEvent, Url};
 
 use super::include_completion::IncludeCompletionTable;
 use super::state;
@@ -12,27 +12,31 @@ use super::LocalWordCache;
 use crate::call_catalog::RelationCatalog;
 use crate::call_model::SemanticGeneration;
 use crate::completion_words;
-use crate::parser::FileSemanticIndex;
+use crate::parser::{FileSemanticIndex, ParseFacts};
+use crate::pathing;
 use crate::project_context::ProjectContextIndex;
 use crate::query::NameTable;
 use crate::reachability::ReachGraph;
 use crate::references;
+use crate::store::IndexStore;
 
-type LiveParseCache = Arc<RwLock<HashMap<Url, (i32, Arc<FileSemanticIndex>)>>>;
+type LiveParseCache = Arc<RwLock<HashMap<Url, (i32, ParseFacts, Arc<FileSemanticIndex>)>>>;
+type LiveParseGates = Arc<Mutex<HashMap<Url, Arc<Mutex<()>>>>>;
+type LiveParseCancellations = Arc<Mutex<HashMap<Url, (i32, Arc<AtomicBool>)>>>;
 type RelationOverlayCacheEntry = (state::EngineEpoch, u64, Arc<RelationCatalog>);
 type RelationOverlayCache = Arc<Mutex<HashMap<PathBuf, RelationOverlayCacheEntry>>>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum RelationOverlayState {
     Clean,
     Unsaved,
-    SavedAwaitingGeneration(SemanticGeneration),
+    SavedAwaitingContentHash(String),
 }
 
 #[derive(Clone, Debug)]
 struct OpenDocument {
     version: i32,
-    text: String,
+    text: Arc<str>,
     relation_overlay: RelationOverlayState,
 }
 
@@ -40,24 +44,24 @@ struct OpenDocument {
 pub(super) struct DocumentStore {
     open_docs: Arc<Mutex<HashMap<Url, OpenDocument>>>,
     pub(in crate::server) live_parse_cache: LiveParseCache,
+    live_parse_gates: LiveParseGates,
+    live_parse_cancellations: LiveParseCancellations,
     pub(in crate::server) local_word_cache: LocalWordCache,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct DocumentSnapshot {
     pub(super) version: i32,
-    pub(super) text: String,
+    pub(super) text: Arc<str>,
     relation_overlay: RelationOverlayState,
 }
 
 impl DocumentSnapshot {
-    pub(super) fn needs_relation_overlay(&self, generation: SemanticGeneration) -> bool {
-        match self.relation_overlay {
+    pub(super) fn needs_relation_overlay(&self, _generation: SemanticGeneration) -> bool {
+        match &self.relation_overlay {
             RelationOverlayState::Clean => false,
             RelationOverlayState::Unsaved => true,
-            RelationOverlayState::SavedAwaitingGeneration(saved_generation) => {
-                generation.0 <= saved_generation.0
-            }
+            RelationOverlayState::SavedAwaitingContentHash(_) => true,
         }
     }
 }
@@ -69,38 +73,153 @@ impl DocumentStore {
             uri,
             OpenDocument {
                 version,
-                text,
+                text: Arc::from(text),
                 relation_overlay,
             },
         );
     }
 
+    #[cfg(test)]
     pub(super) async fn change_document(&self, uri: Url, version: i32, text: String) {
         self.open_docs.lock().await.insert(
             uri.clone(),
             OpenDocument {
                 version,
-                text,
+                text: Arc::from(text),
                 relation_overlay: RelationOverlayState::Unsaved,
             },
         );
         self.clear_live_state(&uri).await;
     }
 
-    pub(super) async fn save_document(&self, uri: &Url, generation: SemanticGeneration) {
+    pub(super) async fn apply_document_changes(
+        &self,
+        uri: &Url,
+        version: i32,
+        changes: Vec<TextDocumentContentChangeEvent>,
+    ) -> bool {
+        let applied = {
+            let mut documents = self.open_docs.lock().await;
+            let Some(document) = documents.get_mut(uri) else {
+                return false;
+            };
+            let mut text = document.text.to_string();
+            for change in changes {
+                match change.range {
+                    None => text = change.text,
+                    Some(range) => {
+                        let Some(start) = utf16_position_to_byte(&text, range.start) else {
+                            return false;
+                        };
+                        let Some(end) = utf16_position_to_byte(&text, range.end) else {
+                            return false;
+                        };
+                        if start > end {
+                            return false;
+                        }
+                        text.replace_range(start..end, &change.text);
+                    }
+                }
+            }
+            document.text = Arc::from(text);
+            document.version = version;
+            document.relation_overlay = RelationOverlayState::Unsaved;
+            true
+        };
+        if applied {
+            self.clear_live_state(uri).await;
+        }
+        applied
+    }
+
+    pub(super) async fn save_document(&self, uri: &Url, _generation: SemanticGeneration) {
         if let Some(document) = self.open_docs.lock().await.get_mut(uri) {
-            document.relation_overlay = RelationOverlayState::SavedAwaitingGeneration(generation);
+            document.relation_overlay = RelationOverlayState::SavedAwaitingContentHash(
+                blake3::hash(document.text.as_bytes()).to_hex().to_string(),
+            );
+        }
+    }
+
+    /// Clear saved overlays only when the published revision contains the same
+    /// bytes as the still-open document. A generation advance alone is not
+    /// evidence that this particular file was part of that publication.
+    pub(super) async fn reconcile_published_files(
+        &self,
+        root: PathBuf,
+        rel_paths: Option<Vec<String>>,
+        generation: SemanticGeneration,
+    ) {
+        let candidates: Vec<(Url, String, String)> = {
+            let docs = self.open_docs.lock().await;
+            docs.iter()
+                .filter_map(|(uri, document)| {
+                    let RelationOverlayState::SavedAwaitingContentHash(hash) =
+                        &document.relation_overlay
+                    else {
+                        return None;
+                    };
+                    let path = uri.to_file_path().ok()?;
+                    let rel = pathing::relative_slash_path(&root, &path).ok()?;
+                    if rel_paths
+                        .as_ref()
+                        .is_some_and(|paths| !paths.iter().any(|path| path == &rel))
+                    {
+                        return None;
+                    }
+                    Some((uri.clone(), rel, hash.clone()))
+                })
+                .collect()
+        };
+        if candidates.is_empty() {
+            return;
+        }
+
+        let db_path = match pathing::default_index_path(&root) {
+            Ok(path) => path,
+            Err(_) => return,
+        };
+        let paths: Vec<String> = candidates.iter().map(|(_, rel, _)| rel.clone()).collect();
+        let stored = match tokio::task::spawn_blocking(move || {
+            IndexStore::read_at_generation(&db_path, generation.0, |store| {
+                store.stored_files(&paths)
+            })
+        })
+        .await
+        {
+            Ok(Ok(files)) => files,
+            _ => return,
+        };
+
+        let mut docs = self.open_docs.lock().await;
+        for (uri, rel, expected_hash) in candidates {
+            if stored
+                .get(&rel)
+                .is_some_and(|file| file.hash == expected_hash)
+            {
+                if let Some(document) = docs.get_mut(&uri) {
+                    if matches!(
+                        &document.relation_overlay,
+                        RelationOverlayState::SavedAwaitingContentHash(hash) if hash == &expected_hash
+                    ) {
+                        document.relation_overlay = RelationOverlayState::Clean;
+                    }
+                }
+            }
         }
     }
 
     pub(super) async fn close_document(&self, uri: &Url) {
         self.open_docs.lock().await.remove(uri);
         self.clear_live_state(uri).await;
+        self.live_parse_gates.lock().await.remove(uri);
     }
 
     pub(super) async fn clear_live_state(&self, uri: &Url) {
         self.live_parse_cache.write().await.remove(uri);
         self.local_word_cache.lock().await.remove(uri);
+        if let Some((_, cancellation)) = self.live_parse_cancellations.lock().await.remove(uri) {
+            cancellation.store(true, Ordering::Relaxed);
+        }
     }
 
     pub(super) async fn snapshot(&self, uri: &Url) -> Option<DocumentSnapshot> {
@@ -111,7 +230,7 @@ impl DocumentStore {
             .map(|document| DocumentSnapshot {
                 version: document.version,
                 text: document.text.clone(),
-                relation_overlay: document.relation_overlay,
+                relation_overlay: document.relation_overlay.clone(),
             })
     }
 
@@ -151,17 +270,52 @@ impl DocumentStore {
         &self,
         uri: &Url,
         version: i32,
+        facts: ParseFacts,
     ) -> Option<Arc<FileSemanticIndex>> {
         let cache = self.live_parse_cache.read().await;
-        cache.get(uri).and_then(|(cached_version, parsed)| {
-            (*cached_version == version).then(|| parsed.clone())
-        })
+        cache
+            .get(uri)
+            .and_then(|(cached_version, cached_facts, parsed)| {
+                (*cached_version == version && cached_facts.contains(facts)).then(|| parsed.clone())
+            })
+    }
+
+    pub(super) async fn cached_live_parse_facts(&self, uri: &Url, version: i32) -> ParseFacts {
+        self.live_parse_cache
+            .read()
+            .await
+            .get(uri)
+            .filter(|(cached_version, _, _)| *cached_version == version)
+            .map_or(ParseFacts::empty(), |(_, facts, _)| *facts)
+    }
+
+    pub(super) async fn live_parse_gate(&self, uri: &Url) -> Arc<Mutex<()>> {
+        self.live_parse_gates
+            .lock()
+            .await
+            .entry(uri.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    pub(super) async fn live_parse_cancellation(&self, uri: &Url, version: i32) -> Arc<AtomicBool> {
+        let mut cancellations = self.live_parse_cancellations.lock().await;
+        if let Some((cached_version, cancellation)) = cancellations.get(uri) {
+            if *cached_version == version {
+                return cancellation.clone();
+            }
+            cancellation.store(true, Ordering::Relaxed);
+        }
+        let cancellation = Arc::new(AtomicBool::new(false));
+        cancellations.insert(uri.clone(), (version, cancellation.clone()));
+        cancellation
     }
 
     pub(super) async fn store_live_parse(
         &self,
         uri: Url,
         version: i32,
+        facts: ParseFacts,
         parsed: Arc<FileSemanticIndex>,
     ) {
         // Latest document revision wins. Holding `open_docs` until the cache
@@ -176,7 +330,7 @@ impl DocumentStore {
             self.live_parse_cache
                 .write()
                 .await
-                .insert(uri, (version, parsed));
+                .insert(uri, (version, facts, parsed));
         }
     }
 
@@ -191,7 +345,7 @@ impl DocumentStore {
                     DocumentSnapshot {
                         version: document.version,
                         text: document.text.clone(),
-                        relation_overlay: document.relation_overlay,
+                        relation_overlay: document.relation_overlay.clone(),
                     },
                 )
             })
@@ -205,7 +359,8 @@ impl DocumentStore {
         version: i32,
         parsed: Arc<FileSemanticIndex>,
     ) {
-        self.store_live_parse(uri, version, parsed).await;
+        self.store_live_parse(uri, version, ParseFacts::ALL, parsed)
+            .await;
     }
 
     #[cfg(test)]
@@ -214,7 +369,7 @@ impl DocumentStore {
             .read()
             .await
             .get(uri)
-            .map(|(_, parsed)| parsed.clone())
+            .map(|(_, _, parsed)| parsed.clone())
     }
 
     #[cfg(test)]
@@ -224,6 +379,30 @@ impl DocumentStore {
     ) -> Option<(i32, Arc<HashSet<String>>)> {
         self.local_word_cache.lock().await.get(uri).cloned()
     }
+}
+
+fn utf16_position_to_byte(text: &str, position: Position) -> Option<usize> {
+    let mut line_start = 0usize;
+    for _ in 0..position.line {
+        let newline = text[line_start..].find('\n')?;
+        line_start += newline + 1;
+    }
+    let line_end = text[line_start..]
+        .find('\n')
+        .map_or(text.len(), |offset| line_start + offset);
+    let line = &text[line_start..line_end];
+    let target = position.character as usize;
+    let mut utf16_units = 0usize;
+    for (byte, ch) in line.char_indices() {
+        if utf16_units == target {
+            return Some(line_start + byte);
+        }
+        utf16_units += ch.len_utf16();
+        if utf16_units > target {
+            return None;
+        }
+    }
+    (utf16_units == target).then_some(line_end)
 }
 
 async fn relation_overlay_state_on_open(uri: &Url, text: &str) -> RelationOverlayState {
@@ -322,6 +501,7 @@ pub(super) struct RequestContext {
 
 #[derive(Clone)]
 pub(super) struct CachePublishReport {
+    pub(super) semantic_generation: SemanticGeneration,
     pub(super) symbol_count: usize,
     pub(super) include_count: usize,
     pub(super) reference_file_count: usize,
@@ -339,6 +519,22 @@ impl CacheLedger {
         root: &PathBuf,
     ) -> Option<Arc<EngineSnapshot>> {
         self.engine_snapshots.lock().await.get(root).cloned()
+    }
+
+    pub(super) async fn remove_workspace_roots(&self, roots: &[PathBuf]) {
+        if roots.is_empty() {
+            return;
+        }
+        self.engine_snapshots
+            .lock()
+            .await
+            .retain(|root, _| !roots.contains(root));
+        self.relation_overlay_cache
+            .lock()
+            .await
+            .retain(|root, _| !roots.contains(root));
+        self.clear_all_completion_memos().await;
+        self.invalidate_references();
     }
 
     pub(in crate::server) fn allocate_engine_epoch(&self) -> state::EngineEpoch {
@@ -581,13 +777,30 @@ impl WorkspaceSession {
         self.cache.invalidate_relation_overlays().await;
     }
 
+    #[cfg(test)]
     pub(super) async fn change_document(&self, uri: Url, version: i32, text: String) {
         self.documents
             .change_document(uri.clone(), version, text)
             .await;
-        self.cache.clear_completion_memo(&uri).await;
         self.cache.invalidate_references();
         self.cache.invalidate_relation_overlays().await;
+    }
+
+    pub(super) async fn apply_document_changes(
+        &self,
+        uri: &Url,
+        version: i32,
+        changes: Vec<TextDocumentContentChangeEvent>,
+    ) -> bool {
+        let applied = self
+            .documents
+            .apply_document_changes(uri, version, changes)
+            .await;
+        if applied {
+            self.cache.invalidate_references();
+            self.cache.invalidate_relation_overlays().await;
+        }
+        applied
     }
 
     pub(super) async fn close_document(&self, uri: &Url) {

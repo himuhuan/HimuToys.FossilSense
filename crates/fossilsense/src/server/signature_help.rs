@@ -34,13 +34,12 @@ impl Backend {
         let current_rel = uri_to_path(&uri)
             .and_then(|path| pathing::relative_slash_path(&root, &path).ok())
             .unwrap_or_default();
-        let reach_scope = self.reach_scope_for(&uri).await.map(|(_, reach)| reach);
-        let project_context = self
-            .request_context_for_root(root.clone())
-            .await
-            .engine
-            .project_context
-            .clone();
+        let context = self.request_context_for_root(root.clone()).await;
+        let reach_scope = self
+            .reach_scope_from_context(&uri, &context)
+            .map(|(_, reach)| reach);
+        let project_context = context.engine.project_context.clone();
+        let semantic_generation = context.engine.semantic_generation.0;
         let active_argument = call.active_argument;
         let call_name = call.name;
         let limit = query::SIGNATURE_HELP_LIMIT;
@@ -51,8 +50,9 @@ impl Backend {
             if !db_path.exists() {
                 return Ok(Vec::new());
             }
-            let store = IndexStore::open_readonly(&db_path)?;
-            let records = store.symbol_read_view().symbols_by_name(&call_name)?;
+            let records = IndexStore::read_at_generation(&db_path, semantic_generation, |store| {
+                store.symbol_read_view().symbols_by_name(&call_name)
+            })?;
             let ranked = query::rank_function_signature_candidates(
                 records.clone(),
                 &current_rel,

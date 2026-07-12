@@ -60,6 +60,7 @@ const ROLE_CACHE_CAP: usize = 256;
 /// after the standard references request can reuse the same text hits without a
 /// second workspace discovery pass.
 const SEARCH_CACHE_CAP: usize = 32;
+const REFERENCE_SEARCH_CHUNK: usize = 32;
 
 /// A single text-level reference hit, annotated with its best-effort role.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -323,6 +324,7 @@ pub fn search_references_with_result_cache(
     )
 }
 
+#[cfg(test)]
 pub fn search_references_with_result_cache_and_files(
     root: impl AsRef<Path>,
     identifier: &str,
@@ -364,6 +366,15 @@ fn search_references_inner(
     cache: Option<&ReferenceRoleCache>,
     indexed_files: Option<Vec<(String, PathBuf)>>,
 ) -> Result<(Vec<ReferenceHit>, bool, ReferencesTiming)> {
+    search_references_inner_borrowed(root, identifier, cache, indexed_files.as_deref())
+}
+
+fn search_references_inner_borrowed(
+    root: impl AsRef<Path>,
+    identifier: &str,
+    cache: Option<&ReferenceRoleCache>,
+    indexed_files: Option<&[(String, PathBuf)]>,
+) -> Result<(Vec<ReferenceHit>, bool, ReferencesTiming)> {
     let root = root.as_ref().canonicalize().with_context(|| {
         format!(
             "failed to canonicalize workspace root {}",
@@ -382,48 +393,58 @@ fn search_references_inner(
 
     let (config, _config_issue) = WorkspaceConfig::load(&root);
     let discover_started = Instant::now();
+    let discovered;
     let candidates = match indexed_files {
         Some(files) if !files.is_empty() => files,
-        _ => discover_reference_files(&root, &config),
+        _ => {
+            discovered = discover_reference_files(&root, &config);
+            &discovered
+        }
     };
     let mut timing = ReferencesTiming {
         discover_ms: discover_started.elapsed().as_millis() as u64,
         ..Default::default()
     };
 
-    let file_results: Result<Vec<_>> = candidates
-        .par_iter()
-        .map(|(rel_path, path)| {
-            let mut file_hits = Vec::new();
-            let search_started = Instant::now();
-            search_file_references(&matcher, path, rel_path, &mut file_hits)?;
-            let search_elapsed = search_started.elapsed();
-
-            let mut classify_elapsed = Duration::ZERO;
-            let mut occurrence_count = 0usize;
-            if !file_hits.is_empty() {
-                let classify_started = Instant::now();
-                occurrence_count = classify_file_hits(path, &mut file_hits, cache);
-                classify_elapsed = classify_started.elapsed();
-            }
-
-            Ok((
-                file_hits,
-                search_elapsed,
-                classify_elapsed,
-                occurrence_count,
-            ))
-        })
-        .collect();
-
     let mut hits = Vec::new();
     let mut search_acc = Duration::ZERO;
     let mut classify_acc = Duration::ZERO;
-    for (mut file_hits, search_elapsed, classify_elapsed, occurrence_count) in file_results? {
-        search_acc += search_elapsed;
-        classify_acc += classify_elapsed;
-        timing.total_occurrences += occurrence_count as u64;
-        hits.append(&mut file_hits);
+    let mut truncated = false;
+    for candidate_chunk in candidates.chunks(REFERENCE_SEARCH_CHUNK) {
+        let file_results: Result<Vec<_>> = candidate_chunk
+            .par_iter()
+            .map(|(rel_path, path)| {
+                let mut file_hits = Vec::new();
+                let search_started = Instant::now();
+                search_file_references(&matcher, path, rel_path, &mut file_hits)?;
+                let search_elapsed = search_started.elapsed();
+
+                let mut classify_elapsed = Duration::ZERO;
+                let mut occurrence_count = 0usize;
+                if !file_hits.is_empty() {
+                    let classify_started = Instant::now();
+                    occurrence_count = classify_file_hits(path, &mut file_hits, cache);
+                    classify_elapsed = classify_started.elapsed();
+                }
+
+                Ok((
+                    file_hits,
+                    search_elapsed,
+                    classify_elapsed,
+                    occurrence_count,
+                ))
+            })
+            .collect();
+        for (mut file_hits, search_elapsed, classify_elapsed, occurrence_count) in file_results? {
+            search_acc += search_elapsed;
+            classify_acc += classify_elapsed;
+            timing.total_occurrences += occurrence_count as u64;
+            hits.append(&mut file_hits);
+        }
+        if hits.len() > REFERENCES_LIMIT {
+            truncated = true;
+            break;
+        }
     }
 
     timing.search_ms = search_acc.as_millis() as u64;
@@ -434,10 +455,48 @@ fn search_references_inner(
             .then(a.line.cmp(&b.line))
             .then(a.start_col_utf16.cmp(&b.start_col_utf16))
     });
-    let truncated = hits.len() > REFERENCES_LIMIT;
     hits.truncate(REFERENCES_LIMIT);
     timing.total_ms = total_started.elapsed().as_millis() as u64;
 
+    Ok((hits, truncated, timing))
+}
+
+pub fn search_references_with_shared_files(
+    root: impl AsRef<Path>,
+    identifier: &str,
+    role_cache: &ReferenceRoleCache,
+    search_cache: &ReferenceSearchCache,
+    generation: u64,
+    indexed_files: Option<Arc<Vec<(String, PathBuf)>>>,
+) -> Result<(Vec<ReferenceHit>, bool, ReferencesTiming)> {
+    let root = root.as_ref().canonicalize().with_context(|| {
+        format!(
+            "failed to canonicalize workspace root {}",
+            root.as_ref().display()
+        )
+    })?;
+    let key = SearchCacheKey {
+        root: pathing::normalize_abs_path(&root),
+        identifier: identifier.to_string(),
+        generation,
+    };
+    if let Some(cached) = search_cache.get(&key) {
+        return Ok((
+            cached.0,
+            cached.1,
+            ReferencesTiming {
+                cached: true,
+                ..Default::default()
+            },
+        ));
+    }
+    let (hits, truncated, timing) = search_references_inner_borrowed(
+        &root,
+        identifier,
+        Some(role_cache),
+        indexed_files.as_deref().map(Vec::as_slice),
+    )?;
+    search_cache.put(key, hits.clone(), truncated);
     Ok((hits, truncated, timing))
 }
 

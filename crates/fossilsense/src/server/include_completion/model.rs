@@ -5,13 +5,17 @@ use tower_lsp::lsp_types::CompletionItem;
 use crate::includes;
 use crate::store::views::{IncludeCompletionPathRow, IncludeEdgeRow};
 
-use super::{indexed_workspace_include_candidates, parent_slash, push_include_candidate};
+use super::{
+    indexed_workspace_include_candidates, parent_slash, push_include_candidate,
+    IndexedIncludeCandidate,
+};
 
 #[derive(Debug, Clone, Default)]
 pub(in crate::server) struct IncludeCompletionTable {
     workspace_paths: Vec<String>,
     basename_counts: HashMap<String, usize>,
     incoming_by_src_dir: HashMap<String, HashSet<String>>,
+    candidates_by_dir: HashMap<String, Vec<IndexedIncludeCandidate>>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -57,10 +61,12 @@ impl IncludeCompletionTable {
             let src_dir = parent_slash(&src).unwrap_or_default();
             incoming_by_src_dir.entry(src_dir).or_default().insert(dst);
         }
+        let candidates_by_dir = build_candidate_index(&workspace_paths);
         Self {
             workspace_paths,
             basename_counts,
             incoming_by_src_dir,
+            candidates_by_dir,
         }
     }
 
@@ -99,8 +105,13 @@ impl IncludeCompletionTable {
         seen: &mut HashSet<String>,
         scored: &mut Vec<(i32, String, CompletionItem)>,
     ) {
-        for path in &self.workspace_paths {
-            for candidate in indexed_workspace_include_candidates(path, dir_part, seg_lower) {
+        if let Some(candidates) = self.candidates_by_dir.get(dir_part) {
+            let start =
+                candidates.partition_point(|candidate| candidate.name_lower.as_str() < seg_lower);
+            for candidate in &candidates[start..] {
+                if !candidate.name_lower.starts_with(seg_lower) {
+                    break;
+                }
                 let (boost, signals) = self.ranking_boost(
                     &candidate.rel_path,
                     &candidate.name,
@@ -123,7 +134,14 @@ impl IncludeCompletionTable {
                     metrics.depth_penalty += 1;
                 }
                 let score = base_score + boost;
-                push_include_candidate(candidate.name, candidate.is_dir, score, seg, seen, scored);
+                push_include_candidate(
+                    candidate.name.clone(),
+                    candidate.is_dir,
+                    score,
+                    seg,
+                    seen,
+                    scored,
+                );
             }
         }
     }
@@ -173,6 +191,42 @@ impl IncludeCompletionTable {
         signals.depth_penalty = depth_penalty > 0;
         (boost.min(49), signals)
     }
+}
+
+fn build_candidate_index(
+    workspace_paths: &[String],
+) -> HashMap<String, Vec<IndexedIncludeCandidate>> {
+    let mut index: HashMap<String, Vec<IndexedIncludeCandidate>> = HashMap::new();
+    for path in workspace_paths {
+        index
+            .entry(String::new())
+            .or_default()
+            .extend(indexed_workspace_include_candidates(path, "", ""));
+        let components: Vec<&str> = path.split('/').collect();
+        for start in 0..components.len().saturating_sub(1) {
+            for end in (start + 1)..components.len() {
+                let dir = format!("{}/", components[start..end].join("/"));
+                index
+                    .entry(dir.clone())
+                    .or_default()
+                    .extend(indexed_workspace_include_candidates(path, &dir, ""));
+            }
+        }
+    }
+    for candidates in index.values_mut() {
+        candidates.sort_by(|left, right| {
+            left.name_lower
+                .cmp(&right.name_lower)
+                .then_with(|| left.rel_path.cmp(&right.rel_path))
+                .then_with(|| left.is_dir.cmp(&right.is_dir))
+        });
+        candidates.dedup_by(|left, right| {
+            left.name_lower == right.name_lower
+                && left.rel_path == right.rel_path
+                && left.is_dir == right.is_dir
+        });
+    }
+    index
 }
 
 #[derive(Debug, Clone, Default)]

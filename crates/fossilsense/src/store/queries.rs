@@ -102,7 +102,7 @@ impl IndexStore {
         let mut names: Vec<String> = self
             .members_for_records(record_ids, None, None)?
             .into_iter()
-            .filter(|member| member.kind == crate::parser::MemberKind::Field)
+            .filter(|member| member.kind == crate::semantic_model::MemberKind::Field)
             .map(|member| member.name)
             .collect();
         names.sort();

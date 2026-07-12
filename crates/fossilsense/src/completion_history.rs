@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -33,13 +34,14 @@ pub struct CompletionAcceptEvent {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CompletionHistorySnapshot {
-    entries: Vec<CompletionAcceptEvent>,
+    counts: HashMap<(u64, String, String, String), usize>,
+    total_accepts: usize,
 }
 
 impl CompletionHistorySnapshot {
     #[allow(dead_code)]
     pub fn total_accepts(&self) -> usize {
-        self.entries.len()
+        self.total_accepts
     }
 
     pub fn accept_count(
@@ -49,20 +51,23 @@ impl CompletionHistorySnapshot {
         intent: &str,
         prefix_bucket: &str,
     ) -> usize {
-        self.entries
-            .iter()
-            .filter(|entry| {
-                candidate_hash_key_from_hex(&entry.candidate_hash) == Some(candidate_key)
-                    && entry.kind == kind
-                    && entry.intent == intent
-                    && entry.prefix_bucket == prefix_bucket
-            })
-            .count()
+        self.counts
+            .get(&(
+                candidate_key,
+                kind.to_string(),
+                intent.to_string(),
+                prefix_bucket.to_string(),
+            ))
+            .copied()
+            .unwrap_or(0)
     }
 
     #[allow(dead_code)]
     pub(crate) fn append_from(&mut self, other: CompletionHistorySnapshot) {
-        self.entries.extend(other.entries);
+        self.total_accepts += other.total_accepts;
+        for (key, count) in other.counts {
+            *self.counts.entry(key).or_default() += count;
+        }
     }
 
     #[cfg(test)]
@@ -82,7 +87,22 @@ impl CompletionHistorySnapshot {
                 });
             }
         }
-        Self { entries }
+        Self::from_entries(entries)
+    }
+
+    fn from_entries(entries: Vec<CompletionAcceptEvent>) -> Self {
+        let mut snapshot = Self::default();
+        for entry in entries {
+            let Some(candidate_key) = candidate_hash_key_from_hex(&entry.candidate_hash) else {
+                continue;
+            };
+            *snapshot
+                .counts
+                .entry((candidate_key, entry.kind, entry.intent, entry.prefix_bucket))
+                .or_default() += 1;
+            snapshot.total_accepts += 1;
+        }
+        snapshot
     }
 }
 
@@ -105,6 +125,35 @@ impl Default for HistoryFile {
 pub struct CompletionHistoryStore {
     path: PathBuf,
     data: HistoryFile,
+}
+
+pub struct CompletionHistoryWrite {
+    path: PathBuf,
+    text: String,
+}
+
+impl CompletionHistoryWrite {
+    pub fn persist(self) -> Result<()> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create history dir {}", parent.display()))?;
+        }
+        let tmp_path = self.path.with_extension("json.tmp");
+        fs::write(&tmp_path, self.text)
+            .with_context(|| format!("failed to write history temp {}", tmp_path.display()))?;
+        if self.path.exists() {
+            fs::remove_file(&self.path)
+                .with_context(|| format!("failed to replace history {}", self.path.display()))?;
+        }
+        fs::rename(&tmp_path, &self.path).with_context(|| {
+            format!(
+                "failed to move history temp {} to {}",
+                tmp_path.display(),
+                self.path.display()
+            )
+        })?;
+        Ok(())
+    }
 }
 
 impl CompletionHistoryStore {
@@ -135,26 +184,33 @@ impl CompletionHistoryStore {
         }
     }
 
+    #[cfg(test)]
     pub fn record_accept(&mut self, event: CompletionAcceptEvent) -> Result<()> {
+        self.record_accept_deferred(event)?.persist()
+    }
+
+    pub fn record_accept_deferred(
+        &mut self,
+        event: CompletionAcceptEvent,
+    ) -> Result<CompletionHistoryWrite> {
         self.data.entries.push(event);
         self.data
             .entries
             .sort_by(|left, right| right.accepted_at.cmp(&left.accepted_at));
         self.data.entries.truncate(MAX_HISTORY_ENTRIES);
-        self.persist()
+        self.prepare_persist()
     }
 
     #[allow(dead_code)]
     pub fn snapshot(&self, workspace_hash: &str) -> CompletionHistorySnapshot {
-        CompletionHistorySnapshot {
-            entries: self
-                .data
+        CompletionHistorySnapshot::from_entries(
+            self.data
                 .entries
                 .iter()
                 .filter(|entry| entry.workspace_hash == workspace_hash)
                 .cloned()
                 .collect(),
-        }
+        )
     }
 
     #[allow(dead_code)]
@@ -164,39 +220,29 @@ impl CompletionHistoryStore {
             .entries
             .retain(|entry| entry.workspace_hash != workspace_hash);
         let removed = before - self.data.entries.len();
-        self.persist()?;
+        self.prepare_persist()?.persist()?;
         Ok(removed)
     }
 
+    #[cfg(test)]
     pub fn clear_all(&mut self) -> Result<usize> {
+        let (removed, write) = self.clear_all_deferred()?;
+        write.persist()?;
+        Ok(removed)
+    }
+
+    pub fn clear_all_deferred(&mut self) -> Result<(usize, CompletionHistoryWrite)> {
         let removed = self.data.entries.len();
         self.data.entries.clear();
-        self.persist()?;
-        Ok(removed)
+        Ok((removed, self.prepare_persist()?))
     }
 
-    fn persist(&self) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create history dir {}", parent.display()))?;
-        }
-
-        let tmp_path = self.path.with_extension("json.tmp");
+    fn prepare_persist(&self) -> Result<CompletionHistoryWrite> {
         let text = serde_json::to_string_pretty(&self.data).context("failed to encode history")?;
-        fs::write(&tmp_path, text)
-            .with_context(|| format!("failed to write history temp {}", tmp_path.display()))?;
-        if self.path.exists() {
-            fs::remove_file(&self.path)
-                .with_context(|| format!("failed to replace history {}", self.path.display()))?;
-        }
-        fs::rename(&tmp_path, &self.path).with_context(|| {
-            format!(
-                "failed to move history temp {} to {}",
-                tmp_path.display(),
-                self.path.display()
-            )
-        })?;
-        Ok(())
+        Ok(CompletionHistoryWrite {
+            path: self.path.clone(),
+            text,
+        })
     }
 }
 

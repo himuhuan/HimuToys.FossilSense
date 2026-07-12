@@ -13,20 +13,22 @@ use tower_lsp::lsp_types::{
     CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
     CallHierarchyServerCapability, Command, CompletionItem, CompletionItemKind, CompletionList,
     CompletionOptions, CompletionParams, CompletionResponse, DidChangeTextDocumentParams,
-    DidChangeWatchedFilesParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DidSaveTextDocumentParams, DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse,
-    Documentation, ExecuteCommandParams, GotoDefinitionParams, GotoDefinitionResponse, Hover,
-    HoverParams, HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams,
-    Location, MessageType, OneOf, ReferenceParams, SaveOptions, SemanticTokenType, SemanticTokens,
-    SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions, SemanticTokensParams,
-    SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult,
-    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SignatureHelp,
-    SignatureHelpParams, SymbolInformation, TextDocumentSyncCapability, TextDocumentSyncKind,
-    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, Url, WorkspaceFoldersServerCapabilities,
+    DidChangeWatchedFilesParams, DidChangeWorkspaceFoldersParams, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentSymbol, DocumentSymbolParams,
+    DocumentSymbolResponse, Documentation, ExecuteCommandParams, GotoDefinitionParams,
+    GotoDefinitionResponse, Hover, HoverParams, HoverProviderCapability, InitializeParams,
+    InitializeResult, InitializedParams, Location, MessageType, OneOf, ReferenceParams,
+    SaveOptions, SemanticTokenType, SemanticTokens, SemanticTokensFullOptions,
+    SemanticTokensLegend, SemanticTokensOptions, SemanticTokensParams, SemanticTokensRangeParams,
+    SemanticTokensRangeResult, SemanticTokensResult, SemanticTokensServerCapabilities,
+    ServerCapabilities, ServerInfo, SignatureHelp, SignatureHelpParams, SymbolInformation,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
+    TextDocumentSyncSaveOptions, Url, WorkspaceFoldersServerCapabilities,
     WorkspaceServerCapabilities, WorkspaceSymbolParams,
 };
 use tower_lsp::{async_trait, Client, LanguageServer, LspService, Server};
 
+use crate::call_model::SemanticGeneration;
 use crate::completion::ordinary_service::{
     OrdinaryCompletionDocumentationTarget, OrdinaryCompletionInput, OrdinaryCompletionItem,
     OrdinaryCompletionKind, OrdinaryCompletionNameTable,
@@ -104,6 +106,7 @@ enum CompletionDocumentationData {
         root: String,
         uri: String,
         symbol_id: i64,
+        semantic_generation: u64,
     },
     CurrentDocument {
         uri: String,
@@ -120,6 +123,7 @@ fn ordinary_completion_item_to_lsp(
     item: OrdinaryCompletionItem,
     uri: &Url,
     table_roots: &[PathBuf],
+    table_semantic_generations: &[SemanticGeneration],
 ) -> CompletionItem {
     let data = item.documentation_target.and_then(|target| {
         let target = match target {
@@ -130,6 +134,7 @@ fn ordinary_completion_item_to_lsp(
                 root: table_roots.get(table_index)?.to_string_lossy().into_owned(),
                 uri: uri.to_string(),
                 symbol_id,
+                semantic_generation: table_semantic_generations.get(table_index)?.0,
             },
             OrdinaryCompletionDocumentationTarget::CurrentDocument { start_line } => {
                 CompletionDocumentationData::CurrentDocument {
@@ -195,6 +200,7 @@ pub async fn run_stdio() -> Result<()> {
         scoping_enabled: AtomicBool::new(true),
         completion_history_mode: Arc::new(Mutex::new(CompletionHistoryMode::Auto)),
         completion_history: Arc::new(Mutex::new(HashMap::new())),
+        completion_history_write_gate: Arc::new(Mutex::new(())),
         project_context_selection: Arc::new(Mutex::new(ProjectContextSelection::Auto)),
         project_context_selection_epoch: AtomicU64::new(1),
         debug_candidate_reasons: AtomicBool::new(false),
@@ -230,6 +236,8 @@ struct Backend {
     /// Workspace-local completion history stores, keyed by their cache file
     /// path so multi-root workspaces remain separate on disk.
     completion_history: Arc<Mutex<HashMap<PathBuf, CompletionHistoryStore>>>,
+    /// Serializes atomic history-file replacements without holding the store map.
+    completion_history_write_gate: Arc<Mutex<()>>,
     /// User-selected completion project policy. The extension persists the
     /// choice; the server validates it against current immutable snapshots.
     project_context_selection: Arc<Mutex<ProjectContextSelection>>,
@@ -263,6 +271,16 @@ impl Backend {
         let current_dir = uri_to_path(uri).and_then(|p| p.parent().map(|d| d.to_path_buf()));
         let client_include_roots = self.include_paths.lock().await.clone();
         let workspace_root = self.root_for_uri(uri).await;
+        let semantic_generation = match &workspace_root {
+            Some(root) => Some(
+                self.request_context_for_root(root.clone())
+                    .await
+                    .engine
+                    .semantic_generation
+                    .0,
+            ),
+            None => None,
+        };
         let include_roots =
             configured_include_paths(workspace_root.as_deref(), &client_include_roots);
         let db_path = workspace_root
@@ -277,6 +295,7 @@ impl Backend {
                 workspace_root.as_deref(),
                 &include_roots,
                 db_path.as_deref(),
+                semantic_generation,
             )?;
             Ok(resolved
                 .iter()
@@ -314,15 +333,16 @@ impl Backend {
         let current_rel_dir = current_rel_path
             .as_deref()
             .and_then(|path| path.rsplit_once('/').map(|(dir, _)| dir.to_string()));
-        let include_table = match &workspace_root {
-            Some(root) => self
-                .request_context_for_root(root.clone())
-                .await
-                .engine
-                .include_table
-                .clone(),
+        let request_context = match &workspace_root {
+            Some(root) => Some(self.request_context_for_root(root.clone()).await),
             None => None,
         };
+        let include_table = request_context
+            .as_ref()
+            .and_then(|context| context.engine.include_table.clone());
+        let semantic_generation = request_context
+            .as_ref()
+            .map(|context| context.engine.semantic_generation.0);
         let include_roots =
             configured_include_paths(workspace_root.as_deref(), &client_include_roots);
         let db_path = workspace_root
@@ -347,6 +367,7 @@ impl Backend {
                     workspace_root.as_deref(),
                     &include_roots,
                     db_path.as_deref(),
+                    semantic_generation,
                     include_table.as_deref(),
                     Some(&external_cache),
                     current_rel_dir.as_deref(),
@@ -387,19 +408,19 @@ impl Backend {
     }
 
     /// Text of an open buffer, falling back to the file on disk.
-    async fn document_text(&self, uri: &Url) -> Option<String> {
+    async fn document_text(&self, uri: &Url) -> Option<Arc<str>> {
         self.document_snapshot(uri).await.map(|(_, text)| text)
     }
 
     /// Version + text of an open buffer, read under one lock so live-parse cache
     /// entries cannot pair an old text snapshot with a newer LSP version.
-    async fn document_snapshot(&self, uri: &Url) -> Option<(i32, String)> {
+    async fn document_snapshot(&self, uri: &Url) -> Option<(i32, Arc<str>)> {
         if let Some(snapshot) = self.session.documents.snapshot(uri).await {
             return Some((snapshot.version, snapshot.text));
         }
         uri_to_path(uri)
             .and_then(|path| std::fs::read_to_string(path).ok())
-            .map(|text| (0, text))
+            .map(|text| (0, Arc::from(text)))
     }
 
     async fn local_words_for(&self, uri: &Url, version: i32, text: &str) -> Arc<HashSet<String>> {
@@ -420,20 +441,47 @@ impl Backend {
         path: &Path,
         version: i32,
         text: &str,
+        requested_facts: parser::ParseFacts,
     ) -> Option<Arc<FileSemanticIndex>> {
         if version == 0 {
             let path_owned = path.to_path_buf();
             let text_owned = text.to_string();
             return tokio::task::spawn_blocking(move || {
-                Arc::new(parser::parse(&path_owned, &text_owned))
+                Arc::new(parser::parse_thread_local_with_facts(
+                    &path_owned,
+                    &text_owned,
+                    requested_facts,
+                ))
             })
             .await
             .ok();
         }
 
         // Fast path: cached entry with matching version.
-        if let Some(cached) = self.session.documents.cached_live_parse(uri, version).await {
+        if let Some(cached) = self
+            .session
+            .documents
+            .cached_live_parse(uri, version, requested_facts)
+            .await
+        {
             self.perf_log(|| format!("[perf] live_parse_cache hit {uri} (v{version})"))
+                .await;
+            return Some(cached);
+        }
+
+        // Coalesce concurrent semantic-token/completion/symbol requests for
+        // the same open document. The second waiter rechecks after acquiring
+        // the gate and reuses the first parse instead of duplicating all-facts
+        // parsing on the blocking pool.
+        let parse_gate = self.session.documents.live_parse_gate(uri).await;
+        let _parse_guard = parse_gate.lock().await;
+        if let Some(cached) = self
+            .session
+            .documents
+            .cached_live_parse(uri, version, requested_facts)
+            .await
+        {
+            self.perf_log(|| format!("[perf] live_parse_cache coalesced {uri} (v{version})"))
                 .await;
             return Some(cached);
         }
@@ -443,14 +491,35 @@ impl Backend {
             .await;
         let path_owned = path.to_path_buf();
         let text_owned = text.to_string();
-        let index =
-            tokio::task::spawn_blocking(move || Arc::new(parser::parse(&path_owned, &text_owned)))
-                .await
-                .ok()?;
+        let facts = self
+            .session
+            .documents
+            .cached_live_parse_facts(uri, version)
+            .await
+            | requested_facts;
+        let cancellation = self
+            .session
+            .documents
+            .live_parse_cancellation(uri, version)
+            .await;
+        let parse_cancellation = cancellation.clone();
+        let index = tokio::task::spawn_blocking(move || {
+            Arc::new(parser::parse_thread_local_with_facts_cancel(
+                &path_owned,
+                &text_owned,
+                facts,
+                &parse_cancellation,
+            ))
+        })
+        .await
+        .ok()?;
+        if cancellation.load(Ordering::Relaxed) {
+            return None;
+        }
 
         self.session
             .documents
-            .store_live_parse(uri.clone(), version, index.clone())
+            .store_live_parse(uri.clone(), version, facts, index.clone())
             .await;
         Some(index)
     }
@@ -606,42 +675,82 @@ impl Backend {
             return Ok(());
         };
         let history_path = pathing::default_completion_history_path(&root)?;
-        let mut stores = self.completion_history.lock().await;
-        if !stores.contains_key(&history_path) {
-            stores.insert(
-                history_path.clone(),
-                CompletionHistoryStore::open(&history_path)?,
-            );
+        if !self
+            .completion_history
+            .lock()
+            .await
+            .contains_key(&history_path)
+        {
+            let open_path = history_path.clone();
+            let opened =
+                tokio::task::spawn_blocking(move || CompletionHistoryStore::open(&open_path))
+                    .await??;
+            self.completion_history
+                .lock()
+                .await
+                .entry(history_path.clone())
+                .or_insert(opened);
         }
-        if let Some(store) = stores.get_mut(&history_path) {
-            store.record_accept(event)?;
-        }
+        let write = self
+            .completion_history
+            .lock()
+            .await
+            .get_mut(&history_path)
+            .expect("history store inserted")
+            .record_accept_deferred(event)?;
+        let _write_guard = self.completion_history_write_gate.lock().await;
+        tokio::task::spawn_blocking(move || write.persist()).await??;
         Ok(())
     }
 
     async fn clear_completion_history(&self) -> Result<usize> {
         let roots = self.workspace_roots.lock().await.clone();
-        let mut stores = self.completion_history.lock().await;
         let mut removed = 0usize;
+        let mut writes = Vec::new();
 
         if roots.is_empty() {
+            let mut stores = self.completion_history.lock().await;
             for store in stores.values_mut() {
-                removed += store.clear_all()?;
+                let (count, write) = store.clear_all_deferred()?;
+                removed += count;
+                writes.push(write);
             }
-            return Ok(removed);
+        } else {
+            for root in roots {
+                let history_path = pathing::default_completion_history_path(&root)?;
+                if !self
+                    .completion_history
+                    .lock()
+                    .await
+                    .contains_key(&history_path)
+                {
+                    let open_path = history_path.clone();
+                    let store = tokio::task::spawn_blocking(move || {
+                        CompletionHistoryStore::open(&open_path)
+                            .unwrap_or_else(|_| CompletionHistoryStore::empty(&open_path))
+                    })
+                    .await?;
+                    self.completion_history
+                        .lock()
+                        .await
+                        .entry(history_path.clone())
+                        .or_insert(store);
+                }
+                if let Some(store) = self.completion_history.lock().await.get_mut(&history_path) {
+                    let (count, write) = store.clear_all_deferred()?;
+                    removed += count;
+                    writes.push(write);
+                }
+            }
         }
-
-        for root in roots {
-            let history_path = pathing::default_completion_history_path(&root)?;
-            if !stores.contains_key(&history_path) {
-                let store = CompletionHistoryStore::open(&history_path)
-                    .unwrap_or_else(|_| CompletionHistoryStore::empty(&history_path));
-                stores.insert(history_path.clone(), store);
+        let _write_guard = self.completion_history_write_gate.lock().await;
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            for write in writes {
+                write.persist()?;
             }
-            if let Some(store) = stores.get_mut(&history_path) {
-                removed += store.clear_all()?;
-            }
-        }
+            Ok(())
+        })
+        .await??;
         Ok(removed)
     }
 

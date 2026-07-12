@@ -41,7 +41,8 @@ fn staged_file_revision_is_invisible_until_manifest_flip() {
     let published = store
         .commit_index_build(build, &IncludeGraphUpdate::default())
         .unwrap();
-    assert_eq!(published, 2);
+    assert_eq!(published.generation, 2);
+    assert!(published.cleanup_warning.is_none());
     assert!(store.symbols_by_name("old_name").unwrap().is_empty());
     assert!(store.symbols_by_name("new_name").unwrap().len() == 1);
 }
@@ -99,6 +100,39 @@ fn sqlite_reader_keeps_one_active_generation_across_publish() {
     assert_eq!((old_after_publish, new_after_publish), (1, 0));
     transaction.commit().unwrap();
     assert_eq!(writer.symbols_by_name("after").unwrap().len(), 1);
+}
+
+#[test]
+fn request_generation_guard_rejects_a_newer_active_manifest() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("index.sqlite");
+    let mut store = IndexStore::open(&db, dir.path()).unwrap();
+    upsert_source(&mut store, "main.c", "int before(void);\n");
+    let captured_generation = store.semantic_generation().unwrap();
+
+    let source = "int after(void);\n";
+    let parsed = parse(std::path::Path::new("main.c"), source);
+    let fp = fingerprint("main.c", source, 2);
+    let build = store.begin_index_build(false).unwrap();
+    store
+        .stage_file_updates(
+            build,
+            &[FileIndexUpdate {
+                fingerprint: &fp,
+                source: FileSource::Workspace,
+                payload: FileIndexPayload::Ok(&parsed),
+            }],
+        )
+        .unwrap();
+    store
+        .commit_index_build(build, &IncludeGraphUpdate::default())
+        .unwrap();
+
+    let error = IndexStore::read_at_generation(&db, captured_generation, |reader| {
+        reader.symbols_by_name("after")
+    })
+    .expect_err("a request snapshot must not mix with a newer database generation");
+    assert!(error.to_string().contains("generation"));
 }
 
 #[test]
@@ -184,4 +218,52 @@ fn semantic_read_guard_rejects_a_mismatched_snapshot_generation() {
 
     let error = reader.begin_semantic_read(Some(9)).err().unwrap();
     assert!(error.to_string().contains("semantic generation mismatch"));
+}
+
+#[test]
+fn cleanup_failure_does_not_turn_a_committed_generation_into_failure() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("index.sqlite");
+    let mut store = IndexStore::open(&db, dir.path()).unwrap();
+    upsert_source(&mut store, "main.c", "int before_cleanup(void);\n");
+
+    // Fail only the post-commit inactive-revision deletion. The generation
+    // transaction itself does not delete from file_revisions.
+    store
+        .conn
+        .execute_batch(
+            "CREATE TRIGGER fail_inactive_revision_cleanup
+             BEFORE DELETE ON file_revisions
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected cleanup failure');
+             END;",
+        )
+        .unwrap();
+
+    let source = "int after_cleanup(void);\n";
+    let parsed = parse(std::path::Path::new("main.c"), source);
+    let fp = fingerprint("main.c", source, 2);
+    let build = store.begin_index_build(false).unwrap();
+    store
+        .stage_file_updates(
+            build,
+            &[FileIndexUpdate {
+                fingerprint: &fp,
+                source: FileSource::Workspace,
+                payload: FileIndexPayload::Ok(&parsed),
+            }],
+        )
+        .unwrap();
+
+    let outcome = store
+        .commit_index_build(build, &IncludeGraphUpdate::default())
+        .unwrap();
+    assert_eq!(outcome.generation, 2);
+    assert!(outcome
+        .cleanup_warning
+        .as_deref()
+        .is_some_and(|warning| warning.contains("injected cleanup failure")));
+    assert_eq!(store.semantic_generation().unwrap(), 2);
+    assert!(store.symbols_by_name("before_cleanup").unwrap().is_empty());
+    assert_eq!(store.symbols_by_name("after_cleanup").unwrap().len(), 1);
 }

@@ -3,7 +3,10 @@ use std::collections::HashSet;
 use anyhow::Result;
 use rusqlite::OptionalExtension;
 
-use super::{now_unix_secs, IncludeGraphUpdate, IndexBuild, IndexStore, SemanticReadGuard};
+use super::{
+    now_unix_secs, IncludeGraphUpdate, IndexBuild, IndexCommitOutcome, IndexStore,
+    SemanticReadGuard,
+};
 
 impl IndexStore {
     pub fn begin_index_build(&mut self, full_rebuild: bool) -> Result<IndexBuild> {
@@ -107,7 +110,7 @@ impl IndexStore {
         &mut self,
         build: IndexBuild,
         include_graph: &IncludeGraphUpdate,
-    ) -> Result<u64> {
+    ) -> Result<IndexCommitOutcome> {
         let tx = self.conn.transaction()?;
         let state: String = tx.query_row(
             "SELECT state FROM index_builds WHERE id = ?1 AND target_generation = ?2",
@@ -224,8 +227,14 @@ impl IndexStore {
             [build.id],
         )?;
         tx.commit()?;
-        self.collect_inactive_revisions()?;
-        Ok(build.target_generation)
+        let cleanup_warning = self
+            .collect_inactive_revisions()
+            .err()
+            .map(|error| format!("post-publication cleanup failed: {error:#}"));
+        Ok(IndexCommitOutcome {
+            generation: build.target_generation,
+            cleanup_warning,
+        })
     }
 
     fn collect_inactive_revisions(&mut self) -> Result<()> {

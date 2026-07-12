@@ -173,7 +173,9 @@ pub fn index_workspace(
     // derive the first-layer `directly_included` flag in the same pass.
     let include_edge_started = Instant::now();
     let include_graph = build_include_edges(&store, build, &include_roots, None)?;
-    stats.semantic_generation = store.commit_index_build(build, &include_graph)?;
+    let commit = store.commit_index_build(build, &include_graph)?;
+    stats.semantic_generation = commit.generation;
+    stats.maintenance_warning = commit.cleanup_warning;
     stats.include_edge_ms = include_edge_started.elapsed().as_millis();
     stats.symbols = store.symbol_count()?;
     let call_coverage = store.call_fact_view().coverage()?;
@@ -307,7 +309,9 @@ pub fn index_dirty_files(
         sql_affected_include_edge_sources(&store, &roots_slash, &upsert_rels, &changed_rels)?;
     stats.include_edge_sources_rebuilt = affected_rels.clone();
     let include_graph = build_include_edges(&store, build, &include_roots, Some(&affected_rels))?;
-    stats.semantic_generation = store.commit_index_build(build, &include_graph)?;
+    let commit = store.commit_index_build(build, &include_graph)?;
+    stats.semantic_generation = commit.generation;
+    stats.maintenance_warning = commit.cleanup_warning;
     stats.include_edge_ms = include_edge_started.elapsed().as_millis();
     stats.symbols = store.symbol_count()?;
     let call_coverage = store.call_fact_view().coverage()?;

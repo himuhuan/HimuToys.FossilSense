@@ -290,6 +290,14 @@ function checkCoreDirection(findings, relPath, text) {
     });
   }
 
+  if (isModule(relPath, "semantic_model")) {
+    directionRules.push({
+      owner: "semantic_model",
+      forbidden: ["parser", "store", "server", "indexer"],
+      detail: "semantic_model must remain a parser- and persistence-neutral domain leaf",
+    });
+  }
+
   if (isModule(relPath, "call_model")) {
     directionRules.push({
       owner: "call_model",
@@ -319,8 +327,8 @@ function checkCoreDirection(findings, relPath, text) {
   if (isModule(relPath, "store")) {
     directionRules.push({
       owner: "store",
-      forbidden: ["server"],
-      detail: "store must not depend on server handler details",
+      forbidden: ["parser", "server"],
+      detail: "store must depend on semantic_model ports, not parser or server details",
     });
   }
 
@@ -433,7 +441,9 @@ function collectFindings(root, options = {}) {
       );
     }
 
-    checkCoreDirection(findings, relPath, text);
+    if (!isTestSource(relPath)) {
+      checkCoreDirection(findings, relPath, text);
+    }
   }
 
   applyAllowlist(findings, options.allowlist);

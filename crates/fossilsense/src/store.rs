@@ -5,7 +5,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
-use crate::parser::{FileSemanticIndex, SymbolKind, SymbolRole};
+use crate::semantic_model::{
+    MemberConfidence, MemberKind, PersistentFacts, RecordConfidence, RecordKind, SymbolKind,
+    SymbolRole,
+};
 
 mod generations;
 mod includes;
@@ -75,8 +78,20 @@ pub struct StoredFile {
     pub hash: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct PersistenceDiagnostics {
+    pub fact_mask: u8,
+    pub parse_error_count: usize,
+    pub fallback_used: bool,
+}
+
+pub trait PersistableFileIndex: Sync {
+    fn persistent_facts(&self) -> PersistentFacts<'_>;
+    fn persistence_diagnostics(&self) -> PersistenceDiagnostics;
+}
+
 pub enum FileIndexPayload<'a> {
-    Ok(&'a FileSemanticIndex),
+    Ok(&'a dyn PersistableFileIndex),
     Error(&'a str),
 }
 
@@ -96,6 +111,18 @@ pub struct IndexBuild {
     pub id: i64,
     pub target_generation: u64,
     pub full_rebuild: bool,
+}
+
+/// Outcome of publishing one staged index generation.
+///
+/// Once `generation` is returned, the active manifest has already been
+/// committed and must be treated as published. Post-publication cleanup is a
+/// best-effort maintenance step: its failure is surfaced separately so callers
+/// can warn without reporting the committed generation as failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexCommitOutcome {
+    pub generation: u64,
+    pub cleanup_warning: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -194,6 +221,25 @@ impl IndexStore {
             conn,
             legacy_full_build: None,
         })
+    }
+
+    /// Execute one durable read inside a SQLite snapshot pinned to the semantic
+    /// generation captured by the request's engine snapshot.
+    ///
+    /// A generation mismatch is deliberately an error: returning rows from a
+    /// newer active manifest together with an older in-memory reach/name model
+    /// would expose a mixed request generation. Callers may recapture a newer
+    /// request snapshot and retry, but must not silently drop the check.
+    pub fn read_at_generation<T>(
+        path: &Path,
+        expected_generation: u64,
+        read: impl FnOnce(&IndexStore) -> Result<T>,
+    ) -> Result<T> {
+        let store = Self::open_readonly(path)?;
+        let guard = store.begin_semantic_read(Some(expected_generation))?;
+        let value = read(guard.store())?;
+        guard.finish()?;
+        Ok(value)
     }
 
     /// Reachability-scoped variant of [`kind_counts_by_names`]: only definitions
@@ -355,30 +401,6 @@ impl IndexStore {
         }
 
         Ok(files)
-    }
-
-    /// Workspace-source convenience wrapper, used by tests and any caller that
-    /// does not distinguish sources.
-    #[allow(dead_code)]
-    pub fn upsert_file_index(
-        &mut self,
-        fingerprint: &FileFingerprint,
-        index: &FileSemanticIndex,
-    ) -> Result<()> {
-        self.upsert_file_index_with_source(fingerprint, index, FileSource::Workspace)
-    }
-
-    pub fn upsert_file_index_with_source(
-        &mut self,
-        fingerprint: &FileFingerprint,
-        index: &FileSemanticIndex,
-        source: FileSource,
-    ) -> Result<()> {
-        self.apply_file_updates(&[FileIndexUpdate {
-            fingerprint,
-            source,
-            payload: FileIndexPayload::Ok(index),
-        }])
     }
 
     #[allow(dead_code)]
@@ -601,36 +623,36 @@ fn symbol_kind(kind: SymbolKind) -> &'static str {
     }
 }
 
-fn record_kind_to_str(k: crate::parser::RecordKind) -> &'static str {
+fn record_kind_to_str(k: RecordKind) -> &'static str {
     match k {
-        crate::parser::RecordKind::Struct => "struct",
-        crate::parser::RecordKind::Union => "union",
-        crate::parser::RecordKind::Class => "class",
+        RecordKind::Struct => "struct",
+        RecordKind::Union => "union",
+        RecordKind::Class => "class",
     }
 }
 
-fn record_kind_from_str(s: &str) -> Option<crate::parser::RecordKind> {
+fn record_kind_from_str(s: &str) -> Option<RecordKind> {
     match s {
-        "struct" => Some(crate::parser::RecordKind::Struct),
-        "union" => Some(crate::parser::RecordKind::Union),
-        "class" => Some(crate::parser::RecordKind::Class),
+        "struct" => Some(RecordKind::Struct),
+        "union" => Some(RecordKind::Union),
+        "class" => Some(RecordKind::Class),
         _ => None,
     }
 }
 
-fn record_confidence_to_str(c: crate::parser::RecordConfidence) -> &'static str {
+fn record_confidence_to_str(c: RecordConfidence) -> &'static str {
     match c {
-        crate::parser::RecordConfidence::NamedTag => "named_tag",
-        crate::parser::RecordConfidence::AnonymousTypedef => "anonymous_typedef",
-        crate::parser::RecordConfidence::Heuristic => "heuristic",
+        RecordConfidence::NamedTag => "named_tag",
+        RecordConfidence::AnonymousTypedef => "anonymous_typedef",
+        RecordConfidence::Heuristic => "heuristic",
     }
 }
 
-fn member_kind_to_str(k: crate::parser::MemberKind) -> &'static str {
+fn member_kind_to_str(k: MemberKind) -> &'static str {
     k.as_str()
 }
 
-fn member_confidence_to_str(c: crate::parser::MemberConfidence) -> &'static str {
+fn member_confidence_to_str(c: MemberConfidence) -> &'static str {
     c.as_str()
 }
 

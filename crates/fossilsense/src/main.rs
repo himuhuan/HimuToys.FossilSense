@@ -18,8 +18,10 @@ mod reachability;
 mod references;
 mod resolver;
 mod scanner;
+mod semantic_model;
 mod server;
 mod store;
+mod store_parser_adapter;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -182,6 +184,9 @@ async fn main() -> Result<()> {
             println!("include_edge_ms: {}", stats.include_edge_ms);
             println!("name_table_ms: {}", stats.name_table_ms);
             println!("reach_graph_ms: {}", stats.reach_graph_ms);
+            if let Some(warning) = &stats.maintenance_warning {
+                eprintln!("warning: {warning}");
+            }
             Ok(())
         }
         Command::Scan { workspace } => {

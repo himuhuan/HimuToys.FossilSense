@@ -48,11 +48,7 @@ impl IndexStore {
         build: IndexBuild,
         only: Option<&[i64]>,
     ) -> Result<Vec<(i64, String)>> {
-        let mut allowed = std::collections::HashSet::new();
-        if let Some(ids) = only {
-            allowed.extend(ids.iter().copied());
-        }
-        let sql = if build.full_rebuild {
+        let base_sql = if build.full_rebuild {
             "SELECT i.file_id, i.target_text
              FROM include_facts i
              JOIN pending_file_revisions p
@@ -72,18 +68,24 @@ impl IndexStore {
              SELECT i.file_id, i.target_text FROM include_facts i
              JOIN effective e ON e.file_id = i.file_id AND e.revision_id = i.revision_id"
         };
-        let mut stmt = self.conn.prepare(sql)?;
-        let rows = stmt.query_map([build.id], |row| {
+        let restriction = only
+            .filter(|ids| !ids.is_empty())
+            .map(|ids| format!(" AND i.file_id IN ({})", vec!["?"; ids.len()].join(",")))
+            .unwrap_or_default();
+        if only.is_some_and(|ids| ids.is_empty()) {
+            return Ok(Vec::new());
+        }
+        let sql = format!("{base_sql}{restriction}");
+        let mut parameters = vec![build.id];
+        if let Some(ids) = only {
+            parameters.extend_from_slice(ids);
+        }
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(parameters), |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let row = row?;
-            if only.is_none() || allowed.contains(&row.0) {
-                out.push(row);
-            }
-        }
-        Ok(out)
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     /// Reset the first-layer flag on every external file, then set it on the

@@ -73,7 +73,7 @@ impl LanguageServer for Backend {
                 text_document_sync: Some(TextDocumentSyncCapability::Options(
                     TextDocumentSyncOptions {
                         open_close: Some(true),
-                        change: Some(TextDocumentSyncKind::FULL),
+                        change: Some(TextDocumentSyncKind::INCREMENTAL),
                         save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
                             include_text: Some(false),
                         })),
@@ -172,15 +172,18 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
-        // FULL text sync: the final change carries the entire document.
-        if let Some(change) = params.content_changes.into_iter().next_back() {
-            self.session
-                .change_document(
-                    params.text_document.uri.clone(),
-                    params.text_document.version,
-                    change.text,
+        let uri = params.text_document.uri;
+        if !self
+            .session
+            .apply_document_changes(&uri, params.text_document.version, params.content_changes)
+            .await
+        {
+            self.client
+                .log_message(
+                    MessageType::WARNING,
+                    format!("ignored invalid incremental document change for {uri}"),
                 )
-                .await
+                .await;
         }
     }
 
@@ -223,7 +226,7 @@ impl LanguageServer for Backend {
             .unwrap_or_default();
         let live_records = match uri_to_path(&uri) {
             Some(path) if !current_rel.is_empty() => self
-                .get_or_parse_document(&uri, &path, version, &text)
+                .get_or_parse_document(&uri, &path, version, &text, parser::ParseFacts::MEMBER)
                 .await
                 .map(|index| live_definition_records_for_word(&index, &word, &current_rel))
                 .unwrap_or_default(),
@@ -248,14 +251,12 @@ impl LanguageServer for Backend {
         // the R1 "open scope does not bury unreachable" softening as a tier).
         // `None` when scoping is disabled or no graph exists yet — non-current
         // workspace files then fall back to `Global`.
-        let reach_scope: Option<Arc<reachability::ReachScope>> =
-            self.reach_scope_for(&uri).await.map(|(_, reach)| reach);
-        let project_context = self
-            .request_context_for_root(root.clone())
-            .await
-            .engine
-            .project_context
-            .clone();
+        let context = self.request_context_for_root(root.clone()).await;
+        let reach_scope: Option<Arc<reachability::ReachScope>> = self
+            .reach_scope_from_context(&uri, &context)
+            .map(|(_, reach)| reach);
+        let project_context = context.engine.project_context.clone();
+        let semantic_generation = context.engine.semantic_generation.0;
 
         // Debug-gated candidate-reason logging (default off): when on, each
         // returned candidate's tier/confidence/reason is logged to the output
@@ -271,8 +272,10 @@ impl LanguageServer for Backend {
                 let mut records = live_records;
                 let db_path = pathing::default_index_path(&root)?;
                 if db_path.exists() {
-                    let store = IndexStore::open_readonly(&db_path)?;
-                    let mut indexed_records = store.symbol_read_view().symbols_by_name(&word)?;
+                    let mut indexed_records =
+                        IndexStore::read_at_generation(&db_path, semantic_generation, |store| {
+                            store.symbol_read_view().symbols_by_name(&word)
+                        })?;
                     if live_records_replace_current_file {
                         indexed_records.retain(|record| record.path != current_rel);
                     }
@@ -343,15 +346,11 @@ impl LanguageServer for Backend {
         let search_cache = self.session.cache.reference_search_cache.clone();
         let context = self.request_context_for_root(root.clone()).await;
         let indexed_generation = context.engine.epoch.as_u64();
-        let indexed_files = context
-            .engine
-            .indexed_files
-            .as_ref()
-            .map(|files| (**files).clone());
+        let indexed_files = context.engine.indexed_files.clone();
         let result = tokio::task::spawn_blocking(
             move || -> Result<(Vec<Location>, bool, references::ReferencesTiming)> {
                 let (mut hits, truncated, timing) =
-                    references::search_references_with_result_cache_and_files(
+                    references::search_references_with_shared_files(
                         &root,
                         &search_word,
                         &role_cache,
@@ -410,13 +409,17 @@ impl LanguageServer for Backend {
         &self,
         params: WorkspaceSymbolParams,
     ) -> LspResult<Option<Vec<SymbolInformation>>> {
-        let tables: Vec<(PathBuf, Arc<NameTable>)> = {
+        let tables: Vec<(PathBuf, u64, Arc<NameTable>)> = {
             let roots = self.workspace_roots.lock().await.clone();
             let mut tables = Vec::new();
             for root in roots {
                 let context = self.request_context_for_root(root).await;
                 if let Some(table) = context.engine.name_table.clone() {
-                    tables.push((context.engine.root.clone(), table));
+                    tables.push((
+                        context.engine.root.clone(),
+                        context.engine.semantic_generation.0,
+                        table,
+                    ));
                 }
             }
             tables
@@ -428,16 +431,16 @@ impl LanguageServer for Backend {
         let query_text = params.query;
         let result = tokio::task::spawn_blocking(move || -> Result<Vec<SymbolInformation>> {
             let mut hits = Vec::new();
-            for (root_index, (root, table)) in tables.iter().enumerate() {
+            for (root_index, (_, _, table)) in tables.iter().enumerate() {
                 for hit in table.search_ranked(&query_text, query::WORKSPACE_SYMBOL_LIMIT) {
-                    hits.push((root_index, root.clone(), hit));
+                    hits.push((root_index, hit));
                 }
             }
             hits.sort_by(|a, b| {
-                b.2.score
-                    .cmp(&a.2.score)
-                    .then(a.2.name_len.cmp(&b.2.name_len))
-                    .then_with(|| a.2.name.cmp(&b.2.name))
+                b.1.score
+                    .cmp(&a.1.score)
+                    .then(a.1.name_len.cmp(&b.1.name_len))
+                    .then_with(|| a.1.name.cmp(&b.1.name))
                     .then(a.0.cmp(&b.0))
             });
             hits.truncate(query::WORKSPACE_SYMBOL_LIMIT);
@@ -447,28 +450,32 @@ impl LanguageServer for Backend {
             }
 
             let mut records_by_root_and_id = HashMap::new();
-            let mut ids_by_root: HashMap<PathBuf, Vec<i64>> = HashMap::new();
-            for (_, root, hit) in &hits {
-                ids_by_root.entry(root.clone()).or_default().push(hit.id);
+            let mut ids_by_root: HashMap<usize, Vec<i64>> = HashMap::new();
+            for (root_index, hit) in &hits {
+                ids_by_root.entry(*root_index).or_default().push(hit.id);
             }
 
-            for (root, ids) in ids_by_root {
-                let db_path = pathing::default_index_path(&root)?;
+            for (root_index, ids) in ids_by_root {
+                let (root, generation, _) = &tables[root_index];
+                let db_path = pathing::default_index_path(root)?;
                 if !db_path.exists() {
                     continue;
                 }
-                let store = IndexStore::open_readonly(&db_path)?;
-                for record in store.symbol_read_view().symbols_by_ids(&ids)? {
-                    records_by_root_and_id.insert((root.clone(), record.id), record);
+                let records = IndexStore::read_at_generation(&db_path, *generation, |store| {
+                    store.symbol_read_view().symbols_by_ids(&ids)
+                })?;
+                for record in records {
+                    records_by_root_and_id.insert((root_index, record.id), record);
                 }
             }
 
             Ok(hits
                 .into_iter()
-                .filter_map(|(_, root, hit)| {
+                .filter_map(|(root_index, hit)| {
+                    let root = &tables[root_index].0;
                     records_by_root_and_id
-                        .get(&(root.clone(), hit.id))
-                        .and_then(|record| record_to_symbol_information(&root, record))
+                        .get(&(root_index, hit.id))
+                        .and_then(|record| record_to_symbol_information(root, record))
                 })
                 .collect())
         })
@@ -493,7 +500,13 @@ impl LanguageServer for Backend {
         // Live parse served from the in-memory cache (one parse per document
         // version, shared across semantic tokens, completion, and symbols).
         let index = self
-            .get_or_parse_document(&uri, &path, version, &text)
+            .get_or_parse_document(
+                &uri,
+                &path,
+                version,
+                &text,
+                parser::ParseFacts::SYMBOLS | parser::ParseFacts::INCLUDES,
+            )
             .await;
         let Some(index) = index else {
             return Ok(None);
@@ -575,8 +588,14 @@ impl LanguageServer for Backend {
 
         let parsed_document = match uri_to_path(&uri) {
             Some(path) => {
-                self.get_or_parse_document(&uri, &path, version, &text)
-                    .await
+                self.get_or_parse_document(
+                    &uri,
+                    &path,
+                    version,
+                    &text,
+                    parser::ParseFacts::COMPLETION,
+                )
+                .await
             }
             None => None,
         };
@@ -592,11 +611,13 @@ impl LanguageServer for Backend {
         };
         let mut tables = Vec::new();
         let mut table_roots = Vec::new();
+        let mut table_semantic_generations = Vec::new();
         let mut table_generations = Vec::new();
         for context in &contexts {
             if let Some(table) = context.engine.name_table.clone() {
                 table_generations.push((context.engine.root.clone(), context.engine.epoch));
                 table_roots.push(context.engine.root.clone());
+                table_semantic_generations.push(context.engine.semantic_generation);
                 tables.push(OrdinaryCompletionNameTable { table });
             }
         }
@@ -679,8 +700,12 @@ impl LanguageServer for Backend {
                     .into_iter()
                     .map(|ordinary_item| {
                         let evidence = ordinary_item.evidence;
-                        let mut item =
-                            ordinary_completion_item_to_lsp(ordinary_item, &uri, &table_roots);
+                        let mut item = ordinary_completion_item_to_lsp(
+                            ordinary_item,
+                            &uri,
+                            &table_roots,
+                            &table_semantic_generations,
+                        );
                         if history_enabled {
                             if let Some(workspace_hash) = history_workspace_hash.as_deref() {
                                 attach_completion_history_accept_command(
@@ -842,6 +867,59 @@ impl LanguageServer for Backend {
         }
     }
 
+    async fn did_change_workspace_folders(&self, params: DidChangeWorkspaceFoldersParams) {
+        let removed: Vec<PathBuf> = params
+            .event
+            .removed
+            .iter()
+            .filter_map(|folder| uri_to_path(&folder.uri))
+            .collect();
+        let added: Vec<PathBuf> = params
+            .event
+            .added
+            .iter()
+            .filter_map(|folder| uri_to_path(&folder.uri))
+            .collect();
+
+        {
+            let mut roots = self.workspace_roots.lock().await;
+            roots.retain(|root| !removed.contains(root));
+            roots.extend(added.iter().cloned());
+            roots.sort();
+            roots.dedup();
+        }
+        if !removed.is_empty() {
+            self.session.cache.remove_workspace_roots(&removed).await;
+            self.config_cache
+                .lock()
+                .await
+                .retain(|root, _| !removed.contains(root));
+            let removed_history_paths: Vec<PathBuf> = removed
+                .iter()
+                .filter_map(|root| pathing::default_completion_history_path(root).ok())
+                .collect();
+            self.completion_history
+                .lock()
+                .await
+                .retain(|path, _| !removed_history_paths.contains(path));
+        }
+        if !added.is_empty() {
+            self.spawn_index_roots(None).await;
+        }
+
+        self.client
+            .log_message(
+                MessageType::INFO,
+                format!(
+                    "workspace folders updated: added={}, removed={}, active={}",
+                    added.len(),
+                    removed.len(),
+                    self.workspace_roots.lock().await.len()
+                ),
+            )
+            .await;
+    }
+
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
         let uri = params.text_document.uri;
         if let Some(root) = self.root_for_uri(&uri).await {
@@ -912,18 +990,14 @@ impl LanguageServer for Backend {
             let search_cache = self.session.cache.reference_search_cache.clone();
             let context = self.request_context_for_root(root.clone()).await;
             let indexed_generation = context.engine.epoch.as_u64();
-            let indexed_files = context
-                .engine
-                .indexed_files
-                .as_ref()
-                .map(|files| (**files).clone());
+            let indexed_files = context.engine.indexed_files.clone();
             let result = tokio::task::spawn_blocking(
                 move || -> Result<(Vec<GroupedReferenceItem>, bool, references::ReferencesTiming)> {
                     // Reuses the full search-result cache shared with standard
                     // references; on a cache hit this does not redo discovery or
                     // the text-search pass.
                     let (mut hits, truncated, timing) =
-                        references::search_references_with_result_cache_and_files(
+                        references::search_references_with_shared_files(
                             &root,
                             &word,
                             &role_cache,
