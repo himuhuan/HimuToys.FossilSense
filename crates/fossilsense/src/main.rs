@@ -311,6 +311,7 @@ fn run_query(kind: QueryCommand) -> Result<()> {
             let view = store.call_fact_view();
             let catalog = call_catalog::RelationCatalog::build_from_view(&view)?;
             let catalog_stats = catalog.stats();
+            let catalog_metrics = catalog.build_metrics();
             let catalog_ms = build_started.elapsed().as_millis();
             let rel = pathing::normalize_path_string(&file);
             let position = call_model::SourcePosition {
@@ -363,6 +364,23 @@ fn run_query(kind: QueryCommand) -> Result<()> {
                 catalog_stats.relation_call_site_refs
             );
             println!("catalog_build_ms: {catalog_ms}");
+            println!(
+                "catalog_load_anchors_ms: {}",
+                catalog_metrics.load_anchors_ms
+            );
+            println!(
+                "catalog_load_call_sites_ms: {}",
+                catalog_metrics.load_call_sites_ms
+            );
+            println!(
+                "catalog_group_entities_ms: {}",
+                catalog_metrics.group_entities_ms
+            );
+            println!(
+                "catalog_resolve_relations_ms: {}",
+                catalog_metrics.resolve_relations_ms
+            );
+            println!("catalog_finalize_ms: {}", catalog_metrics.finalize_ms);
             println!("query_us: {query_us}");
             println!("coverage: {}", serde_json::to_string(catalog.coverage())?);
             for relation in relations {

@@ -2,6 +2,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use anyhow::Result;
 
@@ -34,6 +35,15 @@ pub struct RelationCatalogStats {
     pub relation_call_site_refs: usize,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RelationCatalogBuildMetrics {
+    pub load_anchors_ms: u128,
+    pub load_call_sites_ms: u128,
+    pub group_entities_ms: u128,
+    pub resolve_relations_ms: u128,
+    pub finalize_ms: u128,
+}
+
 #[derive(Debug)]
 pub struct RelationPage {
     pub relations: Vec<CallRelation>,
@@ -55,6 +65,7 @@ pub struct RelationCatalog {
     outgoing: HashMap<EntityId, Vec<RelationId>>,
     incoming: HashMap<EntityId, Vec<RelationId>>,
     coverage: CoverageSummary,
+    build_metrics: RelationCatalogBuildMetrics,
 }
 
 impl RelationCatalog {
@@ -93,18 +104,22 @@ impl RelationCatalog {
 
     pub fn build_from_view(view: &CallFactStoreView<'_>) -> Result<Self> {
         let coverage = view.coverage()?;
+        let anchor_started = Instant::now();
         let mut anchors = Vec::with_capacity(coverage.callable_anchors as usize);
         view.visit_all_anchors(|row| {
             anchors.push(anchor_from_row(row));
             Ok(())
         })?;
+        let load_anchors_ms = anchor_started.elapsed().as_millis();
 
+        let call_site_started = Instant::now();
         let mut strings = StringPool::default();
         let mut call_sites = Vec::with_capacity(coverage.call_sites as usize);
         view.visit_all_call_sites(|row| {
             call_sites.push(StoredCallSite::from_fact(call_from_row(row), &mut strings));
             Ok(())
         })?;
+        let load_call_sites_ms = call_site_started.elapsed().as_millis();
 
         Ok(Self::from_stored_facts(
             anchors,
@@ -115,6 +130,11 @@ impl RelationCatalog {
                 analyzed_files: coverage.analyzed_files,
                 fallback_files: coverage.fallback_files,
                 external_bodies_limited: true,
+            },
+            RelationCatalogBuildMetrics {
+                load_anchors_ms,
+                load_call_sites_ms,
+                ..Default::default()
             },
         ))
     }
@@ -158,7 +178,13 @@ impl RelationCatalog {
             .into_iter()
             .map(|call| StoredCallSite::from_fact(call, &mut strings))
             .collect();
-        Self::from_stored_facts(anchors, strings, call_sites, coverage)
+        Self::from_stored_facts(
+            anchors,
+            strings,
+            call_sites,
+            coverage,
+            RelationCatalogBuildMetrics::default(),
+        )
     }
 
     fn from_stored_facts(
@@ -166,7 +192,9 @@ impl RelationCatalog {
         strings: StringPool,
         call_sites: Vec<StoredCallSite>,
         coverage: CoverageSummary,
+        mut build_metrics: RelationCatalogBuildMetrics,
     ) -> Self {
+        let group_started = Instant::now();
         let mut grouped: HashMap<String, Vec<CallableAnchor>> = HashMap::new();
         for anchor in anchors {
             grouped
@@ -236,8 +264,11 @@ impl RelationCatalog {
             outgoing: HashMap::new(),
             incoming: HashMap::new(),
             coverage,
+            build_metrics: RelationCatalogBuildMetrics::default(),
         };
+        build_metrics.group_entities_ms = group_started.elapsed().as_millis();
 
+        let resolve_started = Instant::now();
         let mut relation_by_key = HashMap::new();
         let mut builders = Vec::new();
         let mut candidates = Vec::new();
@@ -290,7 +321,9 @@ impl RelationCatalog {
                 );
             }
         }
+        build_metrics.resolve_relations_ms = resolve_started.elapsed().as_millis();
 
+        let finalize_started = Instant::now();
         let relation_ref_count = builders
             .iter()
             .map(|builder| 1 + builder.additional_call_sites.len())
@@ -339,6 +372,8 @@ impl RelationCatalog {
         {
             relation_ids.sort_by(|left, right| relation_order(entities, relations, *left, *right));
         }
+        build_metrics.finalize_ms = finalize_started.elapsed().as_millis();
+        catalog.build_metrics = build_metrics;
         catalog
     }
 
@@ -502,6 +537,10 @@ impl RelationCatalog {
             relations: self.relations.len(),
             relation_call_site_refs: self.relation_call_sites.len(),
         }
+    }
+
+    pub fn build_metrics(&self) -> RelationCatalogBuildMetrics {
+        self.build_metrics
     }
 
     fn entity_by_id(&self, entity_id: EntityId) -> &CallableEntity {
