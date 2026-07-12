@@ -57,15 +57,15 @@ impl<'a> NameIndexBuilder<'a> {
             self.project_by_path.insert(path_id, project_id);
             project_id
         };
-        self.push_compact(
-            row.symbol_id,
+        self.push_compact(CompactNameEntry {
+            id: row.symbol_id,
             name_id,
             path_id,
             project_id,
-            crate::parser::kind_from_str(row.kind),
-            row.external,
-            row.directly_included,
-        );
+            kind: crate::parser::kind_from_str(row.kind),
+            external: row.external,
+            directly_included: row.directly_included,
+        });
     }
 
     pub(super) fn push_entry(&mut self, entry: NameEntry) {
@@ -74,15 +74,15 @@ impl<'a> NameIndexBuilder<'a> {
         let project_id = entry
             .project_key
             .map_or(NO_PROJECT_ID, |project| self.intern_project(project));
-        self.push_compact(
-            entry.id,
+        self.push_compact(CompactNameEntry {
+            id: entry.id,
             name_id,
             path_id,
             project_id,
-            entry.kind,
-            entry.external,
-            entry.directly_included,
-        );
+            kind: entry.kind,
+            external: entry.external,
+            directly_included: entry.directly_included,
+        });
     }
 
     pub(super) fn push_ref(&mut self, entry: NameEntryRef<'_>) {
@@ -92,15 +92,15 @@ impl<'a> NameIndexBuilder<'a> {
             .project_key
             .cloned()
             .map_or(NO_PROJECT_ID, |project| self.intern_project(project));
-        self.push_compact(
-            entry.id,
+        self.push_compact(CompactNameEntry {
+            id: entry.id,
             name_id,
             path_id,
             project_id,
-            entry.kind,
-            entry.external,
-            entry.directly_included,
-        );
+            kind: entry.kind,
+            external: entry.external,
+            directly_included: entry.directly_included,
+        });
     }
 
     pub(super) fn push_ref_with_project_context(&mut self, entry: NameEntryRef<'_>) {
@@ -118,37 +118,20 @@ impl<'a> NameIndexBuilder<'a> {
             self.project_by_path.insert(path_id, project_id);
             project_id
         };
-        self.push_compact(
-            entry.id,
+        self.push_compact(CompactNameEntry {
+            id: entry.id,
             name_id,
             path_id,
             project_id,
-            entry.kind,
-            entry.external,
-            entry.directly_included,
-        );
+            kind: entry.kind,
+            external: entry.external,
+            directly_included: entry.directly_included,
+        });
     }
 
-    fn push_compact(
-        &mut self,
-        id: i64,
-        name_id: u32,
-        path_id: u32,
-        project_id: u32,
-        kind: crate::parser::SymbolKind,
-        external: bool,
-        directly_included: bool,
-    ) {
-        self.path_counts[path_id as usize] += 1;
-        self.entries.push(CompactNameEntry {
-            id,
-            name_id,
-            path_id,
-            project_id,
-            kind,
-            external,
-            directly_included,
-        });
+    fn push_compact(&mut self, entry: CompactNameEntry) {
+        self.path_counts[entry.path_id as usize] += 1;
+        self.entries.push(entry);
     }
 
     fn intern_name(&mut self, name: &str, known_lower: Option<&str>) -> u32 {

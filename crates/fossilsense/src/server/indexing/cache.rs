@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -51,7 +51,7 @@ async fn rebuild_name_table(
 }
 
 fn capture_call_read_handle(
-    root: &PathBuf,
+    root: &Path,
     generation: SemanticGeneration,
 ) -> Result<Arc<CallReadHandle>> {
     Ok(Arc::new(CallReadHandle::at_generation(

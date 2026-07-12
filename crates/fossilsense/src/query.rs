@@ -659,8 +659,8 @@ impl NameTable {
         out.sort_by(|left, right| {
             self.entry(*left)
                 .lower
-                .cmp(&self.entry(*right).lower)
-                .then_with(|| self.entry(*left).name.cmp(&self.entry(*right).name))
+                .cmp(self.entry(*right).lower)
+                .then_with(|| self.entry(*left).name.cmp(self.entry(*right).name))
         });
         out
     }
@@ -743,12 +743,8 @@ impl NameTable {
             if !names.contains(&entry.name) {
                 continue;
             }
-            let tier = resolver::scope_tier(
-                &entry.path,
-                entry.external,
-                entry.directly_included,
-                ctx_ref,
-            );
+            let tier =
+                resolver::scope_tier(entry.path, entry.external, entry.directly_included, ctx_ref);
             // Hard gate: only determinate in-scope tiers color. Open/indeterminate
             // (`Unknown`) and out-of-scope (`Global`) do not color.
             let in_scope = matches!(
@@ -841,12 +837,12 @@ impl NameTable {
                 .map(|index| {
                     let entry = self.entry(index);
                     let tier = resolver::scope_tier(
-                        &entry.path,
+                        entry.path,
                         entry.external,
                         entry.directly_included,
                         ctx_ref,
                     );
-                    let loc = resolver::locality(&entry.path, ctx_ref.and_then(|c| c.current_path));
+                    let loc = resolver::locality(entry.path, ctx_ref.and_then(|c| c.current_path));
                     let score = resolver::pack_score(tier, 0, loc);
                     ScoredCandidate {
                         score,
@@ -1029,8 +1025,8 @@ impl NameTable {
                 return;
             }
             let tier =
-                resolver::scope_tier(&entry.path, entry.external, entry.directly_included, ctx);
-            let loc = resolver::locality(&entry.path, ctx.and_then(|c| c.current_path));
+                resolver::scope_tier(entry.path, entry.external, entry.directly_included, ctx);
+            let loc = resolver::locality(entry.path, ctx.and_then(|c| c.current_path));
             let score = resolver::pack_score(tier, base_match, loc);
             scored.push(ScoredCandidate {
                 score,
@@ -1088,12 +1084,12 @@ impl NameTable {
                 .map(|index| {
                     let entry = self.entry(index);
                     let tier = resolver::scope_tier(
-                        &entry.path,
+                        entry.path,
                         entry.external,
                         entry.directly_included,
                         ctx_ref,
                     );
-                    let loc = resolver::locality(&entry.path, ctx_ref.and_then(|c| c.current_path));
+                    let loc = resolver::locality(entry.path, ctx_ref.and_then(|c| c.current_path));
                     ScoredCandidate {
                         score: resolver::pack_score(tier, 0, loc),
                         name_len: entry.name.len(),
@@ -1232,7 +1228,7 @@ fn scored_order(a: &ScoredCandidate, b: &ScoredCandidate, table: &NameTable) -> 
     b.score
         .cmp(&a.score)
         .then(a.name_len.cmp(&b.name_len))
-        .then_with(|| table.entry(a.index).name.cmp(&table.entry(b.index).name))
+        .then_with(|| table.entry(a.index).name.cmp(table.entry(b.index).name))
 }
 
 fn top_scored(

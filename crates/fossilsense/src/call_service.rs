@@ -118,13 +118,15 @@ impl<'a> CallRelationService<'a> {
 
         let (catalog, page) = query_resolved(
             &view,
-            &key,
-            &name,
-            direction,
-            cursor,
-            relation_limit,
-            call_site_limit,
-            self.overlays,
+            ResolvedQuery {
+                key: &key,
+                name: &name,
+                direction,
+                cursor,
+                relation_limit,
+                call_site_limit,
+                overlays: self.overlays,
+            },
         )?;
         guard.finish()?;
         Ok((catalog, key, page))
@@ -174,13 +176,15 @@ impl<'a> CallRelationService<'a> {
         let name = entity.name.clone();
         let (catalog, page) = query_resolved(
             &view,
-            &key,
-            &name,
-            direction,
-            cursor,
-            relation_limit,
-            call_site_limit,
-            self.overlays,
+            ResolvedQuery {
+                key: &key,
+                name: &name,
+                direction,
+                cursor,
+                relation_limit,
+                call_site_limit,
+                overlays: self.overlays,
+            },
         )?;
         guard.finish()?;
         Ok((catalog, key, page))
@@ -220,13 +224,15 @@ impl<'a> CallRelationService<'a> {
         let name = entity.name.clone();
         let (catalog, page) = query_resolved(
             &view,
-            &resolved_key,
-            &name,
-            direction,
-            cursor,
-            relation_limit,
-            call_site_limit,
-            self.overlays,
+            ResolvedQuery {
+                key: &resolved_key,
+                name: &name,
+                direction,
+                cursor,
+                relation_limit,
+                call_site_limit,
+                overlays: self.overlays,
+            },
         )?;
         guard.finish()?;
         Ok((catalog, resolved_key, page))
@@ -292,16 +298,29 @@ fn locator_catalog(
     ))
 }
 
-fn query_resolved(
-    view: &CallFactStoreView<'_>,
-    key: &str,
-    name: &str,
+struct ResolvedQuery<'a> {
+    key: &'a str,
+    name: &'a str,
     direction: RelationDirection,
     cursor: usize,
     relation_limit: usize,
     call_site_limit: usize,
-    overlays: &[FileCallOverlay],
+    overlays: &'a [FileCallOverlay],
+}
+
+fn query_resolved(
+    view: &CallFactStoreView<'_>,
+    query: ResolvedQuery<'_>,
 ) -> Result<(RelationQueryIndex, RelationPage)> {
+    let ResolvedQuery {
+        key,
+        name,
+        direction,
+        cursor,
+        relation_limit,
+        call_site_limit,
+        overlays,
+    } = query;
     let (base_rows, mut scan_limited) = match direction {
         RelationDirection::Incoming => {
             view.call_sites_by_callee_limited(name, DEFAULT_SCANNED_SITE_LIMIT)?
