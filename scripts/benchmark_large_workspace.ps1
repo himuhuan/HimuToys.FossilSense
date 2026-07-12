@@ -231,12 +231,19 @@ if ($results.Count -eq 0) {
 $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 $jsonPath = Join-Path $benchmarkPath "large-workspace-$stamp.json"
 $markdownPath = Join-Path $benchmarkPath "large-workspace-$stamp.md"
+$binaryVersion = 'unavailable'
+try {
+    $versionLine = @(& $binaryPath --version 2>$null | Select-Object -First 1)
+    if ($versionLine.Count -gt 0 -and -not [string]::IsNullOrWhiteSpace($versionLine[0])) {
+        $binaryVersion = $versionLine[0].Trim()
+    }
+} catch {
+    # Version metadata is diagnostic only and must not invalidate benchmark data.
+}
 $report = [ordered]@{
     schema_version = 1
     measured_at = (Get-Date).ToUniversalTime().ToString('o')
-    binary_version = ((Get-Item -LiteralPath $binaryPath).VersionInfo.FileVersion | ForEach-Object {
-        if ($_) { $_ } else { 'unavailable' }
-    })
+    binary_version = $binaryVersion
     sample_interval_ms = 20
     results = $results
 }
