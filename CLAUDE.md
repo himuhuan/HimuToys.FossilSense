@@ -131,7 +131,7 @@ Runtime snapshot 规则：
 
 | 项 | 规则 |
 |---|---|
-| `EngineSnapshot` | 每工作区一个完整不可变读模型，统一携带 segmented name index、reach graph、include table、reference file list、project context、轻量 `CallReadHandle`、degraded state；不得持有全库 call sites/relations |
+| `EngineSnapshot` | 每工作区一个完整不可变读模型，统一携带 compact segmented name index、reach graph、include table、reference file list、project context、轻量 `CallReadHandle`、degraded state；name entry 只持有 segment-local name/path/project ID 与 flags，不按 symbol 重复字符串/项目对象；不得持有全库 call sites/relations |
 | publication | 所有下一代读模型在后台构建完成后，只通过一次 map 交换发布；构建期间旧快照继续服务请求 |
 | `EngineEpoch` | 每次成功发布分配显式单调 epoch；`0` 只表示尚未发布索引读模型 |
 | `SemanticGeneration` | SQLite active manifest 的持久化单调代际；marker-only 等纯派生刷新不得推进它 |
@@ -140,7 +140,7 @@ Runtime snapshot 规则：
 | saved overlay | 不能用全局 generation 推断单文件已发布；只在 active revision 的同路径内容哈希匹配时清除 |
 | dirty reach graph | 增量 include edge 更新生成新的 `ReachGraph`，不得原地修改旧快照持有的图 |
 | publisher | snapshot publisher 串行协调；发布失败不得暴露半更新状态 |
-| name compaction | segmented `NameTable` 累积 64 个 delta，或 retained delta slots 超过 base entries 的 25% 时，在 blocking worker 重建 compact base；构建前后都校验 `EngineEpoch`，且只在 dirty publication 释放 publisher 后启动，旧快照继续服务请求 |
+| name compaction | segmented `NameTable` 累积 64 个 delta，或 retained delta slots 超过 base entries 的 25% 时，在 blocking worker 通过 borrowed compact-entry view 重建 compact base；不得先还原全量 owned entries；构建前后都校验 `EngineEpoch`，且只在 dirty publication 释放 publisher 后启动，旧快照继续服务请求 |
 
 ## 5. 当前能力
 

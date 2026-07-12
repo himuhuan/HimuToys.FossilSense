@@ -95,6 +95,37 @@ struct NameEntry {
     project_key: Option<ProjectKey>,
 }
 
+const NO_PROJECT_ID: u32 = u32::MAX;
+
+#[derive(Clone, Copy)]
+struct CompactNameEntry {
+    id: i64,
+    name_id: u32,
+    path_id: u32,
+    project_id: u32,
+    kind: ParserKind,
+    external: bool,
+    directly_included: bool,
+}
+
+#[derive(Clone)]
+struct NameString {
+    original: Arc<str>,
+    lower: Arc<str>,
+}
+
+#[derive(Clone, Copy)]
+struct NameEntryRef<'a> {
+    id: i64,
+    name: &'a str,
+    lower: &'a str,
+    external: bool,
+    directly_included: bool,
+    path: &'a str,
+    kind: ParserKind,
+    project_key: Option<&'a ProjectKey>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ScoredCandidate {
     score: i32,
@@ -182,10 +213,15 @@ impl CompletionScope {
 }
 
 struct NameSegment {
-    entries: Vec<NameEntry>,
+    entries: Vec<CompactNameEntry>,
+    names: Vec<NameString>,
+    paths: Vec<Arc<str>>,
+    path_ids: HashMap<Arc<str>, u32>,
+    path_counts: Vec<usize>,
+    path_is_external: Vec<bool>,
+    projects: Vec<ProjectKey>,
     sorted: Vec<usize>,
     by_project: HashMap<ProjectKey, Vec<usize>>,
-    path_counts: HashMap<Arc<str>, usize>,
 }
 
 /// Segmented workspace name index. Full publication installs one immutable base;
@@ -207,23 +243,29 @@ pub struct NameTable {
 }
 
 /// Entry indices sorted by `(lowercased name, original name)` for prefix search.
-fn sorted_indices(entries: &[NameEntry]) -> Vec<usize> {
+fn sorted_indices(entries: &[CompactNameEntry], names: &[NameString]) -> Vec<usize> {
     let mut idx: Vec<usize> = (0..entries.len()).collect();
     idx.sort_by(|&a, &b| {
-        entries[a]
+        names[entries[a].name_id as usize]
             .lower
-            .cmp(&entries[b].lower)
-            .then_with(|| entries[a].name.cmp(&entries[b].name))
+            .cmp(&names[entries[b].name_id as usize].lower)
+            .then_with(|| {
+                names[entries[a].name_id as usize]
+                    .original
+                    .cmp(&names[entries[b].name_id as usize].original)
+            })
     });
     idx
 }
 
-fn all_workspace_reach(entries: &[NameEntry]) -> ReachScope {
+fn all_workspace_reach(segment: &NameSegment) -> ReachScope {
     ReachScope {
-        files: entries
+        files: segment
+            .paths
             .iter()
-            .filter(|entry| !entry.external)
-            .map(|entry| entry.path.to_string())
+            .zip(&segment.path_is_external)
+            .filter(|(_, external)| !**external)
+            .map(|(path, _)| path.to_string())
             .collect(),
         open: false,
         reason: None,
@@ -289,11 +331,18 @@ impl NameTable {
     }
 
     fn from_entries(entries: Vec<NameEntry>) -> Self {
-        let all_workspace_reach = Arc::new(all_workspace_reach(&entries));
-        let active_len = entries.len();
-        let base = Arc::new(NameSegment::from_entries(entries));
+        let mut builder = name_index_builder::NameIndexBuilder::new(None);
+        for entry in entries {
+            builder.push_entry(entry);
+        }
+        builder.finish()
+    }
+
+    fn from_base_segment(base: NameSegment) -> Self {
+        let all_workspace_reach = Arc::new(all_workspace_reach(&base));
+        let active_len = base.entries.len();
         Self {
-            base,
+            base: Arc::new(base),
             deltas: Arc::new(Vec::new()),
             path_overrides: Arc::new(HashMap::new()),
             delta_offsets: Arc::new(Vec::new()),
@@ -303,31 +352,16 @@ impl NameTable {
         }
     }
 
-    fn from_interned_entries(entries: Vec<NameEntry>) -> Self {
-        let all_workspace_reach = Arc::new(all_workspace_reach(&entries));
-        let active_len = entries.len();
-        let base = Arc::new(NameSegment::from_interned_entries(entries));
-        Self {
-            base,
-            deltas: Arc::new(Vec::new()),
-            path_overrides: Arc::new(HashMap::new()),
-            delta_offsets: Arc::new(Vec::new()),
-            active_len,
-            slot_len: active_len,
-            all_workspace_reach,
-        }
-    }
-
-    fn entry(&self, index: usize) -> &NameEntry {
+    fn entry(&self, index: usize) -> NameEntryRef<'_> {
         if index < self.base.entries.len() {
-            return &self.base.entries[index];
+            return self.base.entry(index);
         }
         let delta_index = self
             .delta_offsets
             .partition_point(|offset| *offset <= index)
             .saturating_sub(1);
         let offset = self.delta_offsets[delta_index];
-        &self.deltas[delta_index].entries[index - offset]
+        self.deltas[delta_index].entry(index - offset)
     }
 
     fn segment_for_index(&self, index: usize) -> Option<usize> {
@@ -340,7 +374,7 @@ impl NameTable {
 
     fn is_active_index(&self, index: usize) -> bool {
         let entry = self.entry(index);
-        match self.path_overrides.get(entry.path.as_ref()) {
+        match self.path_overrides.get(entry.path) {
             None => self.segment_for_index(index).is_none(),
             Some(Some(active_delta)) => self.segment_for_index(index) == Some(*active_delta),
             Some(None) => false,
@@ -360,9 +394,9 @@ impl NameTable {
     ) {
         let start = segment
             .sorted
-            .partition_point(|&index| segment.entries[index].lower.as_ref() < needle_lower);
+            .partition_point(|&index| segment.entry(index).lower < needle_lower);
         for &local in &segment.sorted[start..] {
-            if !segment.entries[local].lower.starts_with(needle_lower) {
+            if !segment.entry(local).lower.starts_with(needle_lower) {
                 break;
             }
             let index = offset + local;
@@ -384,54 +418,86 @@ impl NameTable {
     }
 
     pub(crate) fn compacted(&self) -> Self {
-        Self::from_entries(
-            self.active_indices()
-                .map(|index| self.entry(index).clone())
-                .collect(),
-        )
+        let mut builder = name_index_builder::NameIndexBuilder::new(None);
+        for index in self.active_indices() {
+            builder.push_ref(self.entry(index));
+        }
+        builder.finish()
     }
 
     #[cfg(test)]
-    fn active_entry(&self, index: usize) -> &NameEntry {
+    fn active_entry(&self, index: usize) -> NameEntryRef<'_> {
         self.entry(index)
     }
 }
 
 impl NameSegment {
-    fn from_entries(mut entries: Vec<NameEntry>) -> Self {
-        // Symbols commonly repeat both their file path and spelling. Intern
-        // those immutable strings within one published table so a large file
-        // contributes one path allocation rather than one per symbol. Dirty
-        // rebuilds clone these Arcs for unchanged entries.
-        let mut paths: HashMap<Arc<str>, Arc<str>> = HashMap::new();
-        let mut names: HashMap<Arc<str>, Arc<str>> = HashMap::new();
-        let mut lowers: HashMap<Arc<str>, Arc<str>> = HashMap::new();
-        for entry in &mut entries {
-            entry.path = intern_arc(&mut paths, entry.path.clone());
-            entry.name = intern_arc(&mut names, entry.name.clone());
-            entry.lower = intern_arc(&mut lowers, entry.lower.clone());
+    fn from_entries(entries: Vec<NameEntry>) -> Self {
+        let mut builder = name_index_builder::NameIndexBuilder::new(None);
+        for entry in entries {
+            builder.push_entry(entry);
         }
-        Self::from_interned_entries(entries)
+        builder.finish_segment()
     }
 
-    fn from_interned_entries(entries: Vec<NameEntry>) -> Self {
-        let sorted = sorted_indices(&entries);
+    fn from_compact_parts(
+        entries: Vec<CompactNameEntry>,
+        names: Vec<NameString>,
+        paths: Vec<Arc<str>>,
+        path_ids: HashMap<Arc<str>, u32>,
+        path_counts: Vec<usize>,
+        path_is_external: Vec<bool>,
+        projects: Vec<ProjectKey>,
+    ) -> Self {
+        let sorted = sorted_indices(&entries, &names);
         let mut by_project: HashMap<ProjectKey, Vec<usize>> = HashMap::new();
         for (index, entry) in entries.iter().enumerate() {
-            if let Some(key) = &entry.project_key {
-                by_project.entry(key.clone()).or_default().push(index);
+            if entry.project_id != NO_PROJECT_ID {
+                by_project
+                    .entry(projects[entry.project_id as usize].clone())
+                    .or_default()
+                    .push(index);
             }
-        }
-        let mut path_counts = HashMap::new();
-        for entry in &entries {
-            *path_counts.entry(entry.path.clone()).or_insert(0) += 1;
         }
         Self {
             entries,
+            names,
+            paths,
+            path_ids,
+            path_counts,
+            path_is_external,
+            projects,
             sorted,
             by_project,
-            path_counts,
         }
+    }
+
+    fn entry(&self, index: usize) -> NameEntryRef<'_> {
+        let entry = self.entries[index];
+        let name = &self.names[entry.name_id as usize];
+        NameEntryRef {
+            id: entry.id,
+            name: &name.original,
+            lower: &name.lower,
+            external: entry.external,
+            directly_included: entry.directly_included,
+            path: &self.paths[entry.path_id as usize],
+            kind: entry.kind,
+            project_key: (entry.project_id != NO_PROJECT_ID)
+                .then(|| &self.projects[entry.project_id as usize]),
+        }
+    }
+
+    fn path_count(&self, path: &str) -> usize {
+        self.path_ids
+            .get(path)
+            .map_or(0, |id| self.path_counts[*id as usize])
+    }
+
+    fn interned_path(&self, path: &str) -> Option<Arc<str>> {
+        self.path_ids
+            .get(path)
+            .map(|id| self.paths[*id as usize].clone())
     }
 }
 
@@ -495,25 +561,11 @@ impl NameTable {
     /// so an overlapping index writer cannot leak partially committed rows into
     /// the runtime snapshot.
     pub fn with_project_context(&self, project_context: Option<&ProjectContextIndex>) -> Self {
-        let mut project_by_path = HashMap::<Arc<str>, Option<ProjectKey>>::new();
-        let entries = self
-            .active_indices()
-            .map(|index| self.entry(index).clone())
-            .map(|mut entry| {
-                entry.project_key = if entry.external {
-                    None
-                } else if let Some(project) = project_by_path.get(entry.path.as_ref()) {
-                    project.clone()
-                } else {
-                    let project =
-                        project_context.and_then(|index| index.nearest_for_file(&entry.path));
-                    project_by_path.insert(entry.path.clone(), project.clone());
-                    project
-                };
-                entry
-            })
-            .collect();
-        Self::from_entries(entries)
+        let mut builder = name_index_builder::NameIndexBuilder::new(project_context);
+        for index in self.active_indices() {
+            builder.push_ref_with_project_context(self.entry(index));
+        }
+        builder.finish()
     }
 
     fn with_updated_entries(
@@ -533,29 +585,15 @@ impl NameTable {
         let mut active_len = self.active_len;
         for path in paths {
             let old_count = match overrides.get(path.as_str()) {
-                Some(Some(previous_delta)) => self.deltas[*previous_delta]
-                    .path_counts
-                    .get(path.as_str())
-                    .copied()
-                    .unwrap_or(0),
+                Some(Some(previous_delta)) => self.deltas[*previous_delta].path_count(path),
                 Some(None) => 0,
-                None => self
-                    .base
-                    .path_counts
-                    .get(path.as_str())
-                    .copied()
-                    .unwrap_or(0),
+                None => self.base.path_count(path),
             };
-            let fresh_count = fresh_segment
-                .path_counts
-                .get(path.as_str())
-                .copied()
-                .unwrap_or(0);
+            let fresh_count = fresh_segment.path_count(path);
             active_len = active_len.saturating_sub(old_count) + fresh_count;
             let interned_path = fresh_segment
-                .path_counts
-                .get_key_value(path.as_str())
-                .map_or_else(|| Arc::<str>::from(path.as_str()), |(path, _)| path.clone());
+                .interned_path(path)
+                .unwrap_or_else(|| Arc::<str>::from(path.as_str()));
             overrides.insert(interned_path, (fresh_count > 0).then_some(delta_index));
         }
 
@@ -563,9 +601,13 @@ impl NameTable {
         for path in paths {
             all_workspace_reach.files.remove(path);
         }
-        for entry in &fresh_segment.entries {
-            if !entry.external {
-                all_workspace_reach.files.insert(entry.path.to_string());
+        for (path, external) in fresh_segment
+            .paths
+            .iter()
+            .zip(&fresh_segment.path_is_external)
+        {
+            if !external {
+                all_workspace_reach.files.insert(path.to_string());
             }
         }
         deltas.push(fresh_segment);
@@ -619,7 +661,7 @@ impl NameTable {
         let indices: Vec<usize> = self
             .prefix_candidates(&needle)
             .into_iter()
-            .filter(|index| self.entry(*index).lower.as_ref() == needle)
+            .filter(|index| self.entry(*index).lower == needle)
             .collect();
         let ctx_owned: Option<ResolveContext<'_>> = scope.map(|s| s.resolve_context());
         self.rank_indices(&needle, limit, ctx_owned.as_ref(), &indices)
@@ -681,7 +723,7 @@ impl NameTable {
                 // Non-colorable kinds never affect `resolve_kind`; skip them.
                 _ => continue,
             };
-            if !names.contains(entry.name.as_ref()) {
+            if !names.contains(&entry.name) {
                 continue;
             }
             let tier = resolver::scope_tier(
@@ -1084,19 +1126,11 @@ impl NameTable {
                     name_len: candidate.name_len,
                     name: entry.name.to_string(),
                     kind: entry.kind,
-                    project_key: entry.project_key.clone(),
+                    project_key: entry.project_key.cloned(),
                 }
             })
             .collect()
     }
-}
-
-fn intern_arc(pool: &mut HashMap<Arc<str>, Arc<str>>, value: Arc<str>) -> Arc<str> {
-    if let Some(existing) = pool.get(value.as_ref()) {
-        return existing.clone();
-    }
-    pool.insert(value.clone(), value.clone());
-    value
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1310,8 +1344,8 @@ fn name_entry_parts(
 
 /// Score a single name against an already-lowercased query. `None` means no
 /// match (not even a subsequence). Higher is better.
-fn score_match(needle: &str, entry: &NameEntry) -> Option<i32> {
-    let hay = entry.lower.as_ref();
+fn score_match(needle: &str, entry: NameEntryRef<'_>) -> Option<i32> {
+    let hay = entry.lower;
 
     if hay == needle {
         return Some(1000);

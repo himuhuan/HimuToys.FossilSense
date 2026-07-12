@@ -115,6 +115,17 @@ fn benchmark_large_name_table_build_and_dirty_update() {
 
     println!("name_rows: {expected_len}");
     println!("name_changed_rows: {}", fresh_rows.len());
+    println!(
+        "name_compact_entry_bytes: {}",
+        std::mem::size_of::<CompactNameEntry>()
+    );
+    println!(
+        "name_owned_entry_bytes: {}",
+        std::mem::size_of::<NameEntry>()
+    );
+    println!("name_unique_names: {}", table.base.names.len());
+    println!("name_unique_paths: {}", table.base.paths.len());
+    println!("name_unique_projects: {}", table.base.projects.len());
     println!("name_stream_build_ms: {stream_build_ms}");
     println!("name_dirty_update_us: {}", dirty_us[dirty_us.len() / 2]);
     println!(
@@ -141,6 +152,14 @@ fn table() -> NameTable {
         (4, "main".to_string(), false),
         (5, "hello".to_string(), false),
     ])
+}
+
+#[test]
+fn compact_name_entry_stays_within_three_ids_and_flags_layout() {
+    assert!(
+        std::mem::size_of::<CompactNameEntry>() <= 24,
+        "compact entries must not regain per-symbol pointers"
+    );
 }
 
 #[test]
