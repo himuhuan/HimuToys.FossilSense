@@ -124,7 +124,7 @@ async fn workspace_folder_removal_drops_root_and_published_snapshot() {
             include_table: None,
             indexed_files: None,
             project_context: None,
-            relation_catalog: None,
+            call_read_handle: None,
             degraded: Default::default(),
         })
         .await;
@@ -150,6 +150,91 @@ async fn workspace_folder_removal_drops_root_and_published_snapshot() {
         .current_engine_snapshot(&root)
         .await
         .is_none());
+}
+
+#[tokio::test]
+async fn name_index_compaction_publishes_only_for_the_expected_engine_epoch() {
+    let cache = super::CacheLedger::default();
+    let root = tempdir().expect("root").path().to_path_buf();
+    let paths = std::collections::HashSet::from(["src/changed.c".to_string()]);
+    let mut table = crate::query::NameTable::build_with_paths(vec![
+        (
+            1,
+            "base_name".to_string(),
+            false,
+            "src/base.c".to_string(),
+            "function".to_string(),
+            false,
+        ),
+        (
+            2,
+            "changed_0".to_string(),
+            false,
+            "src/changed.c".to_string(),
+            "function".to_string(),
+            false,
+        ),
+    ]);
+    for revision in 1..=64 {
+        table = table.with_updated_paths(
+            &paths,
+            vec![(
+                2 + revision,
+                format!("changed_{revision}"),
+                false,
+                "src/changed.c".to_string(),
+                "function".to_string(),
+                false,
+            )],
+        );
+    }
+    let initial_epoch = cache.allocate_engine_epoch();
+    cache
+        .publish_engine_snapshot(super::workspace::EngineSnapshot {
+            root: root.clone(),
+            epoch: initial_epoch,
+            semantic_generation: crate::call_model::SemanticGeneration(7),
+            name_table: Some(Arc::new(table)),
+            reach_graph: None,
+            include_table: None,
+            indexed_files: None,
+            project_context: None,
+            call_read_handle: None,
+            degraded: Default::default(),
+        })
+        .await;
+
+    assert!(cache
+        .compact_name_index_if_current(root.clone(), initial_epoch)
+        .await
+        .expect("compact current"));
+    let compacted = cache
+        .current_engine_snapshot(&root)
+        .await
+        .expect("compacted snapshot");
+    assert_ne!(compacted.epoch, initial_epoch);
+    assert_eq!(compacted.semantic_generation.0, 7);
+    assert_eq!(
+        compacted
+            .name_table
+            .as_ref()
+            .expect("name table")
+            .delta_segment_count(),
+        0
+    );
+
+    assert!(!cache
+        .compact_name_index_if_current(root.clone(), initial_epoch)
+        .await
+        .expect("stale compaction discarded"));
+    assert_eq!(
+        cache
+            .current_engine_snapshot(&root)
+            .await
+            .expect("current snapshot")
+            .epoch,
+        compacted.epoch
+    );
 }
 
 fn write_workspace_file(root: &std::path::Path, rel: &str, text: &str) {
@@ -1145,7 +1230,7 @@ async fn project_context_commands_validate_selection_and_outside_uri_has_no_auto
             include_table: current.include_table.clone(),
             indexed_files: current.indexed_files.clone(),
             project_context: None,
-            relation_catalog: None,
+            call_read_handle: None,
             degraded,
         })
         .await;
@@ -1485,64 +1570,8 @@ async fn cache_ledger_clears_reference_search_cache_after_document_and_index_cha
 
     cache.mark_reference_search_cache_for_test("root", "needle", 2);
     assert_eq!(cache.reference_search_cache_len_for_test(), 1);
-    cache
-        .store_relation_overlay(
-            PathBuf::from("root"),
-            super::state::EngineEpoch::published(2),
-            7,
-            Arc::new(crate::call_catalog::RelationCatalog::default()),
-        )
-        .await;
-    assert_eq!(cache.relation_overlay_cache_len_for_test().await, 1);
     cache.invalidate_after_index_change().await;
     assert_eq!(cache.reference_search_cache_len_for_test(), 0);
-    assert_eq!(cache.relation_overlay_cache_len_for_test().await, 0);
-}
-
-#[tokio::test]
-async fn workspace_document_lifecycle_drops_stale_relation_overlays() {
-    let documents = super::DocumentStore::default();
-    let cache = super::CacheLedger::default();
-    let session = super::WorkspaceSession::new(documents, cache.clone());
-    let uri = Url::parse("file:///tmp/relations.c").expect("uri");
-    let root = PathBuf::from("root");
-
-    cache
-        .store_relation_overlay(
-            root.clone(),
-            super::state::EngineEpoch::published(1),
-            1,
-            Arc::new(crate::call_catalog::RelationCatalog::default()),
-        )
-        .await;
-    session
-        .open_document(uri.clone(), 1, "void first(void);".into())
-        .await;
-    assert_eq!(cache.relation_overlay_cache_len_for_test().await, 0);
-
-    cache
-        .store_relation_overlay(
-            root.clone(),
-            super::state::EngineEpoch::published(1),
-            2,
-            Arc::new(crate::call_catalog::RelationCatalog::default()),
-        )
-        .await;
-    session
-        .change_document(uri.clone(), 2, "void second(void);".into())
-        .await;
-    assert_eq!(cache.relation_overlay_cache_len_for_test().await, 0);
-
-    cache
-        .store_relation_overlay(
-            root,
-            super::state::EngineEpoch::published(1),
-            3,
-            Arc::new(crate::call_catalog::RelationCatalog::default()),
-        )
-        .await;
-    session.close_document(&uri).await;
-    assert_eq!(cache.relation_overlay_cache_len_for_test().await, 0);
 }
 
 #[tokio::test]
@@ -1614,7 +1643,7 @@ async fn reach_scope_uses_captured_request_context_graph() {
             include_table: None,
             indexed_files: None,
             project_context: None,
-            relation_catalog: None,
+            call_read_handle: None,
             degraded: crate::progress::DegradedCapabilities::default(),
         }),
         settings: super::RequestSettings {

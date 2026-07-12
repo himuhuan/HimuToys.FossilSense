@@ -4,7 +4,7 @@ use crate::call_model::{
 };
 use crate::store::views::{CallSiteRow, CallableAnchorRow};
 
-pub(super) fn anchor_from_row(row: CallableAnchorRow) -> CallableAnchor {
+pub(crate) fn anchor_from_row(row: CallableAnchorRow) -> CallableAnchor {
     let linkage = match row.linkage_kind.as_str() {
         "external" => LinkageDomain::External,
         // The parser sees an absolute path while active store rows expose the
@@ -39,7 +39,7 @@ pub(super) fn anchor_from_row(row: CallableAnchorRow) -> CallableAnchor {
     }
 }
 
-pub(super) fn call_from_row(row: CallSiteRow) -> CallSiteFact {
+pub(crate) fn call_from_row(row: CallSiteRow) -> CallSiteFact {
     CallSiteFact {
         path: row.path,
         caller_entity_key: row.caller_entity_key,

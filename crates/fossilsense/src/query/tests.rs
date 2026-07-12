@@ -1,6 +1,162 @@
 use super::*;
 use crate::reachability::ReachScope;
 
+#[cfg(windows)]
+fn current_private_bytes() -> u64 {
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    let mut counters = PROCESS_MEMORY_COUNTERS_EX {
+        cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+        ..Default::default()
+    };
+    let loaded = unsafe {
+        K32GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            (&mut counters as *mut PROCESS_MEMORY_COUNTERS_EX).cast::<PROCESS_MEMORY_COUNTERS>(),
+            std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+        )
+    };
+    assert_ne!(loaded, 0, "GetProcessMemoryInfo failed");
+    counters.PrivateUsage as u64
+}
+
+#[cfg(not(windows))]
+fn current_private_bytes() -> u64 {
+    0
+}
+
+#[test]
+#[ignore = "diagnostic large-workspace NameTable benchmark; set FOSSILSENSE_BENCH_DB"]
+fn benchmark_large_name_table_build_and_dirty_update() {
+    let db = std::env::var_os("FOSSILSENSE_BENCH_DB")
+        .map(std::path::PathBuf::from)
+        .expect("set FOSSILSENSE_BENCH_DB to a schema-15 benchmark database");
+    let store = crate::store::IndexStore::open_readonly(&db).expect("benchmark database");
+
+    let build_started = std::time::Instant::now();
+    let mut builder = name_index_builder::NameIndexBuilder::new(None);
+    let visit_started = std::time::Instant::now();
+    store
+        .name_table_view()
+        .visit_symbol_rows(|row| {
+            builder.push(row);
+            Ok(())
+        })
+        .expect("stream name rows into builder");
+    let sql_visit_ms = visit_started.elapsed().as_millis();
+    let finalize_started = std::time::Instant::now();
+    let mut table = builder.finish();
+    let finalize_ms = finalize_started.elapsed().as_millis();
+    let stream_build_ms = build_started.elapsed().as_millis();
+    let expected_len = table.len();
+
+    let changed_path = store
+        .name_table_view()
+        .largest_symbol_path()
+        .expect("largest symbol path")
+        .map(|(path, _)| path)
+        .expect("at least one symbol row");
+    let fresh_rows = store
+        .name_table_view()
+        .symbol_rows_for_paths(std::slice::from_ref(&changed_path))
+        .expect("load changed path rows");
+
+    let paths = std::collections::HashSet::from([changed_path]);
+    let mut dirty_us = Vec::new();
+    let private_before = current_private_bytes();
+    let peak_private = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(private_before));
+    let stop_sampling = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sampler = {
+        let peak_private = peak_private.clone();
+        let stop_sampling = stop_sampling.clone();
+        std::thread::spawn(move || {
+            while !stop_sampling.load(std::sync::atomic::Ordering::Relaxed) {
+                peak_private.fetch_max(
+                    current_private_bytes(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        })
+    };
+    for _ in 0..5 {
+        let update_started = std::time::Instant::now();
+        table = table.with_updated_path_rows(&paths, fresh_rows.clone());
+        dirty_us.push(update_started.elapsed().as_micros());
+        assert_eq!(table.len(), expected_len);
+    }
+    stop_sampling.store(true, std::sync::atomic::Ordering::Relaxed);
+    sampler.join().expect("memory sampler");
+    dirty_us.sort_unstable();
+
+    while !table.needs_compaction() {
+        table = table.with_updated_path_rows(&paths, fresh_rows.clone());
+        assert_eq!(table.len(), expected_len);
+    }
+    let segments_before_compaction = table.delta_segment_count();
+    let compaction_private_before = current_private_bytes();
+    let compaction_peak_private =
+        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(compaction_private_before));
+    let stop_compaction_sampling = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let compaction_sampler = {
+        let peak_private = compaction_peak_private.clone();
+        let stop_sampling = stop_compaction_sampling.clone();
+        std::thread::spawn(move || {
+            while !stop_sampling.load(std::sync::atomic::Ordering::Relaxed) {
+                peak_private.fetch_max(
+                    current_private_bytes(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        })
+    };
+    let compaction_started = std::time::Instant::now();
+    let compacted = table.compacted();
+    let compaction_ms = compaction_started.elapsed().as_millis();
+    stop_compaction_sampling.store(true, std::sync::atomic::Ordering::Relaxed);
+    compaction_sampler
+        .join()
+        .expect("compaction memory sampler");
+    assert_eq!(compacted.len(), expected_len);
+    assert_eq!(compacted.delta_segment_count(), 0);
+
+    println!("name_rows: {expected_len}");
+    println!("name_changed_rows: {}", fresh_rows.len());
+    println!(
+        "name_compact_entry_bytes: {}",
+        std::mem::size_of::<CompactNameEntry>()
+    );
+    println!(
+        "name_owned_entry_bytes: {}",
+        std::mem::size_of::<NameEntry>()
+    );
+    println!("name_unique_names: {}", table.base.names.len());
+    println!("name_unique_paths: {}", table.base.paths.len());
+    println!("name_unique_projects: {}", table.base.projects.len());
+    println!("name_sql_visit_ms: {sql_visit_ms}");
+    println!("name_finalize_ms: {finalize_ms}");
+    println!("name_stream_build_ms: {stream_build_ms}");
+    println!("name_dirty_update_us: {}", dirty_us[dirty_us.len() / 2]);
+    println!(
+        "name_dirty_private_delta_bytes: {}",
+        peak_private
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_sub(private_before)
+    );
+    println!("name_compaction_input_segments: {segments_before_compaction}");
+    println!("name_compaction_ms: {compaction_ms}");
+    println!(
+        "name_compaction_private_delta_bytes: {}",
+        compaction_peak_private
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_sub(compaction_private_before)
+    );
+}
+
 fn table() -> NameTable {
     NameTable::build(vec![
         (1, "hello_value".to_string(), false),
@@ -9,6 +165,14 @@ fn table() -> NameTable {
         (4, "main".to_string(), false),
         (5, "hello".to_string(), false),
     ])
+}
+
+#[test]
+fn compact_name_entry_stays_within_three_ids_and_flags_layout() {
+    assert!(
+        std::mem::size_of::<CompactNameEntry>() <= 24,
+        "compact entries must not regain per-symbol pointers"
+    );
 }
 
 #[test]
@@ -23,21 +187,21 @@ fn bounded_top_selection_matches_full_sort_at_scale() {
         })
         .collect();
     let table = NameTable::build(names);
-    let candidates: Vec<ScoredCandidate> = (0..table.entries.len())
+    let candidates: Vec<ScoredCandidate> = (0..table.len())
         .map(|index| ScoredCandidate {
             score: ((index * 104_729) % 50_000) as i32,
-            name_len: table.entries[index].name.len(),
+            name_len: table.active_entry(index).name.len(),
             index,
             tier: ScopeTier::Global,
             base_match: 0,
         })
         .collect();
     let mut oracle = candidates.clone();
-    sort_scored(&mut oracle, &table.entries);
+    sort_scored(&mut oracle, &table);
     oracle.truncate(200);
 
     assert_eq!(
-        top_scored(candidates, 200, &table.entries)
+        top_scored(candidates, 200, &table)
             .into_iter()
             .map(|candidate| candidate.index)
             .collect::<Vec<_>>(),
@@ -223,7 +387,10 @@ fn name_table_tags_workspace_entries_and_keeps_external_entries_unowned() {
         .expect("external")
         .project_key
         .is_none());
-    assert_eq!(table.project_indices(&key).map(<[usize]>::len), Some(1));
+    assert_eq!(
+        table.project_indices(&key).map(|indices| indices.len()),
+        Some(1)
+    );
 }
 
 // --- Prefix index + incremental narrowing (completion performance) --------
@@ -239,10 +406,27 @@ fn prefix_candidates_match_full_scan_exact_prefix() {
     let mut ids: Vec<i64> = table
         .prefix_candidates("foo")
         .iter()
-        .map(|&i| table.entries[i].id)
+        .map(|&i| table.active_entry(i).id)
         .collect();
     ids.sort_unstable();
     assert_eq!(ids, vec![1, 2], "only exact/prefix entries, not substrings");
+}
+
+#[test]
+fn name_id_counting_sort_preserves_spelling_order_and_duplicate_stability() {
+    let table = NameTable::build(vec![
+        (1, "beta".to_string(), false),
+        (2, "Alpha".to_string(), false),
+        (3, "alpha".to_string(), false),
+        (4, "Alpha".to_string(), false),
+        (5, "ALPHA".to_string(), false),
+    ]);
+    let ids: Vec<i64> = table
+        .prefix_candidates("a")
+        .into_iter()
+        .map(|index| table.active_entry(index).id)
+        .collect();
+    assert_eq!(ids, vec![5, 2, 4, 3]);
 }
 
 #[test]
@@ -564,6 +748,155 @@ fn name_table_replaces_entries_for_dirty_paths() {
 }
 
 #[test]
+fn name_table_repeated_segments_shadow_then_tombstone_one_path() {
+    let table = NameTable::build_with_paths(vec![
+        (
+            1,
+            "old_name".to_string(),
+            false,
+            "src/a.c".to_string(),
+            "function".to_string(),
+            false,
+        ),
+        (
+            2,
+            "keep_name".to_string(),
+            false,
+            "src/b.c".to_string(),
+            "function".to_string(),
+            false,
+        ),
+    ]);
+    let paths = std::collections::HashSet::from(["src/a.c".to_string()]);
+    let first = table.with_updated_paths(
+        &paths,
+        vec![(
+            3,
+            "first_delta".to_string(),
+            false,
+            "src/a.c".to_string(),
+            "function".to_string(),
+            false,
+        )],
+    );
+    let second = first.with_updated_paths(
+        &paths,
+        vec![(
+            4,
+            "second_delta".to_string(),
+            false,
+            "src/a.c".to_string(),
+            "function".to_string(),
+            false,
+        )],
+    );
+    assert_eq!(second.len(), 2);
+    assert!(second.search("old", 10).is_empty());
+    assert!(second.search("first", 10).is_empty());
+    assert_eq!(second.search("second", 10), vec![4]);
+    assert_eq!(second.search("keep", 10), vec![2]);
+
+    let deleted = second.with_updated_paths(&paths, vec![]);
+    assert_eq!(deleted.len(), 1);
+    assert!(deleted.search("second", 10).is_empty());
+    assert_eq!(deleted.search("keep", 10), vec![2]);
+    assert_eq!(deleted.delta_segment_count(), 3);
+}
+
+#[test]
+fn name_table_segmented_prefix_and_narrowing_match_cold_search() {
+    let table = NameTable::build_with_paths(vec![
+        (
+            1,
+            "foo_base".to_string(),
+            false,
+            "src/base.c".to_string(),
+            "function".to_string(),
+            false,
+        ),
+        (
+            2,
+            "old_delta".to_string(),
+            false,
+            "src/changed.c".to_string(),
+            "function".to_string(),
+            false,
+        ),
+    ]);
+    let paths = std::collections::HashSet::from(["src/changed.c".to_string()]);
+    let table = table.with_updated_paths(
+        &paths,
+        vec![(
+            3,
+            "foo_delta".to_string(),
+            false,
+            "src/changed.c".to_string(),
+            "function".to_string(),
+            false,
+        )],
+    );
+    let mut prefix_ids: Vec<i64> = table
+        .prefix_candidates("foo")
+        .into_iter()
+        .map(|index| table.active_entry(index).id)
+        .collect();
+    prefix_ids.sort_unstable();
+    assert_eq!(prefix_ids, vec![1, 3]);
+
+    let (_, pool) = table.search_ranked_scoped_pooled("fo", 10, None, None);
+    let narrowed = table
+        .search_ranked_scoped_pooled("foo", 10, None, Some(&pool))
+        .0;
+    let cold = table.search_ranked_scoped_pooled("foo", 10, None, None).0;
+    assert_eq!(narrowed, cold);
+    assert!(cold.iter().all(|hit| hit.id != 2));
+}
+
+#[test]
+fn name_table_compaction_preserves_active_results_and_removes_segments() {
+    let mut table = NameTable::build_with_paths(vec![
+        (
+            1,
+            "base_name".to_string(),
+            false,
+            "src/base.c".to_string(),
+            "function".to_string(),
+            false,
+        ),
+        (
+            2,
+            "changed_0".to_string(),
+            false,
+            "src/changed.c".to_string(),
+            "function".to_string(),
+            false,
+        ),
+    ]);
+    let paths = std::collections::HashSet::from(["src/changed.c".to_string()]);
+    for revision in 1..=64 {
+        table = table.with_updated_paths(
+            &paths,
+            vec![(
+                2 + revision,
+                format!("changed_{revision}"),
+                false,
+                "src/changed.c".to_string(),
+                "function".to_string(),
+                false,
+            )],
+        );
+    }
+    assert!(table.needs_compaction());
+    let before = table.search_ranked("changed", 10);
+    let compacted = table.compacted();
+    assert_eq!(compacted.delta_segment_count(), 0);
+    assert!(!compacted.needs_compaction());
+    assert_eq!(compacted.len(), 2);
+    assert_eq!(compacted.search_ranked("changed", 10), before);
+    assert_eq!(compacted.search("base", 10), vec![1]);
+}
+
+#[test]
 fn identifier_completion_starts_at_one_character() {
     assert_eq!(MIN_PREFIX_LEN, 1);
 }
@@ -710,8 +1043,8 @@ fn build_table_and_scope_with_options(
     crate::indexer::index_workspace(dir, options, |_| {}).expect("index");
 
     let store = crate::store::IndexStore::open_readonly(&db).expect("readonly");
-    let names = store.load_symbol_names_with_paths().expect("names");
-    let table = NameTable::build_with_paths(names);
+    let table = NameTable::build_from_store_view(&store.name_table_view(), None)
+        .expect("streamed name table");
 
     let edges = store.load_include_edge_paths().expect("edges");
     let unresolved: Vec<String> = store.open_include_file_paths().unwrap_or_default();
@@ -719,6 +1052,61 @@ fn build_table_and_scope_with_options(
     let graph = crate::reachability::ReachGraph::new(edges, unresolved, ambiguous);
 
     (table, graph)
+}
+
+#[test]
+fn streamed_name_index_matches_typed_row_builder_with_project_context() {
+    use crate::project_context::{ProjectContext, ProjectContextIndex, ProjectKey};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+    for (path, source) in [
+        (
+            "app/src/main.c",
+            "#define APP_FLAG 1\nint project_api(void) { return APP_FLAG; }\n",
+        ),
+        ("other/helper.c", "int helper_api(void) { return 2; }\n"),
+    ] {
+        let absolute = dir.path().join(path);
+        std::fs::create_dir_all(absolute.parent().expect("parent")).expect("mkdir");
+        std::fs::write(absolute, source).expect("write source");
+    }
+    let options = crate::indexer::IndexOptions {
+        db_path: Some(db.clone()),
+        ..Default::default()
+    };
+    crate::indexer::index_workspace(dir.path(), options, |_| {}).expect("index");
+    let store = crate::store::IndexStore::open_readonly(&db).expect("readonly");
+    let key = ProjectKey {
+        workspace_root_id: "root".to_string(),
+        project_path: "app".to_string(),
+    };
+    let projects = ProjectContextIndex::new(
+        "root".to_string(),
+        "workspace".to_string(),
+        vec![ProjectContext {
+            key: key.clone(),
+            workspace_name: "workspace".to_string(),
+            marker_files: vec!["app/Makefile".to_string()],
+        }],
+    );
+
+    let legacy = NameTable::build_from_rows_with_project_context(
+        store.name_table_view().symbol_rows().expect("typed rows"),
+        Some(&projects),
+    );
+    let streamed = NameTable::build_from_store_view(&store.name_table_view(), Some(&projects))
+        .expect("streamed rows");
+
+    assert_eq!(streamed.len(), legacy.len());
+    for query in ["api", "APP", "helper", "project"] {
+        assert_eq!(
+            streamed.search_ranked(query, 100),
+            legacy.search_ranked(query, 100),
+            "streamed and typed-row builders diverged for {query}"
+        );
+    }
+    assert_eq!(streamed.project_indices(&key), legacy.project_indices(&key));
 }
 
 #[test]

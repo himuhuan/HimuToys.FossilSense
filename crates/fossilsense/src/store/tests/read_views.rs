@@ -50,6 +50,23 @@ fn name_table_read_view_exposes_typed_symbol_rows_and_legacy_wrapper_parity() {
     assert_eq!(path_rows.len(), 1);
     assert_eq!(path_rows[0].label, "main_entry");
 
+    let mut visited = Vec::new();
+    let visited_count = reader
+        .name_table_view()
+        .visit_symbol_rows(|row| {
+            visited.push((
+                row.symbol_id,
+                row.label.to_string(),
+                row.external,
+                row.path.to_string(),
+                row.kind.to_string(),
+                row.directly_included,
+            ));
+            Ok(())
+        })
+        .expect("visit rows");
+    assert_eq!(visited_count, rows.len());
+
     let view_tuples: Vec<_> = rows
         .into_iter()
         .map(crate::store::views::NameTableSymbolRow::into_legacy_tuple)
@@ -61,6 +78,7 @@ fn name_table_read_view_exposes_typed_symbol_rows_and_legacy_wrapper_parity() {
             .expect("compat wrapper"),
         "compatibility wrapper must preserve the old tuple shape and ordering"
     );
+    assert_eq!(visited, view_tuples);
 }
 
 #[test]

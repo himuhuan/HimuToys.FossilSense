@@ -103,6 +103,30 @@ impl LspProcess {
         }
     }
 
+    #[cfg(windows)]
+    fn private_bytes(&self) -> Option<u64> {
+        let output = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!(
+                    "(Get-Process -Id {} -ErrorAction Stop).PrivateMemorySize64",
+                    self.child.id()
+                ),
+            ])
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().parse().ok())?
+    }
+
+    #[cfg(not(windows))]
+    fn private_bytes(&self) -> Option<u64> {
+        None
+    }
+
     fn recv_until(&mut self, deadline: Instant, label: &str) -> Result<Value> {
         let now = Instant::now();
         if now >= deadline {
@@ -750,6 +774,50 @@ fn lsp_smoke_completion_definition_and_references() -> Result<()> {
         "helper should see an incoming call from another unsaved open document, got {incoming}"
     );
 
+    let overlay_private_before = lsp.private_bytes();
+    for revision in 2..=101 {
+        let has_call = revision % 2 == 0;
+        let text = if has_call {
+            "int live_caller(void) { helper(0); return 0; }\n"
+        } else {
+            "int live_caller(void) { return 0; }\n"
+        };
+        lsp.notify(
+            "textDocument/didChange",
+            json!({
+                "textDocument": { "uri": live_uri, "version": revision },
+                "contentChanges": [{ "text": text }]
+            }),
+        )?;
+        let incoming_id = lsp.request(
+            "callHierarchy/incomingCalls",
+            json!({ "item": helper_item }),
+        )?;
+        let edited_incoming = lsp.wait_response(incoming_id, Duration::from_secs(10))?;
+        let sees_live = edited_incoming.as_array().is_some_and(|items| {
+            items.iter().any(|call| {
+                call.get("from")
+                    .and_then(|item| item.get("name"))
+                    .and_then(Value::as_str)
+                    == Some("live_caller")
+            })
+        });
+        assert_eq!(
+            sees_live, has_call,
+            "overlay revision {revision} must shadow the base file without stale relations"
+        );
+    }
+    if let (Some(before), Some(after)) = (overlay_private_before, lsp.private_bytes()) {
+        eprintln!(
+            "call_overlay_memory cycles=100 private_before_bytes={before} private_after_bytes={after} delta_bytes={}",
+            after.saturating_sub(before)
+        );
+        assert!(
+            after <= before + 32 * 1024 * 1024,
+            "100 overlay edit/query cycles retained too much private memory: before={before}, after={after}"
+        );
+    }
+
     let rich_id = lsp.request(
         "workspace/executeCommand",
         json!({
@@ -758,7 +826,8 @@ fn lsp_smoke_completion_definition_and_references() -> Result<()> {
         }),
     )?;
     let rich = lsp.wait_response(rich_id, Duration::from_secs(10))?;
-    assert_eq!(rich.get("protocolVersion").and_then(Value::as_u64), Some(1));
+    assert_eq!(rich.get("protocolVersion").and_then(Value::as_u64), Some(2));
+    assert!(rich.get("entities").is_some());
     assert_eq!(rich.get("complete").and_then(Value::as_bool), Some(true));
     assert_eq!(
         rich.get("budgetState").and_then(Value::as_str),

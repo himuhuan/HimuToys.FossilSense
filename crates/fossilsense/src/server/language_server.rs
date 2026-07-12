@@ -929,7 +929,6 @@ impl LanguageServer for Backend {
                 .await;
         } else {
             self.session.cache.invalidate_references();
-            self.session.cache.invalidate_relation_overlays().await;
         }
         self.client
             .log_message(

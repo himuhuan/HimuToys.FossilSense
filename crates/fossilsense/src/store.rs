@@ -104,6 +104,7 @@ pub struct FileIndexUpdate<'a> {
 pub struct IndexStore {
     conn: Connection,
     legacy_full_build: Option<IndexBuild>,
+    bulk_call_string_ids: Option<HashMap<String, i64>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,6 +187,30 @@ fn include_normalized_metadata(target_text: &str) -> (&'static str, String, Stri
 
 impl IndexStore {
     pub fn open(path: &Path, workspace_root: &Path) -> Result<Self> {
+        Self::open_with_call_indexes(path, workspace_root, true)
+    }
+
+    /// Open a full-build destination without maintaining the large call-fact
+    /// secondary indexes while facts are inserted. The destination must not be
+    /// visible to request readers until [`finalize_full_build_indexes`] returns.
+    pub fn open_for_full_rebuild(path: &Path, workspace_root: &Path) -> Result<Self> {
+        let new_database = !path.exists();
+        let mut store = Self::open_with_call_indexes(path, workspace_root, false)?;
+        if new_database {
+            store.bulk_call_string_ids = Some(HashMap::new());
+        } else {
+            store
+                .conn
+                .execute_batch(schema::CREATE_CALL_STRING_INDEX_SQL)?;
+        }
+        Ok(store)
+    }
+
+    fn open_with_call_indexes(
+        path: &Path,
+        workspace_root: &Path,
+        create_call_indexes: bool,
+    ) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).with_context(|| {
                 format!("failed to create index directory {}", parent.display())
@@ -201,9 +226,45 @@ impl IndexStore {
         let store = Self {
             conn,
             legacy_full_build: None,
+            bulk_call_string_ids: None,
         };
-        store.migrate(workspace_root)?;
+        store.migrate(workspace_root, create_call_indexes)?;
+        if !create_call_indexes {
+            store
+                .conn
+                .execute_batch(schema::DROP_CALL_LOOKUP_INDEXES_SQL)?;
+        }
         Ok(store)
+    }
+
+    pub fn finalize_full_build_indexes(&mut self) -> Result<()> {
+        self.bulk_call_string_ids.take();
+        self.conn
+            .execute_batch(schema::CREATE_CALL_LOOKUP_INDEXES_SQL)?;
+        self.conn.execute_batch(
+            "ANALYZE callable_anchor_facts;
+             ANALYZE call_site_facts;
+             PRAGMA optimize;",
+        )?;
+        Ok(())
+    }
+
+    /// Validate and checkpoint a side-by-side database before its file name can
+    /// become visible through the active manifest.
+    pub fn prepare_full_build_publication(&self) -> Result<()> {
+        let check: String = self
+            .conn
+            .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
+        anyhow::ensure!(check == "ok", "SQLite quick_check failed: {check}");
+        let mut foreign_key_check = self.conn.prepare("PRAGMA foreign_key_check")?;
+        anyhow::ensure!(
+            !foreign_key_check.exists([])?,
+            "SQLite foreign_key_check reported a violation"
+        );
+        drop(foreign_key_check);
+        self.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        Ok(())
     }
 
     /// Open an existing index for read-only queries (no schema migration).
@@ -220,7 +281,22 @@ impl IndexStore {
         Ok(Self {
             conn,
             legacy_full_build: None,
+            bulk_call_string_ids: None,
         })
+    }
+
+    pub fn has_current_schema(path: &Path) -> Result<bool> {
+        let store = Self::open_readonly(path)?;
+        let version: Option<i64> = store
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|value| value.parse().ok());
+        Ok(version == Some(schema::SCHEMA_VERSION))
     }
 
     /// Execute one durable read inside a SQLite snapshot pinned to the semantic
@@ -436,7 +512,12 @@ impl IndexStore {
         build: IndexBuild,
         updates: &[FileIndexUpdate<'_>],
     ) -> Result<()> {
-        writes::stage_file_updates(&mut self.conn, build, updates)
+        writes::stage_file_updates(
+            &mut self.conn,
+            build,
+            updates,
+            self.bulk_call_string_ids.as_mut(),
+        )
     }
 
     #[allow(dead_code)]
@@ -487,7 +568,7 @@ impl IndexStore {
             .context("failed to count symbols")
     }
 
-    fn migrate(&self, workspace_root: &Path) -> Result<()> {
+    fn migrate(&self, workspace_root: &Path, create_call_indexes: bool) -> Result<()> {
         // Ensure the meta table exists, then drop the data tables when the stored
         // schema version differs so the next index pass repopulates with the new
         // shape (e.g. the `container` column / `type_aliases` table).
@@ -541,6 +622,9 @@ impl IndexStore {
 
         self.conn.execute_batch(schema::CREATE_SCHEMA_SQL)?;
         self.create_lookup_indexes()?;
+        if create_call_indexes {
+            self.create_call_lookup_indexes()?;
+        }
 
         self.conn.execute(
             "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
@@ -561,6 +645,12 @@ impl IndexStore {
 
     fn create_lookup_indexes(&self) -> Result<()> {
         self.conn.execute_batch(schema::CREATE_LOOKUP_INDEXES_SQL)?;
+        Ok(())
+    }
+
+    fn create_call_lookup_indexes(&self) -> Result<()> {
+        self.conn
+            .execute_batch(schema::CREATE_CALL_LOOKUP_INDEXES_SQL)?;
         Ok(())
     }
 
@@ -588,7 +678,6 @@ impl IndexStore {
         views::MemberStoreView::new(self)
     }
 
-    #[allow(dead_code)] // Consumed by the relation catalog in the next stage.
     pub fn call_fact_view(&self) -> views::CallFactStoreView<'_> {
         views::CallFactStoreView::new(self)
     }

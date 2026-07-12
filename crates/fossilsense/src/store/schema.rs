@@ -1,7 +1,6 @@
-// Version 14 preserves complete UTF-16 declaration/body ranges for callable
-// anchors. All semantic read names remain SQL views, so a SQLite read
-// transaction sees one complete generation while the next is staged.
-pub(crate) const SCHEMA_VERSION: i64 = 14;
+// Version 15 interns repeated call strings, stores digests as BLOBs, uses
+// integer enums/flags, and relates sites to compact caller anchor IDs.
+pub(crate) const SCHEMA_VERSION: i64 = 15;
 
 pub(crate) const DROP_DATA_TABLES_SQL: &str = "
     DROP TABLE IF EXISTS pending_file_revisions;
@@ -10,6 +9,7 @@ pub(crate) const DROP_DATA_TABLES_SQL: &str = "
     DROP TABLE IF EXISTS type_alias_facts;
     DROP TABLE IF EXISTS call_site_facts;
     DROP TABLE IF EXISTS callable_anchor_facts;
+    DROP TABLE IF EXISTS call_strings;
     DROP TABLE IF EXISTS member_facts;
     DROP TABLE IF EXISTS record_facts;
     DROP TABLE IF EXISTS include_edges;
@@ -166,26 +166,31 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
         confidence TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS call_strings (
+        id INTEGER PRIMARY KEY,
+        text TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS callable_anchor_facts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id INTEGER PRIMARY KEY,
         revision_id INTEGER NOT NULL REFERENCES file_revisions(id) ON DELETE CASCADE,
         file_id INTEGER NOT NULL REFERENCES file_entries(id) ON DELETE CASCADE,
-        entity_key TEXT NOT NULL,
-        anchor_fingerprint TEXT NOT NULL,
-        name TEXT NOT NULL,
-        qualified_name TEXT NOT NULL,
-        owner TEXT,
-        owner_kind TEXT,
-        kind TEXT NOT NULL,
-        role TEXT NOT NULL,
-        linkage_kind TEXT NOT NULL,
-        linkage_file TEXT,
-        signature TEXT NOT NULL,
+        entity_digest BLOB NOT NULL CHECK(typeof(entity_digest) = 'blob' AND length(entity_digest) = 12),
+        anchor_digest BLOB NOT NULL CHECK(typeof(anchor_digest) = 'blob' AND length(anchor_digest) = 12),
+        name_id INTEGER NOT NULL REFERENCES call_strings(id),
+        qualified_name_id INTEGER NOT NULL REFERENCES call_strings(id),
+        owner_id INTEGER REFERENCES call_strings(id),
+        owner_kind INTEGER CHECK(owner_kind IS NULL OR owner_kind IN (0, 1, 2)),
+        kind INTEGER NOT NULL CHECK(kind IN (0, 1, 2, 3)),
+        role INTEGER NOT NULL CHECK(role IN (0, 1, 2)),
+        linkage_kind INTEGER NOT NULL CHECK(linkage_kind IN (0, 1, 2)),
+        linkage_file_id INTEGER REFERENCES call_strings(id),
+        signature_id INTEGER NOT NULL REFERENCES call_strings(id),
         min_arity INTEGER,
         max_arity INTEGER,
-        variadic INTEGER NOT NULL,
-        name_start_byte INTEGER NOT NULL,
-        name_end_byte INTEGER NOT NULL,
+        variadic INTEGER NOT NULL CHECK(variadic IN (0, 1)),
+        name_start_byte INTEGER NOT NULL CHECK(name_start_byte >= 0),
+        name_end_byte INTEGER NOT NULL CHECK(name_end_byte >= name_start_byte),
         name_start_line INTEGER NOT NULL,
         name_start_col INTEGER NOT NULL,
         name_end_line INTEGER NOT NULL,
@@ -202,36 +207,29 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
         body_start_col INTEGER,
         body_end_line INTEGER,
         body_end_col INTEGER,
-        guard TEXT,
-        provenance TEXT NOT NULL,
-        syntax_error_overlap INTEGER NOT NULL
+        guard_id INTEGER REFERENCES call_strings(id),
+        flags INTEGER NOT NULL CHECK((flags & 255) IN (0, 1, 2) AND (flags & -512) = 0)
     );
 
     CREATE TABLE IF NOT EXISTS call_site_facts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id INTEGER PRIMARY KEY,
         revision_id INTEGER NOT NULL REFERENCES file_revisions(id) ON DELETE CASCADE,
         file_id INTEGER NOT NULL REFERENCES file_entries(id) ON DELETE CASCADE,
-        caller_entity_key TEXT NOT NULL,
-        site_fingerprint TEXT NOT NULL,
-        expression_start_byte INTEGER NOT NULL,
-        expression_end_byte INTEGER NOT NULL,
-        expression_start_line INTEGER NOT NULL,
-        expression_start_col INTEGER NOT NULL,
-        expression_end_line INTEGER NOT NULL,
-        expression_end_col INTEGER NOT NULL,
-        callee_start_byte INTEGER NOT NULL,
-        callee_end_byte INTEGER NOT NULL,
+        caller_anchor_id INTEGER NOT NULL REFERENCES callable_anchor_facts(id) ON DELETE CASCADE,
+        expression_start_byte INTEGER NOT NULL CHECK(expression_start_byte >= 0),
+        expression_end_byte INTEGER NOT NULL CHECK(expression_end_byte >= expression_start_byte),
+        callee_start_byte INTEGER NOT NULL CHECK(callee_start_byte >= expression_start_byte),
+        callee_end_byte INTEGER NOT NULL CHECK(callee_end_byte >= callee_start_byte AND callee_end_byte <= expression_end_byte),
         callee_start_line INTEGER NOT NULL,
         callee_start_col INTEGER NOT NULL,
         callee_end_line INTEGER NOT NULL,
         callee_end_col INTEGER NOT NULL,
-        callee_name TEXT,
-        qualified_name TEXT,
-        call_form TEXT NOT NULL,
+        callee_name_id INTEGER REFERENCES call_strings(id),
+        qualified_name_id INTEGER REFERENCES call_strings(id),
+        call_form INTEGER NOT NULL CHECK(call_form BETWEEN 0 AND 9),
         argument_count INTEGER,
-        guard TEXT,
-        provenance TEXT NOT NULL,
-        syntax_error_overlap INTEGER NOT NULL
+        guard_id INTEGER REFERENCES call_strings(id),
+        flags INTEGER NOT NULL CHECK((flags & 255) IN (0, 1, 2) AND (flags & -512) = 0)
     );
 
     CREATE VIEW IF NOT EXISTS files AS
@@ -293,11 +291,30 @@ pub(crate) const CREATE_LOOKUP_INDEXES_SQL: &str = "
     CREATE INDEX IF NOT EXISTS idx_include_facts_target_basename ON include_facts(target_basename);
     CREATE INDEX IF NOT EXISTS idx_include_facts_target_normalized ON include_facts(target_normalized);
     CREATE INDEX IF NOT EXISTS idx_include_facts_file_id ON include_facts(file_id);
-    CREATE INDEX IF NOT EXISTS idx_callable_anchor_name ON callable_anchor_facts(name);
-    CREATE INDEX IF NOT EXISTS idx_callable_anchor_qualified_name ON callable_anchor_facts(qualified_name);
-    CREATE INDEX IF NOT EXISTS idx_callable_anchor_entity_key ON callable_anchor_facts(entity_key);
+";
+
+pub(crate) const CREATE_CALL_LOOKUP_INDEXES_SQL: &str = "
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_call_strings_text ON call_strings(text);
+    CREATE INDEX IF NOT EXISTS idx_callable_anchor_name ON callable_anchor_facts(name_id);
+    CREATE INDEX IF NOT EXISTS idx_callable_anchor_qualified_name ON callable_anchor_facts(qualified_name_id);
+    CREATE INDEX IF NOT EXISTS idx_callable_anchor_entity_key ON callable_anchor_facts(entity_digest);
     CREATE INDEX IF NOT EXISTS idx_callable_anchor_revision ON callable_anchor_facts(revision_id);
-    CREATE INDEX IF NOT EXISTS idx_call_site_caller ON call_site_facts(caller_entity_key);
-    CREATE INDEX IF NOT EXISTS idx_call_site_callee_arity ON call_site_facts(callee_name, argument_count);
+    CREATE INDEX IF NOT EXISTS idx_call_site_caller ON call_site_facts(caller_anchor_id);
+    CREATE INDEX IF NOT EXISTS idx_call_site_callee_arity ON call_site_facts(callee_name_id, argument_count);
     CREATE INDEX IF NOT EXISTS idx_call_site_revision ON call_site_facts(revision_id);
+";
+
+pub(crate) const CREATE_CALL_STRING_INDEX_SQL: &str = "
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_call_strings_text ON call_strings(text);
+";
+
+pub(crate) const DROP_CALL_LOOKUP_INDEXES_SQL: &str = "
+    DROP INDEX IF EXISTS idx_call_strings_text;
+    DROP INDEX IF EXISTS idx_callable_anchor_name;
+    DROP INDEX IF EXISTS idx_callable_anchor_qualified_name;
+    DROP INDEX IF EXISTS idx_callable_anchor_entity_key;
+    DROP INDEX IF EXISTS idx_callable_anchor_revision;
+    DROP INDEX IF EXISTS idx_call_site_caller;
+    DROP INDEX IF EXISTS idx_call_site_callee_arity;
+    DROP INDEX IF EXISTS idx_call_site_revision;
 ";

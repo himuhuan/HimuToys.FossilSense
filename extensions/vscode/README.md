@@ -7,14 +7,13 @@ native Rust indexing engine - no external tools (ctags / cscope / clangd) requir
 This VSIX is self-contained: the `fossilsense` engine binary ships inside the
 extension's `bin/` folder.
 
-v1.3.4 focuses on beautiful comment rendering for Hover, completion
-documentation, and Signature Help. Leading, inline-leading, and unambiguous
-trailing comments are attributed best-effort, then rendered as Markdown with
-Doxygen/XML parameter and return sections when present. Structured completion
-items load docs through `completionItem/resolve` so typing stays off the
-per-keystroke disk path. When a discovered project has compatible `.h` / `.c`
-pairs, documentation prefers the header while ordinary jumps and call relations
-keep the source definition as the implementation target.
+v1.4.0 focuses on predictable large-workspace cost. Call relations are resolved
+lazily from compact schema-15 facts with explicit scan, candidate, time, site,
+and relation budgets; open-document overlays shadow only their own files instead
+of copying the workspace graph. Full rebuilds publish side-by-side database
+generations, while the segmented compact name index keeps single-file saves off
+the all-symbol clone/sort path. Result confidence, ambiguity, coverage, and
+truncation remain explicit best-effort evidence.
 
 ## Current Capability
 
@@ -24,7 +23,10 @@ keep the source definition as the implementation target.
   native Relation Panel views. The first switches between incoming/outgoing targets;
   selecting one navigates to it and populates the second view with exact call
   sites, confidence, evidence, coverage, and budget state. Unsaved calls from
-  every open document in the workspace participate. Member calls, function
+  every open document in the workspace participate without copying the base
+  call graph. Large/high-ambiguity results are explicitly partial: the panel
+  shows the scan/page/site budget reason and offers continuation when a stable
+  next page exists. Member calls, function
   pointers, callable objects, macros, templates, and overload binding remain
   explicit unresolved/unsupported evidence rather than fabricated targets.
 - Find All References: searches the workspace for whole-word textual matches of

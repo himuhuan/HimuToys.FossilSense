@@ -1,5 +1,6 @@
 mod call_catalog;
 mod call_model;
+mod call_service;
 mod coloring;
 mod completion;
 mod completion_history;
@@ -34,10 +35,27 @@ use crate::store::IndexStore;
 
 #[derive(Debug, Parser)]
 #[command(name = "fossilsense")]
+#[command(version)]
 #[command(about = "FossilSense best-effort C/C++ navigation and analysis")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use clap::{error::ErrorKind, Parser};
+
+    use super::Cli;
+
+    #[test]
+    fn version_flag_reports_the_crate_version() {
+        let error = Cli::try_parse_from(["fossilsense", "--version"])
+            .expect_err("--version exits after printing version information");
+
+        assert_eq!(error.kind(), ErrorKind::DisplayVersion);
+        assert!(error.to_string().contains(env!("CARGO_PKG_VERSION")));
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -182,6 +200,8 @@ async fn main() -> Result<()> {
             println!("write_ms: {}", stats.write_ms);
             println!("check_ms: {}", stats.check_ms);
             println!("include_edge_ms: {}", stats.include_edge_ms);
+            println!("secondary_index_ms: {}", stats.secondary_index_ms);
+            println!("publication_ms: {}", stats.publication_ms);
             println!("name_table_ms: {}", stats.name_table_ms);
             println!("reach_graph_ms: {}", stats.reach_graph_ms);
             if let Some(warning) = &stats.maintenance_warning {
@@ -217,7 +237,7 @@ fn run_query(kind: QueryCommand) -> Result<()> {
         } => {
             let db_path = resolve_db_path(db, &workspace)?;
             let store = IndexStore::open_readonly(&db_path)?;
-            let table = query::NameTable::build_from_rows(store.name_table_view().symbol_rows()?);
+            let table = query::NameTable::build_from_store_view(&store.name_table_view(), None)?;
             let ids: Vec<i64> = table.search(&text, query::WORKSPACE_SYMBOL_LIMIT);
             let records = store.symbol_read_view().symbols_by_ids(&ids)?;
 
@@ -306,28 +326,31 @@ fn run_query(kind: QueryCommand) -> Result<()> {
             db,
         } => {
             let db_path = resolve_db_path(db, &workspace)?;
-            let store = IndexStore::open_readonly(&db_path)?;
             let build_started = Instant::now();
-            let view = store.call_fact_view();
-            let catalog = call_catalog::RelationCatalog::build_from_view(&view)?;
-            let catalog_stats = catalog.stats();
-            let catalog_ms = build_started.elapsed().as_millis();
+            let handle = call_service::CallReadHandle::capture(db_path)?;
             let rel = pathing::normalize_path_string(&file);
             let position = call_model::SourcePosition {
                 line: line.checked_sub(1).context("line is 1-based")? as u32,
                 character: col.checked_sub(1).context("column is 1-based")? as u32,
             };
-            let entity = catalog
-                .entity_at(&rel, position)
-                .with_context(|| format!("no callable at {}:{line}:{col}", file.display()))?;
-            let entity_key = entity.entity_key.clone();
             let query_started = Instant::now();
-            let relations = if incoming {
-                catalog.incoming(&entity_key)
+            let direction = if incoming {
+                call_model::RelationDirection::Incoming
             } else {
-                catalog.outgoing(&entity_key)
+                call_model::RelationDirection::Outgoing
             };
+            let (query_index, entity_key, page) = call_service::CallRelationService::new(&handle)
+                .query_at(&rel, position, direction, 0, 200, 200)
+                .with_context(|| format!("no callable at {}:{line}:{col}", file.display()))?;
+            let entity = query_index
+                .entity(&entity_key)
+                .context("resolved callable missing")?;
+            let relation_total_in_scan = page.total;
+            let scan_limited = page.scan_limited;
+            let relations = page.relations;
             let query_us = query_started.elapsed().as_micros();
+            let relation_query_ms = build_started.elapsed().as_millis();
+            let query_stats = query_index.stats();
             println!(
                 "call_relations: {}",
                 if incoming { "incoming" } else { "outgoing" }
@@ -355,16 +378,21 @@ fn run_query(kind: QueryCommand) -> Result<()> {
                 );
             }
             println!("relations: {}", relations.len());
-            println!("catalog_entities: {}", catalog_stats.entities);
-            println!("catalog_call_sites: {}", catalog_stats.call_sites);
-            println!("catalog_relations: {}", catalog_stats.relations);
+            println!("relations_total_in_scan: {relation_total_in_scan}");
+            println!("scan_limited: {scan_limited}");
+            println!("relation_query_entities: {}", query_stats.entities);
+            println!("relation_query_call_sites: {}", query_stats.call_sites);
+            println!("relation_query_relations: {}", query_stats.relations);
             println!(
-                "catalog_call_site_refs: {}",
-                catalog_stats.relation_call_site_refs
+                "relation_query_call_site_refs: {}",
+                query_stats.relation_call_site_refs
             );
-            println!("catalog_build_ms: {catalog_ms}");
+            println!("relation_query_ms: {relation_query_ms}");
             println!("query_us: {query_us}");
-            println!("coverage: {}", serde_json::to_string(catalog.coverage())?);
+            println!(
+                "coverage: {}",
+                serde_json::to_string(query_index.coverage())?
+            );
             for relation in relations {
                 let target = relation
                     .callee

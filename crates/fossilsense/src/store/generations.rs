@@ -38,6 +38,23 @@ impl IndexStore {
         Ok(value.and_then(|value| value.parse().ok()).unwrap_or(0))
     }
 
+    /// Seed a fresh side-by-side database with the last published generation so
+    /// its first build advances monotonically across database files.
+    pub fn seed_semantic_generation(&self, generation: u64) -> Result<()> {
+        let revisions: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM file_revisions", [], |row| row.get(0))?;
+        anyhow::ensure!(
+            revisions == 0,
+            "semantic generation can only be seeded in an empty database"
+        );
+        self.conn.execute(
+            "UPDATE meta SET value = ?1 WHERE key = 'semantic_generation'",
+            [generation.to_string()],
+        )?;
+        Ok(())
+    }
+
     pub fn begin_semantic_read(
         &self,
         expected_generation: Option<u64>,
@@ -228,7 +245,7 @@ impl IndexStore {
         )?;
         tx.commit()?;
         let cleanup_warning = self
-            .collect_inactive_revisions()
+            .collect_inactive_revisions(build.full_rebuild)
             .err()
             .map(|error| format!("post-publication cleanup failed: {error:#}"));
         Ok(IndexCommitOutcome {
@@ -237,7 +254,7 @@ impl IndexStore {
         })
     }
 
-    fn collect_inactive_revisions(&mut self) -> Result<()> {
+    fn collect_inactive_revisions(&mut self, collect_call_strings: bool) -> Result<()> {
         self.conn.execute(
             "DELETE FROM file_revisions
              WHERE id NOT IN (SELECT revision_id FROM active_file_revisions)
@@ -252,6 +269,22 @@ impl IndexStore {
                AND id NOT IN (SELECT file_id FROM pending_file_revisions)",
             [],
         )?;
+        if collect_call_strings {
+            self.conn.execute(
+                "DELETE FROM call_strings WHERE id NOT IN (
+                    SELECT name_id FROM callable_anchor_facts
+                    UNION SELECT qualified_name_id FROM callable_anchor_facts
+                    UNION SELECT owner_id FROM callable_anchor_facts WHERE owner_id IS NOT NULL
+                    UNION SELECT linkage_file_id FROM callable_anchor_facts WHERE linkage_file_id IS NOT NULL
+                    UNION SELECT signature_id FROM callable_anchor_facts
+                    UNION SELECT guard_id FROM callable_anchor_facts WHERE guard_id IS NOT NULL
+                    UNION SELECT callee_name_id FROM call_site_facts WHERE callee_name_id IS NOT NULL
+                    UNION SELECT qualified_name_id FROM call_site_facts WHERE qualified_name_id IS NOT NULL
+                    UNION SELECT guard_id FROM call_site_facts WHERE guard_id IS NOT NULL
+                 )",
+                [],
+            )?;
+        }
         Ok(())
     }
 }

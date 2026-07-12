@@ -1,13 +1,13 @@
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tower_lsp::lsp_types::MessageType;
 use tower_lsp::Client;
 
-use crate::call_catalog::RelationCatalog;
 use crate::call_model::SemanticGeneration;
+use crate::call_service::CallReadHandle;
 use crate::pathing;
 use crate::progress::DegradedCapabilities;
 use crate::project_context::{self, ProjectContextIndex};
@@ -39,10 +39,7 @@ async fn rebuild_name_table(
     let built = tokio::task::spawn_blocking(move || -> Result<NameTable> {
         let db_path = pathing::default_index_path(&root)?;
         let store = IndexStore::open_readonly(&db_path)?;
-        Ok(NameTable::build_from_rows_with_project_context(
-            store.name_table_view().symbol_rows()?,
-            project_context.as_deref(),
-        ))
+        NameTable::build_from_store_view(&store.name_table_view(), project_context.as_deref())
     })
     .await;
 
@@ -53,33 +50,14 @@ async fn rebuild_name_table(
     }
 }
 
-async fn rebuild_relation_catalog(root: PathBuf) -> Result<Arc<RelationCatalog>> {
-    let built = tokio::task::spawn_blocking(move || -> Result<RelationCatalog> {
-        let db_path = pathing::default_index_path(&root)?;
-        let store = IndexStore::open_readonly(&db_path)?;
-        let view = store.call_fact_view();
-        RelationCatalog::build_from_view(&view)
-    })
-    .await?;
-    built.map(Arc::new)
-}
-
-async fn rebuild_relation_catalog_or_degrade(
-    client: &Client,
-    root: PathBuf,
-) -> Option<Arc<RelationCatalog>> {
-    match rebuild_relation_catalog(root).await {
-        Ok(catalog) => Some(catalog),
-        Err(error) => {
-            client
-                .log_message(
-                    MessageType::WARNING,
-                    format!("call relation catalog build failed: {error:#}"),
-                )
-                .await;
-            None
-        }
-    }
+fn capture_call_read_handle(
+    root: &Path,
+    generation: SemanticGeneration,
+) -> Result<Arc<CallReadHandle>> {
+    Ok(Arc::new(CallReadHandle::at_generation(
+        pathing::default_index_path(root)?,
+        generation,
+    )))
 }
 
 async fn update_name_table_paths(
@@ -357,14 +335,14 @@ impl CacheLedger {
         let name_table = rebuild_name_table(root.clone(), project_context.clone()).await?;
         let symbol_count = name_table.len();
         let name_table_ms = nt_started.elapsed().as_millis();
-        let relation_catalog = rebuild_relation_catalog_or_degrade(client, root.clone()).await;
+        let call_read_handle = capture_call_read_handle(&root, semantic_generation)?;
 
         let rg_started = tokio::time::Instant::now();
         let reach_graph = rebuild_reach_graph(client, root.clone()).await;
         let mut degraded = DegradedCapabilities {
             reach_graph: reach_graph.is_none(),
             project_context: project_context.is_none(),
-            call_relations: relation_catalog.is_none(),
+            call_relations: false,
             ..Default::default()
         };
 
@@ -406,7 +384,7 @@ impl CacheLedger {
             include_table,
             indexed_files,
             project_context,
-            relation_catalog,
+            call_read_handle: Some(call_read_handle),
             degraded: degraded.clone(),
         })
         .await;
@@ -452,9 +430,8 @@ impl CacheLedger {
         .await?;
         let symbol_count = name_table.len();
         let name_table_ms = nt_started.elapsed().as_millis();
-        // Cross-file candidate sets can change when any callable is edited, so
-        // dirty publication rebuilds the immutable relation catalog.
-        let relation_catalog = rebuild_relation_catalog_or_degrade(client, root.clone()).await;
+        let should_compact_name_index = name_table.needs_compaction();
+        let call_read_handle = capture_call_read_handle(&root, semantic_generation)?;
 
         let rg_started = tokio::time::Instant::now();
         let reach_graph = refresh_reach_graph_incremental(
@@ -469,7 +446,7 @@ impl CacheLedger {
         let mut degraded = DegradedCapabilities {
             reach_graph: reach_graph.is_none(),
             project_context: project_context.is_none(),
-            call_relations: relation_catalog.is_none(),
+            call_relations: false,
             ..Default::default()
         };
 
@@ -511,7 +488,7 @@ impl CacheLedger {
 
         let epoch = self.allocate_engine_epoch();
         self.publish_engine_snapshot(EngineSnapshot {
-            root,
+            root: root.clone(),
             epoch,
             semantic_generation,
             name_table: Some(name_table),
@@ -519,13 +496,13 @@ impl CacheLedger {
             include_table,
             indexed_files,
             project_context,
-            relation_catalog,
+            call_read_handle: Some(call_read_handle),
             degraded: degraded.clone(),
         })
         .await;
         self.invalidate_after_index_change().await;
 
-        Ok(CachePublishReport {
+        let report = CachePublishReport {
             semantic_generation,
             symbol_count,
             include_count,
@@ -536,7 +513,94 @@ impl CacheLedger {
             epoch,
             include_table_error,
             reference_file_list_error,
+        };
+        drop(_publish_guard);
+        if should_compact_name_index {
+            self.spawn_name_index_compaction(client.clone(), root, epoch);
+        }
+        Ok(report)
+    }
+
+    fn spawn_name_index_compaction(
+        &self,
+        client: Client,
+        root: PathBuf,
+        expected_epoch: crate::server::state::EngineEpoch,
+    ) {
+        let cache = self.clone();
+        tokio::spawn(async move {
+            let started = tokio::time::Instant::now();
+            match cache
+                .compact_name_index_if_current(root.clone(), expected_epoch)
+                .await
+            {
+                Ok(true) => {
+                    client
+                        .log_message(
+                            MessageType::INFO,
+                            format!(
+                                "name index compacted for {} in {}ms",
+                                root.display(),
+                                started.elapsed().as_millis()
+                            ),
+                        )
+                        .await;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    client
+                        .log_message(
+                            MessageType::WARNING,
+                            format!("name index compaction failed: {error:#}"),
+                        )
+                        .await;
+                }
+            }
+        });
+    }
+
+    pub(in crate::server) async fn compact_name_index_if_current(
+        &self,
+        root: PathBuf,
+        expected_epoch: crate::server::state::EngineEpoch,
+    ) -> Result<bool> {
+        let Some(snapshot) = self.current_engine_snapshot(&root).await else {
+            return Ok(false);
+        };
+        if snapshot.epoch != expected_epoch {
+            return Ok(false);
+        }
+        let Some(name_table) = snapshot.name_table.clone() else {
+            return Ok(false);
+        };
+        if !name_table.needs_compaction() {
+            return Ok(false);
+        }
+        let compacted =
+            tokio::task::spawn_blocking(move || Arc::new(name_table.compacted())).await?;
+
+        let _publish_guard = self.publish_gate.lock().await;
+        let Some(current) = self.current_engine_snapshot(&root).await else {
+            return Ok(false);
+        };
+        if current.epoch != expected_epoch {
+            return Ok(false);
+        }
+        self.publish_engine_snapshot(EngineSnapshot {
+            root,
+            epoch: self.allocate_engine_epoch(),
+            semantic_generation: current.semantic_generation,
+            name_table: Some(compacted),
+            reach_graph: current.reach_graph.clone(),
+            include_table: current.include_table.clone(),
+            indexed_files: current.indexed_files.clone(),
+            project_context: current.project_context.clone(),
+            call_read_handle: current.call_read_handle.clone(),
+            degraded: current.degraded.clone(),
         })
+        .await;
+        self.clear_all_completion_memos().await;
+        Ok(true)
     }
 
     /// Refresh build-marker ownership without re-indexing or reparsing source
@@ -574,7 +638,7 @@ impl CacheLedger {
             include_table: previous.include_table.clone(),
             indexed_files: previous.indexed_files.clone(),
             project_context,
-            relation_catalog: previous.relation_catalog.clone(),
+            call_read_handle: previous.call_read_handle.clone(),
             degraded,
         })
         .await;

@@ -6,7 +6,8 @@ use anyhow::Result;
 
 use crate::config::{resolve_include_roots, WorkspaceConfig};
 use crate::pathing::{
-    canonical_workspace, default_index_path, normalize_abs_path, relative_slash_path,
+    canonical_workspace, default_index_path, default_index_staging_path, normalize_abs_path,
+    publish_default_index, relative_slash_path,
 };
 use crate::progress::{IndexStats, IndexStatus};
 use crate::store::IndexStore;
@@ -59,10 +60,39 @@ pub fn index_workspace(
     let started = Instant::now();
     let workspace = canonical_workspace(workspace)?;
     let workspace_display = workspace.display().to_string();
-    let db_path = match options.db_path {
-        Some(path) => path,
-        None => default_index_path(&workspace)?,
-    };
+    let explicit_db_path = options.db_path.clone();
+    let (db_path, side_by_side_publication, previous_generation) =
+        if let Some(path) = explicit_db_path.as_ref() {
+            (path.clone(), false, 0)
+        } else {
+            let active = match default_index_path(&workspace) {
+                Ok(path) => path,
+                Err(_) if options.force => {
+                    crate::pathing::default_index_directory(&workspace)?.join("index.sqlite")
+                }
+                Err(error) => return Err(error),
+            };
+            let active_exists = active.is_file();
+            let current_schema =
+                active_exists && IndexStore::has_current_schema(&active).unwrap_or(false);
+            if options.force || !active_exists || !current_schema {
+                let previous_generation = if active_exists {
+                    IndexStore::open_readonly(&active)
+                        .and_then(|store| store.semantic_generation())
+                        .unwrap_or(0)
+                } else {
+                    latest_default_generation(&workspace)
+                };
+                (
+                    default_index_staging_path(&workspace)?,
+                    true,
+                    previous_generation,
+                )
+            } else {
+                (active, false, 0)
+            }
+        };
+    let database_existed = db_path.exists();
     let mut stats = IndexStats::default();
     progress(IndexStatus::indexing_phase(
         workspace_display.clone(),
@@ -113,7 +143,19 @@ pub fn index_workspace(
         .map(|candidate| candidate.fingerprint.path.clone())
         .collect();
 
-    let mut store = IndexStore::open(&db_path, &workspace)?;
+    // Explicit full-build databases have no in-process request readers. Default
+    // full builds write an unpublished generation file and switch the manifest
+    // only after facts, indexes, validation, and checkpointing all complete.
+    let defer_call_indexes = side_by_side_publication
+        || ((!database_existed || options.force) && explicit_db_path.is_some());
+    let mut store = if defer_call_indexes {
+        IndexStore::open_for_full_rebuild(&db_path, &workspace)?
+    } else {
+        IndexStore::open(&db_path, &workspace)?
+    };
+    if side_by_side_publication {
+        store.seed_semantic_generation(previous_generation)?;
+    }
     progress(IndexStatus::indexing_phase(
         workspace_display.clone(),
         &stats,
@@ -128,7 +170,7 @@ pub fn index_workspace(
         .map(|candidate| candidate.fingerprint.path.clone())
         .collect();
     let stored_files = store.stored_files(&candidate_paths)?;
-    let replace_all_files = options.force || stored_files.is_empty();
+    let replace_all_files = side_by_side_publication || options.force || stored_files.is_empty();
     let build = store.begin_index_build(replace_all_files)?;
     for candidate in candidates {
         // Fast incremental check: reading and hashing every unchanged workspace
@@ -177,13 +219,58 @@ pub fn index_workspace(
     stats.semantic_generation = commit.generation;
     stats.maintenance_warning = commit.cleanup_warning;
     stats.include_edge_ms = include_edge_started.elapsed().as_millis();
+    if defer_call_indexes {
+        progress(IndexStatus::indexing_phase(
+            workspace_display.clone(),
+            &stats,
+            "building call indexes",
+        ));
+        let secondary_index_started = Instant::now();
+        store.finalize_full_build_indexes()?;
+        stats.secondary_index_ms = secondary_index_started.elapsed().as_millis();
+    }
     stats.symbols = store.symbol_count()?;
     let call_coverage = store.call_fact_view().coverage()?;
     stats.callable_anchors = call_coverage.callable_anchors as usize;
     stats.call_sites = call_coverage.call_sites as usize;
+    if side_by_side_publication {
+        progress(IndexStatus::indexing_phase(
+            workspace_display.clone(),
+            &stats,
+            "publishing database generation",
+        ));
+        let publication_started = Instant::now();
+        store.prepare_full_build_publication()?;
+        drop(store);
+        publish_default_index(&workspace, &db_path, stats.semantic_generation)?;
+        stats.publication_ms = publication_started.elapsed().as_millis();
+    }
     stats.elapsed_ms = started.elapsed().as_millis();
     progress(IndexStatus::ready(workspace_display, &stats));
     Ok(stats)
+}
+
+fn latest_default_generation(workspace: &Path) -> u64 {
+    let Ok(directory) = crate::pathing::default_index_directory(workspace) else {
+        return 0;
+    };
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("index-g") && name.ends_with(".sqlite")
+        })
+        .filter_map(|entry| {
+            IndexStore::open_readonly(&entry.path())
+                .and_then(|store| store.semantic_generation())
+                .ok()
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 pub fn index_dirty_files(

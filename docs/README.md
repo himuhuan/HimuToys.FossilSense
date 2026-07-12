@@ -18,6 +18,8 @@ FossilSense 的文档分三层。读错层会把过程稿当成规范。
 
 - `architecture/engine-read-model.md`：请求侧读模型、`EngineSnapshot`、发布边界
 - `architecture/project-context-read-model.md`：构建标记项目模型、补全请求选择与失效边界
+- `benchmark/1.4.0-final-gates.md`：大工作区性能验收结论与复现入口
+- `benchmark/large-workspace-runbook.md`：U-Boot / Wine 基准脚本使用说明
 
 ## 归档层
 

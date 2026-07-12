@@ -1,4 +1,6 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
+use std::collections::HashMap;
+
 use rusqlite::{params, Connection};
 
 use crate::semantic_model::AliasTarget;
@@ -13,6 +15,7 @@ pub(super) fn stage_file_updates(
     conn: &mut Connection,
     build: IndexBuild,
     updates: &[FileIndexUpdate<'_>],
+    bulk_call_string_ids: Option<&mut HashMap<String, i64>>,
 ) -> Result<()> {
     if updates.is_empty() {
         return Ok(());
@@ -66,34 +69,54 @@ pub(super) fn stage_file_updates(
         )?;
         let mut callable_stmt = tx.prepare(
             "INSERT INTO callable_anchor_facts (
-                revision_id, file_id, entity_key, anchor_fingerprint, name, qualified_name,
-                owner, owner_kind, kind, role, linkage_kind, linkage_file, signature,
+                revision_id, file_id, entity_digest, anchor_digest, name_id, qualified_name_id,
+                owner_id, owner_kind, kind, role, linkage_kind, linkage_file_id, signature_id,
                 min_arity, max_arity, variadic,
                 name_start_byte, name_end_byte, name_start_line, name_start_col,
                 name_end_line, name_end_col, declaration_start_byte, declaration_end_byte,
                 declaration_start_line, declaration_start_col, declaration_end_line,
                 declaration_end_col, body_start_byte, body_end_byte, body_start_line,
-                body_start_col, body_end_line, body_end_col, guard, provenance,
-                syntax_error_overlap
+                body_start_col, body_end_line, body_end_col, guard_id, flags
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                 ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25,
-                ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37
+                ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36
              )",
         )?;
         let mut call_site_stmt = tx.prepare(
             "INSERT INTO call_site_facts (
-                revision_id, file_id, caller_entity_key, site_fingerprint,
-                expression_start_byte, expression_end_byte, expression_start_line,
-                expression_start_col, expression_end_line, expression_end_col,
+                revision_id, file_id, caller_anchor_id,
+                expression_start_byte, expression_end_byte,
                 callee_start_byte, callee_end_byte, callee_start_line, callee_start_col,
-                callee_end_line, callee_end_col, callee_name, qualified_name, call_form,
-                argument_count, guard, provenance, syntax_error_overlap
+                callee_end_line, callee_end_col, callee_name_id, qualified_name_id, call_form,
+                argument_count, guard_id, flags
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23
+                ?14, ?15, ?16, ?17
              )",
         )?;
+        let bulk_call_strings = bulk_call_string_ids.is_some();
+        let mut call_string_insert = tx.prepare(if bulk_call_strings {
+            "INSERT INTO call_strings (text) VALUES (?1)"
+        } else {
+            "INSERT OR IGNORE INTO call_strings (text) VALUES (?1)"
+        })?;
+        let mut call_string_select = tx.prepare("SELECT id FROM call_strings WHERE text = ?1")?;
+        let mut local_call_string_ids = HashMap::<String, i64>::new();
+        let call_string_ids = bulk_call_string_ids.unwrap_or(&mut local_call_string_ids);
+        let mut intern_call_string = |value: &str| -> Result<i64> {
+            if let Some(id) = call_string_ids.get(value) {
+                return Ok(*id);
+            }
+            call_string_insert.execute([value])?;
+            let id = if bulk_call_strings {
+                tx.last_insert_rowid()
+            } else {
+                call_string_select.query_row([value], |row| row.get(0))?
+            };
+            call_string_ids.insert(value.to_string(), id);
+            Ok(id)
+        };
 
         for update in updates {
             let fingerprint = update.fingerprint;
@@ -274,30 +297,41 @@ pub(super) fn stage_file_updates(
                 ])?;
             }
 
+            let mut callable_id_by_entity = std::collections::HashMap::new();
             for anchor in facts.callable_anchors {
                 let (linkage_kind, linkage_file) = match &anchor.linkage {
-                    crate::call_model::LinkageDomain::External => ("external", None),
-                    crate::call_model::LinkageDomain::Internal(path) => {
-                        ("internal", Some(path.as_str()))
-                    }
-                    crate::call_model::LinkageDomain::Unknown => ("unknown", None),
+                    crate::call_model::LinkageDomain::External => (1i64, None),
+                    crate::call_model::LinkageDomain::Internal(path) => (2, Some(path.as_str())),
+                    crate::call_model::LinkageDomain::Unknown => (0, None),
                 };
+                let name_id = intern_call_string(&anchor.name)?;
+                let qualified_name_id = intern_call_string(&anchor.qualified_name)?;
+                let owner_id = anchor
+                    .owner
+                    .as_deref()
+                    .map(&mut intern_call_string)
+                    .transpose()?;
+                let linkage_file_id = linkage_file.map(&mut intern_call_string).transpose()?;
+                let signature_id = intern_call_string(&anchor.signature.normalized)?;
+                let guard_id = anchor
+                    .guard
+                    .as_deref()
+                    .map(&mut intern_call_string)
+                    .transpose()?;
                 callable_stmt.execute(params![
                     revision_id,
                     file_id,
-                    anchor.entity_key.as_str(),
-                    anchor.anchor_fingerprint.as_str(),
-                    anchor.name.as_str(),
-                    anchor.qualified_name.as_str(),
-                    anchor.owner.as_deref(),
-                    anchor
-                        .owner_kind
-                        .map(crate::call_model::OwnerKindHint::as_str),
-                    anchor.kind.as_str(),
-                    anchor.role.as_str(),
+                    digest_bytes(&anchor.entity_key)?,
+                    digest_bytes(&anchor.anchor_fingerprint)?,
+                    name_id,
+                    qualified_name_id,
+                    owner_id,
+                    anchor.owner_kind.map(owner_kind_code),
+                    callable_kind_code(anchor.kind),
+                    anchor_role_code(anchor.role),
                     linkage_kind,
-                    linkage_file,
-                    anchor.signature.normalized.as_str(),
+                    linkage_file_id,
+                    signature_id,
                     anchor.signature.min_arity.map(i64::from),
                     anchor.signature.max_arity.map(i64::from),
                     i64::from(anchor.signature.variadic),
@@ -319,41 +353,125 @@ pub(super) fn stage_file_updates(
                     anchor.body_range.map(|range| range.start.character as i64),
                     anchor.body_range.map(|range| range.end.line as i64),
                     anchor.body_range.map(|range| range.end.character as i64),
-                    anchor.guard.as_deref(),
-                    anchor.provenance.as_str(),
-                    i64::from(anchor.syntax_error_overlap),
+                    guard_id,
+                    fact_flags(anchor.provenance, anchor.syntax_error_overlap),
                 ])?;
+                let anchor_id = tx.last_insert_rowid();
+                callable_id_by_entity
+                    .entry(anchor.entity_key.as_str())
+                    .or_insert(anchor_id);
             }
 
             for call in facts.call_sites {
+                let caller_anchor_id = callable_id_by_entity
+                    .get(call.caller_entity_key.as_str())
+                    .copied()
+                    .with_context(|| {
+                        format!(
+                            "call site caller {} has no anchor in the same revision",
+                            call.caller_entity_key
+                        )
+                    })?;
+                let callee_name_id = call
+                    .callee_name
+                    .as_deref()
+                    .map(&mut intern_call_string)
+                    .transpose()?;
+                let qualified_name_id = call
+                    .qualified_name
+                    .as_deref()
+                    .map(&mut intern_call_string)
+                    .transpose()?;
+                let guard_id = call
+                    .guard
+                    .as_deref()
+                    .map(&mut intern_call_string)
+                    .transpose()?;
                 call_site_stmt.execute(params![
                     revision_id,
                     file_id,
-                    call.caller_entity_key.as_str(),
-                    call.site_fingerprint.as_str(),
+                    caller_anchor_id,
                     call.expression_range.start_byte as i64,
                     call.expression_range.end_byte as i64,
-                    call.expression_range.start.line as i64,
-                    call.expression_range.start.character as i64,
-                    call.expression_range.end.line as i64,
-                    call.expression_range.end.character as i64,
                     call.callee_range.start_byte as i64,
                     call.callee_range.end_byte as i64,
                     call.callee_range.start.line as i64,
                     call.callee_range.start.character as i64,
                     call.callee_range.end.line as i64,
                     call.callee_range.end.character as i64,
-                    call.callee_name.as_deref(),
-                    call.qualified_name.as_deref(),
-                    call.form.as_str(),
+                    callee_name_id,
+                    qualified_name_id,
+                    call_form_code(call.form),
                     call.argument_count.map(i64::from),
-                    call.guard.as_deref(),
-                    call.provenance.as_str(),
-                    i64::from(call.syntax_error_overlap),
+                    guard_id,
+                    fact_flags(call.provenance, call.syntax_error_overlap),
                 ])?;
             }
         }
     }
     tx.commit()?;
     Ok(())
+}
+
+fn digest_bytes(value: &str) -> Result<Vec<u8>> {
+    if value.len() != 24 {
+        anyhow::bail!("call digest must contain exactly 24 hexadecimal characters");
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let text = std::str::from_utf8(pair).context("call digest is not UTF-8")?;
+            u8::from_str_radix(text, 16).context("call digest contains a non-hexadecimal byte")
+        })
+        .collect()
+}
+
+fn owner_kind_code(kind: crate::call_model::OwnerKindHint) -> i64 {
+    match kind {
+        crate::call_model::OwnerKindHint::Unknown => 0,
+        crate::call_model::OwnerKindHint::Namespace => 1,
+        crate::call_model::OwnerKindHint::Record => 2,
+    }
+}
+
+fn callable_kind_code(kind: crate::call_model::CallableKind) -> i64 {
+    match kind {
+        crate::call_model::CallableKind::Function => 0,
+        crate::call_model::CallableKind::SyntheticGlobalInitializer => 1,
+        crate::call_model::CallableKind::SyntheticLambda => 2,
+        crate::call_model::CallableKind::FunctionLikeMacro => 3,
+    }
+}
+
+fn anchor_role_code(role: crate::call_model::AnchorRole) -> i64 {
+    match role {
+        crate::call_model::AnchorRole::Declaration => 0,
+        crate::call_model::AnchorRole::Definition => 1,
+        crate::call_model::AnchorRole::Synthetic => 2,
+    }
+}
+
+fn call_form_code(form: crate::call_model::CallForm) -> i64 {
+    match form {
+        crate::call_model::CallForm::DirectName => 0,
+        crate::call_model::CallForm::QualifiedName => 1,
+        crate::call_model::CallForm::ParenthesizedName => 2,
+        crate::call_model::CallForm::MemberDot => 3,
+        crate::call_model::CallForm::MemberArrow => 4,
+        crate::call_model::CallForm::StaticMember => 5,
+        crate::call_model::CallForm::FunctionPointer => 6,
+        crate::call_model::CallForm::CallableObject => 7,
+        crate::call_model::CallForm::ExplicitConstruction => 8,
+        crate::call_model::CallForm::Unsupported => 9,
+    }
+}
+
+fn fact_flags(provenance: crate::call_model::FactProvenance, syntax_error: bool) -> i64 {
+    let provenance = match provenance {
+        crate::call_model::FactProvenance::Ast => 0,
+        crate::call_model::FactProvenance::LexicalFallback => 1,
+        crate::call_model::FactProvenance::Synthetic => 2,
+    };
+    provenance | (i64::from(syntax_error) << 8)
 }

@@ -9,8 +9,8 @@ use tower_lsp::lsp_types::{Position, TextDocumentContentChangeEvent, Url};
 use super::include_completion::IncludeCompletionTable;
 use super::state;
 use super::LocalWordCache;
-use crate::call_catalog::RelationCatalog;
 use crate::call_model::SemanticGeneration;
+use crate::call_service::CallReadHandle;
 use crate::completion_words;
 use crate::parser::{FileSemanticIndex, ParseFacts};
 use crate::pathing;
@@ -23,8 +23,6 @@ use crate::store::IndexStore;
 type LiveParseCache = Arc<RwLock<HashMap<Url, (i32, ParseFacts, Arc<FileSemanticIndex>)>>>;
 type LiveParseGates = Arc<Mutex<HashMap<Url, Arc<Mutex<()>>>>>;
 type LiveParseCancellations = Arc<Mutex<HashMap<Url, (i32, Arc<AtomicBool>)>>>;
-type RelationOverlayCacheEntry = (state::EngineEpoch, u64, Arc<RelationCatalog>);
-type RelationOverlayCache = Arc<Mutex<HashMap<PathBuf, RelationOverlayCacheEntry>>>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RelationOverlayState {
@@ -423,7 +421,6 @@ pub(super) struct CacheLedger {
     pub(in crate::server) reference_role_cache: Arc<references::ReferenceRoleCache>,
     pub(in crate::server) reference_search_cache: Arc<references::ReferenceSearchCache>,
     pub(in crate::server) completion_memo: Arc<Mutex<HashMap<Url, state::CompletionMemo>>>,
-    relation_overlay_cache: RelationOverlayCache,
 }
 
 pub(in crate::server) type EngineSnapshots = Arc<Mutex<HashMap<PathBuf, Arc<EngineSnapshot>>>>;
@@ -441,7 +438,7 @@ pub(in crate::server) struct EngineSnapshot {
     pub(in crate::server) include_table: Option<Arc<IncludeCompletionTable>>,
     pub(in crate::server) indexed_files: Option<Arc<Vec<(String, PathBuf)>>>,
     pub(in crate::server) project_context: Option<Arc<ProjectContextIndex>>,
-    pub(in crate::server) relation_catalog: Option<Arc<RelationCatalog>>,
+    pub(in crate::server) call_read_handle: Option<Arc<CallReadHandle>>,
     #[allow(dead_code)] // Captured now; request capability-health routing is the next phase.
     pub(in crate::server) degraded: crate::progress::DegradedCapabilities,
 }
@@ -457,7 +454,7 @@ impl EngineSnapshot {
             include_table: None,
             indexed_files: None,
             project_context: None,
-            relation_catalog: None,
+            call_read_handle: None,
             degraded: crate::progress::DegradedCapabilities::default(),
         }
     }
@@ -472,7 +469,6 @@ impl Default for CacheLedger {
             reference_role_cache: Arc::new(references::ReferenceRoleCache::new()),
             reference_search_cache: Arc::new(references::ReferenceSearchCache::new()),
             completion_memo: Arc::new(Mutex::new(HashMap::new())),
-            relation_overlay_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -529,10 +525,6 @@ impl CacheLedger {
             .lock()
             .await
             .retain(|root, _| !roots.contains(root));
-        self.relation_overlay_cache
-            .lock()
-            .await
-            .retain(|root, _| !roots.contains(root));
         self.clear_all_completion_memos().await;
         self.invalidate_references();
     }
@@ -572,11 +564,6 @@ impl CacheLedger {
 
     pub(super) async fn invalidate_after_index_change(&self) {
         self.invalidate_references();
-        self.invalidate_relation_overlays().await;
-    }
-
-    pub(super) async fn invalidate_relation_overlays(&self) {
-        self.relation_overlay_cache.lock().await.clear();
     }
 
     pub(super) async fn clear_completion_memo(&self, uri: &Url) {
@@ -585,38 +572,6 @@ impl CacheLedger {
 
     pub(super) async fn clear_all_completion_memos(&self) {
         self.completion_memo.lock().await.clear();
-    }
-
-    pub(super) async fn cached_relation_overlay(
-        &self,
-        root: &PathBuf,
-        epoch: state::EngineEpoch,
-        overlay_epoch: u64,
-    ) -> Option<Arc<RelationCatalog>> {
-        self.relation_overlay_cache.lock().await.get(root).and_then(
-            |(cached_epoch, cached_overlay, catalog)| {
-                (*cached_epoch == epoch && *cached_overlay == overlay_epoch)
-                    .then(|| catalog.clone())
-            },
-        )
-    }
-
-    pub(super) async fn store_relation_overlay(
-        &self,
-        root: PathBuf,
-        epoch: state::EngineEpoch,
-        overlay_epoch: u64,
-        catalog: Arc<RelationCatalog>,
-    ) {
-        self.relation_overlay_cache
-            .lock()
-            .await
-            .insert(root, (epoch, overlay_epoch, catalog));
-    }
-
-    #[cfg(test)]
-    pub(super) async fn relation_overlay_cache_len_for_test(&self) -> usize {
-        self.relation_overlay_cache.lock().await.len()
     }
 
     pub(super) async fn record_completion_memo(
@@ -692,7 +647,7 @@ impl CacheLedger {
             include_table: current.include_table.clone(),
             indexed_files: current.indexed_files.clone(),
             project_context: current.project_context.clone(),
-            relation_catalog: current.relation_catalog.clone(),
+            call_read_handle: current.call_read_handle.clone(),
             degraded: current.degraded.clone(),
         })
         .await;
@@ -717,7 +672,7 @@ impl CacheLedger {
             include_table: current.include_table.clone(),
             indexed_files: Some(files),
             project_context: current.project_context.clone(),
-            relation_catalog: current.relation_catalog.clone(),
+            call_read_handle: current.call_read_handle.clone(),
             degraded: current.degraded.clone(),
         })
         .await;
@@ -738,7 +693,7 @@ impl CacheLedger {
             include_table: current.include_table.clone(),
             indexed_files: current.indexed_files.clone(),
             project_context: current.project_context.clone(),
-            relation_catalog: current.relation_catalog.clone(),
+            call_read_handle: current.call_read_handle.clone(),
             degraded: current.degraded.clone(),
         })
         .await;
@@ -774,7 +729,6 @@ impl WorkspaceSession {
 
     pub(super) async fn open_document(&self, uri: Url, version: i32, text: String) {
         self.documents.open_document(uri, version, text).await;
-        self.cache.invalidate_relation_overlays().await;
     }
 
     #[cfg(test)]
@@ -783,7 +737,6 @@ impl WorkspaceSession {
             .change_document(uri.clone(), version, text)
             .await;
         self.cache.invalidate_references();
-        self.cache.invalidate_relation_overlays().await;
     }
 
     pub(super) async fn apply_document_changes(
@@ -798,7 +751,6 @@ impl WorkspaceSession {
             .await;
         if applied {
             self.cache.invalidate_references();
-            self.cache.invalidate_relation_overlays().await;
         }
         applied
     }
@@ -806,13 +758,11 @@ impl WorkspaceSession {
     pub(super) async fn close_document(&self, uri: &Url) {
         self.documents.close_document(uri).await;
         self.cache.clear_completion_memo(uri).await;
-        self.cache.invalidate_relation_overlays().await;
     }
 
     pub(super) async fn save_document(&self, uri: &Url, generation: SemanticGeneration) {
         self.documents.save_document(uri, generation).await;
         self.cache.invalidate_references();
-        self.cache.invalidate_relation_overlays().await;
     }
 
     #[cfg(test)]

@@ -51,7 +51,8 @@ fossilsense 单一 Rust 原生二进制 (crates/fossilsense)
 | `indexer` | 扫描、增量判定、解析、SQLite 写入、进度事件 |
 | `model` | 候选语义层与规范导出名 |
 | `call_model` | 调用关系领域值对象、稳定 locator、关系质量与覆盖合同；协议中立，不依赖 parser/store/server |
-| `call_catalog` | 从 active call facts 构建不可变 callable 目录；事实与关系负载只存一份，incoming/outgoing 使用紧凑 ID 邻接索引，请求按页物化歧义/未解析证据 |
+| `call_catalog` | 请求期 `RelationQueryIndex`：候选解析、evidence、grouping 与分页物化；只处理一次窄查询命中的 bounded facts，不提供 workspace 全量 loader 或 unlimited incoming/outgoing API |
+| `call_service` | generation-pinned Call facts 窄查询、base/dirty-document delta 合并与一跳关系请求编排；SQLite 读取在 blocking worker 执行 |
 | `parser` | tree-sitter C/C++ 容错解析；唯一入口 `parse()`；提供 persistent/request facts 投影与 fact availability |
 | `semantic_model` | parser/store 中立的共享语义事实；不得依赖 parser/store/server/indexer |
 | `store` | SQLite schema、迁移、事务、清理、写入，以及 durable read views / typed rows |
@@ -91,7 +92,8 @@ fossilsense 单一 Rust 原生二进制 (crates/fossilsense)
 默认索引库：
 
 ```text
-<user-cache-dir>/FossilSense/indexes/<workspace-hash>/index.sqlite
+<user-cache-dir>/FossilSense/indexes/<workspace-hash>/active-index
+<user-cache-dir>/FossilSense/indexes/<workspace-hash>/index-g<generation>-<token>.sqlite
 ```
 
 规则：
@@ -108,11 +110,12 @@ Store read-view 规则：
 
 | 项 | 规则 |
 |---|---|
-| read views | 跨模块 durable reads 通过 `store::views` 的窄视图：name table、reach graph、include table、symbol/reference file、member、call facts |
+| read views | 跨模块 durable reads 通过 `store::views` 的窄视图：name table、reach graph、include table、symbol/reference file、member、call facts；name table 冷构建使用 borrowed-row visitor 直接 intern，不先物化全库 owned typed-row `Vec`；call facts 只暴露 path/position/name/caller 的窄读与显式 limited page，不保留全库 visitor |
 | typed rows | read-model builder 输入使用 typed row / DTO，不依赖 SQL tuple column order |
 | SQL ownership | `rusqlite` 与 SQL-to-domain 转换留在 `store` / persistence 边界 |
 | compatibility | 旧 `IndexStore` query wrapper 可作为兼容/测试 oracle 保留，但应委托 read views 或共享 typed loader |
 | bundled SQLite | 必须包含 WAL-reset 并发损坏修复（当前基线 SQLite 3.51.3+）；`store` resilience test 防止版本回退 |
+| generation lease | `CallReadHandle` 持有可克隆 `IndexDbLease`；manifest 切换后只清理非 active、非 leased 的旧 generation，最后一个 lease 释放时 best-effort 重试；无有效 manifest 时不得删除可恢复 generation，超过 24 小时的废弃 build/manifest staging 可在启动时清理 |
 
 统一语义代际规则：
 
@@ -129,7 +132,7 @@ Runtime snapshot 规则：
 
 | 项 | 规则 |
 |---|---|
-| `EngineSnapshot` | 每工作区一个完整不可变读模型，统一携带 name table、reach graph、include table、reference file list、project context、relation catalog、degraded state |
+| `EngineSnapshot` | 每工作区一个完整不可变读模型，统一携带 compact segmented name index、reach graph、include table、reference file list、project context、轻量 `CallReadHandle`、degraded state；name entry 只持有 segment-local name/path/project ID 与 flags，不按 symbol 重复字符串/项目对象；不得持有全库 call sites/relations |
 | publication | 所有下一代读模型在后台构建完成后，只通过一次 map 交换发布；构建期间旧快照继续服务请求 |
 | `EngineEpoch` | 每次成功发布分配显式单调 epoch；`0` 只表示尚未发布索引读模型 |
 | `SemanticGeneration` | SQLite active manifest 的持久化单调代际；marker-only 等纯派生刷新不得推进它 |
@@ -138,6 +141,7 @@ Runtime snapshot 规则：
 | saved overlay | 不能用全局 generation 推断单文件已发布；只在 active revision 的同路径内容哈希匹配时清除 |
 | dirty reach graph | 增量 include edge 更新生成新的 `ReachGraph`，不得原地修改旧快照持有的图 |
 | publisher | snapshot publisher 串行协调；发布失败不得暴露半更新状态 |
+| name compaction | segmented `NameTable` 累积 64 个 delta，或 retained delta slots 超过 base entries 的 25% 时，在 blocking worker 通过 borrowed compact-entry view 重建 compact base；不得先还原全量 owned entries；构建前后都校验 `EngineEpoch`，且只在 dirty publication 释放 publisher 后启动，旧快照继续服务请求 |
 
 ## 5. 当前能力
 
@@ -166,7 +170,8 @@ Runtime snapshot 规则：
 | `isIncomplete` | 成功、空结果、截断结果都必须为 `true` |
 | 截断 | top-N 始终针对当前完整前缀重算 |
 | 增量 | 前缀延长时结果收窄；空结果不能黏住后续输入 |
-| 热路径 | 每键扫描内存 `NameTable` / `RankedNameHit`，不做磁盘 IO |
+| 热路径 | 每键合并内存 `NameTable` base/delta segments 并生成 `RankedNameHit`，不做磁盘 IO |
+| prefix index | 每个 compact segment 先按唯一 name ID 的 `(lower, original)` 排序，再用 count/offset 线性生成稳定 entry postings；同 spelling 的 entry 保持插入顺序，不逐 entry 重复字符串比较 |
 | 召回 | exact / prefix 档通过 sorted-by-lower 前缀索引二分 |
 | 排序 | 可叠加目录局部性偏移，但绝不过滤 |
 
@@ -197,6 +202,7 @@ Smart Completion 当前约定：
 | v1.3.2 | 解析类型符号卫生修复；注释/字面量不再污染 type symbols，AST 精确类型名优先，关键词不可跳转，schema 11 强制重建 |
 | v1.3.3 | 有证据的一跳调用关系版本；统一代际 callable/call-site facts、标准 LSP、富协议、workspace open-document overlay 与原生双视图；schema 14 |
 | v1.3.4 | 注释美化渲染版本；Hover / 补全文档 / Signature Help 共用注释归属与 Doxygen/XML Markdown 渲染，补全经 `completionItem/resolve` 延迟挂载，并支持严格同项目 `.h/.c` 文档配对 |
+| v1.4.0 | 大工作区性能与懒调用关系版本；schema 15 紧凑 call facts、请求期有界关系派生、per-file overlay、side-by-side generation、租约清理，以及分段紧凑 NameIndex |
 | 后置能力 | auto include insertion、ML ranker、telemetry、cloud sync、完整 C++ 语义仍不属于当前版本 |
 
 项目上下文约定：
@@ -208,7 +214,7 @@ Smart Completion 当前约定：
 | 自动归属 | 请求 URI 所在的最具体 workspace root 内，最近祖先 marker 目录获胜；同目录 marker 合并，嵌套项目保持独立 |
 | 选择 | 状态栏提供 `Current Project (Auto)`、所有发现路径和 `Unspecified`；显式选择只存 VS Code `workspaceState` |
 | 配置 | `fossilsense.projectContext.mode = auto / promptOnAmbiguous / off`；prompt 只在有可选项目且活动本地 C/C++ 文件无法归属时每 URI/会话提示一次 |
-| snapshot | `ProjectContextIndex` 与带 `ProjectKey` 的 `NameTable` 同代原子发布；marker 变化只重建派生读模型，不重解析未变源码 |
+| snapshot | `ProjectContextIndex` 与带 `ProjectKey` 的 segmented `NameTable` 同代原子发布；marker 变化只重建派生读模型，不重解析未变源码 |
 | memo | engine epoch、selection epoch 和 effective project 都参与 completion memo generation；marker/选择变化不得复用旧池 |
 | fallback | project discovery 失败标记 `projectContext` degraded，ordinary completion 继续走基线；热路径只查内存，不遍历文件系统 |
 | 边界 | 项目上下文的召回/排序 boost 仍仅由 ordinary identifier completion 消费；definition、Hover、completion documentation 与 Signature Help 只读取 `ProjectKey` 作为严格 `.h/.c` 配对门槛，不改变跨项目召回或基础候选排名；references、coloring、workspace symbol、member/include completion 不消费 |
@@ -355,14 +361,21 @@ Parser facts 合同：
 - C/C++ 自由函数是关系解析的正式候选；record method、member call、函数指针和 callable object 仍持久化为显式事实，但不得伪装为已绑定关系。
 - 外部头只贡献声明锚点，不索引函数体调用点。
 - 全局初始化表达式使用 synthetic global initializer 作为 caller；lambda 内调用暂不错误归属给外层函数。
-- schema 14 为 callable anchors / call sites 建立独立 active views 和查询索引，并完整保存 declaration/body UTF-16 ranges，与统一语义代际一起发布。
+- schema 15 为 callable anchors / call sites 建立独立 active views 和查询索引；重复文本使用整数 ID，96-bit digest 使用 BLOB，枚举/布尔量使用整数 flags，call site 只持久化 expression byte offsets 与 callee UTF-16 range，并与统一语义代际一起发布。
+- 显式 full build 与首次未发布的默认库在 facts 写完前不维护 call 二级索引；commit 后集中创建索引并 `ANALYZE`。已有默认库的 dirty/force 路径在旁路数据库发布落地前继续保留在线索引，不能对活跃读者直接 drop。
+- 新建 full-build 库的 `call_strings` 在构建期由跨 batch interner 分配唯一 integer ID，不逐行维护 UNIQUE B-tree；facts 完成后释放 interner，再创建 `idx_call_strings_text` 唯一索引。普通/既有库继续依赖在线唯一索引，dirty upsert 不得绕过约束。
+- 默认 full/force/schema-mismatch rebuild 写入 cache family 内独立的 `index-build-*.sqlite`；facts、二级索引、`quick_check`、foreign-key check 与 WAL checkpoint 全部完成并关闭连接后，才封装为单调 generation 文件，并通过 `active-index` 原子 manifest 切换。Windows 使用 replace-existing + write-through 的原子文件替换。
+- dirty index 只写 manifest 当前指向的 active generation，继续使用 WAL staging。full publication 不覆盖 leased 旧 generation；旧 `EngineSnapshot`/SQLite reader 通过 `IndexDbLease` 继续读取旧文件，最后 lease 释放后才 best-effort 删除。force rebuild 可从损坏 manifest 恢复，并从现存 generation 文件维持 generation 单调性；manifest 无效时 cleanup 不得删除候选 generation。
 
 调用关系查询合同：
 
-- `RelationCatalog` 随 `EngineSnapshot` 原子发布；callable、call site 与逻辑 relation 负载各只存一份，incoming/outgoing 只保存共享 relation ID，协议 DTO 必须在分页和 call-site 上限之后物化；请求不得直接查询 SQLite 或深拷贝完整 catalog。
-- dirty index 可以重建完整关系目录，因为任一声明变化都可能改变跨文件候选；失败只标记 `callRelations` degraded，不得暴露半代目录。
-- open document overlay 只纳入内容与磁盘不同，或已保存但尚未发布更新 `SemanticGeneration` 的文档；普通 clean open document 直接复用基础 catalog。overlay 以有效文档版本集合和 engine epoch 缓存，`didOpen` / `didChange` / `didSave` / `didClose` 与索引发布必须主动释放旧项。
-- overlay generation 覆盖同一 workspace 的全部有效未同步文档，因此查询 callee incoming 时必须看到其它未保存 buffer 的调用点；缓存与请求只共享 `Arc<RelationCatalog>`，不得为读取或存储缓存深拷贝完整 catalog。
+- `EngineSnapshot` 只发布 generation-pinned `CallReadHandle` 与 capability state；full/dirty publication 都不得读取、复制或解析全库 call sites/relations。
+- `CallRelationService` 通过 `CallFactStoreView` 的 path/position、caller 和 callee 窄查询读取 schema 15 facts，并在 `SemanticReadGuard` 内校验 generation；请求结束前不得混入新代。
+- relation 只在请求期从命中 facts 派生；候选解析、grouping、relation page 和 call-site cap 完成后才物化协议 DTO。精确全库 fact count 不属于请求 coverage 热路径。
+- open document overlay 只纳入内容与磁盘不同，或已保存但尚未发布同路径 content hash 的文档；使用 `ParseFacts::CALL_RELATIONS` 生成 per-file delta。基础 SQL 行按 shadowed path 跳过，再合并相关 overlay facts，不存在 overlay catalog 或基础图复制。
+- overlay generation 覆盖同一 workspace 的全部有效未同步文档，因此查询 callee incoming 时必须看到其它未保存 buffer 的调用点；clean open document 不生成 delta。
+- 富协议固定为 v2：entity dictionary + ID relation、generation/overlay/resolver 绑定的 opaque cursor、非精确 total、显式 page/site/scan/candidate/time/cancelled budget state，以及携带 generation/incomplete reason 的 coverage。扩展与 server 同版本发布，不保留 v1 adapter。
+- 标准 Call Hierarchy 使用确定性的 relation、per-relation site 和 raw scan 上限；达到上限时不伪装为完整结果。富面板通过 `budgetState`、`coverage.incompleteReason` 和可用的 `nextCursor` 展示 partial/continue。
 - 标准 hierarchy item 携带 `CallableLocator`；entity key 失效后按 path、signature digest 与最近旧锚点保守重定位，不得只依赖瞬时数据库行号。
 - 名字、显式限定名、arity、internal linkage、same-file 与 include reachability 都只是证据；reachability 不得作为 hard filter。
 - 标准 LSP 只返回可表示的已解析候选；富协议同时返回 confidence、evidence、ambiguity、unresolved、revision、coverage 与 budget state。
