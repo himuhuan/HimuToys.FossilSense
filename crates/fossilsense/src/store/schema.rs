@@ -168,7 +168,7 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
 
     CREATE TABLE IF NOT EXISTS call_strings (
         id INTEGER PRIMARY KEY,
-        text TEXT NOT NULL UNIQUE
+        text TEXT NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS callable_anchor_facts (
@@ -294,6 +294,7 @@ pub(crate) const CREATE_LOOKUP_INDEXES_SQL: &str = "
 ";
 
 pub(crate) const CREATE_CALL_LOOKUP_INDEXES_SQL: &str = "
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_call_strings_text ON call_strings(text);
     CREATE INDEX IF NOT EXISTS idx_callable_anchor_name ON callable_anchor_facts(name_id);
     CREATE INDEX IF NOT EXISTS idx_callable_anchor_qualified_name ON callable_anchor_facts(qualified_name_id);
     CREATE INDEX IF NOT EXISTS idx_callable_anchor_entity_key ON callable_anchor_facts(entity_digest);
@@ -303,7 +304,12 @@ pub(crate) const CREATE_CALL_LOOKUP_INDEXES_SQL: &str = "
     CREATE INDEX IF NOT EXISTS idx_call_site_revision ON call_site_facts(revision_id);
 ";
 
+pub(crate) const CREATE_CALL_STRING_INDEX_SQL: &str = "
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_call_strings_text ON call_strings(text);
+";
+
 pub(crate) const DROP_CALL_LOOKUP_INDEXES_SQL: &str = "
+    DROP INDEX IF EXISTS idx_call_strings_text;
     DROP INDEX IF EXISTS idx_callable_anchor_name;
     DROP INDEX IF EXISTS idx_callable_anchor_qualified_name;
     DROP INDEX IF EXISTS idx_callable_anchor_entity_key;

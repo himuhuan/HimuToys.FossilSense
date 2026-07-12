@@ -6,7 +6,8 @@ param(
     [int]$Repeats = 2,
     [ValidateRange(5, 3600)]
     [int]$TimeoutSeconds = 600,
-    [switch]$IncludeFullIndex
+    [switch]$IncludeFullIndex,
+    [string[]]$CaseFilter = @()
 )
 
 $ErrorActionPreference = 'Stop'
@@ -146,18 +147,21 @@ $cases = @(
         Id = 'uboot-board-init-incoming'
         Workspace = Join-Path $repoRoot 'samples\u-boot'
         Database = Join-Path $benchmarkPath 'index-u-boot.sqlite'
+        ResetDatabase = $null
         Arguments = @('query', 'calls', (Join-Path $repoRoot 'samples\u-boot'), 'common/board_f.c', '1073', '6', '--incoming', '--db', (Join-Path $benchmarkPath 'index-u-boot.sqlite'))
     },
     [pscustomobject]@{
         Id = 'wine-medium-fanin-incoming'
         Workspace = Join-Path $repoRoot 'samples\wine'
         Database = Join-Path $benchmarkPath 'index-wine.sqlite'
+        ResetDatabase = $null
         Arguments = @('query', 'calls', (Join-Path $repoRoot 'samples\wine'), 'dlls/ntdll/heap.c', '1489', '30', '--incoming', '--db', (Join-Path $benchmarkPath 'index-wine.sqlite'))
     },
     [pscustomobject]@{
         Id = 'wine-high-frequency-incoming'
         Workspace = Join-Path $repoRoot 'samples\wine'
         Database = Join-Path $benchmarkPath 'index-wine.sqlite'
+        ResetDatabase = $null
         Arguments = @('query', 'calls', (Join-Path $repoRoot 'samples\wine'), 'dlls/kernelbase/console.c', '2295', '36', '--incoming', '--db', (Join-Path $benchmarkPath 'index-wine.sqlite'))
     }
 )
@@ -170,8 +174,21 @@ if ($IncludeFullIndex) {
             Id = "$sample-full-index"
             Workspace = $workspace
             Database = $null
+            ResetDatabase = $database
             Arguments = @('index', $workspace, '--db', $database, '--force')
         }
+    }
+}
+
+if ($CaseFilter.Count -gt 0) {
+    $requested = [System.Collections.Generic.HashSet[string]]::new(
+        $CaseFilter,
+        [System.StringComparer]::OrdinalIgnoreCase
+    )
+    $cases = @($cases | Where-Object { $requested.Contains($_.Id) })
+    if ($cases.Count -ne $requested.Count) {
+        $available = ($cases.Id | Sort-Object) -join ', '
+        throw "one or more benchmark case filters did not match; selected: $available"
     }
 }
 
@@ -186,6 +203,18 @@ foreach ($case in $cases) {
         continue
     }
     for ($run = 1; $run -le $Repeats; $run++) {
+        if ($case.ResetDatabase) {
+            $resetPath = Resolve-FullPath $case.ResetDatabase
+            if (-not $resetPath.StartsWith($benchmarkPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+                throw "benchmark reset path escaped benchmark root: $resetPath"
+            }
+            foreach ($suffix in @('', '-wal', '-shm')) {
+                $candidate = "$resetPath$suffix"
+                if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+                    Remove-Item -LiteralPath $candidate -Force
+                }
+            }
+        }
         Write-Host "benchmark $($case.Id) run $run/$Repeats"
         $sample = Invoke-SampledProcess -FilePath $binaryPath -ArgumentList $case.Arguments `
             -Timeout $TimeoutSeconds

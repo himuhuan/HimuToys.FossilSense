@@ -10,7 +10,7 @@ This runbook fixes the measurement boundary used by the large-workspace performa
 
 ## Prerequisites
 
-Build the release binary and prepare the schema-14 baseline indexes described in `1.3.4-analyse.md`:
+Build the release binary. Query-only comparison requires the prepared indexes described in the phase benchmark documents; a filtered full-index run does not require query databases:
 
 ```powershell
 cargo build --release -p fossilsense
@@ -42,6 +42,15 @@ The full rebuild is opt-in because it takes minutes and replaces dedicated bench
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark_large_workspace.ps1 `
   -Repeats 1 -IncludeFullIndex -TimeoutSeconds 1800
 ```
+
+To isolate one full-index case without first running query cases:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark_large_workspace.ps1 `
+  -Repeats 1 -IncludeFullIndex -CaseFilter wine-full-index -TimeoutSeconds 1800
+```
+
+Full-index cases remove only their dedicated database and WAL/SHM sidecars under the resolved benchmark root before every repetition. This guarantees that bulk-writer measurements start with an empty schema and cannot accidentally exercise an older database's online indexes.
 
 The relevant gates are `write_ms`, `elapsed_ms`, peak memory, final database bytes, and the call-fact `dbstat` bytes recorded by the accompanying analysis. A tuning result must report both elapsed time and memory/disk cost; elapsed-only wins are insufficient.
 

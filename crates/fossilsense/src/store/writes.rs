@@ -1,4 +1,6 @@
 use anyhow::{Context, Result};
+use std::collections::HashMap;
+
 use rusqlite::{params, Connection};
 
 use crate::semantic_model::AliasTarget;
@@ -13,6 +15,7 @@ pub(super) fn stage_file_updates(
     conn: &mut Connection,
     build: IndexBuild,
     updates: &[FileIndexUpdate<'_>],
+    bulk_call_string_ids: Option<&mut HashMap<String, i64>>,
 ) -> Result<()> {
     if updates.is_empty() {
         return Ok(());
@@ -92,16 +95,25 @@ pub(super) fn stage_file_updates(
                 ?14, ?15, ?16, ?17
              )",
         )?;
-        let mut call_string_insert =
-            tx.prepare("INSERT OR IGNORE INTO call_strings (text) VALUES (?1)")?;
+        let bulk_call_strings = bulk_call_string_ids.is_some();
+        let mut call_string_insert = tx.prepare(if bulk_call_strings {
+            "INSERT INTO call_strings (text) VALUES (?1)"
+        } else {
+            "INSERT OR IGNORE INTO call_strings (text) VALUES (?1)"
+        })?;
         let mut call_string_select = tx.prepare("SELECT id FROM call_strings WHERE text = ?1")?;
-        let mut call_string_ids = std::collections::HashMap::<String, i64>::new();
+        let mut local_call_string_ids = HashMap::<String, i64>::new();
+        let call_string_ids = bulk_call_string_ids.unwrap_or(&mut local_call_string_ids);
         let mut intern_call_string = |value: &str| -> Result<i64> {
             if let Some(id) = call_string_ids.get(value) {
                 return Ok(*id);
             }
             call_string_insert.execute([value])?;
-            let id = call_string_select.query_row([value], |row| row.get(0))?;
+            let id = if bulk_call_strings {
+                tx.last_insert_rowid()
+            } else {
+                call_string_select.query_row([value], |row| row.get(0))?
+            };
             call_string_ids.insert(value.to_string(), id);
             Ok(id)
         };

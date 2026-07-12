@@ -168,6 +168,17 @@ fn dirty_revision_replaces_old_call_facts_without_leaking_stale_rows() {
             .len(),
         1
     );
+    let duplicate_strings: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM (
+                SELECT text FROM call_strings GROUP BY text HAVING COUNT(*) > 1
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(duplicate_strings, 0);
 }
 
 #[test]

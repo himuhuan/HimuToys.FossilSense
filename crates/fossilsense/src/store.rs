@@ -104,6 +104,7 @@ pub struct FileIndexUpdate<'a> {
 pub struct IndexStore {
     conn: Connection,
     legacy_full_build: Option<IndexBuild>,
+    bulk_call_string_ids: Option<HashMap<String, i64>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,7 +194,16 @@ impl IndexStore {
     /// secondary indexes while facts are inserted. The destination must not be
     /// visible to request readers until [`finalize_full_build_indexes`] returns.
     pub fn open_for_full_rebuild(path: &Path, workspace_root: &Path) -> Result<Self> {
-        Self::open_with_call_indexes(path, workspace_root, false)
+        let new_database = !path.exists();
+        let mut store = Self::open_with_call_indexes(path, workspace_root, false)?;
+        if new_database {
+            store.bulk_call_string_ids = Some(HashMap::new());
+        } else {
+            store
+                .conn
+                .execute_batch(schema::CREATE_CALL_STRING_INDEX_SQL)?;
+        }
+        Ok(store)
     }
 
     fn open_with_call_indexes(
@@ -216,6 +226,7 @@ impl IndexStore {
         let store = Self {
             conn,
             legacy_full_build: None,
+            bulk_call_string_ids: None,
         };
         store.migrate(workspace_root, create_call_indexes)?;
         if !create_call_indexes {
@@ -226,7 +237,8 @@ impl IndexStore {
         Ok(store)
     }
 
-    pub fn finalize_full_build_indexes(&self) -> Result<()> {
+    pub fn finalize_full_build_indexes(&mut self) -> Result<()> {
+        self.bulk_call_string_ids.take();
         self.conn
             .execute_batch(schema::CREATE_CALL_LOOKUP_INDEXES_SQL)?;
         self.conn.execute_batch(
@@ -269,6 +281,7 @@ impl IndexStore {
         Ok(Self {
             conn,
             legacy_full_build: None,
+            bulk_call_string_ids: None,
         })
     }
 
@@ -499,7 +512,12 @@ impl IndexStore {
         build: IndexBuild,
         updates: &[FileIndexUpdate<'_>],
     ) -> Result<()> {
-        writes::stage_file_updates(&mut self.conn, build, updates)
+        writes::stage_file_updates(
+            &mut self.conn,
+            build,
+            updates,
+            self.bulk_call_string_ids.as_mut(),
+        )
     }
 
     #[allow(dead_code)]
