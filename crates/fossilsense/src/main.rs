@@ -35,10 +35,27 @@ use crate::store::IndexStore;
 
 #[derive(Debug, Parser)]
 #[command(name = "fossilsense")]
+#[command(version)]
 #[command(about = "FossilSense best-effort C/C++ navigation and analysis")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use clap::{error::ErrorKind, Parser};
+
+    use super::Cli;
+
+    #[test]
+    fn version_flag_reports_the_crate_version() {
+        let error = Cli::try_parse_from(["fossilsense", "--version"])
+            .expect_err("--version exits after printing version information");
+
+        assert_eq!(error.kind(), ErrorKind::DisplayVersion);
+        assert!(error.to_string().contains(env!("CARGO_PKG_VERSION")));
+    }
 }
 
 #[derive(Debug, Subcommand)]
