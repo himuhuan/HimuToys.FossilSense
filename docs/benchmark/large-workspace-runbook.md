@@ -82,3 +82,16 @@ cargo test --release -p fossilsense benchmark_large_fan_in_catalog_and_cached_qu
 ```
 
 High-ambiguity budget and pagination become hard CI gates in the lazy service phase. The schema-14 catalog benchmark exists only to preserve the before measurement.
+
+## Name-index publication benchmark
+
+The ignored release benchmark measures schema-15 row loading, cold in-memory name-index construction, and repeated replacement of the single file with the most symbol rows. It prints aggregate counts/timings only:
+
+```powershell
+$env:FOSSILSENSE_BENCH_DB = (Resolve-Path 'target/benchmark/index-wine-rebuild.sqlite').Path
+cargo test --release -p fossilsense `
+  query::tests::benchmark_large_name_table_build_and_dirty_update -- `
+  --ignored --exact --nocapture
+```
+
+On Windows the test samples its own Private Bytes every millisecond around dirty replacement. `name_dirty_private_delta_bytes` is the process peak above the fully built base table, not an allocator estimate.

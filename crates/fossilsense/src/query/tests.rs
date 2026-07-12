@@ -1,6 +1,106 @@
 use super::*;
 use crate::reachability::ReachScope;
 
+#[cfg(windows)]
+fn current_private_bytes() -> u64 {
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    let mut counters = PROCESS_MEMORY_COUNTERS_EX {
+        cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+        ..Default::default()
+    };
+    let loaded = unsafe {
+        K32GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            (&mut counters as *mut PROCESS_MEMORY_COUNTERS_EX).cast::<PROCESS_MEMORY_COUNTERS>(),
+            std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+        )
+    };
+    assert_ne!(loaded, 0, "GetProcessMemoryInfo failed");
+    counters.PrivateUsage as u64
+}
+
+#[cfg(not(windows))]
+fn current_private_bytes() -> u64 {
+    0
+}
+
+#[test]
+#[ignore = "diagnostic large-workspace NameTable benchmark; set FOSSILSENSE_BENCH_DB"]
+fn benchmark_large_name_table_build_and_dirty_update() {
+    let db = std::env::var_os("FOSSILSENSE_BENCH_DB")
+        .map(std::path::PathBuf::from)
+        .expect("set FOSSILSENSE_BENCH_DB to a schema-15 benchmark database");
+    let store = crate::store::IndexStore::open_readonly(&db).expect("benchmark database");
+
+    let load_started = std::time::Instant::now();
+    let rows = store
+        .name_table_view()
+        .symbol_rows()
+        .expect("load name rows");
+    let load_ms = load_started.elapsed().as_millis();
+    let mut counts = std::collections::HashMap::<&str, usize>::new();
+    for row in &rows {
+        *counts.entry(&row.path).or_default() += 1;
+    }
+    let changed_path = counts
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(path, _)| path.to_string())
+        .expect("at least one symbol row");
+    let fresh_rows = store
+        .name_table_view()
+        .symbol_rows_for_paths(std::slice::from_ref(&changed_path))
+        .expect("load changed path rows");
+
+    let build_started = std::time::Instant::now();
+    let mut table = NameTable::build_from_rows(rows);
+    let build_ms = build_started.elapsed().as_millis();
+    let expected_len = table.len();
+    let paths = std::collections::HashSet::from([changed_path]);
+    let mut dirty_us = Vec::new();
+    let private_before = current_private_bytes();
+    let peak_private = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(private_before));
+    let stop_sampling = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sampler = {
+        let peak_private = peak_private.clone();
+        let stop_sampling = stop_sampling.clone();
+        std::thread::spawn(move || {
+            while !stop_sampling.load(std::sync::atomic::Ordering::Relaxed) {
+                peak_private.fetch_max(
+                    current_private_bytes(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        })
+    };
+    for _ in 0..5 {
+        let update_started = std::time::Instant::now();
+        table = table.with_updated_path_rows(&paths, fresh_rows.clone());
+        dirty_us.push(update_started.elapsed().as_micros());
+        assert_eq!(table.len(), expected_len);
+    }
+    stop_sampling.store(true, std::sync::atomic::Ordering::Relaxed);
+    sampler.join().expect("memory sampler");
+    dirty_us.sort_unstable();
+
+    println!("name_rows: {expected_len}");
+    println!("name_changed_rows: {}", fresh_rows.len());
+    println!("name_load_ms: {load_ms}");
+    println!("name_build_ms: {build_ms}");
+    println!("name_dirty_update_us: {}", dirty_us[dirty_us.len() / 2]);
+    println!(
+        "name_dirty_private_delta_bytes: {}",
+        peak_private
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_sub(private_before)
+    );
+}
+
 fn table() -> NameTable {
     NameTable::build(vec![
         (1, "hello_value".to_string(), false),
