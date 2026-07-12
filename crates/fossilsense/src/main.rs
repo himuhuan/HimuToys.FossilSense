@@ -183,6 +183,7 @@ async fn main() -> Result<()> {
             println!("write_ms: {}", stats.write_ms);
             println!("check_ms: {}", stats.check_ms);
             println!("include_edge_ms: {}", stats.include_edge_ms);
+            println!("secondary_index_ms: {}", stats.secondary_index_ms);
             println!("name_table_ms: {}", stats.name_table_ms);
             println!("reach_graph_ms: {}", stats.reach_graph_ms);
             if let Some(warning) = &stats.maintenance_warning {

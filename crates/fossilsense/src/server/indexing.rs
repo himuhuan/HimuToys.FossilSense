@@ -349,7 +349,7 @@ async fn index_roots(
                     .log_message(
                         MessageType::INFO,
                         format!(
-                            "index complete for {}: {} files, {} symbols, elapsed={}ms (discover={}ms, parse={}ms, write={}ms, check={}ms, include_edge={}ms)",
+                            "index complete for {}: {} files, {} symbols, elapsed={}ms (discover={}ms, parse={}ms, write={}ms, secondary_index={}ms, check={}ms, include_edge={}ms)",
                             display_root,
                             stats.total_files,
                             stats.symbols,
@@ -357,6 +357,7 @@ async fn index_roots(
                             stats.discover_ms,
                             stats.parse_ms,
                             stats.write_ms,
+                            stats.secondary_index_ms,
                             stats.check_ms,
                             stats.include_edge_ms,
                         ),
@@ -402,7 +403,7 @@ async fn index_roots(
                             .await;
                         emit_perf_log(&client, perf_logging_enabled, || {
                             format!(
-                                "[perf] index_full total={}ms discover={}ms check={}ms parse={}ms write={}ms include_edge={}ms name_table={}ms reach_graph={}ms force={}",
+                                "[perf] index_full total={}ms discover={}ms check={}ms parse={}ms write={}ms secondary_index={}ms include_edge={}ms name_table={}ms reach_graph={}ms force={}",
                                 stats
                                     .elapsed_ms
                                     .saturating_add(stats.name_table_ms)
@@ -411,6 +412,7 @@ async fn index_roots(
                                 stats.check_ms,
                                 stats.parse_ms,
                                 stats.write_ms,
+                                stats.secondary_index_ms,
                                 stats.include_edge_ms,
                                 stats.name_table_ms,
                                 stats.reach_graph_ms,

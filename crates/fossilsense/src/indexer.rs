@@ -59,10 +59,12 @@ pub fn index_workspace(
     let started = Instant::now();
     let workspace = canonical_workspace(workspace)?;
     let workspace_display = workspace.display().to_string();
+    let explicit_db_path = options.db_path.is_some();
     let db_path = match options.db_path {
         Some(path) => path,
         None => default_index_path(&workspace)?,
     };
+    let database_existed = db_path.exists();
     let mut stats = IndexStats::default();
     progress(IndexStatus::indexing_phase(
         workspace_display.clone(),
@@ -113,7 +115,16 @@ pub fn index_workspace(
         .map(|candidate| candidate.fingerprint.path.clone())
         .collect();
 
-    let mut store = IndexStore::open(&db_path, &workspace)?;
+    // Explicit full-build databases have no in-process request readers. A new
+    // default database is likewise unpublished. Existing default databases stay
+    // on the ordinary WAL path until side-by-side publication is installed.
+    let defer_call_indexes =
+        (!database_existed || options.force) && (explicit_db_path || !database_existed);
+    let mut store = if defer_call_indexes {
+        IndexStore::open_for_full_rebuild(&db_path, &workspace)?
+    } else {
+        IndexStore::open(&db_path, &workspace)?
+    };
     progress(IndexStatus::indexing_phase(
         workspace_display.clone(),
         &stats,
@@ -177,6 +188,16 @@ pub fn index_workspace(
     stats.semantic_generation = commit.generation;
     stats.maintenance_warning = commit.cleanup_warning;
     stats.include_edge_ms = include_edge_started.elapsed().as_millis();
+    if defer_call_indexes {
+        progress(IndexStatus::indexing_phase(
+            workspace_display.clone(),
+            &stats,
+            "building call indexes",
+        ));
+        let secondary_index_started = Instant::now();
+        store.finalize_full_build_indexes()?;
+        stats.secondary_index_ms = secondary_index_started.elapsed().as_millis();
+    }
     stats.symbols = store.symbol_count()?;
     let call_coverage = store.call_fact_view().coverage()?;
     stats.callable_anchors = call_coverage.callable_anchors as usize;

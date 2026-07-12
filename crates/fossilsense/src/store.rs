@@ -186,6 +186,21 @@ fn include_normalized_metadata(target_text: &str) -> (&'static str, String, Stri
 
 impl IndexStore {
     pub fn open(path: &Path, workspace_root: &Path) -> Result<Self> {
+        Self::open_with_call_indexes(path, workspace_root, true)
+    }
+
+    /// Open a full-build destination without maintaining the large call-fact
+    /// secondary indexes while facts are inserted. The destination must not be
+    /// visible to request readers until [`finalize_full_build_indexes`] returns.
+    pub fn open_for_full_rebuild(path: &Path, workspace_root: &Path) -> Result<Self> {
+        Self::open_with_call_indexes(path, workspace_root, false)
+    }
+
+    fn open_with_call_indexes(
+        path: &Path,
+        workspace_root: &Path,
+        create_call_indexes: bool,
+    ) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).with_context(|| {
                 format!("failed to create index directory {}", parent.display())
@@ -202,8 +217,24 @@ impl IndexStore {
             conn,
             legacy_full_build: None,
         };
-        store.migrate(workspace_root)?;
+        store.migrate(workspace_root, create_call_indexes)?;
+        if !create_call_indexes {
+            store
+                .conn
+                .execute_batch(schema::DROP_CALL_LOOKUP_INDEXES_SQL)?;
+        }
         Ok(store)
+    }
+
+    pub fn finalize_full_build_indexes(&self) -> Result<()> {
+        self.conn
+            .execute_batch(schema::CREATE_CALL_LOOKUP_INDEXES_SQL)?;
+        self.conn.execute_batch(
+            "ANALYZE callable_anchor_facts;
+             ANALYZE call_site_facts;
+             PRAGMA optimize;",
+        )?;
+        Ok(())
     }
 
     /// Open an existing index for read-only queries (no schema migration).
@@ -487,7 +518,7 @@ impl IndexStore {
             .context("failed to count symbols")
     }
 
-    fn migrate(&self, workspace_root: &Path) -> Result<()> {
+    fn migrate(&self, workspace_root: &Path, create_call_indexes: bool) -> Result<()> {
         // Ensure the meta table exists, then drop the data tables when the stored
         // schema version differs so the next index pass repopulates with the new
         // shape (e.g. the `container` column / `type_aliases` table).
@@ -541,6 +572,9 @@ impl IndexStore {
 
         self.conn.execute_batch(schema::CREATE_SCHEMA_SQL)?;
         self.create_lookup_indexes()?;
+        if create_call_indexes {
+            self.create_call_lookup_indexes()?;
+        }
 
         self.conn.execute(
             "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
@@ -561,6 +595,12 @@ impl IndexStore {
 
     fn create_lookup_indexes(&self) -> Result<()> {
         self.conn.execute_batch(schema::CREATE_LOOKUP_INDEXES_SQL)?;
+        Ok(())
+    }
+
+    fn create_call_lookup_indexes(&self) -> Result<()> {
+        self.conn
+            .execute_batch(schema::CREATE_CALL_LOOKUP_INDEXES_SQL)?;
         Ok(())
     }
 

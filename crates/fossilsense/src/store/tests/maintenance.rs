@@ -121,3 +121,67 @@ fn wal_checkpoint_after_full_rebuild() {
     let reader = IndexStore::open_readonly(&db).expect("readonly");
     assert!(!reader.load_symbol_names().expect("names").is_empty());
 }
+
+#[test]
+fn full_build_defers_call_indexes_until_facts_are_complete() {
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+    let mut store = IndexStore::open_for_full_rebuild(&db, dir.path()).expect("bulk store");
+    let call_index_count = |store: &IndexStore| -> i64 {
+        store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name IN (
+                    'idx_callable_anchor_name', 'idx_callable_anchor_qualified_name',
+                    'idx_callable_anchor_entity_key', 'idx_callable_anchor_revision',
+                    'idx_call_site_caller', 'idx_call_site_callee_arity',
+                    'idx_call_site_revision'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .expect("call index count")
+    };
+    assert_eq!(call_index_count(&store), 0);
+
+    store.begin_full_rebuild_load().expect("begin");
+    upsert_source(
+        &mut store,
+        "main.c",
+        "int helper(int v) { return v; }\nint caller(void) { return helper(3); }\n",
+    );
+    store.finish_full_rebuild_load().expect("finish facts");
+    assert_eq!(call_index_count(&store), 0);
+    assert_eq!(
+        store
+            .call_fact_view()
+            .call_sites_by_callee("helper")
+            .expect("pre-index query")
+            .len(),
+        1
+    );
+
+    store
+        .finalize_full_build_indexes()
+        .expect("build call indexes");
+    assert_eq!(call_index_count(&store), 7);
+    let plan: Vec<String> = store
+        .conn
+        .prepare(
+            "EXPLAIN QUERY PLAN
+             SELECT id FROM call_site_facts
+             WHERE callee_name_id = (SELECT id FROM call_strings WHERE text = 'helper')
+               AND argument_count = 1",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(3))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert!(
+        plan.iter()
+            .any(|detail| detail.contains("idx_call_site_callee_arity")),
+        "unexpected call lookup plan: {plan:?}"
+    );
+}

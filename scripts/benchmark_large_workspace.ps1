@@ -119,6 +119,7 @@ function Convert-WhitelistedMetrics([string[]]$Lines) {
         write_ms = $true
         check_ms = $true
         include_edge_ms = $true
+        secondary_index_ms = $true
         name_table_ms = $true
         reach_graph_ms = $true
     }
@@ -219,14 +220,16 @@ $report | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $jsonPath -Encoding
 $markdown = [System.Collections.Generic.List[string]]::new()
 $markdown.Add('# FossilSense large-workspace benchmark')
 $markdown.Add('')
-$markdown.Add('| Case | Run | Elapsed ms | Peak WS MiB | Peak private MiB | Catalog build ms | Query us |')
-$markdown.Add('|---|---:|---:|---:|---:|---:|---:|')
+$markdown.Add('| Case | Run | Elapsed ms | Peak WS MiB | Peak private MiB | Write ms | Secondary index ms | Catalog build ms | Query us |')
+$markdown.Add('|---|---:|---:|---:|---:|---:|---:|---:|---:|')
 foreach ($result in $results) {
+    $write = if ($result.metrics.Contains('write_ms')) { $result.metrics.write_ms } else { '-' }
+    $secondaryIndex = if ($result.metrics.Contains('secondary_index_ms')) { $result.metrics.secondary_index_ms } else { '-' }
     $catalogBuild = if ($result.metrics.Contains('catalog_build_ms')) { $result.metrics.catalog_build_ms } else { '-' }
     $queryUs = if ($result.metrics.Contains('query_us')) { $result.metrics.query_us } else { '-' }
     $workingSetMiB = [Math]::Round($result.peak_working_set_bytes / 1MB, 2)
     $privateMiB = [Math]::Round($result.peak_private_bytes / 1MB, 2)
-    $markdown.Add("| $($result.case_id) | $($result.run) | $($result.elapsed_ms) | $workingSetMiB | $privateMiB | $catalogBuild | $queryUs |")
+    $markdown.Add("| $($result.case_id) | $($result.run) | $($result.elapsed_ms) | $workingSetMiB | $privateMiB | $write | $secondaryIndex | $catalogBuild | $queryUs |")
 }
 $markdown | Set-Content -LiteralPath $markdownPath -Encoding UTF8
 

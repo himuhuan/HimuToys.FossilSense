@@ -357,6 +357,7 @@ Parser facts 合同：
 - 外部头只贡献声明锚点，不索引函数体调用点。
 - 全局初始化表达式使用 synthetic global initializer 作为 caller；lambda 内调用暂不错误归属给外层函数。
 - schema 15 为 callable anchors / call sites 建立独立 active views 和查询索引；重复文本使用整数 ID，96-bit digest 使用 BLOB，枚举/布尔量使用整数 flags，call site 只持久化 expression byte offsets 与 callee UTF-16 range，并与统一语义代际一起发布。
+- 显式 full build 与首次未发布的默认库在 facts 写完前不维护 call 二级索引；commit 后集中创建索引并 `ANALYZE`。已有默认库的 dirty/force 路径在旁路数据库发布落地前继续保留在线索引，不能对活跃读者直接 drop。
 
 调用关系查询合同：
 

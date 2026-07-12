@@ -291,6 +291,9 @@ pub(crate) const CREATE_LOOKUP_INDEXES_SQL: &str = "
     CREATE INDEX IF NOT EXISTS idx_include_facts_target_basename ON include_facts(target_basename);
     CREATE INDEX IF NOT EXISTS idx_include_facts_target_normalized ON include_facts(target_normalized);
     CREATE INDEX IF NOT EXISTS idx_include_facts_file_id ON include_facts(file_id);
+";
+
+pub(crate) const CREATE_CALL_LOOKUP_INDEXES_SQL: &str = "
     CREATE INDEX IF NOT EXISTS idx_callable_anchor_name ON callable_anchor_facts(name_id);
     CREATE INDEX IF NOT EXISTS idx_callable_anchor_qualified_name ON callable_anchor_facts(qualified_name_id);
     CREATE INDEX IF NOT EXISTS idx_callable_anchor_entity_key ON callable_anchor_facts(entity_digest);
@@ -298,4 +301,14 @@ pub(crate) const CREATE_LOOKUP_INDEXES_SQL: &str = "
     CREATE INDEX IF NOT EXISTS idx_call_site_caller ON call_site_facts(caller_anchor_id);
     CREATE INDEX IF NOT EXISTS idx_call_site_callee_arity ON call_site_facts(callee_name_id, argument_count);
     CREATE INDEX IF NOT EXISTS idx_call_site_revision ON call_site_facts(revision_id);
+";
+
+pub(crate) const DROP_CALL_LOOKUP_INDEXES_SQL: &str = "
+    DROP INDEX IF EXISTS idx_callable_anchor_name;
+    DROP INDEX IF EXISTS idx_callable_anchor_qualified_name;
+    DROP INDEX IF EXISTS idx_callable_anchor_entity_key;
+    DROP INDEX IF EXISTS idx_callable_anchor_revision;
+    DROP INDEX IF EXISTS idx_call_site_caller;
+    DROP INDEX IF EXISTS idx_call_site_callee_arity;
+    DROP INDEX IF EXISTS idx_call_site_revision;
 ";
