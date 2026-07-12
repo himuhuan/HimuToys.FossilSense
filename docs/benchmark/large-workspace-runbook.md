@@ -54,17 +54,9 @@ Full-index cases remove only their dedicated database and WAL/SHM sidecars under
 
 The relevant gates are `write_ms`, `elapsed_ms`, peak memory, final database bytes, and the call-fact `dbstat` bytes recorded by the accompanying analysis. A tuning result must report both elapsed time and memory/disk cost; elapsed-only wins are insufficient.
 
-## Catalog phase metrics
+## Relation-query metrics
 
-The schema-14 `query calls` baseline exposes these temporary comparison metrics:
-
-- `catalog_load_anchors_ms`
-- `catalog_load_call_sites_ms`
-- `catalog_group_entities_ms`
-- `catalog_resolve_relations_ms`
-- `catalog_finalize_ms`
-
-They separate SQLite fact loading from candidate expansion and DTO/adjacency finalization. Phase 1 deletes this workspace-wide build from production paths; the fields remain useful only as the schema-14 oracle until the legacy catalog is removed.
+Current `query calls` output exposes only bounded request-index counters: `relation_query_entities`, `relation_query_call_sites`, `relation_query_relations`, `relation_query_call_site_refs`, `relation_query_ms`, and `query_us`. The schema-14 `catalog_*` build metrics and full-workspace oracle loaders were removed in Phase 5; current benchmark query cases must use schema-15 `*-rebuild.sqlite` databases.
 
 ## Correctness and synthetic gates
 

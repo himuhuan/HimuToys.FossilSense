@@ -51,7 +51,7 @@ fossilsense 单一 Rust 原生二进制 (crates/fossilsense)
 | `indexer` | 扫描、增量判定、解析、SQLite 写入、进度事件 |
 | `model` | 候选语义层与规范导出名 |
 | `call_model` | 调用关系领域值对象、稳定 locator、关系质量与覆盖合同；协议中立，不依赖 parser/store/server |
-| `call_catalog` | 请求期候选解析、evidence、grouping 与分页物化；只处理一次窄查询命中的 facts，不持有 workspace 全量目录 |
+| `call_catalog` | 请求期 `RelationQueryIndex`：候选解析、evidence、grouping 与分页物化；只处理一次窄查询命中的 bounded facts，不提供 workspace 全量 loader 或 unlimited incoming/outgoing API |
 | `call_service` | generation-pinned Call facts 窄查询、base/dirty-document delta 合并与一跳关系请求编排；SQLite 读取在 blocking worker 执行 |
 | `parser` | tree-sitter C/C++ 容错解析；唯一入口 `parse()`；提供 persistent/request facts 投影与 fact availability |
 | `semantic_model` | parser/store 中立的共享语义事实；不得依赖 parser/store/server/indexer |
@@ -110,7 +110,7 @@ Store read-view 规则：
 
 | 项 | 规则 |
 |---|---|
-| read views | 跨模块 durable reads 通过 `store::views` 的窄视图：name table、reach graph、include table、symbol/reference file、member、call facts；name table 冷构建使用 borrowed-row visitor 直接 intern，不先物化全库 owned typed-row `Vec` |
+| read views | 跨模块 durable reads 通过 `store::views` 的窄视图：name table、reach graph、include table、symbol/reference file、member、call facts；name table 冷构建使用 borrowed-row visitor 直接 intern，不先物化全库 owned typed-row `Vec`；call facts 只暴露 path/position/name/caller 的窄读与显式 limited page，不保留全库 visitor |
 | typed rows | read-model builder 输入使用 typed row / DTO，不依赖 SQL tuple column order |
 | SQL ownership | `rusqlite` 与 SQL-to-domain 转换留在 `store` / persistence 边界 |
 | compatibility | 旧 `IndexStore` query wrapper 可作为兼容/测试 oracle 保留，但应委托 read views 或共享 typed loader |

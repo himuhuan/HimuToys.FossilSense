@@ -154,14 +154,7 @@ fn full_build_defers_call_indexes_until_facts_are_complete() {
     );
     store.finish_full_rebuild_load().expect("finish facts");
     assert_eq!(call_index_count(&store), 0);
-    assert_eq!(
-        store
-            .call_fact_view()
-            .call_sites_by_callee("helper")
-            .expect("pre-index query")
-            .len(),
-        1
-    );
+    assert_eq!(test_call_sites_by_callee(&store, "helper").len(), 1);
 
     store
         .finalize_full_build_indexes()
@@ -234,19 +227,8 @@ fn existing_explicit_full_build_keeps_online_call_string_uniqueness() {
         .finalize_full_build_indexes()
         .expect("finalize replacement indexes");
 
-    assert!(store
-        .call_fact_view()
-        .call_sites_by_callee("first")
-        .expect("old calls")
-        .is_empty());
-    assert_eq!(
-        store
-            .call_fact_view()
-            .call_sites_by_callee("second")
-            .expect("new calls")
-            .len(),
-        1
-    );
+    assert!(test_call_sites_by_callee(&store, "first").is_empty());
+    assert_eq!(test_call_sites_by_callee(&store, "second").len(), 1);
     let duplicates: i64 = store
         .conn
         .query_row(

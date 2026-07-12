@@ -12,7 +12,7 @@ use tower_lsp::lsp_types::{
 };
 
 use super::{uri_to_path, Backend};
-use crate::call_catalog::{RelationCatalog, RelationPage};
+use crate::call_catalog::{RelationPage, RelationQueryIndex};
 use crate::call_model::{
     BudgetState, CallRelation, CallableEntity, CallableLocator, CoverageSummary, RelationDirection,
     RelationRevision, SourcePosition, SourceRange, RELATION_PROTOCOL_VERSION,
@@ -50,7 +50,7 @@ impl RelationRequestState {
         cursor: usize,
         relation_limit: usize,
         call_site_limit: usize,
-    ) -> anyhow::Result<(RelationCatalog, String, RelationPage)> {
+    ) -> anyhow::Result<(RelationQueryIndex, String, RelationPage)> {
         let handle = self.handle.clone();
         let overlays = self.overlays.clone();
         let path = path.to_string();
@@ -76,7 +76,7 @@ impl RelationRequestState {
         cursor: usize,
         relation_limit: usize,
         call_site_limit: usize,
-    ) -> anyhow::Result<(RelationCatalog, String, RelationPage)> {
+    ) -> anyhow::Result<(RelationQueryIndex, String, RelationPage)> {
         let handle = self.handle.clone();
         let overlays = self.overlays.clone();
         let key = key.to_string();
@@ -101,7 +101,7 @@ impl RelationRequestState {
         cursor: usize,
         relation_limit: usize,
         call_site_limit: usize,
-    ) -> anyhow::Result<(RelationCatalog, String, RelationPage)> {
+    ) -> anyhow::Result<(RelationQueryIndex, String, RelationPage)> {
         let handle = self.handle.clone();
         let overlays = self.overlays.clone();
         let locator = locator.clone();

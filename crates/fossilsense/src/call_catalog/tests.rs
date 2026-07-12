@@ -1,5 +1,24 @@
 use super::*;
 
+const TEST_RELATION_LIMIT: usize = 100_000;
+const TEST_SITE_LIMIT: usize = 10_000;
+
+fn relations(
+    index: &RelationQueryIndex,
+    direction: RelationDirection,
+    entity_key: &str,
+) -> Vec<CallRelation> {
+    index
+        .relation_page(
+            direction,
+            entity_key,
+            0,
+            TEST_RELATION_LIMIT,
+            TEST_SITE_LIMIT,
+        )
+        .relations
+}
+
 fn range(start: usize, end: usize) -> SourceRange {
     SourceRange {
         start: SourcePosition {
@@ -61,8 +80,8 @@ fn call(caller: &str, callee: &str, path: &str, arity: u32) -> CallSiteRow {
 }
 
 #[test]
-fn catalog_groups_variants_and_resolves_one_hop_both_directions() {
-    let catalog = RelationCatalog::build(
+fn query_index_groups_variants_and_resolves_one_hop_both_directions() {
+    let catalog = RelationQueryIndex::build(
         vec![
             anchor("a", "caller", "a.c", AnchorRole::Definition, 0),
             anchor("b", "target", "b.h", AnchorRole::Declaration, 1),
@@ -77,15 +96,20 @@ fn catalog_groups_variants_and_resolves_one_hop_both_directions() {
         "b.c",
         "call relations must keep the source definition as the primary anchor"
     );
-    let outgoing = catalog.outgoing("a");
+    let outgoing = relations(&catalog, RelationDirection::Outgoing, "a");
     assert_eq!(outgoing.len(), 1);
     assert_eq!(outgoing[0].callee.as_ref().unwrap().entity_key, "b");
-    assert_eq!(catalog.incoming("b")[0].caller.entity_key, "a");
+    assert_eq!(
+        relations(&catalog, RelationDirection::Incoming, "b")[0]
+            .caller
+            .entity_key,
+        "a"
+    );
 }
 
 #[test]
 fn incompatible_arity_is_unresolved_and_duplicate_names_are_ambiguous() {
-    let catalog = RelationCatalog::build(
+    let catalog = RelationQueryIndex::build(
         vec![
             anchor("a", "caller", "a.c", AnchorRole::Definition, 0),
             anchor("b", "target", "b.c", AnchorRole::Definition, 1),
@@ -96,7 +120,7 @@ fn incompatible_arity_is_unresolved_and_duplicate_names_are_ambiguous() {
             call("a", "missing", "a.c", 2),
         ],
     );
-    let outgoing = catalog.outgoing("a");
+    let outgoing = relations(&catalog, RelationDirection::Outgoing, "a");
     assert_eq!(
         outgoing
             .iter()
@@ -115,11 +139,11 @@ fn internal_linkage_uses_active_row_path_not_parser_absolute_path() {
     let mut target = anchor("b", "target", "src/a.c", AnchorRole::Definition, 0);
     target.linkage_kind = "internal".into();
     target.linkage_file = Some("C:/workspace/src/a.c".into());
-    let catalog = RelationCatalog::build(
+    let catalog = RelationQueryIndex::build(
         vec![caller, target],
         vec![call("a", "target", "src/a.c", 0)],
     );
-    let outgoing = catalog.outgoing("a");
+    let outgoing = relations(&catalog, RelationDirection::Outgoing, "a");
     assert_eq!(outgoing.len(), 1);
     assert_eq!(outgoing[0].callee.as_ref().unwrap().entity_key, "b");
     assert!(outgoing[0]
@@ -130,7 +154,7 @@ fn internal_linkage_uses_active_row_path_not_parser_absolute_path() {
 
 #[test]
 fn stale_entity_key_remaps_by_path_signature_and_nearest_anchor() {
-    let catalog = RelationCatalog::build(
+    let catalog = RelationQueryIndex::build(
         vec![anchor(
             "fresh",
             "target",
@@ -166,7 +190,7 @@ fn root_lookup_only_tests_variants_from_the_requested_file() {
     definition.body_range.as_mut().unwrap().start.line = 5;
     definition.body_range.as_mut().unwrap().end.line = 6;
     let local = anchor("local", "local", "impl.c", AnchorRole::Definition, 0);
-    let catalog = RelationCatalog::build(vec![header, definition, local], vec![]);
+    let catalog = RelationQueryIndex::build(vec![header, definition, local], vec![]);
     assert_eq!(
         catalog
             .entity_at(
@@ -184,7 +208,7 @@ fn root_lookup_only_tests_variants_from_the_requested_file() {
 
 #[test]
 fn compact_relation_storage_is_shared_by_both_directions_and_pages_before_materializing() {
-    let catalog = RelationCatalog::build(
+    let catalog = RelationQueryIndex::build(
         vec![
             anchor("a", "caller", "a.c", AnchorRole::Definition, 0),
             anchor("b", "target", "b.c", AnchorRole::Definition, 0),
@@ -199,8 +223,14 @@ fn compact_relation_storage_is_shared_by_both_directions_and_pages_before_materi
     let stats = catalog.stats();
     assert_eq!(stats.relations, 1);
     assert_eq!(stats.relation_call_site_refs, 3);
-    assert_eq!(catalog.outgoing("a").len(), 1);
-    assert_eq!(catalog.incoming("b").len(), 1);
+    assert_eq!(
+        relations(&catalog, RelationDirection::Outgoing, "a").len(),
+        1
+    );
+    assert_eq!(
+        relations(&catalog, RelationDirection::Incoming, "b").len(),
+        1
+    );
 
     let page = catalog.relation_page(RelationDirection::Outgoing, "a", 0, 1, 2);
     assert_eq!(page.total, 1);
@@ -237,7 +267,7 @@ fn high_ambiguity_expansion_stays_compact_and_materializes_only_the_requested_pa
         })
         .collect();
 
-    let catalog = RelationCatalog::build(anchors, calls);
+    let catalog = RelationQueryIndex::build(anchors, calls);
     let stats = catalog.stats();
     assert_eq!(stats.relations, CANDIDATES * CALLS);
     assert_eq!(stats.relation_call_site_refs, CANDIDATES * CALLS);
@@ -253,7 +283,7 @@ fn high_ambiguity_expansion_stays_compact_and_materializes_only_the_requested_pa
 
 #[test]
 #[ignore = "diagnostic scale benchmark; run explicitly in release mode"]
-fn benchmark_large_fan_in_catalog_and_cached_query() {
+fn benchmark_large_fan_in_query_index_and_cached_page() {
     const CALLERS: usize = 5_000;
     let mut anchors = Vec::with_capacity(CALLERS + 1);
     let mut calls = Vec::with_capacity(CALLERS);
@@ -277,7 +307,7 @@ fn benchmark_large_fan_in_catalog_and_cached_query() {
         calls.push(call(&key, "shared_target", &path, 0));
     }
     let build_started = std::time::Instant::now();
-    let catalog = RelationCatalog::build(anchors, calls);
+    let catalog = RelationQueryIndex::build(anchors, calls);
     let build_ms = build_started.elapsed().as_millis();
     let query_started = std::time::Instant::now();
     let incoming = catalog.relation_page(RelationDirection::Incoming, "target", 0, 200, 200);

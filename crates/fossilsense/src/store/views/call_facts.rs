@@ -1,5 +1,3 @@
-#![allow(dead_code)] // The service consumer lands after the durable fact contract.
-
 use anyhow::Result;
 
 use crate::call_model::{SourcePosition, SourceRange};
@@ -69,39 +67,6 @@ impl<'a> CallFactStoreView<'a> {
         Self { store }
     }
 
-    #[cfg(test)]
-    pub fn all_anchors(&self) -> Result<Vec<CallableAnchorRow>> {
-        self.anchor_query("", [])
-    }
-
-    #[cfg(test)]
-    pub fn all_call_sites(&self) -> Result<Vec<CallSiteRow>> {
-        self.call_site_query("", [])
-    }
-
-    #[cfg(test)]
-    pub fn visit_all_anchors(
-        &self,
-        visitor: impl FnMut(CallableAnchorRow) -> Result<()>,
-    ) -> Result<()> {
-        self.visit_anchors("", &[], visitor)
-    }
-
-    #[cfg(test)]
-    pub fn visit_all_call_sites(
-        &self,
-        visitor: impl FnMut(CallSiteRow) -> Result<()>,
-    ) -> Result<()> {
-        self.visit_call_sites("", [], None, visitor)
-    }
-
-    pub fn anchors_by_name(&self, name: &str) -> Result<Vec<CallableAnchorRow>> {
-        self.anchor_query(
-            "WHERE a.name_id = (SELECT id FROM call_strings WHERE text = ?1)",
-            [name],
-        )
-    }
-
     pub fn anchors_by_entity_key(&self, entity_key: &str) -> Result<Vec<CallableAnchorRow>> {
         self.anchor_query("WHERE a.entity_digest = unhex(?1)", [entity_key])
     }
@@ -141,10 +106,6 @@ impl<'a> CallFactStoreView<'a> {
         self.anchors_by_values("a.entity_digest", keys, true)
     }
 
-    pub fn call_sites_by_caller(&self, entity_key: &str) -> Result<Vec<CallSiteRow>> {
-        self.call_site_query("WHERE caller.entity_digest = unhex(?1)", [entity_key])
-    }
-
     pub fn call_sites_by_caller_limited(
         &self,
         entity_key: &str,
@@ -154,13 +115,6 @@ impl<'a> CallFactStoreView<'a> {
             "WHERE caller.entity_digest = unhex(?1)",
             [entity_key],
             limit,
-        )
-    }
-
-    pub fn call_sites_by_callee(&self, name: &str) -> Result<Vec<CallSiteRow>> {
-        self.call_site_query(
-            "WHERE c.callee_name_id = (SELECT id FROM call_strings WHERE text = ?1)",
-            [name],
         )
     }
 
@@ -174,10 +128,6 @@ impl<'a> CallFactStoreView<'a> {
             [name],
             limit,
         )
-    }
-
-    pub fn call_sites_by_path(&self, path: &str) -> Result<Vec<CallSiteRow>> {
-        self.call_site_query("WHERE f.path = ?1", [path])
     }
 
     pub fn call_sites_at(&self, path: &str, line: u32, character: u32) -> Result<Vec<CallSiteRow>> {

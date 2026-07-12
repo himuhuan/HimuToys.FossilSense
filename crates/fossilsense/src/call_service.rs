@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 
 use crate::call_catalog::rows::{anchor_from_row, call_from_row};
-use crate::call_catalog::{RelationCatalog, RelationPage};
+use crate::call_catalog::{RelationPage, RelationQueryIndex};
 use crate::call_model::{CallSiteFact, CallableAnchor, CoverageSummary, SourceRange};
 use crate::call_model::{CallableLocator, RelationDirection, SemanticGeneration, SourcePosition};
 use crate::pathing::IndexDbLease;
@@ -84,7 +84,7 @@ impl<'a> CallRelationService<'a> {
         Self { handle, overlays }
     }
 
-    pub fn prepare_at(&self, path: &str, position: SourcePosition) -> Result<RelationCatalog> {
+    pub fn prepare_at(&self, path: &str, position: SourcePosition) -> Result<RelationQueryIndex> {
         let store = IndexStore::open_readonly(self.handle.db.path())?;
         let guard = store.begin_semantic_read(Some(self.handle.generation.0))?;
         let catalog = locator_catalog(
@@ -105,7 +105,7 @@ impl<'a> CallRelationService<'a> {
         cursor: usize,
         relation_limit: usize,
         call_site_limit: usize,
-    ) -> Result<(RelationCatalog, String, RelationPage)> {
+    ) -> Result<(RelationQueryIndex, String, RelationPage)> {
         let store = IndexStore::open_readonly(self.handle.db.path())?;
         let guard = store.begin_semantic_read(Some(self.handle.generation.0))?;
         let view = guard.store().call_fact_view();
@@ -137,7 +137,7 @@ impl<'a> CallRelationService<'a> {
         cursor: usize,
         relation_limit: usize,
         call_site_limit: usize,
-    ) -> Result<(RelationCatalog, String, RelationPage)> {
+    ) -> Result<(RelationQueryIndex, String, RelationPage)> {
         let store = IndexStore::open_readonly(self.handle.db.path())?;
         let guard = store.begin_semantic_read(Some(self.handle.generation.0))?;
         let view = guard.store().call_fact_view();
@@ -166,7 +166,7 @@ impl<'a> CallRelationService<'a> {
         );
         let coverage = coverage_summary(view.request_coverage()?);
         let locator_catalog =
-            RelationCatalog::build_from_facts(anchors, Vec::<CallSiteFact>::new(), coverage);
+            RelationQueryIndex::build_from_facts(anchors, Vec::<CallSiteFact>::new(), coverage);
         let entity = locator_catalog
             .resolve_locator(locator)
             .context("callable locator is stale")?;
@@ -193,7 +193,7 @@ impl<'a> CallRelationService<'a> {
         cursor: usize,
         relation_limit: usize,
         call_site_limit: usize,
-    ) -> Result<(RelationCatalog, String, RelationPage)> {
+    ) -> Result<(RelationQueryIndex, String, RelationPage)> {
         let store = IndexStore::open_readonly(self.handle.db.path())?;
         let guard = store.begin_semantic_read(Some(self.handle.generation.0))?;
         let view = guard.store().call_fact_view();
@@ -212,7 +212,7 @@ impl<'a> CallRelationService<'a> {
         );
         let coverage = coverage_summary(view.request_coverage()?);
         let locator_catalog =
-            RelationCatalog::build_from_facts(anchors, Vec::<CallSiteFact>::new(), coverage);
+            RelationQueryIndex::build_from_facts(anchors, Vec::<CallSiteFact>::new(), coverage);
         let entity = locator_catalog
             .entity(key)
             .context("callable key is stale")?;
@@ -238,7 +238,7 @@ fn locator_catalog(
     overlays: &[FileCallOverlay],
     path: &str,
     position: SourcePosition,
-) -> Result<RelationCatalog> {
+) -> Result<RelationQueryIndex> {
     let mut path_anchors: Vec<CallableAnchor> = if let Some(overlay) = overlay_for(overlays, path) {
         overlay
             .anchors
@@ -285,7 +285,7 @@ fn locator_catalog(
             .cloned(),
     );
     lookup_anchors.append(&mut path_anchors);
-    Ok(RelationCatalog::build_from_facts(
+    Ok(RelationQueryIndex::build_from_facts(
         lookup_anchors,
         path_calls,
         coverage_summary(view.request_coverage()?),
@@ -301,7 +301,7 @@ fn query_resolved(
     relation_limit: usize,
     call_site_limit: usize,
     overlays: &[FileCallOverlay],
-) -> Result<(RelationCatalog, RelationPage)> {
+) -> Result<(RelationQueryIndex, RelationPage)> {
     let (base_rows, mut scan_limited) = match direction {
         RelationDirection::Incoming => {
             view.call_sites_by_callee_limited(name, DEFAULT_SCANNED_SITE_LIMIT)?
@@ -352,7 +352,7 @@ fn query_resolved(
     );
     let candidate_limited =
         apply_candidate_expansion_budget(&mut calls, &anchors, DEFAULT_CANDIDATE_EXPANSION_LIMIT);
-    let catalog = RelationCatalog::build_from_facts(
+    let catalog = RelationQueryIndex::build_from_facts(
         anchors,
         calls,
         coverage_summary(view.request_coverage()?),
@@ -438,7 +438,7 @@ mod tests {
     use crate::indexer::{index_workspace, IndexOptions};
 
     #[test]
-    fn lazy_store_query_matches_full_catalog_oracle() {
+    fn lazy_store_query_and_overlay_merge_preserve_expected_relation() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
@@ -464,9 +464,18 @@ mod tests {
         )
         .unwrap();
 
-        let store = IndexStore::open_readonly(&db_path).unwrap();
-        let oracle = RelationCatalog::build_from_view(&store.call_fact_view()).unwrap();
-        let root = oracle
+        let handle = CallReadHandle::capture(db_path).unwrap();
+        let service = CallRelationService::new(&handle);
+        let prepared = service
+            .prepare_at(
+                "target.c",
+                SourcePosition {
+                    line: 0,
+                    character: 5,
+                },
+            )
+            .unwrap();
+        let root = prepared
             .entity_at(
                 "target.c",
                 SourcePosition {
@@ -475,10 +484,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let expected = oracle.incoming(&root.entity_key);
-
-        let handle = CallReadHandle::capture(db_path).unwrap();
-        let (_, _, actual) = CallRelationService::new(&handle)
+        let (_, _, actual) = service
             .query_at(
                 "target.c",
                 SourcePosition {
@@ -492,8 +498,17 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(actual.total, expected.len());
-        assert_eq!(actual.relations, expected);
+        assert_eq!(actual.total, 1);
+        assert_eq!(actual.relations.len(), 1);
+        assert_eq!(actual.relations[0].caller.name, "caller");
+        assert_eq!(
+            actual.relations[0]
+                .callee
+                .as_ref()
+                .expect("resolved target")
+                .entity_key,
+            root.entity_key
+        );
 
         let clean_caller_replacement = crate::parser::parse(
             &workspace.join("caller.c"),
@@ -542,8 +557,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            merged_page.total,
-            expected.len() + 1,
+            merged_page.total, 2,
             "incoming must merge calls from other dirty documents"
         );
     }
@@ -630,7 +644,8 @@ mod tests {
         ));
         assert_eq!(calls.len(), DEFAULT_CANDIDATE_EXPANSION_LIMIT / 64);
         let started = std::time::Instant::now();
-        let catalog = RelationCatalog::build_from_facts(anchors, calls, CoverageSummary::default());
+        let catalog =
+            RelationQueryIndex::build_from_facts(anchors, calls, CoverageSummary::default());
         let elapsed_ms = started.elapsed().as_millis();
         assert!(catalog.stats().relations <= DEFAULT_CANDIDATE_EXPANSION_LIMIT);
         eprintln!(

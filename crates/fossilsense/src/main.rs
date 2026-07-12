@@ -322,19 +322,18 @@ fn run_query(kind: QueryCommand) -> Result<()> {
             } else {
                 call_model::RelationDirection::Outgoing
             };
-            let (catalog, entity_key, page) = call_service::CallRelationService::new(&handle)
+            let (query_index, entity_key, page) = call_service::CallRelationService::new(&handle)
                 .query_at(&rel, position, direction, 0, 200, 200)
                 .with_context(|| format!("no callable at {}:{line}:{col}", file.display()))?;
-            let entity = catalog
+            let entity = query_index
                 .entity(&entity_key)
                 .context("resolved callable missing")?;
             let relation_total_in_scan = page.total;
             let scan_limited = page.scan_limited;
             let relations = page.relations;
             let query_us = query_started.elapsed().as_micros();
-            let catalog_ms = build_started.elapsed().as_millis();
-            let catalog_stats = catalog.stats();
-            let catalog_metrics = catalog.build_metrics();
+            let relation_query_ms = build_started.elapsed().as_millis();
+            let query_stats = query_index.stats();
             println!(
                 "call_relations: {}",
                 if incoming { "incoming" } else { "outgoing" }
@@ -364,33 +363,19 @@ fn run_query(kind: QueryCommand) -> Result<()> {
             println!("relations: {}", relations.len());
             println!("relations_total_in_scan: {relation_total_in_scan}");
             println!("scan_limited: {scan_limited}");
-            println!("catalog_entities: {}", catalog_stats.entities);
-            println!("catalog_call_sites: {}", catalog_stats.call_sites);
-            println!("catalog_relations: {}", catalog_stats.relations);
+            println!("relation_query_entities: {}", query_stats.entities);
+            println!("relation_query_call_sites: {}", query_stats.call_sites);
+            println!("relation_query_relations: {}", query_stats.relations);
             println!(
-                "catalog_call_site_refs: {}",
-                catalog_stats.relation_call_site_refs
+                "relation_query_call_site_refs: {}",
+                query_stats.relation_call_site_refs
             );
-            println!("catalog_build_ms: {catalog_ms}");
-            println!(
-                "catalog_load_anchors_ms: {}",
-                catalog_metrics.load_anchors_ms
-            );
-            println!(
-                "catalog_load_call_sites_ms: {}",
-                catalog_metrics.load_call_sites_ms
-            );
-            println!(
-                "catalog_group_entities_ms: {}",
-                catalog_metrics.group_entities_ms
-            );
-            println!(
-                "catalog_resolve_relations_ms: {}",
-                catalog_metrics.resolve_relations_ms
-            );
-            println!("catalog_finalize_ms: {}", catalog_metrics.finalize_ms);
+            println!("relation_query_ms: {relation_query_ms}");
             println!("query_us: {query_us}");
-            println!("coverage: {}", serde_json::to_string(catalog.coverage())?);
+            println!(
+                "coverage: {}",
+                serde_json::to_string(query_index.coverage())?
+            );
             for relation in relations {
                 let target = relation
                     .callee

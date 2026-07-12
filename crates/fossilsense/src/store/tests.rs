@@ -41,6 +41,42 @@ fn upsert_with_source(store: &mut IndexStore, path: &str, source: &str, file_sou
         .expect("upsert");
 }
 
+const TEST_CALL_READ_LIMIT: usize = 10_000;
+
+fn test_anchors_by_name(
+    store: &IndexStore,
+    name: &str,
+) -> Vec<crate::store::views::CallableAnchorRow> {
+    store
+        .call_fact_view()
+        .anchors_by_names(&[name.to_string()])
+        .expect("anchors by name")
+}
+
+fn test_call_sites_by_callee(
+    store: &IndexStore,
+    name: &str,
+) -> Vec<crate::store::views::CallSiteRow> {
+    let (rows, limited) = store
+        .call_fact_view()
+        .call_sites_by_callee_limited(name, TEST_CALL_READ_LIMIT)
+        .expect("call sites by callee");
+    assert!(!limited, "test fixture exceeded bounded call read");
+    rows
+}
+
+fn test_call_sites_by_caller(
+    store: &IndexStore,
+    entity_key: &str,
+) -> Vec<crate::store::views::CallSiteRow> {
+    let (rows, limited) = store
+        .call_fact_view()
+        .call_sites_by_caller_limited(entity_key, TEST_CALL_READ_LIMIT)
+        .expect("call sites by caller");
+    assert!(!limited, "test fixture exceeded bounded call read");
+    rows
+}
+
 /// Test convenience over the production record/field APIs: resolve record
 /// candidates for `names` (unscoped) and read their fields by id, sorted.
 /// Mirrors what `complete_members` does on the receiver-resolved path.

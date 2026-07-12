@@ -96,16 +96,11 @@ function Invoke-SampledProcess {
 function Convert-WhitelistedMetrics([string[]]$Lines) {
     $allowed = @{
         relations = $true
-        catalog_entities = $true
-        catalog_call_sites = $true
-        catalog_relations = $true
-        catalog_call_site_refs = $true
-        catalog_build_ms = $true
-        catalog_load_anchors_ms = $true
-        catalog_load_call_sites_ms = $true
-        catalog_group_entities_ms = $true
-        catalog_resolve_relations_ms = $true
-        catalog_finalize_ms = $true
+        relation_query_entities = $true
+        relation_query_call_sites = $true
+        relation_query_relations = $true
+        relation_query_call_site_refs = $true
+        relation_query_ms = $true
         query_us = $true
         files = $true
         indexed = $true
@@ -146,23 +141,23 @@ $cases = @(
     [pscustomobject]@{
         Id = 'uboot-board-init-incoming'
         Workspace = Join-Path $repoRoot 'samples\u-boot'
-        Database = Join-Path $benchmarkPath 'index-u-boot.sqlite'
+        Database = Join-Path $benchmarkPath 'index-u-boot-rebuild.sqlite'
         ResetDatabase = $null
-        Arguments = @('query', 'calls', (Join-Path $repoRoot 'samples\u-boot'), 'common/board_f.c', '1073', '6', '--incoming', '--db', (Join-Path $benchmarkPath 'index-u-boot.sqlite'))
+        Arguments = @('query', 'calls', (Join-Path $repoRoot 'samples\u-boot'), 'common/board_f.c', '1073', '6', '--incoming', '--db', (Join-Path $benchmarkPath 'index-u-boot-rebuild.sqlite'))
     },
     [pscustomobject]@{
         Id = 'wine-medium-fanin-incoming'
         Workspace = Join-Path $repoRoot 'samples\wine'
-        Database = Join-Path $benchmarkPath 'index-wine.sqlite'
+        Database = Join-Path $benchmarkPath 'index-wine-rebuild.sqlite'
         ResetDatabase = $null
-        Arguments = @('query', 'calls', (Join-Path $repoRoot 'samples\wine'), 'dlls/ntdll/heap.c', '1489', '30', '--incoming', '--db', (Join-Path $benchmarkPath 'index-wine.sqlite'))
+        Arguments = @('query', 'calls', (Join-Path $repoRoot 'samples\wine'), 'dlls/ntdll/heap.c', '1489', '30', '--incoming', '--db', (Join-Path $benchmarkPath 'index-wine-rebuild.sqlite'))
     },
     [pscustomobject]@{
         Id = 'wine-high-frequency-incoming'
         Workspace = Join-Path $repoRoot 'samples\wine'
-        Database = Join-Path $benchmarkPath 'index-wine.sqlite'
+        Database = Join-Path $benchmarkPath 'index-wine-rebuild.sqlite'
         ResetDatabase = $null
-        Arguments = @('query', 'calls', (Join-Path $repoRoot 'samples\wine'), 'dlls/kernelbase/console.c', '2295', '36', '--incoming', '--db', (Join-Path $benchmarkPath 'index-wine.sqlite'))
+        Arguments = @('query', 'calls', (Join-Path $repoRoot 'samples\wine'), 'dlls/kernelbase/console.c', '2295', '36', '--incoming', '--db', (Join-Path $benchmarkPath 'index-wine-rebuild.sqlite'))
     }
 )
 
@@ -250,17 +245,17 @@ $report | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $jsonPath -Encoding
 $markdown = [System.Collections.Generic.List[string]]::new()
 $markdown.Add('# FossilSense large-workspace benchmark')
 $markdown.Add('')
-$markdown.Add('| Case | Run | Elapsed ms | Peak WS MiB | Peak private MiB | Write ms | Secondary index ms | Publication ms | Catalog build ms | Query us |')
+$markdown.Add('| Case | Run | Elapsed ms | Peak WS MiB | Peak private MiB | Write ms | Secondary index ms | Publication ms | Relation query ms | Query us |')
 $markdown.Add('|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|')
 foreach ($result in $results) {
     $write = if ($result.metrics.Contains('write_ms')) { $result.metrics.write_ms } else { '-' }
     $secondaryIndex = if ($result.metrics.Contains('secondary_index_ms')) { $result.metrics.secondary_index_ms } else { '-' }
     $publication = if ($result.metrics.Contains('publication_ms')) { $result.metrics.publication_ms } else { '-' }
-    $catalogBuild = if ($result.metrics.Contains('catalog_build_ms')) { $result.metrics.catalog_build_ms } else { '-' }
+    $relationQuery = if ($result.metrics.Contains('relation_query_ms')) { $result.metrics.relation_query_ms } else { '-' }
     $queryUs = if ($result.metrics.Contains('query_us')) { $result.metrics.query_us } else { '-' }
     $workingSetMiB = [Math]::Round($result.peak_working_set_bytes / 1MB, 2)
     $privateMiB = [Math]::Round($result.peak_private_bytes / 1MB, 2)
-    $markdown.Add("| $($result.case_id) | $($result.run) | $($result.elapsed_ms) | $workingSetMiB | $privateMiB | $write | $secondaryIndex | $publication | $catalogBuild | $queryUs |")
+    $markdown.Add("| $($result.case_id) | $($result.run) | $($result.elapsed_ms) | $workingSetMiB | $privateMiB | $write | $secondaryIndex | $publication | $relationQuery | $queryUs |")
 }
 $markdown | Set-Content -LiteralPath $markdownPath -Encoding UTF8
 
