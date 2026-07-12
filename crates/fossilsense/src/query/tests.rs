@@ -37,8 +37,19 @@ fn benchmark_large_name_table_build_and_dirty_update() {
     let store = crate::store::IndexStore::open_readonly(&db).expect("benchmark database");
 
     let build_started = std::time::Instant::now();
-    let mut table = NameTable::build_from_store_view(&store.name_table_view(), None)
-        .expect("stream name rows into index");
+    let mut builder = name_index_builder::NameIndexBuilder::new(None);
+    let visit_started = std::time::Instant::now();
+    store
+        .name_table_view()
+        .visit_symbol_rows(|row| {
+            builder.push(row);
+            Ok(())
+        })
+        .expect("stream name rows into builder");
+    let sql_visit_ms = visit_started.elapsed().as_millis();
+    let finalize_started = std::time::Instant::now();
+    let mut table = builder.finish();
+    let finalize_ms = finalize_started.elapsed().as_millis();
     let stream_build_ms = build_started.elapsed().as_millis();
     let expected_len = table.len();
 
@@ -126,6 +137,8 @@ fn benchmark_large_name_table_build_and_dirty_update() {
     println!("name_unique_names: {}", table.base.names.len());
     println!("name_unique_paths: {}", table.base.paths.len());
     println!("name_unique_projects: {}", table.base.projects.len());
+    println!("name_sql_visit_ms: {sql_visit_ms}");
+    println!("name_finalize_ms: {finalize_ms}");
     println!("name_stream_build_ms: {stream_build_ms}");
     println!("name_dirty_update_us: {}", dirty_us[dirty_us.len() / 2]);
     println!(
@@ -397,6 +410,23 @@ fn prefix_candidates_match_full_scan_exact_prefix() {
         .collect();
     ids.sort_unstable();
     assert_eq!(ids, vec![1, 2], "only exact/prefix entries, not substrings");
+}
+
+#[test]
+fn name_id_counting_sort_preserves_spelling_order_and_duplicate_stability() {
+    let table = NameTable::build(vec![
+        (1, "beta".to_string(), false),
+        (2, "Alpha".to_string(), false),
+        (3, "alpha".to_string(), false),
+        (4, "Alpha".to_string(), false),
+        (5, "ALPHA".to_string(), false),
+    ]);
+    let ids: Vec<i64> = table
+        .prefix_candidates("a")
+        .into_iter()
+        .map(|index| table.active_entry(index).id)
+        .collect();
+    assert_eq!(ids, vec![5, 2, 4, 3]);
 }
 
 #[test]

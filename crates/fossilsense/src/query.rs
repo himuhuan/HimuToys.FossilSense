@@ -244,18 +244,35 @@ pub struct NameTable {
 
 /// Entry indices sorted by `(lowercased name, original name)` for prefix search.
 fn sorted_indices(entries: &[CompactNameEntry], names: &[NameString]) -> Vec<usize> {
-    let mut idx: Vec<usize> = (0..entries.len()).collect();
-    idx.sort_by(|&a, &b| {
-        names[entries[a].name_id as usize]
+    let mut name_order: Vec<u32> = (0..names.len())
+        .map(|index| u32::try_from(index).expect("name arena exceeds u32 IDs"))
+        .collect();
+    name_order.sort_unstable_by(|&a, &b| {
+        names[a as usize]
             .lower
-            .cmp(&names[entries[b].name_id as usize].lower)
-            .then_with(|| {
-                names[entries[a].name_id as usize]
-                    .original
-                    .cmp(&names[entries[b].name_id as usize].original)
-            })
+            .cmp(&names[b as usize].lower)
+            .then_with(|| names[a as usize].original.cmp(&names[b as usize].original))
     });
-    idx
+
+    let mut counts = vec![0_u32; names.len()];
+    for entry in entries {
+        counts[entry.name_id as usize] += 1;
+    }
+    let mut cursors = vec![0_u32; names.len()];
+    let mut next = 0_u32;
+    for name_id in name_order {
+        cursors[name_id as usize] = next;
+        next = next
+            .checked_add(counts[name_id as usize])
+            .expect("name index exceeds u32 entry positions");
+    }
+    let mut sorted = vec![0_usize; entries.len()];
+    for (index, entry) in entries.iter().enumerate() {
+        let cursor = &mut cursors[entry.name_id as usize];
+        sorted[*cursor as usize] = index;
+        *cursor += 1;
+    }
+    sorted
 }
 
 fn all_workspace_reach(segment: &NameSegment) -> ReachScope {

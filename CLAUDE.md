@@ -170,6 +170,7 @@ Runtime snapshot 规则：
 | 截断 | top-N 始终针对当前完整前缀重算 |
 | 增量 | 前缀延长时结果收窄；空结果不能黏住后续输入 |
 | 热路径 | 每键合并内存 `NameTable` base/delta segments 并生成 `RankedNameHit`，不做磁盘 IO |
+| prefix index | 每个 compact segment 先按唯一 name ID 的 `(lower, original)` 排序，再用 count/offset 线性生成稳定 entry postings；同 spelling 的 entry 保持插入顺序，不逐 entry 重复字符串比较 |
 | 召回 | exact / prefix 档通过 sorted-by-lower 前缀索引二分 |
 | 排序 | 可叠加目录局部性偏移，但绝不过滤 |
 
