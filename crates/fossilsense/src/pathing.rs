@@ -1,10 +1,62 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use directories::ProjectDirs;
+
+static INDEX_DB_LEASES: OnceLock<Mutex<std::collections::HashMap<PathBuf, Weak<()>>>> =
+    OnceLock::new();
+
+#[derive(Debug, Clone)]
+pub struct IndexDbLease {
+    path: PathBuf,
+    token: Arc<()>,
+}
+
+impl IndexDbLease {
+    pub fn acquire(path: PathBuf) -> Self {
+        let registry = INDEX_DB_LEASES.get_or_init(Default::default);
+        let mut leases = registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let token = leases
+            .get(&path)
+            .and_then(Weak::upgrade)
+            .unwrap_or_else(|| {
+                let token = Arc::new(());
+                leases.insert(path.clone(), Arc::downgrade(&token));
+                token
+            });
+        Self { path, token }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for IndexDbLease {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.token) != 1 {
+            return;
+        }
+        let Some(directory) = self.path.parent() else {
+            return;
+        };
+        let registry = INDEX_DB_LEASES.get_or_init(Default::default);
+        let mut leases = registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if Arc::strong_count(&self.token) != 1 {
+            return;
+        }
+        leases.remove(&self.path);
+        let _ = cleanup_index_directory_locked(directory, &mut leases, stale_temp_cutoff());
+    }
+}
 
 pub fn canonical_workspace(root: impl AsRef<Path>) -> Result<PathBuf> {
     let root = root.as_ref();
@@ -58,6 +110,7 @@ pub fn default_index_staging_path(workspace: &Path) -> Result<PathBuf> {
     let directory = default_index_directory(workspace)?;
     fs::create_dir_all(&directory)
         .with_context(|| format!("failed to create index directory {}", directory.display()))?;
+    let _ = cleanup_index_directory(&directory, stale_temp_cutoff());
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -119,7 +172,90 @@ fn publish_index_in_directory(
     file.sync_all()?;
     drop(file);
     atomic_replace(&manifest_staging, &manifest)?;
+    let _ = cleanup_index_directory(directory, stale_temp_cutoff());
     Ok(final_path)
+}
+
+fn stale_temp_cutoff() -> SystemTime {
+    SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(24 * 60 * 60))
+        .unwrap_or(UNIX_EPOCH)
+}
+
+fn cleanup_index_directory(directory: &Path, temp_cutoff: SystemTime) -> Result<usize> {
+    let registry = INDEX_DB_LEASES.get_or_init(Default::default);
+    let mut leases = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cleanup_index_directory_locked(directory, &mut leases, temp_cutoff)
+}
+
+fn cleanup_index_directory_locked(
+    directory: &Path,
+    leases: &mut std::collections::HashMap<PathBuf, Weak<()>>,
+    temp_cutoff: SystemTime,
+) -> Result<usize> {
+    leases.retain(|_, lease| lease.strong_count() > 0);
+    let active_name = directory
+        .join("active-index")
+        .is_file()
+        .then(|| resolve_active_index(directory).ok())
+        .flatten()
+        .and_then(|path| path.file_name().map(|name| name.to_owned()));
+    let mut removed = 0;
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let Some(name_text) = name.to_str() else {
+            continue;
+        };
+        let generation_base = name_text
+            .strip_suffix("-wal")
+            .or_else(|| name_text.strip_suffix("-shm"))
+            .unwrap_or(name_text);
+        let is_generation = generation_base.starts_with("index-g")
+            && generation_base.ends_with(".sqlite")
+            && generation_base[7..generation_base.len() - 7]
+                .split('-')
+                .next()
+                .is_some_and(|value| value.parse::<u64>().is_ok());
+        if is_generation {
+            // Without a valid manifest there is no safe way to distinguish an
+            // old generation from the last recoverable database.
+            let Some(active_name) = active_name.as_deref() else {
+                continue;
+            };
+            if active_name == std::ffi::OsStr::new(generation_base) {
+                continue;
+            }
+            let base_path = directory.join(generation_base);
+            if leases.contains_key(&base_path) {
+                continue;
+            }
+            if fs::remove_file(&path).is_ok() {
+                removed += 1;
+            }
+            continue;
+        }
+
+        let is_staging = name_text.starts_with("index-build-")
+            || (name_text.starts_with("active-index-") && name_text.ends_with(".tmp"));
+        if is_staging
+            && entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .is_ok_and(|modified| modified <= temp_cutoff)
+            && fs::remove_file(&path).is_ok()
+        {
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
 
 #[cfg(windows)]
@@ -251,12 +387,13 @@ pub fn normalize_abs_path(path: &Path) -> String {
 mod tests {
     use std::fs;
     use std::path::Path;
+    use std::time::SystemTime;
 
     use tempfile::tempdir;
 
     use super::{
-        default_index_path, path_is_within, publish_index_in_directory, relative_slash_path,
-        resolve_active_index,
+        cleanup_index_directory, default_index_path, path_is_within, publish_index_in_directory,
+        relative_slash_path, resolve_active_index, IndexDbLease,
     };
 
     #[test]
@@ -283,6 +420,7 @@ mod tests {
         fs::write(&first_staging, b"first").expect("first staging");
         let first =
             publish_index_in_directory(dir.path(), &first_staging, 1).expect("publish first");
+        let first_lease = IndexDbLease::acquire(first.clone());
         assert_eq!(resolve_active_index(dir.path()).unwrap(), first);
 
         let second_staging = dir.path().join("index-build-second.sqlite");
@@ -298,16 +436,94 @@ mod tests {
                 .trim(),
             second.file_name().unwrap().to_string_lossy()
         );
+        drop(first_lease);
+        assert!(!first.exists(), "released old generation is cleaned");
+        assert_eq!(fs::read(&second).unwrap(), b"second");
+    }
+
+    #[test]
+    fn cleanup_respects_temp_cutoff_and_preserves_leased_generation() {
+        let dir = tempdir().expect("tempdir");
+        let active = dir.path().join("index-g3-active.sqlite");
+        let leased = dir.path().join("index-g2-leased.sqlite");
+        let old = dir.path().join("index-g1-old.sqlite");
+        fs::write(&active, b"active").unwrap();
+        fs::write(&leased, b"leased").unwrap();
+        fs::write(&old, b"old").unwrap();
+        fs::write(dir.path().join("active-index"), "index-g3-active.sqlite\n").unwrap();
+        let stale_build = dir.path().join("index-build-stale.sqlite");
+        let live_build = dir.path().join("index-build-live.sqlite");
+        fs::write(&stale_build, b"stale").unwrap();
+        fs::write(&live_build, b"live").unwrap();
+        let lease = IndexDbLease::acquire(leased.clone());
+
+        cleanup_index_directory(dir.path(), SystemTime::UNIX_EPOCH).expect("generation cleanup");
+        assert!(active.exists());
+        assert!(leased.exists());
+        assert!(!old.exists());
+        assert!(stale_build.exists());
+        assert!(live_build.exists());
+        cleanup_index_directory(
+            dir.path(),
+            SystemTime::now() + std::time::Duration::from_secs(1),
+        )
+        .expect("temp cleanup");
+        assert!(!stale_build.exists());
+        assert!(!live_build.exists());
+        drop(lease);
+        assert!(!leased.exists());
+    }
+
+    #[test]
+    #[ignore = "diagnostic generation-family cleanup benchmark"]
+    fn benchmark_generation_family_cleanup() {
+        let dir = tempdir().expect("tempdir");
+        let active = dir.path().join("index-g1001-active.sqlite");
+        fs::write(&active, b"active").unwrap();
+        fs::write(
+            dir.path().join("active-index"),
+            "index-g1001-active.sqlite\n",
+        )
+        .unwrap();
+        let leased = dir.path().join("index-g500-leased.sqlite");
+        for generation in 1..=1_000 {
+            let path = if generation == 500 {
+                leased.clone()
+            } else {
+                dir.path().join(format!("index-g{generation}-old.sqlite"))
+            };
+            fs::write(path, b"old").unwrap();
+        }
+        let lease = IndexDbLease::acquire(leased.clone());
+        let started = std::time::Instant::now();
+        let removed = cleanup_index_directory(dir.path(), SystemTime::now()).expect("cleanup");
+        let elapsed_us = started.elapsed().as_micros();
+        println!("generation_cleanup_files: {removed}");
+        println!("generation_cleanup_us: {elapsed_us}");
+        assert_eq!(removed, 999);
+        assert!(active.exists());
+        assert!(leased.exists());
+        drop(lease);
+        assert!(!leased.exists());
     }
 
     #[test]
     fn generation_manifest_rejects_traversal_and_missing_targets() {
         let dir = tempdir().expect("tempdir");
+        let recoverable = dir.path().join("index-g8-recoverable.sqlite");
+        fs::write(&recoverable, b"recoverable").unwrap();
         fs::write(dir.path().join("active-index"), "../outside.sqlite\n").expect("bad manifest");
         assert!(resolve_active_index(dir.path()).is_err());
+        cleanup_index_directory(dir.path(), SystemTime::now()).expect("safe cleanup");
+        assert!(
+            recoverable.exists(),
+            "invalid manifest must preserve recoverable generations"
+        );
         fs::write(dir.path().join("active-index"), "index-g9-missing.sqlite\n")
             .expect("missing manifest");
         assert!(resolve_active_index(dir.path()).is_err());
+        cleanup_index_directory(dir.path(), SystemTime::now()).expect("safe cleanup");
+        assert!(recoverable.exists());
     }
 
     #[test]

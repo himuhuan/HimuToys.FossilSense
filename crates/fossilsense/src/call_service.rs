@@ -7,6 +7,7 @@ use crate::call_catalog::rows::{anchor_from_row, call_from_row};
 use crate::call_catalog::{RelationCatalog, RelationPage};
 use crate::call_model::{CallSiteFact, CallableAnchor, CoverageSummary, SourceRange};
 use crate::call_model::{CallableLocator, RelationDirection, SemanticGeneration, SourcePosition};
+use crate::pathing::IndexDbLease;
 use crate::store::views::CallFactStoreView;
 use crate::store::IndexStore;
 
@@ -15,14 +16,14 @@ const DEFAULT_CANDIDATE_EXPANSION_LIMIT: usize = 32_768;
 
 #[derive(Debug, Clone)]
 pub struct CallReadHandle {
-    db_path: PathBuf,
+    db: IndexDbLease,
     pub generation: SemanticGeneration,
 }
 
 impl CallReadHandle {
     pub fn at_generation(db_path: PathBuf, generation: SemanticGeneration) -> Self {
         Self {
-            db_path,
+            db: IndexDbLease::acquire(db_path),
             generation,
         }
     }
@@ -33,7 +34,7 @@ impl CallReadHandle {
         let generation = SemanticGeneration(guard.generation());
         guard.finish()?;
         Ok(Self {
-            db_path,
+            db: IndexDbLease::acquire(db_path),
             generation,
         })
     }
@@ -84,7 +85,7 @@ impl<'a> CallRelationService<'a> {
     }
 
     pub fn prepare_at(&self, path: &str, position: SourcePosition) -> Result<RelationCatalog> {
-        let store = IndexStore::open_readonly(&self.handle.db_path)?;
+        let store = IndexStore::open_readonly(self.handle.db.path())?;
         let guard = store.begin_semantic_read(Some(self.handle.generation.0))?;
         let catalog = locator_catalog(
             &guard.store().call_fact_view(),
@@ -105,7 +106,7 @@ impl<'a> CallRelationService<'a> {
         relation_limit: usize,
         call_site_limit: usize,
     ) -> Result<(RelationCatalog, String, RelationPage)> {
-        let store = IndexStore::open_readonly(&self.handle.db_path)?;
+        let store = IndexStore::open_readonly(self.handle.db.path())?;
         let guard = store.begin_semantic_read(Some(self.handle.generation.0))?;
         let view = guard.store().call_fact_view();
         let locator_catalog = locator_catalog(&view, self.overlays, path, position)?;
@@ -137,7 +138,7 @@ impl<'a> CallRelationService<'a> {
         relation_limit: usize,
         call_site_limit: usize,
     ) -> Result<(RelationCatalog, String, RelationPage)> {
-        let store = IndexStore::open_readonly(&self.handle.db_path)?;
+        let store = IndexStore::open_readonly(self.handle.db.path())?;
         let guard = store.begin_semantic_read(Some(self.handle.generation.0))?;
         let view = guard.store().call_fact_view();
         let mut anchors: Vec<_> = view
@@ -193,7 +194,7 @@ impl<'a> CallRelationService<'a> {
         relation_limit: usize,
         call_site_limit: usize,
     ) -> Result<(RelationCatalog, String, RelationPage)> {
-        let store = IndexStore::open_readonly(&self.handle.db_path)?;
+        let store = IndexStore::open_readonly(self.handle.db.path())?;
         let guard = store.begin_semantic_read(Some(self.handle.generation.0))?;
         let view = guard.store().call_fact_view();
         let mut anchors: Vec<_> = view

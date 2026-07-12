@@ -115,6 +115,7 @@ Store read-view 规则：
 | SQL ownership | `rusqlite` 与 SQL-to-domain 转换留在 `store` / persistence 边界 |
 | compatibility | 旧 `IndexStore` query wrapper 可作为兼容/测试 oracle 保留，但应委托 read views 或共享 typed loader |
 | bundled SQLite | 必须包含 WAL-reset 并发损坏修复（当前基线 SQLite 3.51.3+）；`store` resilience test 防止版本回退 |
+| generation lease | `CallReadHandle` 持有可克隆 `IndexDbLease`；manifest 切换后只清理非 active、非 leased 的旧 generation，最后一个 lease 释放时 best-effort 重试；无有效 manifest 时不得删除可恢复 generation，超过 24 小时的废弃 build/manifest staging 可在启动时清理 |
 
 统一语义代际规则：
 
@@ -363,7 +364,7 @@ Parser facts 合同：
 - 显式 full build 与首次未发布的默认库在 facts 写完前不维护 call 二级索引；commit 后集中创建索引并 `ANALYZE`。已有默认库的 dirty/force 路径在旁路数据库发布落地前继续保留在线索引，不能对活跃读者直接 drop。
 - 新建 full-build 库的 `call_strings` 在构建期由跨 batch interner 分配唯一 integer ID，不逐行维护 UNIQUE B-tree；facts 完成后释放 interner，再创建 `idx_call_strings_text` 唯一索引。普通/既有库继续依赖在线唯一索引，dirty upsert 不得绕过约束。
 - 默认 full/force/schema-mismatch rebuild 写入 cache family 内独立的 `index-build-*.sqlite`；facts、二级索引、`quick_check`、foreign-key check 与 WAL checkpoint 全部完成并关闭连接后，才封装为单调 generation 文件，并通过 `active-index` 原子 manifest 切换。Windows 使用 replace-existing + write-through 的原子文件替换。
-- dirty index 只写 manifest 当前指向的 active generation，继续使用 WAL staging。full publication 不覆盖或立即删除旧 generation 文件；旧 `EngineSnapshot`/SQLite reader 必须能继续读取旧文件。force rebuild 可从损坏 manifest 恢复，并从现存 generation 文件维持 generation 单调性。
+- dirty index 只写 manifest 当前指向的 active generation，继续使用 WAL staging。full publication 不覆盖 leased 旧 generation；旧 `EngineSnapshot`/SQLite reader 通过 `IndexDbLease` 继续读取旧文件，最后 lease 释放后才 best-effort 删除。force rebuild 可从损坏 manifest 恢复，并从现存 generation 文件维持 generation 单调性；manifest 无效时 cleanup 不得删除候选 generation。
 
 调用关系查询合同：
 
