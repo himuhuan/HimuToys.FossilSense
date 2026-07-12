@@ -356,6 +356,20 @@ impl NameTable {
         self.deltas.len()
     }
 
+    pub(crate) fn needs_compaction(&self) -> bool {
+        self.deltas.len() >= 64
+            || self.slot_len.saturating_sub(self.base.entries.len())
+                > self.base.entries.len().saturating_div(4)
+    }
+
+    pub(crate) fn compacted(&self) -> Self {
+        Self::from_entries(
+            self.active_indices()
+                .map(|index| self.entry(index).clone())
+                .collect(),
+        )
+    }
+
     #[cfg(test)]
     fn active_entry(&self, index: usize) -> &NameEntry {
         self.entry(index)

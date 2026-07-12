@@ -88,6 +88,38 @@ fn benchmark_large_name_table_build_and_dirty_update() {
     sampler.join().expect("memory sampler");
     dirty_us.sort_unstable();
 
+    while !table.needs_compaction() {
+        table = table.with_updated_path_rows(&paths, fresh_rows.clone());
+        assert_eq!(table.len(), expected_len);
+    }
+    let segments_before_compaction = table.delta_segment_count();
+    let compaction_private_before = current_private_bytes();
+    let compaction_peak_private =
+        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(compaction_private_before));
+    let stop_compaction_sampling = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let compaction_sampler = {
+        let peak_private = compaction_peak_private.clone();
+        let stop_sampling = stop_compaction_sampling.clone();
+        std::thread::spawn(move || {
+            while !stop_sampling.load(std::sync::atomic::Ordering::Relaxed) {
+                peak_private.fetch_max(
+                    current_private_bytes(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        })
+    };
+    let compaction_started = std::time::Instant::now();
+    let compacted = table.compacted();
+    let compaction_ms = compaction_started.elapsed().as_millis();
+    stop_compaction_sampling.store(true, std::sync::atomic::Ordering::Relaxed);
+    compaction_sampler
+        .join()
+        .expect("compaction memory sampler");
+    assert_eq!(compacted.len(), expected_len);
+    assert_eq!(compacted.delta_segment_count(), 0);
+
     println!("name_rows: {expected_len}");
     println!("name_changed_rows: {}", fresh_rows.len());
     println!("name_load_ms: {load_ms}");
@@ -98,6 +130,14 @@ fn benchmark_large_name_table_build_and_dirty_update() {
         peak_private
             .load(std::sync::atomic::Ordering::Relaxed)
             .saturating_sub(private_before)
+    );
+    println!("name_compaction_input_segments: {segments_before_compaction}");
+    println!("name_compaction_ms: {compaction_ms}");
+    println!(
+        "name_compaction_private_delta_bytes: {}",
+        compaction_peak_private
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_sub(compaction_private_before)
     );
 }
 
@@ -769,6 +809,50 @@ fn name_table_segmented_prefix_and_narrowing_match_cold_search() {
     let cold = table.search_ranked_scoped_pooled("foo", 10, None, None).0;
     assert_eq!(narrowed, cold);
     assert!(cold.iter().all(|hit| hit.id != 2));
+}
+
+#[test]
+fn name_table_compaction_preserves_active_results_and_removes_segments() {
+    let mut table = NameTable::build_with_paths(vec![
+        (
+            1,
+            "base_name".to_string(),
+            false,
+            "src/base.c".to_string(),
+            "function".to_string(),
+            false,
+        ),
+        (
+            2,
+            "changed_0".to_string(),
+            false,
+            "src/changed.c".to_string(),
+            "function".to_string(),
+            false,
+        ),
+    ]);
+    let paths = std::collections::HashSet::from(["src/changed.c".to_string()]);
+    for revision in 1..=64 {
+        table = table.with_updated_paths(
+            &paths,
+            vec![(
+                2 + revision,
+                format!("changed_{revision}"),
+                false,
+                "src/changed.c".to_string(),
+                "function".to_string(),
+                false,
+            )],
+        );
+    }
+    assert!(table.needs_compaction());
+    let before = table.search_ranked("changed", 10);
+    let compacted = table.compacted();
+    assert_eq!(compacted.delta_segment_count(), 0);
+    assert!(!compacted.needs_compaction());
+    assert_eq!(compacted.len(), 2);
+    assert_eq!(compacted.search_ranked("changed", 10), before);
+    assert_eq!(compacted.search("base", 10), vec![1]);
 }
 
 #[test]

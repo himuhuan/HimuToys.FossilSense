@@ -94,4 +94,4 @@ cargo test --release -p fossilsense `
   --ignored --exact --nocapture
 ```
 
-On Windows the test samples its own Private Bytes every millisecond around dirty replacement. `name_dirty_private_delta_bytes` is the process peak above the fully built base table, not an allocator estimate.
+On Windows the test samples its own Private Bytes every millisecond around dirty replacement. `name_dirty_private_delta_bytes` is the process peak above the fully built base table, not an allocator estimate. After preserving the five-update dirty measurement, the test accumulates worst-case replacements until the background-compaction threshold is reached and reports `name_compaction_input_segments`, `name_compaction_ms`, and `name_compaction_private_delta_bytes` independently.

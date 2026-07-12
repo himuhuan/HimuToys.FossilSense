@@ -433,6 +433,7 @@ impl CacheLedger {
         .await?;
         let symbol_count = name_table.len();
         let name_table_ms = nt_started.elapsed().as_millis();
+        let should_compact_name_index = name_table.needs_compaction();
         let call_read_handle = capture_call_read_handle(&root, semantic_generation)?;
 
         let rg_started = tokio::time::Instant::now();
@@ -490,7 +491,7 @@ impl CacheLedger {
 
         let epoch = self.allocate_engine_epoch();
         self.publish_engine_snapshot(EngineSnapshot {
-            root,
+            root: root.clone(),
             epoch,
             semantic_generation,
             name_table: Some(name_table),
@@ -504,7 +505,7 @@ impl CacheLedger {
         .await;
         self.invalidate_after_index_change().await;
 
-        Ok(CachePublishReport {
+        let report = CachePublishReport {
             semantic_generation,
             symbol_count,
             include_count,
@@ -515,7 +516,94 @@ impl CacheLedger {
             epoch,
             include_table_error,
             reference_file_list_error,
+        };
+        drop(_publish_guard);
+        if should_compact_name_index {
+            self.spawn_name_index_compaction(client.clone(), root, epoch);
+        }
+        Ok(report)
+    }
+
+    fn spawn_name_index_compaction(
+        &self,
+        client: Client,
+        root: PathBuf,
+        expected_epoch: crate::server::state::EngineEpoch,
+    ) {
+        let cache = self.clone();
+        tokio::spawn(async move {
+            let started = tokio::time::Instant::now();
+            match cache
+                .compact_name_index_if_current(root.clone(), expected_epoch)
+                .await
+            {
+                Ok(true) => {
+                    client
+                        .log_message(
+                            MessageType::INFO,
+                            format!(
+                                "name index compacted for {} in {}ms",
+                                root.display(),
+                                started.elapsed().as_millis()
+                            ),
+                        )
+                        .await;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    client
+                        .log_message(
+                            MessageType::WARNING,
+                            format!("name index compaction failed: {error:#}"),
+                        )
+                        .await;
+                }
+            }
+        });
+    }
+
+    pub(in crate::server) async fn compact_name_index_if_current(
+        &self,
+        root: PathBuf,
+        expected_epoch: crate::server::state::EngineEpoch,
+    ) -> Result<bool> {
+        let Some(snapshot) = self.current_engine_snapshot(&root).await else {
+            return Ok(false);
+        };
+        if snapshot.epoch != expected_epoch {
+            return Ok(false);
+        }
+        let Some(name_table) = snapshot.name_table.clone() else {
+            return Ok(false);
+        };
+        if !name_table.needs_compaction() {
+            return Ok(false);
+        }
+        let compacted =
+            tokio::task::spawn_blocking(move || Arc::new(name_table.compacted())).await?;
+
+        let _publish_guard = self.publish_gate.lock().await;
+        let Some(current) = self.current_engine_snapshot(&root).await else {
+            return Ok(false);
+        };
+        if current.epoch != expected_epoch {
+            return Ok(false);
+        }
+        self.publish_engine_snapshot(EngineSnapshot {
+            root,
+            epoch: self.allocate_engine_epoch(),
+            semantic_generation: current.semantic_generation,
+            name_table: Some(compacted),
+            reach_graph: current.reach_graph.clone(),
+            include_table: current.include_table.clone(),
+            indexed_files: current.indexed_files.clone(),
+            project_context: current.project_context.clone(),
+            call_read_handle: current.call_read_handle.clone(),
+            degraded: current.degraded.clone(),
         })
+        .await;
+        self.clear_all_completion_memos().await;
+        Ok(true)
     }
 
     /// Refresh build-marker ownership without re-indexing or reparsing source

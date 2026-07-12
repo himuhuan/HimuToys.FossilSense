@@ -152,6 +152,91 @@ async fn workspace_folder_removal_drops_root_and_published_snapshot() {
         .is_none());
 }
 
+#[tokio::test]
+async fn name_index_compaction_publishes_only_for_the_expected_engine_epoch() {
+    let cache = super::CacheLedger::default();
+    let root = tempdir().expect("root").path().to_path_buf();
+    let paths = std::collections::HashSet::from(["src/changed.c".to_string()]);
+    let mut table = crate::query::NameTable::build_with_paths(vec![
+        (
+            1,
+            "base_name".to_string(),
+            false,
+            "src/base.c".to_string(),
+            "function".to_string(),
+            false,
+        ),
+        (
+            2,
+            "changed_0".to_string(),
+            false,
+            "src/changed.c".to_string(),
+            "function".to_string(),
+            false,
+        ),
+    ]);
+    for revision in 1..=64 {
+        table = table.with_updated_paths(
+            &paths,
+            vec![(
+                2 + revision,
+                format!("changed_{revision}"),
+                false,
+                "src/changed.c".to_string(),
+                "function".to_string(),
+                false,
+            )],
+        );
+    }
+    let initial_epoch = cache.allocate_engine_epoch();
+    cache
+        .publish_engine_snapshot(super::workspace::EngineSnapshot {
+            root: root.clone(),
+            epoch: initial_epoch,
+            semantic_generation: crate::call_model::SemanticGeneration(7),
+            name_table: Some(Arc::new(table)),
+            reach_graph: None,
+            include_table: None,
+            indexed_files: None,
+            project_context: None,
+            call_read_handle: None,
+            degraded: Default::default(),
+        })
+        .await;
+
+    assert!(cache
+        .compact_name_index_if_current(root.clone(), initial_epoch)
+        .await
+        .expect("compact current"));
+    let compacted = cache
+        .current_engine_snapshot(&root)
+        .await
+        .expect("compacted snapshot");
+    assert_ne!(compacted.epoch, initial_epoch);
+    assert_eq!(compacted.semantic_generation.0, 7);
+    assert_eq!(
+        compacted
+            .name_table
+            .as_ref()
+            .expect("name table")
+            .delta_segment_count(),
+        0
+    );
+
+    assert!(!cache
+        .compact_name_index_if_current(root.clone(), initial_epoch)
+        .await
+        .expect("stale compaction discarded"));
+    assert_eq!(
+        cache
+            .current_engine_snapshot(&root)
+            .await
+            .expect("current snapshot")
+            .epoch,
+        compacted.epoch
+    );
+}
+
 fn write_workspace_file(root: &std::path::Path, rel: &str, text: &str) {
     let path = root.join(rel);
     if let Some(parent) = path.parent() {
