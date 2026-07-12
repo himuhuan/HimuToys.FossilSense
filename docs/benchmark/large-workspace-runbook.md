@@ -10,7 +10,7 @@ This runbook fixes the measurement boundary used by the large-workspace performa
 
 ## Prerequisites
 
-Build the release binary. Query-only comparison requires the prepared indexes described in the phase benchmark documents; a filtered full-index run does not require query databases:
+Build the release binary. Query-only comparison requires prepared schema-15 indexes under `target/benchmark/`; a filtered full-index run does not require query databases:
 
 ```powershell
 cargo build --release -p fossilsense
@@ -56,7 +56,7 @@ The relevant gates are `write_ms`, `elapsed_ms`, peak memory, final database byt
 
 ## Relation-query metrics
 
-Current `query calls` output exposes only bounded request-index counters: `relation_query_entities`, `relation_query_call_sites`, `relation_query_relations`, `relation_query_call_site_refs`, `relation_query_ms`, and `query_us`. The schema-14 `catalog_*` build metrics and full-workspace oracle loaders were removed in Phase 5; current benchmark query cases must use schema-15 `*-rebuild.sqlite` databases.
+Current `query calls` output exposes only bounded request-index counters: `relation_query_entities`, `relation_query_call_sites`, `relation_query_relations`, `relation_query_call_site_refs`, `relation_query_ms`, and `query_us`. Benchmark query cases must use schema-15 `*-rebuild.sqlite` databases.
 
 ## Correctness and synthetic gates
 
@@ -73,7 +73,7 @@ The ignored release benchmark is diagnostic, not a pass/fail CI assertion:
 cargo test --release -p fossilsense benchmark_large_fan_in_catalog_and_cached_query -- --ignored --nocapture
 ```
 
-High-ambiguity budget and pagination become hard CI gates in the lazy service phase. The schema-14 catalog benchmark exists only to preserve the before measurement.
+High-ambiguity budget and pagination are covered by the lazy call-service tests and the ignored release benchmark above.
 
 ## Name-index publication benchmark
 
