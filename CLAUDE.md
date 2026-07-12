@@ -131,7 +131,7 @@ Runtime snapshot 规则：
 
 | 项 | 规则 |
 |---|---|
-| `EngineSnapshot` | 每工作区一个完整不可变读模型，统一携带 name table、reach graph、include table、reference file list、project context、轻量 `CallReadHandle`、degraded state；不得持有全库 call sites/relations |
+| `EngineSnapshot` | 每工作区一个完整不可变读模型，统一携带 segmented name index、reach graph、include table、reference file list、project context、轻量 `CallReadHandle`、degraded state；不得持有全库 call sites/relations |
 | publication | 所有下一代读模型在后台构建完成后，只通过一次 map 交换发布；构建期间旧快照继续服务请求 |
 | `EngineEpoch` | 每次成功发布分配显式单调 epoch；`0` 只表示尚未发布索引读模型 |
 | `SemanticGeneration` | SQLite active manifest 的持久化单调代际；marker-only 等纯派生刷新不得推进它 |
@@ -168,7 +168,7 @@ Runtime snapshot 规则：
 | `isIncomplete` | 成功、空结果、截断结果都必须为 `true` |
 | 截断 | top-N 始终针对当前完整前缀重算 |
 | 增量 | 前缀延长时结果收窄；空结果不能黏住后续输入 |
-| 热路径 | 每键扫描内存 `NameTable` / `RankedNameHit`，不做磁盘 IO |
+| 热路径 | 每键合并内存 `NameTable` base/delta segments 并生成 `RankedNameHit`，不做磁盘 IO |
 | 召回 | exact / prefix 档通过 sorted-by-lower 前缀索引二分 |
 | 排序 | 可叠加目录局部性偏移，但绝不过滤 |
 
@@ -210,7 +210,7 @@ Smart Completion 当前约定：
 | 自动归属 | 请求 URI 所在的最具体 workspace root 内，最近祖先 marker 目录获胜；同目录 marker 合并，嵌套项目保持独立 |
 | 选择 | 状态栏提供 `Current Project (Auto)`、所有发现路径和 `Unspecified`；显式选择只存 VS Code `workspaceState` |
 | 配置 | `fossilsense.projectContext.mode = auto / promptOnAmbiguous / off`；prompt 只在有可选项目且活动本地 C/C++ 文件无法归属时每 URI/会话提示一次 |
-| snapshot | `ProjectContextIndex` 与带 `ProjectKey` 的 `NameTable` 同代原子发布；marker 变化只重建派生读模型，不重解析未变源码 |
+| snapshot | `ProjectContextIndex` 与带 `ProjectKey` 的 segmented `NameTable` 同代原子发布；marker 变化只重建派生读模型，不重解析未变源码 |
 | memo | engine epoch、selection epoch 和 effective project 都参与 completion memo generation；marker/选择变化不得复用旧池 |
 | fallback | project discovery 失败标记 `projectContext` degraded，ordinary completion 继续走基线；热路径只查内存，不遍历文件系统 |
 | 边界 | 项目上下文的召回/排序 boost 仍仅由 ordinary identifier completion 消费；definition、Hover、completion documentation 与 Signature Help 只读取 `ProjectKey` 作为严格 `.h/.c` 配对门槛，不改变跨项目召回或基础候选排名；references、coloring、workspace symbol、member/include completion 不消费 |

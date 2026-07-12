@@ -14,7 +14,7 @@ Status: current (2026-07-12)
 
 每个工作区发布一份不可变的 **`EngineSnapshot`**。它统一携带：
 
-- name table
+- segmented name index（共享 immutable base、changed-file delta segments、per-path active override/tombstone）
 - reach graph
 - include table
 - reference file list

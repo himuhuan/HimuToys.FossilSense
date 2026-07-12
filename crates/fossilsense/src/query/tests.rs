@@ -123,21 +123,21 @@ fn bounded_top_selection_matches_full_sort_at_scale() {
         })
         .collect();
     let table = NameTable::build(names);
-    let candidates: Vec<ScoredCandidate> = (0..table.entries.len())
+    let candidates: Vec<ScoredCandidate> = (0..table.len())
         .map(|index| ScoredCandidate {
             score: ((index * 104_729) % 50_000) as i32,
-            name_len: table.entries[index].name.len(),
+            name_len: table.active_entry(index).name.len(),
             index,
             tier: ScopeTier::Global,
             base_match: 0,
         })
         .collect();
     let mut oracle = candidates.clone();
-    sort_scored(&mut oracle, &table.entries);
+    sort_scored(&mut oracle, &table);
     oracle.truncate(200);
 
     assert_eq!(
-        top_scored(candidates, 200, &table.entries)
+        top_scored(candidates, 200, &table)
             .into_iter()
             .map(|candidate| candidate.index)
             .collect::<Vec<_>>(),
@@ -323,7 +323,10 @@ fn name_table_tags_workspace_entries_and_keeps_external_entries_unowned() {
         .expect("external")
         .project_key
         .is_none());
-    assert_eq!(table.project_indices(&key).map(<[usize]>::len), Some(1));
+    assert_eq!(
+        table.project_indices(&key).map(|indices| indices.len()),
+        Some(1)
+    );
 }
 
 // --- Prefix index + incremental narrowing (completion performance) --------
@@ -339,7 +342,7 @@ fn prefix_candidates_match_full_scan_exact_prefix() {
     let mut ids: Vec<i64> = table
         .prefix_candidates("foo")
         .iter()
-        .map(|&i| table.entries[i].id)
+        .map(|&i| table.active_entry(i).id)
         .collect();
     ids.sort_unstable();
     assert_eq!(ids, vec![1, 2], "only exact/prefix entries, not substrings");
@@ -661,6 +664,111 @@ fn name_table_replaces_entries_for_dirty_paths() {
     assert!(updated.search("old", 10).is_empty());
     assert_eq!(updated.search("new", 10), vec![3]);
     assert_eq!(updated.search("keep", 10), vec![2]);
+}
+
+#[test]
+fn name_table_repeated_segments_shadow_then_tombstone_one_path() {
+    let table = NameTable::build_with_paths(vec![
+        (
+            1,
+            "old_name".to_string(),
+            false,
+            "src/a.c".to_string(),
+            "function".to_string(),
+            false,
+        ),
+        (
+            2,
+            "keep_name".to_string(),
+            false,
+            "src/b.c".to_string(),
+            "function".to_string(),
+            false,
+        ),
+    ]);
+    let paths = std::collections::HashSet::from(["src/a.c".to_string()]);
+    let first = table.with_updated_paths(
+        &paths,
+        vec![(
+            3,
+            "first_delta".to_string(),
+            false,
+            "src/a.c".to_string(),
+            "function".to_string(),
+            false,
+        )],
+    );
+    let second = first.with_updated_paths(
+        &paths,
+        vec![(
+            4,
+            "second_delta".to_string(),
+            false,
+            "src/a.c".to_string(),
+            "function".to_string(),
+            false,
+        )],
+    );
+    assert_eq!(second.len(), 2);
+    assert!(second.search("old", 10).is_empty());
+    assert!(second.search("first", 10).is_empty());
+    assert_eq!(second.search("second", 10), vec![4]);
+    assert_eq!(second.search("keep", 10), vec![2]);
+
+    let deleted = second.with_updated_paths(&paths, vec![]);
+    assert_eq!(deleted.len(), 1);
+    assert!(deleted.search("second", 10).is_empty());
+    assert_eq!(deleted.search("keep", 10), vec![2]);
+    assert_eq!(deleted.delta_segment_count(), 3);
+}
+
+#[test]
+fn name_table_segmented_prefix_and_narrowing_match_cold_search() {
+    let table = NameTable::build_with_paths(vec![
+        (
+            1,
+            "foo_base".to_string(),
+            false,
+            "src/base.c".to_string(),
+            "function".to_string(),
+            false,
+        ),
+        (
+            2,
+            "old_delta".to_string(),
+            false,
+            "src/changed.c".to_string(),
+            "function".to_string(),
+            false,
+        ),
+    ]);
+    let paths = std::collections::HashSet::from(["src/changed.c".to_string()]);
+    let table = table.with_updated_paths(
+        &paths,
+        vec![(
+            3,
+            "foo_delta".to_string(),
+            false,
+            "src/changed.c".to_string(),
+            "function".to_string(),
+            false,
+        )],
+    );
+    let mut prefix_ids: Vec<i64> = table
+        .prefix_candidates("foo")
+        .into_iter()
+        .map(|index| table.active_entry(index).id)
+        .collect();
+    prefix_ids.sort_unstable();
+    assert_eq!(prefix_ids, vec![1, 3]);
+
+    let (_, pool) = table.search_ranked_scoped_pooled("fo", 10, None, None);
+    let narrowed = table
+        .search_ranked_scoped_pooled("foo", 10, None, Some(&pool))
+        .0;
+    let cold = table.search_ranked_scoped_pooled("foo", 10, None, None).0;
+    assert_eq!(narrowed, cold);
+    assert!(cold.iter().all(|hit| hit.id != 2));
 }
 
 #[test]

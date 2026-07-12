@@ -180,17 +180,25 @@ impl CompletionScope {
     }
 }
 
-/// All symbol names loaded into memory for sub-second fuzzy search. Built once
-/// per workspace after an index pass; `search` returns symbol ids that callers
-/// resolve back to full records via the store.
-pub struct NameTable {
+struct NameSegment {
     entries: Vec<NameEntry>,
-    /// Entry indices sorted by lowercased name, enabling binary-search retrieval
-    /// of the exact/prefix tiers without a full scan.
     sorted: Vec<usize>,
-    /// Candidate indices grouped by derived build-marker project. This is a
-    /// completion recall index, not a semantic scope.
     by_project: HashMap<ProjectKey, Vec<usize>>,
+    path_counts: HashMap<Arc<str>, usize>,
+}
+
+/// Segmented workspace name index. Full publication installs one immutable base;
+/// dirty publication appends small changed-file segments and updates only the
+/// per-path active override map. Virtual entry indices remain stable for the
+/// lifetime of one engine snapshot and are invalidated with its completion memo.
+pub struct NameTable {
+    base: Arc<NameSegment>,
+    deltas: Arc<Vec<Arc<NameSegment>>>,
+    /// Path -> active delta segment. `None` is a deletion tombstone.
+    path_overrides: Arc<HashMap<Arc<str>, Option<usize>>>,
+    delta_offsets: Arc<Vec<usize>>,
+    active_len: usize,
+    slot_len: usize,
     /// Cached unscoped coloring fallback: all workspace files in a closed
     /// reachability set. Reused by `colorable_kind_counts(None)` instead of
     /// rebuilding the same path set on every semantic-token request.
@@ -274,6 +282,87 @@ impl NameTable {
         Self::from_entries(entries)
     }
 
+    fn from_entries(entries: Vec<NameEntry>) -> Self {
+        let all_workspace_reach = Arc::new(all_workspace_reach(&entries));
+        let active_len = entries.len();
+        let base = Arc::new(NameSegment::from_entries(entries));
+        Self {
+            base,
+            deltas: Arc::new(Vec::new()),
+            path_overrides: Arc::new(HashMap::new()),
+            delta_offsets: Arc::new(Vec::new()),
+            active_len,
+            slot_len: active_len,
+            all_workspace_reach,
+        }
+    }
+
+    fn entry(&self, index: usize) -> &NameEntry {
+        if index < self.base.entries.len() {
+            return &self.base.entries[index];
+        }
+        let delta_index = self
+            .delta_offsets
+            .partition_point(|offset| *offset <= index)
+            .saturating_sub(1);
+        let offset = self.delta_offsets[delta_index];
+        &self.deltas[delta_index].entries[index - offset]
+    }
+
+    fn segment_for_index(&self, index: usize) -> Option<usize> {
+        (index >= self.base.entries.len()).then(|| {
+            self.delta_offsets
+                .partition_point(|offset| *offset <= index)
+                .saturating_sub(1)
+        })
+    }
+
+    fn is_active_index(&self, index: usize) -> bool {
+        let entry = self.entry(index);
+        match self.path_overrides.get(entry.path.as_ref()) {
+            None => self.segment_for_index(index).is_none(),
+            Some(Some(active_delta)) => self.segment_for_index(index) == Some(*active_delta),
+            Some(None) => false,
+        }
+    }
+
+    fn active_indices(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.slot_len).filter(|index| self.is_active_index(*index))
+    }
+
+    fn extend_prefix_matches(
+        &self,
+        segment: &NameSegment,
+        offset: usize,
+        needle_lower: &str,
+        output: &mut Vec<usize>,
+    ) {
+        let start = segment
+            .sorted
+            .partition_point(|&index| segment.entries[index].lower.as_ref() < needle_lower);
+        for &local in &segment.sorted[start..] {
+            if !segment.entries[local].lower.starts_with(needle_lower) {
+                break;
+            }
+            let index = offset + local;
+            if self.is_active_index(index) {
+                output.push(index);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub fn delta_segment_count(&self) -> usize {
+        self.deltas.len()
+    }
+
+    #[cfg(test)]
+    fn active_entry(&self, index: usize) -> &NameEntry {
+        self.entry(index)
+    }
+}
+
+impl NameSegment {
     fn from_entries(mut entries: Vec<NameEntry>) -> Self {
         // Symbols commonly repeat both their file path and spelling. Intern
         // those immutable strings within one published table so a large file
@@ -294,15 +383,20 @@ impl NameTable {
                 by_project.entry(key.clone()).or_default().push(index);
             }
         }
-        let all_workspace_reach = Arc::new(all_workspace_reach(&entries));
+        let mut path_counts = HashMap::new();
+        for entry in &entries {
+            *path_counts.entry(entry.path.clone()).or_insert(0) += 1;
+        }
         Self {
             entries,
             sorted,
             by_project,
-            all_workspace_reach,
+            path_counts,
         }
     }
+}
 
+impl NameTable {
     #[allow(dead_code)]
     pub fn with_updated_paths(
         &self,
@@ -335,8 +429,28 @@ impl NameTable {
         self.with_updated_entries(paths, fresh_entries)
     }
 
-    pub fn project_indices(&self, key: &ProjectKey) -> Option<&[usize]> {
-        self.by_project.get(key).map(Vec::as_slice)
+    pub fn project_indices(&self, key: &ProjectKey) -> Option<Vec<usize>> {
+        let mut indices = Vec::new();
+        if let Some(base) = self.base.by_project.get(key) {
+            indices.extend(
+                base.iter()
+                    .copied()
+                    .filter(|index| self.is_active_index(*index)),
+            );
+        }
+        for (delta_index, delta) in self.deltas.iter().enumerate() {
+            let Some(project) = delta.by_project.get(key) else {
+                continue;
+            };
+            let offset = self.delta_offsets[delta_index];
+            indices.extend(
+                project
+                    .iter()
+                    .map(|index| offset + index)
+                    .filter(|index| self.is_active_index(*index)),
+            );
+        }
+        (!indices.is_empty()).then_some(indices)
     }
 
     /// Re-derive build-marker ownership over this already-published name
@@ -345,9 +459,8 @@ impl NameTable {
     /// the runtime snapshot.
     pub fn with_project_context(&self, project_context: Option<&ProjectContextIndex>) -> Self {
         let entries = self
-            .entries
-            .iter()
-            .cloned()
+            .active_indices()
+            .map(|index| self.entry(index).clone())
             .map(|mut entry| {
                 entry.project_key = if entry.external {
                     None
@@ -365,14 +478,63 @@ impl NameTable {
         paths: &HashSet<String>,
         fresh_entries: impl IntoIterator<Item = NameEntry>,
     ) -> Self {
-        let mut entries: Vec<NameEntry> = self
-            .entries
-            .iter()
-            .filter(|entry| !paths.contains(entry.path.as_ref()))
-            .cloned()
-            .collect();
-        entries.extend(fresh_entries);
-        Self::from_entries(entries)
+        let fresh_entries: Vec<NameEntry> = fresh_entries.into_iter().collect();
+        let fresh_segment = Arc::new(NameSegment::from_entries(fresh_entries));
+        let mut deltas = self.deltas.as_ref().clone();
+        let delta_index = deltas.len();
+        let mut offsets = self.delta_offsets.as_ref().clone();
+        offsets.push(self.slot_len);
+        let fresh_slots = fresh_segment.entries.len();
+
+        let mut overrides = self.path_overrides.as_ref().clone();
+        let mut active_len = self.active_len;
+        for path in paths {
+            let old_count = match overrides.get(path.as_str()) {
+                Some(Some(previous_delta)) => self.deltas[*previous_delta]
+                    .path_counts
+                    .get(path.as_str())
+                    .copied()
+                    .unwrap_or(0),
+                Some(None) => 0,
+                None => self
+                    .base
+                    .path_counts
+                    .get(path.as_str())
+                    .copied()
+                    .unwrap_or(0),
+            };
+            let fresh_count = fresh_segment
+                .path_counts
+                .get(path.as_str())
+                .copied()
+                .unwrap_or(0);
+            active_len = active_len.saturating_sub(old_count) + fresh_count;
+            let interned_path = fresh_segment
+                .path_counts
+                .get_key_value(path.as_str())
+                .map_or_else(|| Arc::<str>::from(path.as_str()), |(path, _)| path.clone());
+            overrides.insert(interned_path, (fresh_count > 0).then_some(delta_index));
+        }
+
+        let mut all_workspace_reach = self.all_workspace_reach.as_ref().clone();
+        for path in paths {
+            all_workspace_reach.files.remove(path);
+        }
+        for entry in &fresh_segment.entries {
+            if !entry.external {
+                all_workspace_reach.files.insert(entry.path.to_string());
+            }
+        }
+        deltas.push(fresh_segment);
+        Self {
+            base: self.base.clone(),
+            deltas: Arc::new(deltas),
+            path_overrides: Arc::new(overrides),
+            delta_offsets: Arc::new(offsets),
+            active_len,
+            slot_len: self.slot_len + fresh_slots,
+            all_workspace_reach: Arc::new(all_workspace_reach),
+        }
     }
 
     /// Entry indices whose lowercased name starts with `needle_lower` (the exact
@@ -382,17 +544,22 @@ impl NameTable {
         if needle_lower.is_empty() {
             return Vec::new();
         }
-        let start = self
-            .sorted
-            .partition_point(|&i| self.entries[i].lower.as_ref() < needle_lower);
         let mut out = Vec::new();
-        for &i in &self.sorted[start..] {
-            if self.entries[i].lower.starts_with(needle_lower) {
-                out.push(i);
-            } else {
-                break;
-            }
+        self.extend_prefix_matches(&self.base, 0, needle_lower, &mut out);
+        for (delta_index, delta) in self.deltas.iter().enumerate() {
+            self.extend_prefix_matches(
+                delta,
+                self.delta_offsets[delta_index],
+                needle_lower,
+                &mut out,
+            );
         }
+        out.sort_by(|left, right| {
+            self.entry(*left)
+                .lower
+                .cmp(&self.entry(*right).lower)
+                .then_with(|| self.entry(*left).name.cmp(&self.entry(*right).name))
+        });
         out
     }
 
@@ -406,23 +573,17 @@ impl NameTable {
             return Vec::new();
         }
         let needle = name.to_ascii_lowercase();
-        let start = self
-            .sorted
-            .partition_point(|&i| self.entries[i].lower.as_ref() < needle.as_str());
-        let mut indices = Vec::new();
-        for &i in &self.sorted[start..] {
-            match self.entries[i].lower.as_ref().cmp(needle.as_str()) {
-                std::cmp::Ordering::Equal => indices.push(i),
-                std::cmp::Ordering::Greater => break,
-                std::cmp::Ordering::Less => {}
-            }
-        }
+        let indices: Vec<usize> = self
+            .prefix_candidates(&needle)
+            .into_iter()
+            .filter(|index| self.entry(*index).lower.as_ref() == needle)
+            .collect();
         let ctx_owned: Option<ResolveContext<'_>> = scope.map(|s| s.resolve_context());
         self.rank_indices(&needle, limit, ctx_owned.as_ref(), &indices)
     }
 
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.active_len
     }
 
     /// In-memory equivalent of `store::kind_counts_by_names_scoped`, restricted
@@ -468,7 +629,8 @@ impl NameTable {
             }),
         };
         let ctx_ref = ctx_owned.as_ref();
-        for entry in &self.entries {
+        for index in self.active_indices() {
+            let entry = self.entry(index);
             let kind = match entry.kind {
                 ParserKind::Macro => "macro",
                 ParserKind::Type => "type",
@@ -573,10 +735,9 @@ impl NameTable {
             // encodes (tier, 0, locality) so sorting by score desc reproduces
             // the strict-tier order; ties on tier break by name asc.
             let scored: Vec<ScoredCandidate> = self
-                .entries
-                .iter()
-                .enumerate()
-                .map(|(index, entry)| {
+                .active_indices()
+                .map(|index| {
+                    let entry = self.entry(index);
                     let tier = resolver::scope_tier(
                         &entry.path,
                         entry.external,
@@ -594,7 +755,7 @@ impl NameTable {
                     }
                 })
                 .collect();
-            let hits = self.scored_to_hits(top_scored(scored, limit, &self.entries));
+            let hits = self.scored_to_hits(top_scored(scored, limit, self));
             // An empty query establishes no usable narrowing base.
             return (hits, Vec::new());
         }
@@ -623,7 +784,7 @@ impl NameTable {
                 }
             }
             None => {
-                for i in 0..self.entries.len() {
+                for i in self.active_indices() {
                     self.consider(i, &needle, min_score, ctx_ref, &mut scored, &mut pool);
                 }
             }
@@ -660,11 +821,7 @@ impl NameTable {
             .saturating_add(quotas.unknown)
             .saturating_add(quotas.global)
             .saturating_add(quotas.same_project);
-        let global_top = top_scored(
-            scored.clone(),
-            total_limit.saturating_add(reserved),
-            &self.entries,
-        );
+        let global_top = top_scored(scored.clone(), total_limit.saturating_add(reserved), self);
 
         let mut selected_indices = HashSet::new();
         let mut selected = Vec::new();
@@ -675,7 +832,7 @@ impl NameTable {
                 .filter(|candidate| channel_for_tier(candidate.tier) == ScopeChannel::Reachable)
                 .collect(),
             quotas.reachable,
-            &self.entries,
+            self,
         );
         take_channel(
             &reachable,
@@ -694,7 +851,7 @@ impl NameTable {
                         .filter(|candidate| indices.binary_search(&candidate.index).is_ok())
                         .collect(),
                     quotas.same_project,
-                    &self.entries,
+                    self,
                 )
             })
             .unwrap_or_default();
@@ -718,7 +875,7 @@ impl NameTable {
                     .filter(|candidate| channel_for_tier(candidate.tier) == channel)
                     .collect(),
                 quota,
-                &self.entries,
+                self,
             );
             take_channel(
                 &channel_top,
@@ -738,7 +895,7 @@ impl NameTable {
             }
         }
 
-        sort_scored(&mut selected, &self.entries);
+        sort_scored(&mut selected, self);
         selected.truncate(total_limit);
         let hits = self.scored_to_hits(selected);
         let metrics = recall_metrics(&hits, pool.len(), active_project);
@@ -760,7 +917,10 @@ impl NameTable {
         scored: &mut Vec<ScoredCandidate>,
         pool: &mut Vec<usize>,
     ) {
-        let entry = &self.entries[i];
+        if !self.is_active_index(i) {
+            return;
+        }
+        let entry = self.entry(i);
         if let Some(base_match) = score_match(needle, entry) {
             pool.push(i);
             if base_match < min_score {
@@ -808,7 +968,7 @@ impl NameTable {
         limit: usize,
         _ctx: Option<&ResolveContext<'_>>,
     ) -> Vec<RankedNameHit> {
-        self.scored_to_hits(top_scored(scored, limit, &self.entries))
+        self.scored_to_hits(top_scored(scored, limit, self))
     }
 
     fn scored_pool_for_query(
@@ -822,10 +982,9 @@ impl NameTable {
         let query = query.trim();
         if query.is_empty() {
             let mut scored: Vec<ScoredCandidate> = self
-                .entries
-                .iter()
-                .enumerate()
-                .map(|(index, entry)| {
+                .active_indices()
+                .map(|index| {
+                    let entry = self.entry(index);
                     let tier = resolver::scope_tier(
                         &entry.path,
                         entry.external,
@@ -842,7 +1001,7 @@ impl NameTable {
                     }
                 })
                 .collect();
-            sort_scored(&mut scored, &self.entries);
+            sort_scored(&mut scored, self);
             return (scored, Vec::new());
         }
 
@@ -861,7 +1020,7 @@ impl NameTable {
                 }
             }
             None => {
-                for i in 0..self.entries.len() {
+                for i in self.active_indices() {
                     self.consider(i, &needle, min_score, ctx_ref, &mut scored, &mut pool);
                 }
             }
@@ -873,7 +1032,7 @@ impl NameTable {
         scored
             .into_iter()
             .map(|candidate| {
-                let entry = &self.entries[candidate.index];
+                let entry = self.entry(candidate.index);
                 RankedNameHit {
                     id: entry.id,
                     score: candidate.score,
@@ -971,34 +1130,30 @@ fn take_same_project(
     }
 }
 
-fn sort_scored(scored: &mut [ScoredCandidate], entries: &[NameEntry]) {
-    scored.sort_by(|a, b| scored_order(a, b, entries));
+fn sort_scored(scored: &mut [ScoredCandidate], table: &NameTable) {
+    scored.sort_by(|a, b| scored_order(a, b, table));
 }
 
-fn scored_order(
-    a: &ScoredCandidate,
-    b: &ScoredCandidate,
-    entries: &[NameEntry],
-) -> std::cmp::Ordering {
+fn scored_order(a: &ScoredCandidate, b: &ScoredCandidate, table: &NameTable) -> std::cmp::Ordering {
     b.score
         .cmp(&a.score)
         .then(a.name_len.cmp(&b.name_len))
-        .then_with(|| entries[a.index].name.cmp(&entries[b.index].name))
+        .then_with(|| table.entry(a.index).name.cmp(&table.entry(b.index).name))
 }
 
 fn top_scored(
     mut scored: Vec<ScoredCandidate>,
     limit: usize,
-    entries: &[NameEntry],
+    table: &NameTable,
 ) -> Vec<ScoredCandidate> {
     if limit == 0 {
         return Vec::new();
     }
     if scored.len() > limit {
-        scored.select_nth_unstable_by(limit, |a, b| scored_order(a, b, entries));
+        scored.select_nth_unstable_by(limit, |a, b| scored_order(a, b, table));
         scored.truncate(limit);
     }
-    sort_scored(&mut scored, entries);
+    sort_scored(&mut scored, table);
     scored
 }
 
