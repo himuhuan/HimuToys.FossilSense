@@ -59,6 +59,109 @@ fn indexes_mini_workspace_and_skips_unchanged_files() {
 }
 
 #[test]
+fn default_full_rebuild_publishes_side_by_side_and_preserves_old_reader() {
+    let workspace = tempdir().expect("workspace");
+    let source = workspace.path().join("main.c");
+    fs::write(&source, "int first_generation(void) { return 1; }\n").expect("first source");
+    let cache_dir = crate::pathing::default_index_directory(workspace.path()).expect("cache dir");
+    if cache_dir.exists() {
+        fs::remove_dir_all(&cache_dir).expect("clear unique test cache");
+    }
+
+    let first = index_workspace(
+        workspace.path(),
+        IndexOptions {
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("first side-by-side build");
+    assert_eq!(first.semantic_generation, 1);
+    let first_path = crate::pathing::default_index_path(workspace.path()).expect("first active");
+    assert!(first_path
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .starts_with("index-g1-"));
+    let old_reader = IndexStore::open_readonly(&first_path).expect("old reader");
+    assert_eq!(
+        old_reader
+            .symbols_by_name("first_generation")
+            .expect("first symbol")
+            .len(),
+        1
+    );
+
+    fs::write(&source, "int second_generation(void) { return 2; }\n").expect("second source");
+    let second = index_workspace(
+        workspace.path(),
+        IndexOptions {
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("second side-by-side build");
+    assert_eq!(second.semantic_generation, 2);
+    let second_path = crate::pathing::default_index_path(workspace.path()).expect("second active");
+    assert_ne!(first_path, second_path);
+    assert!(
+        first_path.is_file(),
+        "old generation must remain leased by path"
+    );
+
+    assert_eq!(
+        old_reader
+            .symbols_by_name("first_generation")
+            .expect("old snapshot remains readable")
+            .len(),
+        1
+    );
+    let new_reader = IndexStore::open_readonly(&second_path).expect("new reader");
+    assert!(new_reader
+        .symbols_by_name("first_generation")
+        .expect("old symbol removed")
+        .is_empty());
+    assert_eq!(
+        new_reader
+            .symbols_by_name("second_generation")
+            .expect("new symbol")
+            .len(),
+        1
+    );
+
+    fs::write(cache_dir.join("active-index"), "../broken.sqlite\n").expect("corrupt manifest");
+    fs::write(&source, "int recovered_generation(void) { return 3; }\n").expect("recovery source");
+    let recovered = index_workspace(
+        workspace.path(),
+        IndexOptions {
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("force rebuild recovers manifest");
+    assert_eq!(recovered.semantic_generation, 3);
+    let recovered_path =
+        crate::pathing::default_index_path(workspace.path()).expect("recovered active");
+    assert_ne!(recovered_path, second_path);
+    let recovered_reader = IndexStore::open_readonly(&recovered_path).expect("recovered reader");
+    assert_eq!(
+        recovered_reader
+            .symbols_by_name("recovered_generation")
+            .expect("recovered symbol")
+            .len(),
+        1
+    );
+
+    drop(recovered_reader);
+    drop(new_reader);
+    drop(old_reader);
+    fs::remove_dir_all(cache_dir).expect("clean unique test cache");
+}
+
+#[test]
 fn dirty_file_update_reindexes_only_changed_file() {
     let dir = tempdir().expect("tempdir");
     fs::create_dir_all(dir.path().join("src")).expect("src");

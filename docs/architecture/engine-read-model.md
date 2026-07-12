@@ -28,7 +28,7 @@ Status: current (2026-07-12)
 
 SQLite 事实另有持久化 **`SemanticGeneration`**。解析批次先把不可变 file revisions 和 facts 写入 staging；文件 manifest、include edges/open counts 与 generation 只在最终短事务中一起切换。`files`、`symbols`、`includes`、record/member/alias 等 SQL 名称都是 active-only views，因此 staged rows 不会泄漏给普通查询。纯 project-context 刷新会推进 `EngineEpoch`，但不会伪造新的 `SemanticGeneration`。
 
-DB-backed 请求通过 `SemanticReadGuard` 开启 read transaction 并校验 generation。SQLite WAL 保证已经开始的旧事务在发布后仍读取完整旧代；新事务读取完整新代。关系请求会把两种代际连同文档 overlay epoch 和 resolver version 一起带入 revision。
+DB-backed 请求通过 `SemanticReadGuard` 开启 read transaction 并校验 generation。dirty publication 仍由 SQLite WAL 保证已经开始的旧事务读取完整旧代；新事务读取完整新代。full/force/schema-mismatch rebuild 则写入未发布的 generation 数据库，完成二级索引、校验和 checkpoint 后，通过 `active-index` 文件 manifest 原子切换。旧 generation 文件不会在切换时删除，因此旧 snapshot/reader 仍可按原路径完成；关系请求会把语义代际、文档 overlay epoch 和 resolver version 一起带入 revision。
 
 调用关系不再随 snapshot 构建 workspace 级 catalog。请求捕获 `CallReadHandle` 后，在 blocking worker 中开启 generation-pinned `SemanticReadGuard`，按 path/position、caller 或 callee 读取窄 facts，再进行候选解析、grouping、分页和 DTO 物化。普通已保存且内容与磁盘一致的 open document 只读基础 DB；dirty document 使用 `ParseFacts::CALL_RELATIONS` 生成 per-file delta，基础行按 shadowed path 跳过后再合并 delta，不复制基础调用图。保存后的 overlay 不因“任意 generation 变大”而消失；只有同路径 active revision 的内容哈希与当前 buffer 相同，才确认该文件已发布并清除 overlay。
 

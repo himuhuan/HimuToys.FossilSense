@@ -237,6 +237,24 @@ impl IndexStore {
         Ok(())
     }
 
+    /// Validate and checkpoint a side-by-side database before its file name can
+    /// become visible through the active manifest.
+    pub fn prepare_full_build_publication(&self) -> Result<()> {
+        let check: String = self
+            .conn
+            .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
+        anyhow::ensure!(check == "ok", "SQLite quick_check failed: {check}");
+        let mut foreign_key_check = self.conn.prepare("PRAGMA foreign_key_check")?;
+        anyhow::ensure!(
+            !foreign_key_check.exists([])?,
+            "SQLite foreign_key_check reported a violation"
+        );
+        drop(foreign_key_check);
+        self.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        Ok(())
+    }
+
     /// Open an existing index for read-only queries (no schema migration).
     ///
     /// The connection is opened read-write (without create) so it can read a
@@ -252,6 +270,20 @@ impl IndexStore {
             conn,
             legacy_full_build: None,
         })
+    }
+
+    pub fn has_current_schema(path: &Path) -> Result<bool> {
+        let store = Self::open_readonly(path)?;
+        let version: Option<i64> = store
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|value| value.parse().ok());
+        Ok(version == Some(schema::SCHEMA_VERSION))
     }
 
     /// Execute one durable read inside a SQLite snapshot pinned to the semantic

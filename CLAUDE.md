@@ -92,7 +92,8 @@ fossilsense 单一 Rust 原生二进制 (crates/fossilsense)
 默认索引库：
 
 ```text
-<user-cache-dir>/FossilSense/indexes/<workspace-hash>/index.sqlite
+<user-cache-dir>/FossilSense/indexes/<workspace-hash>/active-index
+<user-cache-dir>/FossilSense/indexes/<workspace-hash>/index-g<generation>-<token>.sqlite
 ```
 
 规则：
@@ -358,6 +359,8 @@ Parser facts 合同：
 - 全局初始化表达式使用 synthetic global initializer 作为 caller；lambda 内调用暂不错误归属给外层函数。
 - schema 15 为 callable anchors / call sites 建立独立 active views 和查询索引；重复文本使用整数 ID，96-bit digest 使用 BLOB，枚举/布尔量使用整数 flags，call site 只持久化 expression byte offsets 与 callee UTF-16 range，并与统一语义代际一起发布。
 - 显式 full build 与首次未发布的默认库在 facts 写完前不维护 call 二级索引；commit 后集中创建索引并 `ANALYZE`。已有默认库的 dirty/force 路径在旁路数据库发布落地前继续保留在线索引，不能对活跃读者直接 drop。
+- 默认 full/force/schema-mismatch rebuild 写入 cache family 内独立的 `index-build-*.sqlite`；facts、二级索引、`quick_check`、foreign-key check 与 WAL checkpoint 全部完成并关闭连接后，才封装为单调 generation 文件，并通过 `active-index` 原子 manifest 切换。Windows 使用 replace-existing + write-through 的原子文件替换。
+- dirty index 只写 manifest 当前指向的 active generation，继续使用 WAL staging。full publication 不覆盖或立即删除旧 generation 文件；旧 `EngineSnapshot`/SQLite reader 必须能继续读取旧文件。force rebuild 可从损坏 manifest 恢复，并从现存 generation 文件维持 generation 单调性。
 
 调用关系查询合同：
 

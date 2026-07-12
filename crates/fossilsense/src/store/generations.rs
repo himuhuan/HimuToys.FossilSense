@@ -38,6 +38,23 @@ impl IndexStore {
         Ok(value.and_then(|value| value.parse().ok()).unwrap_or(0))
     }
 
+    /// Seed a fresh side-by-side database with the last published generation so
+    /// its first build advances monotonically across database files.
+    pub fn seed_semantic_generation(&self, generation: u64) -> Result<()> {
+        let revisions: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM file_revisions", [], |row| row.get(0))?;
+        anyhow::ensure!(
+            revisions == 0,
+            "semantic generation can only be seeded in an empty database"
+        );
+        self.conn.execute(
+            "UPDATE meta SET value = ?1 WHERE key = 'semantic_generation'",
+            [generation.to_string()],
+        )?;
+        Ok(())
+    }
+
     pub fn begin_semantic_read(
         &self,
         expected_generation: Option<u64>,

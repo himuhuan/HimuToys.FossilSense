@@ -406,6 +406,7 @@ dependencies = [
  "tree-sitter",
  "tree-sitter-c",
  "tree-sitter-cpp",
+ "windows-sys",
 ]
 
 [[package]]
