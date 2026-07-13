@@ -12,7 +12,6 @@ use crate::semantic_model::{AliasTargetFidelity, DeclaratorShape, RecordRangeFid
 use crate::store::{record_kind_from_str, IndexStore};
 
 const MEMBER_FALLBACK_SCAN_LIMIT: usize = 8_192;
-pub const MEMBER_FALLBACK_EXCLUDED_PATH_LIMIT: usize = 512;
 
 const RECORD_READ_SELECT: &str = "SELECT r.id, r.display_name, r.tag_name, r.typedef_name, r.kind,
             f.path, rev.source, f.directly_included,
