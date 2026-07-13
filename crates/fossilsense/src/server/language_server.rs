@@ -17,6 +17,10 @@ impl LanguageServer for Backend {
         let completion_mode = parse_completion_mode(&params);
         self.completion_enabled
             .store(completion_mode.is_enabled(), Ordering::Relaxed);
+        self.strict_prefix_ranking.store(
+            parse_completion_prefix_ranking(&params) == completion::CompletionPrefixRanking::Strict,
+            Ordering::Relaxed,
+        );
         *self.completion_history_mode.lock().await = parse_completion_history_mode(&params);
         *self.project_context_selection.lock().await =
             parse_initial_project_context_selection(&params);
@@ -677,6 +681,7 @@ impl LanguageServer for Backend {
             history_enabled,
             history: history_snapshot,
             prefix_bucket: history_prefix_bucket.clone(),
+            prefix_ranking: request_settings.prefix_ranking,
             limit,
             locality_bonus,
         };

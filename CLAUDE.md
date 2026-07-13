@@ -180,8 +180,9 @@ Smart Completion 当前约定：
 | 项 | 规则 |
 |---|---|
 | pipeline | 普通标识符补全候选必须经过 `completion` 核心模块合并 evidence、去重、排序和截断 |
-| module boundary | `completion/intent.rs` 负责 intent；`completion/pipeline.rs` 负责 evidence、merge/dedup、policy、metrics；`completion/ordinary_service/providers.rs` 负责候选源到统一 evidence 的转换 |
+| module boundary | `completion/intent.rs` 负责 intent；`completion/prefix_ranking.rs` 负责 exact/prefix/fuzzy 外层排序政策；`completion/pipeline.rs` 负责 evidence、merge/dedup、其余 policy 与 metrics；`completion/ordinary_service/providers.rs` 负责候选源到统一 evidence 的转换 |
 | 排序 | 普通标识符补全使用 deterministic evidence-aware ranker；`ScopeTier` 是 soft prior，并通过 guard band 防止低置信 global/text 噪音反超 |
+| 前缀优先 | `fossilsense.completion.prefixRanking = strict`（默认）时，大小写不敏感的 exact name / literal prefix 作为普通标识符补全最外层排序档，依次高于 fuzzy；`_` 按字面匹配，不折叠连续分隔符。同档内仍使用 evidence-aware ranker。`scopeFirst` 完整保留旧的 scope/evidence 优先顺序 |
 | strict policy | `resolver::pack_score` 仍可用于跳转、着色、workspace symbol、`NameTable` recall 和兼容测试；不再作为普通补全最终 displayed ranking |
 | evidence merge | 同名候选合并 indexed、local binding、current-file overlay、language builtin、local word evidence，优先保留更结构化的 LSP kind/detail |
 | project context | 普通标识符补全可使用构建标记推断的同项目召回与有界排序 evidence；不得新增 `ScopeTier`、过滤跨项目候选或影响其它语言功能 |
@@ -203,6 +204,7 @@ Smart Completion 当前约定：
 | v1.3.3 | 有证据的一跳调用关系版本；统一代际 callable/call-site facts、标准 LSP、富协议、workspace open-document overlay 与原生双视图；schema 14 |
 | v1.3.4 | 注释美化渲染版本；Hover / 补全文档 / Signature Help 共用注释归属与 Doxygen/XML Markdown 渲染，补全经 `completionItem/resolve` 延迟挂载，并支持严格同项目 `.h/.c` 文档配对 |
 | v1.4.0 | 大工作区性能与懒调用关系版本；schema 15 紧凑 call facts、请求期有界关系派生、per-file overlay、side-by-side generation、租约清理，以及分段紧凑 NameIndex |
+| v1.4.1 | 普通标识符补全前缀优先排序；默认 `fossilsense.completion.prefixRanking = strict`，字面 exact/prefix 先于 fuzzy，`scopeFirst` 可回退旧行为 |
 | 后置能力 | auto include insertion、ML ranker、telemetry、cloud sync、完整 C++ 语义仍不属于当前版本 |
 
 项目上下文约定：

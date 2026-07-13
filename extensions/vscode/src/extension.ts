@@ -8,6 +8,7 @@ import {
   Trace,
 } from 'vscode-languageclient/node';
 import {
+  normalizeCompletionPrefixRanking,
   normalizeIncludeScopingMode,
   normalizeOnOffAuto,
   normalizeProjectContextMode,
@@ -158,6 +159,7 @@ export function activate(context: vscode.ExtensionContext): void {
         client &&
         (event.affectsConfiguration('fossilsense.includePaths') ||
           event.affectsConfiguration('fossilsense.completion.mode') ||
+          event.affectsConfiguration('fossilsense.completion.prefixRanking') ||
           event.affectsConfiguration('fossilsense.completionHistory.mode') ||
           event.affectsConfiguration('fossilsense.semanticColoring.mode') ||
           event.affectsConfiguration('fossilsense.includeScoping.mode') ||
@@ -278,6 +280,7 @@ async function startServer(context: vscode.ExtensionContext): Promise<void> {
       fossilsense: {
         completion: {
           mode: completionMode,
+          prefixRanking: completionPrefixRankingFromConfig(),
         },
         ...completionHistoryInitializationOptions(completionHistoryMode),
         semanticColoring: {
@@ -700,6 +703,13 @@ function fossilsenseModeFromConfig(): string {
     .getConfiguration('fossilsense')
     .get<string>('mode', 'auto');
   return normalizeOnOffAuto(setting);
+}
+
+function completionPrefixRankingFromConfig(): string {
+  const setting = vscode.workspace
+    .getConfiguration('fossilsense')
+    .get<string>('completion.prefixRanking', 'strict');
+  return normalizeCompletionPrefixRanking(setting);
 }
 
 // Limited include-reachability scoping. Unlike completion/coloring there is no

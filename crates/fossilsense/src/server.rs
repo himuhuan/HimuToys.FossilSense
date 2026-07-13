@@ -80,8 +80,8 @@ use lsp_adapters::{
 use options::{
     candidate_reason_log_lines, completion_trigger_characters, empty_completion_list,
     member_completion_is_incomplete, parse_completion_history_mode, parse_completion_mode,
-    parse_debug_candidate_reasons, parse_debug_perf_logs, parse_include_paths,
-    parse_include_scoping_enabled, parse_initial_project_context_selection,
+    parse_completion_prefix_ranking, parse_debug_candidate_reasons, parse_debug_perf_logs,
+    parse_include_paths, parse_include_scoping_enabled, parse_initial_project_context_selection,
     parse_semantic_coloring_mode, signature_help_options,
 };
 use workspace::{
@@ -196,6 +196,7 @@ pub async fn run_stdio() -> Result<()> {
         external_include_dir_cache: Arc::new(StdMutex::new(HashMap::new())),
         include_paths: Arc::new(Mutex::new(Vec::new())),
         completion_enabled: AtomicBool::new(true),
+        strict_prefix_ranking: AtomicBool::new(true),
         semantic_coloring_enabled: AtomicBool::new(true),
         scoping_enabled: AtomicBool::new(true),
         completion_history_mode: Arc::new(Mutex::new(CompletionHistoryMode::Auto)),
@@ -225,6 +226,10 @@ struct Backend {
     include_paths: Arc<Mutex<Vec<String>>>,
     /// Whether completion is enabled (based on initializationOptions).
     completion_enabled: AtomicBool,
+    /// Whether ordinary identifier completion guards exact/literal-prefix
+    /// matches above all fuzzy matches. False preserves legacy scope-first
+    /// ranking.
+    strict_prefix_ranking: AtomicBool,
     /// Whether semantic coloring is enabled (based on initializationOptions).
     semantic_coloring_enabled: AtomicBool,
     /// Whether limited include-reachability scoping is enabled. When off, both
@@ -555,6 +560,11 @@ impl Backend {
     fn request_settings(&self) -> RequestSettings {
         RequestSettings {
             completion_enabled: self.completion_enabled.load(Ordering::Relaxed),
+            prefix_ranking: if self.strict_prefix_ranking.load(Ordering::Relaxed) {
+                completion::CompletionPrefixRanking::Strict
+            } else {
+                completion::CompletionPrefixRanking::ScopeFirst
+            },
             semantic_coloring_enabled: self.semantic_coloring_enabled.load(Ordering::Relaxed),
             scoping_enabled: self.scoping_enabled.load(Ordering::Relaxed),
             perf_logging_enabled: self.perf_logging_enabled.load(Ordering::Relaxed),

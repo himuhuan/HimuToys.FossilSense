@@ -7,13 +7,15 @@ native Rust indexing engine - no external tools (ctags / cscope / clangd) requir
 This VSIX is self-contained: the `fossilsense` engine binary ships inside the
 extension's `bin/` folder.
 
-v1.4.0 focuses on predictable large-workspace cost. Call relations are resolved
-lazily from compact schema-15 facts with explicit scan, candidate, time, site,
-and relation budgets; open-document overlays shadow only their own files instead
-of copying the workspace graph. Full rebuilds publish side-by-side database
-generations, while the segmented compact name index keeps single-file saves off
-the all-symbol clone/sort path. Result confidence, ambiguity, coverage, and
-truncation remain explicit best-effort evidence.
+v1.4.1 keeps the 1.4.0 large-workspace cost model and adds a default
+prefix-first policy for ordinary identifier completion. With
+`fossilsense.completion.prefixRanking = strict`, exact names and case-insensitive
+literal prefixes rank ahead of fuzzy matches before the existing evidence-aware
+ranker runs within each class; underscores stay literal, and `scopeFirst`
+restores the older scope-led order. Call relations remain lazy schema-15 queries
+with explicit budgets, side-by-side generations, and segmented name-index
+publication. Result confidence, ambiguity, coverage, and truncation remain
+explicit best-effort evidence.
 
 ## Current Capability
 
@@ -223,6 +225,14 @@ because FossilSense returns ranked text/index candidates.
   identifier completion, include-path completion, and degraded `.`/`->` field/method
   member completion. C/C++ language-server conflicts are reported by `fossilsense.mode`,
   not handled by silently disabling completion.
+- `fossilsense.completion.prefixRanking` - ordinary identifier name-match policy:
+  `"strict"` (default) orders exact names and case-insensitive literal prefixes ahead
+  of fuzzy matches, then applies the existing evidence-aware ranking within each class.
+  Underscores are literal, so `wns_ipc` prefixes `wns_ipc_send` but not
+  `wns__ipc_rsp_init`. `"scopeFirst"` preserves the legacy behavior where stronger
+  Current/Reachable/External evidence can outrank a better Global name match. Changing
+  it restarts the server; it does not affect include/member completion, workspace
+  symbols, navigation, references, or coloring.
 - `fossilsense.completionHistory.mode` - controls local-only accepted-completion
   history: `"auto"` (default, enabled), `"on"` (enabled), `"off"` (do not record or
   rank with history). History stays in the local workspace cache, is bounded, stores

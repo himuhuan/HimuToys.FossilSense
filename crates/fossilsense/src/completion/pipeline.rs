@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use crate::completion_history::{candidate_hash_key, CompletionHistorySnapshot};
 use crate::model::{ResolutionConfidence, ScopeTier};
 
+use super::prefix_ranking::{compare_name_match, CompletionPrefixRanking};
 use super::{CompletionIntent, CompletionIntentConfidence, CompletionIntentKind};
 
 #[allow(dead_code)]
@@ -100,6 +101,8 @@ pub(crate) struct CompletionRankContext {
     pub history_enabled: bool,
     pub history: CompletionHistorySnapshot,
     pub prefix_bucket: String,
+    pub prefix: String,
+    pub prefix_ranking: CompletionPrefixRanking,
 }
 
 impl CompletionRankContext {
@@ -110,9 +113,7 @@ impl CompletionRankContext {
     ) -> Self {
         Self {
             intent: CompletionIntent { kind, confidence },
-            history_enabled: false,
-            history: CompletionHistorySnapshot::default(),
-            prefix_bucket: String::new(),
+            ..Self::default()
         }
     }
 }
@@ -456,9 +457,8 @@ pub(crate) fn run_evidence_aware_pipeline_with_context<T>(
     metrics.project_max_boost = project_max_boost;
 
     kept.sort_by(|a, b| {
-        b.evidence
-            .score
-            .cmp(&a.evidence.score)
+        compare_name_match(&context.prefix, context.prefix_ranking, &a.name, &b.name)
+            .then_with(|| b.evidence.score.cmp(&a.evidence.score))
             .then_with(|| {
                 b.evidence
                     .primary_source

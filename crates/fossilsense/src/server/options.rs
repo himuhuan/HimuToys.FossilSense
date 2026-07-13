@@ -2,6 +2,7 @@ use tower_lsp::lsp_types::{
     CompletionList, CompletionResponse, InitializeParams, SignatureHelpOptions,
 };
 
+use crate::completion::CompletionPrefixRanking;
 use crate::completion_history::CompletionHistoryMode;
 use crate::model;
 use crate::project_context::ProjectContextSelection;
@@ -36,6 +37,30 @@ pub(super) fn parse_completion_mode(params: &InitializeParams) -> CompletionMode
         "on" => CompletionMode::On,
         "off" => CompletionMode::Off,
         _ => CompletionMode::Auto,
+    }
+}
+
+/// Name-match ordering policy for ordinary identifier completion. Strict
+/// literal prefix priority is the default; `scopeFirst` preserves the legacy
+/// behavior where `ScopeTier` can dominate match quality.
+pub(super) fn parse_completion_prefix_ranking(
+    params: &InitializeParams,
+) -> CompletionPrefixRanking {
+    let mode = params
+        .initialization_options
+        .as_ref()
+        .and_then(|opts| opts.as_object())
+        .and_then(|object| object.get("fossilsense"))
+        .and_then(|value| value.as_object())
+        .and_then(|object| object.get("completion"))
+        .and_then(|value| value.as_object())
+        .and_then(|object| object.get("prefixRanking"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("strict");
+    if mode == "scopeFirst" {
+        CompletionPrefixRanking::ScopeFirst
+    } else {
+        CompletionPrefixRanking::Strict
     }
 }
 
@@ -308,6 +333,18 @@ mod tests {
         }
     }
 
+    fn params_with_prefix_ranking(mode: Option<&str>) -> InitializeParams {
+        let initialization_options = mode.map(|mode| {
+            serde_json::json!({
+                "fossilsense": { "completion": { "prefixRanking": mode } }
+            })
+        });
+        InitializeParams {
+            initialization_options,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn defaults_to_auto_when_unset() {
         assert_eq!(
@@ -368,6 +405,26 @@ mod tests {
         assert!(
             !parse_completion_history_mode(&params_with_completion_history_mode(Some("off")))
                 .is_enabled()
+        );
+    }
+
+    #[test]
+    fn strict_prefix_ranking_is_default_and_scope_first_is_explicit() {
+        assert_eq!(
+            parse_completion_prefix_ranking(&params_with_prefix_ranking(None)),
+            CompletionPrefixRanking::Strict
+        );
+        assert_eq!(
+            parse_completion_prefix_ranking(&params_with_prefix_ranking(Some("strict"))),
+            CompletionPrefixRanking::Strict
+        );
+        assert_eq!(
+            parse_completion_prefix_ranking(&params_with_prefix_ranking(Some("scopeFirst"))),
+            CompletionPrefixRanking::ScopeFirst
+        );
+        assert_eq!(
+            parse_completion_prefix_ranking(&params_with_prefix_ranking(Some("bogus"))),
+            CompletionPrefixRanking::Strict
         );
     }
 

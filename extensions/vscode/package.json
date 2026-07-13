@@ -2,7 +2,7 @@
   "name": "fossilsense-vscode",
   "displayName": "FossilSense",
   "description": "FossilSense C/C++ best-effort navigation: rich comment hover, completion docs, signature help, call relations, symbols, outlines, ranked definitions, and role-grouped references.",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "private": true,
   "license": "UNLICENSED",
   "publisher": "himutoys",
@@ -163,6 +163,15 @@
           ],
           "default": "auto",
           "description": "Controls FossilSense completion, including ordinary identifiers, include paths, and degraded '.'/'->' field/method member completion. 'auto' and 'on' enable completion; 'off' disables completion. C/C++ language-server conflicts are reported by fossilsense.mode, not silently handled per feature."
+        },
+        "fossilsense.completion.prefixRanking": {
+          "type": "string",
+          "enum": [
+            "strict",
+            "scopeFirst"
+          ],
+          "default": "strict",
+          "markdownDescription": "Controls ordinary identifier completion when literal name matching conflicts with scope evidence. `strict` (default) orders exact names and case-insensitive literal prefixes ahead of fuzzy matches, then applies the existing scope/source/intent/project/history ranking within each match class. `_` is literal, so `wns_ipc` strictly prefixes `wns_ipc_send` but not `wns__ipc_rsp_init`. `scopeFirst` preserves the legacy behavior where Current/Reachable/External scope evidence may outrank a stronger Global name match. This does not affect include, member, workspace-symbol, navigation, reference, or coloring behavior."
         },
         "fossilsense.completionHistory.mode": {
           "type": "string",

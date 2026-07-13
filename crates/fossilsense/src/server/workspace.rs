@@ -481,6 +481,7 @@ pub(super) struct CompletionMemoLookup {
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct RequestSettings {
     pub(super) completion_enabled: bool,
+    pub(super) prefix_ranking: crate::completion::CompletionPrefixRanking,
     pub(super) semantic_coloring_enabled: bool,
     pub(super) scoping_enabled: bool,
     pub(super) perf_logging_enabled: bool,

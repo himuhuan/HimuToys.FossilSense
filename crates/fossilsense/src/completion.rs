@@ -1,11 +1,13 @@
 mod intent;
 pub(crate) mod ordinary_service;
 mod pipeline;
+mod prefix_ranking;
 
 pub(crate) use intent::{
     classify_completion_intent, CompletionIntent, CompletionIntentConfidence, CompletionIntentKind,
 };
 pub(crate) use pipeline::*;
+pub(crate) use prefix_ranking::CompletionPrefixRanking;
 
 #[cfg(test)]
 mod tests {
@@ -150,6 +152,10 @@ mod tests {
                 history_enabled: true,
                 history,
                 prefix_bucket: "gl".to_string(),
+                // This test isolates the bounded history signal. Name-match
+                // guard behavior is covered independently below.
+                prefix: String::new(),
+                prefix_ranking: CompletionPrefixRanking::Strict,
             },
         );
 
@@ -198,6 +204,8 @@ mod tests {
                 history_enabled: true,
                 history,
                 prefix_bucket: "sa".to_string(),
+                prefix: "sa".to_string(),
+                prefix_ranking: CompletionPrefixRanking::Strict,
             },
         );
 
@@ -500,6 +508,50 @@ mod tests {
 
         assert_eq!(output.items[0].payload, "reach");
         assert_eq!(output.metrics.final_rank.guarded_low_trust, 1);
+    }
+
+    #[test]
+    fn strict_prefix_ranking_guards_exact_then_prefix_above_fuzzy_scope() {
+        let output = run_evidence_aware_pipeline_with_context(
+            vec![
+                candidate(
+                    "wns__ipc_rsp_init",
+                    CandidateSource::Indexed,
+                    ScopeTier::Current,
+                    200,
+                    "fuzzy",
+                ),
+                candidate(
+                    "wns_ipc_send",
+                    CandidateSource::Indexed,
+                    ScopeTier::External,
+                    800,
+                    "prefix",
+                ),
+                candidate(
+                    "wns_ipc",
+                    CandidateSource::Indexed,
+                    ScopeTier::Global,
+                    1000,
+                    "exact",
+                ),
+            ],
+            10,
+            CompletionRankContext {
+                prefix: "wns_ipc".to_string(),
+                prefix_ranking: CompletionPrefixRanking::Strict,
+                ..CompletionRankContext::default()
+            },
+        );
+
+        assert_eq!(
+            output
+                .items
+                .iter()
+                .map(|candidate| candidate.payload)
+                .collect::<Vec<_>>(),
+            vec!["exact", "prefix", "fuzzy"]
+        );
     }
 
     #[test]

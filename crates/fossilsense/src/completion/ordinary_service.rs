@@ -10,7 +10,7 @@ use crate::resolver;
 
 use super::{
     CandidateEvidence, CandidateSource, CompletionCandidateKind, CompletionIntent,
-    CompletionPipelineMetrics, CompletionRankContext, PipelineCandidate,
+    CompletionPipelineMetrics, CompletionPrefixRanking, CompletionRankContext, PipelineCandidate,
 };
 
 mod providers;
@@ -38,6 +38,7 @@ pub(crate) struct OrdinaryCompletionInput {
     pub history_enabled: bool,
     pub history: CompletionHistorySnapshot,
     pub prefix_bucket: String,
+    pub prefix_ranking: CompletionPrefixRanking,
     pub limit: usize,
     pub locality_bonus: i32,
 }
@@ -241,6 +242,8 @@ pub(crate) fn complete_ordinary_identifier(
             history_enabled: input.history_enabled,
             history: input.history,
             prefix_bucket: input.prefix_bucket,
+            prefix: input.prefix,
+            prefix_ranking: input.prefix_ranking,
         },
     );
     output.metrics.recall_channels = recall_channels;
@@ -277,7 +280,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use crate::completion::{CandidateSource, CompletionIntent};
+    use crate::completion::{CandidateSource, CompletionIntent, CompletionPrefixRanking};
     use crate::completion_history::CompletionHistorySnapshot;
     use crate::model::ScopeTier;
     use crate::parser;
@@ -379,6 +382,7 @@ mod tests {
             history_enabled: true,
             history: CompletionHistorySnapshot::default(),
             prefix_bucket: "fs".to_string(),
+            prefix_ranking: CompletionPrefixRanking::Strict,
             limit: COMPLETION_LIMIT,
             locality_bonus: COMPLETION_LOCALITY_BONUS,
         });
@@ -457,6 +461,7 @@ mod tests {
             history_enabled: false,
             history: CompletionHistorySnapshot::default(),
             prefix_bucket: "zz".to_string(),
+            prefix_ranking: CompletionPrefixRanking::Strict,
             limit: COMPLETION_LIMIT,
             locality_bonus: COMPLETION_LOCALITY_BONUS,
         });
@@ -490,6 +495,7 @@ mod tests {
                 history_enabled: false,
                 history: CompletionHistorySnapshot::default(),
                 prefix_bucket: prefix.to_ascii_lowercase(),
+                prefix_ranking: CompletionPrefixRanking::Strict,
                 limit: COMPLETION_LIMIT,
                 locality_bonus: COMPLETION_LOCALITY_BONUS,
             });
@@ -531,6 +537,7 @@ mod tests {
             history_enabled: false,
             history: CompletionHistorySnapshot::default(),
             prefix_bucket: "si".to_string(),
+            prefix_ranking: CompletionPrefixRanking::Strict,
             limit: COMPLETION_LIMIT,
             locality_bonus: COMPLETION_LOCALITY_BONUS,
         });
@@ -577,6 +584,7 @@ mod tests {
             history_enabled: false,
             history: CompletionHistorySnapshot::default(),
             prefix_bucket: "si".to_string(),
+            prefix_ranking: CompletionPrefixRanking::Strict,
             limit: COMPLETION_LIMIT,
             locality_bonus: COMPLETION_LOCALITY_BONUS,
         });
@@ -616,6 +624,7 @@ mod tests {
             history_enabled: false,
             history: CompletionHistorySnapshot::default(),
             prefix_bucket: "si".to_string(),
+            prefix_ranking: CompletionPrefixRanking::Strict,
             limit: COMPLETION_LIMIT,
             locality_bonus: COMPLETION_LOCALITY_BONUS,
         });
@@ -687,6 +696,7 @@ mod tests {
             history_enabled: false,
             history: CompletionHistorySnapshot::default(),
             prefix_bucket: "fs".to_string(),
+            prefix_ranking: CompletionPrefixRanking::Strict,
             limit: COMPLETION_LIMIT,
             locality_bonus: COMPLETION_LOCALITY_BONUS,
         });
@@ -700,6 +710,79 @@ mod tests {
             vec!["fs_exact_prefix", "noise_fs_substring"]
         );
         assert_eq!(output.items[0].evidence.tier, ScopeTier::Current);
+    }
+
+    fn underscore_prefix_ranking_fixture(
+        prefix_ranking: CompletionPrefixRanking,
+        external_fuzzy_count: usize,
+        limit: usize,
+    ) -> Vec<String> {
+        let mut rows = vec![(
+            1,
+            "wns_ipc_send".to_string(),
+            false,
+            "src/wns_ipc.c".to_string(),
+            "function".to_string(),
+            false,
+        )];
+        for index in 0..external_fuzzy_count {
+            rows.push((
+                index as i64 + 2,
+                format!("wns__ipc_rsp_init_{index:03}"),
+                true,
+                format!("sdk/include/wns_{index:03}.h"),
+                "function".to_string(),
+                true,
+            ));
+        }
+        let output = complete_ordinary_identifier(OrdinaryCompletionInput {
+            prefix: "wns_ipc".to_string(),
+            text: Arc::from("wns_ipc"),
+            line: 0,
+            character: 7,
+            parsed_document: None,
+            local_words: Arc::new(HashSet::new()),
+            tables: vec![OrdinaryCompletionNameTable {
+                table: Arc::new(NameTable::build_with_paths(rows)),
+            }],
+            scope: None,
+            active_project_context: None,
+            prior_pools: vec![None],
+            intent: CompletionIntent::default(),
+            history_enabled: false,
+            history: CompletionHistorySnapshot::default(),
+            prefix_bucket: "wns_ipc".to_string(),
+            prefix_ranking,
+            limit,
+            locality_bonus: COMPLETION_LOCALITY_BONUS,
+        });
+        output.items.into_iter().map(|item| item.label).collect()
+    }
+
+    #[test]
+    fn strict_prefix_default_beats_external_cross_separator_fuzzy_match() {
+        let labels = underscore_prefix_ranking_fixture(CompletionPrefixRanking::Strict, 1, 10);
+        assert_eq!(
+            labels,
+            vec!["wns_ipc_send", "wns__ipc_rsp_init_000"],
+            "literal global prefix must outrank an External candidate that skips an extra '_'"
+        );
+    }
+
+    #[test]
+    fn scope_first_preserves_external_over_global_legacy_order() {
+        let labels = underscore_prefix_ranking_fixture(CompletionPrefixRanking::ScopeFirst, 1, 10);
+        assert_eq!(
+            labels,
+            vec!["wns__ipc_rsp_init_000", "wns_ipc_send"],
+            "explicit compatibility mode must retain the existing tier-first result"
+        );
+    }
+
+    #[test]
+    fn dense_external_fuzzy_recall_does_not_truncate_global_strict_prefix() {
+        let labels = underscore_prefix_ranking_fixture(CompletionPrefixRanking::Strict, 400, 1);
+        assert_eq!(labels, vec!["wns_ipc_send"]);
     }
 
     fn duplicate_project_fixture() -> (Arc<NameTable>, ProjectKey, ProjectKey) {
@@ -769,6 +852,7 @@ mod tests {
             history_enabled: false,
             history: CompletionHistorySnapshot::default(),
             prefix_bucket: "get".to_string(),
+            prefix_ranking: CompletionPrefixRanking::Strict,
             limit: COMPLETION_LIMIT,
             locality_bonus: COMPLETION_LOCALITY_BONUS,
         })
@@ -846,6 +930,7 @@ mod tests {
             history_enabled: false,
             history: CompletionHistorySnapshot::default(),
             prefix_bucket: "api".to_string(),
+            prefix_ranking: CompletionPrefixRanking::Strict,
             limit: COMPLETION_LIMIT,
             locality_bonus: COMPLETION_LOCALITY_BONUS,
         });
@@ -926,6 +1011,7 @@ mod tests {
             history_enabled: false,
             history: CompletionHistorySnapshot::default(),
             prefix_bucket: "api".to_string(),
+            prefix_ranking: CompletionPrefixRanking::Strict,
             limit: 2,
             locality_bonus: COMPLETION_LOCALITY_BONUS,
         });

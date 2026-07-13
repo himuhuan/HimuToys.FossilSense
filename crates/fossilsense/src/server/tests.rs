@@ -31,6 +31,7 @@ fn test_backend_service() -> LspService<super::Backend> {
         external_include_dir_cache: Arc::new(StdMutex::new(HashMap::new())),
         include_paths: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         completion_enabled: AtomicBool::new(true),
+        strict_prefix_ranking: AtomicBool::new(true),
         semantic_coloring_enabled: AtomicBool::new(true),
         scoping_enabled: AtomicBool::new(true),
         completion_history_mode: Arc::new(tokio::sync::Mutex::new(
@@ -1436,6 +1437,42 @@ async fn initialize_advertises_project_context_commands() {
         .commands;
     assert!(commands.contains(&super::PROJECT_CONTEXTS_LSP_COMMAND.to_string()));
     assert!(commands.contains(&super::SET_PROJECT_CONTEXT_LSP_COMMAND.to_string()));
+}
+
+#[tokio::test]
+async fn initialize_defaults_to_strict_prefix_ranking_and_accepts_scope_first() {
+    let strict = test_backend_service();
+    strict
+        .inner()
+        .initialize(InitializeParams::default())
+        .await
+        .expect("default initialize");
+    assert!(strict
+        .inner()
+        .strict_prefix_ranking
+        .load(std::sync::atomic::Ordering::Relaxed));
+
+    let scope_first = test_backend_service();
+    scope_first
+        .inner()
+        .initialize(InitializeParams {
+            initialization_options: Some(serde_json::json!({
+                "fossilsense": {
+                    "completion": { "prefixRanking": "scopeFirst" }
+                }
+            })),
+            ..Default::default()
+        })
+        .await
+        .expect("scope-first initialize");
+    assert!(!scope_first
+        .inner()
+        .strict_prefix_ranking
+        .load(std::sync::atomic::Ordering::Relaxed));
+    assert_eq!(
+        scope_first.inner().request_settings().prefix_ranking,
+        crate::completion::CompletionPrefixRanking::ScopeFirst
+    );
 }
 
 #[tokio::test]
