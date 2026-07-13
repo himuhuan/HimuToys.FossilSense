@@ -7,15 +7,14 @@ native Rust indexing engine - no external tools (ctags / cscope / clangd) requir
 This VSIX is self-contained: the `fossilsense` engine binary ships inside the
 extension's `bin/` folder.
 
-v1.4.1 keeps the 1.4.0 large-workspace cost model and adds a default
-prefix-first policy for ordinary identifier completion. With
-`fossilsense.completion.prefixRanking = strict`, exact names and case-insensitive
-literal prefixes rank ahead of fuzzy matches before the existing evidence-aware
-ranker runs within each class; underscores stay literal, and `scopeFirst`
-restores the older scope-led order. Call relations remain lazy schema-15 queries
-with explicit budgets, side-by-side generations, and segmented name-index
-publication. Result confidence, ambiguity, coverage, and truncation remain
-explicit best-effort evidence.
+v1.4.2 keeps the large-workspace cost model and introduces one schema-16
+request-time candidate pipeline for callable Hover, Definition, Signature Help,
+completion documentation, and Call Hierarchy. It combines the indexed generation
+with all unsynchronized open-document overlays, uses argument arity as evidence,
+and permits a header/source counterpart only for a closed, bidirectionally unique
+exact-signature pair. Full record excerpts and bounded `typedef` `aka`
+resolution share the same revision-safe source reader. Result confidence,
+ambiguity, coverage, truncation, and fallback remain explicit best-effort evidence.
 
 ## Current Capability
 
@@ -40,36 +39,42 @@ explicit best-effort evidence.
   / read). The grouped QuickPick hides `:line` suffixes by default; enable
   `fossilsense.references.showRanges` to show them. Roles are syntactic guesses,
   not resolved bindings.
-- Rich Hover: hovering an indexed identifier shows a Markdown candidate view with
-  the stored signature, candidate tier/confidence/reason, and best-effort nearby
+- Rich Hover: hovering an identifier shows a Markdown candidate view with the
+  candidate signature, source path, tier/confidence/reason, and best-effort nearby
   comments. Comments may come from immediately leading lines, an inline-leading
   block on the declaration line, or a same-line trailing `//` / `/* */` comment
   when attachment is unambiguous. Doxygen and a small XML subset are parsed into
   structured sections for parameters and returns; unknown tags fall back to a
   `### Tag` heading with preserved body lines. Hard line breaks keep ordinary
-  multi-line prose readable in VS Code. This is ranked exact-name candidate
-  display and best-effort comment attachment, not type-aware semantic binding or
-  full Doxygen/XML. Unsupported, oversized, unreadable, or malformed comment
-  sources degrade to signature-only hover. `@see` links, inherited docs, and
-  declaration/definition doc merging are out of scope.
-- Lightweight Completion: index-based, current-file overlay, and current-file
-  word completion for C/C++. When the cursor is inside a detected function body,
+  multi-line prose readable in VS Code. Function candidates use the shared
+  callable pipeline. Records (`struct` / `class` / `union`) use their exact source
+  range to show a bounded full declaration, while uniquely resolved `typedef`
+  chains add `aka`; ambiguity, cycles, unsupported declarators, stale or
+  oversized source, and read failures degrade to the original signature with an
+  explicit reason. This is best-effort candidate presentation, not compiler type
+  binding or full Doxygen/XML. `@see` links, inherited docs, declaration/
+  definition doc merging, and C++ `using T = ...` alias tracing are out of scope.
+- Lightweight Completion: index-based, all-unsynchronized-document structured
+  overlay, and current-file word completion for C/C++. When the cursor is inside a detected function body,
   ordinary identifier completion also adds best-effort current-function
   parameters and local variables declared before the cursor from the open
-  document snapshot. Current open-document facts such as unsaved macros,
-  typedef/using aliases, enum constants, function declarations/definitions, and
-  record/type definitions can also participate as structured current-file
-  overlay evidence. Nearby identifier usage can raise text fallback candidates,
+  document snapshot. Structured facts such as unsaved macros, typedef aliases,
+  enum constants, function declarations/definitions, and record/type definitions
+  from every unsynchronized open document in the same workspace can participate
+  as request-local overlay evidence and shadow that path's indexed rows. Local
+  bindings and nearby identifier usage remain current-document-only; nearby words can raise text fallback candidates,
   but raw words remain visibly textual fallback and are not semantic bindings.
   Expanding a structured identifier or member completion item resolves and
   renders its best-effort leading/inline/trailing source comment as Markdown.
   Documentation is loaded through `completionItem/resolve`, so ordinary typing
   does not add source-file reads to the per-keystroke completion hot path.
-  When a discovered project contains compatible `.h` and `.c` declarations for
-  the same symbol, completion, Hover, and Signature Help use the header as the
-  API-documentation source while preserving the source definition as the
-  implementation target. Pairing requires the same discovered project, symbol
-  kind, and normalized signature; FossilSense does not pair by name alone.
+  When a header declaration and source definition form a strict counterpart,
+  completion, Hover, and Signature Help use the header as the API-documentation
+  source while preserving the source definition as the implementation target.
+  Pairing requires an exact canonical signature, external linkage, a closed
+  source-to-header include reach, and degree = 1 in both directions. `ProjectKey`
+  is not a binding gate; open/incomplete reachability or 1:N/N:1 ambiguity keeps
+  the candidates unpaired.
   A bounded static language-builtin source also offers common C/C++ keywords,
   builtin-style types, and literal-like constants such as `struct`, `sizeof`,
   `size_t`, `uint32_t`, and `NULL` when matching the current prefix. These items
@@ -124,19 +129,24 @@ explicit best-effort evidence.
   `build.ninja`, Visual Studio solution/project files, `meson.build`, and Bazel
   BUILD/WORKSPACE main files. Discovery respects `.gitignore`, workspace scope,
   and default generated-directory exclusions. Marker contents are never parsed.
-- Best-effort Signature Help: inside simple function calls, shows exact-name
-  indexed function signatures ranked by the same include reachability tiers as
-  Go to Definition. The signature popup renders the candidate's nearby comment,
-  and recognized Doxygen/XML parameter descriptions are also attached to the
-  matching parameter popup. Candidates are hints, not overload resolution; there is no
-  argument type matching, template or namespace lookup, function-like macro
-  expansion, or function-pointer target inference. Unsupported call shapes or
-  unsplittable signatures degrade to empty or whole-signature results.
-- Counterpart navigation: on a paired header declaration, Go to Definition
-  prefers the same-project source definition; on the source definition itself,
-  it prefers the header declaration instead of returning the current location.
-  Calls elsewhere still prefer the source definition, and Call Hierarchy remains
-  source-body-first. Without a discovered project, existing ranking is unchanged.
+- Best-effort Signature Help: inside direct-name, explicitly qualified, or
+  parenthesized free-function calls, shows exact-name signatures from the same
+  candidate snapshot as Hover and Go to Definition. When argument arity is
+  reliable, compatible candidates are presented before unknown ones and the
+  first compatible signature becomes active. The popup renders the candidate's
+  nearby comment, and recognized Doxygen/XML parameter descriptions are attached
+  to matching parameters. Candidates are hints, not overload resolution: there
+  is no argument type matching, template binding, function-like macro expansion,
+  member-call binding, callable-object binding, or function-pointer inference.
+  Unsupported call shapes and incomplete parser facts degrade explicitly rather
+  than being relabeled as free-function matches.
+- Counterpart navigation: on a strictly paired header declaration, Go to
+  Definition prefers the source definition; on the source definition, it prefers
+  the header declaration instead of returning the current location. Calls
+  elsewhere and Call Hierarchy remain source-body-first. An unpaired declaration
+  or definition still returns its own anchor. Open reachability, dirty tombstones,
+  signature mismatch, internal linkage, and non-bijective groups disable pairing
+  but do not remove ordinary candidates.
 - Limited Include Analysis (`fossilsense.includePaths`): point at external header
   directories (e.g. a MinGW/TDM-GCC or SDK include tree) to get header-path completion
   inside `#include "…"`/`<…>`, jump-to-header on an include line (ranked candidate list

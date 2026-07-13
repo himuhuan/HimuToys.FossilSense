@@ -30,7 +30,7 @@ const packageJson = JSON.parse(
   fs.readFileSync(path.resolve(__dirname, '..', '..', 'package.json'), 'utf8'),
 );
 
-assert.strictEqual(packageJson.version, '1.4.1');
+assert.strictEqual(packageJson.version, '1.4.2');
 assert.ok(
   packageJson.contributes.commands.some(
     (command: { command: string }) => command.command === CLEAR_COMPLETION_HISTORY_COMMAND,

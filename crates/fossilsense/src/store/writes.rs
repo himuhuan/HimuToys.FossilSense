@@ -3,7 +3,10 @@ use std::collections::HashMap;
 
 use rusqlite::{params, Connection};
 
-use crate::semantic_model::AliasTarget;
+use crate::call_model::SignatureFidelity;
+use crate::semantic_model::{
+    AliasTarget, AliasTargetFidelity, RecordRangeFidelity, PARSER_FACT_VERSION,
+};
 
 use super::{
     include_normalized_metadata, member_confidence_to_str, member_kind_to_str, now_unix_secs,
@@ -34,7 +37,7 @@ pub(super) fn stage_file_updates(
             "INSERT INTO file_revisions (
                 file_id, extension, size, mtime_ns, hash, indexed_at, status, error, source,
                 parser_version, fact_mask, parse_error_count, fallback_used
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11, ?12)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         )?;
         let mut pending_stmt = tx.prepare(
             "INSERT INTO pending_file_revisions (build_id, file_id, revision_id)
@@ -52,8 +55,15 @@ pub(super) fn stage_file_updates(
         let mut record_stmt = tx.prepare(
             "INSERT INTO record_facts (
                     revision_id, file_id, display_name, tag_name, typedef_name, kind, start_byte, end_byte,
-                    start_line, start_col, end_line, end_col, signature, confidence
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                    start_line, start_col, end_line, end_col,
+                    body_start_byte, body_end_byte, body_start_line, body_start_col,
+                    body_end_line, body_end_col,
+                    declaration_start_byte, declaration_end_byte, declaration_start_line,
+                    declaration_start_col, declaration_end_line, declaration_end_col,
+                    range_fidelity, signature, confidence, declaration_hash
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                           ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23,
+                           ?24, ?25, ?26, ?27, ?28)",
         )?;
         let mut member_stmt = tx.prepare(
             "INSERT INTO member_facts (
@@ -64,13 +74,18 @@ pub(super) fn stage_file_updates(
         let mut alias_stmt = tx.prepare(
             "INSERT INTO type_alias_facts (
                     revision_id, file_id, alias, start_byte, end_byte, start_line, start_col, end_line, end_col,
-                    target_record_id, target_name, target_kind, confidence
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    declaration_start_byte, declaration_end_byte, declaration_start_line,
+                    declaration_start_col, declaration_end_line, declaration_end_col,
+                    underlying_spelling, declarator_shape, target_fidelity, fingerprint,
+                    target_record_id, target_name, target_kind, confidence, declaration_hash
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                           ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
         )?;
         let mut callable_stmt = tx.prepare(
             "INSERT INTO callable_anchor_facts (
                 revision_id, file_id, entity_digest, anchor_digest, name_id, qualified_name_id,
                 owner_id, owner_kind, kind, role, linkage_kind, linkage_file_id, signature_id,
+                canonical_signature_id, presentation_signature_id, signature_fidelity,
                 min_arity, max_arity, variadic,
                 name_start_byte, name_end_byte, name_start_line, name_start_col,
                 name_end_line, name_end_col, declaration_start_byte, declaration_end_byte,
@@ -80,7 +95,8 @@ pub(super) fn stage_file_updates(
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                 ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25,
-                ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36
+                ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37,
+                ?38, ?39
              )",
         )?;
         let mut call_site_stmt = tx.prepare(
@@ -155,6 +171,7 @@ pub(super) fn stage_file_updates(
                 status,
                 error,
                 update.source.as_str(),
+                PARSER_FACT_VERSION,
                 fact_mask,
                 parse_error_count,
                 fallback_used,
@@ -217,8 +234,22 @@ pub(super) fn stage_file_updates(
                     record.start_col as i64,
                     record.end_line as i64,
                     record.end_col as i64,
+                    record.body_range.start_byte as i64,
+                    record.body_range.end_byte as i64,
+                    record.body_range.start.line as i64,
+                    record.body_range.start.character as i64,
+                    record.body_range.end.line as i64,
+                    record.body_range.end.character as i64,
+                    record.declaration_range.start_byte as i64,
+                    record.declaration_range.end_byte as i64,
+                    record.declaration_range.start.line as i64,
+                    record.declaration_range.start.character as i64,
+                    record.declaration_range.end.line as i64,
+                    record.declaration_range.end.character as i64,
+                    record_range_fidelity_to_str(record.range_fidelity),
                     record.signature.as_str(),
                     record_confidence_to_str(record.confidence),
+                    record.declaration_hash.as_slice(),
                 ])?;
                 let record_id = tx.last_insert_rowid();
                 record_key_to_id.insert(record.record_key.clone(), record_id);
@@ -290,10 +321,21 @@ pub(super) fn stage_file_updates(
                     alias.start_col as i64,
                     alias.end_line as i64,
                     alias.end_col as i64,
+                    alias.declaration_range.start_byte as i64,
+                    alias.declaration_range.end_byte as i64,
+                    alias.declaration_range.start.line as i64,
+                    alias.declaration_range.start.character as i64,
+                    alias.declaration_range.end.line as i64,
+                    alias.declaration_range.end.character as i64,
+                    alias.underlying_spelling.as_str(),
+                    serde_json::to_string(&alias.declarator_shape)?,
+                    alias_target_fidelity_to_str(alias.target_fidelity),
+                    digest_bytes(&alias.fingerprint)?,
                     target_record_id,
                     target_name,
                     target_kind,
                     confidence,
+                    alias.declaration_hash.as_slice(),
                 ])?;
             }
 
@@ -313,6 +355,8 @@ pub(super) fn stage_file_updates(
                     .transpose()?;
                 let linkage_file_id = linkage_file.map(&mut intern_call_string).transpose()?;
                 let signature_id = intern_call_string(&anchor.signature.normalized)?;
+                let canonical_signature_id = intern_call_string(&anchor.canonical_signature)?;
+                let presentation_signature_id = intern_call_string(&anchor.presentation_signature)?;
                 let guard_id = anchor
                     .guard
                     .as_deref()
@@ -332,6 +376,9 @@ pub(super) fn stage_file_updates(
                     linkage_kind,
                     linkage_file_id,
                     signature_id,
+                    canonical_signature_id,
+                    presentation_signature_id,
+                    signature_fidelity_code(anchor.signature_fidelity),
                     anchor.signature.min_arity.map(i64::from),
                     anchor.signature.max_arity.map(i64::from),
                     i64::from(anchor.signature.variadic),
@@ -415,7 +462,7 @@ pub(super) fn stage_file_updates(
 
 fn digest_bytes(value: &str) -> Result<Vec<u8>> {
     if value.len() != 24 {
-        anyhow::bail!("call digest must contain exactly 24 hexadecimal characters");
+        anyhow::bail!("fact digest must contain exactly 24 hexadecimal characters");
     }
     value
         .as_bytes()
@@ -425,6 +472,29 @@ fn digest_bytes(value: &str) -> Result<Vec<u8>> {
             u8::from_str_radix(text, 16).context("call digest contains a non-hexadecimal byte")
         })
         .collect()
+}
+
+fn record_range_fidelity_to_str(fidelity: RecordRangeFidelity) -> &'static str {
+    match fidelity {
+        RecordRangeFidelity::AstExact => "ast_exact",
+        RecordRangeFidelity::Malformed => "malformed",
+    }
+}
+
+fn alias_target_fidelity_to_str(fidelity: AliasTargetFidelity) -> &'static str {
+    match fidelity {
+        AliasTargetFidelity::AstExact => "ast_exact",
+        AliasTargetFidelity::Heuristic => "heuristic",
+        AliasTargetFidelity::Malformed => "malformed",
+    }
+}
+
+fn signature_fidelity_code(fidelity: SignatureFidelity) -> i64 {
+    match fidelity {
+        SignatureFidelity::AstExact => 0,
+        SignatureFidelity::LexicalFallback => 1,
+        SignatureFidelity::Malformed => 2,
+    }
 }
 
 fn owner_kind_code(kind: crate::call_model::OwnerKindHint) -> i64 {

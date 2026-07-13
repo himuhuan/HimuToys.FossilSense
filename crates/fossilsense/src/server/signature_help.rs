@@ -5,10 +5,11 @@ use tower_lsp::lsp_types::{
     SignatureHelpParams, SignatureInformation,
 };
 
-use super::{uri_to_path, Backend};
+use super::{uri_to_path, Backend, HydrationStats, SemanticRequestPerf};
+use crate::call_model::{SourcePosition, SourceRange};
+use crate::candidate_service::CandidateQueryService;
 use crate::pathing;
 use crate::query;
-use crate::store::IndexStore;
 
 impl Backend {
     pub(super) async fn provide_signature_help(
@@ -17,7 +18,13 @@ impl Backend {
     ) -> LspResult<Option<SignatureHelp>> {
         let position = params.text_document_position_params;
         let uri = position.text_document.uri;
-        let Some((_version, text)) = self.document_snapshot(&uri).await else {
+        let documents = self
+            .session
+            .documents
+            .capture_request_snapshot(Some(&uri))
+            .await;
+        let Some((_version, text)) = self.document_snapshot_from_request(&uri, &documents).await
+        else {
             return Ok(None);
         };
         let call: query::CallContext = match query::call_context_at(
@@ -34,87 +41,195 @@ impl Backend {
         let current_rel = uri_to_path(&uri)
             .and_then(|path| pathing::relative_slash_path(&root, &path).ok())
             .unwrap_or_default();
+        let total_started = std::time::Instant::now();
         let context = self.request_context_for_root(root.clone()).await;
+        let reach_started = std::time::Instant::now();
         let reach_scope = self
             .reach_scope_from_context(&uri, &context)
             .map(|(_, reach)| reach);
-        let project_context = context.engine.project_context.clone();
-        let semantic_generation = context.engine.semantic_generation.0;
+        let mut reach_us = reach_started.elapsed().as_micros();
+        let semantic_generation = context.engine.semantic_generation;
+        let call_read_handle = context.engine.call_read_handle.clone();
+        let reach_graph = context.engine.reach_graph.clone();
+        let overlay_started = std::time::Instant::now();
+        let overlay = self
+            .candidate_overlay_snapshot_from_documents(
+                &root,
+                semantic_generation,
+                reach_graph.as_deref(),
+                context.engine.indexed_files.as_deref().map(Vec::as_slice),
+                documents,
+            )
+            .await;
+        reach_us = reach_us.saturating_add(overlay_started.elapsed().as_micros());
         let active_argument = call.active_argument;
         let call_name = call.name;
-        let limit = query::SIGNATURE_HELP_LIMIT;
+        let call_site_context = match call.argument_state {
+            query::ArgumentState::Partial {
+                minimum_arity,
+                active_argument,
+            } => {
+                let reliability = if matches!(
+                    call.form,
+                    crate::call_model::CallForm::DirectName
+                        | crate::call_model::CallForm::QualifiedName
+                        | crate::call_model::CallForm::ParenthesizedName
+                ) {
+                    query::ContextReliability::Reliable
+                } else {
+                    query::ContextReliability::UnsupportedCallForm
+                };
+                query::CallSiteContext::partial(
+                    call_name.clone(),
+                    call.form,
+                    SourceRange {
+                        start: SourcePosition {
+                            line: position.position.line,
+                            character: position.position.character,
+                        },
+                        end: SourcePosition {
+                            line: position.position.line,
+                            character: position.position.character,
+                        },
+                        start_byte: 0,
+                        end_byte: 0,
+                    },
+                    minimum_arity,
+                    active_argument,
+                    reliability,
+                )
+            }
+            query::ArgumentState::Unknown => query::CallSiteContext {
+                callee_name: call_name.clone(),
+                qualified_name: None,
+                form: call.form,
+                callee_range: SourceRange {
+                    start: SourcePosition {
+                        line: position.position.line,
+                        character: position.position.character,
+                    },
+                    end: SourcePosition {
+                        line: position.position.line,
+                        character: position.position.character,
+                    },
+                    start_byte: 0,
+                    end_byte: 0,
+                },
+                argument_count: None,
+                argument_state: query::ArgumentState::Unknown,
+                reliability: query::ContextReliability::SyntaxErrorOverlap,
+            },
+            query::ArgumentState::Complete => return Ok(None),
+        };
+        let mut call_site_context = call_site_context;
+        call_site_context.qualified_name = call.qualified_name;
         let current_text = text;
 
-        let result = tokio::task::spawn_blocking(move || -> Result<Vec<SignatureInformation>> {
-            let db_path = pathing::default_index_path(&root)?;
-            if !db_path.exists() {
-                return Ok(Vec::new());
-            }
-            let records = IndexStore::read_at_generation(&db_path, semantic_generation, |store| {
-                store.symbol_read_view().symbols_by_name(&call_name)
-            })?;
-            let ranked = query::rank_function_signature_candidates(
-                records.clone(),
-                &current_rel,
-                reach_scope.as_deref(),
-                limit,
-            );
-            let documentation_candidates: Vec<_> = query::rank_function_signature_candidates(
-                records,
-                &current_rel,
-                reach_scope.as_deref(),
-                32,
-            )
-            .iter()
-            .map(|candidate| query::DocumentationCandidate {
-                candidate: candidate.candidate.clone(),
-                signature: candidate.signature.clone(),
-            })
-            .collect();
-            Ok(ranked
-                .iter()
-                .map(|candidate| {
-                    let primary = query::DocumentationCandidate {
-                        candidate: candidate.candidate.clone(),
-                        signature: candidate.signature.clone(),
+        let result = tokio::task::spawn_blocking(
+            move || -> Result<(Vec<SignatureInformation>, usize, SemanticRequestPerf)> {
+                let query_started = std::time::Instant::now();
+                let service = CandidateQueryService::new(
+                    call_read_handle.as_deref(),
+                    &overlay,
+                    &current_rel,
+                    reach_scope.as_deref(),
+                    reach_graph.as_deref(),
+                );
+                let candidates =
+                    service.callable_candidates(&call_name, Some(call_site_context))?;
+                let mut perf = SemanticRequestPerf::from_callable_set(&candidates);
+                perf.reach_us = reach_us;
+                let presentations = query::signature_presentations(&candidates.groups);
+                let presentations =
+                    &presentations[..presentations.len().min(query::SIGNATURE_HELP_LIMIT)];
+                let mut source_paths: Vec<_> = presentations
+                    .iter()
+                    .map(|candidate| candidate.candidate.path.clone())
+                    .collect();
+                source_paths.sort();
+                source_paths.dedup();
+                let source_revisions = service.source_revisions(&source_paths)?;
+                perf.query_us = query_started.elapsed().as_micros();
+                let active_signature = query::signature_active_index(presentations);
+                let hydration_started = std::time::Instant::now();
+                let mut hydration = HydrationStats::default();
+                let mut signatures = Vec::with_capacity(presentations.len());
+                for candidate in presentations {
+                    let signature = if candidate.anchor.presentation_signature.trim().is_empty() {
+                        candidate.anchor.signature.normalized.clone()
+                    } else {
+                        candidate.anchor.presentation_signature.clone()
                     };
-                    let preferred = super::completion_documentation::preferred_symbol_documentation(
-                        &root,
-                        &current_rel,
-                        &current_text,
-                        &primary,
-                        &documentation_candidates,
-                        project_context.as_deref(),
-                    );
-                    let mut presentation = candidate.clone();
-                    presentation.signature = preferred.presentation.signature;
-                    signature_information_for_with_comment(
-                        &presentation,
+                    let ranked = query::RankedSignatureCandidate {
+                        candidate: candidate.candidate.clone(),
+                        signature,
+                    };
+                    let source =
+                        super::hover::candidate_source_text_for_path_with_overlay_at_revision(
+                            &root,
+                            &current_rel,
+                            &current_text,
+                            &overlay,
+                            &candidate.candidate.path,
+                            &candidate.candidate.source,
+                            source_revisions.get(&candidate.candidate.path),
+                        );
+                    hydration.record(source.as_deref());
+                    let comment = source.as_deref().and_then(|source| {
+                        query::comment_documentation_for_candidate_symbol(
+                            source,
+                            &candidate.candidate.name,
+                            candidate.candidate.range.start_line,
+                            &candidate.candidate.range,
+                        )
+                    });
+                    signatures.push(signature_information_for_with_comment(
+                        &ranked,
                         active_argument,
-                        preferred.comment.as_ref(),
-                    )
-                })
-                .collect())
-        })
+                        comment.as_ref(),
+                        candidates.arity_mismatch_fallback,
+                    ));
+                }
+                perf.returned = signatures.len();
+                perf.hydration_us = hydration_started.elapsed().as_micros();
+                perf.hydration_count = hydration.count;
+                perf.hydration_bytes = hydration.bytes;
+                Ok((signatures, active_signature, perf))
+            },
+        )
         .await;
 
+        let metrics = result
+            .as_ref()
+            .ok()
+            .and_then(|result| result.as_ref().ok().map(|(_, _, metrics)| *metrics))
+            .unwrap_or_default();
+        self.perf_log(|| metrics.log_line("signature_help", total_started.elapsed().as_micros()))
+            .await;
+
         match self.unwrap_query("signature help", result).await {
-            Some(signatures) => Ok(signature_help_from_signatures(signatures)),
+            Some((signatures, active_signature, _)) => {
+                Ok(signature_help_from_signatures(signatures, active_signature))
+            }
             _ => Ok(None),
         }
     }
 }
 
-fn signature_help_from_signatures(signatures: Vec<SignatureInformation>) -> Option<SignatureHelp> {
+fn signature_help_from_signatures(
+    signatures: Vec<SignatureInformation>,
+    active_signature: usize,
+) -> Option<SignatureHelp> {
     if signatures.is_empty() {
         return None;
     }
+    let active_signature = active_signature.min(signatures.len() - 1);
     let active_parameter = signatures
-        .first()
+        .get(active_signature)
         .and_then(|signature| signature.active_parameter);
     Some(SignatureHelp {
         signatures,
-        active_signature: Some(0),
+        active_signature: Some(active_signature as u32),
         active_parameter,
     })
 }
@@ -124,13 +239,14 @@ pub(super) fn signature_information_for(
     ranked: &query::RankedSignatureCandidate,
     active_argument: u32,
 ) -> SignatureInformation {
-    signature_information_for_with_comment(ranked, active_argument, None)
+    signature_information_for_with_comment(ranked, active_argument, None, false)
 }
 
 fn signature_information_for_with_comment(
     ranked: &query::RankedSignatureCandidate,
     active_argument: u32,
     comment: Option<&query::RenderedSymbolComment>,
+    arity_mismatch_fallback: bool,
 ) -> SignatureInformation {
     let parts: query::SignatureParts = if ranked.candidate.name.is_empty() {
         query::signature_parts(&ranked.signature)
@@ -159,7 +275,9 @@ fn signature_information_for_with_comment(
     SignatureInformation {
         label: parts.label,
         documentation: Some(markdown_documentation(signature_documentation(
-            ranked, comment,
+            ranked,
+            comment,
+            arity_mismatch_fallback,
         ))),
         parameters: (!parameters.is_empty()).then_some(parameters),
         active_parameter,
@@ -169,6 +287,7 @@ fn signature_information_for_with_comment(
 fn signature_documentation(
     ranked: &query::RankedSignatureCandidate,
     comment: Option<&query::RenderedSymbolComment>,
+    arity_mismatch_fallback: bool,
 ) -> String {
     let evidence = format!(
         "*FossilSense: tier: {} | confidence: {} | reason: {}*",
@@ -176,12 +295,18 @@ fn signature_documentation(
         ranked.candidate.confidence.as_str(),
         ranked.candidate.reason.as_str()
     );
-    match comment {
+    let mut documentation = match comment {
         Some(comment) if !comment.markdown.trim().is_empty() => {
             format!("{}\n\n---\n\n{evidence}", comment.markdown.trim_end())
         }
         _ => evidence,
+    };
+    if arity_mismatch_fallback {
+        documentation.push_str(
+            "\n\n> **Arity mismatch fallback:** no callable candidate matched the available argument-count evidence; showing conservative signatures.",
+        );
     }
+    documentation
 }
 
 fn markdown_documentation(value: String) -> Documentation {
@@ -319,6 +444,7 @@ mod tests {
             &candidate("int foo(int size);", crate::model::ScopeTier::Reachable),
             0,
             Some(&comment),
+            false,
         );
         let documentation = match info.documentation.expect("documentation") {
             Documentation::String(value) => value,
@@ -362,9 +488,9 @@ mod tests {
                 2,
             ),
         ];
-        let help = signature_help_from_signatures(signatures).expect("signature help");
-        assert_eq!(help.active_signature, Some(0));
-        assert_eq!(help.active_parameter, None);
+        let help = signature_help_from_signatures(signatures, 1).expect("signature help");
+        assert_eq!(help.active_signature, Some(1));
+        assert_eq!(help.active_parameter, Some(2));
         assert_eq!(help.signatures[0].active_parameter, None);
         assert_eq!(help.signatures[1].active_parameter, Some(2));
     }

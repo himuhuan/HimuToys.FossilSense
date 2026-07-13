@@ -27,6 +27,20 @@ Invoke-Checked cargo @('clippy', '-p', 'fossilsense', '--all-targets', '--', '-D
 Invoke-Checked cargo @('test', '-p', 'fossilsense') $RepoRoot
 Invoke-Checked node @('scripts/test_architecture_fitness.js') $RepoRoot
 Invoke-Checked node @('scripts/architecture_fitness.js') $RepoRoot
+Invoke-Checked powershell @(
+    '-NoProfile',
+    '-ExecutionPolicy',
+    'Bypass',
+    '-File',
+    'scripts/test_release_hardening.ps1'
+) $RepoRoot
+Invoke-Checked powershell @(
+    '-NoProfile',
+    '-ExecutionPolicy',
+    'Bypass',
+    '-File',
+    'scripts/test_benchmark_entrypoints.ps1'
+) $RepoRoot
 Invoke-Checked pnpm @('test') $ExtensionRoot
 
 Write-Host 'FossilSense verification passed.' -ForegroundColor Green

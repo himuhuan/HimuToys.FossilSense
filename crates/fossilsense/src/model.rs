@@ -246,6 +246,9 @@ pub struct MemberCandidate {
     pub tier: ScopeTier,
     pub confidence: crate::parser::MemberConfidence,
     pub owner_path: String,
+    /// Blake3 hash of the exact owner source revision that produced this
+    /// member. Completion resolve validates it before reading lazy docs.
+    pub owner_revision_hash: Option<String>,
 }
 
 /// User-visible best-effort label for a completion candidate (R6). `detail` is a

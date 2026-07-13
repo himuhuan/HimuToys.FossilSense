@@ -4,12 +4,14 @@
 //   1. cargo build --release          -> native engine
 //   2. copy fossilsense(.exe)         -> extension bin/  (self-contained)
 //   3. esbuild bundle                 -> out/extension.js (single file)
-//   4. vsce package --no-dependencies -> dist/fossilsense-vscode-<version>_BUILD<YYYYMMDD_HHMMSS>.vsix
+//   4. fingerprint inputs + payload   -> bin/release-build.json
+//   5. vsce package --no-dependencies -> dist/fossilsense-vscode-<version>_BUILD<YYYYMMDD_HHMMSS>.vsix
 //
 // Run from anywhere via `pnpm run package` in extensions/vscode.
 
 import { execFileSync, execSync } from 'node:child_process';
-import { copyFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -53,6 +55,50 @@ function requireDep(path, name) {
   }
 }
 
+function captureReleaseFingerprint() {
+  const hardeningScript = join(repoRoot, 'scripts', 'verify_release_hardening.ps1');
+  if (!existsSync(hardeningScript)) {
+    throw new Error(`Release fingerprint helper not found: ${hardeningScript}`);
+  }
+  const powershell = isWin ? 'powershell.exe' : 'pwsh';
+  const output = execFileSync(powershell, [
+    '-NoProfile',
+    '-ExecutionPolicy',
+    'Bypass',
+    '-File',
+    hardeningScript,
+    '-RepoRoot',
+    repoRoot,
+    '-PrintReleaseFingerprint',
+  ], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+    windowsHide: true,
+  }).trim();
+  const fingerprint = JSON.parse(output);
+  if (!/^[0-9a-f]{64}$/.test(fingerprint.releaseInputSha256) ||
+      !Number.isInteger(fingerprint.releaseInputFileCount) ||
+      fingerprint.releaseInputFileCount <= 0) {
+    throw new Error('Release fingerprint helper returned an invalid source fingerprint.');
+  }
+  return fingerprint;
+}
+
+function sha256File(path) {
+  return createHash('sha256').update(readFileSync(path)).digest('hex');
+}
+
+function artifactPayloadFingerprint(parts) {
+  const payload = [
+    `releaseInput\t${parts.releaseInputSha256}`,
+    `nativeBinary\t${parts.nativeBinarySha256}`,
+    `extensionBundle\t${parts.extensionBundleSha256}`,
+    `extensionManifest\t${parts.extensionManifestSha256}`,
+    '',
+  ].join('\n');
+  return createHash('sha256').update(payload, 'utf8').digest('hex');
+}
+
 requireDep(esbuildBin, 'esbuild');
 requireDep(vsceBin, '@vscode/vsce');
 
@@ -66,7 +112,8 @@ if (!existsSync(builtBinary)) {
 }
 const binDir = join(extDir, 'bin');
 mkdirSync(binDir, { recursive: true });
-copyFileSync(builtBinary, join(binDir, exeName));
+const stagedBinary = join(binDir, exeName);
+copyFileSync(builtBinary, stagedBinary);
 console.log(`Staged ${exeName} -> ${binDir}`);
 
 // 3. Bundle the TypeScript client into a single file (sidesteps pnpm symlinks for vsce).
@@ -81,7 +128,36 @@ run(NODE, [
   '--target=node18',
 ], extDir);
 
-// 4. Package the VSIX.
+// Bind the artifact to the exact release inputs and the exact staged payload,
+// including an uncommitted working tree. The manifest contains no paths or
+// source text, only hashes and aggregate build provenance.
+const fingerprint = captureReleaseFingerprint();
+const payloadHashes = {
+  releaseInputSha256: fingerprint.releaseInputSha256,
+  nativeBinarySha256: sha256File(stagedBinary),
+  extensionBundleSha256: sha256File(join(extDir, 'out', 'extension.js')),
+  extensionManifestSha256: sha256File(join(extDir, 'package.json')),
+};
+const releaseBuild = {
+  schemaVersion: 1,
+  packageVersion: version,
+  releaseInputSha256: fingerprint.releaseInputSha256,
+  releaseInputFileCount: fingerprint.releaseInputFileCount,
+  nativeBinarySha256: payloadHashes.nativeBinarySha256,
+  extensionBundleSha256: payloadHashes.extensionBundleSha256,
+  extensionManifestSha256: payloadHashes.extensionManifestSha256,
+  artifactPayloadSha256: artifactPayloadFingerprint(payloadHashes),
+  sourceCommit: fingerprint.sourceCommit,
+  worktreeDirty: fingerprint.worktreeDirty,
+};
+writeFileSync(
+  join(binDir, 'release-build.json'),
+  `${JSON.stringify(releaseBuild, null, 2)}\n`,
+  'utf8',
+);
+console.log(`Staged release-build.json (${fingerprint.releaseInputFileCount} inputs)`);
+
+// 5. Package the VSIX.
 const distDir = join(repoRoot, 'dist');
 mkdirSync(distDir, { recursive: true });
 const bts = buildTimestamp();

@@ -12,6 +12,8 @@ const RULES = {
   coreDirection: "core-dependency-direction",
   callDomainDirection: "call-domain-dependency-direction",
   callServiceIoBoundary: "call-service-io-boundary",
+  semanticCandidateBoundary: "semantic-candidate-query-boundary",
+  sourceExcerptIoBoundary: "source-excerpt-io-boundary",
   largeFile: "large-source-file",
 };
 
@@ -236,6 +238,18 @@ function isCallService(relPath) {
   return isModule(relPath, "call_hierarchy");
 }
 
+function isServerFeature(relPath, feature) {
+  return relPath === `crates/fossilsense/src/server/${feature}.rs`;
+}
+
+function isLegacyDocumentationPolicy(relPath) {
+  return relPath === "crates/fossilsense/src/query/documentation.rs";
+}
+
+function isSourceExcerptReader(relPath) {
+  return relPath === "crates/fossilsense/src/query/source_excerpt.rs";
+}
+
 function isModule(relPath, moduleName) {
   return (
     relPath === `crates/fossilsense/src/${moduleName}.rs` ||
@@ -428,6 +442,72 @@ function collectFindings(root, options = {}) {
         RULES.callServiceIoBoundary,
         relPath,
         "call hierarchy queries must use indexed facts and must not enumerate workspace files"
+      );
+    }
+
+    if (
+      (isServerFeature(relPath, "hover") || isServerFeature(relPath, "signature_help")) &&
+      /\bsymbols_by_name\s*\(/.test(text)
+    ) {
+      addFinding(
+        findings,
+        "ERROR",
+        RULES.semanticCandidateBoundary,
+        relPath,
+        "function hover and signature help must consume the shared callable candidate service instead of SymbolRecord name queries"
+      );
+    }
+
+    if (
+      isServerFeature(relPath, "signature_help") &&
+      /\brank_function_signature_candidates\s*\(/.test(text)
+    ) {
+      addFinding(
+        findings,
+        "ERROR",
+        RULES.semanticCandidateBoundary,
+        relPath,
+        "signature help must not re-parse function arity from SymbolRecord signatures"
+      );
+    }
+
+    if (
+      isLegacyDocumentationPolicy(relPath) &&
+      /\bsame_documentation_project\s*\(/.test(text)
+    ) {
+      addFinding(
+        findings,
+        "ERROR",
+        RULES.semanticCandidateBoundary,
+        relPath,
+        "ProjectKey-only declaration/definition pairing must not remain a production identity policy"
+      );
+    }
+
+    if (
+      isSourceExcerptReader(relPath) &&
+      (/\bread_to_string\s*\(/.test(text) || /\bfs\s*::\s*read\s*\(/.test(text))
+    ) {
+      addFinding(
+        findings,
+        "ERROR",
+        RULES.sourceExcerptIoBoundary,
+        relPath,
+        "source excerpts must use bounded range reads instead of loading the whole candidate file"
+      );
+    }
+
+    if (
+      !isStoreBoundary(relPath) &&
+      /\bSELECT\b/i.test(text) &&
+      /\b(?:record_facts|type_alias_facts)\b/.test(text)
+    ) {
+      addFinding(
+        findings,
+        "ERROR",
+        RULES.semanticCandidateBoundary,
+        relPath,
+        "record and alias durable reads must use typed store views"
       );
     }
 

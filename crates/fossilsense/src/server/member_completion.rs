@@ -1,5 +1,5 @@
-use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -13,14 +13,18 @@ use super::{
     empty_completion_list, member_completion_is_incomplete, uri_to_path, Backend,
     CompletionDocumentationData,
 };
-use crate::call_model::SemanticGeneration;
+use crate::call_service::CallReadHandle;
+use crate::candidate_service::{CandidateOverlaySnapshot, CandidateQueryService};
 use crate::model;
 use crate::parser::{
     self, FactAvailability, FactGroup, FileSemanticIndex, MemberConfidence, MemberKind,
 };
 use crate::pathing;
 use crate::query;
-use crate::store::IndexStore;
+
+use super::workspace::DocumentRequestSnapshot;
+
+const RESOLVED_MEMBER_SCAN_LIMIT: usize = 8_192;
 
 impl Backend {
     /// Member-access (`.`/`->`) completion: narrow to the receiver record's
@@ -34,6 +38,7 @@ impl Backend {
         text: &str,
         line_text: &str,
         position: Position,
+        documents: DocumentRequestSnapshot,
     ) -> LspResult<Option<CompletionResponse>> {
         let member_chain = query::member_access_chain_at(line_text, position.character);
         let receiver = member_chain.as_ref().map(|chain| chain.receiver.clone());
@@ -46,15 +51,38 @@ impl Backend {
         let path = uri_to_path(uri);
         let text_owned = text.to_string();
         let uri_owned = uri.to_string();
+        let completion_overlay_epoch = documents.overlay_epoch;
         let roots = self.workspace_roots.lock().await.clone();
-        let mut db_generations = HashMap::new();
+        let primary_root = self.root_for_uri(uri).await;
+        let mut member_root_contexts: HashMap<PathBuf, MemberRootQueryContext> = HashMap::new();
+        let mut primary_context = None;
         for root in &roots {
             let context = self.request_context_for_root(root.clone()).await;
-            db_generations.insert(
-                pathing::default_index_path(root).map_err(|error| {
-                    tower_lsp::jsonrpc::Error::invalid_params(error.to_string())
-                })?,
-                context.engine.semantic_generation,
+            if primary_root.as_ref() == Some(root) {
+                primary_context = Some(context.clone());
+            }
+            let overlay = self
+                .candidate_overlay_snapshot_from_documents(
+                    root,
+                    context.engine.semantic_generation,
+                    context.engine.reach_graph.as_deref(),
+                    context.engine.indexed_files.as_deref().map(Vec::as_slice),
+                    documents.clone(),
+                )
+                .await;
+            let current_path = path
+                .as_deref()
+                .and_then(|path| pathing::relative_slash_path(root, path).ok())
+                .or_else(|| path.as_deref().map(pathing::normalize_abs_path))
+                .unwrap_or_else(|| uri_owned.clone());
+            member_root_contexts.insert(
+                root.clone(),
+                MemberRootQueryContext {
+                    handle: context.engine.call_read_handle.clone(),
+                    overlay,
+                    current_path,
+                    reach_graph: context.engine.reach_graph.clone(),
+                },
             );
         }
         let limit = query::COMPLETION_LIMIT;
@@ -64,14 +92,9 @@ impl Backend {
         // open-scope semantics as normal completion/coloring. A closed scope can
         // prove non-reachability; an open scope softens out-of-set candidates to
         // Unknown rather than treating the request as unscoped.
-        let reach_info = self.reach_scope_for(uri).await;
-        let current_rel_path = reach_info.as_ref().map(|(rel, _)| rel.clone()).or_else(|| {
-            let path = path.as_ref()?;
-            roots
-                .iter()
-                .find(|root| path.starts_with(root))
-                .and_then(|root| pathing::relative_slash_path(root, path).ok())
-        });
+        let reach_info = primary_context
+            .as_ref()
+            .and_then(|context| self.reach_scope_from_context(uri, context));
         let member_reach = reach_info.map(|(_, reach)| (*reach).clone());
 
         // Use the live-document parse cache; receiver inference only needs
@@ -114,191 +137,156 @@ impl Backend {
                     _ => None,
                 };
 
-                let mut record_candidates_by_db: Vec<(
-                    PathBuf,
-                    Vec<crate::model::RecordCandidate>,
-                )> = Vec::new();
-                if let Some(key) = &record_key {
-                    for root in &roots {
-                        let db_path = pathing::default_index_path(root)?;
-                        if db_path.exists() {
-                            let ctx = crate::resolver::ResolveContext {
-                                current_path: current_rel_path.as_deref(),
-                                reach: member_reach.as_ref(),
-                            };
-                            let mut candidates =
-                                read_member_at_generation(&db_path, &db_generations, |store| {
-                                    store
-                                        .member_view()
-                                        .resolve_record_candidates(&[key.as_str()], Some(&ctx))
-                                })?;
-
-                            if candidates.is_empty() && member_reach.is_some() {
-                                let ctx_unscoped = crate::resolver::ResolveContext {
-                                    current_path: current_rel_path.as_deref(),
-                                    reach: None,
-                                };
-                                candidates = read_member_at_generation(
-                                    &db_path,
-                                    &db_generations,
-                                    |store| {
-                                        store.member_view().resolve_record_candidates(
-                                            &[key.as_str()],
-                                            Some(&ctx_unscoped),
-                                        )
-                                    },
-                                )?;
-                            }
-
-                            if !candidates.is_empty() {
-                                record_candidates_by_db.push((db_path, candidates));
-                            }
-                        }
-                    }
+                // Every workspace root gets its own generation-pinned handle
+                // and all-open overlay from the same document snapshot. This
+                // keeps cross-root recall useful without allowing a secondary
+                // root's dirty record/alias/member path to revive base facts.
+                let mut owner_incomplete = false;
+                let mut owner_ambiguous = false;
+                let mut explicit_record_found = false;
+                let mut record_candidates_by_root = Vec::new();
+                let mut resolved_member_scan_remaining = RESOLVED_MEMBER_SCAN_LIMIT;
+                if let Some(key) = record_key.as_deref() {
+                    let type_names = [key.to_string()];
+                    let resolution = resolve_record_names_across_roots(
+                        &roots,
+                        &type_names,
+                        &member_root_contexts,
+                    )?;
+                    owner_incomplete |= resolution.incomplete;
+                    owner_ambiguous |= resolution.ambiguous;
+                    explicit_record_found =
+                        resolution.authoritative || !resolution.candidates.is_empty();
+                    record_candidates_by_root = resolution.candidates;
+                    retain_global_highest_record_tier(&mut record_candidates_by_root);
                 }
 
-                let mut explicit_record_found =
-                    record_key.is_some() && !record_candidates_by_db.is_empty();
                 let mut weak_owner_used = false;
-                if record_candidates_by_db.is_empty()
+                if record_candidates_by_root.is_empty()
+                    && !explicit_record_found
                     && completed_members.is_empty()
                     && prefix.len() >= min_prefix
                 {
                     if let Some(receiver_name) = receiver.as_deref() {
                         let lookup_names = weak_receiver_lookup_names(receiver_name);
-                        let lookup_refs: Vec<&str> =
-                            lookup_names.iter().map(String::as_str).collect();
-                        let mut weak_candidates_by_db = Vec::new();
-                        let mut all_candidates = Vec::new();
+                        let mut weak_matches = Vec::new();
+                        let mut seen_weak = HashSet::new();
                         for root in &roots {
-                            let db_path = pathing::default_index_path(root)?;
-                            if db_path.exists() {
-                                let ctx = crate::resolver::ResolveContext {
-                                    current_path: current_rel_path.as_deref(),
-                                    reach: member_reach.as_ref(),
-                                };
-                                let candidates = read_member_at_generation(
-                                    &db_path,
-                                    &db_generations,
-                                    |store| {
-                                        store
-                                            .member_view()
-                                            .resolve_record_candidates(&lookup_refs, Some(&ctx))
-                                    },
-                                )?;
-                                if !candidates.is_empty() {
-                                    all_candidates.extend(candidates.iter().cloned());
-                                    weak_candidates_by_db.push((db_path, candidates));
+                            let Some(context) = member_root_contexts.get(root) else {
+                                continue;
+                            };
+                            let service = context.service();
+                            for lookup_name in &lookup_names {
+                                let resolution =
+                                    service.records_for_type_name_with_evidence(lookup_name)?;
+                                owner_incomplete |= resolution.incomplete;
+                                for candidate in resolution.records.into_iter().filter(|record| {
+                                    weak_receiver_matches_record(receiver_name, record)
+                                }) {
+                                    if seen_weak.insert((root.clone(), candidate.identity.clone()))
+                                    {
+                                        weak_matches.push((root.clone(), candidate));
+                                    }
                                 }
                             }
                         }
-                        let weak_ids = weak_receiver_record_ids(receiver_name, &all_candidates);
-                        if weak_ids.len() == 1 {
-                            let weak_id = weak_ids[0];
-                            let mut accepted = Vec::new();
-                            for (db_path, candidates) in weak_candidates_by_db {
-                                let filtered: Vec<_> = candidates
-                                    .into_iter()
-                                    .filter(|candidate| {
-                                        candidate.id == weak_id
-                                            && weak_receiver_matches_record(
-                                                receiver_name,
-                                                candidate,
-                                            )
-                                    })
-                                    .collect();
-                                if !filtered.is_empty() {
-                                    accepted.push((db_path, filtered));
-                                }
-                            }
-                            if !accepted.is_empty() {
-                                record_candidates_by_db = accepted;
-                                weak_owner_used = true;
-                            }
+                        if let [only] = weak_matches.as_slice() {
+                            record_candidates_by_root =
+                                vec![(only.0.clone(), vec![only.1.clone()])];
+                            weak_owner_used = true;
                         }
                     }
                 }
 
-                if !completed_members.is_empty() && !record_candidates_by_db.is_empty() {
+                if !completed_members.is_empty() && !record_candidates_by_root.is_empty() {
                     for member_name in completed_members {
-                        let type_names = member_type_names_for_segment(
-                            &record_candidates_by_db,
+                        let (type_names, member_read_limited) = member_type_names_for_segment(
+                            &record_candidates_by_root,
                             &member_name,
-                            current_rel_path.as_deref(),
-                            member_reach.as_ref(),
-                            &db_generations,
+                            &member_root_contexts,
+                            &mut resolved_member_scan_remaining,
                         )?;
+                        owner_incomplete |= member_read_limited;
+                        owner_ambiguous |= type_names.len() > 1;
+                        owner_incomplete |= type_names.len() > 1;
                         if type_names.is_empty() {
-                            record_candidates_by_db.clear();
+                            record_candidates_by_root.clear();
                             break;
                         }
 
-                        record_candidates_by_db = resolve_record_names_across_roots(
+                        let resolution = resolve_record_names_across_roots(
                             &roots,
                             &type_names,
-                            current_rel_path.as_deref(),
-                            member_reach.as_ref(),
-                            &db_generations,
+                            &member_root_contexts,
                         )?;
-                        if record_candidates_by_db.is_empty() {
+                        owner_incomplete |= resolution.incomplete;
+                        owner_ambiguous |= resolution.ambiguous;
+                        explicit_record_found |= resolution.authoritative;
+                        record_candidates_by_root = resolution.candidates;
+                        retain_global_highest_record_tier(&mut record_candidates_by_root);
+                        if record_candidates_by_root.is_empty() {
                             break;
                         }
                     }
-                    explicit_record_found = !record_candidates_by_db.is_empty();
+                    explicit_record_found |= !record_candidates_by_root.is_empty();
+                }
+
+                if !weak_owner_used {
+                    let highest_rank = record_candidates_by_root
+                        .iter()
+                        .flat_map(|(_, candidates)| {
+                            candidates.iter().map(|candidate| candidate.tier.rank())
+                        })
+                        .max();
+                    if let Some(highest_rank) = highest_rank {
+                        let highest_count = record_candidates_by_root
+                            .iter()
+                            .flat_map(|(_, candidates)| candidates)
+                            .filter(|candidate| candidate.tier.rank() == highest_rank)
+                            .count();
+                        owner_ambiguous |= highest_count > 1;
+                        owner_incomplete |= highest_count > 1;
+                    }
                 }
 
                 let mut member_to_best: HashMap<(String, MemberKind), MemberPresentation> =
                     HashMap::new();
-                let highest_record_rank = record_candidates_by_db
+                let highest_record_rank = record_candidates_by_root
                     .iter()
                     .flat_map(|(_, candidates)| {
                         candidates.iter().map(|candidate| candidate.tier.rank())
                     })
                     .max();
                 if let Some(highest_rank) = highest_record_rank {
-                    for (db_path, candidates) in &record_candidates_by_db {
-                        let record_ids: Vec<i64> = candidates
+                    for (root, candidates) in &record_candidates_by_root {
+                        let selected: Vec<_> = candidates
                             .iter()
                             .filter(|candidate| candidate.tier.rank() == highest_rank)
-                            .map(|candidate| candidate.id)
+                            .cloned()
                             .collect();
-                        if !record_ids.is_empty() {
-                            let members =
-                                read_member_at_generation(db_path, &db_generations, |store| {
-                                    store.member_view().members_for_records(
-                                        &record_ids,
-                                        None,
-                                        Some(&crate::resolver::ResolveContext {
-                                            current_path: current_rel_path.as_deref(),
-                                            reach: member_reach.as_ref(),
-                                        }),
-                                    )
-                                })?;
-                            for member in members {
-                                remember_member(&mut member_to_best, member, weak_owner_used);
+                        if !selected.is_empty() {
+                            let Some(context) = member_root_contexts.get(root) else {
+                                continue;
+                            };
+                            if resolved_member_scan_remaining == 0 {
+                                owner_incomplete = true;
+                                break;
                             }
-                        }
-                    }
-                }
-
-                if member_to_best.is_empty() && !record_candidates_by_db.is_empty() {
-                    for (db_path, candidates) in &record_candidates_by_db {
-                        let record_ids: Vec<i64> =
-                            candidates.iter().map(|candidate| candidate.id).collect();
-                        if !record_ids.is_empty() {
-                            let members =
-                                read_member_at_generation(db_path, &db_generations, |store| {
-                                    store.member_view().members_for_records(
-                                        &record_ids,
-                                        None,
-                                        Some(&crate::resolver::ResolveContext {
-                                            current_path: current_rel_path.as_deref(),
-                                            reach: member_reach.as_ref(),
-                                        }),
-                                    )
-                                })?;
-                            for member in members {
-                                remember_member(&mut member_to_best, member, weak_owner_used);
+                            let read = context.service().members_for_records_limited(
+                                &selected,
+                                None,
+                                resolved_member_scan_remaining,
+                            )?;
+                            resolved_member_scan_remaining =
+                                resolved_member_scan_remaining.saturating_sub(read.scanned);
+                            owner_incomplete |= read.truncated;
+                            for member in read.candidates {
+                                remember_member(
+                                    &mut member_to_best,
+                                    member,
+                                    weak_owner_used,
+                                    owner_ambiguous,
+                                );
                             }
                         }
                     }
@@ -318,34 +306,22 @@ impl Backend {
                         })
                         .collect();
                     (filtered, explicit_record_found || weak_owner_used, false)
-                } else if prefix.len() >= min_prefix {
-                    let mut fallback: Vec<MemberPresentation> = Vec::new();
+                } else if prefix.len() >= min_prefix && !explicit_record_found {
+                    let mut fallback_best: HashMap<(String, MemberKind), MemberPresentation> =
+                        HashMap::new();
                     for root in &roots {
-                        let db_path = pathing::default_index_path(root)?;
-                        if db_path.exists() {
-                            let ctx = crate::resolver::ResolveContext {
-                                current_path: current_rel_path.as_deref(),
-                                reach: member_reach.as_ref(),
-                            };
-                            fallback.extend(
-                                read_member_at_generation(&db_path, &db_generations, |store| {
-                                    store.member_view().fallback_member_candidates(
-                                        &prefix,
-                                        limit,
-                                        Some(&ctx),
-                                    )
-                                })?
-                                .into_iter()
-                                .map(|candidate| {
-                                    MemberPresentation {
-                                        candidate,
-                                        weak_receiver: false,
-                                    }
-                                }),
-                            );
+                        let Some(context) = member_root_contexts.get(root) else {
+                            continue;
+                        };
+                        let (candidates, fallback_truncated) = context
+                            .service()
+                            .fallback_member_candidates(&prefix, limit)?;
+                        owner_incomplete |= fallback_truncated;
+                        for candidate in candidates {
+                            remember_member(&mut fallback_best, candidate, false, false);
                         }
                     }
-                    (fallback, false, true)
+                    (fallback_best.into_values().collect(), false, true)
                 } else {
                     (Vec::new(), false, false)
                 };
@@ -379,19 +355,40 @@ impl Backend {
                         member_open_reason,
                     );
                     let label = model::completion_scope_label(member.tier, confidence, reason);
-                    let detail =
-                        member_detail(member.kind, label.as_ref(), presentation.weak_receiver);
+                    let detail = member_detail(
+                        member.kind,
+                        label.as_ref(),
+                        presentation.weak_receiver,
+                        presentation.ambiguous_owner,
+                    );
                     let documentation = member_documentation(
                         member.kind,
                         member.confidence,
                         label.as_ref(),
                         presentation.weak_receiver,
+                        presentation.ambiguous_owner,
                     );
                     match member.kind {
                         MemberKind::Field => field_count += 1,
                         MemberKind::Method | MemberKind::StaticMethod => method_count += 1,
                         MemberKind::NestedType => {}
                     }
+                    let documentation_data =
+                        member
+                            .owner_revision_hash
+                            .clone()
+                            .and_then(|owner_revision_hash| {
+                                serde_json::to_value(CompletionDocumentationData::Member {
+                                    version: 3,
+                                    uri: uri_owned.clone(),
+                                    owner_path: member.owner_path.clone(),
+                                    signature: member.signature.clone(),
+                                    owner_revision_hash,
+                                    overlay_epoch: completion_overlay_epoch,
+                                    document_version: version,
+                                })
+                                .ok()
+                            });
                     scored.push((
                         score,
                         member_kind_rank(member.kind),
@@ -402,12 +399,7 @@ impl Backend {
                             sort_text: Some(format!("{:08}", 100_000_000 - score)),
                             detail: Some(detail),
                             documentation: Some(Documentation::String(documentation)),
-                            data: serde_json::to_value(CompletionDocumentationData::Member {
-                                uri: uri_owned.clone(),
-                                owner_path: member.owner_path,
-                                signature: member.signature,
-                            })
-                            .ok(),
+                            data: documentation_data,
                             ..Default::default()
                         },
                     ));
@@ -417,8 +409,8 @@ impl Backend {
                         .then_with(|| a.1.cmp(&b.1))
                         .then_with(|| a.2.cmp(&b.2))
                 });
-                let is_incomplete =
-                    member_completion_is_incomplete(resolved_hit, scored.len(), limit);
+                let is_incomplete = owner_incomplete
+                    || member_completion_is_incomplete(resolved_hit, scored.len(), limit);
                 let items: Vec<CompletionItem> = scored
                     .into_iter()
                     .take(limit)
@@ -482,6 +474,35 @@ impl Backend {
 struct MemberPresentation {
     candidate: crate::model::MemberCandidate,
     weak_receiver: bool,
+    ambiguous_owner: bool,
+}
+
+#[derive(Clone)]
+struct MemberRootQueryContext {
+    handle: Option<Arc<CallReadHandle>>,
+    overlay: Arc<CandidateOverlaySnapshot>,
+    current_path: String,
+    reach_graph: Option<Arc<crate::reachability::ReachGraph>>,
+}
+
+impl MemberRootQueryContext {
+    fn service(&self) -> CandidateQueryService<'_> {
+        CandidateQueryService::new(
+            self.handle.as_deref(),
+            self.overlay.as_ref(),
+            &self.current_path,
+            None,
+            self.reach_graph.as_deref(),
+        )
+    }
+}
+
+#[derive(Default)]
+struct RootRecordResolution {
+    candidates: Vec<(PathBuf, Vec<crate::query::RecordCandidate>)>,
+    authoritative: bool,
+    incomplete: bool,
+    ambiguous: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -498,11 +519,13 @@ fn remember_member(
     members: &mut HashMap<(String, MemberKind), MemberPresentation>,
     candidate: crate::model::MemberCandidate,
     weak_receiver: bool,
+    ambiguous_owner: bool,
 ) {
     let key = (candidate.name.to_ascii_lowercase(), candidate.kind);
     let presentation = MemberPresentation {
         candidate,
         weak_receiver,
+        ambiguous_owner,
     };
     match members.get(&key) {
         Some(existing) if member_candidate_better(&existing.candidate, &presentation.candidate) => {
@@ -526,6 +549,12 @@ fn member_candidate_better(
                 .cmp(&member_confidence_rank(incoming.confidence))
         })
         .then_with(|| incoming.signature.cmp(&current.signature))
+        .then_with(|| incoming.owner_path.cmp(&current.owner_path))
+        .then_with(|| {
+            incoming
+                .owner_revision_hash
+                .cmp(&current.owner_revision_hash)
+        })
         .is_gt()
 }
 
@@ -567,6 +596,7 @@ fn member_detail(
     kind: MemberKind,
     scope_label: Option<&model::CompletionScopeLabel>,
     weak_receiver: bool,
+    ambiguous_owner: bool,
 ) -> String {
     let mut parts = vec![member_kind_label(kind).to_string()];
     if let Some(label) = scope_label {
@@ -574,6 +604,9 @@ fn member_detail(
     }
     if weak_receiver {
         parts.push("heuristic receiver".to_string());
+    }
+    if ambiguous_owner {
+        parts.push("ambiguous owner".to_string());
     }
     parts.join(" ")
 }
@@ -583,6 +616,7 @@ fn member_documentation(
     confidence: MemberConfidence,
     scope_label: Option<&model::CompletionScopeLabel>,
     weak_receiver: bool,
+    ambiguous_owner: bool,
 ) -> String {
     let scope = scope_label
         .map(|label| label.documentation.as_str())
@@ -592,24 +626,46 @@ fn member_documentation(
     } else {
         ""
     };
+    let owner = if ambiguous_owner {
+        ", ambiguous_owner"
+    } else {
+        ""
+    };
     format!(
-        "FossilSense: {} member candidate ({}, {}{})",
+        "FossilSense: {} member candidate ({}, {}{}{})",
         member_kind_label(kind),
         scope,
         confidence.as_str(),
-        receiver
+        receiver,
+        owner,
     )
 }
 
+fn retain_global_highest_record_tier(
+    candidates_by_root: &mut Vec<(PathBuf, Vec<crate::query::RecordCandidate>)>,
+) {
+    let highest_rank = candidates_by_root
+        .iter()
+        .flat_map(|(_, candidates)| candidates.iter().map(|candidate| candidate.tier.rank()))
+        .max();
+    let Some(highest_rank) = highest_rank else {
+        return;
+    };
+    for (_, candidates) in candidates_by_root.iter_mut() {
+        candidates.retain(|candidate| candidate.tier.rank() == highest_rank);
+    }
+    candidates_by_root.retain(|(_, candidates)| !candidates.is_empty());
+}
+
 fn member_type_names_for_segment(
-    record_candidates_by_db: &[(PathBuf, Vec<crate::model::RecordCandidate>)],
+    record_candidates_by_root: &[(PathBuf, Vec<crate::query::RecordCandidate>)],
     member_name: &str,
-    current_rel_path: Option<&str>,
-    member_reach: Option<&crate::reachability::ReachScope>,
-    db_generations: &HashMap<PathBuf, SemanticGeneration>,
-) -> Result<Vec<String>> {
+    member_root_contexts: &HashMap<PathBuf, MemberRootQueryContext>,
+    scan_remaining: &mut usize,
+) -> Result<(Vec<String>, bool)> {
     let mut names = Vec::new();
-    for (db_path, candidates) in record_candidates_by_db {
+    let mut truncated = false;
+    for (root, candidates) in record_candidates_by_root {
         let Some(highest_rank) = candidates
             .iter()
             .map(|candidate| candidate.tier.rank())
@@ -617,25 +673,29 @@ fn member_type_names_for_segment(
         else {
             continue;
         };
-        let record_ids: Vec<i64> = candidates
+        let selected: Vec<_> = candidates
             .iter()
             .filter(|candidate| candidate.tier.rank() == highest_rank)
-            .map(|candidate| candidate.id)
+            .cloned()
             .collect();
-        if record_ids.is_empty() {
+        if selected.is_empty() {
             continue;
         }
-        let members = read_member_at_generation(db_path, db_generations, |store| {
-            store.member_view().members_for_records(
-                &record_ids,
-                Some(member_name),
-                Some(&crate::resolver::ResolveContext {
-                    current_path: current_rel_path,
-                    reach: member_reach,
-                }),
-            )
-        })?;
-        for member in members {
+        let Some(context) = member_root_contexts.get(root) else {
+            continue;
+        };
+        if *scan_remaining == 0 {
+            truncated = true;
+            break;
+        }
+        let read = context.service().members_for_records_limited(
+            &selected,
+            Some(member_name),
+            *scan_remaining,
+        )?;
+        *scan_remaining = scan_remaining.saturating_sub(read.scanned);
+        truncated |= read.truncated;
+        for member in read.candidates {
             if member.kind == MemberKind::Field && member.name == member_name {
                 if let Some(type_name) = member.type_name {
                     names.push(type_name);
@@ -645,59 +705,138 @@ fn member_type_names_for_segment(
     }
     names.sort();
     names.dedup();
-    Ok(names)
+    Ok((names, truncated))
 }
 
 fn resolve_record_names_across_roots(
     roots: &[PathBuf],
     type_names: &[String],
-    current_rel_path: Option<&str>,
-    member_reach: Option<&crate::reachability::ReachScope>,
-    db_generations: &HashMap<PathBuf, SemanticGeneration>,
-) -> Result<Vec<(PathBuf, Vec<crate::model::RecordCandidate>)>> {
-    let lookup_refs: Vec<&str> = type_names.iter().map(String::as_str).collect();
-    let mut by_db = Vec::new();
-    for root in roots {
-        let db_path = pathing::default_index_path(root)?;
-        if !db_path.exists() {
+    member_root_contexts: &HashMap<PathBuf, MemberRootQueryContext>,
+) -> Result<RootRecordResolution> {
+    const MULTI_ROOT_RECORD_LIMIT: usize = crate::query::TYPE_CANDIDATE_LIMIT * 4;
+
+    let mut combined = RootRecordResolution::default();
+    let mut frontier = VecDeque::new();
+    let mut strongest_frontier = HashMap::new();
+    for type_name in type_names {
+        enqueue_type_frontier(
+            &mut frontier,
+            &mut strongest_frontier,
+            type_name.clone(),
+            crate::model::ScopeTier::Current,
+        );
+    }
+    let mut candidates_by_root: HashMap<PathBuf, Vec<crate::query::RecordCandidate>> =
+        HashMap::new();
+    let mut type_queries = 0usize;
+    let mut record_count = 0usize;
+
+    'frontier: while let Some((type_name, tier_cap)) = frontier.pop_front() {
+        if strongest_frontier.get(&type_name).copied() != Some(tier_cap) {
             continue;
         }
-        let ctx = crate::resolver::ResolveContext {
-            current_path: current_rel_path,
-            reach: member_reach,
-        };
-        let mut candidates = read_member_at_generation(&db_path, db_generations, |store| {
-            store
-                .member_view()
-                .resolve_record_candidates(&lookup_refs, Some(&ctx))
-        })?;
-        if candidates.is_empty() && member_reach.is_some() {
-            let ctx_unscoped = crate::resolver::ResolveContext {
-                current_path: current_rel_path,
-                reach: None,
+        for root in roots {
+            if type_queries >= crate::query::ALIAS_RESOLUTION_MAX_VISITS {
+                combined.incomplete = true;
+                break 'frontier;
+            }
+            let Some(context) = member_root_contexts.get(root) else {
+                continue;
             };
-            candidates = read_member_at_generation(&db_path, db_generations, |store| {
-                store
-                    .member_view()
-                    .resolve_record_candidates(&lookup_refs, Some(&ctx_unscoped))
-            })?;
-        }
-        if !candidates.is_empty() {
-            by_db.push((db_path, candidates));
+            type_queries += 1;
+            let bundle = context.service().type_candidates(&type_name)?;
+            combined.authoritative |= bundle.shadowed_evidence
+                || !bundle.records.candidates.is_empty()
+                || !bundle.aliases.candidates.is_empty();
+            combined.incomplete |= !bundle.records.coverage.permits_uniqueness()
+                || !bundle.aliases.coverage.permits_uniqueness();
+
+            let mut records = bundle.records.candidates;
+            for resolution in bundle.alias_resolutions {
+                combined.ambiguous |=
+                    resolution.status == crate::query::AliasResolutionStatus::AmbiguousRecord;
+                combined.incomplete |=
+                    resolution.status != crate::query::AliasResolutionStatus::UniqueRecord;
+                records.extend(resolution.terminal_records);
+            }
+            for alias in bundle.aliases.candidates {
+                let target_name = match alias.target {
+                    crate::query::TypeAliasTarget::TypeName(name) => Some(name),
+                    crate::query::TypeAliasTarget::NamedRecord { tag, .. } => Some(tag),
+                    crate::query::TypeAliasTarget::StableRecord(_) => None,
+                };
+                if let Some(target_name) = target_name.filter(|name| !name.is_empty()) {
+                    let next_tier = if tier_cap.rank() <= alias.tier.rank() {
+                        tier_cap
+                    } else {
+                        alias.tier
+                    };
+                    enqueue_type_frontier(
+                        &mut frontier,
+                        &mut strongest_frontier,
+                        target_name,
+                        next_tier,
+                    );
+                }
+            }
+
+            let root_candidates = candidates_by_root.entry(root.clone()).or_default();
+            for mut record in records {
+                if tier_cap.rank() < record.tier.rank() {
+                    record.tier = tier_cap;
+                }
+                if let Some(existing) = root_candidates
+                    .iter_mut()
+                    .find(|candidate| candidate.identity == record.identity)
+                {
+                    if record.tier.rank() > existing.tier.rank() {
+                        *existing = record;
+                    }
+                    continue;
+                }
+                if record_count >= MULTI_ROOT_RECORD_LIMIT {
+                    combined.incomplete = true;
+                    break 'frontier;
+                }
+                record_count += 1;
+                root_candidates.push(record);
+            }
         }
     }
-    Ok(by_db)
+
+    for root in roots {
+        if let Some(mut candidates) = candidates_by_root.remove(root) {
+            candidates.sort_by(|left, right| {
+                right
+                    .tier
+                    .rank()
+                    .cmp(&left.tier.rank())
+                    .then_with(|| left.path.cmp(&right.path))
+                    .then_with(|| left.name_range.start_byte.cmp(&right.name_range.start_byte))
+            });
+            if !candidates.is_empty() {
+                combined.candidates.push((root.clone(), candidates));
+            }
+        }
+    }
+    Ok(combined)
 }
 
-fn read_member_at_generation<T>(
-    db_path: &Path,
-    db_generations: &HashMap<PathBuf, SemanticGeneration>,
-    read: impl FnOnce(&IndexStore) -> Result<T>,
-) -> Result<T> {
-    let generation = db_generations
-        .get(db_path)
-        .ok_or_else(|| anyhow::anyhow!("missing request generation for {}", db_path.display()))?;
-    IndexStore::read_at_generation(db_path, generation.0, read)
+fn enqueue_type_frontier(
+    frontier: &mut VecDeque<(String, crate::model::ScopeTier)>,
+    strongest: &mut HashMap<String, crate::model::ScopeTier>,
+    name: String,
+    tier: crate::model::ScopeTier,
+) {
+    if name.is_empty()
+        || strongest
+            .get(&name)
+            .is_some_and(|known| known.rank() >= tier.rank())
+    {
+        return;
+    }
+    strongest.insert(name.clone(), tier);
+    frontier.push_back((name, tier));
 }
 
 fn weak_receiver_lookup_names(receiver_name: &str) -> Vec<String> {
@@ -716,24 +855,9 @@ fn weak_receiver_lookup_names(receiver_name: &str) -> Vec<String> {
     names
 }
 
-fn weak_receiver_record_ids(
-    receiver_name: &str,
-    records: &[crate::model::RecordCandidate],
-) -> Vec<i64> {
-    let matches: Vec<&crate::model::RecordCandidate> = records
-        .iter()
-        .filter(|record| weak_receiver_matches_record(receiver_name, record))
-        .collect();
-    if matches.len() == 1 {
-        vec![matches[0].id]
-    } else {
-        Vec::new()
-    }
-}
-
 fn weak_receiver_matches_record(
     receiver_name: &str,
-    record: &crate::model::RecordCandidate,
+    record: &crate::query::RecordCandidate,
 ) -> bool {
     let hint = query::normalized_receiver_record_hint(receiver_name);
     if hint.is_empty() {
@@ -758,39 +882,109 @@ mod tests {
         display_name: &str,
         id: i64,
         tier: crate::model::ScopeTier,
-    ) -> crate::model::RecordCandidate {
-        crate::model::RecordCandidate {
-            id,
+    ) -> crate::query::RecordCandidate {
+        let range = crate::call_model::SourceRange {
+            start_byte: 0,
+            end_byte: 1,
+            start: crate::call_model::SourcePosition {
+                line: 0,
+                character: 0,
+            },
+            end: crate::call_model::SourcePosition {
+                line: 0,
+                character: 1,
+            },
+        };
+        crate::query::RecordCandidate {
+            identity: crate::query::RecordCandidateIdentity::Persistent(id),
             display_name: display_name.to_string(),
             tag_name: Some(display_name.to_string()),
             typedef_name: None,
             kind: crate::parser::RecordKind::Struct,
             path: format!("{display_name}.hpp"),
-            start_byte: 0,
-            end_byte: 0,
-            start_line: 0,
-            start_col: 0,
-            end_line: 0,
-            end_col: 0,
+            name_range: range,
+            body_range: range,
+            declaration_range: range,
+            declaration_hash: [0; 32],
+            range_fidelity: crate::semantic_model::RecordRangeFidelity::AstExact,
             confidence: crate::parser::RecordConfidence::NamedTag,
             signature: format!("struct {display_name}"),
             tier,
+            revision: None,
         }
     }
 
     #[test]
     fn weak_receiver_uses_unique_record_name_correlation_only() {
-        let records = vec![record_candidate(
+        let records = [record_candidate(
             "Widget",
             1,
             crate::model::ScopeTier::Reachable,
         )];
-        assert_eq!(weak_receiver_record_ids("widget", &records), vec![1]);
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| weak_receiver_matches_record("widget", record))
+                .count(),
+            1
+        );
 
-        let ambiguous = vec![
+        let ambiguous = [
             record_candidate("Widget", 1, crate::model::ScopeTier::Reachable),
             record_candidate("Widget", 2, crate::model::ScopeTier::Global),
         ];
-        assert!(weak_receiver_record_ids("widget", &ambiguous).is_empty());
+        assert_eq!(
+            ambiguous
+                .iter()
+                .filter(|record| weak_receiver_matches_record("widget", record))
+                .count(),
+            2
+        );
+    }
+
+    fn member_candidate(
+        owner_path: &str,
+        tier: crate::model::ScopeTier,
+        confidence: MemberConfidence,
+    ) -> crate::model::MemberCandidate {
+        crate::model::MemberCandidate {
+            name: "shared".into(),
+            kind: MemberKind::Field,
+            signature: "int shared".into(),
+            type_name: Some("int".into()),
+            tier,
+            confidence,
+            owner_path: owner_path.into(),
+            owner_revision_hash: Some(format!("revision-{owner_path}")),
+        }
+    }
+
+    #[test]
+    fn global_member_merge_is_tier_first_and_root_order_independent() {
+        let global = member_candidate(
+            "root-a/global.h",
+            crate::model::ScopeTier::Global,
+            MemberConfidence::InBody,
+        );
+        let current = member_candidate(
+            "root-b/current.h",
+            crate::model::ScopeTier::Current,
+            MemberConfidence::Heuristic,
+        );
+
+        for order in [
+            vec![global.clone(), current.clone()],
+            vec![current.clone(), global.clone()],
+        ] {
+            let mut merged = HashMap::new();
+            for candidate in order {
+                remember_member(&mut merged, candidate, false, false);
+            }
+            let selected = merged
+                .get(&("shared".to_string(), MemberKind::Field))
+                .expect("merged member");
+            assert_eq!(selected.candidate.owner_path, "root-b/current.h");
+            assert_eq!(selected.candidate.tier, crate::model::ScopeTier::Current);
+        }
     }
 }

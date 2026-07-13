@@ -1,6 +1,6 @@
-// Version 15 interns repeated call strings, stores digests as BLOBs, uses
-// integer enums/flags, and relates sites to compact caller anchor IDs.
-pub(crate) const SCHEMA_VERSION: i64 = 15;
+// Version 16 adds full callable signatures, exact record ranges, and
+// declarator-aware alias facts. Schema 15 rows are rebuilt, never dual-read.
+pub(crate) const SCHEMA_VERSION: i64 = 16;
 
 pub(crate) const DROP_DATA_TABLES_SQL: &str = "
     DROP TABLE IF EXISTS pending_file_revisions;
@@ -53,7 +53,7 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
         status TEXT NOT NULL,
         error TEXT,
         source TEXT NOT NULL,
-        parser_version INTEGER NOT NULL DEFAULT 1,
+        parser_version INTEGER NOT NULL,
         fact_mask INTEGER NOT NULL DEFAULT 0,
         parse_error_count INTEGER NOT NULL DEFAULT 0,
         fallback_used INTEGER NOT NULL DEFAULT 0
@@ -129,8 +129,23 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
         start_col INTEGER NOT NULL,
         end_line INTEGER NOT NULL,
         end_col INTEGER NOT NULL,
+        body_start_byte INTEGER NOT NULL,
+        body_end_byte INTEGER NOT NULL,
+        body_start_line INTEGER NOT NULL,
+        body_start_col INTEGER NOT NULL,
+        body_end_line INTEGER NOT NULL,
+        body_end_col INTEGER NOT NULL,
+        declaration_start_byte INTEGER NOT NULL,
+        declaration_end_byte INTEGER NOT NULL,
+        declaration_start_line INTEGER NOT NULL,
+        declaration_start_col INTEGER NOT NULL,
+        declaration_end_line INTEGER NOT NULL,
+        declaration_end_col INTEGER NOT NULL,
+        range_fidelity TEXT NOT NULL,
         signature TEXT NOT NULL,
-        confidence TEXT NOT NULL
+        confidence TEXT NOT NULL,
+        declaration_hash BLOB NOT NULL
+            CHECK(typeof(declaration_hash) = 'blob' AND length(declaration_hash) = 32)
     );
 
     CREATE TABLE IF NOT EXISTS member_facts (
@@ -160,10 +175,22 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
         start_col INTEGER NOT NULL,
         end_line INTEGER NOT NULL,
         end_col INTEGER NOT NULL,
+        declaration_start_byte INTEGER NOT NULL,
+        declaration_end_byte INTEGER NOT NULL,
+        declaration_start_line INTEGER NOT NULL,
+        declaration_start_col INTEGER NOT NULL,
+        declaration_end_line INTEGER NOT NULL,
+        declaration_end_col INTEGER NOT NULL,
+        underlying_spelling TEXT NOT NULL,
+        declarator_shape TEXT NOT NULL,
+        target_fidelity TEXT NOT NULL,
+        fingerprint BLOB NOT NULL CHECK(typeof(fingerprint) = 'blob' AND length(fingerprint) = 12),
         target_record_id INTEGER REFERENCES record_facts(id) ON DELETE SET NULL,
         target_name TEXT,
         target_kind TEXT,
-        confidence TEXT NOT NULL
+        confidence TEXT NOT NULL,
+        declaration_hash BLOB NOT NULL
+            CHECK(typeof(declaration_hash) = 'blob' AND length(declaration_hash) = 32)
     );
 
     CREATE TABLE IF NOT EXISTS call_strings (
@@ -186,6 +213,9 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
         linkage_kind INTEGER NOT NULL CHECK(linkage_kind IN (0, 1, 2)),
         linkage_file_id INTEGER REFERENCES call_strings(id),
         signature_id INTEGER NOT NULL REFERENCES call_strings(id),
+        canonical_signature_id INTEGER NOT NULL REFERENCES call_strings(id),
+        presentation_signature_id INTEGER NOT NULL REFERENCES call_strings(id),
+        signature_fidelity INTEGER NOT NULL CHECK(signature_fidelity IN (0, 1, 2)),
         min_arity INTEGER,
         max_arity INTEGER,
         variadic INTEGER NOT NULL CHECK(variadic IN (0, 1)),
@@ -279,6 +309,7 @@ pub(crate) const CREATE_LOOKUP_INDEXES_SQL: &str = "
     CREATE INDEX IF NOT EXISTS idx_symbol_facts_name ON symbol_facts(name);
     CREATE INDEX IF NOT EXISTS idx_symbol_facts_file_id ON symbol_facts(file_id);
     CREATE INDEX IF NOT EXISTS idx_type_alias_facts_alias ON type_alias_facts(alias);
+    CREATE INDEX IF NOT EXISTS idx_type_alias_facts_fingerprint ON type_alias_facts(fingerprint);
     CREATE INDEX IF NOT EXISTS idx_type_alias_facts_file_id ON type_alias_facts(file_id);
     CREATE INDEX IF NOT EXISTS idx_include_edges_src ON include_edges(src_file_id);
     CREATE INDEX IF NOT EXISTS idx_record_facts_display_name ON record_facts(display_name);
@@ -296,8 +327,11 @@ pub(crate) const CREATE_LOOKUP_INDEXES_SQL: &str = "
 pub(crate) const CREATE_CALL_LOOKUP_INDEXES_SQL: &str = "
     CREATE UNIQUE INDEX IF NOT EXISTS idx_call_strings_text ON call_strings(text);
     CREATE INDEX IF NOT EXISTS idx_callable_anchor_name ON callable_anchor_facts(name_id);
+    CREATE INDEX IF NOT EXISTS idx_callable_anchor_name_canonical ON callable_anchor_facts(name_id, canonical_signature_id);
     CREATE INDEX IF NOT EXISTS idx_callable_anchor_qualified_name ON callable_anchor_facts(qualified_name_id);
     CREATE INDEX IF NOT EXISTS idx_callable_anchor_entity_key ON callable_anchor_facts(entity_digest);
+    CREATE INDEX IF NOT EXISTS idx_callable_anchor_canonical_signature ON callable_anchor_facts(canonical_signature_id);
+    CREATE INDEX IF NOT EXISTS idx_callable_anchor_file_id ON callable_anchor_facts(file_id);
     CREATE INDEX IF NOT EXISTS idx_callable_anchor_revision ON callable_anchor_facts(revision_id);
     CREATE INDEX IF NOT EXISTS idx_call_site_caller ON call_site_facts(caller_anchor_id);
     CREATE INDEX IF NOT EXISTS idx_call_site_callee_arity ON call_site_facts(callee_name_id, argument_count);
@@ -311,8 +345,11 @@ pub(crate) const CREATE_CALL_STRING_INDEX_SQL: &str = "
 pub(crate) const DROP_CALL_LOOKUP_INDEXES_SQL: &str = "
     DROP INDEX IF EXISTS idx_call_strings_text;
     DROP INDEX IF EXISTS idx_callable_anchor_name;
+    DROP INDEX IF EXISTS idx_callable_anchor_name_canonical;
     DROP INDEX IF EXISTS idx_callable_anchor_qualified_name;
     DROP INDEX IF EXISTS idx_callable_anchor_entity_key;
+    DROP INDEX IF EXISTS idx_callable_anchor_canonical_signature;
+    DROP INDEX IF EXISTS idx_callable_anchor_file_id;
     DROP INDEX IF EXISTS idx_callable_anchor_revision;
     DROP INDEX IF EXISTS idx_call_site_caller;
     DROP INDEX IF EXISTS idx_call_site_callee_arity;

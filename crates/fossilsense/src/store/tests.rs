@@ -47,10 +47,12 @@ fn test_anchors_by_name(
     store: &IndexStore,
     name: &str,
 ) -> Vec<crate::store::views::CallableAnchorRow> {
-    store
+    let (rows, limited) = store
         .call_fact_view()
-        .anchors_by_names(&[name.to_string()])
-        .expect("anchors by name")
+        .anchors_by_names_limited(&[name.to_string()], TEST_CALL_READ_LIMIT)
+        .expect("anchors by name");
+    assert!(!limited, "test fixture exceeded bounded anchor read");
+    rows
 }
 
 fn test_call_sites_by_callee(

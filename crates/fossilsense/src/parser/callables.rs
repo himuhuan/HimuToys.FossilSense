@@ -2,7 +2,7 @@ use std::path::Path;
 
 use crate::call_model::{
     AnchorRole, CallForm, CallSiteFact, CallableAnchor, CallableKind, FactProvenance,
-    LinkageDomain, OwnerKindHint, SignatureShape, SourcePosition, SourceRange,
+    LinkageDomain, OwnerKindHint, SignatureFidelity, SignatureShape, SourcePosition, SourceRange,
 };
 
 pub(super) struct CollectedCallFacts {
@@ -185,8 +185,26 @@ impl<'a> CallFactCollector<'a> {
             .as_ref()
             .map_or_else(|| name.clone(), |owner| format!("{owner}::{name}"));
         let signature = signature_shape(function_declarator, self.source, self.is_cpp);
-        let declaration_text = text(declaration, self.source).unwrap_or(&name);
-        let normalized_declaration = compact_whitespace(declaration_text);
+        let body = declaration.child_by_field_name("body");
+        let declaration_end = body
+            .map(|body| {
+                trim_ascii_whitespace_end(self.source, declaration.start_byte(), body.start_byte())
+            })
+            .unwrap_or_else(|| declaration.end_byte());
+        let declaration_range = self.source_range_bytes(declaration.start_byte(), declaration_end);
+        let presentation_signature = self
+            .source
+            .get(declaration_range.start_byte..declaration_range.end_byte)
+            .unwrap_or(&name)
+            .trim()
+            .to_string();
+        let canonical_signature = canonical_full_signature(&presentation_signature);
+        let syntax_error_overlap = self.error_depth > 0 || contains_error_or_missing(declaration);
+        let signature_fidelity = if syntax_error_overlap {
+            SignatureFidelity::Malformed
+        } else {
+            SignatureFidelity::AstExact
+        };
         let internal = has_storage_class(declaration, self.source, "static")
             || namespaces.iter().any(|name| name == "<anonymous>");
         let linkage = if internal {
@@ -197,18 +215,21 @@ impl<'a> CallFactCollector<'a> {
         let family_input = format!(
             "{}|{}|{}|{:?}",
             qualified_name,
-            signature.normalized,
+            canonical_signature,
             self.path_if_internal(internal),
             owner_kind
         );
         let entity_key = digest(&family_input);
         let anchor_fingerprint = digest(&format!(
-            "{}|{:?}|{}",
-            entity_key, role, normalized_declaration
+            "{}|{:?}|{}|{}|{}|{}",
+            entity_key,
+            role,
+            self.path,
+            declaration_range.start_byte,
+            declaration_range.end_byte,
+            presentation_signature
         ));
-        let body_range = declaration
-            .child_by_field_name("body")
-            .map(|body| self.source_range(body));
+        let body_range = body.map(|body| self.source_range(body));
 
         Some(CallableAnchor {
             path: self.path.clone(),
@@ -220,12 +241,15 @@ impl<'a> CallFactCollector<'a> {
             role,
             linkage,
             signature,
+            canonical_signature,
+            presentation_signature,
+            signature_fidelity,
             name_range: self.source_range(name_node),
-            declaration_range: self.source_range(declaration),
+            declaration_range,
             body_range,
             guard: None,
             provenance: FactProvenance::Ast,
-            syntax_error_overlap: self.error_depth > 0,
+            syntax_error_overlap,
             entity_key,
             anchor_fingerprint,
         })
@@ -268,7 +292,12 @@ impl<'a> CallFactCollector<'a> {
             argument_count,
             guard: None,
             provenance: FactProvenance::Ast,
-            syntax_error_overlap: self.error_depth > 0,
+            // `enter(call_expression)` runs before the walker reaches the
+            // argument subtree, so `error_depth` alone only sees malformed
+            // ancestors.  A trailing comma or a missing closing parenthesis
+            // is represented by an ERROR/missing descendant of this call and
+            // must make its arity evidence unreliable as well.
+            syntax_error_overlap: self.error_depth > 0 || contains_error_or_missing(call),
             site_fingerprint,
         });
     }
@@ -306,6 +335,9 @@ impl<'a> CallFactCollector<'a> {
                 max_arity: Some(0),
                 variadic: false,
             },
+            canonical_signature: String::new(),
+            presentation_signature: String::new(),
+            signature_fidelity: SignatureFidelity::AstExact,
             name_range: range,
             declaration_range: range,
             body_range: None,
@@ -360,6 +392,29 @@ impl<'a> CallFactCollector<'a> {
             end_byte: node.end_byte(),
         }
     }
+
+    fn source_range_bytes(&self, start_byte: usize, end_byte: usize) -> SourceRange {
+        let start_row = self
+            .line_starts
+            .partition_point(|line_start| *line_start <= start_byte)
+            .saturating_sub(1);
+        let end_row = self
+            .line_starts
+            .partition_point(|line_start| *line_start <= end_byte)
+            .saturating_sub(1);
+        SourceRange {
+            start: SourcePosition {
+                line: start_row as u32,
+                character: utf16_col(self.source, self.line_starts, start_row, start_byte),
+            },
+            end: SourcePosition {
+                line: end_row as u32,
+                character: utf16_col(self.source, self.line_starts, end_row, end_byte),
+            },
+            start_byte,
+            end_byte,
+        }
+    }
 }
 
 struct NormalizedCallTarget<'tree> {
@@ -381,7 +436,7 @@ fn normalize_call_target<'tree>(
             form: CallForm::DirectName,
         },
         "qualified_identifier" => {
-            let qualified = text(node, source).map(str::to_string);
+            let qualified = text(node, source).map(canonical_qualified_name);
             let name_node = node
                 .child_by_field_name("name")
                 .or_else(|| last_identifier(node));
@@ -428,6 +483,13 @@ fn normalize_call_target<'tree>(
     }
 }
 
+fn canonical_qualified_name(raw: &str) -> String {
+    raw.split("::")
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join("::")
+}
+
 fn unsupported_target(form: CallForm) -> NormalizedCallTarget<'static> {
     NormalizedCallTarget {
         name_node: None,
@@ -445,7 +507,7 @@ fn callable_name<'tree>(
         return Some((declarator, None, text(declarator, source)?.to_string()));
     }
     if declarator.kind() == "qualified_identifier" {
-        let full = text(declarator, source)?;
+        let full = canonical_qualified_name(text(declarator, source)?);
         let name_node = declarator
             .child_by_field_name("name")
             .or_else(|| last_identifier(declarator))?;
@@ -489,7 +551,10 @@ fn signature_shape(
     }
     let mut min = 0u32;
     let mut max = 0u32;
-    let mut variadic = false;
+    // Tree-sitter represents the C/C++ ellipsis as an unnamed token, so it is
+    // absent from `named_children(parameters)`. Inspect the full subtree while
+    // continuing to count only named parameter declarations below.
+    let mut variadic = contains_syntax_kind(parameters, "...");
     for child in children {
         if child.kind().contains("variadic") {
             variadic = true;
@@ -497,8 +562,13 @@ fn signature_shape(
         }
         if child.kind().contains("parameter") {
             max += 1;
-            let raw = text(child, source).unwrap_or_default();
-            if !raw.contains('=') {
+            // Only C++'s explicit optional-parameter AST node/field proves a
+            // default argument. Looking for `=` in source text confuses
+            // operators inside a required parameter's type (for example an
+            // array extent containing `sizeof(1 == 1)`) with a default.
+            let has_default = child.kind() == "optional_parameter_declaration"
+                || child.child_by_field_name("default_value").is_some();
+            if !has_default {
                 min += 1;
             }
         }
@@ -546,6 +616,21 @@ fn find_descendant<'tree>(
     None
 }
 
+fn contains_syntax_kind(root: tree_sitter::Node<'_>, kind: &str) -> bool {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == kind {
+            return true;
+        }
+        for index in 0..node.child_count() {
+            if let Some(child) = node.child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    false
+}
+
 fn last_identifier(root: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
     let mut found = None;
     let mut stack = vec![root];
@@ -575,6 +660,105 @@ fn compact_whitespace(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn trim_ascii_whitespace_end(source: &str, start: usize, end: usize) -> usize {
+    let mut trimmed = end.min(source.len());
+    while trimmed > start && source.as_bytes()[trimmed - 1].is_ascii_whitespace() {
+        trimmed -= 1;
+    }
+    trimmed
+}
+
+fn canonical_full_signature(presentation: &str) -> String {
+    let value = presentation.trim().trim_end_matches(';').trim_end();
+    let mut output = String::with_capacity(value.len());
+    let mut pending_space = false;
+    for ch in value.chars() {
+        if ch.is_whitespace() {
+            pending_space = !output.is_empty();
+            continue;
+        }
+        if matches!(ch, '(' | ')' | '[' | ']' | ',' | '*' | '&') {
+            let preserves_token_boundary = pending_space
+                && output
+                    .chars()
+                    .last()
+                    .is_some_and(|previous| would_merge_operator_token(previous, ch));
+            if preserves_token_boundary {
+                output.push(' ');
+            } else {
+                while output.ends_with(' ') {
+                    output.pop();
+                }
+            }
+            output.push(ch);
+            pending_space = false;
+            continue;
+        }
+        if pending_space
+            && !output.is_empty()
+            && output.chars().last().is_some_and(|last| {
+                would_merge_operator_token(last, ch) || !matches!(last, '(' | '[' | ',' | '*' | '&')
+            })
+        {
+            output.push(' ');
+        }
+        output.push(ch);
+        pending_space = false;
+    }
+    output
+}
+
+/// Whitespace may be normalized only while preserving the C/C++ token stream.
+/// In particular, joining `& &` into `&&` changes the meaning of default
+/// expressions and could create a false strict declaration/definition pair.
+fn would_merge_operator_token(left: char, right: char) -> bool {
+    matches!(
+        (left, right),
+        ('+', '+')
+            | ('-', '-')
+            | ('-', '>')
+            | ('<', '<')
+            | ('>', '>')
+            | ('<', '=')
+            | ('>', '=')
+            | ('=', '=')
+            | ('!', '=')
+            | ('&', '&')
+            | ('|', '|')
+            | ('*', '=')
+            | ('/', '=')
+            | ('%', '=')
+            | ('+', '=')
+            | ('-', '=')
+            | ('&', '=')
+            | ('^', '=')
+            | ('|', '=')
+            | (':', ':')
+            | ('.', '*')
+            | ('>', '*')
+            | ('#', '#')
+            | ('/', '*')
+            | ('/', '/')
+            | ('<', ':')
+            | (':', '>')
+            | ('<', '%')
+            | ('%', '>')
+            | ('%', ':')
+    )
+}
+
+fn contains_error_or_missing(root: tree_sitter::Node<'_>) -> bool {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.is_error() || node.is_missing() {
+            return true;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.children(&mut cursor));
+    }
+    false
+}
+
 fn digest(value: &str) -> String {
     blake3::hash(value.as_bytes()).to_hex()[..24].to_string()
 }
@@ -586,4 +770,21 @@ fn utf16_col(source: &str, line_starts: &[usize], row: usize, byte: usize) -> u3
         .unwrap_or_default()
         .encode_utf16()
         .count() as u32
+}
+
+#[cfg(test)]
+mod canonical_signature_tests {
+    use super::canonical_full_signature;
+
+    #[test]
+    fn whitespace_normalization_never_joins_distinct_operator_tokens() {
+        assert_ne!(
+            canonical_full_signature("bool inspect(bool a = left & &right);"),
+            canonical_full_signature("bool inspect(bool a = left&&right);")
+        );
+        assert_eq!(
+            canonical_full_signature("extern int lookup ( int key , const char * value );"),
+            canonical_full_signature("extern int lookup(int key,const char*value)")
+        );
+    }
 }

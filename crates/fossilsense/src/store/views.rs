@@ -12,7 +12,7 @@ mod member;
 #[allow(unused_imports)]
 pub use call_facts::{CallCoverageRow, CallFactStoreView, CallSiteRow, CallableAnchorRow};
 #[allow(unused_imports)]
-pub use member::{MemberReadRow, MemberStoreView, RecordReadRow};
+pub use member::{MemberReadRow, MemberStoreView, RecordReadRow, TypeAliasReadRow};
 
 use super::{map_symbol_record, IndexStore, SymbolRecord, SELECT_SYMBOL_JOIN};
 
@@ -418,6 +418,26 @@ impl<'a> SymbolReadView<'a> {
             .prepare(&format!("{SELECT_SYMBOL_JOIN} WHERE s.name = ?1"))?;
         let rows = stmt.query_map([name], map_symbol_record)?;
         collect_rows(rows)
+    }
+
+    /// Bounded exact-name fallback read for semantic consumers whose richer
+    /// parser fact is unavailable. The extra row distinguishes an exact cap
+    /// hit from a complete result without scanning the rest of the name set.
+    pub fn symbols_by_name_limited(
+        &self,
+        name: &str,
+        limit: usize,
+    ) -> Result<(Vec<SymbolRecord>, bool)> {
+        let fetch = limit.saturating_add(1).min(i64::MAX as usize) as i64;
+        let mut stmt = self.store.conn.prepare(&format!(
+            "{SELECT_SYMBOL_JOIN} WHERE s.name = ?1 \
+             ORDER BY f.path, s.start_line, s.start_col, s.id LIMIT ?2"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params![name, fetch], map_symbol_record)?;
+        let mut records = collect_rows(rows)?;
+        let truncated = records.len() > limit;
+        records.truncate(limit);
+        Ok((records, truncated))
     }
 }
 

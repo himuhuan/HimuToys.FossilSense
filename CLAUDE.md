@@ -53,6 +53,7 @@ fossilsense 单一 Rust 原生二进制 (crates/fossilsense)
 | `call_model` | 调用关系领域值对象、稳定 locator、关系质量与覆盖合同；协议中立，不依赖 parser/store/server |
 | `call_catalog` | 请求期 `RelationQueryIndex`：候选解析、evidence、grouping 与分页物化；只处理一次窄查询命中的 bounded facts，不提供 workspace 全量 loader 或 unlimited incoming/outgoing API |
 | `call_service` | generation-pinned Call facts 窄查询、base/dirty-document delta 合并与一跳关系请求编排；SQLite 读取在 blocking worker 执行 |
+| `candidate_service` | schema 16 请求期语义候选门面；在 generation-pinned base 上叠加全部未同步 open-document overlay，统一 callable / record / alias 召回、arity、counterpart 与 coverage，不复制全库 catalog |
 | `parser` | tree-sitter C/C++ 容错解析；唯一入口 `parse()`；提供 persistent/request facts 投影与 fact availability |
 | `semantic_model` | parser/store 中立的共享语义事实；不得依赖 parser/store/server/indexer |
 | `store` | SQLite schema、迁移、事务、清理、写入，以及 durable read views / typed rows |
@@ -157,9 +158,9 @@ Runtime snapshot 规则：
 | 外部头 | 通过 `fossilsense.includePaths` 索引和补全 |
 | 冲突扩展 | 检测 clangd / cpptools / ccls 并提示二选一 |
 | 调用关系 | 标准 LSP Call Hierarchy 与 `fossilsense.lsp.callRelations` 富结果共享同一一跳关系服务；当前正式绑定范围为 C/C++ 自由函数 |
-| Rich Hover | 索引符号的签名 + tier/confidence/reason；best-effort 挂载 leading / inline-leading / trailing 注释；Doxygen/XML 参数与返回值结构化渲染，未知 tag 走 `### Tag` fallback；源码不可读、超限或 malformed 时降级为 signature-only |
-| Signature Help | 简单调用的 exact-name 函数候选；显示对应函数注释，并将 Doxygen/XML `param` 描述挂载到匹配的参数 popup；不做重载或参数类型绑定 |
-| `.h/.c` 配对 | 仅在双方都有同一 `ProjectKey` 且名称、种类、规范化签名兼容时启用：Hover、补全与 Signature Help 优先使用头文件声明文档；普通调用点跳转和调用关系保持源文件定义优先；在声明/定义锚点上跳转则优先去对侧，避免原地跳转 |
+| Rich Hover | schema 16 共享候选的签名、path、tier/confidence/reason；record 使用精确 source range 展示有界完整声明，唯一 alias 链附 `aka`；best-effort 挂载 leading / inline-leading / trailing 注释；源码 stale、不可读、超限、alias 歧义/环/unsupported 时降级为原始 signature |
+| Signature Help | direct-name、显式 qualified-name、parenthesized-name 自由函数调用的 exact-name 候选；可靠 arity 令 Compatible 先于 Unknown，首个 Compatible 为 active；显示函数注释和 Doxygen/XML `param`；不做参数类型重载、成员/函数指针/callable object/宏展开绑定 |
+| `.h/.c` counterpart | 仅规范化签名完全一致、external linkage、source 到 header include reach 闭合且两个方向 degree = 1 时配对；Hover、补全与 Signature Help 使用 header 文档，调用点与 Call Hierarchy source-body-first，锚点 Definition 优先对侧；未配对锚点仍返回自身，`ProjectKey` 不是 hard gate |
 
 ## 6. 补全规则
 
@@ -184,10 +185,10 @@ Smart Completion 当前约定：
 | 排序 | 普通标识符补全使用 deterministic evidence-aware ranker；`ScopeTier` 是 soft prior，并通过 guard band 防止低置信 global/text 噪音反超 |
 | 前缀优先 | `fossilsense.completion.prefixRanking = strict`（默认）时，大小写不敏感的 exact name / literal prefix 作为普通标识符补全最外层排序档，依次高于 fuzzy；`_` 按字面匹配，不折叠连续分隔符。同档内仍使用 evidence-aware ranker。`scopeFirst` 完整保留旧的 scope/evidence 优先顺序 |
 | strict policy | `resolver::pack_score` 仍可用于跳转、着色、workspace symbol、`NameTable` recall 和兼容测试；不再作为普通补全最终 displayed ranking |
-| evidence merge | 同名候选合并 indexed、local binding、current-file overlay、language builtin、local word evidence，优先保留更结构化的 LSP kind/detail |
+| evidence merge | 同名候选合并 indexed、local binding、同工作区 all-open structured overlay、language builtin、current-document local word evidence，优先保留更结构化的 LSP kind/detail；其它 open document 不贡献局部绑定/词表作用域 |
 | project context | 普通标识符补全可使用构建标记推断的同项目召回与有界排序 evidence；不得新增 `ScopeTier`、过滤跨项目候选或影响其它语言功能 |
 | strict opt-out | `Unspecified`、`projectContext.mode=off`、无祖先标记或 project model unavailable 时，召回预算、顺序、kind/detail/documentation 与无此能力的基线一致 |
-| current overlay | 当前 open document 的宏、typedef/using alias、枚举常量、函数声明/定义、record/type 定义和附近 identifier 使用可作为普通补全 evidence；raw text fallback 仍标为 `text` |
+| open overlay | 同工作区全部未同步 open documents 的宏、typedef alias、枚举常量、函数声明/定义和 record/type 定义可作为普通补全 structured evidence，并以 dirty path replacement/tombstone 遮蔽 base；参数、局部变量和附近 identifier 使用只来自当前请求文档，raw text fallback 仍标为 `text` |
 | language builtin | 静态 C/C++ 关键词、内置类型和常量可作为低置信 fallback 补全 evidence；显示为 `keyword` / `builtin type` / `builtin constant`，不写入索引，不参与跳转、workspace symbol 或着色 |
 | intent | 普通补全使用轻量规则式 intent ranking，覆盖 type、expression、call、macro preprocessor、declaration-name；intent 只是排序证据，不做类型推断或绑定，不硬过滤 |
 | recall | 普通补全 indexed recall 使用 bounded multi-channel quotas，在 current/local、reachable、external、unknown/open-scope、global、可选 same-project、text evidence 间保留有限代表性后再统一 rerank |
@@ -205,6 +206,7 @@ Smart Completion 当前约定：
 | v1.3.4 | 注释美化渲染版本；Hover / 补全文档 / Signature Help 共用注释归属与 Doxygen/XML Markdown 渲染，补全经 `completionItem/resolve` 延迟挂载，并支持严格同项目 `.h/.c` 文档配对 |
 | v1.4.0 | 大工作区性能与懒调用关系版本；schema 15 紧凑 call facts、请求期有界关系派生、per-file overlay、side-by-side generation、租约清理，以及分段紧凑 NameIndex |
 | v1.4.1 | 普通标识符补全前缀优先排序；默认 `fossilsense.completion.prefixRanking = strict`，字面 exact/prefix 先于 fuzzy，`scopeFirst` 可回退旧行为 |
+| v1.4.2 | 语义体验加强版本；schema 16 统一 callable/record/typedef 候选、all-open-document overlay、arity、closed 且双向唯一的 `.h/.c` counterpart、完整 record Hover 与有界 typedef `aka`；C++ `using` alias trace 尚不支持；Call Relations wire protocol 保持 v2 |
 | 后置能力 | auto include insertion、ML ranker、telemetry、cloud sync、完整 C++ 语义仍不属于当前版本 |
 
 项目上下文约定：
@@ -219,7 +221,7 @@ Smart Completion 当前约定：
 | snapshot | `ProjectContextIndex` 与带 `ProjectKey` 的 segmented `NameTable` 同代原子发布；marker 变化只重建派生读模型，不重解析未变源码 |
 | memo | engine epoch、selection epoch 和 effective project 都参与 completion memo generation；marker/选择变化不得复用旧池 |
 | fallback | project discovery 失败标记 `projectContext` degraded，ordinary completion 继续走基线；热路径只查内存，不遍历文件系统 |
-| 边界 | 项目上下文的召回/排序 boost 仍仅由 ordinary identifier completion 消费；definition、Hover、completion documentation 与 Signature Help 只读取 `ProjectKey` 作为严格 `.h/.c` 配对门槛，不改变跨项目召回或基础候选排名；references、coloring、workspace symbol、member/include completion 不消费 |
+| 边界 | 项目上下文的召回/排序 boost 仍仅由 ordinary identifier completion 消费；definition、Hover、completion documentation、Signature Help 与 Call Hierarchy 不把 `ProjectKey` 当绑定或 `.h/.c` 配对门槛；references、coloring、workspace symbol、member/include completion 不消费 |
 
 短前缀：
 
@@ -344,6 +346,7 @@ Parser facts 合同：
 |---|---|
 | `ParseFacts::INDEX` | 索引期事实；包含 call relations，跳过 occurrences、local declarations、local bindings |
 | `ParseFacts::CALL_RELATIONS` | callable anchors 与 call sites；与既有 symbol 投影并行，不能替换文档符号语义 |
+| `ParseFacts::HOVER_SEMANTICS` | 请求期 callable anchors、records 与 aliases；用于 dirty-document Hover/Definition/Signature/补全文档 overlay，不请求无关 occurrences |
 | `ParseFacts::COLOR_REF` | 着色和引用角色所需 occurrences + lexical facts |
 | `ParseFacts::MEMBER` | 成员补全 receiver 推断所需 local declarations / bindings + record/member/alias facts |
 | `PersistentFacts` | `FileSemanticIndex::persistent_facts()` 返回 symbols、includes、records、fields、members、aliases、callable anchors、call sites 的借用投影 |
@@ -363,7 +366,7 @@ Parser facts 合同：
 - C/C++ 自由函数是关系解析的正式候选；record method、member call、函数指针和 callable object 仍持久化为显式事实，但不得伪装为已绑定关系。
 - 外部头只贡献声明锚点，不索引函数体调用点。
 - 全局初始化表达式使用 synthetic global initializer 作为 caller；lambda 内调用暂不错误归属给外层函数。
-- schema 15 为 callable anchors / call sites 建立独立 active views 和查询索引；重复文本使用整数 ID，96-bit digest 使用 BLOB，枚举/布尔量使用整数 flags，call site 只持久化 expression byte offsets 与 callee UTF-16 range，并与统一语义代际一起发布。
+- schema 16 为 callable anchors / call sites / record definitions / type aliases 建立独立 active views 和窄查询索引；callable 持久化 canonical/presentation signature、参数个数与 fidelity，record/alias 持久化精确 declarator/source range、fidelity 与 fingerprint；重复文本使用整数 ID，96-bit digest 使用 BLOB，枚举/布尔量使用整数 flags，并与统一语义代际一起发布。schema 15 mismatch 只走旁路全量重建，不保留生产双读。
 - 显式 full build 与首次未发布的默认库在 facts 写完前不维护 call 二级索引；commit 后集中创建索引并 `ANALYZE`。已有默认库的 dirty/force 路径在旁路数据库发布落地前继续保留在线索引，不能对活跃读者直接 drop。
 - 新建 full-build 库的 `call_strings` 在构建期由跨 batch interner 分配唯一 integer ID，不逐行维护 UNIQUE B-tree；facts 完成后释放 interner，再创建 `idx_call_strings_text` 唯一索引。普通/既有库继续依赖在线唯一索引，dirty upsert 不得绕过约束。
 - 默认 full/force/schema-mismatch rebuild 写入 cache family 内独立的 `index-build-*.sqlite`；facts、二级索引、`quick_check`、foreign-key check 与 WAL checkpoint 全部完成并关闭连接后，才封装为单调 generation 文件，并通过 `active-index` 原子 manifest 切换。Windows 使用 replace-existing + write-through 的原子文件替换。
@@ -372,14 +375,14 @@ Parser facts 合同：
 调用关系查询合同：
 
 - `EngineSnapshot` 只发布 generation-pinned `CallReadHandle` 与 capability state；full/dirty publication 都不得读取、复制或解析全库 call sites/relations。
-- `CallRelationService` 通过 `CallFactStoreView` 的 path/position、caller 和 callee 窄查询读取 schema 15 facts，并在 `SemanticReadGuard` 内校验 generation；请求结束前不得混入新代。
+- `CallRelationService` 通过 `CallFactStoreView` 的 path/position、caller 和 callee 窄查询读取 schema 16 facts，并在 `SemanticReadGuard` 内校验 generation；请求结束前不得混入新代；其 anchor grouping 必须复用共享 callable counterpart resolver。
 - relation 只在请求期从命中 facts 派生；候选解析、grouping、relation page 和 call-site cap 完成后才物化协议 DTO。精确全库 fact count 不属于请求 coverage 热路径。
 - open document overlay 只纳入内容与磁盘不同，或已保存但尚未发布同路径 content hash 的文档；使用 `ParseFacts::CALL_RELATIONS` 生成 per-file delta。基础 SQL 行按 shadowed path 跳过，再合并相关 overlay facts，不存在 overlay catalog 或基础图复制。
 - overlay generation 覆盖同一 workspace 的全部有效未同步文档，因此查询 callee incoming 时必须看到其它未保存 buffer 的调用点；clean open document 不生成 delta。
 - 富协议固定为 v2：entity dictionary + ID relation、generation/overlay/resolver 绑定的 opaque cursor、非精确 total、显式 page/site/scan/candidate/time/cancelled budget state，以及携带 generation/incomplete reason 的 coverage。扩展与 server 同版本发布，不保留 v1 adapter。
 - 标准 Call Hierarchy 使用确定性的 relation、per-relation site 和 raw scan 上限；达到上限时不伪装为完整结果。富面板通过 `budgetState`、`coverage.incompleteReason` 和可用的 `nextCursor` 展示 partial/continue。
 - 标准 hierarchy item 携带 `CallableLocator`；entity key 失效后按 path、signature digest 与最近旧锚点保守重定位，不得只依赖瞬时数据库行号。
-- 名字、显式限定名、arity、internal linkage、same-file 与 include reachability 都只是证据；reachability 不得作为 hard filter。
+- 名字、显式限定名、arity、internal linkage、same-file 与 include reachability 都是候选证据；reachability 不得作为普通候选 hard filter，但严格 counterpart 必须要求 external linkage、closed source-to-header reach、exact canonical signature 和双向 degree = 1。open/incomplete facts 或 dirty tombstone 禁止声称唯一配对。
 - 标准 LSP 只返回可表示的已解析候选；富协议同时返回 confidence、evidence、ambiguity、unresolved、revision、coverage 与 budget state。
 
 旧入口已移除：`FileIndex`、`ColoringTargets`、`collect_coloring_targets`、`occurrences_with_roles`。
@@ -509,8 +512,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify_release_harde
 
 1. 运行 `pnpm run package`。
 2. 确认 VSIX 落在仓库根 `dist/`。
-3. 交付说明写清版本、能力范围、能做什么、还不能做什么。
+3. 交付说明写清版本、能力范围、能做什么、还不能做什么，并精确记录最终 VSIX 文件名、VSIX SHA-256、包内 release-input SHA-256 与打包时 source commit。
 4. 确认 VSIX 自包含原生二进制。
+5. 最终源码必须与 VSIX 内 `extension/bin/release-build.json` 的确定性 release-input fingerprint 一致；允许在未提交工作树打包，但打包后的 release input 变化必须使 hardening 失败并要求重新打包。
 
 安装：
 
@@ -525,7 +529,8 @@ code --install-extension dist/<name>.vsix
 1. `cargo build --release -p fossilsense`
 2. 复制 `target/release/fossilsense(.exe)` 到 `extensions/vscode/bin/`
 3. esbuild 输出 `out/extension.js`
-4. `vsce package --no-dependencies`
+4. 对 Rust/扩展/打包关键输入以及 staged binary、bundle、manifest 生成确定性 SHA-256，并写入不含路径或源码内容的 `bin/release-build.json`
+5. `vsce package --no-dependencies`
 
 VSIX 文件名：
 
@@ -543,6 +548,7 @@ dist/fossilsense-vscode-<version>_BUILD<YYYYMMDD_HHMMSS>.vsix
 |---|---|---|
 | 权威 | 本文件、README、扩展 README、代码/测试 | 当前事实只认这里；冲突时改文档对齐实现 |
 | 活笔记 | `docs/architecture/` | 只保留仍指导当前理解的短文；不堆施工过程 |
+| 版本计划 | `docs/plan/` | 仅保存已立项、未完成的跨模块版本计划；记录目标语义、破坏性迁移、阶段与门禁，但不得冒充当前能力；完成后移入 `docs/archive/plan/` |
 | 施工单 | `openspec/changes/<name>/` | 仅未完成变更；完成后必须迁入 `openspec/changes/archive/` |
 | 归档 | `docs/archive/`、`openspec/changes/archive/` | 标 `archived` / `superseded`；可查痕迹，不当 backlog，不得自动复活愿景 |
 

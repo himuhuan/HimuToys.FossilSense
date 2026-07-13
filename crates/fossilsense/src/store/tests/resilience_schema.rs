@@ -285,14 +285,14 @@ fn current_schema_migrate_by_drop_clears_old_data() {
 }
 
 #[test]
-fn opening_schema_14_drops_text_call_facts_for_schema_15_rebuild() {
+fn opening_schema_15_drops_old_semantic_facts_for_schema_16_rebuild() {
     let dir = tempdir().expect("tempdir");
     let db = dir.path().join("index.sqlite");
     {
         let conn = rusqlite::Connection::open(&db).expect("conn");
         conn.execute_batch(
             "CREATE TABLE meta (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);
-             INSERT INTO meta (key, value) VALUES ('schema_version', '14');
+             INSERT INTO meta (key, value) VALUES ('schema_version', '15');
              CREATE TABLE callable_anchor_facts (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
                  entity_key TEXT NOT NULL,
@@ -309,10 +309,10 @@ fn opening_schema_14_drops_text_call_facts_for_schema_15_rebuild() {
              CREATE VIEW callable_anchors AS SELECT * FROM callable_anchor_facts;
              CREATE VIEW call_sites AS SELECT * FROM call_site_facts;",
         )
-        .expect("seed schema 14 call facts");
+        .expect("seed schema 15 call facts");
     }
 
-    let store = IndexStore::open(&db, dir.path()).expect("open schema 15");
+    let store = IndexStore::open(&db, dir.path()).expect("open schema 16");
     let version: String = store
         .conn
         .query_row(
@@ -321,7 +321,7 @@ fn opening_schema_14_drops_text_call_facts_for_schema_15_rebuild() {
             |row| row.get(0),
         )
         .expect("schema version");
-    assert_eq!(version, "15");
+    assert_eq!(version, "16");
 
     let anchor_count: i64 = store
         .conn
@@ -344,5 +344,46 @@ fn opening_schema_14_drops_text_call_facts_for_schema_15_rebuild() {
         .collect::<rusqlite::Result<_>>()
         .unwrap();
     assert!(anchor_columns.contains(&"entity_digest".to_string()));
+    assert!(anchor_columns.contains(&"canonical_signature_id".to_string()));
+    assert!(anchor_columns.contains(&"presentation_signature_id".to_string()));
+    assert!(anchor_columns.contains(&"signature_fidelity".to_string()));
     assert!(!anchor_columns.contains(&"entity_key".to_string()));
+}
+
+#[test]
+fn parser_fact_version_mismatch_invalidates_and_rebuilds_current_schema() {
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+    {
+        let mut store = IndexStore::open(&db, dir.path()).expect("store");
+        upsert_source(&mut store, "stale.c", "int stale(void) { return 1; }\n");
+        assert!(IndexStore::has_current_schema(&db).expect("current schema"));
+        store
+            .conn
+            .execute(
+                "UPDATE file_revisions SET parser_version = ?1",
+                [crate::parser::PARSER_FACT_VERSION - 1],
+            )
+            .expect("mark parser facts stale");
+    }
+
+    assert!(
+        !IndexStore::has_current_schema(&db).expect("stale parser version"),
+        "an active revision from an older parser fact contract must force rebuild"
+    );
+
+    let store = IndexStore::open(&db, dir.path()).expect("rebuild stale parser facts");
+    let active_revisions: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM active_file_revisions", [], |row| {
+            row.get(0)
+        })
+        .expect("active revisions");
+    let symbols: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM symbol_facts", [], |row| row.get(0))
+        .expect("symbol facts");
+    assert_eq!((active_revisions, symbols), (0, 0));
+    drop(store);
+    assert!(IndexStore::has_current_schema(&db).expect("rebuilt schema"));
 }

@@ -12,6 +12,7 @@ use crate::reachability::ReachScope;
 use crate::resolver::{self, ResolveContext};
 use crate::store::views::{NameTableStoreView, NameTableSymbolRow};
 
+pub mod callables;
 mod comments;
 #[allow(dead_code)]
 mod current_file_overlay;
@@ -21,8 +22,21 @@ mod hover;
 mod local_completion;
 mod name_index_builder;
 mod signatures;
+mod source_excerpt;
 mod text;
+pub mod type_resolution;
 
+pub(crate) use callables::is_source_path;
+#[cfg(test)]
+pub use callables::CounterpartEvidence;
+pub use callables::{
+    anchor_opposite_definition, call_definition_presentations, hover_presentations,
+    resolve_callable_candidates, resolve_counterparts, signature_active_index,
+    signature_presentations, ArgumentState, CallSiteContext, CallableCandidateMetrics,
+    CallableCandidateSet, CallableQueryInput, CandidateCoverage, CandidateIncompleteReason,
+    CandidateOrigin, ContextReliability, ResolvedCallableAnchor,
+    CALLABLE_CANDIDATE_RESOLVER_VERSION,
+};
 pub use comments::RenderedSymbolComment;
 
 #[allow(unused_imports)]
@@ -37,14 +51,19 @@ pub use hover::{
 };
 pub use local_completion::{local_completion_candidates, LocalCompletionCandidate};
 pub use signatures::{
-    call_context_at, rank_function_signature_candidates, signature_parts, signature_parts_for_name,
-    CallContext, ParameterSpan, RankedSignatureCandidate, SignatureParts, SIGNATURE_HELP_LIMIT,
+    call_context_at, signature_parts, signature_parts_for_name, CallContext, ParameterSpan,
+    RankedSignatureCandidate, SignatureParts, SIGNATURE_HELP_LIMIT,
+};
+pub use source_excerpt::{
+    SourceByteRange as SourceExcerptRange, SourceExcerpt as SourceExcerptOutcome,
+    SourceExcerptReader, SourceRevision as SourceExcerptRevision,
 };
 use text::is_boundary;
 pub use text::{
     byte_offset_at, completion_prefix_at, completion_word_score, is_member_completion_context,
     member_access_chain_at, word_at,
 };
+pub use type_resolution::*;
 
 /// Default cap on workspace-symbol results handed back to the editor.
 pub const WORKSPACE_SYMBOL_LIMIT: usize = 200;
@@ -236,6 +255,10 @@ pub struct NameTable {
     delta_offsets: Arc<Vec<usize>>,
     active_len: usize,
     slot_len: usize,
+    /// Sparse request-local replacement for durable first-layer external
+    /// flags. Dirty include edits can change this workspace-wide property
+    /// without rebuilding the immutable segmented name index.
+    direct_include_overrides: Arc<HashMap<String, bool>>,
     /// Cached unscoped coloring fallback: all workspace files in a closed
     /// reachability set. Reused by `colorable_kind_counts(None)` instead of
     /// rebuilding the same path set on every semantic-token request.
@@ -365,6 +388,7 @@ impl NameTable {
             delta_offsets: Arc::new(Vec::new()),
             active_len,
             slot_len: active_len,
+            direct_include_overrides: Arc::new(HashMap::new()),
             all_workspace_reach,
         }
     }
@@ -439,7 +463,9 @@ impl NameTable {
         for index in self.active_indices() {
             builder.push_ref(self.entry(index));
         }
-        builder.finish()
+        let mut compacted = builder.finish();
+        compacted.direct_include_overrides = self.direct_include_overrides.clone();
+        compacted
     }
 
     #[cfg(test)]
@@ -582,7 +608,43 @@ impl NameTable {
         for index in self.active_indices() {
             builder.push_ref_with_project_context(self.entry(index));
         }
-        builder.finish()
+        let mut rebuilt = builder.finish();
+        rebuilt.direct_include_overrides = self.direct_include_overrides.clone();
+        rebuilt
+    }
+
+    /// Apply sparse first-layer external evidence from a request-local dirty
+    /// include graph. This is an O(changed external paths) clone and leaves the
+    /// compact base/delta segments shared.
+    pub fn with_direct_include_overrides(&self, overrides: &HashMap<String, bool>) -> Self {
+        if overrides.is_empty() {
+            return Self {
+                base: self.base.clone(),
+                deltas: self.deltas.clone(),
+                path_overrides: self.path_overrides.clone(),
+                delta_offsets: self.delta_offsets.clone(),
+                active_len: self.active_len,
+                slot_len: self.slot_len,
+                direct_include_overrides: self.direct_include_overrides.clone(),
+                all_workspace_reach: self.all_workspace_reach.clone(),
+            };
+        }
+        let mut merged = self.direct_include_overrides.as_ref().clone();
+        merged.extend(
+            overrides
+                .iter()
+                .map(|(path, included)| (path.clone(), *included)),
+        );
+        Self {
+            base: self.base.clone(),
+            deltas: self.deltas.clone(),
+            path_overrides: self.path_overrides.clone(),
+            delta_offsets: self.delta_offsets.clone(),
+            active_len: self.active_len,
+            slot_len: self.slot_len,
+            direct_include_overrides: Arc::new(merged),
+            all_workspace_reach: self.all_workspace_reach.clone(),
+        }
     }
 
     fn with_updated_entries(
@@ -635,8 +697,19 @@ impl NameTable {
             delta_offsets: Arc::new(offsets),
             active_len,
             slot_len: self.slot_len + fresh_slots,
+            direct_include_overrides: self.direct_include_overrides.clone(),
             all_workspace_reach: Arc::new(all_workspace_reach),
         }
+    }
+
+    fn directly_included_for(&self, entry: NameEntryRef<'_>) -> bool {
+        if !entry.external {
+            return false;
+        }
+        self.direct_include_overrides
+            .get(entry.path)
+            .copied()
+            .unwrap_or(entry.directly_included)
     }
 
     /// Entry indices whose lowercased name starts with `needle_lower` (the exact
@@ -743,8 +816,12 @@ impl NameTable {
             if !names.contains(&entry.name) {
                 continue;
             }
-            let tier =
-                resolver::scope_tier(entry.path, entry.external, entry.directly_included, ctx_ref);
+            let tier = resolver::scope_tier(
+                entry.path,
+                entry.external,
+                self.directly_included_for(entry),
+                ctx_ref,
+            );
             // Hard gate: only determinate in-scope tiers color. Open/indeterminate
             // (`Unknown`) and out-of-scope (`Global`) do not color.
             let in_scope = matches!(
@@ -839,7 +916,7 @@ impl NameTable {
                     let tier = resolver::scope_tier(
                         entry.path,
                         entry.external,
-                        entry.directly_included,
+                        self.directly_included_for(entry),
                         ctx_ref,
                     );
                     let loc = resolver::locality(entry.path, ctx_ref.and_then(|c| c.current_path));
@@ -1024,8 +1101,12 @@ impl NameTable {
             if base_match < min_score {
                 return;
             }
-            let tier =
-                resolver::scope_tier(entry.path, entry.external, entry.directly_included, ctx);
+            let tier = resolver::scope_tier(
+                entry.path,
+                entry.external,
+                self.directly_included_for(entry),
+                ctx,
+            );
             let loc = resolver::locality(entry.path, ctx.and_then(|c| c.current_path));
             let score = resolver::pack_score(tier, base_match, loc);
             scored.push(ScoredCandidate {
@@ -1086,7 +1167,7 @@ impl NameTable {
                     let tier = resolver::scope_tier(
                         entry.path,
                         entry.external,
-                        entry.directly_included,
+                        self.directly_included_for(entry),
                         ctx_ref,
                     );
                     let loc = resolver::locality(entry.path, ctx_ref.and_then(|c| c.current_path));

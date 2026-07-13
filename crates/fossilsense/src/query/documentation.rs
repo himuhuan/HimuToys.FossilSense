@@ -1,4 +1,4 @@
-use std::cmp::Ordering;
+#[cfg(test)]
 use std::path::Path;
 
 use crate::model::DefinitionCandidate;
@@ -11,132 +11,25 @@ pub struct DocumentationCandidate {
     pub signature: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum DocumentationSourcePreference {
-    CompatibleSource,
-    Primary,
-    HeaderDeclaration,
-}
-
-/// Rank sources for documentation without changing definition/completion ranking.
-/// A compatible header declaration in the same project/module is the public API
-/// documentation source; the current `.c` definition remains the semantic target.
+/// Keep documentation attached to the already-selected presentation anchor.
+/// Callable header/source selection is performed once by the strict candidate
+/// graph; this legacy-shaped helper must never infer a counterpart from path,
+/// project, or signature similarity.
 pub fn rank_documentation_candidates(
     primary: &DocumentationCandidate,
     candidates: &[DocumentationCandidate],
     project_context: Option<&ProjectContextIndex>,
 ) -> Vec<DocumentationCandidate> {
-    let mut compatible: Vec<_> = candidates
-        .iter()
-        .filter(|candidate| candidate.candidate.name == primary.candidate.name)
-        .filter(|candidate| candidate.candidate.kind == primary.candidate.kind)
-        .filter(|candidate| signatures_compatible(&candidate.signature, &primary.signature))
-        .filter(|candidate| {
-            same_documentation_project(
-                &primary.candidate.path,
-                &candidate.candidate.path,
-                project_context,
-            )
-        })
-        .cloned()
-        .collect();
-
-    if !compatible.iter().any(|candidate| candidate == primary) {
-        compatible.push(primary.clone());
-    }
-    compatible.sort_by(|left, right| compare_documentation_candidates(primary, left, right));
-    compatible.dedup_by(|left, right| {
-        left.candidate.path == right.candidate.path
-            && left.candidate.range == right.candidate.range
-            && left.signature == right.signature
-    });
-    compatible
+    let _ = (candidates, project_context);
+    vec![primary.clone()]
 }
 
-fn compare_documentation_candidates(
-    primary: &DocumentationCandidate,
-    left: &DocumentationCandidate,
-    right: &DocumentationCandidate,
-) -> Ordering {
-    documentation_preference(primary, right)
-        .cmp(&documentation_preference(primary, left))
-        .then_with(|| {
-            same_module_stem(&primary.candidate.path, &right.candidate.path).cmp(&same_module_stem(
-                &primary.candidate.path,
-                &left.candidate.path,
-            ))
-        })
-        .then_with(|| {
-            (right.candidate.role == "declaration").cmp(&(left.candidate.role == "declaration"))
-        })
-        .then_with(|| right.candidate.tier.cmp(&left.candidate.tier))
-        .then_with(|| left.candidate.path.cmp(&right.candidate.path))
-        .then_with(|| {
-            left.candidate
-                .range
-                .start_line
-                .cmp(&right.candidate.range.start_line)
-        })
-}
-
-fn documentation_preference(
-    primary: &DocumentationCandidate,
-    candidate: &DocumentationCandidate,
-) -> DocumentationSourcePreference {
-    if is_header_path(&candidate.candidate.path) {
-        DocumentationSourcePreference::HeaderDeclaration
-    } else if candidate == primary {
-        DocumentationSourcePreference::Primary
-    } else {
-        DocumentationSourcePreference::CompatibleSource
-    }
-}
-
-pub(super) fn same_documentation_project(
-    primary_path: &str,
-    candidate_path: &str,
-    project_context: Option<&ProjectContextIndex>,
-) -> bool {
-    if primary_path == candidate_path {
-        return true;
-    }
-    let Some(index) = project_context else {
-        return false;
-    };
-    matches!(
-        (
-            index.nearest_for_file(primary_path),
-            index.nearest_for_file(candidate_path),
-        ),
-        (Some(primary), Some(candidate)) if primary == candidate
-    )
-}
-
-fn same_module_stem(left: &str, right: &str) -> bool {
-    let left = Path::new(left).file_stem().and_then(|value| value.to_str());
-    let right = Path::new(right)
-        .file_stem()
-        .and_then(|value| value.to_str());
-    left.zip(right)
-        .is_some_and(|(left, right)| left.eq_ignore_ascii_case(right))
-}
-
-pub(super) fn is_header_path(path: &str) -> bool {
-    Path::new(path)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            matches!(
-                extension.to_ascii_lowercase().as_str(),
-                "h" | "hh" | "hpp" | "hxx" | "inl"
-            )
-        })
-}
-
+#[cfg(test)]
 pub(super) fn signatures_compatible(left: &str, right: &str) -> bool {
     normalize_signature(left) == normalize_signature(right)
 }
 
+#[cfg(test)]
 fn normalize_signature(signature: &str) -> String {
     let signature = signature
         .split_once('{')
@@ -211,7 +104,7 @@ mod tests {
     }
 
     #[test]
-    fn compatible_header_declaration_precedes_current_source_definition() {
+    fn selected_primary_is_not_replaced_by_a_similar_header() {
         let mut source = candidate("lib/ops_chain.c", "int lookup(int value)", "definition");
         source.candidate.tier = ScopeTier::Current;
         let header = candidate("lib/ops_chain.h", "int lookup(int value);", "declaration");
@@ -220,7 +113,7 @@ mod tests {
             &[source.clone(), header.clone()],
             Some(&projects()),
         );
-        assert_eq!(ranked[0], header);
+        assert_eq!(ranked, vec![source]);
     }
 
     #[test]

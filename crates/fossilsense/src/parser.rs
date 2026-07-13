@@ -75,6 +75,15 @@ bitflags::bitflags! {
         const COLOR_LIVE    = Self::COLOR_REF.bits()
                             | Self::LOCAL_DECLS.bits();
 
+        /// Hover/type semantics: the durable type and callable facts needed to
+        /// build a live-document overlay. Occurrences remain a separate opt-in.
+        const HOVER_SEMANTICS = Self::SYMBOLS.bits()
+                               | Self::INCLUDES.bits()
+                               | Self::RECORDS.bits()
+                               | Self::FIELDS.bits()
+                               | Self::ALIASES.bits()
+                               | Self::CALL_RELATIONS.bits();
+
         /// Everything (backward-compatible default).
         const ALL           = !0;
     }
@@ -349,10 +358,13 @@ impl ParseDiagnostics {
 }
 
 pub use crate::semantic_model::{
-    kind_from_str, AliasTarget, FieldDef, Include, MemberConfidence, MemberDef, MemberKind,
-    Occurrence, RecordConfidence, RecordDef, RecordKind, Symbol, SymbolKind, SymbolRole,
-    SyntacticRole, TypeAlias,
+    kind_from_str, AliasTarget, AliasTargetFidelity, DeclaratorShape, FieldDef, Include,
+    MemberConfidence, MemberDef, MemberKind, Occurrence, RecordConfidence, RecordDef, RecordKind,
+    RecordRangeFidelity, Symbol, SymbolKind, SymbolRole, SyntacticRole, TypeAlias,
 };
+
+#[allow(dead_code)]
+pub const PARSER_FACT_VERSION: i64 = crate::semantic_model::PARSER_FACT_VERSION;
 
 /// A typedef alias mapping a new name to an underlying record tag, e.g.
 /// `typedef struct Foo FooT;` records `FooT -> Foo`. Lets member completion

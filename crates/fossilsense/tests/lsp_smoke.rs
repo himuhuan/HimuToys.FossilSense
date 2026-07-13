@@ -259,6 +259,38 @@ fn lsp_smoke_completion_definition_and_references() -> Result<()> {
     std::fs::write(root.join("ops_chain.c"), ops_disk_source)?;
     let ops_open_source =
         "#include \"ops_chain.h\"\nint pair_lookup(int value) { return value; }\nvoid call_pair(void) { pair_lookup(1); }\nvoid use_pair(void) { pair_lo }\n";
+    std::fs::write(root.join("arity_one.h"), "int arity_pick(int value);\n")?;
+    std::fs::write(
+        root.join("arity_two.h"),
+        "int arity_pick(int table, int value);\n",
+    )?;
+    std::fs::write(
+        root.join("arity_two.c"),
+        "#include \"arity_two.h\"\nint arity_pick(int table, int value) { return table + value; }\n",
+    )?;
+    let arity_source = concat!(
+        "#include \"arity_one.h\"\n",
+        "#include \"arity_two.h\"\n",
+        "int use_complete(void) { return arity_pick(1, 2); }\n",
+        "int use_partial(void) { return arity_pick(1, ); }\n",
+    );
+    std::fs::write(root.join("arity_main.c"), arity_source)?;
+    std::fs::write(
+        root.join("types.h"),
+        "struct Packet {\n    int stale_disk_field;\n};\n\ntypedef const struct Packet *PacketView;\n",
+    )?;
+    let types_open_source = concat!(
+        "struct Packet {\n",
+        "    int type;\n",
+        "    /* byte count */\n",
+        "    int size;\n",
+        "#ifdef WITH_CHECKSUM\n",
+        "    int checksum;\n",
+        "#endif\n",
+        "};\n",
+        "\n",
+        "typedef const struct Packet *PacketView;\n",
+    );
     // Keep trailing comments out of the on-disk declaration so indexing still
     // records `trailing_docs`; recover them from the open buffer instead.
     let defs_open_source =
@@ -270,6 +302,10 @@ fn lsp_smoke_completion_definition_and_references() -> Result<()> {
     let live_uri = file_uri(&root.join("live.c"))?;
     let ops_header_uri = file_uri(&root.join("ops_chain.h"))?;
     let ops_source_uri = file_uri(&root.join("ops_chain.c"))?;
+    let arity_one_uri = file_uri(&root.join("arity_one.h"))?;
+    let arity_two_source_uri = file_uri(&root.join("arity_two.c"))?;
+    let arity_main_uri = file_uri(&root.join("arity_main.c"))?;
+    let types_uri = file_uri(&root.join("types.h"))?;
 
     let mut lsp = LspProcess::start()?;
     let init_id = lsp.request(
@@ -371,6 +407,28 @@ fn lsp_smoke_completion_definition_and_references() -> Result<()> {
             }
         }),
     )?;
+    lsp.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": arity_main_uri,
+                "languageId": "c",
+                "version": 1,
+                "text": arity_source
+            }
+        }),
+    )?;
+    lsp.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": types_uri,
+                "languageId": "c",
+                "version": 1,
+                "text": types_open_source
+            }
+        }),
+    )?;
 
     let project_status_id = lsp.request(
         "workspace/executeCommand",
@@ -387,32 +445,45 @@ fn lsp_smoke_completion_definition_and_references() -> Result<()> {
         "paired documentation test requires a discovered project, got {project_status}"
     );
 
-    let paired_completion_id = lsp.request(
-        "textDocument/completion",
-        json!({
-            "textDocument": { "uri": ops_source_uri },
-            "position": { "line": 3, "character": 29 },
-            "context": { "triggerKind": 1 }
-        }),
-    )?;
-    let paired_completion = lsp.wait_response(paired_completion_id, Duration::from_secs(10))?;
-    let paired_item = paired_completion
-        .get("items")
-        .and_then(Value::as_array)
-        .and_then(|items| {
-            items
-                .iter()
-                .find(|item| item.get("label").and_then(Value::as_str) == Some("pair_lookup"))
-        })
-        .cloned()
-        .context("paired completion missing pair_lookup")?;
-    let paired_resolve_id = lsp.request("completionItem/resolve", paired_item)?;
-    let paired_resolved = lsp.wait_response(paired_resolve_id, Duration::from_secs(10))?;
-    let paired_completion_docs = paired_resolved
-        .get("documentation")
-        .and_then(|documentation| documentation.get("value"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+    // didOpen reconciliation is deliberately asynchronous at the protocol
+    // boundary. If another open document finishes reconciling between
+    // completion and resolve, the v3 payload must be rejected as stale; a
+    // fresh completion then carries the stable all-open overlay epoch.
+    let mut paired_resolved = Value::Null;
+    let mut paired_completion_docs = String::new();
+    for _ in 0..4 {
+        let paired_completion_id = lsp.request(
+            "textDocument/completion",
+            json!({
+                "textDocument": { "uri": ops_source_uri },
+                "position": { "line": 3, "character": 29 },
+                "context": { "triggerKind": 1 }
+            }),
+        )?;
+        let paired_completion = lsp.wait_response(paired_completion_id, Duration::from_secs(10))?;
+        let paired_item = paired_completion
+            .get("items")
+            .and_then(Value::as_array)
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| item.get("label").and_then(Value::as_str) == Some("pair_lookup"))
+            })
+            .cloned()
+            .context("paired completion missing pair_lookup")?;
+        let paired_resolve_id = lsp.request("completionItem/resolve", paired_item)?;
+        paired_resolved = lsp.wait_response(paired_resolve_id, Duration::from_secs(10))?;
+        paired_completion_docs = paired_resolved
+            .get("documentation")
+            .and_then(|documentation| documentation.get("value"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if paired_completion_docs.contains("Header lookup documentation.") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
     assert!(
         paired_completion_docs.contains("Header lookup documentation.")
             && paired_completion_docs.contains("// In ops_chain.h")
@@ -433,8 +504,14 @@ fn lsp_smoke_completion_definition_and_references() -> Result<()> {
         .and_then(|contents| contents.get("value"))
         .and_then(Value::as_str)
         .context("paired hover missing markdown")?;
-    assert!(paired_hover_value.contains("Header lookup documentation."));
-    assert!(paired_hover_value.contains("// In ops_chain.h"));
+    assert!(
+        paired_hover_value.contains("Header lookup documentation.")
+            && paired_hover_value.contains("// In ops_chain.h")
+            && paired_hover_value.matches("// In ops_chain.h").count() == 1
+            && !paired_hover_value.contains("// In ops_chain.c")
+            && !paired_hover_value.contains("int pair_lookup(int value) {"),
+        "a strict one-to-one group must render exactly its header presentation and no source section, got {paired_hover}"
+    );
 
     let paired_signature_id = lsp.request(
         "textDocument/signatureHelp",
@@ -445,6 +522,14 @@ fn lsp_smoke_completion_definition_and_references() -> Result<()> {
         }),
     )?;
     let paired_signature = lsp.wait_response(paired_signature_id, Duration::from_secs(10))?;
+    assert_eq!(
+        paired_signature
+            .get("signatures")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(1),
+        "the strict header/source pair should produce one logical signature, got {paired_signature}"
+    );
     assert!(
         paired_signature
             .get("signatures")
@@ -474,14 +559,21 @@ fn lsp_smoke_completion_definition_and_references() -> Result<()> {
         }),
     )?;
     let source_jump = lsp.wait_response(source_jump_id, Duration::from_secs(10))?;
+    let source_locations = source_jump
+        .as_array()
+        .context("source-anchor definition should return a location array")?;
     assert_eq!(
-        source_jump
-            .as_array()
-            .and_then(|locations| locations.first())
+        source_locations.len(),
+        1,
+        "source anchor should expose only its proven header counterpart, got {source_jump}"
+    );
+    assert_eq!(
+        source_locations
+            .first()
             .and_then(|location| location.get("uri"))
             .and_then(Value::as_str),
         Some(ops_header_uri.as_str()),
-        "goto on source definition should prefer the paired header declaration"
+        "goto on source definition should return the paired header declaration"
     );
 
     let header_jump_id = lsp.request(
@@ -492,14 +584,21 @@ fn lsp_smoke_completion_definition_and_references() -> Result<()> {
         }),
     )?;
     let header_jump = lsp.wait_response(header_jump_id, Duration::from_secs(10))?;
+    let header_locations = header_jump
+        .as_array()
+        .context("header-anchor definition should return a location array")?;
     assert_eq!(
-        header_jump
-            .as_array()
-            .and_then(|locations| locations.first())
+        header_locations.len(),
+        1,
+        "header anchor should expose only its proven source counterpart, got {header_jump}"
+    );
+    assert_eq!(
+        header_locations
+            .first()
             .and_then(|location| location.get("uri"))
             .and_then(Value::as_str),
         Some(ops_source_uri.as_str()),
-        "goto on header declaration should prefer the paired source definition"
+        "goto on header declaration should return the paired source definition"
     );
 
     let call_jump_id = lsp.request(
@@ -518,6 +617,186 @@ fn lsp_smoke_completion_definition_and_references() -> Result<()> {
             .and_then(Value::as_str),
         Some(ops_source_uri.as_str()),
         "goto from an ordinary call site should keep the source definition first"
+    );
+
+    let complete_line = arity_source
+        .lines()
+        .position(|line| line.contains("use_complete"))
+        .context("complete-call fixture line")? as u32;
+    let complete_character = arity_source
+        .lines()
+        .nth(complete_line as usize)
+        .and_then(|line| line.find("arity_pick"))
+        .context("complete-call fixture callee")? as u32
+        + 3;
+    let arity_hover_id = lsp.request(
+        "textDocument/hover",
+        json!({
+            "textDocument": { "uri": arity_main_uri },
+            "position": { "line": complete_line, "character": complete_character }
+        }),
+    )?;
+    let arity_hover = lsp.wait_response(arity_hover_id, Duration::from_secs(10))?;
+    let arity_hover_value = arity_hover
+        .get("contents")
+        .and_then(|contents| contents.get("value"))
+        .and_then(Value::as_str)
+        .context("complete-call hover missing markdown")?;
+    assert!(
+        arity_hover_value.contains("int arity_pick(int table, int value);")
+            && !arity_hover_value.contains("int arity_pick(int value);"),
+        "a complete two-argument call must exclude the proven one-argument candidate, got {arity_hover}"
+    );
+
+    let arity_definition_id = lsp.request(
+        "textDocument/definition",
+        json!({
+            "textDocument": { "uri": arity_main_uri },
+            "position": { "line": complete_line, "character": complete_character }
+        }),
+    )?;
+    let arity_definition = lsp.wait_response(arity_definition_id, Duration::from_secs(10))?;
+    let arity_locations = arity_definition
+        .as_array()
+        .context("complete-call definition should return locations")?;
+    assert!(
+        !arity_locations.is_empty()
+            && arity_locations.iter().all(|location| {
+                location.get("uri").and_then(Value::as_str) != Some(arity_one_uri.as_str())
+            }),
+        "complete-call Definition must exclude the proven incompatible header, got {arity_definition}"
+    );
+    assert_eq!(
+        arity_locations
+            .first()
+            .and_then(|location| location.get("uri"))
+            .and_then(Value::as_str),
+        Some(arity_two_source_uri.as_str()),
+        "the compatible callable group should use its source definition at an ordinary call site"
+    );
+
+    let partial_line = arity_source
+        .lines()
+        .position(|line| line.contains("use_partial"))
+        .context("partial-call fixture line")? as u32;
+    let partial_character = arity_source
+        .lines()
+        .nth(partial_line as usize)
+        .and_then(|line| line.find("arity_pick(1, "))
+        .context("partial-call fixture arguments")? as u32
+        + "arity_pick(1, ".len() as u32;
+    let arity_signature_id = lsp.request(
+        "textDocument/signatureHelp",
+        json!({
+            "textDocument": { "uri": arity_main_uri },
+            "position": { "line": partial_line, "character": partial_character },
+            "context": { "triggerKind": 2, "triggerCharacter": ",", "isRetrigger": false }
+        }),
+    )?;
+    let arity_signature = lsp.wait_response(arity_signature_id, Duration::from_secs(10))?;
+    let arity_signatures = arity_signature
+        .get("signatures")
+        .and_then(Value::as_array)
+        .context("partial-call signature help missing signatures")?;
+    let one_signature = arity_signatures
+        .iter()
+        .find(|signature| {
+            signature.get("label").and_then(Value::as_str) == Some("int arity_pick(int value);")
+        })
+        .context("partial call should retain the still-compatible one-argument signature")?;
+    let two_signature = arity_signatures
+        .iter()
+        .find(|signature| {
+            signature.get("label").and_then(Value::as_str)
+                == Some("int arity_pick(int table, int value);")
+        })
+        .context("partial call should retain the two-argument signature")?;
+    assert_eq!(
+        one_signature.get("activeParameter").and_then(Value::as_u64),
+        None,
+        "the empty second argument is outside the one-argument signature"
+    );
+    assert_eq!(
+        two_signature.get("activeParameter").and_then(Value::as_u64),
+        Some(1),
+        "the empty second argument should activate parameter 1 of the two-argument signature"
+    );
+    let first_signature = arity_signatures
+        .first()
+        .context("partial-call signature list should not be empty")?;
+    let expected_active_parameter = (first_signature.get("label").and_then(Value::as_str)
+        == Some("int arity_pick(int table, int value);"))
+    .then_some(1);
+    assert_eq!(
+        arity_signature
+            .get("activeParameter")
+            .and_then(Value::as_u64),
+        expected_active_parameter,
+        "top-level activeParameter must describe activeSignature rather than another candidate"
+    );
+
+    let packet_character = types_open_source
+        .lines()
+        .next()
+        .and_then(|line| line.find("Packet"))
+        .context("record fixture name")? as u32
+        + 2;
+    let record_hover_id = lsp.request(
+        "textDocument/hover",
+        json!({
+            "textDocument": { "uri": types_uri },
+            "position": { "line": 0, "character": packet_character }
+        }),
+    )?;
+    let record_hover = lsp.wait_response(record_hover_id, Duration::from_secs(10))?;
+    let record_hover_value = record_hover
+        .get("contents")
+        .and_then(|contents| contents.get("value"))
+        .and_then(Value::as_str)
+        .context("record hover missing markdown")?;
+    assert!(
+        record_hover_value.contains("### struct `Packet`")
+            && record_hover_value.contains("struct Packet {\n")
+            && record_hover_value.contains("    /* byte count */\n")
+            && record_hover_value.contains("#ifdef WITH_CHECKSUM\n")
+            && record_hover_value.contains("    int checksum;\n")
+            && record_hover_value.contains("#endif\n};")
+            && !record_hover_value.contains("stale_disk_field"),
+        "record Hover must preserve the full multiline dirty-buffer definition and shadow stale disk facts, got {record_hover}"
+    );
+
+    let alias_line = types_open_source
+        .lines()
+        .position(|line| line.contains("typedef"))
+        .context("typedef fixture line")? as u32;
+    let alias_character = types_open_source
+        .lines()
+        .nth(alias_line as usize)
+        .and_then(|line| line.find("PacketView"))
+        .context("typedef fixture name")? as u32
+        + 2;
+    let alias_hover_id = lsp.request(
+        "textDocument/hover",
+        json!({
+            "textDocument": { "uri": types_uri },
+            "position": { "line": alias_line, "character": alias_character }
+        }),
+    )?;
+    let alias_hover = lsp.wait_response(alias_hover_id, Duration::from_secs(10))?;
+    let alias_hover_value = alias_hover
+        .get("contents")
+        .and_then(|contents| contents.get("value"))
+        .and_then(Value::as_str)
+        .context("typedef hover missing markdown")?;
+    assert!(
+        alias_hover_value.contains("### typedef `PacketView`")
+            && alias_hover_value.contains("typedef const struct Packet *PacketView;")
+            && alias_hover_value.contains("`(aka. const struct Packet *)`")
+            && alias_hover_value.contains("### struct `Packet`")
+            && alias_hover_value.contains("#ifdef WITH_CHECKSUM\n")
+            && alias_hover_value.contains("    int checksum;\n")
+            && !alias_hover_value.contains("stale_disk_field"),
+        "typedef Hover must show the exact aka spelling plus the complete dirty terminal record, got {alias_hover}"
     );
     lsp.notify(
         "textDocument/didOpen",

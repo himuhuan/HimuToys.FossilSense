@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -11,6 +11,7 @@ use super::state;
 use super::LocalWordCache;
 use crate::call_model::SemanticGeneration;
 use crate::call_service::CallReadHandle;
+use crate::candidate_service::CandidateOverlaySnapshot;
 use crate::completion_words;
 use crate::parser::{FileSemanticIndex, ParseFacts};
 use crate::pathing;
@@ -31,6 +32,12 @@ enum RelationOverlayState {
     SavedAwaitingContentHash(String),
 }
 
+impl RelationOverlayState {
+    fn is_active(&self) -> bool {
+        !matches!(self, Self::Clean)
+    }
+}
+
 #[derive(Clone, Debug)]
 struct OpenDocument {
     version: i32,
@@ -41,6 +48,7 @@ struct OpenDocument {
 #[derive(Clone, Default)]
 pub(super) struct DocumentStore {
     open_docs: Arc<Mutex<HashMap<Url, OpenDocument>>>,
+    overlay_epoch: Arc<AtomicU64>,
     pub(in crate::server) live_parse_cache: LiveParseCache,
     live_parse_gates: LiveParseGates,
     live_parse_cancellations: LiveParseCancellations,
@@ -52,6 +60,17 @@ pub(super) struct DocumentSnapshot {
     pub(super) version: i32,
     pub(super) text: Arc<str>,
     relation_overlay: RelationOverlayState,
+}
+
+/// One lock-consistent view of the live-document state used by a semantic
+/// request. `current` and `all` are captured under the same `open_docs` guard,
+/// and `overlay_epoch` is read before that guard is released. Consumers can
+/// therefore never pair current-buffer text with a different all-open overlay.
+#[derive(Clone, Debug)]
+pub(super) struct DocumentRequestSnapshot {
+    pub(super) overlay_epoch: u64,
+    pub(super) current: Option<DocumentSnapshot>,
+    pub(super) all: Vec<(Url, DocumentSnapshot)>,
 }
 
 impl DocumentSnapshot {
@@ -66,8 +85,20 @@ impl DocumentSnapshot {
 
 impl DocumentStore {
     pub(super) async fn open_document(&self, uri: Url, version: i32, text: String) {
-        let relation_overlay = relation_overlay_state_on_open(&uri, &text).await;
-        self.open_docs.lock().await.insert(
+        // `didOpen` proves only which bytes the editor is showing. Even when
+        // those bytes match disk, the active semantic generation may predate
+        // the file or contain an older external edit. Keep the document in the
+        // overlay until `reconcile_published_files` proves that this exact hash
+        // exists in the captured generation.
+        let relation_overlay = RelationOverlayState::SavedAwaitingContentHash(
+            blake3::hash(text.as_bytes()).to_hex().to_string(),
+        );
+        let mut documents = self.open_docs.lock().await;
+        let replaced_active = documents
+            .get(&uri)
+            .is_some_and(|document| document.relation_overlay.is_active());
+        let inserted_active = relation_overlay.is_active();
+        documents.insert(
             uri,
             OpenDocument {
                 version,
@@ -75,11 +106,15 @@ impl DocumentStore {
                 relation_overlay,
             },
         );
+        if replaced_active || inserted_active {
+            self.bump_overlay_epoch();
+        }
     }
 
     #[cfg(test)]
     pub(super) async fn change_document(&self, uri: Url, version: i32, text: String) {
-        self.open_docs.lock().await.insert(
+        let mut documents = self.open_docs.lock().await;
+        documents.insert(
             uri.clone(),
             OpenDocument {
                 version,
@@ -87,6 +122,8 @@ impl DocumentStore {
                 relation_overlay: RelationOverlayState::Unsaved,
             },
         );
+        self.bump_overlay_epoch();
+        drop(documents);
         self.clear_live_state(&uri).await;
     }
 
@@ -122,6 +159,7 @@ impl DocumentStore {
             document.text = Arc::from(text);
             document.version = version;
             document.relation_overlay = RelationOverlayState::Unsaved;
+            self.bump_overlay_epoch();
             true
         };
         if applied {
@@ -135,6 +173,7 @@ impl DocumentStore {
             document.relation_overlay = RelationOverlayState::SavedAwaitingContentHash(
                 blake3::hash(document.text.as_bytes()).to_hex().to_string(),
             );
+            self.bump_overlay_epoch();
         }
     }
 
@@ -189,6 +228,7 @@ impl DocumentStore {
         };
 
         let mut docs = self.open_docs.lock().await;
+        let mut changed = false;
         for (uri, rel, expected_hash) in candidates {
             if stored
                 .get(&rel)
@@ -200,14 +240,27 @@ impl DocumentStore {
                         RelationOverlayState::SavedAwaitingContentHash(hash) if hash == &expected_hash
                     ) {
                         document.relation_overlay = RelationOverlayState::Clean;
+                        changed = true;
                     }
                 }
             }
         }
+        if changed {
+            self.bump_overlay_epoch();
+        }
     }
 
     pub(super) async fn close_document(&self, uri: &Url) {
-        self.open_docs.lock().await.remove(uri);
+        let mut documents = self.open_docs.lock().await;
+        let removed_active = documents
+            .remove(uri)
+            .is_some_and(|document| document.relation_overlay.is_active());
+        if removed_active {
+            // Keep the mutation and epoch transition under the same guard used
+            // by `capture_request_snapshot`.
+            self.bump_overlay_epoch();
+        }
+        drop(documents);
         self.clear_live_state(uri).await;
         self.live_parse_gates.lock().await.remove(uri);
     }
@@ -332,10 +385,20 @@ impl DocumentStore {
         }
     }
 
-    pub(super) async fn all_snapshots(&self) -> Vec<(Url, DocumentSnapshot)> {
-        self.open_docs
-            .lock()
-            .await
+    pub(super) async fn capture_request_snapshot(
+        &self,
+        current_uri: Option<&Url>,
+    ) -> DocumentRequestSnapshot {
+        let documents = self.open_docs.lock().await;
+        let epoch = self.overlay_epoch.load(Ordering::Acquire);
+        let current = current_uri.and_then(|uri| {
+            documents.get(uri).map(|document| DocumentSnapshot {
+                version: document.version,
+                text: document.text.clone(),
+                relation_overlay: document.relation_overlay.clone(),
+            })
+        });
+        let all = documents
             .iter()
             .map(|(uri, document)| {
                 (
@@ -347,7 +410,24 @@ impl DocumentStore {
                     },
                 )
             })
-            .collect()
+            .collect();
+        DocumentRequestSnapshot {
+            overlay_epoch: epoch,
+            current,
+            all,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) async fn all_snapshots_with_overlay_epoch(
+        &self,
+    ) -> (u64, Vec<(Url, DocumentSnapshot)>) {
+        let snapshot = self.capture_request_snapshot(None).await;
+        (snapshot.overlay_epoch, snapshot.all)
+    }
+
+    fn bump_overlay_epoch(&self) {
+        self.overlay_epoch.fetch_add(1, Ordering::AcqRel);
     }
 
     #[cfg(test)]
@@ -403,16 +483,6 @@ fn utf16_position_to_byte(text: &str, position: Position) -> Option<usize> {
     (utf16_units == target).then_some(line_end)
 }
 
-async fn relation_overlay_state_on_open(uri: &Url, text: &str) -> RelationOverlayState {
-    let Ok(path) = uri.to_file_path() else {
-        return RelationOverlayState::Unsaved;
-    };
-    match tokio::task::spawn_blocking(move || std::fs::read(path)).await {
-        Ok(Ok(bytes)) if bytes == text.as_bytes() => RelationOverlayState::Clean,
-        Ok(Ok(_)) | Ok(Err(_)) | Err(_) => RelationOverlayState::Unsaved,
-    }
-}
-
 #[derive(Clone)]
 pub(super) struct CacheLedger {
     pub(in crate::server) engine_snapshots: EngineSnapshots,
@@ -421,6 +491,29 @@ pub(super) struct CacheLedger {
     pub(in crate::server) reference_role_cache: Arc<references::ReferenceRoleCache>,
     pub(in crate::server) reference_search_cache: Arc<references::ReferenceSearchCache>,
     pub(in crate::server) completion_memo: Arc<Mutex<HashMap<Url, state::CompletionMemo>>>,
+    candidate_overlays: Arc<Mutex<CandidateOverlayCache>>,
+}
+
+#[derive(Default)]
+struct CandidateOverlayCache {
+    entries: HashMap<CandidateOverlayCacheKey, Arc<CandidateOverlaySnapshot>>,
+    /// Changes at both sides of an EngineSnapshot publication. It prevents a
+    /// build that started before (or inside) the publication window from
+    /// repopulating a key after the publication invalidated it.
+    root_revisions: HashMap<PathBuf, u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct CandidateOverlayCacheKey {
+    root: PathBuf,
+    semantic_generation: SemanticGeneration,
+    overlay_epoch: u64,
+}
+
+fn invalidate_candidate_overlay_root(cache: &mut CandidateOverlayCache, root: &Path) {
+    cache.entries.retain(|key, _| key.root != root);
+    let revision = cache.root_revisions.entry(root.to_path_buf()).or_default();
+    *revision = revision.wrapping_add(1).max(1);
 }
 
 pub(in crate::server) type EngineSnapshots = Arc<Mutex<HashMap<PathBuf, Arc<EngineSnapshot>>>>;
@@ -469,6 +562,7 @@ impl Default for CacheLedger {
             reference_role_cache: Arc::new(references::ReferenceRoleCache::new()),
             reference_search_cache: Arc::new(references::ReferenceSearchCache::new()),
             completion_memo: Arc::new(Mutex::new(HashMap::new())),
+            candidate_overlays: Arc::new(Mutex::new(CandidateOverlayCache::default())),
         }
     }
 }
@@ -526,6 +620,11 @@ impl CacheLedger {
             .lock()
             .await
             .retain(|root, _| !roots.contains(root));
+        let mut overlays = self.candidate_overlays.lock().await;
+        for root in roots {
+            invalidate_candidate_overlay_root(&mut overlays, root);
+        }
+        drop(overlays);
         self.clear_all_completion_memos().await;
         self.invalidate_references();
     }
@@ -540,11 +639,88 @@ impl CacheLedger {
         snapshot: EngineSnapshot,
     ) -> Arc<EngineSnapshot> {
         let snapshot = Arc::new(snapshot);
+        // Invalidate on both sides of the engine-map swap. A builder captured
+        // in either half of this publication window receives a stale cache
+        // revision and cannot republish after the second invalidation.
+        {
+            let mut overlays = self.candidate_overlays.lock().await;
+            invalidate_candidate_overlay_root(&mut overlays, &snapshot.root);
+        }
         self.engine_snapshots
             .lock()
             .await
             .insert(snapshot.root.clone(), snapshot.clone());
+        {
+            let mut overlays = self.candidate_overlays.lock().await;
+            invalidate_candidate_overlay_root(&mut overlays, &snapshot.root);
+        }
         snapshot
+    }
+
+    pub(super) async fn candidate_overlay(
+        &self,
+        root: &Path,
+        semantic_generation: SemanticGeneration,
+        overlay_epoch: u64,
+    ) -> (Option<Arc<CandidateOverlaySnapshot>>, u64) {
+        let overlays = self.candidate_overlays.lock().await;
+        let revision = overlays.root_revisions.get(root).copied().unwrap_or(0);
+        let cached = overlays
+            .entries
+            .get(&CandidateOverlayCacheKey {
+                root: root.to_path_buf(),
+                semantic_generation,
+                overlay_epoch,
+            })
+            .cloned();
+        (cached, revision)
+    }
+
+    /// Publish one fully-built immutable overlay. A concurrent request may
+    /// have won the same key; in that case both callers share the first Arc.
+    /// Older epochs are dropped once a newer overlay for the same base lands.
+    pub(super) async fn publish_candidate_overlay(
+        &self,
+        root: PathBuf,
+        semantic_generation: SemanticGeneration,
+        overlay_epoch: u64,
+        expected_cache_revision: u64,
+        overlay: Arc<CandidateOverlaySnapshot>,
+    ) -> Arc<CandidateOverlaySnapshot> {
+        let key = CandidateOverlayCacheKey {
+            root: root.clone(),
+            semantic_generation,
+            overlay_epoch,
+        };
+        let mut cache = self.candidate_overlays.lock().await;
+        if cache.root_revisions.get(&root).copied().unwrap_or(0) != expected_cache_revision {
+            return overlay;
+        }
+        if let Some(existing) = cache.entries.get(&key) {
+            return existing.clone();
+        }
+        let newest_epoch = cache
+            .entries
+            .keys()
+            .filter(|candidate| {
+                candidate.root == root && candidate.semantic_generation == semantic_generation
+            })
+            .map(|candidate| candidate.overlay_epoch)
+            .max();
+        if newest_epoch.is_none_or(|epoch| overlay_epoch >= epoch) {
+            cache.entries.retain(|candidate, _| {
+                candidate.root != root
+                    || candidate.semantic_generation != semantic_generation
+                    || candidate.overlay_epoch > overlay_epoch
+            });
+            cache.entries.insert(key, overlay.clone());
+        }
+        overlay
+    }
+
+    #[cfg(test)]
+    pub(super) async fn candidate_overlay_cache_len_for_test(&self) -> usize {
+        self.candidate_overlays.lock().await.entries.len()
     }
 
     pub(super) async fn request_context(

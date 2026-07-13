@@ -49,6 +49,7 @@ use crate::references;
 use crate::store::IndexStore;
 
 mod call_hierarchy;
+mod candidate_context;
 mod completion_documentation;
 mod hover;
 mod include_completion;
@@ -85,13 +86,148 @@ use options::{
     parse_semantic_coloring_mode, signature_help_options,
 };
 use workspace::{
-    CacheLedger, CachePublishReport, DocumentStore, RequestContext, RequestSettings,
-    WorkspaceSession,
+    CacheLedger, CachePublishReport, DocumentRequestSnapshot, DocumentStore, RequestContext,
+    RequestSettings, WorkspaceSession,
 };
 
 type LocalWordEntry = (i32, Arc<HashSet<String>>);
 type LocalWordCache = Arc<Mutex<HashMap<Url, LocalWordEntry>>>;
 type IndexSchedule = Arc<Mutex<IndexScheduleState>>;
+
+/// Privacy-safe aggregate diagnostics for semantic candidate requests. This
+/// deliberately carries no symbol, signature, path, URI, or source text.
+#[derive(Clone, Copy, Debug, Default)]
+struct SemanticRequestPerf {
+    candidates: query::CallableCandidateMetrics,
+    returned: usize,
+    hydration_count: usize,
+    hydration_bytes: usize,
+    query_us: u128,
+    hydration_us: u128,
+    reach_us: u128,
+    coverage_open: bool,
+    coverage_truncated: bool,
+    coverage_incomplete: bool,
+    coverage_reason: u8,
+    arity_fallback: bool,
+}
+
+impl SemanticRequestPerf {
+    fn from_callable_set(set: &query::CallableCandidateSet) -> Self {
+        Self {
+            candidates: set.metrics(),
+            coverage_open: set.coverage.scope_open,
+            coverage_truncated: set.coverage.truncated,
+            coverage_incomplete: set.coverage.incomplete_reason.is_some(),
+            coverage_reason: coverage_reason_code(set.coverage.incomplete_reason),
+            arity_fallback: set.arity_mismatch_fallback,
+            ..Self::default()
+        }
+    }
+
+    fn log_line(self, feature: &'static str, total_us: u128) -> String {
+        format!(
+            "[perf] semantic_candidates feature={feature} total_us={total_us} query_us={} reach_us={} hydration_us={} raw={} filtered={} grouped={} returned={} arity_compatible={} arity_unknown={} arity_incompatible={} counterpart_strict={} counterpart_ambiguous={} hydration_count={} hydration_bytes={} coverage_open={} coverage_truncated={} coverage_incomplete={} coverage_reason={} arity_fallback={}",
+            self.query_us,
+            self.reach_us,
+            self.hydration_us,
+            self.candidates.raw_candidates,
+            self.candidates.filtered_candidates,
+            self.candidates.grouped_candidates,
+            self.returned,
+            self.candidates.arity_compatible,
+            self.candidates.arity_unknown,
+            self.candidates.arity_incompatible,
+            self.candidates.counterpart_strict,
+            self.candidates.counterpart_ambiguous,
+            self.hydration_count,
+            self.hydration_bytes,
+            self.coverage_open as u8,
+            self.coverage_truncated as u8,
+            self.coverage_incomplete as u8,
+            self.coverage_reason,
+            self.arity_fallback as u8,
+        )
+    }
+
+    fn include_type_candidates(&mut self, bundle: &crate::candidate_service::TypeCandidateBundle) {
+        let coverage = if bundle.records.coverage.scanned >= bundle.aliases.coverage.scanned {
+            &bundle.records.coverage
+        } else {
+            &bundle.aliases.coverage
+        };
+        self.candidates.raw_candidates = self
+            .candidates
+            .raw_candidates
+            .saturating_add(coverage.scanned);
+        self.candidates.filtered_candidates = self
+            .candidates
+            .filtered_candidates
+            .saturating_add(bundle.records.candidates.len())
+            .saturating_add(bundle.aliases.candidates.len());
+        self.candidates.grouped_candidates = self
+            .candidates
+            .grouped_candidates
+            .saturating_add(bundle.records.candidates.len())
+            .saturating_add(bundle.alias_resolutions.len());
+        self.coverage_open |= coverage.scope_open;
+        self.coverage_truncated |= coverage.truncated;
+        self.coverage_incomplete |= coverage.incomplete_reason.is_some();
+        if self.coverage_reason == 0 {
+            self.coverage_reason = coverage_reason_code(coverage.incomplete_reason);
+        }
+    }
+
+    fn include_non_callable_candidates(&mut self, count: usize) {
+        self.candidates.raw_candidates = self.candidates.raw_candidates.saturating_add(count);
+        self.candidates.filtered_candidates =
+            self.candidates.filtered_candidates.saturating_add(count);
+        self.candidates.grouped_candidates =
+            self.candidates.grouped_candidates.saturating_add(count);
+    }
+}
+
+fn coverage_reason_code(reason: Option<query::CandidateIncompleteReason>) -> u8 {
+    match reason {
+        None => 0,
+        Some(query::CandidateIncompleteReason::ScanLimit) => 1,
+        Some(query::CandidateIncompleteReason::CandidateBudget) => 2,
+        Some(query::CandidateIncompleteReason::TimeBudget) => 3,
+        Some(query::CandidateIncompleteReason::Cancelled) => 4,
+        Some(query::CandidateIncompleteReason::FactsUnavailable) => 5,
+        Some(query::CandidateIncompleteReason::GenerationMismatch) => 6,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct HydrationStats {
+    count: usize,
+    bytes: usize,
+}
+
+#[derive(Clone, Copy)]
+enum LiveParseCacheEvent {
+    Hit,
+    Coalesced,
+    Miss,
+}
+
+fn live_parse_cache_log(event: LiveParseCacheEvent) -> &'static str {
+    match event {
+        LiveParseCacheEvent::Hit => "[perf] live_parse_cache state=hit",
+        LiveParseCacheEvent::Coalesced => "[perf] live_parse_cache state=coalesced",
+        LiveParseCacheEvent::Miss => "[perf] live_parse_cache state=miss",
+    }
+}
+
+impl HydrationStats {
+    fn record(&mut self, source: Option<&str>) {
+        if let Some(source) = source {
+            self.count += 1;
+            self.bytes = self.bytes.saturating_add(source.len());
+        }
+    }
+}
 
 fn apply_final_completion_sort_text(items: &mut [CompletionItem]) {
     for (index, item) in items.iter_mut().enumerate() {
@@ -103,19 +239,44 @@ fn apply_final_completion_sort_text(items: &mut [CompletionItem]) {
 #[serde(tag = "kind", rename_all = "camelCase")]
 enum CompletionDocumentationData {
     Indexed {
+        version: u8,
         root: String,
         uri: String,
+        label: String,
         symbol_id: i64,
         semantic_generation: u64,
+        overlay_epoch: u64,
+        document_version: i32,
     },
     CurrentDocument {
+        version: u8,
         uri: String,
         start_line: u32,
+        overlay_epoch: u64,
+        document_version: i32,
+    },
+    Overlay {
+        version: u8,
+        root: String,
+        uri: String,
+        label: String,
+        path: String,
+        start_line: u32,
+        start_col: u32,
+        end_line: u32,
+        end_col: u32,
+        semantic_generation: u64,
+        overlay_epoch: u64,
+        document_version: i32,
     },
     Member {
+        version: u8,
         uri: String,
         owner_path: String,
         signature: String,
+        owner_revision_hash: String,
+        overlay_epoch: u64,
+        document_version: i32,
     },
 }
 
@@ -124,22 +285,52 @@ fn ordinary_completion_item_to_lsp(
     uri: &Url,
     table_roots: &[PathBuf],
     table_semantic_generations: &[SemanticGeneration],
+    overlay_names: &[HashMap<i64, crate::candidate_service::OverlayCompletionName>],
+    overlay_epoch: u64,
+    document_version: i32,
 ) -> CompletionItem {
+    let documentation_label = item.label.clone();
     let data = item.documentation_target.and_then(|target| {
         let target = match target {
             OrdinaryCompletionDocumentationTarget::Indexed {
                 table_index,
                 symbol_id,
-            } => CompletionDocumentationData::Indexed {
-                root: table_roots.get(table_index)?.to_string_lossy().into_owned(),
-                uri: uri.to_string(),
-                symbol_id,
-                semantic_generation: table_semantic_generations.get(table_index)?.0,
+            } => match overlay_names
+                .get(table_index)
+                .and_then(|locators| locators.get(&symbol_id))
+            {
+                Some(locator) => CompletionDocumentationData::Overlay {
+                    version: 3,
+                    root: table_roots.get(table_index)?.to_string_lossy().into_owned(),
+                    uri: uri.to_string(),
+                    label: documentation_label.clone(),
+                    path: locator.path.clone(),
+                    start_line: locator.start_line,
+                    start_col: locator.start_col,
+                    end_line: locator.end_line,
+                    end_col: locator.end_col,
+                    semantic_generation: table_semantic_generations.get(table_index)?.0,
+                    overlay_epoch,
+                    document_version,
+                },
+                None => CompletionDocumentationData::Indexed {
+                    version: 3,
+                    root: table_roots.get(table_index)?.to_string_lossy().into_owned(),
+                    uri: uri.to_string(),
+                    label: documentation_label.clone(),
+                    symbol_id,
+                    semantic_generation: table_semantic_generations.get(table_index)?.0,
+                    overlay_epoch,
+                    document_version,
+                },
             },
             OrdinaryCompletionDocumentationTarget::CurrentDocument { start_line } => {
                 CompletionDocumentationData::CurrentDocument {
+                    version: 3,
                     uri: uri.to_string(),
                     start_line,
+                    overlay_epoch,
+                    document_version,
                 }
             }
         };
@@ -423,8 +614,29 @@ impl Backend {
         if let Some(snapshot) = self.session.documents.snapshot(uri).await {
             return Some((snapshot.version, snapshot.text));
         }
-        uri_to_path(uri)
-            .and_then(|path| std::fs::read_to_string(path).ok())
+        self.disk_document_snapshot(uri).await
+    }
+
+    /// Resolve current text from a caller-owned atomic all-document capture.
+    /// Closed-document disk fallback is isolated on the blocking pool so no
+    /// semantic handler performs filesystem I/O on Tokio's async workers.
+    async fn document_snapshot_from_request(
+        &self,
+        uri: &Url,
+        request: &DocumentRequestSnapshot,
+    ) -> Option<(i32, Arc<str>)> {
+        if let Some(snapshot) = &request.current {
+            return Some((snapshot.version, snapshot.text.clone()));
+        }
+        self.disk_document_snapshot(uri).await
+    }
+
+    async fn disk_document_snapshot(&self, uri: &Url) -> Option<(i32, Arc<str>)> {
+        let path = uri_to_path(uri)?;
+        tokio::task::spawn_blocking(move || std::fs::read_to_string(path))
+            .await
+            .ok()?
+            .ok()
             .map(|text| (0, Arc::from(text)))
     }
 
@@ -469,7 +681,7 @@ impl Backend {
             .cached_live_parse(uri, version, requested_facts)
             .await
         {
-            self.perf_log(|| format!("[perf] live_parse_cache hit {uri} (v{version})"))
+            self.perf_log(|| live_parse_cache_log(LiveParseCacheEvent::Hit).to_string())
                 .await;
             return Some(cached);
         }
@@ -486,13 +698,13 @@ impl Backend {
             .cached_live_parse(uri, version, requested_facts)
             .await
         {
-            self.perf_log(|| format!("[perf] live_parse_cache coalesced {uri} (v{version})"))
+            self.perf_log(|| live_parse_cache_log(LiveParseCacheEvent::Coalesced).to_string())
                 .await;
             return Some(cached);
         }
 
         // Cache miss: parse on the blocking thread-pool and store.
-        self.perf_log(|| format!("[perf] live_parse_cache miss {uri} (v{version})"))
+        self.perf_log(|| live_parse_cache_log(LiveParseCacheEvent::Miss).to_string())
             .await;
         let path_owned = path.to_path_buf();
         let text_owned = text.to_string();
@@ -527,19 +739,6 @@ impl Backend {
             .store_live_parse(uri.clone(), version, facts, index.clone())
             .await;
         Some(index)
-    }
-
-    /// Compute the limited include-reachability scope for `uri`: the current
-    /// file's workspace-relative path plus its bounded reachable set. Returns
-    /// `None` when scoping is disabled, no graph exists yet, or the path cannot
-    /// be resolved — callers then fall back to whole-index behavior.
-    async fn reach_scope_for(&self, uri: &Url) -> Option<(String, Arc<reachability::ReachScope>)> {
-        if !self.scoping_enabled.load(Ordering::Relaxed) {
-            return None;
-        }
-        let root = self.root_for_uri(uri).await?;
-        let context = self.request_context_for_root(root).await;
-        self.reach_scope_from_context(uri, &context)
     }
 
     fn reach_scope_from_context(

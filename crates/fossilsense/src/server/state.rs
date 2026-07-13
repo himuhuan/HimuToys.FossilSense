@@ -38,6 +38,7 @@ pub(super) fn combine_completion_generation(
     generations: &[(PathBuf, EngineEpoch)],
     selection_epoch: u64,
     effective_project: Option<&ProjectKey>,
+    overlay_epoch: u64,
 ) -> u64 {
     let mut hasher = DefaultHasher::new();
     for (root, generation) in generations {
@@ -46,6 +47,7 @@ pub(super) fn combine_completion_generation(
     }
     selection_epoch.hash(&mut hasher);
     effective_project.hash(&mut hasher);
+    overlay_epoch.hash(&mut hasher);
     hasher.finish()
 }
 

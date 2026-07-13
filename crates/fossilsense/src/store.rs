@@ -7,7 +7,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
 use crate::semantic_model::{
     MemberConfidence, MemberKind, PersistentFacts, RecordConfidence, RecordKind, SymbolKind,
-    SymbolRole,
+    SymbolRole, PARSER_FACT_VERSION,
 };
 
 mod generations;
@@ -296,7 +296,10 @@ impl IndexStore {
             )
             .optional()?
             .and_then(|value| value.parse().ok());
-        Ok(version == Some(schema::SCHEMA_VERSION))
+        if version != Some(schema::SCHEMA_VERSION) {
+            return Ok(false);
+        }
+        parser_facts_are_current(&store.conn)
     }
 
     /// Execute one durable read inside a SQLite snapshot pinned to the semantic
@@ -588,36 +591,38 @@ impl IndexStore {
             )
             .optional()?
             .and_then(|value| value.parse().ok());
-        if let Some(version) = stored_version {
-            if version != schema::SCHEMA_VERSION {
-                for name in [
-                    "call_sites",
-                    "callable_anchors",
-                    "type_aliases",
-                    "members",
-                    "record_defs",
-                    "includes",
-                    "symbols",
-                    "files",
-                ] {
-                    let object_type: Option<String> = self
-                        .conn
-                        .query_row(
-                            "SELECT type FROM sqlite_master WHERE name = ?1",
-                            [name],
-                            |row| row.get(0),
-                        )
-                        .optional()?;
-                    if let Some(object_type) = object_type {
-                        let statement = match object_type.as_str() {
-                            "view" => format!("DROP VIEW IF EXISTS {name}"),
-                            _ => format!("DROP TABLE IF EXISTS {name}"),
-                        };
-                        self.conn.execute_batch(&statement)?;
-                    }
+        let schema_mismatch =
+            stored_version.is_some_and(|version| version != schema::SCHEMA_VERSION);
+        let parser_mismatch = stored_version == Some(schema::SCHEMA_VERSION)
+            && !parser_facts_are_current(&self.conn)?;
+        if schema_mismatch || parser_mismatch {
+            for name in [
+                "call_sites",
+                "callable_anchors",
+                "type_aliases",
+                "members",
+                "record_defs",
+                "includes",
+                "symbols",
+                "files",
+            ] {
+                let object_type: Option<String> = self
+                    .conn
+                    .query_row(
+                        "SELECT type FROM sqlite_master WHERE name = ?1",
+                        [name],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if let Some(object_type) = object_type {
+                    let statement = match object_type.as_str() {
+                        "view" => format!("DROP VIEW IF EXISTS {name}"),
+                        _ => format!("DROP TABLE IF EXISTS {name}"),
+                    };
+                    self.conn.execute_batch(&statement)?;
                 }
-                self.conn.execute_batch(schema::DROP_DATA_TABLES_SQL)?;
             }
+            self.conn.execute_batch(schema::DROP_DATA_TABLES_SQL)?;
         }
 
         self.conn.execute_batch(schema::CREATE_SCHEMA_SQL)?;
@@ -681,6 +686,34 @@ impl IndexStore {
     pub fn call_fact_view(&self) -> views::CallFactStoreView<'_> {
         views::CallFactStoreView::new(self)
     }
+}
+
+/// A schema can stay structurally current while the parser fact contract moves
+/// forward. Every active revision must therefore carry the named fact version;
+/// otherwise both the side-by-side index lifecycle and direct store opening
+/// treat the database as a rebuild source, never as rows suitable for dual-read.
+fn parser_facts_are_current(conn: &Connection) -> Result<bool> {
+    let required_tables: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'table' AND name IN ('active_file_revisions', 'file_revisions')",
+        [],
+        |row| row.get(0),
+    )?;
+    if required_tables != 2 {
+        return Ok(false);
+    }
+
+    let stale_active_revisions: i64 = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM active_file_revisions active
+             LEFT JOIN file_revisions revision ON revision.id = active.revision_id
+             WHERE revision.id IS NULL OR revision.parser_version <> ?1
+         )",
+        [PARSER_FACT_VERSION],
+        |row| row.get(0),
+    )?;
+    Ok(stale_active_revisions == 0)
 }
 
 fn map_symbol_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SymbolRecord> {
