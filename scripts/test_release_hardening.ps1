@@ -124,16 +124,16 @@ $scriptText = Get-Content -Raw -LiteralPath $hardeningScript
 if ($scriptText -match '\[string\]\$Version\s*=\s*"1\.4\.1"') {
     throw 'The hardening script restored the stale 1.4.1 default.'
 }
-if ($scriptText -notmatch 'docs/archive/delivery/DELIVERY-NOTE-') {
-    throw 'The hardening script does not use the canonical archived delivery-note path.'
+if ($scriptText -match 'docs/archive/delivery/DELIVERY-NOTE-' -or
+    $scriptText -match 'Delivery note') {
+    throw 'The hardening script still requires a repository delivery-note document.'
 }
 if ($scriptText -match '\$isV142OrLater') {
     throw 'The v1.4.2-only contract is still incorrectly bound to all future versions.'
 }
 if ($scriptText -notmatch 'extension/bin/release-build\.json' -or
-    $scriptText -notmatch 'release input fingerprint does not match' -or
-    $scriptText -notmatch 'Delivery note does not name the selected VSIX') {
-    throw 'The hardening script does not bind the exact VSIX to its release inputs and delivery note.'
+    $scriptText -notmatch 'release input fingerprint does not match') {
+    throw 'The hardening script does not bind the exact VSIX to its release inputs.'
 }
 
 $firstFingerprint = Read-ReleaseFingerprint $repoRoot
@@ -221,27 +221,11 @@ try {
     $artifactPath = Join-Path $distRoot $artifactName
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     [System.IO.Compression.ZipFile]::CreateFromDirectory($stageRoot, $artifactPath)
-    $artifactSha256 = (Get-FileHash -LiteralPath $artifactPath -Algorithm SHA256).Hash.ToLowerInvariant()
-    $delivery = @"
-# FossilSense 1.4.2
-
-VSIX artifact: $artifactName
-VSIX SHA-256: $artifactSha256
-Release input SHA-256: $($packagedFingerprint.releaseInputSha256)
-Source commit: $($packagedFingerprint.sourceCommit)
-
-User-visible behavior changes: counterpart arity record typedef.
-Known limitations: unsupported fallback.
-Verification performed.
-"@
-    Write-FixtureFile $staleRoot 'docs/archive/delivery/DELIVERY-NOTE-1.4.2.md' $delivery
-
     $boundArtifact = Invoke-HardeningCheck @('-RepoRoot', $staleRoot)
     $boundOutput = $boundArtifact.Output -join "`n"
     if ($boundOutput -match 'release input fingerprint does not match' -or
         $boundOutput -match 'staged .* SHA-256 does not match' -or
-        $boundOutput -match 'aggregate payload SHA-256 does not match' -or
-        $boundOutput -match 'Delivery note does not') {
+        $boundOutput -match 'aggregate payload SHA-256 does not match') {
         throw "A freshly bound fixture VSIX failed its fingerprint checks:`n$boundOutput"
     }
 

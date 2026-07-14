@@ -2,82 +2,91 @@
 
 status: current
 
-scope: U-Boot / Wine call relations, full indexing, process peak memory
+scope: U-Boot / Wine full indexing, call relations, process peak memory
 
 ## Purpose
 
-This runbook fixes the measurement boundary used by the large-workspace performance work. It intentionally keeps the public U-Boot and Wine checkouts and generated SQLite files outside Git. Reports contain anonymous case IDs and aggregate counters only; they do not copy source identifiers, source snippets, or workspace paths.
+This runbook defines the reproducible large-workspace performance boundary. Public U-Boot and Wine checkouts, generated databases, and raw reports stay outside Git. Committed results may contain aggregate counters and anonymous case IDs, but must not contain source identifiers, snippets, or local workspace paths.
 
-## Prerequisites
+The benchmark implementation is `scripts/benchmark_large_workspace.ps1`. Read that script before changing or interpreting a case; this document does not replace its current arguments or metrics.
 
-Build the release binary. Query-only comparison requires prepared schema-15 indexes under `target/benchmark/`; a filtered full-index run does not require query databases:
+## Inputs
+
+Build the current release binary:
 
 ```powershell
 cargo build --release -p fossilsense
 ```
 
-Expected local inputs are `samples/u-boot`, `samples/wine`, `target/benchmark/index-u-boot.sqlite`, and `target/benchmark/index-wine.sqlite`. Missing cases are skipped with a warning.
+Place at least one large checkout at:
 
-## Query and memory benchmark
+```text
+samples/u-boot
+samples/wine
+```
+
+These directories are local and git-ignored. Query cases additionally require current indexes under `target/benchmark/`; create them with the full-index cases instead of reusing a database from an older schema.
+
+## Required 60-second gate
+
+Every release, major feature, or architecture/index/storage/parser/query/concurrency change must run at least one release full-index case:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark_large_workspace.ps1 `
+  -Repeats 1 -IncludeFullIndex -CaseFilter u-boot-full-index -TimeoutSeconds 60
+```
+
+or:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark_large_workspace.ps1 `
+  -Repeats 1 -IncludeFullIndex -CaseFilter wine-full-index -TimeoutSeconds 60
+```
+
+The build is outside the measured process. The full-index process and reported `elapsed_ms` must both be at most `60,000 ms`. A timeout or any value above 60 seconds fails the feature; a faster mini-c run or a lower average does not override that result.
+
+For a release candidate, run both cases when both checkouts are available. Record the source revision of the sample, machine CPU/RAM/storage, exact command, `elapsed_ms`, `write_ms`, phase timings, peak Working Set/Private Bytes, and final database size.
+
+## Repeated diagnostic runs
+
+After the hard gate passes, repeated runs can be used to compare branches:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark_large_workspace.ps1 `
+  -Repeats 3 -IncludeFullIndex -CaseFilter wine-full-index -TimeoutSeconds 60
+```
+
+Compare medians while retaining individual runs. A change is meaningful only when it is larger than same-build run-to-run spread. A median below 60 seconds does not hide an individual required run above the gate.
+
+The script writes JSON and Markdown reports under `target/benchmark/`. It starts a fresh process per repetition and samples Working Set and Private Bytes every 20 ms.
+
+## Call-relation query cases
+
+After building current full indexes, run bounded query cases with at least three repetitions:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark_large_workspace.ps1 -Repeats 3
 ```
 
-The script launches a fresh process per run and samples Working Set and Private Bytes every 20 ms. It writes JSON and Markdown under `target/benchmark`; raw CLI output stays in process memory only until the script parses the whitelisted numeric metrics.
+The fixed cases cover low-frequency U-Boot incoming calls and medium/high fan-in Wine incoming calls. Review `relation_query_entities`, `relation_query_call_sites`, `relation_query_relations`, `relation_query_call_site_refs`, `relation_query_ms`, `query_us`, elapsed time, and peak memory.
 
-The fixed cases cover:
+## Correctness before performance
 
-- U-Boot low-frequency incoming calls.
-- Wine medium fan-in incoming calls.
-- Wine high-frequency incoming calls.
-
-Use at least three repetitions before comparing branches. Compare medians, retain the individual runs, and treat a result as meaningful only when the direction is larger than the same-build run-to-run spread.
-
-## Full-index benchmark
-
-The full rebuild is opt-in because it takes minutes and replaces dedicated benchmark databases:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark_large_workspace.ps1 `
-  -Repeats 1 -IncludeFullIndex -TimeoutSeconds 1800
-```
-
-To isolate one full-index case without first running query cases:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark_large_workspace.ps1 `
-  -Repeats 1 -IncludeFullIndex -CaseFilter wine-full-index -TimeoutSeconds 1800
-```
-
-Full-index cases remove only their dedicated database and WAL/SHM sidecars under the resolved benchmark root before every repetition. This guarantees that bulk-writer measurements start with an empty schema and cannot accidentally exercise an older database's online indexes.
-
-The relevant gates are `write_ms`, `elapsed_ms`, peak memory, final database bytes, and the call-fact `dbstat` bytes recorded by the accompanying analysis. A tuning result must report both elapsed time and memory/disk cost; elapsed-only wins are insufficient.
-
-## Relation-query metrics
-
-Current `query calls` output exposes only bounded request-index counters: `relation_query_entities`, `relation_query_call_sites`, `relation_query_relations`, `relation_query_call_site_refs`, `relation_query_ms`, and `query_us`. Benchmark query cases must use schema-15 `*-rebuild.sqlite` databases.
-
-## Correctness and synthetic gates
-
-Run the focused semantic suite before accepting performance data:
+Performance data is invalid if focused correctness tests fail:
 
 ```powershell
 cargo test -p fossilsense call_catalog --no-fail-fast
 cargo test -p fossilsense store::tests --no-fail-fast
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test_benchmark_entrypoints.ps1
 ```
 
-The ignored release benchmark is diagnostic, not a pass/fail CI assertion:
+Optional ignored release diagnostics:
 
 ```powershell
 cargo test --release -p fossilsense benchmark_large_fan_in_catalog_and_cached_query -- --ignored --nocapture
 ```
 
-High-ambiguity budget and pagination are covered by the lazy call-service tests and the ignored release benchmark above.
-
-## Name-index publication benchmark
-
-The ignored release benchmark measures schema-15 SQLite-to-name-index streaming construction and repeated replacement of the single file with the most symbol rows. It prints aggregate counts/timings only:
+For name-index publication diagnostics, point the ignored test at a current Wine rebuild database:
 
 ```powershell
 $env:FOSSILSENSE_BENCH_DB = (Resolve-Path 'target/benchmark/index-wine-rebuild.sqlite').Path
@@ -86,4 +95,4 @@ cargo test --release -p fossilsense `
   --ignored --exact --nocapture
 ```
 
-`name_stream_build_ms` covers the complete borrowed SQLite visitor plus final immutable index construction; there is no separate owned-row load phase. `name_sql_visit_ms` and `name_finalize_ms` split intern/row visitation from immutable arena/posting finalization without adding production timers. On Windows the test samples its own Private Bytes every millisecond around dirty replacement. `name_dirty_private_delta_bytes` is the process peak above the fully built base table, not an allocator estimate. After preserving the five-update dirty measurement, the test accumulates worst-case replacements until the background-compaction threshold is reached and reports `name_compaction_input_segments`, `name_compaction_ms`, and `name_compaction_private_delta_bytes` independently.
+Report elapsed time together with memory and disk cost. An elapsed-only improvement is not sufficient when it causes unbounded memory, database growth, incomplete results without coverage, or correctness regression.

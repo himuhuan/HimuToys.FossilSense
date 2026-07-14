@@ -399,28 +399,8 @@ if ($isV142Release) {
     )
 }
 
-$releaseNotesPath = Join-Path $RepoRoot "docs/archive/delivery/DELIVERY-NOTE-$Version.md"
-$releaseNotes = $null
 $latestVsix = $null
 if (-not $MetadataOnly) {
-    if (-not (Test-Path -LiteralPath $releaseNotesPath -PathType Leaf)) {
-        Add-Failure "Delivery note is missing: $releaseNotesPath."
-    } else {
-        $releaseNotes = Read-Utf8Text $releaseNotesPath
-        $deliveryRequirements = @(
-            @{ Label = "release version '$Version'"; Pattern = $versionPattern },
-            @{ Label = 'a VSIX artifact declaration'; Pattern = '(?i)VSIX\s+(artifact|\u4ea7\u7269)|VSIX.*BUILD' },
-            @{ Label = 'verification performed'; Pattern = '(?i)verification\s+performed|\u9a8c\u8bc1(\u5df2\u6267\u884c|\u7ed3\u679c|\u95e8\u7981)' },
-            @{ Label = 'user-visible behavior changes'; Pattern = '(?i)user-visible|behavior\s+changes|\u7528\u6237\u53ef\u89c1|\u884c\u4e3a\u53d8\u5316' },
-            @{ Label = 'known limitations/non-goals'; Pattern = '(?i)known\s+(limitations|non-goals)|\u5df2\u77e5(\u9650\u5236|\u975e\u76ee\u6807)|\u4e0d\u80fd\u505a\u4ec0\u4e48' }
-        )
-        foreach ($requirement in $deliveryRequirements) {
-            if ($releaseNotes -notmatch $requirement.Pattern) {
-                Add-Failure "Delivery note is missing $($requirement.Label)."
-            }
-        }
-    }
-
     $distDir = Join-Path $RepoRoot 'dist'
     $vsixPattern = "fossilsense-vscode-$($Version)_BUILD*.vsix"
     $vsixFiles = @()
@@ -435,21 +415,6 @@ if (-not $MetadataOnly) {
     } else {
         $latestVsix = $vsixFiles[0]
         $currentReleaseFingerprint = Get-ReleaseInputFingerprint $RepoRoot
-        $artifactSha256 = Get-FileSha256 $latestVsix.FullName
-        if ($null -ne $releaseNotes) {
-            if ($releaseNotes -notmatch [regex]::Escape($latestVsix.Name)) {
-                Add-Failure "Delivery note does not name the selected VSIX '$($latestVsix.Name)'."
-            }
-            if ($releaseNotes -notmatch "(?i)$([regex]::Escape($artifactSha256))") {
-                Add-Failure "Delivery note does not record the selected VSIX SHA-256 '$artifactSha256'."
-            }
-            if ($releaseNotes -notmatch "(?i)$([regex]::Escape($currentReleaseFingerprint.Sha256))") {
-                Add-Failure (
-                    "Delivery note does not record the current release-input SHA-256 " +
-                    "'$($currentReleaseFingerprint.Sha256)'."
-                )
-            }
-        }
         Add-Type -AssemblyName System.IO.Compression.FileSystem
         $zip = [System.IO.Compression.ZipFile]::OpenRead($latestVsix.FullName)
         $tempDirectory = $null
@@ -562,11 +527,6 @@ if (-not $MetadataOnly) {
                 $packagedCommit = [string]$packagedBuild.sourceCommit
                 if ([string]::IsNullOrWhiteSpace($packagedCommit)) {
                     Add-Failure 'VSIX release-build.json does not record a source commit state.'
-                } elseif ($null -ne $releaseNotes -and
-                    $releaseNotes -notmatch "(?i)$([regex]::Escape($packagedCommit))") {
-                    Add-Failure (
-                        "Delivery note does not record the packaged source commit '$packagedCommit'."
-                    )
                 }
             }
 
@@ -645,8 +605,8 @@ if ($MetadataOnly) {
     Write-Host "Release hardening metadata verification passed for v$Version (artifact checks skipped)." -ForegroundColor Green
 } else {
     Write-Host "Release hardening verification passed for v$Version." -ForegroundColor Green
-    Write-Host "Delivery note: $releaseNotesPath"
     if ($null -ne $latestVsix) {
         Write-Host "VSIX artifact: $($latestVsix.FullName)"
+        Write-Host "VSIX SHA-256: $(Get-FileSha256 $latestVsix.FullName)"
     }
 }
