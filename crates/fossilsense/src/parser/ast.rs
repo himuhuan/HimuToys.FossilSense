@@ -2,10 +2,12 @@ use std::path::Path;
 
 use super::lexical::{compact_whitespace, make_symbol};
 use super::{
-    AliasTarget, FieldDef, LocalBinding, LocalBindingKind, LocalDeclaration, MemberConfidence,
-    MemberDef, MemberKind, Occurrence, ParseFacts, RecordConfidence, RecordDef, RecordKind, Symbol,
-    SymbolKind, SymbolRole, SyntacticRole, TypeAlias,
+    AliasTarget, AliasTargetFidelity, DeclaratorShape, FieldDef, LocalBinding, LocalBindingKind,
+    LocalDeclaration, MemberConfidence, MemberDef, MemberKind, Occurrence, ParseFacts,
+    RecordConfidence, RecordDef, RecordKind, RecordRangeFidelity, Symbol, SymbolKind, SymbolRole,
+    SyntacticRole, TypeAlias,
 };
+use crate::call_model::{SourcePosition, SourceRange};
 
 pub(super) struct AstIndex {
     pub(super) parse_error_count: usize,
@@ -163,6 +165,14 @@ pub(super) fn collect_ast_index(
                     let sig_end = body.start_byte();
                     let raw_sig = source.get(start_byte..sig_end).unwrap_or("");
                     let signature = compact_whitespace(raw_sig);
+                    let declaration = enclosing_record_declaration(node).unwrap_or(node);
+                    let declaration_range = record_declaration_range(node, source, line_starts);
+                    let declaration_hash = source_range_hash(source, declaration_range);
+                    let range_fidelity = if contains_error_or_missing(declaration) {
+                        RecordRangeFidelity::Malformed
+                    } else {
+                        RecordRangeFidelity::AstExact
+                    };
 
                     out.records.push(RecordDef {
                         record_key: record_key.clone(),
@@ -176,6 +186,10 @@ pub(super) fn collect_ast_index(
                         start_col,
                         end_line,
                         end_col,
+                        body_range: source_range(body, source, line_starts),
+                        declaration_range,
+                        declaration_hash,
+                        range_fidelity,
                         confidence,
                         signature,
                     });
@@ -216,7 +230,25 @@ pub(super) fn collect_ast_index(
             if let Some(type_node) = node.child_by_field_name("type") {
                 if let Some(target) = get_alias_target(type_node, source) {
                     let mut cursor = node.walk();
-                    for decl in node.children_by_field_name("declarator", &mut cursor) {
+                    let declarators: Vec<_> = node
+                        .children_by_field_name("declarator", &mut cursor)
+                        .collect();
+                    let underlying_spelling = alias_underlying_spelling(
+                        node,
+                        type_node,
+                        declarators.first().copied(),
+                        source,
+                    );
+                    let base_qualifiers = typedef_base_qualifiers(node, source);
+                    let declaration_range = source_range(node, source, line_starts);
+                    let declaration_hash = source_range_hash(source, declaration_range);
+                    let target_fidelity = if contains_error_or_missing(node) {
+                        AliasTargetFidelity::Malformed
+                    } else {
+                        AliasTargetFidelity::AstExact
+                    };
+                    let path_text = path.to_string_lossy().replace('\\', "/");
+                    for decl in declarators {
                         if let Some((alias_node, alias)) =
                             typedef_declarator_identifier(decl, source)
                         {
@@ -232,14 +264,26 @@ pub(super) fn collect_ast_index(
                                     out.type_symbols.push(symbol);
                                 }
                             }
-                            let is_same = match &target {
-                                AliasTarget::NamedRecord { tag, .. } => alias == tag,
-                                AliasTarget::UnresolvedTypeName(name) => alias == name,
-                                _ => false,
-                            };
-                            if facts.contains(ParseFacts::ALIASES) && !is_same {
+                            if facts.contains(ParseFacts::ALIASES) {
                                 let alias_start = alias_node.start_position();
                                 let alias_end = alias_node.end_position();
+                                let declarator_shape = if target_fidelity
+                                    == AliasTargetFidelity::Malformed
+                                    || contains_error_or_missing(decl)
+                                {
+                                    DeclaratorShape::Unsupported
+                                } else {
+                                    typedef_declarator_shape(decl, source, &base_qualifiers)
+                                };
+                                let fingerprint = digest(&format!(
+                                    "{}|{}|{}|{}|{:?}|{:?}",
+                                    path_text,
+                                    node.start_byte(),
+                                    alias_node.start_byte(),
+                                    alias,
+                                    target,
+                                    declarator_shape
+                                ));
                                 out.aliases.push(TypeAlias {
                                     alias: alias.to_string(),
                                     target: target.clone(),
@@ -257,6 +301,12 @@ pub(super) fn collect_ast_index(
                                         line_starts.get(alias_end.row).copied().unwrap_or(0),
                                         alias_node.end_byte(),
                                     ),
+                                    declaration_range,
+                                    declaration_hash,
+                                    underlying_spelling: underlying_spelling.clone(),
+                                    declarator_shape,
+                                    target_fidelity,
+                                    fingerprint,
                                 });
                             }
                         }
@@ -885,7 +935,11 @@ fn push_synthetic_nested_record(
         .map(|body| body.start_byte())
         .unwrap_or(end_byte);
     let signature = compact_whitespace(source.get(start_byte..sig_end).unwrap_or(""));
+    let enclosing_declaration = enclosing_record_declaration(type_node);
+    let range_is_malformed = contains_error_or_missing(type_node)
+        || enclosing_declaration.is_some_and(contains_error_or_missing);
 
+    let declaration_range = record_declaration_range(type_node, source, line_starts);
     records.push(RecordDef {
         record_key: record_key.to_string(),
         display_name: display_name.to_string(),
@@ -898,6 +952,17 @@ fn push_synthetic_nested_record(
         start_col: byte_to_utf16_col(source, start_line_byte, start_byte),
         end_line,
         end_col: byte_to_utf16_col(source, end_line_byte, end_byte),
+        body_range: type_node
+            .child_by_field_name("body")
+            .map(|body| source_range(body, source, line_starts))
+            .unwrap_or_else(|| source_range(type_node, source, line_starts)),
+        declaration_range,
+        declaration_hash: source_range_hash(source, declaration_range),
+        range_fidelity: if range_is_malformed {
+            RecordRangeFidelity::Malformed
+        } else {
+            RecordRangeFidelity::AstExact
+        },
         confidence: RecordConfidence::Heuristic,
         signature,
     });
@@ -971,6 +1036,239 @@ fn push_member_at_byte(
         end_col: byte_to_utf16_col(source, end_line_byte, end_byte),
         signature,
     });
+}
+
+fn enclosing_record_declaration(record: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
+    let parent = record.parent()?;
+    matches!(
+        parent.kind(),
+        "type_definition" | "declaration" | "field_declaration"
+    )
+    .then_some(parent)
+}
+
+fn record_declaration_range(
+    record: tree_sitter::Node<'_>,
+    source: &str,
+    line_starts: &[usize],
+) -> SourceRange {
+    if let Some(declaration) = enclosing_record_declaration(record) {
+        return source_range(declaration, source, line_starts);
+    }
+
+    // At translation-unit scope the C/C++ grammars expose a standalone record
+    // specifier directly and keep its terminating semicolon as an unnamed
+    // sibling. Join those two exact AST tokens rather than scanning arbitrary
+    // following source text.
+    if let Some(semicolon) = record.next_sibling().filter(|node| node.kind() == ";") {
+        return source_range_bytes(
+            record.start_byte(),
+            semicolon.end_byte(),
+            source,
+            line_starts,
+        );
+    }
+
+    source_range(record, source, line_starts)
+}
+
+fn source_range(node: tree_sitter::Node<'_>, source: &str, line_starts: &[usize]) -> SourceRange {
+    let start = node.start_position();
+    let end = node.end_position();
+    SourceRange {
+        start: SourcePosition {
+            line: start.row as u32,
+            character: byte_to_utf16_col(
+                source,
+                line_starts.get(start.row).copied().unwrap_or(0),
+                node.start_byte(),
+            ) as u32,
+        },
+        end: SourcePosition {
+            line: end.row as u32,
+            character: byte_to_utf16_col(
+                source,
+                line_starts.get(end.row).copied().unwrap_or(0),
+                node.end_byte(),
+            ) as u32,
+        },
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+    }
+}
+
+fn source_range_bytes(
+    start_byte: usize,
+    end_byte: usize,
+    source: &str,
+    line_starts: &[usize],
+) -> SourceRange {
+    let start_line = line_starts
+        .partition_point(|line_start| *line_start <= start_byte)
+        .saturating_sub(1);
+    let end_line = line_starts
+        .partition_point(|line_start| *line_start <= end_byte)
+        .saturating_sub(1);
+    SourceRange {
+        start: SourcePosition {
+            line: start_line as u32,
+            character: byte_to_utf16_col(
+                source,
+                line_starts.get(start_line).copied().unwrap_or(0),
+                start_byte,
+            ) as u32,
+        },
+        end: SourcePosition {
+            line: end_line as u32,
+            character: byte_to_utf16_col(
+                source,
+                line_starts.get(end_line).copied().unwrap_or(0),
+                end_byte,
+            ) as u32,
+        },
+        start_byte,
+        end_byte,
+    }
+}
+
+fn alias_underlying_spelling(
+    declaration: tree_sitter::Node<'_>,
+    type_node: tree_sitter::Node<'_>,
+    first_declarator: Option<tree_sitter::Node<'_>>,
+    source: &str,
+) -> String {
+    let prefix_end = first_declarator
+        .map(|declarator| declarator.start_byte())
+        .unwrap_or_else(|| type_node.end_byte());
+    let before_type = source
+        .get(declaration.start_byte()..type_node.start_byte())
+        .unwrap_or_default();
+    let after_type = source
+        .get(type_node.end_byte()..prefix_end)
+        .unwrap_or_default();
+    let type_spelling = if let Some(body) = type_node.child_by_field_name("body") {
+        source
+            .get(type_node.start_byte()..body.start_byte())
+            .unwrap_or_default()
+    } else {
+        source
+            .get(type_node.start_byte()..type_node.end_byte())
+            .unwrap_or_default()
+    };
+    let before_type = strip_typedef_keyword(before_type);
+    compact_whitespace(&format!("{before_type}{type_spelling}{after_type}"))
+}
+
+fn strip_typedef_keyword(value: &str) -> &str {
+    let trimmed = value.trim_start();
+    let Some(rest) = trimmed.strip_prefix("typedef") else {
+        return value;
+    };
+    if rest
+        .chars()
+        .next()
+        .is_some_and(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+    {
+        value
+    } else {
+        rest
+    }
+}
+
+fn typedef_base_qualifiers(node: tree_sitter::Node<'_>, source: &str) -> Vec<String> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .filter(|child| child.kind() == "type_qualifier")
+        .filter_map(|child| node_text(child, source).map(str::to_string))
+        .collect()
+}
+
+fn typedef_declarator_shape(
+    declarator: tree_sitter::Node<'_>,
+    source: &str,
+    base_qualifiers: &[String],
+) -> DeclaratorShape {
+    if simple_alias_identifier(declarator) {
+        return if base_qualifiers.is_empty() {
+            DeclaratorShape::Identity
+        } else {
+            DeclaratorShape::Qualified {
+                qualifiers: base_qualifiers.to_vec(),
+            }
+        };
+    }
+
+    match declarator.kind() {
+        "pointer_declarator" => {
+            let Some(inner) = declarator.child_by_field_name("declarator") else {
+                return DeclaratorShape::Unsupported;
+            };
+            if !simple_alias_identifier(inner) {
+                return DeclaratorShape::Unsupported;
+            }
+            let mut cursor = declarator.walk();
+            let mut qualifiers = Vec::new();
+            for child in declarator.named_children(&mut cursor) {
+                if child.id() == inner.id() {
+                    continue;
+                }
+                if child.kind() != "type_qualifier" {
+                    return DeclaratorShape::Unsupported;
+                }
+                if let Some(qualifier) = node_text(child, source) {
+                    qualifiers.push(qualifier.to_string());
+                }
+            }
+            DeclaratorShape::Pointer { qualifiers }
+        }
+        "array_declarator" => {
+            let Some(inner) = declarator.child_by_field_name("declarator") else {
+                return DeclaratorShape::Unsupported;
+            };
+            if !simple_alias_identifier(inner) {
+                return DeclaratorShape::Unsupported;
+            }
+            let extent_text = declarator
+                .child_by_field_name("size")
+                .and_then(|size| node_text(size, source))
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            DeclaratorShape::Array { extent_text }
+        }
+        _ => DeclaratorShape::Unsupported,
+    }
+}
+
+fn simple_alias_identifier(node: tree_sitter::Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "identifier" | "field_identifier" | "type_identifier" | "primitive_type"
+    )
+}
+
+fn contains_error_or_missing(root: tree_sitter::Node<'_>) -> bool {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.is_error() || node.is_missing() {
+            return true;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.children(&mut cursor));
+    }
+    false
+}
+
+fn digest(value: &str) -> String {
+    blake3::hash(value.as_bytes()).to_hex()[..24].to_string()
+}
+
+fn source_range_hash(source: &str, range: SourceRange) -> [u8; 32] {
+    let bytes = source
+        .as_bytes()
+        .get(range.start_byte..range.end_byte)
+        .unwrap_or_default();
+    *blake3::hash(bytes).as_bytes()
 }
 
 fn parent_typedef_name(node: tree_sitter::Node<'_>, source: &str) -> Option<String> {

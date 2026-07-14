@@ -1,13 +1,47 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
-use rusqlite::types::Value;
+use rusqlite::types::{Type, Value};
 use rusqlite::OptionalExtension;
 
+use crate::call_model::{SourcePosition, SourceRange};
 use crate::model::{MemberCandidate, RecordCandidate, ScopeTier};
 use crate::resolver::{self, ResolveContext};
+use crate::semantic_model::{AliasTargetFidelity, DeclaratorShape, RecordRangeFidelity};
 
 use crate::store::{record_kind_from_str, IndexStore};
+
+const MEMBER_FALLBACK_SCAN_LIMIT: usize = 8_192;
+
+const RECORD_READ_SELECT: &str = "SELECT r.id, r.display_name, r.tag_name, r.typedef_name, r.kind,
+            f.path, rev.source, f.directly_included,
+            r.start_byte, r.end_byte, r.start_line, r.start_col, r.end_line, r.end_col,
+            r.body_start_byte, r.body_end_byte, r.body_start_line, r.body_start_col,
+            r.body_end_line, r.body_end_col,
+            r.declaration_start_byte, r.declaration_end_byte,
+            r.declaration_start_line, r.declaration_start_col,
+            r.declaration_end_line, r.declaration_end_col,
+            r.range_fidelity, r.confidence, r.signature,
+            rev.id, rev.size, rev.mtime_ns, rev.hash, r.declaration_hash
+     FROM record_defs r
+     JOIN files f ON f.id = r.file_id
+     JOIN active_file_revisions active
+       ON active.file_id = r.file_id AND active.revision_id = r.revision_id
+     JOIN file_revisions rev ON rev.id = active.revision_id";
+
+const ALIAS_READ_SELECT: &str = "SELECT a.id, a.alias, f.path, rev.source, f.directly_included,
+            a.start_byte, a.end_byte, a.start_line, a.start_col, a.end_line, a.end_col,
+            a.declaration_start_byte, a.declaration_end_byte,
+            a.declaration_start_line, a.declaration_start_col,
+            a.declaration_end_line, a.declaration_end_col,
+            a.underlying_spelling, a.declarator_shape, a.target_fidelity,
+            lower(hex(a.fingerprint)), a.target_record_id, a.target_name, a.target_kind,
+            a.confidence, rev.id, rev.size, rev.mtime_ns, rev.hash, a.declaration_hash
+     FROM type_aliases a
+     JOIN files f ON f.id = a.file_id
+     JOIN active_file_revisions active
+       ON active.file_id = a.file_id AND active.revision_id = a.revision_id
+     JOIN file_revisions rev ON rev.id = active.revision_id";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordReadRow {
@@ -25,8 +59,40 @@ pub struct RecordReadRow {
     pub start_col: usize,
     pub end_line: usize,
     pub end_col: usize,
+    pub body_range: SourceRange,
+    pub declaration_range: SourceRange,
+    pub range_fidelity: RecordRangeFidelity,
     pub confidence: crate::semantic_model::RecordConfidence,
     pub signature: String,
+    pub revision_id: i64,
+    pub revision_size: u64,
+    pub revision_mtime_ns: i64,
+    pub revision_hash: String,
+    pub declaration_hash: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeAliasReadRow {
+    pub id: i64,
+    pub alias: String,
+    pub path: String,
+    pub external: bool,
+    pub directly_included: bool,
+    pub name_range: SourceRange,
+    pub declaration_range: SourceRange,
+    pub underlying_spelling: String,
+    pub declarator_shape: DeclaratorShape,
+    pub target_fidelity: AliasTargetFidelity,
+    pub fingerprint: String,
+    pub target_record_id: Option<i64>,
+    pub target_name: Option<String>,
+    pub target_kind: Option<crate::semantic_model::RecordKind>,
+    pub confidence: String,
+    pub revision_id: i64,
+    pub revision_size: u64,
+    pub revision_mtime_ns: i64,
+    pub revision_hash: String,
+    pub declaration_hash: [u8; 32],
 }
 
 impl RecordReadRow {
@@ -62,6 +128,7 @@ pub struct MemberReadRow {
     pub owner_path: String,
     pub external: bool,
     pub directly_included: bool,
+    pub revision_hash: String,
 }
 
 impl MemberReadRow {
@@ -79,6 +146,7 @@ impl MemberReadRow {
             ),
             confidence: self.confidence,
             owner_path: self.owner_path,
+            owner_revision_hash: Some(self.revision_hash),
         }
     }
 }
@@ -101,21 +169,103 @@ impl<'a> MemberStoreView<'a> {
         self.resolve_record_candidates_inner(names, ctx, &mut visited)
     }
 
+    pub fn record_rows_by_name_limited(
+        &self,
+        name: &str,
+        limit: usize,
+    ) -> Result<(Vec<RecordReadRow>, bool)> {
+        let sql = format!(
+            "{RECORD_READ_SELECT}
+             WHERE r.display_name = ?1 OR r.tag_name = ?1 OR r.typedef_name = ?1
+             ORDER BY f.path, r.start_byte, r.id
+             LIMIT ?2"
+        );
+        let mut stmt = self.store.conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            rusqlite::params![name, limit.saturating_add(1) as i64],
+            record_read_row,
+        )?;
+        let mut output = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let truncated = output.len() > limit;
+        output.truncate(limit);
+        Ok((output, truncated))
+    }
+
+    pub fn record_row_by_id(&self, id: i64) -> Result<Option<RecordReadRow>> {
+        let sql = format!(
+            "{RECORD_READ_SELECT}
+             WHERE r.id = ?1"
+        );
+        self.store
+            .conn
+            .query_row(&sql, [id], record_read_row)
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn alias_rows_by_name_limited(
+        &self,
+        name: &str,
+        limit: usize,
+    ) -> Result<(Vec<TypeAliasReadRow>, bool)> {
+        let sql = format!(
+            "{ALIAS_READ_SELECT}
+             WHERE a.alias = ?1
+             ORDER BY f.path, a.start_byte, a.id
+             LIMIT ?2"
+        );
+        let mut stmt = self.store.conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            rusqlite::params![name, limit.saturating_add(1) as i64],
+            type_alias_read_row,
+        )?;
+        let mut output = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let truncated = output.len() > limit;
+        output.truncate(limit);
+        Ok((output, truncated))
+    }
+
     pub fn members_for_records(
         &self,
         record_ids: &[i64],
         prefix: Option<&str>,
         ctx: Option<&ResolveContext<'_>>,
     ) -> Result<Vec<MemberCandidate>> {
+        self.query_members_for_records(record_ids, prefix, ctx, None)
+            .map(|(members, _, _)| members)
+    }
+
+    /// Read member rows for a bounded record set without materializing an
+    /// arbitrarily large record body. `scanned` counts rows retained inside
+    /// the caller's budget; `truncated` is set by a single LIMIT+1 probe.
+    pub fn members_for_records_limited(
+        &self,
+        record_ids: &[i64],
+        prefix: Option<&str>,
+        ctx: Option<&ResolveContext<'_>>,
+        scan_limit: usize,
+    ) -> Result<(Vec<MemberCandidate>, usize, bool)> {
+        self.query_members_for_records(record_ids, prefix, ctx, Some(scan_limit))
+    }
+
+    fn query_members_for_records(
+        &self,
+        record_ids: &[i64],
+        prefix: Option<&str>,
+        ctx: Option<&ResolveContext<'_>>,
+        scan_limit: Option<usize>,
+    ) -> Result<(Vec<MemberCandidate>, usize, bool)> {
         if record_ids.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0, false));
         }
         let placeholders = vec!["?"; record_ids.len()].join(",");
         let mut sql = format!(
-            "SELECT m.name, m.kind, m.signature, m.confidence, m.type_name, f.path, f.source, f.directly_included \
+            "SELECT m.name, m.kind, m.signature, m.confidence, m.type_name, f.path, f.source, f.directly_included, rev.hash \
              FROM members m \
              JOIN record_defs r ON r.id = m.record_id \
              JOIN files f ON f.id = r.file_id \
+             JOIN active_file_revisions active ON active.file_id = f.id \
+             JOIN file_revisions rev ON rev.id = active.revision_id \
              WHERE m.record_id IN ({placeholders})"
         );
         let mut params: Vec<Value> = record_ids.iter().copied().map(Value::Integer).collect();
@@ -126,15 +276,25 @@ impl<'a> MemberStoreView<'a> {
                 prefix.replace('%', "\\%").replace('_', "\\_")
             )));
         }
-        sql.push_str(" ORDER BY m.name, m.kind, m.signature");
+        sql.push_str(" ORDER BY f.path, m.start_byte, m.name, m.kind, m.signature, m.id");
+        if let Some(limit) = scan_limit {
+            sql.push_str(" LIMIT ?");
+            params.push(Value::Integer(
+                i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX),
+            ));
+        }
         let mut stmt = self.store.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(params), member_read_row)?;
-        let mut members = Vec::new();
-        for row in rows {
-            members.push(row?.into_candidate(ctx));
+        let mut members = rows
+            .map(|row| row.map(|row| row.into_candidate(ctx)))
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let truncated = scan_limit.is_some_and(|limit| members.len() > limit);
+        if let Some(limit) = scan_limit {
+            members.truncate(limit);
         }
+        let scanned = members.len();
         sort_members_for_records(&mut members, prefix);
-        Ok(members)
+        Ok((members, scanned, truncated))
     }
 
     pub fn fallback_member_candidates(
@@ -143,18 +303,38 @@ impl<'a> MemberStoreView<'a> {
         limit: usize,
         ctx: Option<&ResolveContext<'_>>,
     ) -> Result<Vec<MemberCandidate>> {
+        self.fallback_member_candidates_limited(prefix, limit, ctx)
+            .map(|(candidates, _)| candidates)
+    }
+
+    pub fn fallback_member_candidates_limited(
+        &self,
+        prefix: &str,
+        limit: usize,
+        ctx: Option<&ResolveContext<'_>>,
+    ) -> Result<(Vec<MemberCandidate>, bool)> {
         if limit == 0 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), false));
         }
         let pattern = format!("{}%", prefix.replace('%', "\\%").replace('_', "\\_"));
         let mut stmt = self.store.conn.prepare(
-            "SELECT m.name, m.kind, m.confidence, m.signature, m.type_name, f.path, f.source, f.directly_included \
+            "SELECT m.name, m.kind, m.confidence, m.signature, m.type_name, f.path, f.source, f.directly_included, rev.hash \
              FROM members m \
              JOIN record_defs r ON r.id = m.record_id \
              JOIN files f ON f.id = r.file_id \
-             WHERE m.name LIKE ?1 ESCAPE '\\' COLLATE NOCASE",
+             JOIN active_file_revisions active ON active.file_id = f.id \
+             JOIN file_revisions rev ON rev.id = active.revision_id \
+             WHERE m.name LIKE ?1 ESCAPE '\\' COLLATE NOCASE \
+             ORDER BY lower(m.name), m.name, f.path, m.kind, m.signature, m.id \
+             LIMIT ?2",
         )?;
-        let rows = stmt.query_map([pattern], member_read_row)?;
+        let rows = stmt.query_map(
+            rusqlite::params![
+                pattern,
+                i64::try_from(MEMBER_FALLBACK_SCAN_LIMIT.saturating_add(1)).unwrap_or(i64::MAX)
+            ],
+            member_read_row,
+        )?;
 
         struct MemberMeta {
             candidate: MemberCandidate,
@@ -163,7 +343,12 @@ impl<'a> MemberStoreView<'a> {
 
         let mut by_member: HashMap<(String, crate::semantic_model::MemberKind), MemberMeta> =
             HashMap::new();
-        for row in rows {
+        let mut truncated = false;
+        for (scanned, row) in rows.enumerate() {
+            if scanned >= MEMBER_FALLBACK_SCAN_LIMIT {
+                truncated = true;
+                break;
+            }
             let candidate = row?.into_candidate(ctx);
             let key = (candidate.name.to_ascii_lowercase(), candidate.kind);
             let entry = by_member.entry(key).or_insert(MemberMeta {
@@ -192,11 +377,15 @@ impl<'a> MemberStoreView<'a> {
                 .then_with(|| a.candidate.name.cmp(&b.candidate.name))
                 .then_with(|| a.candidate.signature.cmp(&b.candidate.signature))
         });
-        Ok(sorted
-            .into_iter()
-            .take(limit)
-            .map(|meta| meta.candidate)
-            .collect())
+        truncated |= sorted.len() > limit;
+        Ok((
+            sorted
+                .into_iter()
+                .take(limit)
+                .map(|meta| meta.candidate)
+                .collect(),
+            truncated,
+        ))
     }
 
     pub fn fallback_field_candidates(
@@ -273,10 +462,7 @@ impl<'a> MemberStoreView<'a> {
 
         let placeholders = vec!["?"; names.len()].join(",");
         let sql = format!(
-            "SELECT r.id, r.display_name, r.tag_name, r.typedef_name, r.kind, f.path, f.source, f.directly_included, \
-             r.start_byte, r.end_byte, r.start_line, r.start_col, r.end_line, r.end_col, r.confidence, r.signature \
-             FROM record_defs r \
-             JOIN files f ON f.id = r.file_id \
+            "{RECORD_READ_SELECT} \
              WHERE r.display_name IN ({placeholders}) \
                 OR r.tag_name IN ({placeholders}) \
                 OR r.typedef_name IN ({placeholders})"
@@ -384,11 +570,7 @@ impl<'a> MemberStoreView<'a> {
         self.store
             .conn
             .query_row(
-                "SELECT r.id, r.display_name, r.tag_name, r.typedef_name, r.kind, f.path, f.source, f.directly_included, \
-                 r.start_byte, r.end_byte, r.start_line, r.start_col, r.end_line, r.end_col, r.confidence, r.signature \
-                 FROM record_defs r \
-                 JOIN files f ON f.id = r.file_id \
-                 WHERE r.id = ?1",
+                &format!("{RECORD_READ_SELECT} WHERE r.id = ?1"),
                 [record_id],
                 record_read_row,
             )
@@ -407,7 +589,11 @@ fn record_read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RecordReadRow> {
     };
     let source_str: String = row.get(6)?;
     let directly_included: i64 = row.get(7)?;
-    let confidence_str: String = row.get(14)?;
+    let range_fidelity = match row.get::<_, String>(26)?.as_str() {
+        "malformed" => RecordRangeFidelity::Malformed,
+        _ => RecordRangeFidelity::AstExact,
+    };
+    let confidence_str: String = row.get(27)?;
     let confidence = match confidence_str.as_str() {
         "named_tag" => crate::semantic_model::RecordConfidence::NamedTag,
         "anonymous_typedef" => crate::semantic_model::RecordConfidence::AnonymousTypedef,
@@ -429,8 +615,84 @@ fn record_read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RecordReadRow> {
         start_col: row.get::<_, i64>(11)? as usize,
         end_line: row.get::<_, i64>(12)? as usize,
         end_col: row.get::<_, i64>(13)? as usize,
+        body_range: source_range(row, 14)?,
+        declaration_range: source_range(row, 20)?,
+        range_fidelity,
         confidence,
-        signature: row.get(15)?,
+        signature: row.get(28)?,
+        revision_id: row.get(29)?,
+        revision_size: row.get::<_, i64>(30)? as u64,
+        revision_mtime_ns: row.get(31)?,
+        revision_hash: row.get(32)?,
+        declaration_hash: digest_32(row, 33)?,
+    })
+}
+
+fn type_alias_read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TypeAliasReadRow> {
+    let source: String = row.get(3)?;
+    let shape_text: String = row.get(18)?;
+    let declarator_shape = serde_json::from_str(&shape_text).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(18, Type::Text, Box::new(error))
+    })?;
+    let target_fidelity = match row.get::<_, String>(19)?.as_str() {
+        "heuristic" => AliasTargetFidelity::Heuristic,
+        "malformed" => AliasTargetFidelity::Malformed,
+        _ => AliasTargetFidelity::AstExact,
+    };
+    let target_kind_text: Option<String> = row.get(23)?;
+    Ok(TypeAliasReadRow {
+        id: row.get(0)?,
+        alias: row.get(1)?,
+        path: row.get(2)?,
+        external: source == "external",
+        directly_included: row.get::<_, i64>(4)? != 0,
+        name_range: source_range(row, 5)?,
+        declaration_range: source_range(row, 11)?,
+        underlying_spelling: row.get(17)?,
+        declarator_shape,
+        target_fidelity,
+        fingerprint: row.get(20)?,
+        target_record_id: row.get(21)?,
+        target_name: row.get(22)?,
+        target_kind: target_kind_text
+            .as_deref()
+            .and_then(crate::store::record_kind_from_str),
+        confidence: row.get(24)?,
+        revision_id: row.get(25)?,
+        revision_size: row.get::<_, i64>(26)? as u64,
+        revision_mtime_ns: row.get(27)?,
+        revision_hash: row.get(28)?,
+        declaration_hash: digest_32(row, 29)?,
+    })
+}
+
+fn digest_32(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<[u8; 32]> {
+    let bytes: Vec<u8> = row.get(index)?;
+    bytes.try_into().map_err(|bytes: Vec<u8>| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            Type::Blob,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("expected 32-byte BLAKE3 digest, got {} bytes", bytes.len()),
+            )
+            .into(),
+        )
+    })
+}
+
+fn source_range(row: &rusqlite::Row<'_>, start: usize) -> rusqlite::Result<SourceRange> {
+    Ok(SourceRange {
+        start_byte: row.get::<_, i64>(start)? as usize,
+        end_byte: row.get::<_, i64>(start + 1)? as usize,
+        start: SourcePosition {
+            line: row.get::<_, i64>(start + 2)? as u32,
+            character: row.get::<_, i64>(start + 3)? as u32,
+        },
+        end: SourcePosition {
+            line: row.get::<_, i64>(start + 4)? as u32,
+            character: row.get::<_, i64>(start + 5)? as u32,
+        },
     })
 }
 
@@ -448,6 +710,7 @@ fn member_read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemberReadRow> {
         owner_path: row.get(5)?,
         external: source_str == "external",
         directly_included: directly_included != 0,
+        revision_hash: row.get(8)?,
     })
 }
 

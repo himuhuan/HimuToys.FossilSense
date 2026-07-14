@@ -1,6 +1,7 @@
 mod call_catalog;
 mod call_model;
 mod call_service;
+mod candidate_service;
 mod coloring;
 mod completion;
 mod completion_history;
@@ -19,6 +20,8 @@ mod reachability;
 mod references;
 mod resolver;
 mod scanner;
+#[cfg(test)]
+mod semantic_benchmark;
 mod semantic_model;
 mod server;
 mod store;

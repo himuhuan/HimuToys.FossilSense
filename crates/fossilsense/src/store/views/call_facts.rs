@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use crate::call_model::{SourcePosition, SourceRange};
+use crate::call_model::{SignatureFidelity, SourcePosition, SourceRange};
 
 use super::super::IndexStore;
 
@@ -9,6 +9,7 @@ pub struct CallableAnchorRow {
     pub id: i64,
     pub path: String,
     pub source: String,
+    pub directly_included: bool,
     pub entity_key: String,
     pub anchor_fingerprint: String,
     pub name: String,
@@ -20,6 +21,9 @@ pub struct CallableAnchorRow {
     pub linkage_kind: String,
     pub linkage_file: Option<String>,
     pub signature: String,
+    pub canonical_signature: String,
+    pub presentation_signature: String,
+    pub signature_fidelity: SignatureFidelity,
     pub min_arity: Option<u32>,
     pub max_arity: Option<u32>,
     pub variadic: bool,
@@ -67,23 +71,32 @@ impl<'a> CallFactStoreView<'a> {
         Self { store }
     }
 
-    pub fn anchors_by_entity_key(&self, entity_key: &str) -> Result<Vec<CallableAnchorRow>> {
-        self.anchor_query("WHERE a.entity_digest = unhex(?1)", [entity_key])
+    pub fn anchors_by_entity_key_limited(
+        &self,
+        entity_key: &str,
+        limit: usize,
+    ) -> Result<(Vec<CallableAnchorRow>, bool)> {
+        self.anchor_query_limited("WHERE a.entity_digest = unhex(?1)", [entity_key], limit)
     }
 
-    pub fn anchors_by_path(&self, path: &str) -> Result<Vec<CallableAnchorRow>> {
-        self.anchor_query("WHERE f.path = ?1", [path])
+    pub fn anchors_by_path_limited(
+        &self,
+        path: &str,
+        limit: usize,
+    ) -> Result<(Vec<CallableAnchorRow>, bool)> {
+        self.anchor_query_limited("WHERE f.path = ?1", [path], limit)
     }
 
-    pub fn anchors_at(
+    pub fn anchors_at_limited(
         &self,
         path: &str,
         line: u32,
         character: u32,
-    ) -> Result<Vec<CallableAnchorRow>> {
+        limit: usize,
+    ) -> Result<(Vec<CallableAnchorRow>, bool)> {
         let line = line.to_string();
         let character = character.to_string();
-        self.anchor_query(
+        self.anchor_query_limited(
             "WHERE a.revision_id = (
                 SELECT active.revision_id FROM active_file_revisions active
                 JOIN file_entries entry ON entry.id = active.file_id
@@ -95,15 +108,44 @@ impl<'a> CallFactStoreView<'a> {
                 OR (a.body_start_line <= ?2 AND a.body_end_line >= ?2)
             )",
             [path, line.as_str(), character.as_str()],
+            limit,
         )
     }
 
-    pub fn anchors_by_names(&self, names: &[String]) -> Result<Vec<CallableAnchorRow>> {
-        self.anchors_by_values("name_text.text", names, false)
+    pub fn anchors_by_names_limited(
+        &self,
+        names: &[String],
+        limit: usize,
+    ) -> Result<(Vec<CallableAnchorRow>, bool)> {
+        self.anchors_by_values_limited("name_text.text", names, false, limit)
     }
 
-    pub fn anchors_by_entity_keys(&self, keys: &[String]) -> Result<Vec<CallableAnchorRow>> {
-        self.anchors_by_values("a.entity_digest", keys, true)
+    pub fn anchors_by_name_limited(
+        &self,
+        name: &str,
+        limit: usize,
+    ) -> Result<(Vec<CallableAnchorRow>, bool)> {
+        let mut output = Vec::new();
+        self.visit_anchors(
+            "WHERE a.name_id = (SELECT id FROM call_strings WHERE text = ?1)",
+            &[name],
+            Some(limit.saturating_add(1)),
+            |row| {
+                output.push(row);
+                Ok(())
+            },
+        )?;
+        let truncated = output.len() > limit;
+        output.truncate(limit);
+        Ok((output, truncated))
+    }
+
+    pub fn anchors_by_entity_keys_limited(
+        &self,
+        keys: &[String],
+        limit: usize,
+    ) -> Result<(Vec<CallableAnchorRow>, bool)> {
+        self.anchors_by_values_limited("a.entity_digest", keys, true, limit)
     }
 
     pub fn call_sites_by_caller_limited(
@@ -130,10 +172,16 @@ impl<'a> CallFactStoreView<'a> {
         )
     }
 
-    pub fn call_sites_at(&self, path: &str, line: u32, character: u32) -> Result<Vec<CallSiteRow>> {
+    pub fn call_sites_at_limited(
+        &self,
+        path: &str,
+        line: u32,
+        character: u32,
+        limit: usize,
+    ) -> Result<(Vec<CallSiteRow>, bool)> {
         let line = line.to_string();
         let character = character.to_string();
-        self.call_site_query(
+        self.call_site_query_limited(
             "WHERE c.revision_id = (
                 SELECT active.revision_id FROM active_file_revisions active
                 JOIN file_entries entry ON entry.id = active.file_id
@@ -142,27 +190,38 @@ impl<'a> CallFactStoreView<'a> {
              AND c.callee_end_line = ?2 AND c.callee_start_col <= ?3
              AND c.callee_end_col >= ?3",
             [path, line.as_str(), character.as_str()],
+            limit,
         )
     }
 
-    fn anchors_by_values(
+    fn anchors_by_values_limited(
         &self,
         column: &str,
         values: &[String],
         hex_values: bool,
-    ) -> Result<Vec<CallableAnchorRow>> {
+        limit: usize,
+    ) -> Result<(Vec<CallableAnchorRow>, bool)> {
         let mut output = Vec::new();
         for chunk in values.chunks(400) {
+            // Probe one row beyond the remaining global budget. If a previous
+            // chunk filled the budget exactly, the next chunk is still probed
+            // with LIMIT 1 so truncation cannot be mistaken for exhaustion.
+            let probe_limit = limit.saturating_sub(output.len()).saturating_add(1);
             let placeholder = if hex_values { "unhex(?)" } else { "?" };
             let placeholders = vec![placeholder; chunk.len()].join(",");
             let predicate = format!("WHERE {column} IN ({placeholders})");
             let params: Vec<&str> = chunk.iter().map(String::as_str).collect();
-            self.visit_anchors(&predicate, &params, |row| {
+            self.visit_anchors(&predicate, &params, Some(probe_limit), |row| {
                 output.push(row);
                 Ok(())
             })?;
+            if output.len() > limit {
+                break;
+            }
         }
-        Ok(output)
+        let truncated = output.len() > limit;
+        output.truncate(limit);
+        Ok((output, truncated))
     }
 
     pub fn coverage(&self) -> Result<CallCoverageRow> {
@@ -217,25 +276,30 @@ impl<'a> CallFactStoreView<'a> {
             .map_err(Into::into)
     }
 
-    fn anchor_query<const N: usize>(
+    fn anchor_query_limited<const N: usize>(
         &self,
         predicate: &str,
         params: [&str; N],
-    ) -> Result<Vec<CallableAnchorRow>> {
+        limit: usize,
+    ) -> Result<(Vec<CallableAnchorRow>, bool)> {
         let mut output = Vec::new();
-        self.visit_anchors(predicate, &params, |row| {
+        self.visit_anchors(predicate, &params, Some(limit.saturating_add(1)), |row| {
             output.push(row);
             Ok(())
         })?;
-        Ok(output)
+        let truncated = output.len() > limit;
+        output.truncate(limit);
+        Ok((output, truncated))
     }
 
     fn visit_anchors(
         &self,
         predicate: &str,
         params: &[&str],
+        limit: Option<usize>,
         mut visitor: impl FnMut(CallableAnchorRow) -> Result<()>,
     ) -> Result<()> {
+        let limit_clause = limit.map_or_else(String::new, |limit| format!(" LIMIT {limit}"));
         let sql = format!(
             "SELECT a.id, f.path, f.source, lower(hex(a.entity_digest)),
                     lower(hex(a.anchor_digest)), name_text.text, qualified_text.text,
@@ -249,8 +313,10 @@ impl<'a> CallFactStoreView<'a> {
                          ELSE 'declaration' END,
                     CASE a.linkage_kind WHEN 1 THEN 'external' WHEN 2 THEN 'internal'
                          ELSE 'unknown' END,
-                    linkage_text.text, signature_text.text, a.min_arity, a.max_arity,
-                    a.variadic, a.name_start_byte, a.name_end_byte, a.name_start_line,
+                    linkage_text.text, signature_text.text, canonical_text.text,
+                    presentation_text.text, a.signature_fidelity,
+                    a.min_arity, a.max_arity, a.variadic,
+                    a.name_start_byte, a.name_end_byte, a.name_start_line,
                     a.name_start_col, a.name_end_line, a.name_end_col,
                     a.declaration_start_byte, a.declaration_end_byte,
                     a.declaration_start_line, a.declaration_start_col,
@@ -260,17 +326,19 @@ impl<'a> CallFactStoreView<'a> {
                     guard_text.text,
                     CASE (a.flags & 255) WHEN 1 THEN 'lexical_fallback'
                          WHEN 2 THEN 'synthetic' ELSE 'ast' END,
-                    ((a.flags & 256) != 0)
+                    ((a.flags & 256) != 0), f.directly_included
              FROM callable_anchors a
              JOIN files f ON f.id = a.file_id
              JOIN call_strings name_text ON name_text.id = a.name_id
              JOIN call_strings qualified_text ON qualified_text.id = a.qualified_name_id
              JOIN call_strings signature_text ON signature_text.id = a.signature_id
+             JOIN call_strings canonical_text ON canonical_text.id = a.canonical_signature_id
+             JOIN call_strings presentation_text ON presentation_text.id = a.presentation_signature_id
              LEFT JOIN call_strings owner_text ON owner_text.id = a.owner_id
              LEFT JOIN call_strings linkage_text ON linkage_text.id = a.linkage_file_id
              LEFT JOIN call_strings guard_text ON guard_text.id = a.guard_id
              {predicate}
-             ORDER BY qualified_text.text, f.path, a.name_start_byte"
+             ORDER BY qualified_text.text, f.path, a.name_start_byte, a.id{limit_clause}"
         );
         let mut stmt = self.store.conn.prepare(&sql)?;
         let rows = stmt.query_map(
@@ -281,19 +349,6 @@ impl<'a> CallFactStoreView<'a> {
             visitor(row?)?;
         }
         Ok(())
-    }
-
-    fn call_site_query<const N: usize>(
-        &self,
-        predicate: &str,
-        params: [&str; N],
-    ) -> Result<Vec<CallSiteRow>> {
-        let mut output = Vec::new();
-        self.visit_call_sites(predicate, params, None, |row| {
-            output.push(row);
-            Ok(())
-        })?;
-        Ok(output)
     }
 
     fn call_site_query_limited<const N: usize>(
@@ -360,6 +415,7 @@ fn map_anchor(row: &rusqlite::Row<'_>) -> rusqlite::Result<CallableAnchorRow> {
         id: row.get(0)?,
         path: row.get(1)?,
         source: row.get(2)?,
+        directly_included: row.get::<_, i64>(41)? != 0,
         entity_key: row.get(3)?,
         anchor_fingerprint: row.get(4)?,
         name: row.get(5)?,
@@ -371,16 +427,27 @@ fn map_anchor(row: &rusqlite::Row<'_>) -> rusqlite::Result<CallableAnchorRow> {
         linkage_kind: row.get(11)?,
         linkage_file: row.get(12)?,
         signature: row.get(13)?,
-        min_arity: row.get::<_, Option<i64>>(14)?.map(|value| value as u32),
-        max_arity: row.get::<_, Option<i64>>(15)?.map(|value| value as u32),
-        variadic: row.get::<_, i64>(16)? != 0,
-        name_range: range(row, 17)?,
-        declaration_range: range(row, 23)?,
-        body_range: optional_range(row, 29)?,
-        guard: row.get(35)?,
-        provenance: row.get(36)?,
-        syntax_error_overlap: row.get::<_, i64>(37)? != 0,
+        canonical_signature: row.get(14)?,
+        presentation_signature: row.get(15)?,
+        signature_fidelity: signature_fidelity(row.get(16)?),
+        min_arity: row.get::<_, Option<i64>>(17)?.map(|value| value as u32),
+        max_arity: row.get::<_, Option<i64>>(18)?.map(|value| value as u32),
+        variadic: row.get::<_, i64>(19)? != 0,
+        name_range: range(row, 20)?,
+        declaration_range: range(row, 26)?,
+        body_range: optional_range(row, 32)?,
+        guard: row.get(38)?,
+        provenance: row.get(39)?,
+        syntax_error_overlap: row.get::<_, i64>(40)? != 0,
     })
+}
+
+fn signature_fidelity(code: i64) -> SignatureFidelity {
+    match code {
+        1 => SignatureFidelity::LexicalFallback,
+        2 => SignatureFidelity::Malformed,
+        _ => SignatureFidelity::AstExact,
+    }
 }
 
 fn map_call_site(row: &rusqlite::Row<'_>) -> rusqlite::Result<CallSiteRow> {

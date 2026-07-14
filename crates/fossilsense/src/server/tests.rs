@@ -4,7 +4,7 @@ use super::{
     grouped_reference_items, local_words_for_cache, rebuild_include_table,
     rebuild_indexed_file_list,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -12,9 +12,11 @@ use std::sync::{Arc, Mutex as StdMutex};
 use tempfile::tempdir;
 use tower_lsp::lsp_types::{
     CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse,
-    DidChangeWorkspaceFoldersParams, Documentation, ExecuteCommandParams, FileChangeType,
-    FileEvent, GotoDefinitionParams, GotoDefinitionResponse, InitializeParams, Position,
-    TextDocumentIdentifier, TextDocumentPositionParams, Url, WorkspaceFolder,
+    DidChangeTextDocumentParams, DidChangeWorkspaceFoldersParams, DidOpenTextDocumentParams,
+    Documentation, ExecuteCommandParams, FileChangeType, FileEvent, GotoDefinitionParams,
+    GotoDefinitionResponse, HoverContents, HoverParams, InitializeParams, Position,
+    SignatureHelpParams, TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
+    TextDocumentPositionParams, Url, VersionedTextDocumentIdentifier, WorkspaceFolder,
     WorkspaceFoldersChangeEvent,
 };
 use tower_lsp::{LanguageServer as _, LspService};
@@ -73,6 +75,27 @@ fn goto_definition_params(uri: Url, line: u32, character: u32) -> GotoDefinition
     }
 }
 
+fn hover_params(uri: Url, line: u32, character: u32) -> HoverParams {
+    HoverParams {
+        text_document_position_params: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri },
+            position: Position::new(line, character),
+        },
+        work_done_progress_params: Default::default(),
+    }
+}
+
+fn signature_help_params(uri: Url, line: u32, character: u32) -> SignatureHelpParams {
+    SignatureHelpParams {
+        text_document_position_params: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri },
+            position: Position::new(line, character),
+        },
+        work_done_progress_params: Default::default(),
+        context: None,
+    }
+}
+
 fn completion_items(response: CompletionResponse) -> Vec<CompletionItem> {
     match response {
         CompletionResponse::Array(items) => items,
@@ -84,6 +107,39 @@ fn completion_response_is_incomplete(response: &CompletionResponse) -> bool {
     match response {
         CompletionResponse::Array(_) => false,
         CompletionResponse::List(list) => list.is_incomplete,
+    }
+}
+
+fn definition_locations(response: GotoDefinitionResponse) -> Vec<tower_lsp::lsp_types::Location> {
+    match response {
+        GotoDefinitionResponse::Array(locations) => locations,
+        GotoDefinitionResponse::Scalar(location) => vec![location],
+        GotoDefinitionResponse::Link(_) => panic!("unexpected location links"),
+    }
+}
+
+fn hover_text(contents: HoverContents) -> String {
+    match contents {
+        HoverContents::Scalar(marked) => match marked {
+            tower_lsp::lsp_types::MarkedString::String(value) => value,
+            tower_lsp::lsp_types::MarkedString::LanguageString(value) => value.value,
+        },
+        HoverContents::Array(values) => values
+            .into_iter()
+            .map(|value| match value {
+                tower_lsp::lsp_types::MarkedString::String(value) => value,
+                tower_lsp::lsp_types::MarkedString::LanguageString(value) => value.value,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        HoverContents::Markup(markup) => markup.value,
+    }
+}
+
+fn documentation_text(documentation: Documentation) -> String {
+    match documentation {
+        Documentation::String(value) => value,
+        Documentation::MarkupContent(markup) => markup.value,
     }
 }
 
@@ -99,6 +155,77 @@ fn text_and_position(marked: &str) -> (String, u32, u32) {
         .map(|ch| ch.len_utf16() as u32)
         .sum();
     (text, line, character)
+}
+
+#[test]
+fn semantic_candidate_perf_log_contains_only_aggregate_contract_fields() {
+    let metrics = super::SemanticRequestPerf {
+        candidates: crate::query::CallableCandidateMetrics {
+            raw_candidates: 9,
+            filtered_candidates: 7,
+            grouped_candidates: 4,
+            arity_compatible: 3,
+            arity_unknown: 2,
+            arity_incompatible: 2,
+            counterpart_strict: 1,
+            counterpart_ambiguous: 1,
+        },
+        returned: 3,
+        hydration_count: 2,
+        hydration_bytes: 512,
+        query_us: 41,
+        hydration_us: 17,
+        reach_us: 5,
+        coverage_open: true,
+        coverage_truncated: false,
+        coverage_incomplete: true,
+        coverage_reason: 4,
+        arity_fallback: false,
+    };
+
+    let line = metrics.log_line("hover", 99);
+    for field in [
+        "raw=9",
+        "filtered=7",
+        "grouped=4",
+        "returned=3",
+        "arity_compatible=3",
+        "arity_unknown=2",
+        "arity_incompatible=2",
+        "counterpart_strict=1",
+        "counterpart_ambiguous=1",
+        "hydration_count=2",
+        "hydration_bytes=512",
+        "query_us=41",
+        "hydration_us=17",
+        "reach_us=5",
+        "coverage_open=1",
+        "coverage_truncated=0",
+        "coverage_incomplete=1",
+        "coverage_reason=4",
+        "arity_fallback=0",
+    ] {
+        assert!(line.contains(field), "missing aggregate metric {field}");
+    }
+    assert!(!line.contains("symbol"));
+    assert!(!line.contains("path"));
+    assert!(!line.contains("source"));
+}
+
+#[test]
+fn live_parse_perf_log_never_contains_document_identity_or_revision() {
+    for event in [
+        super::LiveParseCacheEvent::Hit,
+        super::LiveParseCacheEvent::Coalesced,
+        super::LiveParseCacheEvent::Miss,
+    ] {
+        let line = super::live_parse_cache_log(event);
+        assert!(line.starts_with("[perf] live_parse_cache state="));
+        assert!(!line.contains("file:"));
+        assert!(!line.contains("/"));
+        assert!(!line.contains("\\"));
+        assert!(!line.contains("version"));
+    }
 }
 
 #[tokio::test]
@@ -430,6 +557,282 @@ void use_type(void) {
             .any(|location| location.uri == uri && location.range.start.line == 12),
         "indexed typedef immediately after multiline macro should be a goto-definition target"
     );
+}
+
+#[tokio::test]
+async fn goto_definition_keeps_an_unpaired_callable_anchor_as_a_target() {
+    let (_dir, service, uri, line, character) =
+        indexed_backend_with_open_doc(&[], "api.h", "int lone/*cursor*/(int value);\n").await;
+
+    let response = service
+        .inner()
+        .goto_definition(goto_definition_params(uri.clone(), line, character))
+        .await
+        .expect("goto definition")
+        .expect("unpaired anchor should remain navigable");
+    let locations = match response {
+        GotoDefinitionResponse::Array(locations) => locations,
+        GotoDefinitionResponse::Scalar(location) => vec![location],
+        GotoDefinitionResponse::Link(_) => panic!("unexpected location links"),
+    };
+
+    assert!(
+        locations
+            .iter()
+            .any(|location| location.uri == uri && location.range.start.line == 0),
+        "the current declaration is the conservative definition target when no strict counterpart exists"
+    );
+}
+
+#[tokio::test]
+async fn callable_arity_mismatch_fallback_is_visible_and_remains_navigable() {
+    let source = "int pick(int value);\n\
+                  int pick(int left, int right);\n\
+                  void f(void) { pick/*cursor*/(1, 2, 3); }\n";
+    let (_dir, service, uri, line, character) =
+        indexed_backend_with_open_doc(&[], "main.cpp", source).await;
+
+    let hover = service
+        .inner()
+        .hover(hover_params(uri.clone(), line, character))
+        .await
+        .expect("hover request")
+        .expect("fallback hover");
+    let hover = hover_text(hover.contents);
+    assert!(hover.contains("Arity mismatch fallback"));
+    assert!(hover.contains("pick(int value)"));
+    assert!(hover.contains("pick(int left, int right)"));
+
+    let definition = service
+        .inner()
+        .goto_definition(goto_definition_params(uri.clone(), line, character))
+        .await
+        .expect("definition request")
+        .expect("fallback definition");
+    let locations = definition_locations(definition);
+    assert_eq!(locations.len(), 2, "fallback must retain both candidates");
+
+    let (signature_text, signature_line, signature_character) = text_and_position(
+        "int pick(int value);\n\
+         int pick(int left, int right);\n\
+         void f(void) { pick(1, 2, 3/*cursor*/); }\n",
+    );
+    assert_eq!(
+        service
+            .inner()
+            .session
+            .documents
+            .snapshot(&uri)
+            .await
+            .expect("open document")
+            .text
+            .as_ref(),
+        signature_text
+    );
+    let signature_help = service
+        .inner()
+        .signature_help(signature_help_params(
+            uri,
+            signature_line,
+            signature_character,
+        ))
+        .await
+        .expect("signature request")
+        .expect("fallback signatures");
+    assert_eq!(signature_help.signatures.len(), 2);
+    assert!(signature_help.signatures.iter().all(|signature| {
+        signature
+            .documentation
+            .clone()
+            .is_some_and(|documentation| {
+                documentation_text(documentation).contains("Arity mismatch fallback")
+            })
+    }));
+}
+
+#[tokio::test]
+async fn signature_help_keeps_candidates_for_template_like_partial_argument() {
+    let (_dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[],
+        "main.cpp",
+        "int pick(int value);\n\
+         int pick(int left, int right);\n\
+         void f(void) { pick(std::pair<int, int>{}, /*cursor*/); }\n",
+    )
+    .await;
+
+    let signature_help = service
+        .inner()
+        .signature_help(signature_help_params(uri, line, character))
+        .await
+        .expect("signature request")
+        .expect("unknown-arity signature candidates");
+    assert_eq!(signature_help.signatures.len(), 2);
+    assert!(signature_help
+        .signatures
+        .iter()
+        .any(|signature| signature.active_parameter == Some(1)));
+}
+
+#[tokio::test]
+async fn malformed_call_does_not_hard_filter_definition_candidates_by_arity() {
+    let (_dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[],
+        "main.cpp",
+        "int pick(int value);\n\
+         int pick(int left, int right);\n\
+         void f(void) { pick/*cursor*/(1,); }\n",
+    )
+    .await;
+
+    let response = service
+        .inner()
+        .goto_definition(goto_definition_params(uri, line, character))
+        .await
+        .expect("definition request")
+        .expect("malformed call remains navigable");
+    assert_eq!(definition_locations(response).len(), 2);
+}
+
+#[tokio::test]
+async fn goto_definition_returns_multiple_same_signature_implementations() {
+    let (_dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[
+            ("api.h", "int work(int value);\n"),
+            ("impl_a.c", "int work(int value) { return value; }\n"),
+            ("impl_b.c", "int work(int value) { return value + 1; }\n"),
+        ],
+        "main.c",
+        "#include \"api.h\"\nint run(void) { return work/*cursor*/(1); }\n",
+    )
+    .await;
+
+    let response = service
+        .inner()
+        .goto_definition(goto_definition_params(uri, line, character))
+        .await
+        .expect("definition request")
+        .expect("implementation definitions");
+    let paths: HashSet<_> = definition_locations(response)
+        .into_iter()
+        .filter_map(|location| location.uri.to_file_path().ok())
+        .filter_map(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .collect();
+    assert!(paths.contains("impl_a.c"), "first implementation missing");
+    assert!(paths.contains("impl_b.c"), "second implementation missing");
+}
+
+#[tokio::test]
+async fn hover_uses_dirty_other_document_callable_overlay_without_stale_signature() {
+    let (dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[("api.h", "int target(int indexed_value);\n")],
+        "main.c",
+        "#include \"api.h\"\nint run(void) { return target/*cursor*/(1, 2); }\n",
+    )
+    .await;
+    let header_uri = Url::from_file_path(dir.path().join("api.h")).expect("header uri");
+    open_test_document(
+        &service,
+        header_uri,
+        2,
+        "int target(int dirty_left, int dirty_right);\n".into(),
+    )
+    .await;
+
+    let hover = service
+        .inner()
+        .hover(hover_params(uri, line, character))
+        .await
+        .expect("hover request")
+        .expect("dirty header hover");
+    let hover = hover_text(hover.contents);
+    assert!(hover.contains("dirty_left"));
+    assert!(hover.contains("dirty_right"));
+    assert!(!hover.contains("indexed_value"));
+}
+
+#[tokio::test]
+async fn callable_comment_hydration_rejects_disk_revision_newer_than_index() {
+    let (dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[(
+            "api.h",
+            "/// Original indexed callable docs.\nint target(int value);\n",
+        )],
+        "main.c",
+        "#include \"api.h\"\nint run(void) { return target/*cursor*/(1); }\n",
+    )
+    .await;
+    std::fs::write(
+        dir.path().join("api.h"),
+        "/// Newer disk docs must not mix with the old anchor.\nint target(int value);\n",
+    )
+    .expect("external edit");
+
+    let hover = service
+        .inner()
+        .hover(hover_params(uri.clone(), line, character))
+        .await
+        .expect("hover request")
+        .expect("callable hover");
+    let hover = hover_text(hover.contents);
+    assert!(hover.contains("target(int value)"));
+    assert!(!hover.contains("Newer disk docs"));
+    assert!(!hover.contains("Original indexed callable docs"));
+
+    let signature_help = service
+        .inner()
+        .signature_help(signature_help_params(uri, line, character + 2))
+        .await
+        .expect("signature request")
+        .expect("signature candidates");
+    let rendered = signature_help
+        .signatures
+        .into_iter()
+        .filter_map(|signature| signature.documentation)
+        .map(documentation_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!rendered.contains("Newer disk docs"));
+    assert!(!rendered.contains("Original indexed callable docs"));
+}
+
+#[tokio::test]
+async fn did_open_disk_matched_external_edit_overlays_stale_generation() {
+    let (dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[("api.h", "int target(int indexed_value);\n")],
+        "main.c",
+        "#include \"api.h\"\nint run(void) { return target/*cursor*/(1, 2); }\n",
+    )
+    .await;
+    let header_uri = Url::from_file_path(dir.path().join("api.h")).expect("header uri");
+    let externally_edited = "int target(int external_left, int external_right);\n";
+    std::fs::write(dir.path().join("api.h"), externally_edited).expect("external edit");
+
+    service
+        .inner()
+        .did_open(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: header_uri,
+                language_id: "c".into(),
+                version: 2,
+                text: externally_edited.into(),
+            },
+        })
+        .await;
+
+    let hover = service
+        .inner()
+        .hover(hover_params(uri, line, character))
+        .await
+        .expect("hover request")
+        .expect("external edit hover");
+    let hover = hover_text(hover.contents);
+    assert!(hover.contains("external_left"));
+    assert!(hover.contains("external_right"));
+    assert!(!hover.contains("indexed_value"));
 }
 
 #[tokio::test]
@@ -1616,24 +2019,47 @@ async fn relation_overlay_tracks_only_divergent_or_not_yet_indexed_documents() {
     let dir = tempdir().expect("tempdir");
     let path = dir.path().join("tracked.c");
     std::fs::write(&path, "void tracked(void);\n").expect("write source");
+    crate::indexer::index_workspace(dir.path(), crate::indexer::IndexOptions::default(), |_| {})
+        .expect("index initial source");
+    let db_path = crate::pathing::default_index_path(dir.path()).expect("index path");
+    let initial_generation = crate::store::IndexStore::open_readonly(&db_path)
+        .and_then(|store| store.semantic_generation())
+        .expect("initial generation");
     let uri = Url::from_file_path(&path).expect("uri");
     let documents = super::DocumentStore::default();
 
     documents
         .open_document(uri.clone(), 1, "void tracked(void);\n".into())
         .await;
+    let (opened_epoch, _) = documents.all_snapshots_with_overlay_epoch().await;
+    let awaiting_validation = documents.snapshot(&uri).await.expect("open snapshot");
+    assert!(awaiting_validation
+        .needs_relation_overlay(crate::call_model::SemanticGeneration(initial_generation)));
+    documents
+        .reconcile_published_files(
+            dir.path().to_path_buf(),
+            Some(vec!["tracked.c".to_string()]),
+            crate::call_model::SemanticGeneration(initial_generation),
+        )
+        .await;
+    let (clean_epoch, _) = documents.all_snapshots_with_overlay_epoch().await;
+    assert!(clean_epoch > opened_epoch);
     let clean = documents.snapshot(&uri).await.expect("clean snapshot");
     assert!(!clean.needs_relation_overlay(crate::call_model::SemanticGeneration(4)));
 
     documents
         .change_document(uri.clone(), 2, "void changed(void);\n".into())
         .await;
+    let (unsaved_epoch, _) = documents.all_snapshots_with_overlay_epoch().await;
+    assert!(unsaved_epoch > clean_epoch);
     let unsaved = documents.snapshot(&uri).await.expect("unsaved snapshot");
     assert!(unsaved.needs_relation_overlay(crate::call_model::SemanticGeneration(4)));
 
     documents
         .save_document(&uri, crate::call_model::SemanticGeneration(4))
         .await;
+    let (saved_epoch, _) = documents.all_snapshots_with_overlay_epoch().await;
+    assert!(saved_epoch > unsaved_epoch);
     let awaiting = documents.snapshot(&uri).await.expect("saved snapshot");
     assert!(awaiting.needs_relation_overlay(crate::call_model::SemanticGeneration(4)));
     assert!(awaiting.needs_relation_overlay(crate::call_model::SemanticGeneration(5)));
@@ -1644,7 +2070,6 @@ async fn relation_overlay_tracks_only_divergent_or_not_yet_indexed_documents() {
     std::fs::write(&path, "void changed(void);\n").expect("save changed source");
     crate::indexer::index_workspace(dir.path(), crate::indexer::IndexOptions::default(), |_| {})
         .expect("index saved source");
-    let db_path = crate::pathing::default_index_path(dir.path()).expect("index path");
     let generation = crate::store::IndexStore::open_readonly(&db_path)
         .and_then(|store| store.semantic_generation())
         .expect("active generation");
@@ -1655,8 +2080,312 @@ async fn relation_overlay_tracks_only_divergent_or_not_yet_indexed_documents() {
             crate::call_model::SemanticGeneration(generation),
         )
         .await;
+    let (published_epoch, _) = documents.all_snapshots_with_overlay_epoch().await;
+    assert!(published_epoch > saved_epoch);
     let published = documents.snapshot(&uri).await.expect("published snapshot");
     assert!(!published.needs_relation_overlay(crate::call_model::SemanticGeneration(generation)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_document_capture_keeps_current_all_and_epoch_atomic_during_changes() {
+    let dir = tempdir().expect("tempdir");
+    let uri = Url::from_file_path(dir.path().join("racing.c")).expect("uri");
+    let documents = super::DocumentStore::default();
+    documents
+        .open_document(uri.clone(), 1, "int revision_1;\n".into())
+        .await;
+
+    let writer_documents = documents.clone();
+    let writer_uri = uri.clone();
+    let writer = tokio::spawn(async move {
+        for version in 2..=64 {
+            writer_documents
+                .change_document(
+                    writer_uri.clone(),
+                    version,
+                    format!("int revision_{version};\n"),
+                )
+                .await;
+            tokio::task::yield_now().await;
+        }
+    });
+
+    for _ in 0..128 {
+        let captured = documents.capture_request_snapshot(Some(&uri)).await;
+        let current = captured.current.expect("current document");
+        let all = captured
+            .all
+            .iter()
+            .find(|(candidate, _)| candidate == &uri)
+            .map(|(_, snapshot)| snapshot)
+            .expect("current document in all-open snapshot");
+        assert_eq!(current.version, all.version);
+        assert_eq!(current.text, all.text);
+        assert_eq!(captured.overlay_epoch, current.version as u64);
+        tokio::task::yield_now().await;
+    }
+    writer.await.expect("writer");
+}
+
+#[tokio::test]
+async fn candidate_overlay_cache_includes_dirty_external_header_with_normalized_absolute_path() {
+    let service = test_backend_service();
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().join("workspace");
+    let include_root = dir.path().join("sdk").join("include");
+    std::fs::create_dir_all(&root).expect("workspace");
+    std::fs::create_dir_all(&include_root).expect("include root");
+    let header = include_root.join("vendor.h");
+    std::fs::write(&header, "int saved_vendor(void);\n").expect("saved header");
+    let uri = Url::from_file_path(&header).expect("header uri");
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(root.clone());
+    *service.inner().include_paths.lock().await =
+        vec![crate::pathing::normalize_abs_path(&include_root)];
+    service
+        .inner()
+        .session
+        .open_document(uri.clone(), 1, "int dirty_vendor(void);\n".into())
+        .await;
+
+    let generation = crate::call_model::SemanticGeneration::MISSING;
+    let first = service
+        .inner()
+        .candidate_overlay_snapshot(&root, generation, None, None)
+        .await;
+    let external_path = crate::pathing::normalize_abs_path(&header);
+    assert!(first.shadows(&external_path));
+    assert_eq!(
+        first.source_text(&external_path),
+        Some("int dirty_vendor(void);\n")
+    );
+
+    let cached = service
+        .inner()
+        .candidate_overlay_snapshot(&root, generation, None, None)
+        .await;
+    assert!(Arc::ptr_eq(&first, &cached));
+    assert_eq!(
+        service
+            .inner()
+            .session
+            .cache
+            .candidate_overlay_cache_len_for_test()
+            .await,
+        1
+    );
+
+    service
+        .inner()
+        .session
+        .change_document(uri, 2, "int newer_vendor(void);\n".into())
+        .await;
+    let newer = service
+        .inner()
+        .candidate_overlay_snapshot(&root, generation, None, None)
+        .await;
+    assert!(!Arc::ptr_eq(&first, &newer));
+    assert_eq!(
+        newer.source_text(&external_path),
+        Some("int newer_vendor(void);\n")
+    );
+    assert_eq!(
+        service
+            .inner()
+            .session
+            .cache
+            .candidate_overlay_cache_len_for_test()
+            .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn candidate_overlay_does_not_adopt_a_new_graph_after_request_publication() {
+    let service = test_backend_service();
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().to_path_buf();
+    let uri = Url::from_file_path(root.join("main.c")).expect("uri");
+    service
+        .inner()
+        .session
+        .open_document(uri, 1, "int dirty_main(void);\n".into())
+        .await;
+    let generation = crate::call_model::SemanticGeneration(7);
+    service
+        .inner()
+        .session
+        .cache
+        .publish_engine_snapshot(super::workspace::EngineSnapshot {
+            root: root.clone(),
+            epoch: super::state::EngineEpoch::published(1),
+            semantic_generation: generation,
+            name_table: None,
+            reach_graph: Some(Arc::new(crate::reachability::ReachGraph::new(
+                vec![("unrelated.c".into(), "old.h".into())],
+                vec![],
+                vec![],
+            ))),
+            include_table: None,
+            indexed_files: None,
+            project_context: None,
+            call_read_handle: None,
+            degraded: Default::default(),
+        })
+        .await;
+    let old = service
+        .inner()
+        .session
+        .cache
+        .current_engine_snapshot(&root)
+        .await
+        .expect("old snapshot");
+    service
+        .inner()
+        .session
+        .cache
+        .publish_engine_snapshot(super::workspace::EngineSnapshot {
+            root: root.clone(),
+            epoch: super::state::EngineEpoch::published(2),
+            semantic_generation: generation,
+            name_table: None,
+            reach_graph: Some(Arc::new(crate::reachability::ReachGraph::new(
+                vec![("unrelated.c".into(), "new.h".into())],
+                vec![],
+                vec![],
+            ))),
+            include_table: None,
+            indexed_files: None,
+            project_context: None,
+            call_read_handle: None,
+            degraded: Default::default(),
+        })
+        .await;
+
+    let overlay = service
+        .inner()
+        .candidate_overlay_snapshot(&root, generation, old.reach_graph.as_deref(), None)
+        .await;
+    let scope = overlay
+        .effective_reach_graph(None)
+        .expect("conservative dirty graph")
+        .reachable("unrelated.c");
+    assert!(!scope.files.contains("old.h"));
+    assert!(!scope.files.contains("new.h"));
+}
+
+#[tokio::test]
+async fn candidate_overlay_cache_rejects_a_late_build_after_publication() {
+    let cache = super::CacheLedger::default();
+    let root = PathBuf::from("/workspace/late-overlay");
+    let generation = crate::call_model::SemanticGeneration(7);
+    let (cached, build_revision) = cache.candidate_overlay(&root, generation, 3).await;
+    assert!(cached.is_none());
+
+    cache
+        .publish_engine_snapshot(super::workspace::EngineSnapshot {
+            root: root.clone(),
+            epoch: super::state::EngineEpoch::published(8),
+            semantic_generation: generation,
+            name_table: None,
+            reach_graph: None,
+            include_table: None,
+            indexed_files: None,
+            project_context: None,
+            call_read_handle: None,
+            degraded: Default::default(),
+        })
+        .await;
+    let late = Arc::new(crate::candidate_service::CandidateOverlaySnapshot::new(
+        3,
+        Vec::new(),
+    ));
+    let returned = cache
+        .publish_candidate_overlay(root, generation, 3, build_revision, late.clone())
+        .await;
+
+    assert!(Arc::ptr_eq(&returned, &late));
+    assert_eq!(cache.candidate_overlay_cache_len_for_test().await, 0);
+}
+
+#[tokio::test]
+async fn indexed_completion_resolve_rejects_cross_generation_context_before_overlay_build() {
+    let service = test_backend_service();
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().to_path_buf();
+    let uri = Url::from_file_path(root.join("main.c")).expect("uri");
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(root.clone());
+    service
+        .inner()
+        .session
+        .open_document(uri.clone(), 1, "int dirty(void);\n".into())
+        .await;
+    service
+        .inner()
+        .session
+        .cache
+        .publish_engine_snapshot(super::workspace::EngineSnapshot {
+            root: root.clone(),
+            epoch: super::state::EngineEpoch::published(2),
+            semantic_generation: crate::call_model::SemanticGeneration(12),
+            name_table: None,
+            reach_graph: None,
+            include_table: None,
+            indexed_files: None,
+            project_context: None,
+            call_read_handle: None,
+            degraded: Default::default(),
+        })
+        .await;
+    let item = CompletionItem {
+        label: "dirty".into(),
+        data: Some(
+            serde_json::to_value(super::CompletionDocumentationData::Indexed {
+                version: 3,
+                root: root.to_string_lossy().into_owned(),
+                uri: uri.to_string(),
+                label: "dirty".into(),
+                symbol_id: 1,
+                semantic_generation: 11,
+                overlay_epoch: service
+                    .inner()
+                    .session
+                    .documents
+                    .capture_request_snapshot(Some(&uri))
+                    .await
+                    .overlay_epoch,
+                document_version: 1,
+            })
+            .expect("completion data"),
+        ),
+        ..Default::default()
+    };
+
+    let resolved = service
+        .inner()
+        .completion_resolve(item)
+        .await
+        .expect("resolve");
+    assert!(resolved.documentation.is_none());
+    assert_eq!(
+        service
+            .inner()
+            .session
+            .cache
+            .candidate_overlay_cache_len_for_test()
+            .await,
+        0,
+        "stale completion data must be rejected before mixing/building current overlay state"
+    );
 }
 
 #[tokio::test]
@@ -1833,6 +2562,380 @@ async fn member_completion_returns_fields_and_methods_for_resolved_receiver() {
 }
 
 #[tokio::test]
+async fn member_completion_marks_ambiguous_owner_candidates_incomplete() {
+    let (_dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[
+            ("left.hpp", "struct Widget { int from_left; };\n"),
+            ("right.hpp", "struct Widget { int from_right; };\n"),
+        ],
+        "main.cpp",
+        "#include \"left.hpp\"\n#include \"right.hpp\"\nvoid f(Widget *w) { w->/*cursor*/ }\n",
+    )
+    .await;
+
+    let response = service
+        .inner()
+        .completion(completion_params(uri, line, character))
+        .await
+        .expect("completion request")
+        .expect("completion response");
+
+    assert!(
+        completion_response_is_incomplete(&response),
+        "multiple highest-tier owners must not be presented as a closed result"
+    );
+    let items = completion_items(response);
+    assert!(items.iter().any(|item| item.label == "from_left"));
+    assert!(items.iter().any(|item| item.label == "from_right"));
+    assert!(items.iter().all(|item| {
+        item.detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("ambiguous owner"))
+    }));
+}
+
+#[tokio::test]
+async fn member_completion_resolve_rejects_changed_owner_revision() {
+    let (dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[(
+            "widget.hpp",
+            "struct Widget {\n/// Original resize docs.\nvoid resize();\n};\n",
+        )],
+        "main.cpp",
+        "#include \"widget.hpp\"\nvoid f(Widget *w) { w->res/*cursor*/ }\n",
+    )
+    .await;
+    let response = service
+        .inner()
+        .completion(completion_params(uri, line, character))
+        .await
+        .expect("completion request")
+        .expect("completion response");
+    let item = completion_items(response)
+        .into_iter()
+        .find(|item| item.label == "resize")
+        .expect("resize completion");
+    let header_uri = Url::from_file_path(dir.path().join("widget.hpp")).expect("header uri");
+    service
+        .inner()
+        .session
+        .change_document(
+            header_uri,
+            2,
+            "struct Widget {\n/// Replacement docs must not hydrate the old item.\nvoid resize();\n};\n"
+                .into(),
+        )
+        .await;
+
+    let resolved = service
+        .inner()
+        .completion_resolve(item)
+        .await
+        .expect("resolve stale member item");
+    let documentation = resolved
+        .documentation
+        .map(documentation_text)
+        .unwrap_or_default();
+    assert!(!documentation.contains("Replacement docs"));
+    assert!(!documentation.contains("Original resize docs"));
+}
+
+#[tokio::test]
+async fn member_completion_uses_dirty_header_members_and_tombstones_stale_fields() {
+    let (dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[(
+            "widget.hpp",
+            "struct Widget { int indexed_field; void indexed_method(); };\n",
+        )],
+        "main.cpp",
+        "#include \"widget.hpp\"\nvoid f(Widget *w) { w->/*cursor*/ }\n",
+    )
+    .await;
+    let header_uri = Url::from_file_path(dir.path().join("widget.hpp")).expect("header uri");
+    open_test_document(
+        &service,
+        header_uri,
+        2,
+        "struct Widget {\nint dirty_field;\n/// Unsaved dirty method documentation.\nvoid dirty_method();\n};\n"
+            .into(),
+    )
+    .await;
+
+    let response = service
+        .inner()
+        .completion(completion_params(uri, line, character))
+        .await
+        .expect("completion request")
+        .expect("completion response");
+    let items = completion_items(response);
+
+    assert!(items.iter().any(|item| item.label == "dirty_field"));
+    assert!(items.iter().any(|item| item.label == "dirty_method"));
+    assert!(
+        !items.iter().any(|item| item.label == "indexed_field"),
+        "dirty record must tombstone its stale durable field"
+    );
+    assert!(
+        !items.iter().any(|item| item.label == "indexed_method"),
+        "dirty record must tombstone its stale durable method"
+    );
+    let dirty_method = items
+        .into_iter()
+        .find(|item| item.label == "dirty_method")
+        .expect("dirty method completion");
+    let resolved = service
+        .inner()
+        .completion_resolve(dirty_method)
+        .await
+        .expect("resolve dirty member completion");
+    let documentation =
+        documentation_text(resolved.documentation.expect("dirty member documentation"));
+    assert!(documentation.contains("Unsaved dirty method documentation."));
+}
+
+#[tokio::test]
+async fn member_completion_tombstones_dirty_secondary_root_owner_and_alias() {
+    let primary = tempdir().expect("primary root");
+    let secondary = tempdir().expect("secondary root");
+    let (main_text, line, character) =
+        text_and_position("void use_remote(RemoteAlias value) { value.f/*cursor*/ }\n");
+    let indexed_types = concat!(
+        "struct RemoteRecord { int former_field; };\n",
+        "typedef RemoteRecord RemoteAlias;\n",
+    );
+    let dirty_types = concat!(
+        "struct RemoteRecord { int fresh_field; };\n",
+        "typedef RemoteRecord RemoteAlias;\n",
+    );
+    write_workspace_file(primary.path(), "main.cpp", &main_text);
+    write_workspace_file(secondary.path(), "remote.hpp", indexed_types);
+    for root in [primary.path(), secondary.path()] {
+        crate::indexer::index_workspace(
+            root,
+            crate::indexer::IndexOptions {
+                force: true,
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .expect("index workspace root");
+    }
+
+    let service = test_backend_service();
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .extend([primary.path().to_path_buf(), secondary.path().to_path_buf()]);
+    for root in [primary.path(), secondary.path()] {
+        service
+            .inner()
+            .session
+            .cache
+            .publish_full_index(&service.inner().client, root.to_path_buf())
+            .await
+            .expect("publish workspace root index");
+    }
+
+    let main_uri = Url::from_file_path(primary.path().join("main.cpp")).expect("main uri");
+    service
+        .inner()
+        .did_open(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: main_uri.clone(),
+                language_id: "cpp".into(),
+                version: 1,
+                text: main_text,
+            },
+        })
+        .await;
+    let secondary_uri =
+        Url::from_file_path(secondary.path().join("remote.hpp")).expect("secondary uri");
+    service
+        .inner()
+        .did_open(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: secondary_uri.clone(),
+                language_id: "cpp".into(),
+                version: 1,
+                text: indexed_types.into(),
+            },
+        })
+        .await;
+    service
+        .inner()
+        .did_change(DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier {
+                uri: secondary_uri,
+                version: 2,
+            },
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: dirty_types.into(),
+            }],
+        })
+        .await;
+
+    let response = service
+        .inner()
+        .completion(completion_params(main_uri, line, character))
+        .await
+        .expect("member completion request")
+        .expect("member completion response");
+    let items = completion_items(response);
+    let labels = items
+        .iter()
+        .map(|item| item.label.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        items.iter().any(|item| item.label == "fresh_field"),
+        "secondary dirty member was not visible: {labels:?}"
+    );
+    assert!(
+        !items.iter().any(|item| item.label == "former_field"),
+        "secondary dirty owner/alias must tombstone its durable member: {labels:?}"
+    );
+}
+
+#[tokio::test]
+async fn member_completion_does_not_revive_a_record_deleted_in_dirty_header() {
+    let (dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[("widget.hpp", "struct Widget { int stale_field; };\n")],
+        "main.cpp",
+        "#include \"widget.hpp\"\nvoid f(Widget *w) { w->st/*cursor*/ }\n",
+    )
+    .await;
+    let header_uri = Url::from_file_path(dir.path().join("widget.hpp")).expect("header uri");
+    open_test_document(
+        &service,
+        header_uri,
+        2,
+        "struct Replacement { int fresh_field; };\n".into(),
+    )
+    .await;
+
+    let response = service
+        .inner()
+        .completion(completion_params(uri, line, character))
+        .await
+        .expect("completion request")
+        .expect("completion response");
+    let items = completion_items(response);
+    assert!(
+        !items.iter().any(|item| item.label == "stale_field"),
+        "dirty record deletion must tombstone the durable owner"
+    );
+}
+
+#[tokio::test]
+async fn member_completion_does_not_revive_clean_alias_dirty_deleted_target() {
+    let (dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[
+            ("alias.hpp", "typedef Widget Alias;\n"),
+            ("widget.hpp", "struct Widget { int stale_field; };\n"),
+        ],
+        "main.cpp",
+        "#include \"widget.hpp\"\n#include \"alias.hpp\"\nvoid f(Alias value) { value.st/*cursor*/ }\n",
+    )
+    .await;
+    let widget_uri = Url::from_file_path(dir.path().join("widget.hpp")).expect("widget uri");
+    open_test_document(
+        &service,
+        widget_uri,
+        2,
+        "struct Replacement { int fresh_field; };\n".into(),
+    )
+    .await;
+
+    let response = service
+        .inner()
+        .completion(completion_params(uri, line, character))
+        .await
+        .expect("completion request")
+        .expect("completion response");
+    let items = completion_items(response);
+    assert!(
+        !items.iter().any(|item| item.label == "stale_field"),
+        "a clean alias must not revive its dirty-deleted terminal record"
+    );
+}
+
+#[tokio::test]
+async fn member_completion_follows_dirty_typedef_retarget() {
+    let (dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[(
+            "types.hpp",
+            "struct A { int from_a; };\nstruct B { int from_b; };\ntypedef A Active;\n",
+        )],
+        "main.cpp",
+        "#include \"types.hpp\"\nvoid f(Active value) { value./*cursor*/ }\n",
+    )
+    .await;
+    let header_uri = Url::from_file_path(dir.path().join("types.hpp")).expect("header uri");
+    open_test_document(
+        &service,
+        header_uri,
+        2,
+        "struct A { int from_a; };\nstruct B { int from_b; };\ntypedef B Active;\n".into(),
+    )
+    .await;
+
+    let response = service
+        .inner()
+        .completion(completion_params(uri, line, character))
+        .await
+        .expect("completion request")
+        .expect("completion response");
+    let items = completion_items(response);
+
+    let labels: Vec<_> = items.iter().map(|item| item.label.as_str()).collect();
+    assert!(
+        items.iter().any(|item| item.label == "from_b"),
+        "dirty typedef members were: {labels:?}"
+    );
+    assert!(
+        !items.iter().any(|item| item.label == "from_a"),
+        "dirty typedef target must replace the persisted alias target"
+    );
+}
+
+#[tokio::test]
+async fn member_completion_does_not_revive_deleted_dirty_chain_segment() {
+    let (dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[(
+            "nested.hpp",
+            "struct Inner { int stale_value; };\nstruct Outer { Inner child; };\n",
+        )],
+        "main.cpp",
+        "#include \"nested.hpp\"\nvoid f(Outer value) { value.child./*cursor*/ }\n",
+    )
+    .await;
+    let header_uri = Url::from_file_path(dir.path().join("nested.hpp")).expect("header uri");
+    open_test_document(
+        &service,
+        header_uri,
+        2,
+        "struct Inner { int fresh_value; };\nstruct Outer { int replacement; };\n".into(),
+    )
+    .await;
+
+    let response = service
+        .inner()
+        .completion(completion_params(uri, line, character))
+        .await
+        .expect("completion request")
+        .expect("completion response");
+    let items = completion_items(response);
+    assert!(
+        items.is_empty(),
+        "a deleted dirty chain segment must not fall through to durable members: {:?}",
+        items.iter().map(|item| &item.label).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
 async fn member_completion_resolves_simple_nested_member_chain() {
     let (_dir, service, uri, line, character) = indexed_backend_with_open_doc(
         &[(
@@ -1947,6 +3050,273 @@ async fn member_completion_does_not_leak_global_owner_when_reachable_owner_lacks
     assert!(
         items.is_empty(),
         "resolved receiver should return an empty incomplete list instead of falling back"
+    );
+}
+
+#[tokio::test]
+async fn member_completion_does_not_revive_lower_tier_members_when_dirty_owner_is_empty() {
+    let (dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[
+            (
+                "reachable.hpp",
+                "struct W { int indexed_reachable_member; };\n",
+            ),
+            ("global.hpp", "struct W { int stale_global_member; };\n"),
+        ],
+        "main.cpp",
+        "#include \"reachable.hpp\"\nvoid f(W *w) { w->/*cursor*/ }\n",
+    )
+    .await;
+    service
+        .inner()
+        .session
+        .cache
+        .set_reach_graph_for_test(
+            dir.path().to_path_buf(),
+            Arc::new(crate::reachability::ReachGraph::new(
+                vec![("main.cpp".to_string(), "reachable.hpp".to_string())],
+                vec![],
+                vec![],
+            )),
+        )
+        .await;
+    let reachable_uri =
+        Url::from_file_path(dir.path().join("reachable.hpp")).expect("reachable uri");
+    open_test_document(&service, reachable_uri, 2, "struct W {};\n".to_string()).await;
+
+    let response = service
+        .inner()
+        .completion(completion_params(uri, line, character))
+        .await
+        .expect("completion request")
+        .expect("completion response");
+    let items = completion_items(response);
+    let labels = items
+        .iter()
+        .map(|item| item.label.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(
+        !items.iter().any(|item| item.label == "stale_global_member"),
+        "an empty dirty reachable owner must not revive a lower-tier same-name owner: {labels:?}"
+    );
+    assert!(
+        !items
+            .iter()
+            .any(|item| item.label == "indexed_reachable_member"),
+        "the dirty owner must still tombstone its own durable members: {labels:?}"
+    );
+}
+
+#[tokio::test]
+async fn member_completion_chain_uses_globally_highest_tier_owner_across_roots() {
+    let primary = tempdir().expect("primary root");
+    let secondary = tempdir().expect("secondary root");
+    let (main_text, line, character) = text_and_position(concat!(
+        "#include \"preferred.hpp\"\n",
+        "void f(Outer value) { value.child./*cursor*/ }\n",
+    ));
+    write_workspace_file(primary.path(), "main.cpp", &main_text);
+    write_workspace_file(
+        primary.path(),
+        "preferred.hpp",
+        concat!(
+            "struct PreferredChild { int preferred_member; };\n",
+            "struct Outer { PreferredChild child; };\n",
+        ),
+    );
+    write_workspace_file(
+        secondary.path(),
+        "global.hpp",
+        concat!(
+            "struct GlobalChild { int leaked_global_member; };\n",
+            "struct Outer { GlobalChild child; };\n",
+        ),
+    );
+    for root in [primary.path(), secondary.path()] {
+        crate::indexer::index_workspace(
+            root,
+            crate::indexer::IndexOptions {
+                force: true,
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .expect("index workspace root");
+    }
+
+    let service = test_backend_service();
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .extend([primary.path().to_path_buf(), secondary.path().to_path_buf()]);
+    for root in [primary.path(), secondary.path()] {
+        service
+            .inner()
+            .session
+            .cache
+            .publish_full_index(&service.inner().client, root.to_path_buf())
+            .await
+            .expect("publish workspace root index");
+    }
+    service
+        .inner()
+        .session
+        .cache
+        .set_reach_graph_for_test(
+            primary.path().to_path_buf(),
+            Arc::new(crate::reachability::ReachGraph::new(
+                vec![("main.cpp".to_string(), "preferred.hpp".to_string())],
+                vec![],
+                vec![],
+            )),
+        )
+        .await;
+    service
+        .inner()
+        .session
+        .cache
+        .set_reach_graph_for_test(
+            secondary.path().to_path_buf(),
+            Arc::new(crate::reachability::ReachGraph::new(vec![], vec![], vec![])),
+        )
+        .await;
+    let main_uri = Url::from_file_path(primary.path().join("main.cpp")).expect("main uri");
+    open_test_document(&service, main_uri.clone(), 1, main_text).await;
+
+    let response = service
+        .inner()
+        .completion(completion_params(main_uri, line, character))
+        .await
+        .expect("completion request")
+        .expect("completion response");
+    assert!(
+        !completion_response_is_incomplete(&response),
+        "a lower-tier owner in another root must not make an otherwise exact chain ambiguous"
+    );
+    let items = completion_items(response);
+    let labels = items
+        .iter()
+        .map(|item| item.label.as_str())
+        .collect::<Vec<_>>();
+    let preferred = items
+        .iter()
+        .find(|item| item.label == "preferred_member")
+        .unwrap_or_else(|| panic!("reachable chain member was missing: {labels:?}"));
+
+    assert!(
+        !items
+            .iter()
+            .any(|item| item.label == "leaked_global_member"),
+        "the lower-tier Outer.child chain must not participate: {labels:?}"
+    );
+    assert!(
+        !preferred
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("ambiguous owner")),
+        "the globally shadowed owner must not taint the preferred chain as ambiguous"
+    );
+}
+
+#[tokio::test]
+async fn member_completion_resolves_alias_target_split_across_workspace_roots() {
+    let primary = tempdir().expect("primary root");
+    let secondary = tempdir().expect("secondary root");
+    let (main_text, line, character) = text_and_position(concat!(
+        "#include \"alias.hpp\"\n",
+        "void use_remote(RemoteAlias value) { value.fr/*cursor*/ }\n",
+    ));
+    write_workspace_file(primary.path(), "main.cpp", &main_text);
+    write_workspace_file(
+        primary.path(),
+        "alias.hpp",
+        "typedef RemoteRecord RemoteAlias;\n",
+    );
+    write_workspace_file(
+        secondary.path(),
+        "remote.hpp",
+        concat!(
+            "struct RemoteRecord { int fresh_field; };\n",
+            "struct UnrelatedRecord { int fresh_fallback_noise; };\n",
+        ),
+    );
+    for root in [primary.path(), secondary.path()] {
+        crate::indexer::index_workspace(
+            root,
+            crate::indexer::IndexOptions {
+                force: true,
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .expect("index workspace root");
+    }
+
+    let service = test_backend_service();
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .extend([primary.path().to_path_buf(), secondary.path().to_path_buf()]);
+    for root in [primary.path(), secondary.path()] {
+        service
+            .inner()
+            .session
+            .cache
+            .publish_full_index(&service.inner().client, root.to_path_buf())
+            .await
+            .expect("publish workspace root index");
+    }
+    service
+        .inner()
+        .session
+        .cache
+        .set_reach_graph_for_test(
+            primary.path().to_path_buf(),
+            Arc::new(crate::reachability::ReachGraph::new(
+                vec![("main.cpp".to_string(), "alias.hpp".to_string())],
+                vec![],
+                vec![],
+            )),
+        )
+        .await;
+    service
+        .inner()
+        .session
+        .cache
+        .set_reach_graph_for_test(
+            secondary.path().to_path_buf(),
+            Arc::new(crate::reachability::ReachGraph::new(vec![], vec![], vec![])),
+        )
+        .await;
+    let main_uri = Url::from_file_path(primary.path().join("main.cpp")).expect("main uri");
+    open_test_document(&service, main_uri.clone(), 1, main_text).await;
+
+    let response = service
+        .inner()
+        .completion(completion_params(main_uri, line, character))
+        .await
+        .expect("completion request")
+        .expect("completion response");
+    let items = completion_items(response);
+    let labels = items
+        .iter()
+        .map(|item| item.label.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(
+        items.iter().any(|item| item.label == "fresh_field"),
+        "the alias target name discovered in the primary root must resolve to the record in the secondary root: {labels:?}"
+    );
+    assert!(
+        !items
+            .iter()
+            .any(|item| item.label == "fresh_fallback_noise"),
+        "cross-root alias closure must not degrade into unrelated global member fallback: {labels:?}"
     );
 }
 
@@ -2444,6 +3814,18 @@ async fn ordinary_completion_compat_fixture_captures_presented_boundary_output()
             )),
         )
         .await;
+    service
+        .inner()
+        .session
+        .cache
+        .set_indexed_file_list_for_test(
+            root.clone(),
+            Arc::new(vec![
+                ("src/main.c".to_string(), root.join("src/main.c")),
+                ("reachable.h".to_string(), root.join("reachable.h")),
+            ]),
+        )
+        .await;
     open_test_document(&service, uri.clone(), 1, src).await;
     service
         .inner()
@@ -2518,9 +3900,9 @@ async fn ordinary_completion_compat_fixture_captures_presented_boundary_output()
             PresentedCompletion {
                 label: "fs_global_index".to_string(),
                 kind: Some(CompletionItemKind::CONSTANT),
-                detail: Some("ambiguous".to_string()),
+                detail: Some("global".to_string()),
                 documentation: Some(
-                    "FossilSense: unknown candidate (ambiguous, global_fallback)".to_string(),
+                    "FossilSense: global candidate (fallback, global_fallback)".to_string(),
                 ),
                 sort_text: Some("00000006".to_string()),
                 has_history_command: true,
@@ -2528,9 +3910,9 @@ async fn ordinary_completion_compat_fixture_captures_presented_boundary_output()
             PresentedCompletion {
                 label: "fs_unknown_index".to_string(),
                 kind: Some(CompletionItemKind::ENUM_MEMBER),
-                detail: Some("ambiguous".to_string()),
+                detail: Some("global".to_string()),
                 documentation: Some(
-                    "FossilSense: unknown candidate (ambiguous, global_fallback)".to_string(),
+                    "FossilSense: global candidate (fallback, global_fallback)".to_string(),
                 ),
                 sort_text: Some("00000007".to_string()),
                 has_history_command: true,
@@ -2640,17 +4022,24 @@ fn combined_completion_generation_changes_with_engine_selection_or_project() {
     };
 
     let combined_first =
-        super::state::combine_completion_generation(&[(root.clone(), first)], 1, None);
+        super::state::combine_completion_generation(&[(root.clone(), first)], 1, None, 0);
     let combined_second =
-        super::state::combine_completion_generation(&[(root.clone(), second)], 1, None);
+        super::state::combine_completion_generation(&[(root.clone(), second)], 1, None, 0);
     let combined_selection =
-        super::state::combine_completion_generation(&[(root.clone(), first)], 2, None);
+        super::state::combine_completion_generation(&[(root.clone(), first)], 2, None, 0);
     let combined_project =
-        super::state::combine_completion_generation(&[(root, first)], 1, Some(&project));
+        super::state::combine_completion_generation(&[(root, first)], 1, Some(&project), 0);
+    let combined_overlay = super::state::combine_completion_generation(
+        &[(PathBuf::from("workspace"), first)],
+        1,
+        None,
+        1,
+    );
 
     assert_ne!(combined_first, combined_second);
     assert_ne!(combined_first, combined_selection);
     assert_ne!(combined_first, combined_project);
+    assert_ne!(combined_first, combined_overlay);
 }
 
 // --- R7: local word vs indexed candidate tier ordering --------------------
@@ -2842,6 +4231,137 @@ async fn ordinary_completion_uses_unsaved_current_file_overlay() {
 }
 
 #[tokio::test]
+async fn ordinary_completion_merges_other_dirty_document_symbols_and_tombstones_base() {
+    let (dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[(
+            "api.hpp",
+            "int DirtyOldFunction(void);\n#define DirtyOldMacro 1\ntypedef int DirtyOldType;\n",
+        )],
+        "main.cpp",
+        "void f(void) { Dir/*cursor*/ }\n",
+    )
+    .await;
+    let header_uri = Url::from_file_path(dir.path().join("api.hpp")).expect("header uri");
+    open_test_document(
+        &service,
+        header_uri,
+        2,
+        "int DirtyFunction(void);\n#define DirtyMacro 2\ntypedef long DirtyType;\n".into(),
+    )
+    .await;
+
+    let response = service
+        .inner()
+        .completion(completion_params(uri, line, character))
+        .await
+        .expect("completion request")
+        .expect("completion response");
+    let items = completion_items(response);
+    for name in ["DirtyFunction", "DirtyMacro", "DirtyType"] {
+        assert!(
+            items.iter().any(|item| item.label == name),
+            "missing dirty other-document symbol {name}: {:?}",
+            items.iter().map(|item| &item.label).collect::<Vec<_>>()
+        );
+    }
+    for name in ["DirtyOldFunction", "DirtyOldMacro", "DirtyOldType"] {
+        assert!(
+            !items.iter().any(|item| item.label == name),
+            "dirty path must tombstone stale completion {name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn current_completion_resolve_rejects_changed_document_revision() {
+    let (source, line, character) = text_and_position(
+        "/// Original value.\n#define REVISION_ITEM 1\nvoid f(void) { REV/*cursor*/ }\n",
+    );
+    let dir = tempdir().expect("tempdir");
+    let uri = Url::from_file_path(dir.path().join("main.c")).expect("uri");
+    let service = test_backend_service();
+    open_test_document(&service, uri.clone(), 1, source).await;
+    let response = service
+        .inner()
+        .completion(completion_params(uri.clone(), line, character))
+        .await
+        .expect("completion request")
+        .expect("completion response");
+    let item = completion_items(response)
+        .into_iter()
+        .find(|item| item.label == "REVISION_ITEM")
+        .expect("current completion");
+
+    service
+        .inner()
+        .session
+        .change_document(
+            uri,
+            2,
+            "/// Replacement comment must not hydrate the old item.\n#define REVISION_ITEM 2\n"
+                .into(),
+        )
+        .await;
+    let resolved = service
+        .inner()
+        .completion_resolve(item)
+        .await
+        .expect("resolve stale current item");
+    let documentation = resolved
+        .documentation
+        .map(documentation_text)
+        .unwrap_or_default();
+    assert!(!documentation.contains("Replacement comment"));
+    assert!(!documentation.contains("Original value"));
+}
+
+#[tokio::test]
+async fn indexed_completion_resolve_rejects_changed_overlay_revision() {
+    let (dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[(
+            "api.h",
+            "/// Original indexed docs.\nint RevisionFunction(void);\n",
+        )],
+        "main.c",
+        "void f(void) { Rev/*cursor*/ }\n",
+    )
+    .await;
+    let response = service
+        .inner()
+        .completion(completion_params(uri, line, character))
+        .await
+        .expect("completion request")
+        .expect("completion response");
+    let item = completion_items(response)
+        .into_iter()
+        .find(|item| item.label == "RevisionFunction")
+        .expect("indexed completion");
+    let header_uri = Url::from_file_path(dir.path().join("api.h")).expect("header uri");
+    service
+        .inner()
+        .session
+        .change_document(
+            header_uri,
+            2,
+            "/// Replacement indexed docs must not hydrate the old item.\nint RevisionFunction(void);\n"
+                .into(),
+        )
+        .await;
+
+    let resolved = service
+        .inner()
+        .completion_resolve(item)
+        .await
+        .expect("resolve stale indexed item");
+    let documentation = resolved
+        .documentation
+        .map(documentation_text)
+        .unwrap_or_default();
+    assert!(!documentation.contains("Replacement indexed docs"));
+    assert!(!documentation.contains("Original indexed docs"));
+}
+
+#[tokio::test]
 async fn current_file_text_overlay_renders_text_kind() {
     let (src, line, character) = text_and_position(
         "void f(void) {\n\
@@ -2904,7 +4424,7 @@ async fn text_overlay_still_allows_exact_indexed_semantic_recovery() {
         999,
         "localThing".to_string(),
         false,
-        "a.c".to_string(),
+        "library.c".to_string(),
         "function".to_string(),
         false,
     ));

@@ -38,6 +38,7 @@ fn anchor(key: &str, name: &str, path: &str, role: AnchorRole, arity: u32) -> Ca
         id: 0,
         path: path.into(),
         source: "workspace".into(),
+        directly_included: false,
         entity_key: key.into(),
         anchor_fingerprint: format!("{key}-{role:?}"),
         name: name.into(),
@@ -49,6 +50,9 @@ fn anchor(key: &str, name: &str, path: &str, role: AnchorRole, arity: u32) -> Ca
         linkage_kind: "external".into(),
         linkage_file: None,
         signature: format!("{name}()"),
+        canonical_signature: format!("{name}()"),
+        presentation_signature: format!("{name}();"),
+        signature_fidelity: crate::call_model::SignatureFidelity::AstExact,
         min_arity: Some(arity),
         max_arity: Some(arity),
         variadic: false,
@@ -79,15 +83,35 @@ fn call(caller: &str, callee: &str, path: &str, arity: u32) -> CallSiteRow {
     }
 }
 
+fn build_with_reach(
+    anchors: Vec<CallableAnchorRow>,
+    calls: Vec<CallSiteRow>,
+    graph: &crate::reachability::ReachGraph,
+    incomplete: bool,
+) -> RelationQueryIndex {
+    RelationQueryIndex::build_from_facts_with_context(
+        anchors.into_iter().map(anchor_from_row).collect(),
+        calls.into_iter().map(call_from_row),
+        CoverageSummary::default(),
+        Some(graph),
+        incomplete,
+        false,
+    )
+}
+
 #[test]
 fn query_index_groups_variants_and_resolves_one_hop_both_directions() {
-    let catalog = RelationQueryIndex::build(
+    let graph =
+        crate::reachability::ReachGraph::new(vec![("b.c".into(), "b.h".into())], vec![], vec![]);
+    let catalog = build_with_reach(
         vec![
             anchor("a", "caller", "a.c", AnchorRole::Definition, 0),
             anchor("b", "target", "b.h", AnchorRole::Declaration, 1),
             anchor("b", "target", "b.c", AnchorRole::Definition, 1),
         ],
         vec![call("a", "target", "a.c", 1)],
+        &graph,
+        false,
     );
     assert_eq!(catalog.len(), 2);
     assert_eq!(catalog.entity("b").unwrap().variants.len(), 2);
@@ -104,6 +128,382 @@ fn query_index_groups_variants_and_resolves_one_hop_both_directions() {
             .caller
             .entity_key,
         "a"
+    );
+}
+
+#[test]
+fn relation_page_propagates_candidate_recall_truncation() {
+    let graph = crate::reachability::ReachGraph::new(Vec::new(), Vec::new(), Vec::new());
+    let catalog = RelationQueryIndex::build_from_facts_with_context(
+        vec![
+            anchor("a", "caller", "a.c", AnchorRole::Definition, 0),
+            anchor("b", "target", "b.c", AnchorRole::Definition, 0),
+        ]
+        .into_iter()
+        .map(anchor_from_row)
+        .collect(),
+        [call("a", "target", "a.c", 0)]
+            .into_iter()
+            .map(call_from_row),
+        CoverageSummary::default(),
+        Some(&graph),
+        false,
+        true,
+    );
+
+    let page = catalog.relation_page(RelationDirection::Outgoing, "a", 0, 10, 10);
+    assert!(page.candidate_limited);
+    assert_eq!(page.relations.len(), 1);
+}
+
+#[test]
+fn same_parser_family_does_not_merge_one_to_many_or_many_to_one_variants() {
+    let one_to_many = crate::reachability::ReachGraph::new(
+        vec![
+            ("impl.c".into(), "one.h".into()),
+            ("impl.c".into(), "two.h".into()),
+        ],
+        vec![],
+        vec![],
+    );
+    let catalog = build_with_reach(
+        vec![
+            anchor("caller", "caller", "caller.c", AnchorRole::Definition, 0),
+            anchor("family", "target", "impl.c", AnchorRole::Definition, 0),
+            anchor("family", "target", "one.h", AnchorRole::Declaration, 0),
+            anchor("family", "target", "two.h", AnchorRole::Declaration, 0),
+        ],
+        vec![call("caller", "target", "caller.c", 0)],
+        &one_to_many,
+        false,
+    );
+    let targets = &catalog.by_name["target"];
+    assert_eq!(targets.len(), 3);
+    assert!(targets
+        .iter()
+        .all(|id| catalog.entity_by_id(*id).variants.len() == 1));
+    assert_eq!(
+        relations(&catalog, RelationDirection::Outgoing, "caller")
+            .iter()
+            .filter(|relation| relation.confidence == RelationConfidence::Ambiguous)
+            .count(),
+        3
+    );
+
+    let many_to_one = crate::reachability::ReachGraph::new(
+        vec![
+            ("one.c".into(), "api.h".into()),
+            ("two.c".into(), "api.h".into()),
+        ],
+        vec![],
+        vec![],
+    );
+    let catalog = build_with_reach(
+        vec![
+            anchor("family", "target", "one.c", AnchorRole::Definition, 0),
+            anchor("family", "target", "two.c", AnchorRole::Definition, 0),
+            anchor("family", "target", "api.h", AnchorRole::Declaration, 0),
+        ],
+        vec![],
+        &many_to_one,
+        false,
+    );
+    let targets = &catalog.by_name["target"];
+    assert_eq!(targets.len(), 3);
+    assert!(targets
+        .iter()
+        .all(|id| catalog.entity_by_id(*id).variants.len() == 1));
+}
+
+#[test]
+fn incomplete_dirty_overlay_disables_otherwise_unique_pairing() {
+    let graph = crate::reachability::ReachGraph::new(
+        vec![("impl.c".into(), "api.h".into())],
+        vec![],
+        vec![],
+    );
+    let catalog = build_with_reach(
+        vec![
+            anchor("family", "target", "impl.c", AnchorRole::Definition, 0),
+            anchor("family", "target", "api.h", AnchorRole::Declaration, 0),
+        ],
+        vec![],
+        &graph,
+        true,
+    );
+    assert_eq!(catalog.by_name["target"].len(), 2);
+    assert!(catalog.by_name["target"]
+        .iter()
+        .all(|id| catalog.entity_by_id(*id).variants.len() == 1));
+}
+
+#[test]
+fn truncated_candidate_recall_disables_otherwise_unique_pairing() {
+    let graph = crate::reachability::ReachGraph::new(
+        vec![("impl.c".into(), "api.h".into())],
+        vec![],
+        vec![],
+    );
+    let catalog = RelationQueryIndex::build_from_facts_with_context(
+        vec![
+            anchor("family", "target", "impl.c", AnchorRole::Definition, 0),
+            anchor("family", "target", "api.h", AnchorRole::Declaration, 0),
+        ]
+        .into_iter()
+        .map(anchor_from_row)
+        .collect(),
+        Vec::<CallSiteFact>::new(),
+        CoverageSummary::default(),
+        Some(&graph),
+        false,
+        true,
+    );
+
+    assert_eq!(catalog.by_name["target"].len(), 2);
+    assert!(catalog.by_name["target"].iter().all(|id| {
+        catalog.entity_candidate_limited[*id as usize]
+            && catalog.entity_by_id(*id).variants.len() == 1
+    }));
+}
+
+#[test]
+fn open_same_signature_source_disables_closed_source_pairing() {
+    let graph = crate::reachability::ReachGraph::new(
+        vec![("closed.c".into(), "api.h".into())],
+        vec!["open.c".into()],
+        vec![],
+    );
+    let catalog = build_with_reach(
+        vec![
+            anchor("family", "target", "closed.c", AnchorRole::Definition, 0),
+            anchor("family", "target", "open.c", AnchorRole::Definition, 0),
+            anchor("family", "target", "api.h", AnchorRole::Declaration, 0),
+        ],
+        vec![],
+        &graph,
+        false,
+    );
+    assert_eq!(catalog.by_name["target"].len(), 3);
+    assert!(catalog.by_name["target"]
+        .iter()
+        .all(|id| catalog.entity_by_id(*id).variants.len() == 1));
+}
+
+#[test]
+fn unrelated_open_name_does_not_disable_closed_unique_pairing() {
+    let graph = crate::reachability::ReachGraph::new(
+        vec![("foo.c".into(), "foo.h".into())],
+        vec!["bar.c".into()],
+        vec![],
+    );
+    let catalog = build_with_reach(
+        vec![
+            anchor("foo-family", "foo", "foo.c", AnchorRole::Definition, 0),
+            anchor("foo-family", "foo", "foo.h", AnchorRole::Declaration, 0),
+            anchor("bar-family", "bar", "bar.c", AnchorRole::Definition, 0),
+            anchor("bar-family", "bar", "bar.h", AnchorRole::Declaration, 0),
+        ],
+        vec![],
+        &graph,
+        false,
+    );
+
+    assert_eq!(catalog.by_name["foo"].len(), 1);
+    assert_eq!(catalog.entity("foo-family").unwrap().variants.len(), 2);
+    assert_eq!(
+        catalog.by_name["bar"].len(),
+        2,
+        "only the exact-name bucket with open reach must lose uniqueness"
+    );
+}
+
+#[test]
+fn strict_counterpart_anchor_budget_retains_every_anchor_as_a_singleton() {
+    let graph = crate::reachability::ReachGraph::new(
+        vec![("target.c".into(), "target.h".into())],
+        vec![],
+        vec![],
+    );
+    let mut anchors = vec![
+        anchor(
+            "target-family",
+            "target",
+            "target.c",
+            AnchorRole::Definition,
+            0,
+        ),
+        anchor(
+            "target-family",
+            "target",
+            "target.h",
+            AnchorRole::Declaration,
+            0,
+        ),
+    ];
+    for index in 0..super::grouping::STRICT_COUNTERPART_ANCHOR_BUDGET - 1 {
+        anchors.push(anchor(
+            &format!("filler-{index}"),
+            "target",
+            &format!("filler-{index}.txt"),
+            AnchorRole::Definition,
+            index as u32,
+        ));
+    }
+    let concrete: Vec<_> = anchors.into_iter().map(anchor_from_row).collect();
+    let expected = concrete.len();
+
+    let result = super::grouping::semantic_anchor_groups(concrete, Some(&graph), false);
+
+    assert_eq!(result.groups.len(), expected);
+    assert!(result
+        .groups
+        .iter()
+        .all(|group| { group.candidate_limited && group.variants.len() == 1 }));
+}
+
+#[test]
+fn strict_counterpart_edge_budget_bounds_high_duplication_cartesian_work() {
+    let mut pair_count = 1usize;
+    while pair_count.saturating_mul(pair_count) <= super::grouping::STRICT_COUNTERPART_EDGE_BUDGET {
+        pair_count += 1;
+    }
+    assert!(
+        pair_count.saturating_mul(2) < super::grouping::STRICT_COUNTERPART_ANCHOR_BUDGET,
+        "the edge-budget fixture must not also hit the anchor budget"
+    );
+
+    let mut edges = Vec::with_capacity(pair_count);
+    let mut anchors = Vec::with_capacity(pair_count * 2);
+    for index in 0..pair_count {
+        let source_path = format!("impl-{index}.c");
+        let header_path = format!("api-{index}.h");
+        edges.push((source_path.clone(), header_path.clone()));
+        for (path, role) in [
+            (source_path.as_str(), AnchorRole::Definition),
+            (header_path.as_str(), AnchorRole::Declaration),
+        ] {
+            let mut row = anchor(
+                &format!("target-family-{index}"),
+                "target",
+                path,
+                role,
+                index as u32,
+            );
+            row.signature = format!("target(type_{index})");
+            row.canonical_signature = row.signature.clone();
+            row.presentation_signature = format!("{};", row.signature);
+            anchors.push(anchor_from_row(row));
+        }
+    }
+    let graph = crate::reachability::ReachGraph::new(edges.clone(), vec![], vec![]);
+    let expected = anchors.len();
+
+    let result = super::grouping::semantic_anchor_groups(anchors.clone(), Some(&graph), false);
+
+    assert_eq!(result.groups.len(), expected);
+    assert!(
+        result
+            .groups
+            .iter()
+            .all(|group| group.candidate_limited && group.variants.len() == 1),
+        "an edge-budget hit must disable uniqueness for the whole exact-name bucket"
+    );
+
+    let mut catalog_anchors = anchors;
+    catalog_anchors.push(anchor_from_row(anchor(
+        "small-family",
+        "small",
+        "small.c",
+        AnchorRole::Definition,
+        0,
+    )));
+    catalog_anchors.push(anchor_from_row(anchor(
+        "small-family",
+        "small",
+        "small.h",
+        AnchorRole::Declaration,
+        0,
+    )));
+    edges.push(("small.c".to_string(), "small.h".to_string()));
+    let graph = crate::reachability::ReachGraph::new(edges, vec![], vec![]);
+    let catalog = RelationQueryIndex::build_from_facts_with_context(
+        catalog_anchors,
+        Vec::<CallSiteFact>::new(),
+        CoverageSummary::default(),
+        Some(&graph),
+        false,
+        false,
+    );
+    let entity_key = catalog
+        .entity_by_id(catalog.by_name["target"][0])
+        .entity_key
+        .clone();
+    assert!(
+        catalog
+            .relation_page(RelationDirection::Outgoing, &entity_key, 0, 10, 10)
+            .candidate_limited,
+        "the relation page must expose an internal counterpart grouping limit"
+    );
+    let small_key = catalog
+        .entity_by_id(catalog.by_name["small"][0])
+        .entity_key
+        .clone();
+    assert_eq!(catalog.entity(&small_key).unwrap().variants.len(), 2);
+    assert!(
+        !catalog
+            .relation_page(RelationDirection::Outgoing, &small_key, 0, 10, 10)
+            .candidate_limited,
+        "a budget hit in another exact-name bucket must not taint this entity's coverage"
+    );
+}
+
+#[test]
+fn shared_raw_caller_family_is_disambiguated_by_definition_path() {
+    let catalog = RelationQueryIndex::build(
+        vec![
+            anchor("family", "worker", "one.c", AnchorRole::Definition, 0),
+            anchor("family", "worker", "two.c", AnchorRole::Definition, 0),
+            anchor("left", "left_target", "left.c", AnchorRole::Definition, 0),
+            anchor(
+                "right",
+                "right_target",
+                "right.c",
+                AnchorRole::Definition,
+                0,
+            ),
+        ],
+        vec![
+            call("family", "left_target", "one.c", 0),
+            call("family", "right_target", "two.c", 0),
+        ],
+    );
+    let one = catalog
+        .entity_at(
+            "one.c",
+            SourcePosition {
+                line: 0,
+                character: 5,
+            },
+        )
+        .unwrap();
+    let two = catalog
+        .entity_at(
+            "two.c",
+            SourcePosition {
+                line: 0,
+                character: 5,
+            },
+        )
+        .unwrap();
+    assert_ne!(one.entity_key, two.entity_key);
+    let one_outgoing = relations(&catalog, RelationDirection::Outgoing, &one.entity_key);
+    let two_outgoing = relations(&catalog, RelationDirection::Outgoing, &two.entity_key);
+    assert_eq!(one_outgoing.len(), 1);
+    assert_eq!(two_outgoing.len(), 1);
+    assert_eq!(one_outgoing[0].callee.as_ref().unwrap().name, "left_target");
+    assert_eq!(
+        two_outgoing[0].callee.as_ref().unwrap().name,
+        "right_target"
     );
 }
 

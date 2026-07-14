@@ -17,6 +17,12 @@ fn callable_and_call_site_facts_round_trip_through_active_views() {
     assert_eq!(helper[0].linkage_kind, "internal");
     assert_eq!(helper[0].min_arity, Some(1));
     assert_eq!(helper[0].role, "definition");
+    assert_eq!(helper[0].canonical_signature, "static int helper(int v)");
+    assert_eq!(helper[0].presentation_signature, "static int helper(int v)");
+    assert_eq!(
+        helper[0].signature_fidelity,
+        crate::call_model::SignatureFidelity::AstExact
+    );
     assert_eq!(helper[0].declaration_range.start.line, 0);
     assert_eq!(helper[0].declaration_range.end.line, 0);
     assert!(helper[0].body_range.is_some());
@@ -37,7 +43,7 @@ fn callable_and_call_site_facts_round_trip_through_active_views() {
 }
 
 #[test]
-fn schema_15_persists_compact_typed_call_facts() {
+fn schema_16_persists_full_typed_callable_signatures() {
     let dir = tempdir().unwrap();
     let db = dir.path().join("index.sqlite");
     let mut store = IndexStore::open(&db, dir.path()).unwrap();
@@ -55,7 +61,7 @@ fn schema_15_persists_compact_typed_call_facts() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, "15");
+    assert_eq!(version, "16");
 
     let anchor_columns: Vec<(String, String)> = store
         .conn
@@ -67,6 +73,9 @@ fn schema_15_persists_compact_typed_call_facts() {
         .unwrap();
     assert!(anchor_columns.contains(&("entity_digest".into(), "BLOB".into())));
     assert!(anchor_columns.contains(&("name_id".into(), "INTEGER".into())));
+    assert!(anchor_columns.contains(&("canonical_signature_id".into(), "INTEGER".into())));
+    assert!(anchor_columns.contains(&("presentation_signature_id".into(), "INTEGER".into())));
+    assert!(anchor_columns.contains(&("signature_fidelity".into(), "INTEGER".into())));
     assert!(anchor_columns.contains(&("flags".into(), "INTEGER".into())));
     assert!(!anchor_columns.iter().any(|(name, _)| name == "entity_key"));
 
@@ -123,6 +132,91 @@ fn schema_15_persists_compact_typed_call_facts() {
     assert_eq!(caller_type, "integer");
     assert_eq!(form_type, "integer");
     assert_eq!(joined, 1);
+
+    let parser_version: i64 = store
+        .conn
+        .query_row(
+            "SELECT parser_version FROM file_revisions ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(parser_version, crate::parser::PARSER_FACT_VERSION);
+
+    let indexes: Vec<String> = store
+        .conn
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'callable_anchor_facts'",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    for expected in [
+        "idx_callable_anchor_name",
+        "idx_callable_anchor_name_canonical",
+        "idx_callable_anchor_canonical_signature",
+        "idx_callable_anchor_file_id",
+    ] {
+        assert!(
+            indexes.iter().any(|index| index == expected),
+            "missing {expected}"
+        );
+    }
+}
+
+#[test]
+fn bounded_callable_name_read_reports_truncation_after_stable_ordering() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("index.sqlite");
+    let mut store = IndexStore::open(&db, dir.path()).unwrap();
+    upsert_source(&mut store, "b.c", "int duplicate(int value);\n");
+    upsert_source(&mut store, "a.c", "int duplicate(int value);\n");
+
+    let (rows, truncated) = store
+        .call_fact_view()
+        .anchors_by_name_limited("duplicate", 1)
+        .unwrap();
+    assert!(truncated);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].path, "a.c");
+    let (all, truncated) = store
+        .call_fact_view()
+        .anchors_by_name_limited("duplicate", 2)
+        .unwrap();
+    assert!(!truncated);
+    assert_eq!(
+        all.iter().map(|row| row.path.as_str()).collect::<Vec<_>>(),
+        vec!["a.c", "b.c"]
+    );
+}
+
+#[test]
+fn bounded_multi_name_read_shares_one_budget_across_sql_chunks() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("index.sqlite");
+    let mut store = IndexStore::open(&db, dir.path()).unwrap();
+    upsert_source(
+        &mut store,
+        "api.c",
+        "int first(void); int second(void); int third(void); int late(void);\n",
+    );
+    let mut names = vec!["first".into(), "second".into(), "third".into()];
+    names.extend((0..397).map(|index| format!("missing_{index}")));
+    names.push("late".into());
+
+    let (rows, truncated) = store
+        .call_fact_view()
+        .anchors_by_names_limited(&names, 3)
+        .unwrap();
+
+    assert!(
+        truncated,
+        "the second SQL chunk must be probed after an exact fill"
+    );
+    assert_eq!(rows.len(), 3);
+    assert!(!rows.iter().any(|row| row.name == "late"));
 }
 
 #[test]

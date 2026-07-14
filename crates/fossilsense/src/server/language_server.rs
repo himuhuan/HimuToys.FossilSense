@@ -170,8 +170,26 @@ impl LanguageServer for Backend {
                 params.text_document.text,
             )
             .await;
+        if let Some(root) = self.root_for_uri(&uri).await {
+            let generation = self
+                .request_context_for_root(root.clone())
+                .await
+                .engine
+                .semantic_generation;
+            let rel_paths = uri
+                .to_file_path()
+                .ok()
+                .and_then(|path| pathing::relative_slash_path(&root, &path).ok())
+                .map(|path| vec![path]);
+            if let Some(rel_paths) = rel_paths {
+                self.session
+                    .documents
+                    .reconcile_published_files(root, Some(rel_paths), generation)
+                    .await;
+            }
+        }
         self.client
-            .log_message(MessageType::LOG, format!("opened {uri}"))
+            .log_message(MessageType::LOG, "document opened")
             .await;
     }
 
@@ -185,7 +203,7 @@ impl LanguageServer for Backend {
             self.client
                 .log_message(
                     MessageType::WARNING,
-                    format!("ignored invalid incremental document change for {uri}"),
+                    "ignored invalid incremental document change",
                 )
                 .await;
         }
@@ -202,7 +220,13 @@ impl LanguageServer for Backend {
         let position = params.text_document_position_params;
         let uri = position.text_document.uri;
 
-        let Some((version, text)) = self.document_snapshot(&uri).await else {
+        let documents = self
+            .session
+            .documents
+            .capture_request_snapshot(Some(&uri))
+            .await;
+        let Some((_version, text)) = self.document_snapshot_from_request(&uri, &documents).await
+        else {
             return Ok(None);
         };
         let line_text = text
@@ -228,26 +252,6 @@ impl LanguageServer for Backend {
         let current_rel = uri_to_path(&uri)
             .and_then(|path| pathing::relative_slash_path(&root, &path).ok())
             .unwrap_or_default();
-        let live_records = match uri_to_path(&uri) {
-            Some(path) if !current_rel.is_empty() => self
-                .get_or_parse_document(&uri, &path, version, &text, parser::ParseFacts::MEMBER)
-                .await
-                .map(|index| live_definition_records_for_word(&index, &word, &current_rel))
-                .unwrap_or_default(),
-            _ => Vec::new(),
-        };
-        let origin_record = live_records
-            .iter()
-            .find(|record| {
-                let line = position.position.line;
-                let column = position.position.character;
-                (record.start_line < line
-                    || (record.start_line == line && record.start_col <= column))
-                    && (line < record.end_line
-                        || (line == record.end_line && column <= record.end_col))
-            })
-            .cloned();
-
         // Reachability scope for candidate tier resolution (Current / Reachable
         // / External / Unknown / Global). A file in the set is proved reachable
         // regardless of whether the set is open; an open scope routes
@@ -255,12 +259,32 @@ impl LanguageServer for Backend {
         // the R1 "open scope does not bury unreachable" softening as a tier).
         // `None` when scoping is disabled or no graph exists yet — non-current
         // workspace files then fall back to `Global`.
+        let total_started = std::time::Instant::now();
         let context = self.request_context_for_root(root.clone()).await;
+        let reach_started = std::time::Instant::now();
         let reach_scope: Option<Arc<reachability::ReachScope>> = self
             .reach_scope_from_context(&uri, &context)
             .map(|(_, reach)| reach);
+        let mut reach_us = reach_started.elapsed().as_micros();
         let project_context = context.engine.project_context.clone();
-        let semantic_generation = context.engine.semantic_generation.0;
+        let semantic_generation = context.engine.semantic_generation;
+        let call_read_handle = context.engine.call_read_handle.clone();
+        let reach_graph = context.engine.reach_graph.clone();
+        let overlay_started = std::time::Instant::now();
+        let overlay = self
+            .candidate_overlay_snapshot_from_documents(
+                &root,
+                semantic_generation,
+                reach_graph.as_deref(),
+                context.engine.indexed_files.as_deref().map(Vec::as_slice),
+                documents,
+            )
+            .await;
+        reach_us = reach_us.saturating_add(overlay_started.elapsed().as_micros());
+        let source_position = crate::call_model::SourcePosition {
+            line: position.position.line,
+            character: position.position.character,
+        };
 
         // Debug-gated candidate-reason logging (default off): when on, each
         // returned candidate's tier/confidence/reason is logged to the output
@@ -270,40 +294,113 @@ impl LanguageServer for Backend {
         let client = self.client.clone();
         let word_for_log = word.clone();
 
-        let result =
-            tokio::task::spawn_blocking(move || -> Result<(Vec<Location>, Vec<String>)> {
-                let live_records_replace_current_file = !live_records.is_empty();
-                let mut records = live_records;
-                let db_path = pathing::default_index_path(&root)?;
-                if db_path.exists() {
-                    let mut indexed_records =
-                        IndexStore::read_at_generation(&db_path, semantic_generation, |store| {
-                            store.symbol_read_view().symbols_by_name(&word)
-                        })?;
-                    if live_records_replace_current_file {
-                        indexed_records.retain(|record| record.path != current_rel);
+        let result = tokio::task::spawn_blocking(
+            move || -> Result<(Vec<Location>, Vec<String>, SemanticRequestPerf)> {
+                let query_started = std::time::Instant::now();
+                let service = crate::candidate_service::CandidateQueryService::new(
+                    call_read_handle.as_deref(),
+                    &overlay,
+                    &current_rel,
+                    reach_scope.as_deref(),
+                    reach_graph.as_deref(),
+                );
+                let call_context = service.complete_call_context_at(source_position)?;
+                let callable_set = service.callable_candidates(&word, call_context.clone())?;
+                let mut perf = SemanticRequestPerf::from_callable_set(&callable_set);
+                perf.reach_us = reach_us;
+                if !callable_set.anchors.is_empty() {
+                    // A callee token inside a function body is an ordinary call
+                    // even when its name matches the enclosing/recursive
+                    // function. Anchor opposite-only navigation applies solely
+                    // to the declaration/definition identifier itself.
+                    let origin = if call_context.is_some() {
+                        None
+                    } else {
+                        service.anchor_at(source_position)?
+                    };
+                    let selected: Vec<&query::ResolvedCallableAnchor> = origin
+                        .as_ref()
+                        .and_then(|origin| {
+                            query::anchor_opposite_definition(
+                                &callable_set.groups,
+                                &origin.anchor_fingerprint,
+                            )
+                        })
+                        .map(|opposite| vec![opposite])
+                        .unwrap_or_else(|| {
+                            // Without a proven strict opposite, Definition
+                            // uses the ordinary ranked candidate set. Keeping
+                            // the origin is intentional: removing it can turn
+                            // an unpaired declaration into no result, or leave
+                            // only a semantically weaker same-name function.
+                            query::call_definition_presentations(&callable_set.groups)
+                        });
+                    let candidates: Vec<_> = selected
+                        .iter()
+                        .map(|candidate| candidate.candidate.clone())
+                        .collect();
+                    perf.query_us = query_started.elapsed().as_micros();
+                    let mut debug_lines = candidate_reason_log_lines(&candidates, debug_reasons);
+                    if debug_reasons && callable_set.arity_mismatch_fallback {
+                        debug_lines.insert(
+                            0,
+                            "arity_mismatch_fallback: no candidate matched the available argument-count evidence; retained candidates use fallback confidence"
+                                .to_string(),
+                        );
                     }
-                    records.extend(indexed_records);
+                    let locations: Vec<Location> = candidates
+                        .iter()
+                        .filter_map(|candidate| candidate_to_location(&root, candidate))
+                        .collect();
+                    perf.returned = locations.len();
+                    return Ok((locations, debug_lines, perf));
                 }
-                dedup_symbol_records(&mut records);
+
+                // Non-callable symbols retain the existing navigation policy,
+                // but their durable/live recall still comes through the same
+                // generation-pinned overlay boundary.
+                let records = service.non_callable_symbols(&word)?;
+                let non_callable_count = records.len();
+                let origin_record = records
+                    .iter()
+                    .find(|record| {
+                        record.path == current_rel
+                            && (record.start_line, record.start_col)
+                                <= (source_position.line, source_position.character)
+                            && (source_position.line, source_position.character)
+                                <= (record.end_line, record.end_col)
+                    })
+                    .cloned();
                 let candidates = query::rank_navigation_candidates_with_scope(
                     records,
                     &current_rel,
-                    reach_scope.as_deref(),
+                    service.effective_current_reach(),
                     origin_record.as_ref(),
                     project_context.as_deref(),
                 );
+                perf.include_non_callable_candidates(non_callable_count);
+                perf.query_us = query_started.elapsed().as_micros();
                 let debug_lines = candidate_reason_log_lines(&candidates, debug_reasons);
-                let locations = candidates
+                let locations: Vec<Location> = candidates
                     .iter()
                     .filter_map(|candidate| candidate_to_location(&root, candidate))
                     .collect();
-                Ok((locations, debug_lines))
-            })
+                perf.returned = locations.len();
+                Ok((locations, debug_lines, perf))
+            },
+        )
+        .await;
+
+        let metrics = result
+            .as_ref()
+            .ok()
+            .and_then(|result| result.as_ref().ok().map(|(_, _, metrics)| *metrics))
+            .unwrap_or_default();
+        self.perf_log(|| metrics.log_line("definition", total_started.elapsed().as_micros()))
             .await;
 
         match self.unwrap_query("definition", result).await {
-            Some((locations, debug_lines)) if !locations.is_empty() => {
+            Some((locations, debug_lines, _)) if !locations.is_empty() => {
                 if !debug_lines.is_empty() {
                     client
                         .log_message(
@@ -543,9 +640,21 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
 
-        let Some((version, text)) = self.document_snapshot(&uri).await else {
+        // Current-buffer text and every divergent open-document overlay must
+        // come from one lock-consistent capture. Member completion consumes
+        // the whole capture below; ordinary completion only needs `current`.
+        let document_request = self
+            .session
+            .documents
+            .capture_request_snapshot(Some(&uri))
+            .await;
+        let Some((version, text)) = self
+            .document_snapshot_from_request(&uri, &document_request)
+            .await
+        else {
             return Ok(Some(empty_completion_list(true)));
         };
+        let completion_overlay_epoch = document_request.overlay_epoch;
 
         let line_text = text.lines().nth(position.line as usize).unwrap_or_default();
 
@@ -558,7 +667,7 @@ impl LanguageServer for Backend {
 
         if query::is_member_completion_context(line_text, position.character) {
             return self
-                .complete_members(&uri, version, &text, line_text, position)
+                .complete_members(&uri, version, &text, line_text, position, document_request)
                 .await;
         }
 
@@ -617,12 +726,65 @@ impl LanguageServer for Backend {
         let mut table_roots = Vec::new();
         let mut table_semantic_generations = Vec::new();
         let mut table_generations = Vec::new();
+        let mut overlay_names_by_table = Vec::new();
+        let current_root = self.root_for_uri(&uri).await;
+        let mut effective_completion_scope = None;
         for context in &contexts {
             if let Some(table) = context.engine.name_table.clone() {
+                let overlay = self
+                    .candidate_overlay_snapshot_from_documents(
+                        &context.engine.root,
+                        context.engine.semantic_generation,
+                        context.engine.reach_graph.as_deref(),
+                        context.engine.indexed_files.as_deref().map(Vec::as_slice),
+                        document_request.clone(),
+                    )
+                    .await;
+                if current_root.as_deref() == Some(context.engine.root.as_path())
+                    && context.settings.scoping_enabled
+                {
+                    effective_completion_scope = uri_to_path(&uri)
+                        .and_then(|path| {
+                            pathing::relative_slash_path(&context.engine.root, &path).ok()
+                        })
+                        .and_then(|rel| {
+                            overlay
+                                .effective_reach_graph(context.engine.reach_graph.as_deref())
+                                .map(|graph| query::CompletionScope {
+                                    reach: graph.reachable(&rel).as_ref().clone(),
+                                    current_path: Some(rel),
+                                })
+                        });
+                }
+                let overlay_names = overlay.completion_names();
+                let rows = overlay_names
+                    .iter()
+                    .map(|entry| {
+                        (
+                            entry.id,
+                            entry.name.clone(),
+                            entry.external,
+                            entry.path.clone(),
+                            entry.kind.clone(),
+                            entry.directly_included,
+                        )
+                    })
+                    .collect();
+                let effective_table = table
+                    .with_updated_paths(overlay.shadowed_paths(), rows)
+                    .with_direct_include_overrides(overlay.direct_include_overrides());
                 table_generations.push((context.engine.root.clone(), context.engine.epoch));
                 table_roots.push(context.engine.root.clone());
                 table_semantic_generations.push(context.engine.semantic_generation);
-                tables.push(OrdinaryCompletionNameTable { table });
+                overlay_names_by_table.push(
+                    overlay_names
+                        .into_iter()
+                        .map(|entry| (entry.id, entry))
+                        .collect(),
+                );
+                tables.push(OrdinaryCompletionNameTable {
+                    table: Arc::new(effective_table),
+                });
             }
         }
         let (active_project_context, project_selection_epoch) =
@@ -632,16 +794,7 @@ impl LanguageServer for Backend {
         // `ScopeTier` (current / reachable / first-layer external / unknown /
         // global) via the shared resolver. None => whole-index ranking (scoping
         // off, no graph yet, or unresolvable path).
-        let current_context = self
-            .root_for_uri(&uri)
-            .await
-            .and_then(|root| contexts.iter().find(|context| context.engine.root == root));
-        let scope = current_context
-            .and_then(|context| self.reach_scope_from_context(&uri, context))
-            .map(|(rel, reach)| query::CompletionScope {
-                current_path: Some(rel),
-                reach: (*reach).clone(),
-            });
+        let scope = effective_completion_scope;
 
         let limit = query::COMPLETION_LIMIT;
         let locality_bonus = query::COMPLETION_LOCALITY_BONUS;
@@ -654,6 +807,7 @@ impl LanguageServer for Backend {
             &table_generations,
             project_selection_epoch,
             active_project_context.as_ref(),
+            completion_overlay_epoch,
         );
         let completion_started = tokio::time::Instant::now();
         let memo_lookup = self
@@ -710,6 +864,9 @@ impl LanguageServer for Backend {
                             &uri,
                             &table_roots,
                             &table_semantic_generations,
+                            &overlay_names_by_table,
+                            completion_overlay_epoch,
+                            version,
                         );
                         if history_enabled {
                             if let Some(workspace_hash) = history_workspace_hash.as_deref() {
@@ -938,7 +1095,7 @@ impl LanguageServer for Backend {
         self.client
             .log_message(
                 MessageType::LOG,
-                format!("saved {} (waiting for file watcher before reindex)", uri),
+                "document saved; waiting for file watcher before reindex",
             )
             .await;
     }
@@ -1082,122 +1239,4 @@ impl LanguageServer for Backend {
             Ok(None)
         }
     }
-}
-
-pub(super) fn live_definition_records_for_word(
-    index: &FileSemanticIndex,
-    word: &str,
-    current_rel: &str,
-) -> Vec<crate::store::SymbolRecord> {
-    let persistent_facts = index.persistent_facts();
-    let mut records: Vec<_> = persistent_facts
-        .symbols
-        .iter()
-        .filter(|symbol| symbol.name == word)
-        .map(|symbol| crate::store::SymbolRecord {
-            id: 0,
-            name: symbol.name.clone(),
-            kind: live_symbol_kind(symbol.kind).to_string(),
-            role: live_symbol_role(symbol.role).to_string(),
-            path: current_rel.to_string(),
-            start_line: symbol.start_line as u32,
-            start_col: symbol.start_col as u32,
-            end_line: symbol.end_line as u32,
-            end_col: symbol.end_col as u32,
-            signature: symbol.signature.clone(),
-            guard: symbol.guard.clone(),
-            source: crate::store::FileSource::Workspace.as_str().to_string(),
-            directly_included: false,
-        })
-        .collect();
-
-    // The lexical symbol pass normally covers typedefs, functions, macros,
-    // globals, enum constants, and fields. Fall back to AST-only type facts for
-    // cases the lexical pass intentionally cannot infer, keeping the common path
-    // duplicate-free for typedefs such as `typedef struct { ... } Boom;`.
-    if records.is_empty() {
-        records.extend(
-            persistent_facts
-                .aliases
-                .iter()
-                .filter(|alias| alias.alias == word)
-                .map(|alias| crate::store::SymbolRecord {
-                    id: 0,
-                    name: alias.alias.clone(),
-                    kind: "type".to_string(),
-                    role: "definition".to_string(),
-                    path: current_rel.to_string(),
-                    start_line: alias.start_line as u32,
-                    start_col: alias.start_col as u32,
-                    end_line: alias.end_line as u32,
-                    end_col: alias.end_col as u32,
-                    signature: alias.alias.clone(),
-                    guard: None,
-                    source: crate::store::FileSource::Workspace.as_str().to_string(),
-                    directly_included: false,
-                }),
-        );
-        records.extend(
-            persistent_facts
-                .records
-                .iter()
-                .filter(|record| {
-                    record.display_name == word
-                        || record.tag_name.as_deref() == Some(word)
-                        || record.typedef_name.as_deref() == Some(word)
-                })
-                .map(|record| crate::store::SymbolRecord {
-                    id: 0,
-                    name: word.to_string(),
-                    kind: "type".to_string(),
-                    role: "definition".to_string(),
-                    path: current_rel.to_string(),
-                    start_line: record.start_line as u32,
-                    start_col: record.start_col as u32,
-                    end_line: record.end_line as u32,
-                    end_col: record.end_col as u32,
-                    signature: record.signature.clone(),
-                    guard: None,
-                    source: crate::store::FileSource::Workspace.as_str().to_string(),
-                    directly_included: false,
-                }),
-        );
-    }
-
-    dedup_symbol_records(&mut records);
-    records
-}
-
-fn live_symbol_kind(kind: parser::SymbolKind) -> &'static str {
-    match kind {
-        parser::SymbolKind::Function => "function",
-        parser::SymbolKind::Macro => "macro",
-        parser::SymbolKind::Type => "type",
-        parser::SymbolKind::EnumConstant => "enum_constant",
-        parser::SymbolKind::GlobalVariable => "global_variable",
-        parser::SymbolKind::Field => "field",
-    }
-}
-
-fn live_symbol_role(role: parser::SymbolRole) -> &'static str {
-    match role {
-        parser::SymbolRole::Definition => "definition",
-        parser::SymbolRole::Declaration => "declaration",
-    }
-}
-
-fn dedup_symbol_records(records: &mut Vec<crate::store::SymbolRecord>) {
-    let mut seen = std::collections::HashSet::new();
-    records.retain(|record| {
-        seen.insert((
-            record.name.clone(),
-            record.kind.clone(),
-            record.role.clone(),
-            record.path.clone(),
-            record.start_line,
-            record.start_col,
-            record.end_line,
-            record.end_col,
-        ))
-    });
 }

@@ -59,6 +59,13 @@ const cases = [
     expectedStatus: 0,
     args: ["--large-threshold", "6"],
   },
+  {
+    name: "v1.4.2 semantic candidate and source excerpt boundaries",
+    fixture: "semantic_candidate_boundary",
+    golden: "semantic_candidate_boundary.txt",
+    expectedStatus: 1,
+    args: [],
+  },
 ];
 
 for (const testCase of cases) {

@@ -1,5 +1,16 @@
 //! Parser- and storage-neutral semantic facts shared across internal layers.
 
+use serde::{Deserialize, Serialize};
+
+use crate::call_model::SourceRange;
+
+/// Version of the durable parser-fact contract.
+///
+/// This is deliberately independent from the SQLite schema version: changing
+/// how a fact is derived must invalidate persisted rows even when their SQL
+/// column layout happens to stay compatible.
+pub const PARSER_FACT_VERSION: i64 = 2;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Symbol {
     pub name: String,
@@ -50,6 +61,13 @@ pub enum RecordConfidence {
     Heuristic,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordRangeFidelity {
+    AstExact,
+    Malformed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordDef {
     pub record_key: String,
@@ -63,6 +81,17 @@ pub struct RecordDef {
     pub start_col: usize,
     pub end_line: usize,
     pub end_col: usize,
+    /// Exact range of the `{ ... }` body, including both braces.
+    pub body_range: SourceRange,
+    /// Best-effort enclosing declaration range. When the AST proves direct
+    /// ownership this includes the terminating semicolon; otherwise it falls
+    /// back to the record specifier range above.
+    pub declaration_range: SourceRange,
+    /// BLAKE3 digest of the exact bytes covered by `declaration_range`.
+    /// Durable consumers use this range-local identity to hydrate excerpts
+    /// without reading or hashing the whole source file.
+    pub declaration_hash: [u8; 32],
+    pub range_fidelity: RecordRangeFidelity,
     pub confidence: RecordConfidence,
     pub signature: String,
 }
@@ -137,16 +166,47 @@ pub enum AliasTarget {
     UnresolvedTypeName(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum DeclaratorShape {
+    Identity,
+    Pointer { qualifiers: Vec<String> },
+    Array { extent_text: String },
+    Qualified { qualifiers: Vec<String> },
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AliasTargetFidelity {
+    AstExact,
+    Heuristic,
+    Malformed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeAlias {
     pub alias: String,
     pub target: AliasTarget,
+    /// Alias identifier range. These compatibility fields intentionally remain
+    /// the navigation range rather than being widened to the whole typedef.
     pub start_byte: usize,
     pub end_byte: usize,
     pub start_line: usize,
     pub start_col: usize,
     pub end_line: usize,
     pub end_col: usize,
+    pub declaration_range: SourceRange,
+    /// BLAKE3 digest of the exact bytes covered by `declaration_range`.
+    /// Every declarator in one typedef statement intentionally shares it.
+    pub declaration_hash: [u8; 32],
+    /// Spelling shared by every declarator in the typedef, excluding `typedef`
+    /// itself and excluding each declarator-specific `*`/array suffix.
+    pub underlying_spelling: String,
+    pub declarator_shape: DeclaratorShape,
+    pub target_fidelity: AliasTargetFidelity,
+    /// Stable 96-bit hexadecimal digest scoped to this individual declarator.
+    pub fingerprint: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

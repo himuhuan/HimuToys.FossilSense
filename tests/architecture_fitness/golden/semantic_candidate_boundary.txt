@@ -1,0 +1,9 @@
+Architecture fitness report
+status severity rule file detail allowlist
+FAIL ERROR semantic-candidate-query-boundary crates/fossilsense/src/query/documentation.rs ProjectKey-only declaration/definition pairing must not remain a production identity policy -
+FAIL ERROR semantic-candidate-query-boundary crates/fossilsense/src/query/types/bad_read.rs record and alias durable reads must use typed store views -
+FAIL ERROR semantic-candidate-query-boundary crates/fossilsense/src/server/hover.rs function hover and signature help must consume the shared callable candidate service instead of SymbolRecord name queries -
+FAIL ERROR semantic-candidate-query-boundary crates/fossilsense/src/server/signature_help.rs function hover and signature help must consume the shared callable candidate service instead of SymbolRecord name queries -
+FAIL ERROR semantic-candidate-query-boundary crates/fossilsense/src/server/signature_help.rs signature help must not re-parse function arity from SymbolRecord signatures -
+FAIL ERROR source-excerpt-io-boundary crates/fossilsense/src/query/source_excerpt.rs source excerpts must use bounded range reads instead of loading the whole candidate file -
+Summary: fail=6 warn=0 allowlisted=0

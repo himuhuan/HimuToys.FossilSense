@@ -1,15 +1,17 @@
 use super::byte_offset_at;
-use super::definitions::rank_definition_records_with_scope;
+use super::callables::ArgumentState;
+use crate::call_model::CallForm;
 use crate::model::DefinitionCandidate;
-use crate::reachability::ReachScope;
-use crate::store::SymbolRecord;
 
 pub const SIGNATURE_HELP_LIMIT: usize = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallContext {
     pub name: String,
+    pub qualified_name: Option<String>,
+    pub form: CallForm,
     pub active_argument: u32,
+    pub argument_state: ArgumentState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,63 +42,86 @@ pub fn call_context_at(text: &str, line: u32, character: u32) -> Option<CallCont
     while i < offset {
         let byte = bytes[i];
         match state {
-            LexState::Code => match byte {
-                b'/' if i + 1 < offset && bytes[i + 1] == b'/' => {
-                    state = LexState::LineComment;
-                    i += 2;
-                    continue;
-                }
-                b'/' if i + 1 < offset && bytes[i + 1] == b'*' => {
-                    state = LexState::BlockComment;
-                    i += 2;
-                    continue;
-                }
-                b'"' => state = LexState::String { escaped: false },
-                b'\'' => state = LexState::Char { escaped: false },
-                b'(' => {
-                    let name = identifier_before(bytes, i).filter(|name| !is_control_keyword(name));
-                    stack.push(DelimFrame::Paren {
-                        name,
-                        active_argument: 0,
-                        unsupported_template_argument: false,
-                    });
-                }
-                b')' => pop_matching(&mut stack, FrameKind::Paren),
-                b'[' => stack.push(DelimFrame::Bracket),
-                b']' => pop_matching(&mut stack, FrameKind::Bracket),
-                b'{' => stack.push(DelimFrame::Brace),
-                b'}' => pop_matching(&mut stack, FrameKind::Brace),
-                b'<' if looks_like_template_start(bytes, i, offset) => {
-                    stack.push(DelimFrame::Angle);
-                }
-                b'>' => pop_matching(&mut stack, FrameKind::Angle),
-                b',' => {
-                    if stack.iter().any(|frame| matches!(frame, DelimFrame::Angle)) {
-                        if let Some(DelimFrame::Paren {
-                            name: Some(_),
-                            unsupported_template_argument,
-                            ..
-                        }) = stack
-                            .iter_mut()
-                            .rev()
-                            .find(|frame| matches!(frame, DelimFrame::Paren { name: Some(_), .. }))
-                        {
-                            *unsupported_template_argument = true;
-                        }
-                        i += 1;
+            LexState::Code => {
+                match byte {
+                    b'/' if i + 1 < offset && bytes[i + 1] == b'/' => {
+                        state = LexState::LineComment;
+                        i += 2;
                         continue;
                     }
-                    if let Some(DelimFrame::Paren {
-                        name: Some(_),
-                        active_argument,
-                        ..
-                    }) = stack.last_mut()
-                    {
-                        *active_argument += 1;
+                    b'/' if i + 1 < offset && bytes[i + 1] == b'*' => {
+                        state = LexState::BlockComment;
+                        i += 2;
+                        continue;
                     }
+                    b'"' => {
+                        mark_argument_token(&mut stack);
+                        state = LexState::String { escaped: false };
+                    }
+                    b'\'' => {
+                        mark_argument_token(&mut stack);
+                        state = LexState::Char { escaped: false };
+                    }
+                    b'(' => {
+                        mark_argument_token(&mut stack);
+                        let target = partial_call_target_before(bytes, i)
+                            .filter(|target| !is_control_keyword(&target.name));
+                        stack.push(DelimFrame::Paren {
+                            name: target.as_ref().map(|target| target.name.clone()),
+                            qualified_name: target
+                                .as_ref()
+                                .and_then(|target| target.qualified_name.clone()),
+                            form: target.map_or(CallForm::Unsupported, |target| target.form),
+                            active_argument: 0,
+                            current_argument_has_token: false,
+                            unsupported_template_argument: false,
+                        });
+                    }
+                    b')' => pop_matching(&mut stack, FrameKind::Paren),
+                    b'[' => {
+                        mark_argument_token(&mut stack);
+                        stack.push(DelimFrame::Bracket);
+                    }
+                    b']' => pop_matching(&mut stack, FrameKind::Bracket),
+                    b'{' => {
+                        mark_argument_token(&mut stack);
+                        stack.push(DelimFrame::Brace);
+                    }
+                    b'}' => pop_matching(&mut stack, FrameKind::Brace),
+                    b'<' if looks_like_template_start(bytes, i, offset) => {
+                        mark_argument_token(&mut stack);
+                        stack.push(DelimFrame::Angle);
+                    }
+                    b'>' => pop_matching(&mut stack, FrameKind::Angle),
+                    b',' => {
+                        if stack.iter().any(|frame| matches!(frame, DelimFrame::Angle)) {
+                            if let Some(DelimFrame::Paren {
+                                name: Some(_),
+                                unsupported_template_argument,
+                                ..
+                            }) = stack.iter_mut().rev().find(|frame| {
+                                matches!(frame, DelimFrame::Paren { name: Some(_), .. })
+                            }) {
+                                *unsupported_template_argument = true;
+                            }
+                            i += 1;
+                            continue;
+                        }
+                        if let Some(DelimFrame::Paren {
+                            name: Some(_),
+                            active_argument,
+                            current_argument_has_token,
+                            ..
+                        }) = stack.last_mut()
+                        {
+                            *active_argument += 1;
+                            *current_argument_has_token = false;
+                        }
+                    }
+                    byte if !byte.is_ascii_whitespace() => mark_argument_token(&mut stack),
+                    _ => {}
                 }
-                _ => {}
-            },
+            }
             LexState::String { escaped } => {
                 state = match (escaped, byte) {
                     (true, _) => LexState::String { escaped: false },
@@ -132,11 +157,24 @@ pub fn call_context_at(text: &str, line: u32, character: u32) -> Option<CallCont
     stack.iter().rev().find_map(|frame| match frame {
         DelimFrame::Paren {
             name: Some(name),
+            qualified_name,
+            form,
             active_argument,
+            current_argument_has_token,
             unsupported_template_argument,
         } => Some(CallContext {
             name: name.clone(),
-            active_argument: (!unsupported_template_argument).then_some(*active_argument)?,
+            qualified_name: qualified_name.clone(),
+            form: *form,
+            active_argument: *active_argument,
+            argument_state: if *unsupported_template_argument {
+                ArgumentState::Unknown
+            } else {
+                ArgumentState::Partial {
+                    minimum_arity: active_argument + u32::from(*current_argument_has_token),
+                    active_argument: *active_argument,
+                }
+            },
         }),
         _ => None,
     })
@@ -189,31 +227,14 @@ fn signature_parts_from_bounds(label: String, open: usize, close: usize) -> Sign
     SignatureParts { label, parameters }
 }
 
-pub fn rank_function_signature_candidates(
-    records: Vec<SymbolRecord>,
-    current_rel_path: &str,
-    scope: Option<&ReachScope>,
-    limit: usize,
-) -> Vec<RankedSignatureCandidate> {
-    let functions = records
-        .into_iter()
-        .filter(|record| record.kind == "function")
-        .collect();
-
-    rank_definition_records_with_scope(functions, current_rel_path, scope)
-        .into_iter()
-        .take(limit)
-        .map(|ranked| {
-            let signature = ranked.record.signature;
-            RankedSignatureCandidate {
-                candidate: ranked.candidate,
-                signature,
-            }
-        })
-        .collect()
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PartialCallTarget {
+    name: String,
+    qualified_name: Option<String>,
+    form: CallForm,
 }
 
-fn identifier_before(bytes: &[u8], open_paren: usize) -> Option<String> {
+fn partial_call_target_before(bytes: &[u8], open_paren: usize) -> Option<PartialCallTarget> {
     let mut end = open_paren;
     while end > 0 && bytes[end - 1].is_ascii_whitespace() {
         end -= 1;
@@ -225,9 +246,72 @@ fn identifier_before(bytes: &[u8], open_paren: usize) -> Option<String> {
     if start == end || !is_ident_start(bytes[start]) {
         return None;
     }
-    std::str::from_utf8(&bytes[start..end])
-        .ok()
-        .map(str::to_string)
+    let name = std::str::from_utf8(&bytes[start..end]).ok()?.to_string();
+    let previous = previous_non_ws_index(bytes, start);
+    if previous.is_some_and(|index| bytes[index] == b'.') {
+        return Some(PartialCallTarget {
+            name,
+            qualified_name: None,
+            form: CallForm::MemberDot,
+        });
+    }
+    if let Some(arrow_end) = previous.filter(|index| bytes[*index] == b'>') {
+        if previous_non_ws_index(bytes, arrow_end).is_some_and(|index| bytes[index] == b'-') {
+            return Some(PartialCallTarget {
+                name,
+                qualified_name: None,
+                form: CallForm::MemberArrow,
+            });
+        }
+    }
+
+    let mut qualified_start = start;
+    let mut cursor = start;
+    let mut has_qualifier = false;
+    loop {
+        let Some(second_colon) =
+            previous_non_ws_index(bytes, cursor).filter(|index| bytes[*index] == b':')
+        else {
+            break;
+        };
+        let Some(first_colon) =
+            previous_non_ws_index(bytes, second_colon).filter(|index| bytes[*index] == b':')
+        else {
+            break;
+        };
+        let mut owner_end = first_colon;
+        while owner_end > 0 && bytes[owner_end - 1].is_ascii_whitespace() {
+            owner_end -= 1;
+        }
+        let mut owner_start = owner_end;
+        while owner_start > 0 && is_ident_continue(bytes[owner_start - 1]) {
+            owner_start -= 1;
+        }
+        if owner_start == owner_end || !is_ident_start(bytes[owner_start]) {
+            break;
+        }
+        qualified_start = owner_start;
+        cursor = owner_start;
+        has_qualifier = true;
+    }
+    if has_qualifier {
+        let qualified_name = std::str::from_utf8(&bytes[qualified_start..end])
+            .ok()?
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        Some(PartialCallTarget {
+            name,
+            qualified_name: Some(qualified_name),
+            form: CallForm::QualifiedName,
+        })
+    } else {
+        Some(PartialCallTarget {
+            name,
+            qualified_name: None,
+            form: CallForm::DirectName,
+        })
+    }
 }
 
 fn is_ident_start(byte: u8) -> bool {
@@ -258,12 +342,29 @@ enum LexState {
 enum DelimFrame {
     Paren {
         name: Option<String>,
+        qualified_name: Option<String>,
+        form: CallForm,
         active_argument: u32,
+        current_argument_has_token: bool,
         unsupported_template_argument: bool,
     },
     Bracket,
     Brace,
     Angle,
+}
+
+fn mark_argument_token(stack: &mut [DelimFrame]) {
+    if let Some(DelimFrame::Paren {
+        name: Some(_),
+        current_argument_has_token,
+        ..
+    }) = stack
+        .iter_mut()
+        .rev()
+        .find(|frame| matches!(frame, DelimFrame::Paren { name: Some(_), .. }))
+    {
+        *current_argument_has_token = true;
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -475,47 +576,55 @@ fn push_trimmed_span(label: &str, start: usize, end: usize, spans: &mut Vec<Para
 mod tests {
     use super::*;
 
-    fn symbol_record(
-        name: &str,
-        kind: &str,
-        role: &str,
-        path: &str,
-        signature: &str,
-    ) -> crate::store::SymbolRecord {
-        symbol_record_with_id(0, name, kind, role, path, signature)
-    }
-
-    fn symbol_record_with_id(
-        id: i64,
-        name: &str,
-        kind: &str,
-        role: &str,
-        path: &str,
-        signature: &str,
-    ) -> crate::store::SymbolRecord {
-        crate::store::SymbolRecord {
-            id,
-            name: name.to_string(),
-            kind: kind.to_string(),
-            role: role.to_string(),
-            path: path.to_string(),
-            start_line: 1,
-            start_col: 0,
-            end_line: 1,
-            end_col: 0,
-            signature: signature.to_string(),
-            guard: None,
-            source: "workspace".to_string(),
-            directly_included: false,
-        }
-    }
-
     #[test]
     fn call_context_after_open_paren_is_first_argument() {
         let text = "int main(void) {\n  foo(\n}\n";
         let ctx = call_context_at(text, 1, 6).expect("call context");
         assert_eq!(ctx.name, "foo");
         assert_eq!(ctx.active_argument, 0);
+        assert_eq!(
+            ctx.argument_state,
+            ArgumentState::Partial {
+                minimum_arity: 0,
+                active_argument: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn call_context_distinguishes_empty_and_started_arguments() {
+        let empty = call_context_at("foo(", 0, 4).expect("empty call");
+        let first = call_context_at("foo(value", 0, 9).expect("first argument");
+        let second_empty = call_context_at("foo(value, ", 0, 11).expect("second argument");
+        let second = call_context_at("foo(value, next", 0, 15).expect("second value");
+        assert_eq!(
+            empty.argument_state,
+            ArgumentState::Partial {
+                minimum_arity: 0,
+                active_argument: 0,
+            }
+        );
+        assert_eq!(
+            first.argument_state,
+            ArgumentState::Partial {
+                minimum_arity: 1,
+                active_argument: 0,
+            }
+        );
+        assert_eq!(
+            second_empty.argument_state,
+            ArgumentState::Partial {
+                minimum_arity: 1,
+                active_argument: 1,
+            }
+        );
+        assert_eq!(
+            second.argument_state,
+            ArgumentState::Partial {
+                minimum_arity: 2,
+                active_argument: 1,
+            }
+        );
     }
 
     #[test]
@@ -541,14 +650,14 @@ mod tests {
     }
 
     #[test]
-    fn call_context_rejects_template_like_argument_commas() {
+    fn call_context_keeps_template_like_argument_commas_as_unknown() {
         let text = "void f(void) {\n  foo(std::pair<int, int>{}, \n}\n";
         let line = 1;
         let character = text.lines().nth(1).expect("line").chars().count() as u32;
-        assert!(
-            call_context_at(text, line, character).is_none(),
-            "unsupported template-like shapes must degrade to None"
-        );
+        let context = call_context_at(text, line, character).expect("best-effort call context");
+        assert_eq!(context.name, "foo");
+        assert_eq!(context.active_argument, 1);
+        assert_eq!(context.argument_state, ArgumentState::Unknown);
     }
 
     #[test]
@@ -569,6 +678,21 @@ mod tests {
         let ctx = call_context_at(text, line, character).expect("call context");
         assert_eq!(ctx.name, "log_message");
         assert_eq!(ctx.active_argument, 1);
+    }
+
+    #[test]
+    fn call_context_keeps_member_forms_unsupported_and_normalizes_qualified_names() {
+        let dot = call_context_at("obj.foo(", 0, 8).expect("dot member call");
+        assert_eq!(dot.name, "foo");
+        assert_eq!(dot.form, CallForm::MemberDot);
+        assert_eq!(dot.qualified_name, None);
+
+        let arrow = call_context_at("obj -> foo(", 0, 11).expect("arrow member call");
+        assert_eq!(arrow.form, CallForm::MemberArrow);
+
+        let qualified = call_context_at("net :: io :: open(", 0, 18).expect("qualified call");
+        assert_eq!(qualified.form, CallForm::QualifiedName);
+        assert_eq!(qualified.qualified_name.as_deref(), Some("net::io::open"));
     }
 
     #[test]
@@ -634,99 +758,5 @@ mod tests {
         let parts = signature_parts("int broken(int a, ");
         assert_eq!(parts.label, "int broken(int a, ");
         assert!(parts.parameters.is_empty());
-    }
-
-    #[test]
-    fn signature_candidates_keep_only_functions_and_preserve_signature() {
-        let records = vec![
-            symbol_record(
-                "foo",
-                "macro",
-                "definition",
-                "inc/foo.h",
-                "#define foo(x) (x)",
-            ),
-            symbol_record(
-                "foo",
-                "function",
-                "declaration",
-                "inc/foo.h",
-                "int foo(int x);",
-            ),
-        ];
-        let ranked = rank_function_signature_candidates(records, "src/main.c", None, 10);
-        assert_eq!(ranked.len(), 1);
-        assert_eq!(ranked[0].signature, "int foo(int x);");
-        assert_eq!(ranked[0].candidate.kind, "function");
-    }
-
-    #[test]
-    fn signature_candidates_use_reachability_tier_order() {
-        let records = vec![
-            symbol_record(
-                "foo",
-                "function",
-                "definition",
-                "other/foo.c",
-                "int foo(float x)",
-            ),
-            symbol_record(
-                "foo",
-                "function",
-                "declaration",
-                "inc/foo.h",
-                "int foo(int x);",
-            ),
-        ];
-        let reach = crate::reachability::ReachScope {
-            files: ["src/main.c".to_string(), "inc/foo.h".to_string()]
-                .into_iter()
-                .collect(),
-            open: false,
-            reason: None,
-        };
-        let ranked = rank_function_signature_candidates(records, "src/main.c", Some(&reach), 10);
-        assert_eq!(ranked[0].candidate.path, "inc/foo.h");
-        assert_eq!(ranked[0].candidate.tier, crate::model::ScopeTier::Reachable);
-        assert_eq!(ranked[0].signature, "int foo(int x);");
-    }
-
-    #[test]
-    fn signature_candidates_cap_results_after_ranking() {
-        let records = vec![
-            symbol_record("foo", "function", "definition", "a.c", "int foo(int a)"),
-            symbol_record("foo", "function", "definition", "b.c", "int foo(int b)"),
-        ];
-        let ranked = rank_function_signature_candidates(records, "main.c", None, 1);
-        assert_eq!(ranked.len(), 1);
-    }
-
-    #[test]
-    fn signature_candidates_preserve_distinct_signatures_for_colliding_location_keys() {
-        let records = vec![
-            symbol_record_with_id(
-                1,
-                "foo",
-                "function",
-                "definition",
-                "inc/foo.h",
-                "int foo(int x)",
-            ),
-            symbol_record_with_id(
-                2,
-                "foo",
-                "function",
-                "definition",
-                "inc/foo.h",
-                "int foo(float x)",
-            ),
-        ];
-        let ranked = rank_function_signature_candidates(records, "src/main.c", None, 10);
-        let signatures: Vec<&str> = ranked
-            .iter()
-            .map(|candidate| candidate.signature.as_str())
-            .collect();
-        assert_eq!(ranked.len(), 2);
-        assert_eq!(signatures, vec!["int foo(int x)", "int foo(float x)"]);
     }
 }

@@ -1,6 +1,4 @@
-use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap};
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -19,6 +17,7 @@ use crate::call_model::{
 };
 use crate::call_service::{CallReadHandle, CallRelationService, FileCallOverlay};
 use crate::pathing;
+use crate::query::CALLABLE_CANDIDATE_RESOLVER_VERSION;
 use crate::reachability::ReachGraph;
 
 const STANDARD_RELATION_LIMIT: usize = 500;
@@ -53,16 +52,18 @@ impl RelationRequestState {
     ) -> anyhow::Result<(RelationQueryIndex, String, RelationPage)> {
         let handle = self.handle.clone();
         let overlays = self.overlays.clone();
+        let reach_graph = self.reach_graph.clone();
         let path = path.to_string();
         let (catalog, key, mut page) = tokio::task::spawn_blocking(move || {
-            CallRelationService::for_request(&handle, &overlays).query_at(
-                &path,
-                position,
-                direction,
-                cursor,
-                relation_limit,
-                call_site_limit,
-            )
+            CallRelationService::for_request_with_reach(&handle, &overlays, reach_graph.as_deref())
+                .query_at(
+                    &path,
+                    position,
+                    direction,
+                    cursor,
+                    relation_limit,
+                    call_site_limit,
+                )
         })
         .await??;
         self.with_reachability(&mut page.relations);
@@ -79,15 +80,11 @@ impl RelationRequestState {
     ) -> anyhow::Result<(RelationQueryIndex, String, RelationPage)> {
         let handle = self.handle.clone();
         let overlays = self.overlays.clone();
+        let reach_graph = self.reach_graph.clone();
         let key = key.to_string();
         let (catalog, key, mut page) = tokio::task::spawn_blocking(move || {
-            CallRelationService::for_request(&handle, &overlays).query_key(
-                &key,
-                direction,
-                cursor,
-                relation_limit,
-                call_site_limit,
-            )
+            CallRelationService::for_request_with_reach(&handle, &overlays, reach_graph.as_deref())
+                .query_key(&key, direction, cursor, relation_limit, call_site_limit)
         })
         .await??;
         self.with_reachability(&mut page.relations);
@@ -104,15 +101,11 @@ impl RelationRequestState {
     ) -> anyhow::Result<(RelationQueryIndex, String, RelationPage)> {
         let handle = self.handle.clone();
         let overlays = self.overlays.clone();
+        let reach_graph = self.reach_graph.clone();
         let locator = locator.clone();
         let (catalog, key, mut page) = tokio::task::spawn_blocking(move || {
-            CallRelationService::for_request(&handle, &overlays).query_locator(
-                &locator,
-                direction,
-                cursor,
-                relation_limit,
-                call_site_limit,
-            )
+            CallRelationService::for_request_with_reach(&handle, &overlays, reach_graph.as_deref())
+                .query_locator(&locator, direction, cursor, relation_limit, call_site_limit)
         })
         .await??;
         self.with_reachability(&mut page.relations);
@@ -128,7 +121,11 @@ impl RelationRequestState {
                 continue;
             };
             let scope = graph.reachable(&relation.caller.primary_anchor.path);
-            if scope.files.contains(&callee.primary_anchor.path) {
+            if callee
+                .variants
+                .iter()
+                .any(|anchor| scope.files.contains(&anchor.path))
+            {
                 if !relation
                     .evidence
                     .supports
@@ -213,48 +210,17 @@ impl Backend {
         let root = self.root_for_uri(uri).await?;
         let context = self.request_context_for_root(root.clone()).await;
         let handle = context.engine.call_read_handle.clone()?;
-        let mut snapshots: Vec<_> = self
-            .session
-            .documents
-            .all_snapshots()
-            .await
-            .into_iter()
-            .filter(|(document_uri, snapshot)| {
-                snapshot.needs_relation_overlay(context.engine.semantic_generation)
-                    && uri_to_path(document_uri)
-                        .is_some_and(|path| pathing::path_is_within(&root, &path))
-            })
-            .collect();
-        snapshots.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
-        let mut hasher = DefaultHasher::new();
-        for (document_uri, snapshot) in &snapshots {
-            document_uri.as_str().hash(&mut hasher);
-            snapshot.version.hash(&mut hasher);
-        }
-        let overlay_epoch = if snapshots.is_empty() {
-            0
-        } else {
-            hasher.finish()
-        };
-        let mut overlays = Vec::with_capacity(snapshots.len());
-        for (document_uri, snapshot) in snapshots {
-            let absolute = uri_to_path(&document_uri)?;
-            let rel = pathing::relative_slash_path(&root, &absolute).ok()?;
-            let parsed = self
-                .get_or_parse_document(
-                    &document_uri,
-                    &absolute,
-                    snapshot.version,
-                    &snapshot.text,
-                    crate::parser::ParseFacts::CALL_RELATIONS,
-                )
-                .await?;
-            overlays.push(FileCallOverlay::new(
-                rel,
-                parsed.callable_anchors.clone(),
-                parsed.call_sites.clone(),
-            ));
-        }
+        let overlay = self
+            .candidate_overlay_snapshot(
+                &root,
+                context.engine.semantic_generation,
+                context.engine.reach_graph.as_deref(),
+                context.engine.indexed_files.as_deref().map(Vec::as_slice),
+            )
+            .await;
+        let overlay_epoch = overlay.epoch;
+        let reach_graph = overlay.effective_reach_graph_arc(context.engine.reach_graph.clone());
+        let overlays = overlay.call_relation_overlays();
         Some(RelationRequestState {
             root,
             handle,
@@ -263,9 +229,9 @@ impl Backend {
                 engine_epoch: context.engine.epoch.as_u64(),
                 semantic_generation: context.engine.semantic_generation,
                 overlay_epoch,
-                resolver_version: RELATION_PROTOCOL_VERSION,
+                resolver_version: CALLABLE_CANDIDATE_RESOLVER_VERSION,
             },
-            reach_graph: context.engine.reach_graph.clone(),
+            reach_graph,
         })
     }
 
@@ -279,13 +245,14 @@ impl Backend {
         let rel = catalog_path(&state.root, &path)?;
         let handle = state.handle.clone();
         let overlays = state.overlays.clone();
+        let reach_graph = state.reach_graph.clone();
         let prepare_position = SourcePosition {
             line: position.line,
             character: position.character,
         };
         let prepare_rel = rel.clone();
         let catalog = tokio::task::spawn_blocking(move || {
-            CallRelationService::for_request(&handle, &overlays)
+            CallRelationService::for_request_with_reach(&handle, &overlays, reach_graph.as_deref())
                 .prepare_at(&prepare_rel, prepare_position)
         })
         .await
@@ -613,7 +580,7 @@ mod tests {
             engine_epoch: 9,
             semantic_generation: crate::call_model::SemanticGeneration(7),
             overlay_epoch: 3,
-            resolver_version: RELATION_PROTOCOL_VERSION,
+            resolver_version: CALLABLE_CANDIDATE_RESOLVER_VERSION,
         };
         let cursor = encode_cursor(revision, RelationDirection::Incoming, 200);
         assert_eq!(

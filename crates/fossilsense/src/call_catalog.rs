@@ -6,17 +6,21 @@ use crate::call_model::{
     CallableLocator, CoverageSummary, EvidenceCode, FactProvenance, LinkageDomain, OwnerKindHint,
     RelationConfidence, RelationDirection, SignatureShape, SourcePosition, SourceRange,
 };
+use crate::reachability::ReachGraph;
 #[cfg(test)]
 use crate::store::views::{CallCoverageRow, CallSiteRow, CallableAnchorRow};
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 mod compact;
+mod grouping;
 pub(crate) mod rows;
 use compact::{
     CompactRelation, CompactRelationKey, EvidenceBits, RelationBuilder, StoredCallSite, StringId,
     StringPool,
 };
+pub(crate) use grouping::raw_entity_key;
+use grouping::{derived_group_key, semantic_anchor_groups, SemanticAnchorGroups};
 #[cfg(test)]
 use rows::{anchor_from_row, call_from_row};
 
@@ -45,6 +49,8 @@ pub struct RelationPage {
 pub struct RelationQueryIndex {
     entities: Vec<CallableEntity>,
     entity_by_key: HashMap<String, EntityId>,
+    entity_raw_keys: Vec<Vec<String>>,
+    entities_by_raw_key: HashMap<String, Vec<EntityId>>,
     by_name: HashMap<String, Vec<EntityId>>,
     by_path: HashMap<String, Vec<EntityId>>,
     strings: StringPool,
@@ -55,6 +61,7 @@ pub struct RelationQueryIndex {
     outgoing: HashMap<EntityId, Vec<RelationId>>,
     incoming: HashMap<EntityId, Vec<RelationId>>,
     coverage: CoverageSummary,
+    entity_candidate_limited: Vec<bool>,
 }
 
 impl RelationQueryIndex {
@@ -100,6 +107,7 @@ impl RelationQueryIndex {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn build_from_facts<I>(
         anchors: Vec<CallableAnchor>,
         call_sites: I,
@@ -113,7 +121,34 @@ impl RelationQueryIndex {
             .into_iter()
             .map(|call| StoredCallSite::from_fact(call, &mut strings))
             .collect();
-        Self::from_stored_facts(anchors, strings, call_sites, coverage)
+        Self::from_stored_facts(anchors, strings, call_sites, coverage, None, true, false)
+    }
+
+    pub(crate) fn build_from_facts_with_context<I>(
+        anchors: Vec<CallableAnchor>,
+        call_sites: I,
+        coverage: CoverageSummary,
+        reach_graph: Option<&ReachGraph>,
+        incomplete: bool,
+        candidate_recall_limited: bool,
+    ) -> Self
+    where
+        I: IntoIterator<Item = CallSiteFact>,
+    {
+        let mut strings = StringPool::default();
+        let call_sites: Vec<_> = call_sites
+            .into_iter()
+            .map(|call| StoredCallSite::from_fact(call, &mut strings))
+            .collect();
+        Self::from_stored_facts(
+            anchors,
+            strings,
+            call_sites,
+            coverage,
+            reach_graph,
+            incomplete,
+            candidate_recall_limited,
+        )
     }
 
     fn from_stored_facts(
@@ -121,23 +156,54 @@ impl RelationQueryIndex {
         strings: StringPool,
         call_sites: Vec<StoredCallSite>,
         coverage: CoverageSummary,
+        reach_graph: Option<&ReachGraph>,
+        incomplete: bool,
+        candidate_recall_limited: bool,
     ) -> Self {
-        let mut grouped: HashMap<String, Vec<CallableAnchor>> = HashMap::new();
-        for anchor in anchors {
-            grouped
-                .entry(anchor.entity_key.clone())
-                .or_default()
-                .push(anchor);
+        let SemanticAnchorGroups { groups: grouped } =
+            semantic_anchor_groups(anchors, reach_graph, incomplete || candidate_recall_limited);
+        let mut raw_group_counts: HashMap<String, usize> = HashMap::new();
+        for group in &grouped {
+            let raw_keys: HashSet<_> = group
+                .variants
+                .iter()
+                .map(|anchor| &anchor.entity_key)
+                .collect();
+            for raw_key in raw_keys {
+                *raw_group_counts.entry(raw_key.clone()).or_default() += 1;
+            }
         }
 
         let mut entities = Vec::with_capacity(grouped.len());
         let mut entity_by_key = HashMap::with_capacity(grouped.len());
+        let mut entity_raw_keys = Vec::with_capacity(grouped.len());
+        let mut entities_by_raw_key: HashMap<String, Vec<EntityId>> = HashMap::new();
         let mut by_name: HashMap<String, Vec<EntityId>> = HashMap::new();
         let mut by_path: HashMap<String, Vec<EntityId>> = HashMap::new();
-        for (key, mut variants) in grouped {
+        let mut entity_candidate_limited = Vec::with_capacity(grouped.len());
+        for group in grouped {
+            let mut variants = group.variants;
             variants.sort_by(primary_anchor_cmp);
-            variants.dedup_by(|a, b| a.anchor_fingerprint == b.anchor_fingerprint);
+            variants.dedup_by(|a, b| {
+                a.path == b.path
+                    && a.anchor_fingerprint == b.anchor_fingerprint
+                    && a.name_range == b.name_range
+            });
             let primary_anchor = variants[0].clone();
+            let mut raw_keys: Vec<_> = variants
+                .iter()
+                .map(|anchor| anchor.entity_key.clone())
+                .collect();
+            raw_keys.sort();
+            raw_keys.dedup();
+            let raw_key = primary_anchor.entity_key.clone();
+            let key = if raw_keys.len() == 1
+                && raw_group_counts.get(&raw_key).copied().unwrap_or_default() == 1
+            {
+                raw_key
+            } else {
+                derived_group_key(&raw_key, &variants)
+            };
             let entity = CallableEntity {
                 entity_key: key.clone(),
                 name: primary_anchor.name.clone(),
@@ -160,7 +226,15 @@ impl RelationQueryIndex {
             for path in entity.variants.iter().map(|anchor| anchor.path.clone()) {
                 by_path.entry(path).or_default().push(entity_id);
             }
+            for raw_key in &raw_keys {
+                entities_by_raw_key
+                    .entry(raw_key.clone())
+                    .or_default()
+                    .push(entity_id);
+            }
             entity_by_key.insert(key, entity_id);
+            entity_raw_keys.push(raw_keys);
+            entity_candidate_limited.push(group.candidate_limited || candidate_recall_limited);
             entities.push(entity);
         }
         for ids in by_name.values_mut().chain(by_path.values_mut()) {
@@ -181,6 +255,8 @@ impl RelationQueryIndex {
         let mut catalog = Self {
             entities,
             entity_by_key,
+            entity_raw_keys,
+            entities_by_raw_key,
             by_name,
             by_path,
             strings,
@@ -191,21 +267,14 @@ impl RelationQueryIndex {
             outgoing: HashMap::new(),
             incoming: HashMap::new(),
             coverage,
+            entity_candidate_limited,
         };
         let mut relation_by_key = HashMap::new();
         let mut builders = Vec::new();
         let mut candidates = Vec::new();
         for index in 0..catalog.call_sites.len() {
             let call_id = compact_id(index, "call sites");
-            let Some(caller) = catalog
-                .entity_by_key
-                .get(
-                    catalog
-                        .strings
-                        .get(catalog.call_site(call_id).caller_entity_key),
-                )
-                .copied()
-            else {
+            let Some(caller) = catalog.resolve_caller(call_id) else {
                 continue;
             };
             catalog.resolve_call_into(call_id, &mut candidates);
@@ -299,6 +368,20 @@ impl RelationQueryIndex {
         self.entity_by_key
             .get(key)
             .map(|entity_id| self.entity_by_id(*entity_id))
+    }
+
+    /// Parser entity keys identify a signature family, while this catalog's
+    /// public key identifies one conservative strict-counterpart group. The
+    /// raw keys are needed only to issue the generation-pinned narrow caller
+    /// query after an item has been prepared.
+    pub(crate) fn raw_keys_for_entity(&self, key: &str) -> Option<&[String]> {
+        let id = *self.entity_by_key.get(key)?;
+        self.entity_raw_keys.get(id as usize).map(Vec::as_slice)
+    }
+
+    pub(crate) fn entity_for_unique_raw_key(&self, raw_key: &str) -> Option<&CallableEntity> {
+        let ids = self.entities_by_raw_key.get(raw_key)?;
+        (ids.len() == 1).then(|| self.entity_by_id(ids[0]))
     }
 
     pub fn entity_at(&self, path: &str, position: SourcePosition) -> Option<&CallableEntity> {
@@ -397,7 +480,11 @@ impl RelationQueryIndex {
             total,
             site_limited,
             scan_limited: false,
-            candidate_limited: false,
+            candidate_limited: self
+                .entity_candidate_limited
+                .get(entity_id as usize)
+                .copied()
+                .unwrap_or(false),
         }
     }
 
@@ -444,6 +531,35 @@ impl RelationQueryIndex {
 
     fn call_site(&self, call_site_id: CallSiteId) -> &StoredCallSite {
         &self.call_sites[call_site_id as usize]
+    }
+
+    fn resolve_caller(&self, call_site_id: CallSiteId) -> Option<EntityId> {
+        let call = self.call_site(call_site_id);
+        let raw_key = self.strings.get(call.caller_entity_key);
+        let candidates = self.entities_by_raw_key.get(raw_key)?;
+        if candidates.len() == 1 {
+            return candidates.first().copied();
+        }
+        let call_path = self.strings.get(call.path);
+        let mut exact: Vec<_> = candidates
+            .iter()
+            .copied()
+            .filter(|entity_id| {
+                self.entity_by_id(*entity_id).variants.iter().any(|anchor| {
+                    anchor.entity_key == raw_key
+                        && anchor.path == call_path
+                        && anchor.role == AnchorRole::Definition
+                })
+            })
+            .collect();
+        exact.sort_by(|left, right| {
+            primary_anchor_cmp(
+                &self.entity_by_id(*left).primary_anchor,
+                &self.entity_by_id(*right).primary_anchor,
+            )
+        });
+        exact.dedup();
+        (exact.len() == 1).then(|| exact[0])
     }
 
     fn materialize_relation(

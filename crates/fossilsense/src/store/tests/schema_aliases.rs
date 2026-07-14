@@ -1,7 +1,8 @@
 use super::*;
+use crate::semantic_model::{AliasTargetFidelity, DeclaratorShape, RecordRangeFidelity};
 
 #[test]
-fn test_store_schema_v6() {
+fn test_store_schema_v16() {
     let dir = tempdir().expect("tempdir");
     let db = dir.path().join("index.sqlite");
 
@@ -23,6 +24,45 @@ fn test_store_schema_v6() {
     assert!(tables.contains(&"record_defs".to_string()));
     assert!(tables.contains(&"members".to_string()));
     assert!(tables.contains(&"type_aliases".to_string()));
+
+    let record_columns: Vec<String> = reader
+        .conn
+        .prepare("PRAGMA table_info(record_facts)")
+        .unwrap()
+        .query_map([], |row| row.get(1))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert!(record_columns.contains(&"body_start_byte".to_string()));
+    assert!(record_columns.contains(&"declaration_start_byte".to_string()));
+    assert!(record_columns.contains(&"range_fidelity".to_string()));
+    assert!(record_columns.contains(&"declaration_hash".to_string()));
+
+    let alias_columns: Vec<String> = reader
+        .conn
+        .prepare("PRAGMA table_info(type_alias_facts)")
+        .unwrap()
+        .query_map([], |row| row.get(1))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert!(alias_columns.contains(&"declaration_start_byte".to_string()));
+    assert!(alias_columns.contains(&"underlying_spelling".to_string()));
+    assert!(alias_columns.contains(&"declarator_shape".to_string()));
+    assert!(alias_columns.contains(&"target_fidelity".to_string()));
+    assert!(alias_columns.contains(&"fingerprint".to_string()));
+    assert!(alias_columns.contains(&"declaration_hash".to_string()));
+
+    let alias_indexes: Vec<String> = reader
+        .conn
+        .prepare("PRAGMA index_list(type_alias_facts)")
+        .unwrap()
+        .query_map([], |row| row.get(1))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert!(alias_indexes.contains(&"idx_type_alias_facts_alias".to_string()));
+    assert!(alias_indexes.contains(&"idx_type_alias_facts_fingerprint".to_string()));
 
     // 3. Deleting a file cascades its records, members, and aliases
     let mut store = IndexStore::open(&db, dir.path()).expect("store");
@@ -59,6 +99,158 @@ fn test_store_schema_v6() {
         .resolve_record_candidates(&["Foo"], None)
         .expect("records");
     assert!(records_after.is_empty());
+}
+
+#[test]
+fn record_and_alias_rows_roundtrip_semantic_ranges_shapes_and_revision_metadata() {
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+    let mut store = IndexStore::open(&db, dir.path()).expect("store");
+    let source = concat!(
+        "struct Foo {\r\n",
+        "  int field;\r\n",
+        "};\r\n",
+        "typedef const struct Foo FooConst;\r\n",
+        "typedef struct Foo *FooPtr;\r\n",
+        "typedef struct Foo FooArray[4];\r\n",
+        "typedef int (*Callback)(int);\r\n",
+    );
+    upsert_source(&mut store, "a_types.h", source);
+
+    let (records, record_truncated) = store
+        .member_view()
+        .record_rows_by_name_limited("Foo", 8)
+        .expect("record rows");
+    assert!(!record_truncated);
+    assert_eq!(records.len(), 1);
+    let record = &records[0];
+    assert_eq!(record.range_fidelity, RecordRangeFidelity::AstExact);
+    assert_eq!(
+        &source[record.start_byte..record.end_byte],
+        "struct Foo {\r\n  int field;\r\n}"
+    );
+    assert_eq!(
+        &source[record.body_range.start_byte..record.body_range.end_byte],
+        "{\r\n  int field;\r\n}"
+    );
+    assert_eq!(
+        &source[record.declaration_range.start_byte..record.declaration_range.end_byte],
+        "struct Foo {\r\n  int field;\r\n};"
+    );
+    assert!(record.revision_id > 0);
+    assert_eq!(record.revision_size, source.len() as u64);
+    assert_eq!(record.revision_mtime_ns, 1);
+    assert_eq!(record.revision_hash, "a_types.h-hash");
+    assert_eq!(
+        record.declaration_hash,
+        *blake3::hash(
+            &source.as_bytes()
+                [record.declaration_range.start_byte..record.declaration_range.end_byte]
+        )
+        .as_bytes()
+    );
+
+    let aliases = [
+        (
+            "FooConst",
+            "const struct Foo",
+            DeclaratorShape::Qualified {
+                qualifiers: vec!["const".to_string()],
+            },
+        ),
+        (
+            "FooPtr",
+            "struct Foo",
+            DeclaratorShape::Pointer {
+                qualifiers: Vec::new(),
+            },
+        ),
+        (
+            "FooArray",
+            "struct Foo",
+            DeclaratorShape::Array {
+                extent_text: "4".to_string(),
+            },
+        ),
+        ("Callback", "int", DeclaratorShape::Unsupported),
+    ];
+    for (name, underlying, shape) in aliases {
+        let (rows, truncated) = store
+            .member_view()
+            .alias_rows_by_name_limited(name, 8)
+            .expect("alias rows");
+        assert!(!truncated);
+        assert_eq!(rows.len(), 1, "alias {name}");
+        let alias = &rows[0];
+        assert_eq!(
+            &source[alias.name_range.start_byte..alias.name_range.end_byte],
+            name
+        );
+        assert!(
+            source[alias.declaration_range.start_byte..alias.declaration_range.end_byte]
+                .starts_with("typedef ")
+        );
+        assert_eq!(alias.underlying_spelling, underlying);
+        assert_eq!(alias.declarator_shape, shape);
+        assert_eq!(alias.target_fidelity, AliasTargetFidelity::AstExact);
+        assert_eq!(alias.fingerprint.len(), 24);
+        assert!(alias
+            .fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(alias.revision_id, record.revision_id);
+        assert_eq!(alias.revision_size, source.len() as u64);
+        assert_eq!(alias.revision_mtime_ns, 1);
+        assert_eq!(alias.revision_hash, "a_types.h-hash");
+        assert_eq!(
+            alias.declaration_hash,
+            *blake3::hash(
+                &source.as_bytes()
+                    [alias.declaration_range.start_byte..alias.declaration_range.end_byte]
+            )
+            .as_bytes()
+        );
+    }
+}
+
+#[test]
+fn exact_name_record_and_alias_reads_are_bounded_and_stably_ordered() {
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+    let mut store = IndexStore::open(&db, dir.path()).expect("store");
+    upsert_source(
+        &mut store,
+        "z_types.h",
+        "struct Foo { int z; }; typedef struct Foo FooAlias;\n",
+    );
+    upsert_source(
+        &mut store,
+        "a_types.h",
+        "struct Foo { int a; }; typedef struct Foo FooAlias;\n",
+    );
+
+    let (records, records_truncated) = store
+        .member_view()
+        .record_rows_by_name_limited("Foo", 1)
+        .expect("record rows");
+    assert!(records_truncated);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].path, "a_types.h");
+
+    let (aliases, aliases_truncated) = store
+        .member_view()
+        .alias_rows_by_name_limited("FooAlias", 1)
+        .expect("alias rows");
+    assert!(aliases_truncated);
+    assert_eq!(aliases.len(), 1);
+    assert_eq!(aliases[0].path, "a_types.h");
+
+    let (missing, missing_truncated) = store
+        .member_view()
+        .alias_rows_by_name_limited("fooalias", 1)
+        .expect("case-sensitive alias rows");
+    assert!(missing.is_empty());
+    assert!(!missing_truncated);
 }
 
 #[test]

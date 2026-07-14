@@ -134,6 +134,39 @@ fn members_for_records_returns_fields_and_methods() {
 }
 
 #[test]
+fn members_for_records_limited_uses_limit_plus_one_and_reports_scan_count() {
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+    let mut store = IndexStore::open(&db, dir.path()).expect("store");
+    upsert_source(
+        &mut store,
+        "bounded.hpp",
+        "struct Bounded { int alpha; int beta; int gamma; };\n",
+    );
+
+    let reader = IndexStore::open_readonly(&db).expect("reader");
+    let records = reader
+        .resolve_record_candidates(&["Bounded"], None)
+        .expect("records");
+    let (members, scanned, truncated) = reader
+        .member_view()
+        .members_for_records_limited(&[records[0].id], None, None, 2)
+        .expect("bounded members");
+
+    assert_eq!(scanned, 2);
+    assert_eq!(members.len(), 2);
+    assert!(truncated, "the third row must trip the LIMIT+1 probe");
+
+    let (all, scanned, truncated) = reader
+        .member_view()
+        .members_for_records_limited(&[records[0].id], None, None, 3)
+        .expect("complete bounded members");
+    assert_eq!(scanned, 3);
+    assert_eq!(all.len(), 3);
+    assert!(!truncated);
+}
+
+#[test]
 fn field_member_type_names_are_persisted_for_chain_completion() {
     let dir = tempdir().expect("tempdir");
     let db = dir.path().join("index.sqlite");
@@ -220,6 +253,16 @@ fn fallback_member_candidates_are_prefix_only_and_capped() {
     assert!(names.contains(&"window") || names.contains(&"wipe"));
     assert!(!names.contains(&"draw"));
     assert!(members.len() <= 2);
+
+    let (bounded, truncated) = reader
+        .member_view()
+        .fallback_member_candidates_limited("wi", 2, None)
+        .expect("bounded fallback");
+    assert_eq!(bounded.len(), 2);
+    assert!(
+        truncated,
+        "more matching names than the output cap must be reported"
+    );
 }
 
 #[test]

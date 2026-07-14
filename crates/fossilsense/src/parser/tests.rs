@@ -473,10 +473,8 @@ fn field_members_capture_record_type_name() {
 
 #[test]
 fn nested_anonymous_record_members_get_synthetic_type_names() {
-    let index = parse(
-        Path::new("nested.c"),
-        "typedef struct { struct { int xxx; } mem1[4]; union { int tag; } u; } A;\n",
-    );
+    let source = "typedef struct { struct { int xxx; } mem1[4]; union { int tag; } u; } A;\n";
+    let index = parse(Path::new("nested.c"), source);
 
     let mem1 = index
         .members
@@ -489,6 +487,16 @@ fn nested_anonymous_record_members_get_synthetic_type_names() {
         .iter()
         .any(|record| record.display_name == "A.mem1"
             && record.confidence == super::RecordConfidence::Heuristic));
+    let nested = index
+        .records
+        .iter()
+        .find(|record| record.display_name == "A.mem1")
+        .expect("synthetic nested record");
+    assert_eq!(
+        &source[nested.declaration_range.start_byte..nested.declaration_range.end_byte],
+        "struct { int xxx; } mem1[4];"
+    );
+    assert_eq!(nested.range_fidelity, super::RecordRangeFidelity::AstExact);
     assert_eq!(field_containers(&index, "xxx"), vec!["A.mem1".to_string()]);
 
     let u = index
@@ -1174,7 +1182,7 @@ int caller(void) { return helper(7); }
 fn call_facts_capture_namespace_qualified_free_calls() {
     let source = r#"
 namespace net { int open(int port) { return port; } }
-int start(void) { return net::open(80); }
+int start(void) { return net :: open(80); }
 "#;
     let index = parse(std::path::Path::new("src/main.cpp"), source);
     let open = index
@@ -1194,6 +1202,52 @@ int start(void) { return net::open(80); }
         .expect("qualified call");
     assert_eq!(call.form, crate::call_model::CallForm::QualifiedName);
     assert_eq!(call.qualified_name.as_deref(), Some("net::open"));
+}
+
+#[test]
+fn out_of_namespace_qualified_definition_keeps_unknown_owner_evidence() {
+    let source = r#"
+namespace net { int open(int port); }
+int net::open(int port) { return port; }
+"#;
+    let index = parse(std::path::Path::new("src/main.cpp"), source);
+    let outside_definition = index
+        .callable_anchors
+        .iter()
+        .find(|anchor| {
+            anchor.name == "open" && anchor.role == crate::call_model::AnchorRole::Definition
+        })
+        .expect("out-of-namespace definition");
+
+    assert_eq!(outside_definition.qualified_name, "net::open");
+    assert_eq!(outside_definition.owner.as_deref(), Some("net"));
+    assert_eq!(
+        outside_definition.owner_kind,
+        Some(crate::call_model::OwnerKindHint::Unknown),
+        "without compiler binding, an explicit owner outside its namespace is conservative"
+    );
+}
+
+#[test]
+fn malformed_call_descendants_disable_arity_evidence() {
+    let source = r#"
+int pick(int left, int right);
+int trailing(void) { return pick(1,); }
+int missing(void) { return pick(1; }
+"#;
+    let index = parse(std::path::Path::new("src/main.c"), source);
+    let calls: Vec<_> = index
+        .call_sites
+        .iter()
+        .filter(|call| call.callee_name.as_deref() == Some("pick"))
+        .collect();
+
+    assert_eq!(
+        calls.len(),
+        2,
+        "both malformed calls remain best-effort facts"
+    );
+    assert!(calls.iter().all(|call| call.syntax_error_overlap));
 }
 
 #[test]
@@ -1389,4 +1443,323 @@ fn availability_distinguishes_empty_skipped_and_fallback_ast_vectors() {
     assert_eq!(skipped.local_declarations, clean_empty.local_declarations);
     assert_eq!(clean_empty.local_declarations, fallback.local_declarations);
     assert_eq!(clean_empty.records, fallback.records);
+}
+
+#[test]
+fn callable_full_signatures_are_body_and_whitespace_independent_but_keep_parameter_names() {
+    let declaration = parse(
+        Path::new("api.h"),
+        "extern int lookup ( int key , const char * value );\n",
+    );
+    let definition = parse(
+        Path::new("api.c"),
+        "extern int lookup(int key,const char*value) { return key; }\n",
+    );
+    let renamed = parse(
+        Path::new("renamed.c"),
+        "extern int lookup(int table, const char *value) { return table; }\n",
+    );
+    let declaration = declaration
+        .callable_anchors
+        .iter()
+        .find(|anchor| anchor.name == "lookup")
+        .expect("declaration anchor");
+    let definition = definition
+        .callable_anchors
+        .iter()
+        .find(|anchor| anchor.name == "lookup")
+        .expect("definition anchor");
+    let renamed = renamed
+        .callable_anchors
+        .iter()
+        .find(|anchor| anchor.name == "lookup")
+        .expect("renamed anchor");
+
+    assert_eq!(
+        declaration.canonical_signature,
+        definition.canonical_signature
+    );
+    assert_ne!(definition.canonical_signature, renamed.canonical_signature);
+    assert!(declaration.presentation_signature.ends_with(';'));
+    assert!(!definition.presentation_signature.contains("return key"));
+    assert!(!definition.presentation_signature.contains('{'));
+    assert_eq!(
+        definition.signature_fidelity,
+        crate::call_model::SignatureFidelity::AstExact
+    );
+    assert_eq!(
+        &"extern int lookup(int key,const char*value) { return key; }"
+            [definition.declaration_range.start_byte..definition.declaration_range.end_byte],
+        definition.presentation_signature
+    );
+}
+
+#[test]
+fn callable_anchor_fingerprints_distinguish_identical_cross_file_declarations() {
+    let first = parse(Path::new("first.h"), "int lookup(int key);\n");
+    let second = parse(Path::new("second.h"), "int lookup(int key);\n");
+    let first = first
+        .callable_anchors
+        .iter()
+        .find(|anchor| anchor.name == "lookup")
+        .expect("first declaration");
+    let second = second
+        .callable_anchors
+        .iter()
+        .find(|anchor| anchor.name == "lookup")
+        .expect("second declaration");
+    assert_eq!(first.entity_key, second.entity_key);
+    assert_ne!(first.anchor_fingerprint, second.anchor_fingerprint);
+}
+
+#[test]
+fn callable_signature_shapes_cover_default_variadic_void_and_unspecified_arity() {
+    let cpp = parse(
+        Path::new("arity.cpp"),
+        "int defaults(int first, int second = 2);\n\
+         int variadic(int first, ...);\n\
+         int required(int value[sizeof(1 == 1)]);\n\
+         int optional(int value = sizeof(1 == 1));\n",
+    );
+    let defaults = cpp
+        .callable_anchors
+        .iter()
+        .find(|anchor| anchor.name == "defaults")
+        .expect("defaults");
+    assert_eq!(
+        (defaults.signature.min_arity, defaults.signature.max_arity),
+        (Some(1), Some(2))
+    );
+    let variadic = cpp
+        .callable_anchors
+        .iter()
+        .find(|anchor| anchor.name == "variadic")
+        .expect("variadic");
+    let required = cpp
+        .callable_anchors
+        .iter()
+        .find(|anchor| anchor.name == "required")
+        .expect("required comparison expression");
+    assert_eq!(
+        (required.signature.min_arity, required.signature.max_arity),
+        (Some(1), Some(1))
+    );
+    let optional = cpp
+        .callable_anchors
+        .iter()
+        .find(|anchor| anchor.name == "optional")
+        .expect("optional default expression");
+    assert_eq!(
+        (optional.signature.min_arity, optional.signature.max_arity),
+        (Some(0), Some(1))
+    );
+    assert_eq!(variadic.signature.min_arity, Some(1));
+    assert_eq!(variadic.signature.max_arity, None);
+    assert!(variadic.signature.variadic);
+
+    let c = parse(Path::new("arity.c"), "int old();\nint zero(void);\n");
+    let old = c
+        .callable_anchors
+        .iter()
+        .find(|anchor| anchor.name == "old")
+        .expect("old style");
+    let zero = c
+        .callable_anchors
+        .iter()
+        .find(|anchor| anchor.name == "zero")
+        .expect("void");
+    assert_eq!(
+        (old.signature.min_arity, old.signature.max_arity),
+        (None, None)
+    );
+    assert_eq!(
+        (zero.signature.min_arity, zero.signature.max_arity),
+        (Some(0), Some(0))
+    );
+}
+
+#[test]
+fn record_ranges_preserve_multiline_body_comments_preprocessor_crlf_and_utf16() {
+    let source = "/*😀*/ struct Packet {\r\n    int type; /* field docs */\r\n#ifdef WITH_SIZE\r\n    int size;\r\n#endif\r\n};\r\n";
+    let index = parse(Path::new("packet.h"), source);
+    let record = index
+        .records
+        .iter()
+        .find(|record| record.display_name == "Packet")
+        .expect("Packet record");
+
+    assert_eq!(
+        &source[record.start_byte..record.end_byte],
+        "struct Packet {\r\n    int type; /* field docs */\r\n#ifdef WITH_SIZE\r\n    int size;\r\n#endif\r\n}"
+    );
+    let body = &source[record.body_range.start_byte..record.body_range.end_byte];
+    assert!(body.starts_with('{') && body.ends_with('}'));
+    assert!(body.contains("/* field docs */"));
+    assert!(body.contains("#ifdef WITH_SIZE"));
+    assert_eq!(
+        &source[record.declaration_range.start_byte..record.declaration_range.end_byte],
+        "struct Packet {\r\n    int type; /* field docs */\r\n#ifdef WITH_SIZE\r\n    int size;\r\n#endif\r\n};"
+    );
+    assert_eq!(
+        record.start_col,
+        "/*😀*/ ".encode_utf16().count(),
+        "record columns are UTF-16, not UTF-8 bytes"
+    );
+    assert_eq!(record.range_fidelity, super::RecordRangeFidelity::AstExact);
+}
+
+#[test]
+fn record_ranges_cover_anonymous_typedef_union_and_cpp_class() {
+    for (path, source, name, kind) in [
+        (
+            "anon.h",
+            "typedef struct { int value; } Buffer;",
+            "Buffer",
+            super::RecordKind::Struct,
+        ),
+        (
+            "union.h",
+            "union Value { int integer; };",
+            "Value",
+            super::RecordKind::Union,
+        ),
+        (
+            "widget.hpp",
+            "class Widget { int width; };",
+            "Widget",
+            super::RecordKind::Class,
+        ),
+    ] {
+        let index = parse(Path::new(path), source);
+        let record = index
+            .records
+            .iter()
+            .find(|record| record.display_name == name)
+            .expect("record");
+        assert_eq!(record.kind, kind);
+        assert!(source[record.body_range.start_byte..record.body_range.end_byte].starts_with('{'));
+        assert!(
+            source[record.declaration_range.start_byte..record.declaration_range.end_byte]
+                .ends_with(';')
+        );
+    }
+}
+
+#[test]
+fn typedef_facts_keep_each_declarator_shape_ranges_and_same_named_tag_alias() {
+    let source = "struct Foo { int value; };\n\
+typedef struct Foo Foo, *FooPtr, FooArray[4];\n\
+typedef const struct Foo FooConst;\n\
+typedef int (*Callback)(int);\n\
+typedef struct Foo Foo;\n";
+    let index = parse(Path::new("aliases.h"), source);
+    let aliases = &index.aliases;
+
+    let first_foo = aliases
+        .iter()
+        .find(|alias| alias.alias == "Foo")
+        .expect("same-named tag alias must be retained");
+    assert_eq!(first_foo.declarator_shape, super::DeclaratorShape::Identity);
+    assert_eq!(first_foo.underlying_spelling, "struct Foo");
+    assert_eq!(&source[first_foo.start_byte..first_foo.end_byte], "Foo");
+    assert!(
+        source[first_foo.declaration_range.start_byte..first_foo.declaration_range.end_byte]
+            .starts_with("typedef struct Foo")
+    );
+
+    let pointer = aliases
+        .iter()
+        .find(|alias| alias.alias == "FooPtr")
+        .expect("pointer alias");
+    assert_eq!(
+        pointer.declarator_shape,
+        super::DeclaratorShape::Pointer {
+            qualifiers: Vec::new()
+        }
+    );
+    let array = aliases
+        .iter()
+        .find(|alias| alias.alias == "FooArray")
+        .expect("array alias");
+    assert_eq!(
+        array.declarator_shape,
+        super::DeclaratorShape::Array {
+            extent_text: "4".to_string()
+        }
+    );
+    let qualified = aliases
+        .iter()
+        .find(|alias| alias.alias == "FooConst")
+        .expect("qualified alias");
+    assert_eq!(qualified.underlying_spelling, "const struct Foo");
+    assert_eq!(
+        qualified.declarator_shape,
+        super::DeclaratorShape::Qualified {
+            qualifiers: vec!["const".to_string()]
+        }
+    );
+    let callback = aliases
+        .iter()
+        .find(|alias| alias.alias == "Callback")
+        .expect("function pointer alias");
+    assert_eq!(
+        callback.declarator_shape,
+        super::DeclaratorShape::Unsupported
+    );
+    assert!(aliases.iter().all(|alias| {
+        alias.target_fidelity == super::AliasTargetFidelity::AstExact
+            && alias.fingerprint.len() == 24
+    }));
+    let foo_fingerprints: std::collections::HashSet<_> = aliases
+        .iter()
+        .filter(|alias| alias.alias == "Foo")
+        .map(|alias| alias.fingerprint.as_str())
+        .collect();
+    assert_eq!(foo_fingerprints.len(), 2);
+}
+
+#[test]
+fn malformed_typedef_never_claims_an_exact_declarator_shape() {
+    let index = parse(
+        Path::new("malformed_alias.h"),
+        "struct Foo { int value; };\ntypedef struct Foo Broken",
+    );
+    let alias = index
+        .aliases
+        .iter()
+        .find(|alias| alias.alias == "Broken")
+        .expect("best-effort malformed alias fact");
+    assert_eq!(alias.target_fidelity, super::AliasTargetFidelity::Malformed);
+    assert_eq!(alias.declarator_shape, super::DeclaratorShape::Unsupported);
+}
+
+#[test]
+fn hover_semantics_mask_collects_type_and_callable_facts_without_occurrences() {
+    let index = parse_with_handle(
+        Path::new("hover.h"),
+        "struct Foo { int value; }; typedef struct Foo FooT; int use(FooT value);",
+        None,
+        ParseFacts::HOVER_SEMANTICS,
+    );
+    assert!(!index.records.is_empty());
+    assert!(!index.aliases.is_empty());
+    assert!(!index.callable_anchors.is_empty());
+    assert!(index.occurrences.is_empty());
+    assert!(index.local_declarations.is_empty());
+    assert_eq!(
+        index.fact_availability(FactGroup::Records),
+        FactAvailability::Available
+    );
+    assert_eq!(
+        index.fact_availability(FactGroup::Aliases),
+        FactAvailability::Available
+    );
+    assert_eq!(
+        index.fact_availability(FactGroup::CallableAnchors),
+        FactAvailability::Available
+    );
+    assert_eq!(
+        index.fact_availability(FactGroup::Occurrences),
+        FactAvailability::NotRequested
+    );
 }

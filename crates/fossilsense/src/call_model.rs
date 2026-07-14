@@ -148,6 +148,15 @@ pub struct SignatureShape {
     pub variadic: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignatureFidelity {
+    #[default]
+    AstExact,
+    LexicalFallback,
+    Malformed,
+}
+
 impl SignatureShape {
     pub fn accepts_arity(&self, arity: u32) -> Option<bool> {
         let min = self.min_arity?;
@@ -185,6 +194,16 @@ pub struct CallableAnchor {
     pub role: AnchorRole,
     pub linkage: LinkageDomain,
     pub signature: SignatureShape,
+    /// Full normalized declaration spelling used only for conservative
+    /// declaration/definition identity. It deliberately retains parameter
+    /// names and storage spelling and performs no type equivalence.
+    #[serde(skip)]
+    pub canonical_signature: String,
+    /// Human-readable declaration spelling with a function body removed.
+    #[serde(skip)]
+    pub presentation_signature: String,
+    #[serde(skip)]
+    pub signature_fidelity: SignatureFidelity,
     pub name_range: SourceRange,
     pub declaration_range: SourceRange,
     pub body_range: Option<SourceRange>,

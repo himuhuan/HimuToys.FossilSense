@@ -8,6 +8,7 @@
 //! picture we cannot fully resolve is marked "open" so callers soften the gate.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crate::store::views::{IncludeEdgeRow, OpenIncludeRow};
@@ -60,6 +61,7 @@ pub struct ReachScope {
 /// memoized sets are discarded simply by replacing the `Arc`. Published graphs
 /// are immutable: an incremental refresh is prepared as a new graph so requests
 /// holding an older engine snapshot cannot observe a mixed generation.
+#[derive(Debug)]
 pub struct ReachGraph {
     edges: HashMap<String, Vec<String>>,
     /// First-cause `OpenReason` for every "open" node (an empty set means a
@@ -205,6 +207,23 @@ impl ReachGraph {
         next
     }
 
+    /// Create a request-local immutable graph by replacing source-scoped
+    /// edges/open flags that were resolved from dirty document snapshots.
+    pub fn with_refreshed_sources(
+        &self,
+        sources: &[String],
+        edges: Vec<(String, String)>,
+        open: Vec<(String, OpenReason)>,
+    ) -> Self {
+        let mut next = Self {
+            edges: self.edges.clone(),
+            open: self.open.clone(),
+            cache: Mutex::new(HashMap::new()),
+        };
+        next.refresh_sources(sources, edges, open);
+        next
+    }
+
     /// Reachable set for `start`, memoized for this graph generation.
     pub fn reachable(&self, start: &str) -> Arc<ReachScope> {
         if let Some(hit) = self.cache.lock().unwrap().get(start) {
@@ -216,6 +235,33 @@ impl ReachGraph {
             .unwrap()
             .insert(start.to_string(), scope.clone());
         scope
+    }
+
+    /// Return the workspace-wide first-layer external include targets carried
+    /// by this graph generation. A durable `directly_included` bit is derived
+    /// from the same shape (`workspace -> absolute external path`); exposing
+    /// the request-local projection lets dirty include-edge replacements
+    /// invalidate that bit without reading or mutating the published store.
+    pub(crate) fn directly_included_external_paths(&self) -> HashSet<String> {
+        self.edges
+            .iter()
+            .filter(|(source, _)| !Path::new(source.as_str()).is_absolute())
+            .flat_map(|(_, targets)| targets)
+            .filter(|target| Path::new(target.as_str()).is_absolute())
+            .cloned()
+            .collect()
+    }
+
+    /// Test one external path against the request-local graph. Exact-name
+    /// candidate queries are strictly bounded, so this avoids materializing a
+    /// workspace-wide set for each such request while still replacing stale
+    /// durable first-layer evidence after a dirty include edit.
+    pub(crate) fn directly_includes_external(&self, target: &str) -> bool {
+        Path::new(target).is_absolute()
+            && self.edges.iter().any(|(source, targets)| {
+                !Path::new(source).is_absolute()
+                    && targets.iter().any(|candidate| candidate == target)
+            })
     }
 
     fn compute(&self, start: &str) -> ReachScope {
@@ -280,6 +326,36 @@ mod tests {
 
     fn set(values: &[&str]) -> HashSet<String> {
         values.iter().map(|v| v.to_string()).collect()
+    }
+
+    fn absolute_test_path(name: &str) -> String {
+        std::env::temp_dir()
+            .join("fossilsense-reachability")
+            .join(name)
+            .to_string_lossy()
+            .replace('\\', "/")
+    }
+
+    #[test]
+    fn direct_external_projection_only_counts_workspace_first_layer_edges() {
+        let direct = absolute_test_path("direct.h");
+        let transitive = absolute_test_path("transitive.h");
+        let graph = ReachGraph::new(
+            vec![
+                ("main.c".into(), direct.clone()),
+                (direct.clone(), transitive.clone()),
+            ],
+            vec![],
+            vec![],
+        );
+
+        assert_eq!(
+            graph.directly_included_external_paths(),
+            HashSet::from([direct.clone()])
+        );
+        assert!(graph.directly_includes_external(&direct));
+        assert!(!graph.directly_includes_external(&transitive));
+        assert!(!graph.directly_includes_external("workspace/header.h"));
     }
 
     #[test]

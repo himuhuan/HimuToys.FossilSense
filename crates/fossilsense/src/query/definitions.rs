@@ -23,6 +23,15 @@ fn definition_base_match(record: &SymbolRecord) -> i32 {
     score
 }
 
+fn is_source_ext(path: &str) -> bool {
+    path.rsplit_once('.').is_some_and(|(_, extension)| {
+        matches!(
+            extension.to_ascii_lowercase().as_str(),
+            "c" | "cc" | "cpp" | "cxx"
+        )
+    })
+}
+
 /// Order definition candidates via the shared resolver: tier dominates
 /// `base_match` (definition-preference) dominates locality. Returns the
 /// records in the order the resolver comparator imposes so goto-definition can
@@ -240,55 +249,21 @@ pub fn rank_definitions_into_candidates_with_scope(
         .collect()
 }
 
-/// Rank goto targets with an optional declaration/definition counterpart toggle.
-/// Ordinary call sites retain the established definition-first ordering. When
-/// the cursor is on a declaration/definition anchor, a compatible counterpart
-/// in the same discovered project is moved to the front: header -> source body,
-/// source body -> header declaration.
+/// Rank non-callable goto targets. Callable counterpart navigation is owned by
+/// the strict candidate graph; this compatibility entry point deliberately
+/// ignores the old origin/project toggle so it cannot become a second function
+/// identity policy.
 pub fn rank_navigation_candidates_with_scope(
     candidates: Vec<SymbolRecord>,
     current_rel_path: &str,
     scope: Option<&ReachScope>,
-    origin: Option<&SymbolRecord>,
-    project_context: Option<&ProjectContextIndex>,
+    _origin: Option<&SymbolRecord>,
+    _project_context: Option<&ProjectContextIndex>,
 ) -> Vec<DefinitionCandidate> {
-    let mut ranked = rank_definition_records_with_scope(candidates, current_rel_path, scope);
-    let Some(origin) = origin else {
-        return ranked.into_iter().map(|ranked| ranked.candidate).collect();
-    };
-    let origin_is_header = super::documentation::is_header_path(&origin.path);
-    let origin_is_source = is_source_ext(&origin.path);
-    if !origin_is_header && !origin_is_source {
-        return ranked.into_iter().map(|ranked| ranked.candidate).collect();
-    }
-    ranked.sort_by_key(|ranked| {
-        let record = &ranked.record;
-        let desired_counterpart = if origin_is_header {
-            is_source_ext(&record.path) && record.role == "definition"
-        } else {
-            super::documentation::is_header_path(&record.path) && record.role == "declaration"
-        };
-        let compatible = record.name == origin.name
-            && record.kind == origin.kind
-            && super::documentation::signatures_compatible(&record.signature, &origin.signature)
-            && super::documentation::same_documentation_project(
-                &origin.path,
-                &record.path,
-                project_context,
-            );
-        !desired_counterpart || !compatible
-    });
-    ranked.into_iter().map(|ranked| ranked.candidate).collect()
-}
-
-fn is_source_ext(path: &str) -> bool {
-    match path.rsplit_once('.') {
-        Some((_, ext)) => matches!(
-            ext.to_ascii_lowercase().as_str(),
-            "c" | "cc" | "cpp" | "cxx"
-        ),
-        None => false,
-    }
+    rank_definition_records_with_scope(candidates, current_rel_path, scope)
+        .into_iter()
+        .map(|ranked| ranked.candidate)
+        .collect()
 }
 
 #[cfg(test)]
@@ -356,7 +331,7 @@ mod tests {
     }
 
     #[test]
-    fn navigation_on_source_definition_prefers_header_counterpart() {
+    fn legacy_navigation_does_not_toggle_source_to_header() {
         let mut header = record("foo", "function", "declaration", "lib/foo.h", 1);
         header.signature = "int foo(int value);".to_string();
         let mut source = record("foo", "function", "definition", "lib/foo.c", 10);
@@ -368,11 +343,11 @@ mod tests {
             Some(&source),
             Some(&project_index()),
         );
-        assert_eq!(ranked[0].path, "lib/foo.h");
+        assert_eq!(ranked[0].path, "lib/foo.c");
     }
 
     #[test]
-    fn navigation_on_header_declaration_prefers_source_counterpart() {
+    fn legacy_navigation_does_not_toggle_header_to_source() {
         let mut header = record("foo", "function", "declaration", "lib/foo.h", 1);
         header.signature = "int foo(int value);".to_string();
         let mut source = record("foo", "function", "definition", "lib/foo.c", 10);
@@ -384,7 +359,7 @@ mod tests {
             Some(&header),
             Some(&project_index()),
         );
-        assert_eq!(ranked[0].path, "lib/foo.c");
+        assert_eq!(ranked[0].path, "lib/foo.h");
     }
 
     #[test]
