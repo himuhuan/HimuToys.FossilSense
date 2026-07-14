@@ -204,6 +204,67 @@ fn full_rebuild_switches_the_complete_file_set_once() {
 }
 
 #[test]
+fn full_rebuild_retains_schema16_callable_signature_strings() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("index.sqlite");
+    // Reproduce the production cold/full path: call-fact indexes do not exist
+    // while commit-time cleanup validates every call_strings reference.
+    let mut store = IndexStore::open_for_full_rebuild(&db, dir.path()).unwrap();
+    let source = "int hotfix_target(const unsigned long value) { return (int)value; }\n";
+    let parsed = parse(std::path::Path::new("main.c"), source);
+    let fp = fingerprint("main.c", source, 1);
+    let build = store.begin_index_build(true).unwrap();
+    store
+        .stage_file_updates(
+            build,
+            &[FileIndexUpdate {
+                fingerprint: &fp,
+                source: FileSource::Workspace,
+                payload: FileIndexPayload::Ok(&parsed),
+            }],
+        )
+        .unwrap();
+
+    let outcome = store
+        .commit_index_build(
+            build,
+            &IncludeGraphUpdate {
+                clear_all: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(
+        outcome.cleanup_warning.is_none(),
+        "schema-16 signature strings must not be targeted by cleanup: {:?}",
+        outcome.cleanup_warning
+    );
+
+    let (shape, canonical, presentation): (String, String, String) = store
+        .conn
+        .query_row(
+            "SELECT shape.text, canonical.text, presentation.text
+             FROM callable_anchor_facts anchor
+             JOIN call_strings shape ON shape.id = anchor.signature_id
+             JOIN call_strings canonical ON canonical.id = anchor.canonical_signature_id
+             JOIN call_strings presentation ON presentation.id = anchor.presentation_signature_id
+             WHERE anchor.kind = 0 AND anchor.name_id = (
+                 SELECT id FROM call_strings WHERE text = 'hotfix_target'
+             )",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_ne!(shape, canonical);
+    assert_ne!(shape, presentation);
+    assert!(!canonical.is_empty());
+    assert!(!presentation.is_empty());
+
+    let mut foreign_key_check = store.conn.prepare("PRAGMA foreign_key_check").unwrap();
+    assert!(!foreign_key_check.exists([]).unwrap());
+}
+
+#[test]
 fn semantic_read_guard_rejects_a_mismatched_snapshot_generation() {
     let dir = tempdir().unwrap();
     let db = dir.path().join("index.sqlite");

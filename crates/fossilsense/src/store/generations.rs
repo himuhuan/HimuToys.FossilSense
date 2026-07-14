@@ -277,6 +277,8 @@ impl IndexStore {
                     UNION SELECT owner_id FROM callable_anchor_facts WHERE owner_id IS NOT NULL
                     UNION SELECT linkage_file_id FROM callable_anchor_facts WHERE linkage_file_id IS NOT NULL
                     UNION SELECT signature_id FROM callable_anchor_facts
+                    UNION SELECT canonical_signature_id FROM callable_anchor_facts
+                    UNION SELECT presentation_signature_id FROM callable_anchor_facts
                     UNION SELECT guard_id FROM callable_anchor_facts WHERE guard_id IS NOT NULL
                     UNION SELECT callee_name_id FROM call_site_facts WHERE callee_name_id IS NOT NULL
                     UNION SELECT qualified_name_id FROM call_site_facts WHERE qualified_name_id IS NOT NULL

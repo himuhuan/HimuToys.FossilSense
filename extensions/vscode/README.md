@@ -7,14 +7,13 @@ native Rust indexing engine - no external tools (ctags / cscope / clangd) requir
 This VSIX is self-contained: the `fossilsense` engine binary ships inside the
 extension's `bin/` folder.
 
-v1.4.2 keeps the large-workspace cost model and introduces one schema-16
-request-time candidate pipeline for callable Hover, Definition, Signature Help,
-completion documentation, and Call Hierarchy. It combines the indexed generation
-with all unsynchronized open-document overlays, uses argument arity as evidence,
-and permits a header/source counterpart only for a closed, bidirectionally unique
-exact-signature pair. Full record excerpts and bounded `typedef` `aka`
-resolution share the same revision-safe source reader. Result confidence,
-ambiguity, coverage, truncation, and fallback remain explicit best-effort evidence.
+v1.4.3 is a large-workspace full-build hotfix for the schema-16 candidate model
+introduced in v1.4.2. It retains canonical and presentation signature references
+during call-string cleanup, preventing erroneous SQLite foreign-key deletion scans
+from stalling U-Boot-scale workspaces in `finalizing`. Schema 16, arity-aware
+callable candidates, closed bidirectionally unique header/source counterparts,
+full record excerpts, bounded `typedef` `aka`, and explicit fallback/degradation
+semantics remain unchanged.
 
 ## Current Capability
 

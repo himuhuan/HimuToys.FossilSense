@@ -207,6 +207,7 @@ Smart Completion 当前约定：
 | v1.4.0 | 大工作区性能与懒调用关系版本；schema 15 紧凑 call facts、请求期有界关系派生、per-file overlay、side-by-side generation、租约清理，以及分段紧凑 NameIndex |
 | v1.4.1 | 普通标识符补全前缀优先排序；默认 `fossilsense.completion.prefixRanking = strict`，字面 exact/prefix 先于 fuzzy，`scopeFirst` 可回退旧行为 |
 | v1.4.2 | 语义体验加强版本；schema 16 统一 callable/record/typedef 候选、all-open-document overlay、arity、closed 且双向唯一的 `.h/.c` counterpart、完整 record Hover 与有界 typedef `aka`；C++ `using` alias trace 尚不支持；Call Relations wire protocol 保持 v2 |
+| v1.4.3 | 大工作区 full-build hotfix；schema 16 call-string GC 保留 canonical/presentation signature 外键引用，消除 `finalizing` 阶段的错误外键删除与大表重复扫描；索引格式和语义能力保持不变 |
 | 后置能力 | auto include insertion、ML ranker、telemetry、cloud sync、完整 C++ 语义仍不属于当前版本 |
 
 项目上下文约定：
