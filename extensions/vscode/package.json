@@ -219,7 +219,7 @@
             "off"
           ],
           "default": "auto",
-          "markdownDescription": "Limited `#include` reachability scoping. When 'auto' (default), coloring and completion are narrowed to symbols reachable from the current file's resolved include graph: coloring hard-gates to reachable definitions (uncertain files fall back to whole-index behavior), and completion ranks reachable candidates first without dropping any. 'off' reverts both to whole-index behavior. This trades a little recall for far less cross-file noise in large workspaces; it never errors."
+          "markdownDescription": "Limited `#include` reachability scoping. When 'auto' (default), coloring and completion are narrowed using the current file's resolved include graph: coloring accepts exact reachable definitions, direct external headers, and bounded heuristic include targets, while excluding unrelated whole-workspace definitions when the scope is open; conflicting macro/type/enum kind evidence stays uncolored. Completion ranks stronger scope evidence first without dropping global fallback candidates. 'off' reverts both to whole-index behavior. This trades a little precision and recall for far less cross-file noise in large workspaces; it never errors."
         },
         "fossilsense.references.showRanges": {
           "type": "boolean",

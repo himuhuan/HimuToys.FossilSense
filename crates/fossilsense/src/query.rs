@@ -779,12 +779,13 @@ impl NameTable {
     /// database on the coloring hot path.
     ///
     /// The in-scope gate is delegated to the shared [`resolver::scope_tier`]
-    /// primitive: a colorable definition counts only when its tier is one of
-    /// the determinate in-scope tiers (`Current`, `Reachable`, or first-layer
-    /// `External`). An open/indeterminate scope routes not-proven-reachable
-    /// workspace candidates to `Unknown`, which does **not** count — the
-    /// hard-gate suppress-only behavior. `scope = None` (scoping disabled, no
-    /// graph, or no current file) preserves the prior unscoped fallback
+    /// policy through [`resolver::coloring_scope_allows`]: determinate
+    /// in-scope tiers (`Current`, `Reachable`, or first-layer `External`) count,
+    /// as do bounded paths in `ReachScope::heuristic_files`. A candidate that
+    /// is `Unknown` only because the scope is open does **not** count, so
+    /// unresolved includes cannot admit unrelated whole-index definitions.
+    /// `scope = None` (scoping disabled, no graph, or no current file)
+    /// preserves the prior unscoped fallback
     /// `workspace OR directly_included` by synthesizing a context whose
     /// reachable set contains every workspace file: workspace → `Reachable`
     /// (colors), first-layer external → `External` (colors), non-first-layer
@@ -796,7 +797,6 @@ impl NameTable {
         names: &HashSet<&str>,
         scope: Option<&CompletionScope>,
     ) -> HashMap<String, HashMap<String, usize>> {
-        use crate::model::ScopeTier;
         let mut counts: HashMap<String, HashMap<String, usize>> = HashMap::new();
         if names.is_empty() {
             return counts;
@@ -828,17 +828,11 @@ impl NameTable {
             if !names.contains(&entry.name) {
                 continue;
             }
-            let tier = resolver::scope_tier(
+            let in_scope = resolver::coloring_scope_allows(
                 entry.path,
                 entry.external,
                 self.directly_included_for(entry),
                 ctx_ref,
-            );
-            // Hard gate: only determinate in-scope tiers color. Open/indeterminate
-            // (`Unknown`) and out-of-scope (`Global`) do not color.
-            let in_scope = matches!(
-                tier,
-                ScopeTier::Current | ScopeTier::Reachable | ScopeTier::External
             );
             if !in_scope {
                 continue;

@@ -39,14 +39,13 @@ impl Backend {
             .as_ref()
             .and_then(|context| context.engine.name_table.clone());
 
-        // Reachability scope for coloring kind resolution: delegated to the
-        // shared `scope_tier` primitive. A determinate scope restricts coloring
-        // to in-set definitions (Current/Reachable) + first-layer external
-        // (External); an open scope routes not-proven-reachable workspace
-        // definitions to `Unknown` (hard gate: do not color); `None` (scoping
-        // disabled or no graph) falls back to the unscoped `workspace OR
-        // directly_included` behavior via a synthesized all-workspace context
-        // inside `colorable_kind_counts`.
+        // Reachability scope for coloring kind resolution: determinate
+        // Current/Reachable definitions, first-layer External definitions, and
+        // bounded heuristic include targets may contribute kind evidence.
+        // Workspace definitions that are Unknown only because the scope is open
+        // stay excluded. `None` (scoping disabled or no graph) falls back to the
+        // unscoped `workspace OR directly_included` behavior via a synthesized
+        // all-workspace context inside `colorable_kind_counts`.
         let color_scope: Option<query::CompletionScope> = context
             .as_ref()
             .and_then(|context| self.reach_scope_from_context(uri, context))

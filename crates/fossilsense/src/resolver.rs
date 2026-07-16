@@ -148,6 +148,32 @@ pub fn scope_tier(
     ScopeTier::Global
 }
 
+/// Whether a candidate file may contribute kind evidence to degraded semantic
+/// coloring.
+///
+/// Strong scope tiers (`Current`, `Reachable`, and direct `External`) always
+/// participate. A path carried by `ReachScope::heuristic_files` may also
+/// participate because it is a bounded include-resolution candidate; the
+/// colorer still requires one dominant colorable kind before emitting a token.
+/// An unrelated candidate that is `Unknown` only because the scope is open is
+/// rejected, so an unresolved include never turns coloring into a whole-index
+/// scan.
+pub fn coloring_scope_allows(
+    path: &str,
+    external: bool,
+    directly_included: bool,
+    ctx: Option<&ResolveContext<'_>>,
+) -> bool {
+    let tier = scope_tier(path, external, directly_included, ctx);
+    matches!(
+        tier,
+        ScopeTier::Current | ScopeTier::Reachable | ScopeTier::External
+    ) || (tier == ScopeTier::Unknown
+        && ctx
+            .and_then(|context| context.reach)
+            .is_some_and(|reach| reach.heuristic_files.contains(path)))
+}
+
 /// Locality tiebreak: shared path prefix segments between `path` and
 /// `current_path`, scaled by [`LOCALITY_PER_SEGMENT`] and capped at
 /// [`MAX_LOCALITY`]. `None` for `current_path` yields 0. Locality only breaks
@@ -376,6 +402,22 @@ mod tests {
         assert_eq!(
             scope_tier("inc/b.h", false, false, Some(&c)),
             ScopeTier::Unknown
+        );
+    }
+
+    #[test]
+    fn coloring_accepts_bounded_heuristic_but_rejects_open_only_unknown() {
+        let mut r = reach(&["src/main.c"], true);
+        r.heuristic_files.insert("inc/b.h".to_string());
+        let c = ctx(Some("src/main.c"), Some(&r));
+
+        assert!(
+            coloring_scope_allows("inc/b.h", false, false, Some(&c)),
+            "a bounded suffix-match include candidate should contribute kind evidence"
+        );
+        assert!(
+            !coloring_scope_allows("other/c.h", false, false, Some(&c)),
+            "open-scope uncertainty alone must not admit unrelated global definitions"
         );
     }
 

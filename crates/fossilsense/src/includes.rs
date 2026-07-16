@@ -74,9 +74,10 @@ impl ResolutionKind {
 /// *one* `Edge` (a proven target) when a unique match is found, `Ambiguous`
 /// when two or more candidates match with no exact-tier winner, or `Unresolved`
 /// when nothing matched at all. An `Ambiguous` resolution produces **no**
-/// proven-reachable edge: its candidates are not added to the determinate
-/// reachable set, so coloring's hard gate cannot mistake a wrong twin for
-/// certain. All variants are best-effort path resolution, not semantic binding.
+/// proven-reachable edge: its candidates stay heuristic. Coloring may use those
+/// bounded candidates only as kind evidence and never promotes them to strong
+/// reachability. All variants are best-effort path resolution, not semantic
+/// binding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IncludeResolution {
     /// One proven target with the kind that matched it. The first exact tier

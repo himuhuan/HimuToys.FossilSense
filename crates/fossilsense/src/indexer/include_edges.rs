@@ -22,9 +22,9 @@ use crate::store::{IncludeGraphUpdate, IndexBuild, IndexStore};
 /// - an `Unresolved` outcome bumps the source's `unresolved_includes` count;
 /// - an `Ambiguous { dsts }` outcome bumps the source's `ambiguous_includes`
 ///   count and records every possible target as a weak `SuffixMatch` edge.
-///   Typed reachability keeps those paths heuristic, so coloring's hard gate
-///   cannot mistake a wrong twin for certain while navigation can still show
-///   every bounded possibility.
+///   Typed reachability keeps those paths heuristic: navigation can show every
+///   bounded possibility, and coloring may use them only for kind evidence
+///   without promoting a wrong twin to strong reachability.
 ///
 /// After edges are written, `directly_included` is derived globally from the
 /// full edge table (an external header is first-layer iff some workspace file

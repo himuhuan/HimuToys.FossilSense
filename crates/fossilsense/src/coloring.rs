@@ -654,6 +654,146 @@ mod tests {
     }
 
     #[test]
+    fn pipeline_colors_bounded_heuristic_include_symbols_in_open_scope() {
+        use crate::parser::parse;
+        use crate::query::{CompletionScope, NameTable};
+        use crate::reachability::{OpenReason, ReachScope};
+        use std::collections::HashSet;
+        use std::path::Path;
+
+        let table = NameTable::build_with_paths(vec![
+            (
+                1,
+                "expo".to_string(),
+                false,
+                "include/expo.h".to_string(),
+                "type".to_string(),
+                false,
+            ),
+            (
+                2,
+                "scene".to_string(),
+                false,
+                "include/expo.h".to_string(),
+                "type".to_string(),
+                false,
+            ),
+            (
+                3,
+                "EXPO_MAX_CHARS".to_string(),
+                false,
+                "include/expo.h".to_string(),
+                "enum_constant".to_string(),
+                false,
+            ),
+            (
+                4,
+                "SCENEOBJT_MENU".to_string(),
+                false,
+                "include/expo.h".to_string(),
+                "enum_constant".to_string(),
+                false,
+            ),
+            (
+                5,
+                "log_msg_ret".to_string(),
+                false,
+                "include/log.h".to_string(),
+                "macro".to_string(),
+                false,
+            ),
+            (
+                6,
+                "unrelated".to_string(),
+                false,
+                "other/unrelated.h".to_string(),
+                "type".to_string(),
+                false,
+            ),
+            (
+                7,
+                "AMBIGUOUS_NAME".to_string(),
+                false,
+                "first/util.h".to_string(),
+                "macro".to_string(),
+                false,
+            ),
+            (
+                8,
+                "AMBIGUOUS_NAME".to_string(),
+                false,
+                "second/util.h".to_string(),
+                "type".to_string(),
+                false,
+            ),
+        ]);
+        let scope = CompletionScope {
+            current_path: Some("boot/scene.c".to_string()),
+            direct_external_files: HashSet::new(),
+            reach: ReachScope {
+                files: HashSet::from(["boot/scene.c".to_string()]),
+                heuristic_files: HashSet::from([
+                    "include/expo.h".to_string(),
+                    "include/log.h".to_string(),
+                    "first/util.h".to_string(),
+                    "second/util.h".to_string(),
+                ]),
+                open: true,
+                reason: Some(OpenReason::AmbiguousInclude),
+            },
+        };
+        let current = "int scene_new(struct expo *exp, struct scene **scnp,\n\
+                       struct unrelated *other) {\n\
+                           return log_msg_ret(\"expo\", EXPO_MAX_CHARS + SCENEOBJT_MENU +\n\
+                                              AMBIGUOUS_NAME);\n\
+                       }\n";
+        let targets = parse(Path::new("boot/scene.c"), current);
+        let defs = targets.coloring_defs();
+        let wanted: HashSet<&str> = targets
+            .occurrences
+            .iter()
+            .map(|occ| occ.name.as_str())
+            .filter(|name| {
+                !defs.macro_defs.contains(*name)
+                    && !defs.type_defs.contains(*name)
+                    && !defs.enum_defs.contains(*name)
+            })
+            .collect();
+        let counts = table.colorable_kind_counts(&wanted, Some(&scope));
+        let tokens = classify_occurrences(
+            &targets.occurrences,
+            &defs.macro_defs,
+            &defs.type_defs,
+            &defs.enum_defs,
+            &counts,
+        );
+
+        let kind_of = |name: &str| -> Option<u32> {
+            let occ = targets.occurrences.iter().find(|occ| occ.name == name)?;
+            tokens
+                .iter()
+                .find(|token| token.line == occ.line && token.start == occ.start_col)
+                .map(|token| token.token_type)
+        };
+
+        assert_eq!(kind_of("expo"), Some(TOKEN_TYPE_TYPE));
+        assert_eq!(kind_of("scene"), Some(TOKEN_TYPE_TYPE));
+        assert_eq!(kind_of("EXPO_MAX_CHARS"), Some(TOKEN_TYPE_ENUM_MEMBER));
+        assert_eq!(kind_of("SCENEOBJT_MENU"), Some(TOKEN_TYPE_ENUM_MEMBER));
+        assert_eq!(kind_of("log_msg_ret"), Some(TOKEN_TYPE_MACRO));
+        assert_eq!(
+            kind_of("unrelated"),
+            None,
+            "an open scope must not admit unrelated global definitions"
+        );
+        assert_eq!(
+            kind_of("AMBIGUOUS_NAME"),
+            None,
+            "conflicting heuristic kind evidence must stay uncolored"
+        );
+    }
+
+    #[test]
     fn pipeline_colors_local_defs_without_index() {
         use crate::parser::parse;
         use std::path::Path;
