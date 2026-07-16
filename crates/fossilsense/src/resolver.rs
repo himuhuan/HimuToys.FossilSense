@@ -8,6 +8,7 @@
 //! in isolation. Depends only on the candidate `model` and reachability inputs.
 
 use std::cmp::Ordering;
+use std::collections::HashSet;
 
 use crate::model::{DefinitionCandidate, ResolutionConfidence, ResolutionReason, ScopeTier};
 use crate::reachability::{OpenReason, ReachScope};
@@ -59,6 +60,10 @@ pub struct ResolveContext<'a> {
     /// Bounded `#include`-reachable set for the current file, or `None` when
     /// no reach graph exists.
     pub reach: Option<&'a ReachScope>,
+    /// Origin-specific direct `ExternalExact` targets. `Some` overrides the
+    /// legacy workspace-wide `directly_included` bit; `None` keeps that bit for
+    /// callers that have already projected request-local path evidence.
+    pub direct_external_files: Option<&'a HashSet<String>>,
 }
 
 impl<'a> ResolveContext<'a> {
@@ -70,6 +75,7 @@ impl<'a> ResolveContext<'a> {
         Self {
             current_path,
             reach: None,
+            direct_external_files: None,
         }
     }
 }
@@ -88,9 +94,10 @@ impl<'a> ResolveContext<'a> {
 /// 3. **`Reachable`** — the candidate's path is in `ctx.reach.files`
 ///    (proven reachable by traversal; the set may still be open, but this
 ///    file's reachability is proven).
-/// 4. **`Unknown`** — the scope is open and the candidate is not proven in
-///    the reachable set (cannot prove unreachable either; must not be buried
-///    below a `Global`).
+/// 4. **`Unknown`** — the candidate is reachable only through a suffix-match
+///    edge, or the scope is open and the candidate is not proven in the exact
+///    reachable set (cannot prove unreachable either; must not be buried below
+///    a `Global`).
 /// 5. **`Global`** — closed scope and the candidate is not in the reachable
 ///    set (proven unreachable), or no reach context at all.
 ///
@@ -103,6 +110,9 @@ pub fn scope_tier(
     directly_included: bool,
     ctx: Option<&ResolveContext<'_>>,
 ) -> ScopeTier {
+    let directly_included = ctx
+        .and_then(|context| context.direct_external_files)
+        .map_or(directly_included, |paths| paths.contains(path));
     // First-layer external header: direct include is reachability evidence
     // regardless of whether a reach graph exists.
     if external && directly_included {
@@ -124,6 +134,11 @@ pub fn scope_tier(
         // Proven reachable by traversal (the set may still be open, but this
         // file's reachability is proven by its membership in the set).
         return ScopeTier::Reachable;
+    }
+    if reach.heuristic_files.contains(path) {
+        // A suffix match is useful bounded recall evidence, but it is not
+        // compiler-level proof and must never be laundered into Reachable.
+        return ScopeTier::Unknown;
     }
     if reach.open {
         // Open scope: cannot prove this candidate unreachable.
@@ -313,6 +328,7 @@ mod tests {
     fn reach(files: &[&str], open: bool) -> ReachScope {
         ReachScope {
             files: files.iter().map(|s| s.to_string()).collect(),
+            heuristic_files: Default::default(),
             open,
             reason: if open {
                 Some(OpenReason::UnresolvedInclude)
@@ -326,6 +342,7 @@ mod tests {
         ResolveContext {
             current_path: current,
             reach,
+            direct_external_files: None,
         }
     }
 
@@ -348,6 +365,17 @@ mod tests {
         assert_eq!(
             scope_tier("inc/b.h", false, false, Some(&c)),
             ScopeTier::Reachable
+        );
+    }
+
+    #[test]
+    fn suffix_reachable_workspace_candidate_is_unknown() {
+        let mut r = reach(&["src/main.c"], false);
+        r.heuristic_files.insert("inc/b.h".to_string());
+        let c = ctx(Some("src/main.c"), Some(&r));
+        assert_eq!(
+            scope_tier("inc/b.h", false, false, Some(&c)),
+            ScopeTier::Unknown
         );
     }
 

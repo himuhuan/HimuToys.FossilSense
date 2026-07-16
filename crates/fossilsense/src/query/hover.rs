@@ -257,6 +257,7 @@ mod tests {
             files: ["src/main.c".to_string(), "inc/foo.h".to_string()]
                 .into_iter()
                 .collect(),
+            heuristic_files: Default::default(),
             open: false,
             reason: None,
         };

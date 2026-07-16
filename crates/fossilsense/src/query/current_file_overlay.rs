@@ -12,6 +12,7 @@ const MAX_PROXIMITY_SCORE: i32 = 200;
 pub struct CurrentFileOverlayCandidate {
     pub name: String,
     pub kind: crate::parser::SymbolKind,
+    pub role: Option<SymbolRole>,
     pub detail: Option<String>,
     pub match_score: i32,
     pub proximity_score: i32,
@@ -38,6 +39,13 @@ pub fn current_file_overlay_candidates(
     let usage_stats = occurrence_usage_stats(request_facts.occurrences, cursor_byte, prefix);
 
     for symbol in persistent_facts.symbols {
+        // C declarations become visible in source order.  The durable name
+        // table has no cursor dimension, so the open-document overlay is the
+        // authority for `Current` candidates and must not publish anchors
+        // which have not appeared yet.
+        if symbol.start_byte >= cursor_byte {
+            continue;
+        }
         if !is_overlay_symbol(symbol.kind, symbol.role) {
             continue;
         }
@@ -52,6 +60,7 @@ pub fn current_file_overlay_candidates(
             CurrentFileOverlayCandidate {
                 name: symbol.name.clone(),
                 kind: symbol.kind,
+                role: Some(symbol.role),
                 detail: Some("current".to_string()),
                 match_score,
                 proximity_score,
@@ -63,12 +72,18 @@ pub fn current_file_overlay_candidates(
     }
 
     for alias in persistent_facts.aliases {
+        if alias.start_byte >= cursor_byte {
+            continue;
+        }
         add_alias_candidate(&mut by_name, alias, prefix, cursor_byte, &usage_stats);
     }
 
     add_cpp_using_alias_candidates(&mut by_name, text, cursor_byte, prefix, &usage_stats);
 
     for record in persistent_facts.records {
+        if record.start_byte >= cursor_byte {
+            continue;
+        }
         let Some(match_score) = completion_word_score(prefix, &record.display_name, 0) else {
             continue;
         };
@@ -80,6 +95,7 @@ pub fn current_file_overlay_candidates(
             CurrentFileOverlayCandidate {
                 name: record.display_name.clone(),
                 kind: SymbolKind::Type,
+                role: Some(SymbolRole::Definition),
                 detail: Some("current".to_string()),
                 match_score,
                 proximity_score,
@@ -104,6 +120,7 @@ pub fn current_file_overlay_candidates(
             CurrentFileOverlayCandidate {
                 name,
                 kind: SymbolKind::GlobalVariable,
+                role: None,
                 detail: Some("text".to_string()),
                 match_score,
                 proximity_score: proximity_score(&stats, cursor_byte),
@@ -123,10 +140,16 @@ pub fn current_file_overlay_candidates(
 fn is_overlay_symbol(kind: SymbolKind, role: SymbolRole) -> bool {
     match kind {
         SymbolKind::Function => matches!(role, SymbolRole::Definition | SymbolRole::Declaration),
-        SymbolKind::Macro
-        | SymbolKind::Type
-        | SymbolKind::EnumConstant
-        | SymbolKind::GlobalVariable => role == SymbolRole::Definition,
+        SymbolKind::GlobalVariable => matches!(
+            role,
+            SymbolRole::Definition
+                | SymbolRole::Declaration
+                | SymbolRole::TentativeDefinition
+                | SymbolRole::UnknownDeclarationOrDefinition
+        ),
+        SymbolKind::Macro | SymbolKind::Type | SymbolKind::EnumConstant => {
+            role == SymbolRole::Definition
+        }
         SymbolKind::Field => false,
     }
 }
@@ -149,6 +172,7 @@ fn add_alias_candidate(
         CurrentFileOverlayCandidate {
             name: alias.alias.clone(),
             kind: SymbolKind::Type,
+            role: Some(SymbolRole::Definition),
             detail: Some("current".to_string()),
             match_score,
             proximity_score,
@@ -178,6 +202,7 @@ fn add_cpp_using_alias_candidates(
             CurrentFileOverlayCandidate {
                 name: alias,
                 kind: SymbolKind::Type,
+                role: Some(SymbolRole::Definition),
                 detail: Some("current".to_string()),
                 match_score,
                 proximity_score,
@@ -470,6 +495,49 @@ mod tests {
         assert_eq!(hit.kind, crate::parser::SymbolKind::Function);
         assert_eq!(hit.detail.as_deref(), Some("current"));
         assert!(hit.semantic);
+    }
+
+    #[test]
+    fn overlay_excludes_semantic_declarations_after_the_cursor() {
+        let (text, line, character) = cursor_from_marker(
+            "void f(void) { fs/*cursor*/; }\n\
+             int fs_later(void);\n\
+             typedef int FsLaterType;\n\
+             struct FsLaterRecord { int value; };\n",
+        );
+        let parsed = crate::parser::parse(std::path::Path::new("a.c"), &text);
+
+        let hits = current_file_overlay_candidates(&parsed, &text, line, character, "fs", 20);
+        let semantic_names: Vec<_> = hits
+            .iter()
+            .filter(|hit| hit.semantic)
+            .map(|hit| hit.name.as_str())
+            .collect();
+
+        assert!(!semantic_names.contains(&"fs_later"));
+        assert!(!semantic_names.contains(&"FsLaterType"));
+        assert!(!semantic_names.contains(&"FsLaterRecord"));
+    }
+
+    #[test]
+    fn overlay_includes_every_file_scope_object_role() {
+        let (text, line, character) = cursor_from_marker(
+            "extern int fs_declared;\n\
+             int fs_tentative;\n\
+             int fs_full = 1;\n\
+             int fs_uncertain = };\n\
+             fs/*cursor*/\n",
+        );
+        let parsed = crate::parser::parse(std::path::Path::new("a.c"), &text);
+
+        let hits = current_file_overlay_candidates(&parsed, &text, line, character, "fs", 20);
+
+        for expected in ["fs_declared", "fs_tentative", "fs_full", "fs_uncertain"] {
+            assert!(
+                hits.iter().any(|hit| hit.name == expected && hit.semantic),
+                "missing semantic overlay candidate {expected}"
+            );
+        }
     }
 
     #[test]

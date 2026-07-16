@@ -267,7 +267,7 @@ fn truncated_candidate_recall_disables_otherwise_unique_pairing() {
 }
 
 #[test]
-fn open_same_signature_source_disables_closed_source_pairing() {
+fn open_same_signature_source_without_an_edge_does_not_revoke_a_direct_pair() {
     let graph = crate::reachability::ReachGraph::new(
         vec![("closed.c".into(), "api.h".into())],
         vec!["open.c".into()],
@@ -283,10 +283,13 @@ fn open_same_signature_source_disables_closed_source_pairing() {
         &graph,
         false,
     );
-    assert_eq!(catalog.by_name["target"].len(), 3);
-    assert!(catalog.by_name["target"]
+    assert_eq!(catalog.by_name["target"].len(), 2);
+    let mut variant_counts = catalog.by_name["target"]
         .iter()
-        .all(|id| catalog.entity_by_id(*id).variants.len() == 1));
+        .map(|id| catalog.entity_by_id(*id).variants.len())
+        .collect::<Vec<_>>();
+    variant_counts.sort_unstable();
+    assert_eq!(variant_counts, vec![1, 2]);
 }
 
 #[test]

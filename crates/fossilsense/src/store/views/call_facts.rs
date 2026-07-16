@@ -140,6 +140,44 @@ impl<'a> CallFactStoreView<'a> {
         Ok((output, truncated))
     }
 
+    /// Bounded exact-name read restricted to a caller-provided path set.
+    ///
+    /// Request-local reachability lives outside SQLite (and may include dirty
+    /// overlay edges), so semantic consumers use this narrow read to reserve
+    /// their bounded recall budget for Current/Reachable files before the
+    /// ordinary workspace-wide fallback. Paths are chunked below SQLite's
+    /// conservative bind-parameter budget; every chunk keeps the exact-name
+    /// predicate and a LIMIT+1 probe.
+    pub fn anchors_by_name_in_paths_limited(
+        &self,
+        name: &str,
+        paths: &[String],
+        limit: usize,
+    ) -> Result<(Vec<CallableAnchorRow>, bool)> {
+        let mut output = Vec::new();
+        for chunk in paths.chunks(399) {
+            let probe_limit = limit.saturating_sub(output.len()).saturating_add(1);
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let predicate = format!(
+                "WHERE a.name_id = (SELECT id FROM call_strings WHERE text = ?) \
+                 AND f.path IN ({placeholders})"
+            );
+            let mut params = Vec::with_capacity(chunk.len() + 1);
+            params.push(name);
+            params.extend(chunk.iter().map(String::as_str));
+            self.visit_anchors(&predicate, &params, Some(probe_limit), |row| {
+                output.push(row);
+                Ok(())
+            })?;
+            if output.len() > limit {
+                break;
+            }
+        }
+        let truncated = output.len() > limit;
+        output.truncate(limit);
+        Ok((output, truncated))
+    }
+
     pub fn anchors_by_entity_keys_limited(
         &self,
         keys: &[String],

@@ -94,8 +94,12 @@ fn name_table_loader_rows_preserve_source_path_kind_and_direct_external_evidence
     let table = NameTable::build_with_paths(rows);
     let scope = CompletionScope {
         current_path: Some("src/main.c".to_string()),
+        direct_external_files: ["C:/sdk/include/ext_size.h".to_string()]
+            .into_iter()
+            .collect(),
         reach: crate::reachability::ReachScope {
             files: ["src/main.c".to_string()].into_iter().collect(),
+            heuristic_files: Default::default(),
             open: false,
             reason: None,
         },
@@ -150,12 +154,11 @@ fn reach_graph_store_inputs_preserve_edges_open_reasons_and_incremental_refresh_
         )
         .expect("seed edges");
 
-    let mut graph = ReachGraph::new(
-        store.load_include_edge_paths().expect("edge rows"),
-        store.open_include_file_paths().expect("unresolved rows"),
-        store
-            .ambiguous_include_file_paths()
-            .expect("ambiguous rows"),
+    let reach_view = store.reach_graph_view();
+    let mut graph = ReachGraph::from_rows(
+        reach_view.include_edges().expect("edge rows"),
+        reach_view.unresolved_includes().expect("unresolved rows"),
+        reach_view.ambiguous_includes().expect("ambiguous rows"),
     );
     assert_eq!(
         graph.reachable("src/a.c").reason,
@@ -181,15 +184,20 @@ fn reach_graph_store_inputs_preserve_edges_open_reasons_and_incremental_refresh_
         .expect("refresh a");
     let sources = vec!["src/a.c".to_string()];
     let (edges, open) = store
-        .load_include_data_for_sources(&sources)
+        .reach_graph_view()
+        .include_data_for_sources(&sources)
         .expect("incremental rows");
     assert_eq!(
         edges,
-        vec![("src/a.c".to_string(), "include/d.h".to_string())]
+        vec![crate::store::views::IncludeEdgeRow {
+            source_path: "src/a.c".to_string(),
+            target_path: "include/d.h".to_string(),
+            resolution: crate::includes::ResolutionKind::WorkspaceExact,
+        }]
     );
     assert!(open.is_empty());
 
-    graph.refresh_sources(&sources, edges, open);
+    graph.refresh_sources_from_rows(&sources, edges, open);
     let refreshed = graph.reachable("src/a.c");
     assert!(refreshed.files.contains("include/d.h"));
     assert!(!refreshed.files.contains("include/b.h"));

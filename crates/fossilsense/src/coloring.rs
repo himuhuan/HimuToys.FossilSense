@@ -978,8 +978,10 @@ mod tests {
         // routed through the shared `scope_tier` primitive.
         let mem_scope = crate::query::CompletionScope {
             current_path: Some("use.c".to_string()),
+            direct_external_files: Default::default(),
             reach: crate::reachability::ReachScope {
                 files: scope_files,
+                heuristic_files: Default::default(),
                 open: false,
                 reason: None,
             },

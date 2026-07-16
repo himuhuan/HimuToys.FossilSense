@@ -198,7 +198,15 @@ impl<'a> CallFactCollector<'a> {
             .unwrap_or(&name)
             .trim()
             .to_string();
-        let canonical_signature = canonical_full_signature(&presentation_signature);
+        let canonical_signature = canonical_callable_signature(
+            declaration,
+            function_declarator,
+            name_node,
+            &name,
+            self.source,
+            self.is_cpp,
+            &presentation_signature,
+        );
         let syntax_error_overlap = self.error_depth > 0 || contains_error_or_missing(declaration);
         let signature_fidelity = if syntax_error_overlap {
             SignatureFidelity::Malformed
@@ -706,6 +714,96 @@ fn canonical_full_signature(presentation: &str) -> String {
         pending_space = false;
     }
     output
+}
+
+/// C external-function identity ignores parameter identifiers and a redundant
+/// `extern` storage spelling. C++ keeps the conservative token-preserving
+/// signature because overload/template identity is outside FossilSense's
+/// compiler-free contract.
+fn canonical_callable_signature(
+    declaration: tree_sitter::Node<'_>,
+    function_declarator: tree_sitter::Node<'_>,
+    name_node: tree_sitter::Node<'_>,
+    name: &str,
+    source: &str,
+    is_cpp: bool,
+    presentation: &str,
+) -> String {
+    if is_cpp {
+        return canonical_full_signature(presentation);
+    }
+
+    let prefix = source
+        .get(declaration.start_byte()..name_node.start_byte())
+        .unwrap_or_default();
+    let prefix = prefix
+        .split_whitespace()
+        .filter(|token| *token != "extern")
+        .collect::<Vec<_>>()
+        .join(" ");
+    let parameters = function_declarator
+        .child_by_field_name("parameters")
+        .or_else(|| find_descendant(function_declarator, "parameter_list"));
+    let parameter_shape = parameters.map_or_else(String::new, |parameters| {
+        let mut value = source
+            .get(parameters.start_byte()..parameters.end_byte())
+            .unwrap_or_default()
+            .to_string();
+        let mut removals = Vec::new();
+        let mut stack = vec![parameters];
+        while let Some(node) = stack.pop() {
+            if node.kind().contains("parameter") {
+                if let Some(identifier) = node
+                    .child_by_field_name("declarator")
+                    .and_then(parameter_declarator_identifier)
+                {
+                    removals.push((
+                        identifier
+                            .start_byte()
+                            .saturating_sub(parameters.start_byte()),
+                        identifier
+                            .end_byte()
+                            .saturating_sub(parameters.start_byte()),
+                    ));
+                }
+            }
+            stack.extend(named_children(node));
+        }
+        removals.sort_unstable_by(|left, right| right.0.cmp(&left.0));
+        removals.dedup();
+        for (start, end) in removals {
+            if start <= end && end <= value.len() {
+                value.replace_range(start..end, "");
+            }
+        }
+        value
+    });
+    canonical_full_signature(&format!("{prefix} {name}{parameter_shape}"))
+}
+
+fn parameter_declarator_identifier(
+    declarator: tree_sitter::Node<'_>,
+) -> Option<tree_sitter::Node<'_>> {
+    if matches!(declarator.kind(), "identifier" | "field_identifier") {
+        return Some(declarator);
+    }
+    if let Some(identifier) = declarator
+        .child_by_field_name("declarator")
+        .and_then(parameter_declarator_identifier)
+    {
+        return Some(identifier);
+    }
+    // `parenthesized_declarator` does not consistently expose a named
+    // `declarator` field across the C/C++ grammars. Follow only declarator-
+    // shaped children; never descend into a nested parameter list or a type
+    // identifier, which would erase type information from an abstract
+    // declarator.
+    named_children(declarator).into_iter().find_map(|child| {
+        (child.kind().ends_with("declarator")
+            || matches!(child.kind(), "identifier" | "field_identifier"))
+        .then(|| parameter_declarator_identifier(child))
+        .flatten()
+    })
 }
 
 /// Whitespace may be normalized only while preserving the C/C++ token stream.

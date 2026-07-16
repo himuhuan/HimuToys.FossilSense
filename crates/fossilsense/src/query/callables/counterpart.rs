@@ -25,7 +25,12 @@ pub fn resolve_counterparts(
     // potentially quadratic source/header compatibility matrix after the
     // caller has already reported a truncated or otherwise incomplete
     // candidate bucket.
-    if !coverage.permits_uniqueness() {
+    // `scope_open` describes uncertainty outside the files already reached; it
+    // does not revoke a concrete source -> header relationship that is present
+    // in `ReachScope::files`. Only recall truncation or another explicit
+    // incomplete reason means the candidate set itself cannot support a
+    // uniqueness claim.
+    if coverage.truncated || coverage.incomplete_reason.is_some() {
         return anchors
             .iter()
             .cloned()
@@ -43,27 +48,6 @@ pub fn resolve_counterparts(
         .enumerate()
         .filter_map(|(index, anchor)| is_header_declaration(anchor).then_some(index))
         .collect();
-
-    // A same-signature source whose reach scope is missing or open may still
-    // include one of these headers. Ignoring it would let a different closed
-    // source/header edge look spuriously one-to-one. Treat the whole exact-name
-    // candidate set as incomplete until every potentially compatible source
-    // has a closed scope.
-    let potentially_open_counterpart = sources.iter().any(|source| {
-        headers.iter().any(|header| {
-            strict_identity_compatible(&anchors[*source], &anchors[*header])
-                && source_reach
-                    .get(&anchors[*source].anchor.path)
-                    .is_none_or(|scope| scope.open)
-        })
-    });
-    if potentially_open_counterpart {
-        return anchors
-            .iter()
-            .cloned()
-            .map(|anchor| singleton_group(anchor, CounterpartEvidence::IncompleteCoverage))
-            .collect();
-    }
 
     let mut source_edges: HashMap<usize, Vec<usize>> = HashMap::new();
     let mut header_edges: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -149,7 +133,7 @@ fn strict_edge(
     }
     source_reach
         .get(&source.anchor.path)
-        .is_some_and(|scope| !scope.open && scope.files.contains(&header.anchor.path))
+        .is_some_and(|scope| scope.files.contains(&header.anchor.path))
 }
 
 fn strict_identity_compatible(

@@ -16,6 +16,7 @@ mod tests {
         candidate_hash, candidate_hash_key, CompletionHistorySnapshot,
     };
     use crate::model::{ResolutionConfidence, ScopeTier};
+    use crate::parser::SymbolRole;
 
     #[test]
     fn intent_classifies_preprocessor_macro_context() {
@@ -482,6 +483,52 @@ mod tests {
         assert!(evidence.sources.current_file_overlay);
         assert!(evidence.sources.local_word);
         assert_eq!(output.items[0].payload, "overlay");
+    }
+
+    #[test]
+    fn symbol_role_breaks_only_same_scope_ties_and_merge_keeps_the_winner_role() {
+        let mut source_definition = CandidateEvidence::new(
+            CandidateSource::Indexed,
+            ScopeTier::Reachable,
+            ResolutionConfidence::Reachable,
+            1_000,
+        );
+        source_definition.role = Some(SymbolRole::Definition);
+        let mut header_declaration = CandidateEvidence::new(
+            CandidateSource::Indexed,
+            ScopeTier::Reachable,
+            ResolutionConfidence::Reachable,
+            800,
+        );
+        header_declaration.role = Some(SymbolRole::Declaration);
+
+        for candidates in [
+            vec![
+                PipelineCandidate::new("shared", source_definition, "source"),
+                PipelineCandidate::new("shared", header_declaration, "header"),
+            ],
+            vec![
+                PipelineCandidate::new("shared", header_declaration, "header"),
+                PipelineCandidate::new("shared", source_definition, "source"),
+            ],
+        ] {
+            let output = run_evidence_aware_pipeline(candidates, 10);
+            assert_eq!(output.items[0].payload, "header");
+            assert_eq!(output.items[0].evidence.role, Some(SymbolRole::Declaration));
+        }
+
+        let mut weak_declaration = header_declaration;
+        weak_declaration.tier = ScopeTier::Global;
+        weak_declaration.confidence = ResolutionConfidence::Fallback;
+        let output = run_evidence_aware_pipeline(
+            vec![
+                PipelineCandidate::new("shared", weak_declaration, "weak-header"),
+                PipelineCandidate::new("shared", source_definition, "reachable-source"),
+            ],
+            10,
+        );
+        assert_eq!(output.items[0].payload, "reachable-source");
+        assert_eq!(output.items[0].evidence.role, Some(SymbolRole::Definition));
     }
 
     #[test]

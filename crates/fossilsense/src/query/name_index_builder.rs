@@ -63,6 +63,7 @@ impl<'a> NameIndexBuilder<'a> {
             path_id,
             project_id,
             kind: crate::parser::kind_from_str(row.kind),
+            role: super::symbol_role_from_str(row.role),
             external: row.external,
             directly_included: row.directly_included,
         });
@@ -80,6 +81,7 @@ impl<'a> NameIndexBuilder<'a> {
             path_id,
             project_id,
             kind: entry.kind,
+            role: entry.role,
             external: entry.external,
             directly_included: entry.directly_included,
         });
@@ -98,6 +100,7 @@ impl<'a> NameIndexBuilder<'a> {
             path_id,
             project_id,
             kind: entry.kind,
+            role: entry.role,
             external: entry.external,
             directly_included: entry.directly_included,
         });
@@ -124,6 +127,7 @@ impl<'a> NameIndexBuilder<'a> {
             path_id,
             project_id,
             kind: entry.kind,
+            role: entry.role,
             external: entry.external,
             directly_included: entry.directly_included,
         });

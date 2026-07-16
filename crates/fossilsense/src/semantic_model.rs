@@ -9,7 +9,7 @@ use crate::call_model::SourceRange;
 /// This is deliberately independent from the SQLite schema version: changing
 /// how a fact is derived must invalidate persisted rows even when their SQL
 /// column layout happens to stay compatible.
-pub const PARSER_FACT_VERSION: i64 = 2;
+pub const PARSER_FACT_VERSION: i64 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Symbol {
@@ -213,6 +213,14 @@ pub struct TypeAlias {
 pub enum SymbolRole {
     Definition,
     Declaration,
+    /// C file-scope object declaration without an initializer and without an
+    /// `extern` storage-class specifier. For objects this is weaker than a full
+    /// definition but stronger than a declaration-only anchor.
+    TentativeDefinition,
+    /// The lexical pass found an object name but could not safely distinguish
+    /// a declaration from a definition (for example because its declarator is
+    /// malformed or uses syntax outside the supported subset).
+    UnknownDeclarationOrDefinition,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyntacticRole {

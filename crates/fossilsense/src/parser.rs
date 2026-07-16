@@ -227,6 +227,10 @@ pub struct LocalBinding {
     pub decl_start_byte: usize,
     pub function_start_byte: usize,
     pub function_end_byte: usize,
+    /// Lexical block in which this binding is visible. Parameters use the
+    /// function body; locals use their nearest compound statement.
+    pub scope_start_byte: usize,
+    pub scope_end_byte: usize,
 }
 
 /// Coloring's macro/type/enum definition name sets, projected from an already
@@ -482,7 +486,8 @@ fn parse_with_handle_control(
     cancel: Option<&AtomicBool>,
 ) -> FileSemanticIndex {
     let line_starts = line_starts(source);
-    let (symbols, includes) = extract_symbols_and_includes(source, &line_starts);
+    let is_cpp = is_cpp_path(path);
+    let (symbols, includes) = extract_symbols_and_includes(source, &line_starts, is_cpp);
 
     let language = language_for_path(path);
 
@@ -615,15 +620,19 @@ fn lexical_fallback_with_facts(
 }
 
 fn language_for_path(path: &Path) -> tree_sitter::Language {
-    if normalized_extension(path).is_some_and(|ext| {
-        ["cpp", "hpp", "cc", "hh", "cxx", "hxx"]
-            .iter()
-            .any(|candidate| ext.eq_ignore_ascii_case(candidate))
-    }) {
+    if is_cpp_path(path) {
         tree_sitter_cpp::LANGUAGE.into()
     } else {
         tree_sitter_c::LANGUAGE.into()
     }
+}
+
+fn is_cpp_path(path: &Path) -> bool {
+    normalized_extension(path).is_some_and(|ext| {
+        ["cpp", "hpp", "cc", "hh", "cxx", "hxx"]
+            .iter()
+            .any(|candidate| ext.eq_ignore_ascii_case(candidate))
+    })
 }
 
 fn line_starts(source: &str) -> Vec<usize> {

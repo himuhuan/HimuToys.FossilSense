@@ -30,6 +30,8 @@ pub fn local_completion_candidates(
         .filter(|binding| {
             binding.function_start_byte < byte_offset
                 && byte_offset <= binding.function_end_byte
+                && binding.scope_start_byte < byte_offset
+                && byte_offset <= binding.scope_end_byte
                 && binding.decl_start_byte < byte_offset
         })
         .filter_map(|binding| {
@@ -54,6 +56,29 @@ pub fn local_completion_candidates(
     dedup_by_name_keep_first(&mut hits);
     hits.truncate(limit);
     hits
+}
+
+/// Resolve the nearest visible parameter/local with an exact name. This is a
+/// language-rule proof, so callers can stop before consulting workspace
+/// candidates even when the global candidate channel is truncated.
+pub fn visible_local_binding<'a>(
+    bindings: &'a [LocalBinding],
+    name: &str,
+    byte_offset: usize,
+) -> Option<&'a LocalBinding> {
+    bindings
+        .iter()
+        .filter(|binding| {
+            let at_declaration = binding.decl_start_byte <= byte_offset
+                && byte_offset <= binding.decl_start_byte.saturating_add(binding.name.len());
+            let visible_use = binding.function_start_byte < byte_offset
+                && byte_offset <= binding.function_end_byte
+                && binding.scope_start_byte < byte_offset
+                && byte_offset <= binding.scope_end_byte
+                && binding.decl_start_byte < byte_offset;
+            binding.name == name && (at_declaration || visible_use)
+        })
+        .max_by_key(|binding| binding.decl_start_byte)
 }
 
 fn local_binding_detail(binding: &LocalBinding) -> String {
@@ -91,6 +116,8 @@ mod tests {
             decl_start_byte,
             function_start_byte,
             function_end_byte,
+            scope_start_byte: function_start_byte,
+            scope_end_byte: function_end_byte,
         }
     }
 
@@ -202,6 +229,8 @@ mod tests {
                 decl_start_byte: text.find("value").unwrap(),
                 function_start_byte: 0,
                 function_end_byte: text.len(),
+                scope_start_byte: 0,
+                scope_end_byte: text.len(),
             },
             LocalBinding {
                 name: "value".to_string(),
@@ -210,6 +239,8 @@ mod tests {
                 decl_start_byte: text.rfind("value").unwrap(),
                 function_start_byte: 0,
                 function_end_byte: text.len(),
+                scope_start_byte: 0,
+                scope_end_byte: text.len(),
             },
         ];
 
@@ -218,5 +249,48 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].kind, LocalBindingKind::LocalVariable);
         assert_eq!(hits[0].detail, "local: long");
+    }
+
+    #[test]
+    fn parsed_local_completion_drops_inner_binding_after_its_block() {
+        let text = "int f(int value) {\n    { int value; val; }\n    val\n}\n";
+        let parsed = crate::parser::parse(std::path::Path::new("a.c"), text);
+
+        let inside = local_completion_candidates(&parsed.local_bindings, text, 1, 19, "val", 10);
+        assert_eq!(inside.len(), 1);
+        assert_eq!(inside[0].kind, LocalBindingKind::LocalVariable);
+
+        let outside = local_completion_candidates(&parsed.local_bindings, text, 2, 7, "val", 10);
+        assert_eq!(outside.len(), 1);
+        assert_eq!(outside[0].kind, LocalBindingKind::Parameter);
+    }
+
+    #[test]
+    fn parsed_local_completion_drops_for_initializer_after_the_loop() {
+        let text =
+            "void f(void) {\n    for (int index = 0; index < 2; ++index) { ind; }\n    ind;\n}\n";
+        let parsed = crate::parser::parse(std::path::Path::new("a.c"), text);
+        let inside_character = text.lines().nth(1).unwrap().rfind("ind").unwrap() as u32 + 3;
+        let outside_character = text.lines().nth(2).unwrap().rfind("ind").unwrap() as u32 + 3;
+
+        let inside = local_completion_candidates(
+            &parsed.local_bindings,
+            text,
+            1,
+            inside_character,
+            "ind",
+            10,
+        );
+        let outside = local_completion_candidates(
+            &parsed.local_bindings,
+            text,
+            2,
+            outside_character,
+            "ind",
+            10,
+        );
+
+        assert!(inside.iter().any(|candidate| candidate.name == "index"));
+        assert!(outside.iter().all(|candidate| candidate.name != "index"));
     }
 }

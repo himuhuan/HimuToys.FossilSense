@@ -10,6 +10,7 @@ use super::{Include, Symbol, SymbolKind, SymbolRole};
 pub(super) fn extract_symbols_and_includes(
     source: &str,
     line_starts: &[usize],
+    is_cpp: bool,
 ) -> (Vec<Symbol>, Vec<Include>) {
     let mut symbols = Vec::new();
     let mut includes = Vec::new();
@@ -59,6 +60,7 @@ pub(super) fn extract_symbols_and_includes(
                     line_starts,
                     source,
                     current_guard(&guard_stack),
+                    is_cpp,
                 ));
                 statement.clear();
             }
@@ -145,6 +147,7 @@ fn capture_statement_symbols(
     line_starts: &[usize],
     source: &str,
     guard: Option<String>,
+    is_cpp: bool,
 ) -> Vec<Symbol> {
     // All regex classification must see code only. In particular, flattening a
     // multi-line record before removing `//` comments can turn
@@ -180,7 +183,9 @@ fn capture_statement_symbols(
     // Enum constants are extracted from the AST (`collect_enum_constants`), which
     // handles multi-line enums the line-based pass cannot.
 
-    if let Some(symbol) = capture_global_variable(statement, &compact, line_starts, source, guard) {
+    if let Some(symbol) =
+        capture_global_variable(statement, &compact, line_starts, source, guard, is_cpp)
+    {
         symbols.push(symbol);
     }
 
@@ -387,6 +392,7 @@ fn capture_global_variable(
     line_starts: &[usize],
     source: &str,
     guard: Option<String>,
+    is_cpp: bool,
 ) -> Option<Symbol> {
     if compact.contains('(')
         || compact.starts_with("typedef ")
@@ -399,11 +405,13 @@ fn capture_global_variable(
     }
 
     let captures = global_var_regex().captures(compact)?;
-    let name = captures.get(1)?.as_str();
+    let name_match = captures.get(1)?;
+    let name = name_match.as_str();
+    let role = classify_global_object_role(compact, name_match, is_cpp);
     Some(make_symbol(
         name,
         SymbolKind::GlobalVariable,
-        SymbolRole::Definition,
+        role,
         statement.start_line,
         statement.end_line,
         line_starts,
@@ -411,6 +419,56 @@ fn capture_global_variable(
         compact.to_string(),
         guard,
     ))
+}
+
+fn classify_global_object_role(compact: &str, name: regex::Match<'_>, is_cpp: bool) -> SymbolRole {
+    match declarator_has_initializer(&compact[name.end()..]) {
+        Some(true) => SymbolRole::Definition,
+        Some(false) if contains_identifier(&compact[..name.start()], "extern") => {
+            SymbolRole::Declaration
+        }
+        // C++ has no tentative-definition category: a namespace-scope object
+        // declaration without `extern` is a full definition.
+        Some(false) if is_cpp => SymbolRole::Definition,
+        Some(false) => SymbolRole::TentativeDefinition,
+        None => SymbolRole::UnknownDeclarationOrDefinition,
+    }
+}
+
+/// Inspect only the selected declarator suffix. `Some(true)` means a top-level
+/// initializer was found, `Some(false)` means the declarator ended cleanly at a
+/// semicolon, and `None` preserves uncertainty for malformed/unbalanced input.
+fn declarator_has_initializer(suffix: &str) -> Option<bool> {
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut has_initializer = false;
+
+    for ch in suffix.chars() {
+        match ch {
+            '(' => paren_depth += 1,
+            '[' => bracket_depth += 1,
+            '{' => brace_depth += 1,
+            ')' => paren_depth = paren_depth.checked_sub(1)?,
+            ']' => bracket_depth = bracket_depth.checked_sub(1)?,
+            '}' => brace_depth = brace_depth.checked_sub(1)?,
+            '=' if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => {
+                has_initializer = true;
+            }
+            ';' if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => {
+                return Some(has_initializer);
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn contains_identifier(text: &str, expected: &str) -> bool {
+    identifier_regex()
+        .find_iter(text)
+        .any(|identifier| identifier.as_str() == expected)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1032,7 +1090,7 @@ mod tests {
                 .map(|(index, _)| index + 1)
                 .filter(|index| *index < source.len()),
         );
-        let (symbols, _) = extract_symbols_and_includes(source, &line_starts);
+        let (symbols, _) = extract_symbols_and_includes(source, &line_starts, false);
         let names: Vec<_> = symbols.iter().map(|symbol| symbol.name.as_str()).collect();
 
         assert_eq!(names, vec!["AVTextWriter", "AVTextWriter"]);

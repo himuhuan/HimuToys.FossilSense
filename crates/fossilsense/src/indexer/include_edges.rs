@@ -21,9 +21,10 @@ use crate::store::{IncludeGraphUpdate, IndexBuild, IndexStore};
 ///   `Edge` outcomes become proven-reachable edges;
 /// - an `Unresolved` outcome bumps the source's `unresolved_includes` count;
 /// - an `Ambiguous { dsts }` outcome bumps the source's `ambiguous_includes`
-///   count and adds **no** edges — its candidates are not added to the
-///   determinate reachable set (coloring's hard gate cannot mistake a wrong
-///   twin for certain).
+///   count and records every possible target as a weak `SuffixMatch` edge.
+///   Typed reachability keeps those paths heuristic, so coloring's hard gate
+///   cannot mistake a wrong twin for certain while navigation can still show
+///   every bounded possibility.
 ///
 /// After edges are written, `directly_included` is derived globally from the
 /// full edge table (an external header is first-layer iff some workspace file
@@ -85,7 +86,11 @@ pub(super) fn build_include_edges(
         by_src.entry(file_id).or_default().push(target);
     }
 
-    let mut edges: Vec<(i64, i64, String)> = Vec::new();
+    // A source can mention the same physical target through both an
+    // ambiguous suffix and a later exact include.  Collapse by endpoint while
+    // preserving the strongest resolution so SQLite's `(src,dst)` key cannot
+    // let an earlier weak row hide later exact evidence.
+    let mut edges_by_endpoint: HashMap<(i64, i64), ResolutionKind> = HashMap::new();
     let mut unresolved: Vec<(i64, i64)> = Vec::new();
     let mut ambiguous: Vec<(i64, i64)> = Vec::new();
     for (src_id, targets) in &by_src {
@@ -103,12 +108,24 @@ pub(super) fn build_include_edges(
                 IncludeResolution::Edge { dst, kind } => {
                     if let Some(&dst_id) = id_of_path.get(&dst) {
                         if dst_id != *src_id {
-                            edges.push((*src_id, dst_id, ResolutionKind::as_str(kind).to_string()));
+                            retain_strongest_edge(&mut edges_by_endpoint, *src_id, dst_id, kind);
                         }
                     }
                 }
-                IncludeResolution::Ambiguous { .. } => {
+                IncludeResolution::Ambiguous { dsts } => {
                     ambiguous_count += 1;
+                    for dst in dsts {
+                        if let Some(&dst_id) = id_of_path.get(&dst) {
+                            if dst_id != *src_id {
+                                retain_strongest_edge(
+                                    &mut edges_by_endpoint,
+                                    *src_id,
+                                    dst_id,
+                                    ResolutionKind::SuffixMatch,
+                                );
+                            }
+                        }
+                    }
                 }
                 IncludeResolution::Unresolved => {
                     unresolved_count += 1;
@@ -126,6 +143,12 @@ pub(super) fn build_include_edges(
         }
     }
 
+    let mut edges: Vec<_> = edges_by_endpoint
+        .into_iter()
+        .map(|((src_id, dst_id), resolution)| (src_id, dst_id, resolution.as_str().to_string()))
+        .collect();
+    edges.sort();
+
     let src_id_list: Vec<i64> = by_src.keys().copied().collect();
     // Full pass (only = None) wipes edges AND both counts first; incremental
     // pass only resets the listed src_ids. `directly_included` is derived
@@ -137,6 +160,22 @@ pub(super) fn build_include_edges(
         ambiguous,
         clear_all: only.is_none(),
     })
+}
+
+fn retain_strongest_edge(
+    edges: &mut HashMap<(i64, i64), ResolutionKind>,
+    source: i64,
+    target: i64,
+    candidate: ResolutionKind,
+) {
+    edges
+        .entry((source, target))
+        .and_modify(|current| {
+            if *current == ResolutionKind::SuffixMatch && candidate != ResolutionKind::SuffixMatch {
+                *current = candidate;
+            }
+        })
+        .or_insert(candidate);
 }
 
 /// Find source files whose include edges need rebuild because `changed_paths`

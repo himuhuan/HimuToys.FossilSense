@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::model::ScopeTier;
-use crate::parser::SymbolKind as ParserKind;
+use crate::parser::{SymbolKind as ParserKind, SymbolRole};
 use crate::project_context::{ProjectContextIndex, ProjectKey};
 use crate::reachability::ReachScope;
 use crate::resolver::{self, ResolveContext};
@@ -30,7 +30,7 @@ pub(crate) use callables::is_source_path;
 #[cfg(test)]
 pub use callables::CounterpartEvidence;
 pub use callables::{
-    anchor_opposite_definition, call_definition_presentations, hover_presentations,
+    call_declaration_presentations_at, call_definition_presentations, hover_presentations,
     resolve_callable_candidates, resolve_counterparts, signature_active_index,
     signature_presentations, ArgumentState, CallSiteContext, CallableCandidateMetrics,
     CallableCandidateSet, CallableQueryInput, CandidateCoverage, CandidateIncompleteReason,
@@ -42,14 +42,17 @@ pub use comments::RenderedSymbolComment;
 #[allow(unused_imports)]
 pub use current_file_overlay::{current_file_overlay_candidates, CurrentFileOverlayCandidate};
 pub use definitions::{
-    rank_definitions_into_candidates_with_scope, rank_navigation_candidates_with_scope,
+    rank_declaration_candidates_with_scope, rank_definitions_into_candidates_with_scope,
+    rank_navigation_candidates_with_scope,
 };
 pub use documentation::{rank_documentation_candidates, DocumentationCandidate};
 pub use hover::{
     comment_documentation_for_candidate_symbol, hover_markdown_for_candidate,
     rank_hover_candidates, RankedHoverCandidate, HOVER_CANDIDATE_LIMIT,
 };
-pub use local_completion::{local_completion_candidates, LocalCompletionCandidate};
+pub use local_completion::{
+    local_completion_candidates, visible_local_binding, LocalCompletionCandidate,
+};
 pub use signatures::{
     call_context_at, signature_parts, signature_parts_for_name, CallContext, ParameterSpan,
     RankedSignatureCandidate, SignatureParts, SIGNATURE_HELP_LIMIT,
@@ -91,6 +94,7 @@ pub struct RankedNameHit {
     pub name_len: usize,
     pub name: String,
     pub kind: ParserKind,
+    pub role: SymbolRole,
     /// Best-effort build-marker ownership for ordinary completion only.
     pub project_key: Option<ProjectKey>,
 }
@@ -111,6 +115,7 @@ struct NameEntry {
     directly_included: bool,
     path: Arc<str>,
     kind: ParserKind,
+    role: SymbolRole,
     project_key: Option<ProjectKey>,
 }
 
@@ -123,6 +128,7 @@ struct CompactNameEntry {
     path_id: u32,
     project_id: u32,
     kind: ParserKind,
+    role: SymbolRole,
     external: bool,
     directly_included: bool,
 }
@@ -142,6 +148,7 @@ struct NameEntryRef<'a> {
     directly_included: bool,
     path: &'a str,
     kind: ParserKind,
+    role: SymbolRole,
     project_key: Option<&'a ProjectKey>,
 }
 
@@ -218,6 +225,7 @@ impl CompletionRecallMetrics {
 pub struct CompletionScope {
     pub current_path: Option<String>,
     pub reach: ReachScope,
+    pub direct_external_files: HashSet<String>,
 }
 
 impl CompletionScope {
@@ -227,6 +235,7 @@ impl CompletionScope {
         ResolveContext {
             current_path: self.current_path.as_deref(),
             reach: Some(&self.reach),
+            direct_external_files: Some(&self.direct_external_files),
         }
     }
 }
@@ -307,6 +316,7 @@ fn all_workspace_reach(segment: &NameSegment) -> ReachScope {
             .filter(|(_, external)| !**external)
             .map(|(path, _)| path.to_string())
             .collect(),
+        heuristic_files: HashSet::new(),
         open: false,
         reason: None,
     }
@@ -526,6 +536,7 @@ impl NameSegment {
             directly_included: entry.directly_included,
             path: &self.paths[entry.path_id as usize],
             kind: entry.kind,
+            role: entry.role,
             project_key: (entry.project_id != NO_PROJECT_ID)
                 .then(|| &self.projects[entry.project_id as usize]),
         }
@@ -801,6 +812,7 @@ impl NameTable {
             None => Some(ResolveContext {
                 current_path: None,
                 reach: Some(self.all_workspace_reach.as_ref()),
+                direct_external_files: None,
             }),
         };
         let ctx_ref = ctx_owned.as_ref();
@@ -1220,6 +1232,7 @@ impl NameTable {
                     name_len: candidate.name_len,
                     name: entry.name.to_string(),
                     kind: entry.kind,
+                    role: entry.role,
                     project_key: entry.project_key.cloned(),
                 }
             })
@@ -1306,10 +1319,29 @@ fn sort_scored(scored: &mut [ScoredCandidate], table: &NameTable) {
 }
 
 fn scored_order(a: &ScoredCandidate, b: &ScoredCandidate, table: &NameTable) -> std::cmp::Ordering {
+    let a_entry = table.entry(a.index);
+    let b_entry = table.entry(b.index);
     b.score
         .cmp(&a.score)
         .then(a.name_len.cmp(&b.name_len))
-        .then_with(|| table.entry(a.index).name.cmp(table.entry(b.index).name))
+        .then_with(|| a_entry.name.cmp(b_entry.name))
+        // Role is a same-logical-name recall tie-break only; it must not
+        // reorder different labels before fuzzy/name quality has spoken.
+        .then_with(|| {
+            completion_role_recall_priority(b_entry.role)
+                .cmp(&completion_role_recall_priority(a_entry.role))
+        })
+        .then_with(|| a_entry.path.cmp(b_entry.path))
+        .then_with(|| a_entry.id.cmp(&b_entry.id))
+}
+
+fn completion_role_recall_priority(role: SymbolRole) -> u8 {
+    match role {
+        SymbolRole::Declaration => 4,
+        SymbolRole::TentativeDefinition => 3,
+        SymbolRole::Definition => 2,
+        SymbolRole::UnknownDeclarationOrDefinition => 1,
+    }
 }
 
 fn top_scored(
@@ -1358,7 +1390,16 @@ fn recall_metrics(
 fn name_entry(
     (id, name, external, path, kind, directly_included): (i64, String, bool, String, String, bool),
 ) -> NameEntry {
-    name_entry_parts(id, name, external, path, kind, directly_included, None)
+    name_entry_parts(
+        id,
+        name,
+        external,
+        path,
+        kind,
+        SymbolRole::Definition,
+        directly_included,
+        None,
+    )
 }
 
 fn name_entry_from_row(row: NameTableSymbolRow) -> NameEntry {
@@ -1380,6 +1421,7 @@ fn name_entry_from_row_with_project_context(
         row.external,
         row.path,
         row.kind,
+        symbol_role_from_str(&row.role),
         row.directly_included,
         project_key,
     )
@@ -1407,6 +1449,7 @@ fn name_entries_from_rows_with_project_context(
                 row.external,
                 row.path,
                 row.kind,
+                symbol_role_from_str(&row.role),
                 row.directly_included,
                 project_key,
             )
@@ -1414,12 +1457,14 @@ fn name_entries_from_rows_with_project_context(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn name_entry_parts(
     id: i64,
     name: String,
     external: bool,
     path: String,
     kind: String,
+    role: SymbolRole,
     directly_included: bool,
     project_key: Option<ProjectKey>,
 ) -> NameEntry {
@@ -1432,7 +1477,18 @@ fn name_entry_parts(
         directly_included,
         path: Arc::from(path),
         kind: crate::parser::kind_from_str(&kind),
+        role,
         project_key,
+    }
+}
+
+fn symbol_role_from_str(role: &str) -> SymbolRole {
+    match role {
+        "definition" => SymbolRole::Definition,
+        "declaration" => SymbolRole::Declaration,
+        "tentative_definition" => SymbolRole::TentativeDefinition,
+        "unknown_declaration_or_definition" => SymbolRole::UnknownDeclarationOrDefinition,
+        _ => SymbolRole::UnknownDeclarationOrDefinition,
     }
 }
 

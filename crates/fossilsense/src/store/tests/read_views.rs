@@ -120,10 +120,12 @@ fn include_read_views_expose_typed_reach_and_completion_rows() {
             crate::store::views::IncludeEdgeRow {
                 source_path: "src/a.c".to_string(),
                 target_path: "include/b.h".to_string(),
+                resolution: crate::includes::ResolutionKind::WorkspaceExact,
             },
             crate::store::views::IncludeEdgeRow {
                 source_path: "src/c.c".to_string(),
                 target_path: "include/d.h".to_string(),
+                resolution: crate::includes::ResolutionKind::RelativeExact,
             },
         ]
     );
@@ -237,4 +239,29 @@ fn symbol_reference_and_member_read_views_preserve_existing_domain_shapes() {
             .fallback_member_candidates("wi", 2, None)
             .expect("compat fallback")
     );
+}
+
+#[test]
+fn bounded_exact_name_symbol_read_can_reserve_a_reachable_path() {
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+    let mut store = IndexStore::open(&db, dir.path()).expect("store");
+    let noise = "extern int crowded_value;\n".repeat(300);
+    upsert_source(&mut store, "aaa/noise.h", &noise);
+    upsert_source(&mut store, "zzz/reachable.h", "int crowded_value = 1;\n");
+
+    let (global, global_truncated) = store
+        .symbol_read_view()
+        .symbols_by_name_limited("crowded_value", 256)
+        .expect("global exact-name rows");
+    assert!(global_truncated);
+    assert!(global.iter().all(|row| row.path == "aaa/noise.h"));
+
+    let (reachable, reachable_truncated) = store
+        .symbol_read_view()
+        .symbols_by_name_in_paths_limited("crowded_value", &["zzz/reachable.h".into()], 1)
+        .expect("reachable exact-name rows");
+    assert!(!reachable_truncated);
+    assert_eq!(reachable.len(), 1);
+    assert_eq!(reachable[0].path, "zzz/reachable.h");
 }

@@ -7,16 +7,20 @@ use crate::reachability::ReachScope;
 use crate::resolver::{self, ResolveContext};
 use crate::store::SymbolRecord;
 
-/// Definition-preference `base_match` for a [`SymbolRecord`]: definition >
-/// declaration, function in `.c`/`.cpp` over `.h`. The workspace/locality
-/// terms from R1's `definition_score` are gone — tier (`scope_tier`) and
-/// locality are now policy axes owned by the resolver. `base_match` is
-/// purely match quality, kept structurally separate from tier.
+/// Definition-preference `base_match` for a [`SymbolRecord`] uses the order
+/// `full definition > tentative definition > declaration > unknown`, with a
+/// final function-in-source-file preference. The workspace/locality terms from R1's
+/// `definition_score` are gone — tier (`scope_tier`) and locality are policy
+/// axes owned by the resolver. `base_match` is purely match quality, kept
+/// structurally separate from tier.
 fn definition_base_match(record: &SymbolRecord) -> i32 {
-    let mut score = 0;
-    if record.role == "definition" {
-        score += 1000;
-    }
+    let mut score = match record.role.as_str() {
+        "definition" => 1000,
+        "tentative_definition" => 750,
+        "declaration" => 500,
+        "unknown_declaration_or_definition" => 0,
+        _ => 0,
+    };
     if record.kind == "function" && is_source_ext(&record.path) {
         score += 100;
     }
@@ -173,6 +177,7 @@ pub(super) fn rank_definition_records_with_scope(
     let ctx = ResolveContext {
         current_path: Some(current_rel_path),
         reach: scope,
+        direct_external_files: None,
     };
     let mut keyed: Vec<(i32, String, u32, SymbolRecord, crate::model::ScopeTier, i32)> = candidates
         .into_iter()
@@ -249,21 +254,79 @@ pub fn rank_definitions_into_candidates_with_scope(
         .collect()
 }
 
+/// Rank non-callable declaration targets by selecting the operation-specific
+/// role class before applying the shared scope/locality ordering.
+///
+/// A real declaration is always the preferred answer to "go to declaration",
+/// even when a definition happens to be closer to the current file.  Only when
+/// no declaration fact exists do full/tentative definitions become fallback
+/// anchors.  Unknown/legacy roles are retained as a final best-effort fallback
+/// only when neither of those known role classes is available.
+pub fn rank_declaration_candidates_with_scope(
+    candidates: Vec<SymbolRecord>,
+    current_rel_path: &str,
+    scope: Option<&ReachScope>,
+) -> Vec<DefinitionCandidate> {
+    let has_declaration = candidates.iter().any(|record| record.role == "declaration");
+    let has_definition_fallback = candidates
+        .iter()
+        .any(|record| matches!(record.role.as_str(), "definition" | "tentative_definition"));
+
+    let selected = candidates
+        .into_iter()
+        .filter(|record| {
+            if has_declaration {
+                record.role == "declaration"
+            } else if has_definition_fallback {
+                matches!(record.role.as_str(), "definition" | "tentative_definition")
+            } else {
+                true
+            }
+        })
+        .collect();
+
+    rank_definition_records_with_scope(selected, current_rel_path, scope)
+        .into_iter()
+        .map(|ranked| ranked.candidate)
+        .collect()
+}
+
 /// Rank non-callable goto targets. Callable counterpart navigation is owned by
 /// the strict candidate graph; this compatibility entry point deliberately
 /// ignores the old origin/project toggle so it cannot become a second function
 /// identity policy.
 pub fn rank_navigation_candidates_with_scope(
-    candidates: Vec<SymbolRecord>,
+    mut candidates: Vec<SymbolRecord>,
     current_rel_path: &str,
     scope: Option<&ReachScope>,
     _origin: Option<&SymbolRecord>,
     _project_context: Option<&ProjectContextIndex>,
 ) -> Vec<DefinitionCandidate> {
+    // Definition is operation-specific: once a stronger object/type role is
+    // known, weaker anchors are fallback evidence rather than additional
+    // default destinations.  Keep competing anchors of the same role so
+    // platform/backend ambiguity remains visible.
+    if let Some(best_role) = candidates
+        .iter()
+        .map(|record| definition_role_priority(&record.role))
+        .max()
+    {
+        candidates.retain(|record| definition_role_priority(&record.role) == best_role);
+    }
     rank_definition_records_with_scope(candidates, current_rel_path, scope)
         .into_iter()
         .map(|ranked| ranked.candidate)
         .collect()
+}
+
+fn definition_role_priority(role: &str) -> u8 {
+    match role {
+        "definition" => 3,
+        "tentative_definition" => 2,
+        "declaration" => 1,
+        "unknown_declaration_or_definition" => 0,
+        _ => 0,
+    }
 }
 
 #[cfg(test)]
@@ -320,7 +383,7 @@ mod tests {
     #[test]
     fn definition_outranks_declaration() {
         // No reach graph: both candidates are Global tier, so the tie breaks
-        // by base_match — definition (1000) > declaration (0).
+        // by base_match — definition (1000) > declaration (500).
         let candidates = vec![
             record("foo", "function", "declaration", "include/foo.h", 1),
             record("foo", "function", "definition", "src/foo.c", 10),
@@ -328,6 +391,135 @@ mod tests {
         let ranked = rank_definitions(candidates, "src/main.c", None);
         assert_eq!(ranked[0].role, "definition");
         assert_eq!(ranked[0].path, "src/foo.c");
+    }
+
+    #[test]
+    fn object_roles_rank_full_then_tentative_then_declaration_then_unknown() {
+        let candidates = vec![
+            record(
+                "count",
+                "global_variable",
+                "unknown_declaration_or_definition",
+                "unknown.h",
+                1,
+            ),
+            record(
+                "count",
+                "global_variable",
+                "declaration",
+                "declaration.h",
+                1,
+            ),
+            record(
+                "count",
+                "global_variable",
+                "tentative_definition",
+                "tentative.c",
+                1,
+            ),
+            record("count", "global_variable", "definition", "definition.c", 1),
+        ];
+
+        let ranked = rank_definitions_into_candidates(candidates, "main.c", None);
+
+        assert_eq!(
+            ranked
+                .iter()
+                .map(|candidate| candidate.role.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "definition",
+                "tentative_definition",
+                "declaration",
+                "unknown_declaration_or_definition",
+            ]
+        );
+        assert_eq!(
+            ranked
+                .iter()
+                .map(|candidate| candidate.base_match)
+                .collect::<Vec<_>>(),
+            vec![1000, 750, 500, 0]
+        );
+    }
+
+    #[test]
+    fn definition_navigation_suppresses_weaker_role_fallbacks() {
+        let candidates = vec![
+            record(
+                "count",
+                "global_variable",
+                "declaration",
+                "include/api.h",
+                1,
+            ),
+            record(
+                "count",
+                "global_variable",
+                "tentative_definition",
+                "src/tentative.c",
+                2,
+            ),
+            record("count", "global_variable", "definition", "src/first.c", 3),
+            record("count", "global_variable", "definition", "src/second.c", 4),
+        ];
+
+        let ranked =
+            rank_navigation_candidates_with_scope(candidates, "src/main.c", None, None, None);
+
+        assert_eq!(ranked.len(), 2);
+        assert!(ranked
+            .iter()
+            .all(|candidate| candidate.role == "definition"));
+    }
+
+    #[test]
+    fn declaration_navigation_selects_declarations_before_scope_ranking() {
+        let candidates = vec![
+            record("count", "global_variable", "definition", "src/main.c", 10),
+            record(
+                "count",
+                "global_variable",
+                "declaration",
+                "include/api.h",
+                2,
+            ),
+        ];
+
+        let ranked = rank_declaration_candidates_with_scope(candidates, "src/main.c", None);
+
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].role, "declaration");
+        assert_eq!(ranked[0].path, "include/api.h");
+    }
+
+    #[test]
+    fn declaration_navigation_uses_definition_roles_only_as_fallback() {
+        let candidates = vec![
+            record(
+                "count",
+                "global_variable",
+                "unknown_declaration_or_definition",
+                "unknown.h",
+                1,
+            ),
+            record(
+                "count",
+                "global_variable",
+                "tentative_definition",
+                "src/count.c",
+                3,
+            ),
+            record("count", "global_variable", "definition", "other/count.c", 8),
+        ];
+
+        let ranked = rank_declaration_candidates_with_scope(candidates, "src/main.c", None);
+
+        assert_eq!(ranked.len(), 2);
+        assert!(ranked.iter().all(|candidate| matches!(
+            candidate.role.as_str(),
+            "definition" | "tentative_definition"
+        )));
     }
 
     #[test]
@@ -347,7 +539,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_navigation_does_not_toggle_header_to_source() {
+    fn definition_navigation_from_a_header_selects_the_full_definition() {
         let mut header = record("foo", "function", "declaration", "lib/foo.h", 1);
         header.signature = "int foo(int value);".to_string();
         let mut source = record("foo", "function", "definition", "lib/foo.c", 10);
@@ -359,7 +551,7 @@ mod tests {
             Some(&header),
             Some(&project_index()),
         );
-        assert_eq!(ranked[0].path, "lib/foo.h");
+        assert_eq!(ranked[0].path, "lib/foo.c");
     }
 
     #[test]
@@ -486,6 +678,7 @@ mod tests {
             files: ["src/main.c".to_string(), "inc/foo.h".to_string()]
                 .into_iter()
                 .collect(),
+            heuristic_files: Default::default(),
             open: true,
             reason: Some(crate::reachability::OpenReason::AmbiguousInclude),
         };
@@ -508,6 +701,7 @@ mod tests {
         let candidates = vec![record("foo", "function", "definition", "other/foo.c", 20)];
         let scope = crate::reachability::ReachScope {
             files: HashSet::new(),
+            heuristic_files: Default::default(),
             open: true,
             reason: Some(crate::reachability::OpenReason::UnresolvedInclude),
         };

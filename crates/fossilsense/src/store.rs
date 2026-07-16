@@ -782,6 +782,8 @@ fn symbol_role(role: SymbolRole) -> &'static str {
     match role {
         SymbolRole::Definition => "definition",
         SymbolRole::Declaration => "declaration",
+        SymbolRole::TentativeDefinition => "tentative_definition",
+        SymbolRole::UnknownDeclarationOrDefinition => "unknown_declaration_or_definition",
     }
 }
 

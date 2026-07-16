@@ -460,10 +460,17 @@ impl CandidateOverlaySnapshot {
                     &all_paths,
                     &by_basename,
                 ) {
-                    crate::includes::IncludeResolution::Edge { dst, .. } => {
-                        edges.push((source.clone(), dst));
+                    crate::includes::IncludeResolution::Edge { dst, kind } => {
+                        edges.push((source.clone(), dst, kind));
                     }
-                    crate::includes::IncludeResolution::Ambiguous { .. } => {
+                    crate::includes::IncludeResolution::Ambiguous { dsts } => {
+                        edges.extend(dsts.into_iter().map(|dst| {
+                            (
+                                source.clone(),
+                                dst,
+                                crate::includes::ResolutionKind::SuffixMatch,
+                            )
+                        }));
                         if reason.is_none() {
                             reason = Some(crate::reachability::OpenReason::AmbiguousInclude);
                         }
@@ -478,7 +485,7 @@ impl CandidateOverlaySnapshot {
             }
         }
         let graph = match base {
-            Some(base) => base.with_refreshed_sources(&sources, edges, open),
+            Some(base) => base.with_refreshed_sources_with_kinds(&sources, edges, open),
             None => {
                 let unresolved = open
                     .iter()
@@ -494,7 +501,7 @@ impl CandidateOverlaySnapshot {
                     })
                     .map(|(path, _)| path.clone())
                     .collect();
-                ReachGraph::new(edges, unresolved, ambiguous)
+                ReachGraph::new_with_kinds(edges, unresolved, ambiguous)
             }
         };
         if let Some(base) = base {
@@ -672,10 +679,9 @@ impl CandidateOverlaySnapshot {
             .map(|(index, fact)| {
                 let external = Path::new(&fact.path).is_absolute();
                 let directly_included = external
-                    && self
-                        .effective_reach_graph
-                        .as_deref()
-                        .is_some_and(|graph| graph.directly_includes_external(&fact.path));
+                    && self.effective_reach_graph.as_deref().is_some_and(|graph| {
+                        graph.any_workspace_directly_includes_external(&fact.path)
+                    });
                 OverlayCompletionName {
                     id: -((index as i64) + 1),
                     name: fact.symbol.name.clone(),
@@ -729,6 +735,13 @@ fn position_in_range(position: SourcePosition, range: SourceRange) -> bool {
         && (position.line, position.character) <= (range.end.line, range.end.character)
 }
 
+fn candidate_origin_priority(origin: CandidateOrigin) -> u8 {
+    match origin {
+        CandidateOrigin::Base => 0,
+        CandidateOrigin::Overlay => 1,
+    }
+}
+
 /// Generation-pinned facade that recalls narrow durable rows, shadows them
 /// with all divergent open documents, and hands a single candidate set to all
 /// callable consumers. The pure arity/counterpart policy remains in `query`.
@@ -763,6 +776,28 @@ impl<'a> CandidateQueryService<'a> {
         }
     }
 
+    /// Durable paths that must be recalled before a workspace-wide exact-name
+    /// cap is allowed to spend the request budget. Dirty paths are omitted:
+    /// their overlay is authoritative even when it is an empty tombstone.
+    fn durable_priority_path_groups(&self) -> (Vec<String>, Vec<String>) {
+        let current = if self.overlays.shadows(self.current_path) {
+            Vec::new()
+        } else {
+            vec![self.current_path.to_string()]
+        };
+        let mut reachable: Vec<_> = self
+            .current_reach
+            .as_ref()
+            .into_iter()
+            .flat_map(|scope| scope.files.iter())
+            .filter(|path| path.as_str() != self.current_path && !self.overlays.shadows(path))
+            .cloned()
+            .collect();
+        reachable.sort();
+        reachable.dedup();
+        (current, reachable)
+    }
+
     pub fn callable_candidates(
         &self,
         name: &str,
@@ -784,14 +819,44 @@ impl<'a> CandidateQueryService<'a> {
                 arity_mismatch_fallback: false,
             });
         }
+        let (current_paths, reachable_paths) = self.durable_priority_path_groups();
         let (base_rows, fallback_symbol_rows, mut truncated) = match self.handle {
             Some(handle) => handle.read(|store| {
-                let (anchors, anchor_truncated) = store
-                    .call_fact_view()
-                    .anchors_by_name_limited(name, self.exact_name_limit)?;
-                let (symbols, symbol_truncated) = store
-                    .symbol_read_view()
-                    .symbols_by_name_limited(name, self.exact_name_limit)?;
+                let call_view = store.call_fact_view();
+                let (global_anchors, mut anchor_truncated) =
+                    call_view.anchors_by_name_limited(name, self.exact_name_limit)?;
+                let mut anchors = Vec::new();
+                if anchor_truncated {
+                    for paths in [&current_paths, &reachable_paths] {
+                        let remaining = self.exact_name_limit.saturating_sub(anchors.len());
+                        let (rows, limited) =
+                            call_view.anchors_by_name_in_paths_limited(name, paths, remaining)?;
+                        anchors.extend(rows);
+                        anchor_truncated |= limited;
+                    }
+                }
+                // The global LIMIT+1 read remains the ordinary fast path. A
+                // scope-priority rescue runs only after it proves truncation.
+                anchors.extend(global_anchors);
+                let mut seen_anchor_ids = HashSet::new();
+                anchors.retain(|row| seen_anchor_ids.insert(row.id));
+
+                let symbol_view = store.symbol_read_view();
+                let (global_symbols, mut symbol_truncated) =
+                    symbol_view.symbols_by_name_limited(name, self.exact_name_limit)?;
+                let mut symbols = Vec::new();
+                if symbol_truncated {
+                    for paths in [&current_paths, &reachable_paths] {
+                        let remaining = self.exact_name_limit.saturating_sub(symbols.len());
+                        let (rows, limited) =
+                            symbol_view.symbols_by_name_in_paths_limited(name, paths, remaining)?;
+                        symbols.extend(rows);
+                        symbol_truncated |= limited;
+                    }
+                }
+                symbols.extend(global_symbols);
+                let mut seen_symbol_ids = HashSet::new();
+                symbols.retain(|record| seen_symbol_ids.insert(record.id));
                 Ok((anchors, symbols, anchor_truncated || symbol_truncated))
             })?,
             None => (Vec::new(), Vec::new(), false),
@@ -803,9 +868,11 @@ impl<'a> CandidateQueryService<'a> {
         let resolve_context = ResolveContext {
             current_path: Some(self.current_path),
             reach: self.current_reach.as_deref(),
+            direct_external_files: None,
         };
         let mut base_anchors: Vec<ResolvedCallableAnchor> = base_rows
             .into_iter()
+            .filter(|row| !self.overlays.shadows(&row.path))
             .map(|row| {
                 let source = row.source.clone();
                 let (external, directly_included) =
@@ -895,14 +962,47 @@ impl<'a> CandidateQueryService<'a> {
             ));
             fallback_used = true;
         }
-        if overlay_anchors.len() > self.exact_name_limit {
-            overlay_anchors.truncate(self.exact_name_limit);
+        // Spend the final candidate budget by semantic tier, across both
+        // durable and live facts. Overlay freshness wins only within an equal
+        // tier; a dirty Global candidate cannot displace a durable Current or
+        // Reachable candidate merely because overlays are merged first.
+        let mut recalled = Vec::with_capacity(base_anchors.len() + overlay_anchors.len());
+        recalled.extend(base_anchors);
+        recalled.extend(overlay_anchors);
+        recalled.sort_by(|left, right| {
+            right
+                .candidate
+                .tier
+                .rank()
+                .cmp(&left.candidate.tier.rank())
+                .then_with(|| {
+                    candidate_origin_priority(right.origin)
+                        .cmp(&candidate_origin_priority(left.origin))
+                })
+                .then_with(|| left.anchor.path.cmp(&right.anchor.path))
+                .then_with(|| {
+                    left.anchor
+                        .name_range
+                        .start_byte
+                        .cmp(&right.anchor.name_range.start_byte)
+                })
+                .then_with(|| {
+                    left.anchor
+                        .anchor_fingerprint
+                        .cmp(&right.anchor.anchor_fingerprint)
+                })
+        });
+        if recalled.len() > self.exact_name_limit {
+            recalled.truncate(self.exact_name_limit);
             truncated = true;
         }
-        let remaining = self.exact_name_limit.saturating_sub(overlay_anchors.len());
-        if base_anchors.len() > remaining {
-            base_anchors.truncate(remaining);
-            truncated = true;
+        let mut base_anchors = Vec::new();
+        let mut overlay_anchors = Vec::new();
+        for candidate in recalled {
+            match candidate.origin {
+                CandidateOrigin::Base => base_anchors.push(candidate),
+                CandidateOrigin::Overlay => overlay_anchors.push(candidate),
+            }
         }
         let source_paths: HashSet<_> = base_anchors
             .iter()
@@ -932,12 +1032,19 @@ impl<'a> CandidateQueryService<'a> {
                 fallback_used.then_some(crate::query::CandidateIncompleteReason::FactsUnavailable)
             },
         };
+        let mut visible_internal_paths = self
+            .current_reach
+            .as_ref()
+            .map(|scope| scope.files.clone())
+            .unwrap_or_default();
+        visible_internal_paths.insert(self.current_path.to_string());
         Ok(resolve_callable_candidates(CallableQueryInput {
             base_anchors,
             overlay_anchors,
             shadowed_paths: self.overlays.shadowed_paths().clone(),
             call_context,
             source_reach,
+            visible_internal_paths,
             coverage,
         }))
     }
@@ -964,7 +1071,7 @@ impl<'a> CandidateQueryService<'a> {
             return (false, false);
         }
         let directly_included = self.reach_graph.map_or(durable_directly_included, |graph| {
-            graph.directly_includes_external(path)
+            graph.directly_includes_external(self.current_path, path)
         });
         (true, directly_included)
     }
@@ -1048,34 +1155,70 @@ impl<'a> CandidateQueryService<'a> {
                 record.directly_included = directly_included;
                 record
             })
-            .take(DEFAULT_EXACT_NAME_CANDIDATE_LIMIT)
+            .filter(|record| self.non_callable_record_is_visible(record))
             .collect();
-        let remaining = DEFAULT_EXACT_NAME_CANDIDATE_LIMIT.saturating_sub(records.len());
-        if remaining > 0 {
-            let mut base = match self.handle {
-                Some(handle) => handle.read(|store| {
-                    store
-                        .symbol_read_view()
-                        .symbols_by_name_limited(name, DEFAULT_EXACT_NAME_CANDIDATE_LIMIT)
-                        .map(|(records, _)| records)
-                })?,
-                None => Vec::new(),
-            };
-            base.retain(|record| record.kind != "function" && !self.overlays.shadows(&record.path));
-            for record in &mut base {
-                let (external, directly_included) = self.path_evidence(
-                    &record.path,
-                    record.source == "external",
-                    record.directly_included,
-                );
-                record.source = if external { "external" } else { "workspace" }.into();
-                record.directly_included = directly_included;
-            }
-            records.extend(base.into_iter().take(remaining));
+        let (current_paths, reachable_paths) = self.durable_priority_path_groups();
+        let mut base = match self.handle {
+            Some(handle) => handle.read(|store| {
+                let view = store.symbol_read_view();
+                let (global, truncated) =
+                    view.symbols_by_name_limited(name, DEFAULT_EXACT_NAME_CANDIDATE_LIMIT)?;
+                let mut base = Vec::new();
+                if truncated {
+                    for paths in [&current_paths, &reachable_paths] {
+                        let remaining =
+                            DEFAULT_EXACT_NAME_CANDIDATE_LIMIT.saturating_sub(base.len());
+                        let (rows, _) =
+                            view.symbols_by_name_in_paths_limited(name, paths, remaining)?;
+                        base.extend(rows);
+                    }
+                }
+                // Preserve a bounded unscoped fallback for projects whose
+                // reach graph is absent/open, then remove overlap by row id.
+                base.extend(global);
+                let mut seen_ids = HashSet::new();
+                base.retain(|record| seen_ids.insert(record.id));
+                Ok(base)
+            })?,
+            None => Vec::new(),
+        };
+        base.retain(|record| {
+            record.kind != "function"
+                && !self.overlays.shadows(&record.path)
+                && self.non_callable_record_is_visible(record)
+        });
+        for record in &mut base {
+            let (external, directly_included) = self.path_evidence(
+                &record.path,
+                record.source == "external",
+                record.directly_included,
+            );
+            record.source = if external { "external" } else { "workspace" }.into();
+            record.directly_included = directly_included;
         }
+        records.extend(base);
+        let resolve_context = ResolveContext {
+            current_path: Some(self.current_path),
+            reach: self.current_reach.as_deref(),
+            direct_external_files: None,
+        };
         records.sort_by(|left, right| {
-            left.path
-                .cmp(&right.path)
+            let left_tier = resolver::scope_tier(
+                &left.path,
+                left.source == "external",
+                left.directly_included,
+                Some(&resolve_context),
+            );
+            let right_tier = resolver::scope_tier(
+                &right.path,
+                right.source == "external",
+                right.directly_included,
+                Some(&resolve_context),
+            );
+            right_tier
+                .rank()
+                .cmp(&left_tier.rank())
+                .then_with(|| left.path.cmp(&right.path))
                 .then(left.start_line.cmp(&right.start_line))
                 .then(left.start_col.cmp(&right.start_col))
                 .then(left.kind.cmp(&right.kind))
@@ -1088,6 +1231,19 @@ impl<'a> CandidateQueryService<'a> {
         });
         records.truncate(DEFAULT_EXACT_NAME_CANDIDATE_LIMIT);
         Ok(records)
+    }
+
+    fn non_callable_record_is_visible(&self, record: &SymbolRecord) -> bool {
+        !symbol_record_has_internal_linkage(record)
+            || self.path_is_in_current_translation_unit(&record.path)
+    }
+
+    fn path_is_in_current_translation_unit(&self, path: &str) -> bool {
+        path == self.current_path
+            || self
+                .current_reach
+                .as_ref()
+                .is_some_and(|scope| scope.files.contains(path))
     }
 
     /// Revision evidence for bounded lazy source hydration. The metadata comes
@@ -1124,6 +1280,7 @@ impl<'a> CandidateQueryService<'a> {
         let resolve_context = ResolveContext {
             current_path: Some(self.current_path),
             reach: self.current_reach.as_deref(),
+            direct_external_files: None,
         };
         let mut names = vec![name.to_string()];
         let mut visited_names = HashSet::new();
@@ -1415,6 +1572,7 @@ impl<'a> CandidateQueryService<'a> {
         let resolve_context = ResolveContext {
             current_path: Some(self.current_path),
             reach: self.current_reach.as_deref(),
+            direct_external_files: None,
         };
         let mut persistent_ids: Vec<_> = records
             .iter()
@@ -1532,6 +1690,7 @@ impl<'a> CandidateQueryService<'a> {
         let resolve_context = ResolveContext {
             current_path: Some(self.current_path),
             reach: self.current_reach.as_deref(),
+            direct_external_files: None,
         };
         let (mut members, mut truncated) = match self.handle {
             Some(handle) => handle.read(|store| {
@@ -1684,6 +1843,8 @@ fn overlay_symbol_record(fact: &OverlaySymbolFact) -> SymbolRecord {
         role: match fact.symbol.role {
             SymbolRole::Definition => "definition",
             SymbolRole::Declaration => "declaration",
+            SymbolRole::TentativeDefinition => "tentative_definition",
+            SymbolRole::UnknownDeclarationOrDefinition => "unknown_declaration_or_definition",
         }
         .into(),
         path: fact.path.clone(),
@@ -1701,6 +1862,14 @@ fn overlay_symbol_record(fact: &OverlaySymbolFact) -> SymbolRecord {
         .into(),
         directly_included: false,
     }
+}
+
+fn symbol_record_has_internal_linkage(record: &SymbolRecord) -> bool {
+    record.kind == "global_variable"
+        && record
+            .signature
+            .split(|ch: char| ch != '_' && !ch.is_ascii_alphanumeric())
+            .any(|token| token == "static")
 }
 
 fn resolved_anchor(
@@ -1823,8 +1992,11 @@ fn resolved_lexical_function(
 mod tests {
     use std::path::Path;
 
+    use tempfile::tempdir;
+
     use super::*;
     use crate::parser::{parse_with_handle, ParseFacts};
+    use crate::store::{FileFingerprint, FileSource, IndexStore};
 
     fn absolute_test_path(name: &str) -> String {
         std::env::temp_dir()
@@ -1832,6 +2004,23 @@ mod tests {
             .join(name)
             .to_string_lossy()
             .replace('\\', "/")
+    }
+
+    fn upsert_candidate_test_file(store: &mut IndexStore, path: &str, source: &str) {
+        let parsed = parse_with_handle(Path::new(path), source, None, ParseFacts::HOVER_SEMANTICS);
+        store
+            .upsert_file_index_with_source(
+                &FileFingerprint {
+                    path: path.to_string(),
+                    extension: path.rsplit('.').next().unwrap_or("c").to_string(),
+                    size: source.len() as u64,
+                    mtime_ns: 1,
+                    hash: format!("{path}-scope-recall"),
+                },
+                &parsed,
+                FileSource::Workspace,
+            )
+            .expect("upsert candidate fixture");
     }
 
     #[test]
@@ -2230,6 +2419,88 @@ mod tests {
     }
 
     #[test]
+    fn dirty_suffix_include_stays_heuristic() {
+        let header = parse_with_handle(
+            Path::new("inc/api.h"),
+            "int api(int value);\n",
+            None,
+            ParseFacts::HOVER_SEMANTICS,
+        );
+        let source = parse_with_handle(
+            Path::new("src/api.c"),
+            "#include \"api.h\"\nint api(int value) { return value; }\n",
+            None,
+            ParseFacts::HOVER_SEMANTICS,
+        );
+        let base = ReachGraph::new(Vec::new(), Vec::new(), Vec::new());
+        let mut snapshot = CandidateOverlaySnapshot::new(
+            8,
+            vec![
+                FileCandidateOverlay::from_index("inc/api.h".into(), &header),
+                FileCandidateOverlay::from_index("src/api.c".into(), &source),
+            ],
+        );
+        snapshot.refresh_reach_graph(Some(&base), ["src/api.c", "inc/api.h"], &[]);
+
+        let scope = snapshot
+            .effective_reach_graph(Some(&base))
+            .expect("effective graph")
+            .reachable("src/api.c");
+        assert!(!scope.files.contains("inc/api.h"));
+        assert!(scope.heuristic_files.contains("inc/api.h"));
+    }
+
+    #[test]
+    fn dirty_ambiguous_include_retains_every_heuristic_target() {
+        let first = parse_with_handle(
+            Path::new("first/api.h"),
+            "int first_api(void);\n",
+            None,
+            ParseFacts::HOVER_SEMANTICS,
+        );
+        let second = parse_with_handle(
+            Path::new("second/api.h"),
+            "int second_api(void);\n",
+            None,
+            ParseFacts::HOVER_SEMANTICS,
+        );
+        let source = parse_with_handle(
+            Path::new("src/main.c"),
+            "#include \"api.h\"\nint main(void) { return 0; }\n",
+            None,
+            ParseFacts::HOVER_SEMANTICS,
+        );
+        let base = ReachGraph::new(Vec::new(), Vec::new(), Vec::new());
+        let mut snapshot = CandidateOverlaySnapshot::new(
+            9,
+            vec![
+                FileCandidateOverlay::from_index("first/api.h".into(), &first),
+                FileCandidateOverlay::from_index("second/api.h".into(), &second),
+                FileCandidateOverlay::from_index("src/main.c".into(), &source),
+            ],
+        );
+        snapshot.refresh_reach_graph(
+            Some(&base),
+            ["src/main.c", "first/api.h", "second/api.h"],
+            &[],
+        );
+
+        let scope = snapshot
+            .effective_reach_graph(Some(&base))
+            .expect("effective graph")
+            .reachable("src/main.c");
+        assert!(scope.open);
+        assert_eq!(
+            scope.reason,
+            Some(crate::reachability::OpenReason::AmbiguousInclude)
+        );
+        assert!(!scope.files.contains("first/api.h"));
+        assert!(!scope.files.contains("second/api.h"));
+        assert!(scope.heuristic_files.contains("first/api.h"));
+        assert!(scope.heuristic_files.contains("second/api.h"));
+    }
+
+    #[test]
     fn dirty_external_overlay_uses_effective_direct_include_and_source_evidence() {
         let external = absolute_test_path("external_api.h");
         let external_parsed = parse_with_handle(
@@ -2322,7 +2593,12 @@ mod tests {
                 FileCandidateOverlay::from_index("main.c".into(), &main_with_include),
             ],
         );
-        added.refresh_reach_graph(Some(&empty_published), ["main.c"], &[]);
+        let external_root = external
+            .rsplit_once('/')
+            .expect("external parent")
+            .0
+            .to_string();
+        added.refresh_reach_graph(Some(&empty_published), ["main.c"], &[external_root]);
 
         assert_eq!(
             added.direct_include_overrides().get(&external),
@@ -2344,6 +2620,15 @@ mod tests {
         assert_eq!(
             added_candidates.anchors[0].candidate.tier,
             crate::model::ScopeTier::External
+        );
+        let unrelated_candidates =
+            CandidateQueryService::new(None, &added, "other.c", None, Some(&empty_published))
+                .callable_candidates("external_api", None)
+                .expect("unrelated-origin external candidates");
+        assert_eq!(
+            unrelated_candidates.anchors[0].candidate.tier,
+            crate::model::ScopeTier::Global,
+            "another workspace source must not inherit main.c's direct external evidence"
         );
         let added_service =
             CandidateQueryService::new(None, &added, "main.c", None, Some(&empty_published));
@@ -2399,27 +2684,19 @@ mod tests {
         ]);
         let overrides = HashMap::from([(external.clone(), false)]);
         let effective = table.with_direct_include_overrides(&overrides);
-        let scope = crate::query::CompletionScope {
-            current_path: Some("main.c".into()),
-            reach: ReachGraph::new(Vec::new(), Vec::new(), Vec::new())
-                .reachable("main.c")
-                .as_ref()
-                .clone(),
-        };
-
         assert_eq!(
-            effective.exact_name_hits_scoped("external_name", 1, Some(&scope))[0].tier,
+            effective.exact_name_hits_scoped("external_name", 1, None)[0].tier,
             crate::model::ScopeTier::Global
         );
         assert_eq!(
-            effective.exact_name_hits_scoped("workspace_name", 1, Some(&scope))[0].tier,
+            effective.exact_name_hits_scoped("workspace_name", 1, None)[0].tier,
             crate::model::ScopeTier::Global,
             "a workspace path must not become External even if a malformed durable bit is set"
         );
 
         let added = table.with_direct_include_overrides(&HashMap::from([(external, true)]));
         assert_eq!(
-            added.exact_name_hits_scoped("external_name", 1, Some(&scope))[0].tier,
+            added.exact_name_hits_scoped("external_name", 1, None)[0].tier,
             crate::model::ScopeTier::External
         );
     }
@@ -2509,5 +2786,104 @@ mod tests {
         assert_eq!(read.scanned, 2);
         assert_eq!(read.candidates.len(), 2);
         assert!(read.truncated);
+    }
+
+    #[test]
+    fn scoped_exact_name_recall_survives_global_cap_and_dirty_tombstones() {
+        let dir = tempdir().expect("tempdir");
+        let db = dir.path().join("index.sqlite");
+        let mut store = IndexStore::open(&db, dir.path()).expect("store");
+        let mut noise = String::new();
+        for _ in 0..300 {
+            noise.push_str("int crowded(void);\n");
+            noise.push_str("extern int crowded_value;\n");
+        }
+        upsert_candidate_test_file(&mut store, "aaa/noise.h", &noise);
+        upsert_candidate_test_file(
+            &mut store,
+            "zzz/reachable.h",
+            "int crowded(void);\nint crowded_value = 1;\n",
+        );
+        drop(store);
+
+        let graph = ReachGraph::new(
+            vec![("main.c".into(), "zzz/reachable.h".into())],
+            Vec::new(),
+            Vec::new(),
+        );
+        let reach = graph.reachable("main.c");
+        let handle = CallReadHandle::capture(db).expect("read handle");
+        let clean = CandidateOverlaySnapshot::default();
+        let service = CandidateQueryService::new(
+            Some(&handle),
+            &clean,
+            "main.c",
+            Some(reach.as_ref()),
+            Some(&graph),
+        );
+
+        let callables = service
+            .callable_candidates("crowded", None)
+            .expect("callable candidates");
+        assert!(callables.coverage.truncated);
+        assert!(callables.anchors.len() <= DEFAULT_EXACT_NAME_CANDIDATE_LIMIT);
+        assert!(callables
+            .anchors
+            .iter()
+            .any(|candidate| candidate.anchor.path == "zzz/reachable.h"));
+
+        let symbols = service
+            .non_callable_symbols("crowded_value")
+            .expect("non-callable candidates");
+        assert!(symbols.len() <= DEFAULT_EXACT_NAME_CANDIDATE_LIMIT);
+        assert!(symbols
+            .iter()
+            .any(|candidate| candidate.path == "zzz/reachable.h"));
+
+        let current_service =
+            CandidateQueryService::new(Some(&handle), &clean, "zzz/reachable.h", None, None);
+        assert!(current_service
+            .callable_candidates("crowded", None)
+            .expect("current-file callable candidates")
+            .anchors
+            .iter()
+            .any(|candidate| candidate.anchor.path == "zzz/reachable.h"));
+        assert!(current_service
+            .non_callable_symbols("crowded_value")
+            .expect("current-file non-callable candidates")
+            .iter()
+            .any(|candidate| candidate.path == "zzz/reachable.h"));
+
+        let dirty = parse_with_handle(
+            Path::new("zzz/reachable.h"),
+            "int replacement_value = 2;\n",
+            None,
+            ParseFacts::HOVER_SEMANTICS,
+        );
+        let tombstone = CandidateOverlaySnapshot::new(
+            9,
+            vec![FileCandidateOverlay::from_index(
+                "zzz/reachable.h".into(),
+                &dirty,
+            )],
+        );
+        let dirty_service = CandidateQueryService::new(
+            Some(&handle),
+            &tombstone,
+            "main.c",
+            Some(reach.as_ref()),
+            Some(&graph),
+        );
+        assert!(dirty_service
+            .callable_candidates("crowded", None)
+            .expect("dirty callable candidates")
+            .anchors
+            .iter()
+            .all(|candidate| candidate.anchor.path != "zzz/reachable.h"));
+        assert!(dirty_service
+            .non_callable_symbols("crowded_value")
+            .expect("dirty non-callable candidates")
+            .iter()
+            .all(|candidate| candidate.path != "zzz/reachable.h"));
     }
 }

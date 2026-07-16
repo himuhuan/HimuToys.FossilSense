@@ -114,11 +114,11 @@ pub enum ScopeTier {
     /// reachability is proven by traversal).
     Reachable,
     /// External (toolchain) header that is first-layer directly `#include`d by
-    /// a workspace file (`directly_included == true`).
+    /// the current request origin (`directly_included == true`).
     External,
-    /// Reachability indeterminate because the scope is open: the candidate is
-    /// not proven in the reachable set, but it cannot be proven unreachable
-    /// either. Must not be buried below a `Global` candidate.
+    /// Reachability is heuristic (`ReachScope::heuristic_files`) or the scope
+    /// is open: the candidate is not proven in the exact reachable set, but it
+    /// cannot be proven unreachable either. Must not be buried below Global.
     Unknown,
     /// Workspace file proven not reachable (closed scope, not in the reachable
     /// set), or no scope evidence at all (no reach context).

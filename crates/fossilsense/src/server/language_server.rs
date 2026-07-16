@@ -92,6 +92,7 @@ impl LanguageServer for Backend {
                     file_operations: None,
                 }),
                 definition_provider: Some(OneOf::Left(true)),
+                declaration_provider: Some(DeclarationCapability::Simple(true)),
                 references_provider: Some(OneOf::Left(true)),
                 workspace_symbol_provider: Some(OneOf::Left(true)),
                 document_symbol_provider: Some(OneOf::Left(true)),
@@ -105,6 +106,7 @@ impl LanguageServer for Backend {
                         REFRESH_INDEX_LSP_COMMAND.to_string(),
                         REBUILD_INDEX_LSP_COMMAND.to_string(),
                         GROUPED_REFERENCES_LSP_COMMAND.to_string(),
+                        POSSIBLE_TARGETS_LSP_COMMAND.to_string(),
                         COMPLETION_ACCEPTED_LSP_COMMAND.to_string(),
                         CLEAR_COMPLETION_HISTORY_LSP_COMMAND.to_string(),
                         PROJECT_CONTEXTS_LSP_COMMAND.to_string(),
@@ -217,209 +219,16 @@ impl LanguageServer for Backend {
         &self,
         params: GotoDefinitionParams,
     ) -> LspResult<Option<GotoDefinitionResponse>> {
-        let position = params.text_document_position_params;
-        let uri = position.text_document.uri;
+        self.navigate_symbol(params, NavigationOperation::Definition)
+            .await
+    }
 
-        let documents = self
-            .session
-            .documents
-            .capture_request_snapshot(Some(&uri))
-            .await;
-        let Some((_version, text)) = self.document_snapshot_from_request(&uri, &documents).await
-        else {
-            return Ok(None);
-        };
-        let line_text = text
-            .lines()
-            .nth(position.position.line as usize)
-            .unwrap_or_default();
-
-        // An `#include` line resolves to the included header rather than a symbol.
-        if let Some((form, rel)) = includes::parse_include_line(line_text) {
-            return self.goto_include(&uri, form, rel).await;
-        }
-
-        let Some(word) = query::word_at(line_text, position.position.character) else {
-            return Ok(None);
-        };
-        if crate::language_builtins::is_language_keyword(&word) {
-            return Ok(None);
-        }
-
-        let Some(root) = self.root_for_uri(&uri).await else {
-            return Ok(None);
-        };
-        let current_rel = uri_to_path(&uri)
-            .and_then(|path| pathing::relative_slash_path(&root, &path).ok())
-            .unwrap_or_default();
-        // Reachability scope for candidate tier resolution (Current / Reachable
-        // / External / Unknown / Global). A file in the set is proved reachable
-        // regardless of whether the set is open; an open scope routes
-        // not-proven-reachable workspace candidates to `Unknown` (preserving
-        // the R1 "open scope does not bury unreachable" softening as a tier).
-        // `None` when scoping is disabled or no graph exists yet — non-current
-        // workspace files then fall back to `Global`.
-        let total_started = std::time::Instant::now();
-        let context = self.request_context_for_root(root.clone()).await;
-        let reach_started = std::time::Instant::now();
-        let reach_scope: Option<Arc<reachability::ReachScope>> = self
-            .reach_scope_from_context(&uri, &context)
-            .map(|(_, reach)| reach);
-        let mut reach_us = reach_started.elapsed().as_micros();
-        let project_context = context.engine.project_context.clone();
-        let semantic_generation = context.engine.semantic_generation;
-        let call_read_handle = context.engine.call_read_handle.clone();
-        let reach_graph = context.engine.reach_graph.clone();
-        let overlay_started = std::time::Instant::now();
-        let overlay = self
-            .candidate_overlay_snapshot_from_documents(
-                &root,
-                semantic_generation,
-                reach_graph.as_deref(),
-                context.engine.indexed_files.as_deref().map(Vec::as_slice),
-                documents,
-            )
-            .await;
-        reach_us = reach_us.saturating_add(overlay_started.elapsed().as_micros());
-        let source_position = crate::call_model::SourcePosition {
-            line: position.position.line,
-            character: position.position.character,
-        };
-
-        // Debug-gated candidate-reason logging (default off): when on, each
-        // returned candidate's tier/confidence/reason is logged to the output
-        // panel. The flag only adds log lines; it never changes which locations
-        // are returned or their order.
-        let debug_reasons = self.debug_candidate_reasons.load(Ordering::Relaxed);
-        let client = self.client.clone();
-        let word_for_log = word.clone();
-
-        let result = tokio::task::spawn_blocking(
-            move || -> Result<(Vec<Location>, Vec<String>, SemanticRequestPerf)> {
-                let query_started = std::time::Instant::now();
-                let service = crate::candidate_service::CandidateQueryService::new(
-                    call_read_handle.as_deref(),
-                    &overlay,
-                    &current_rel,
-                    reach_scope.as_deref(),
-                    reach_graph.as_deref(),
-                );
-                let call_context = service.complete_call_context_at(source_position)?;
-                let callable_set = service.callable_candidates(&word, call_context.clone())?;
-                let mut perf = SemanticRequestPerf::from_callable_set(&callable_set);
-                perf.reach_us = reach_us;
-                if !callable_set.anchors.is_empty() {
-                    // A callee token inside a function body is an ordinary call
-                    // even when its name matches the enclosing/recursive
-                    // function. Anchor opposite-only navigation applies solely
-                    // to the declaration/definition identifier itself.
-                    let origin = if call_context.is_some() {
-                        None
-                    } else {
-                        service.anchor_at(source_position)?
-                    };
-                    let selected: Vec<&query::ResolvedCallableAnchor> = origin
-                        .as_ref()
-                        .and_then(|origin| {
-                            query::anchor_opposite_definition(
-                                &callable_set.groups,
-                                &origin.anchor_fingerprint,
-                            )
-                        })
-                        .map(|opposite| vec![opposite])
-                        .unwrap_or_else(|| {
-                            // Without a proven strict opposite, Definition
-                            // uses the ordinary ranked candidate set. Keeping
-                            // the origin is intentional: removing it can turn
-                            // an unpaired declaration into no result, or leave
-                            // only a semantically weaker same-name function.
-                            query::call_definition_presentations(&callable_set.groups)
-                        });
-                    let candidates: Vec<_> = selected
-                        .iter()
-                        .map(|candidate| candidate.candidate.clone())
-                        .collect();
-                    perf.query_us = query_started.elapsed().as_micros();
-                    let mut debug_lines = candidate_reason_log_lines(&candidates, debug_reasons);
-                    if debug_reasons && callable_set.arity_mismatch_fallback {
-                        debug_lines.insert(
-                            0,
-                            "arity_mismatch_fallback: no candidate matched the available argument-count evidence; retained candidates use fallback confidence"
-                                .to_string(),
-                        );
-                    }
-                    let locations: Vec<Location> = candidates
-                        .iter()
-                        .filter_map(|candidate| candidate_to_location(&root, candidate))
-                        .collect();
-                    perf.returned = locations.len();
-                    return Ok((locations, debug_lines, perf));
-                }
-
-                // Non-callable symbols retain the existing navigation policy,
-                // but their durable/live recall still comes through the same
-                // generation-pinned overlay boundary.
-                let records = service.non_callable_symbols(&word)?;
-                let non_callable_count = records.len();
-                let origin_record = records
-                    .iter()
-                    .find(|record| {
-                        record.path == current_rel
-                            && (record.start_line, record.start_col)
-                                <= (source_position.line, source_position.character)
-                            && (source_position.line, source_position.character)
-                                <= (record.end_line, record.end_col)
-                    })
-                    .cloned();
-                let candidates = query::rank_navigation_candidates_with_scope(
-                    records,
-                    &current_rel,
-                    service.effective_current_reach(),
-                    origin_record.as_ref(),
-                    project_context.as_deref(),
-                );
-                perf.include_non_callable_candidates(non_callable_count);
-                perf.query_us = query_started.elapsed().as_micros();
-                let debug_lines = candidate_reason_log_lines(&candidates, debug_reasons);
-                let locations: Vec<Location> = candidates
-                    .iter()
-                    .filter_map(|candidate| candidate_to_location(&root, candidate))
-                    .collect();
-                perf.returned = locations.len();
-                Ok((locations, debug_lines, perf))
-            },
-        )
-        .await;
-
-        let metrics = result
-            .as_ref()
-            .ok()
-            .and_then(|result| result.as_ref().ok().map(|(_, _, metrics)| *metrics))
-            .unwrap_or_default();
-        self.perf_log(|| metrics.log_line("definition", total_started.elapsed().as_micros()))
-            .await;
-
-        match self.unwrap_query("definition", result).await {
-            Some((locations, debug_lines, _)) if !locations.is_empty() => {
-                if !debug_lines.is_empty() {
-                    client
-                        .log_message(
-                            MessageType::INFO,
-                            format!(
-                                "FossilSense goto '{}': {} candidate(s) (tier/confidence/reason):",
-                                word_for_log,
-                                debug_lines.len()
-                            ),
-                        )
-                        .await;
-                    for line in debug_lines {
-                        client.log_message(MessageType::INFO, line).await;
-                    }
-                }
-                Ok(Some(GotoDefinitionResponse::Array(locations)))
-            }
-            _ => Ok(None),
-        }
+    async fn goto_declaration(
+        &self,
+        params: GotoDeclarationParams,
+    ) -> LspResult<Option<GotoDeclarationResponse>> {
+        self.navigate_symbol(params, NavigationOperation::Declaration)
+            .await
     }
 
     async fn references(&self, params: ReferenceParams) -> LspResult<Option<Vec<Location>>> {
@@ -750,9 +559,14 @@ impl LanguageServer for Backend {
                         .and_then(|rel| {
                             overlay
                                 .effective_reach_graph(context.engine.reach_graph.as_deref())
-                                .map(|graph| query::CompletionScope {
-                                    reach: graph.reachable(&rel).as_ref().clone(),
-                                    current_path: Some(rel),
+                                .map(|graph| {
+                                    let direct_external_files =
+                                        graph.directly_included_external_paths_from(&rel);
+                                    query::CompletionScope {
+                                        reach: graph.reachable(&rel).as_ref().clone(),
+                                        current_path: Some(rel),
+                                        direct_external_files,
+                                    }
                                 })
                         });
                 }
@@ -1120,6 +934,11 @@ impl LanguageServer for Backend {
                 return Ok(None);
             };
             Ok(self.rich_relations_command(arg).await)
+        } else if params.command == POSSIBLE_TARGETS_LSP_COMMAND {
+            let Some(arg) = params.arguments.first() else {
+                return Ok(None);
+            };
+            Ok(self.possible_targets_command(arg).await)
         } else if params.command == GROUPED_REFERENCES_LSP_COMMAND {
             // Role-grouped find-references: same cached search as the standard
             // `references` request, but the result carries each hit's role so

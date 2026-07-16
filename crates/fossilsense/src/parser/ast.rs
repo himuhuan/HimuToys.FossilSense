@@ -462,6 +462,8 @@ fn collect_parameter_bindings(
                 LocalBindingKind::Parameter,
                 function_start_byte,
                 function_end_byte,
+                function_start_byte,
+                function_end_byte,
                 out,
             );
             continue;
@@ -484,12 +486,16 @@ fn collect_local_variable_bindings(
     let mut stack = vec![body];
     while let Some(node) = stack.pop() {
         if node.kind() == "declaration" {
+            let (scope_start_byte, scope_end_byte) =
+                nearest_compound_scope(node, function_start_byte, function_end_byte);
             push_binding_declarators(
                 node,
                 source,
                 LocalBindingKind::LocalVariable,
                 function_start_byte,
                 function_end_byte,
+                scope_start_byte,
+                scope_end_byte,
                 out,
             );
             continue;
@@ -502,12 +508,15 @@ fn collect_local_variable_bindings(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_binding_declarators(
     declaration: tree_sitter::Node<'_>,
     source: &str,
     kind: LocalBindingKind,
     function_start_byte: usize,
     function_end_byte: usize,
+    scope_start_byte: usize,
+    scope_end_byte: usize,
     out: &mut Vec<LocalBinding>,
 ) {
     let type_text = binding_type_text(declaration, source);
@@ -521,9 +530,38 @@ fn push_binding_declarators(
                 decl_start_byte: id_node.start_byte(),
                 function_start_byte,
                 function_end_byte,
+                scope_start_byte,
+                scope_end_byte,
             });
         }
     }
+}
+
+fn nearest_compound_scope(
+    declaration: tree_sitter::Node<'_>,
+    function_start_byte: usize,
+    function_end_byte: usize,
+) -> (usize, usize) {
+    let mut parent = declaration.parent();
+    while let Some(node) = parent {
+        if node.kind() == "compound_statement" {
+            return (node.start_byte(), node.end_byte());
+        }
+        // Initializer/condition declarations belong to the control statement,
+        // not to the surrounding compound block. Declarations inside a braced
+        // body encounter that body's compound statement first.
+        if matches!(
+            node.kind(),
+            "for_statement" | "if_statement" | "switch_statement" | "while_statement"
+        ) {
+            return (node.start_byte(), node.end_byte());
+        }
+        if node.kind() == "function_definition" {
+            break;
+        }
+        parent = node.parent();
+    }
+    (function_start_byte, function_end_byte)
 }
 
 fn binding_type_text(node: tree_sitter::Node<'_>, source: &str) -> Option<String> {

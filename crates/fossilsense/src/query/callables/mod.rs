@@ -21,8 +21,12 @@ pub use arity::{
 };
 pub(crate) use counterpart::is_source_path;
 pub use counterpart::{resolve_counterparts, CounterpartEvidence};
+#[cfg(test)]
+pub use presentation::anchor_opposite_definition;
+#[cfg(test)]
+pub use presentation::call_declaration_presentations;
 pub use presentation::{
-    anchor_opposite_definition, call_definition_presentations, hover_presentations,
+    call_declaration_presentations_at, call_definition_presentations, hover_presentations,
     signature_active_index, signature_presentations,
 };
 
@@ -30,7 +34,7 @@ pub use presentation::{
 ///
 /// This is deliberately independent from the Call Relations wire protocol.
 #[allow(dead_code)] // Read by the release hardening gate and future relation cursors.
-pub const CALLABLE_CANDIDATE_RESOLVER_VERSION: u32 = 3;
+pub const CALLABLE_CANDIDATE_RESOLVER_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CandidateOrigin {
@@ -180,6 +184,9 @@ pub struct CallableQueryInput {
     pub shadowed_paths: HashSet<String>,
     pub call_context: Option<CallSiteContext>,
     pub source_reach: HashMap<String, ReachScope>,
+    /// Physical files proven to participate in the current translation unit.
+    /// Internal-linkage anchors outside this set are impossible bindings.
+    pub visible_internal_paths: HashSet<String>,
     pub coverage: CandidateCoverage,
 }
 
@@ -205,6 +212,14 @@ pub fn resolve_callable_candidates(input: CallableQueryInput) -> CallableCandida
             anchor.anchor.owner_kind,
             None | Some(OwnerKindHint::Namespace | OwnerKindHint::Unknown)
         )
+    });
+    anchors.retain(|anchor| match &anchor.anchor.linkage {
+        crate::call_model::LinkageDomain::Internal(_) => {
+            input.visible_internal_paths.contains(&anchor.anchor.path)
+        }
+        crate::call_model::LinkageDomain::External | crate::call_model::LinkageDomain::Unknown => {
+            true
+        }
     });
     // Defend the pure boundary too, even though the request facade normally
     // rejects these forms first. Otherwise a `widget.open()` name-only recall

@@ -102,12 +102,14 @@ fn fields_by_record_names_scoped(
 ) -> Vec<String> {
     let reach = crate::reachability::ReachScope {
         files: scope.clone(),
+        heuristic_files: Default::default(),
         open: false,
         reason: None,
     };
     let ctx = crate::resolver::ResolveContext {
         current_path: None,
         reach: Some(&reach),
+        direct_external_files: None,
     };
     let candidates = store
         .resolve_record_candidates(names, Some(&ctx))

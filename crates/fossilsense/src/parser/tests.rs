@@ -779,6 +779,52 @@ int main(void) {
 }
 
 #[test]
+fn c_file_scope_objects_distinguish_declaration_tentative_and_full_definition() {
+    let source = "extern int declared;\n\
+                  int tentative;\n\
+                  static int internal_tentative;\n\
+                  int full = 1;\n\
+                  extern int extern_full = 2;\n\
+                  int uncertain = };\n";
+    let index = parse(Path::new("objects.c"), source);
+
+    for (name, expected_role) in [
+        ("declared", SymbolRole::Declaration),
+        ("tentative", SymbolRole::TentativeDefinition),
+        ("internal_tentative", SymbolRole::TentativeDefinition),
+        ("full", SymbolRole::Definition),
+        ("extern_full", SymbolRole::Definition),
+        ("uncertain", SymbolRole::UnknownDeclarationOrDefinition),
+    ] {
+        let symbol = index
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == name && symbol.kind == SymbolKind::GlobalVariable)
+            .unwrap_or_else(|| panic!("missing object symbol {name}"));
+        assert_eq!(symbol.role, expected_role, "unexpected role for {name}");
+    }
+}
+
+#[test]
+fn cpp_file_scope_object_without_initializer_is_a_full_definition() {
+    let source = "extern int declared;\nint full;\nstatic int internal_full;\n";
+    let index = parse(Path::new("objects.cpp"), source);
+
+    let role = |name: &str| {
+        index
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == name && symbol.kind == SymbolKind::GlobalVariable)
+            .map(|symbol| symbol.role)
+            .unwrap_or_else(|| panic!("missing object symbol {name}"))
+    };
+
+    assert_eq!(role("declared"), SymbolRole::Declaration);
+    assert_eq!(role("full"), SymbolRole::Definition);
+    assert_eq!(role("internal_full"), SymbolRole::Definition);
+}
+
+#[test]
 fn leading_comments_do_not_pollute_symbol_signature_or_start_line() {
     let source = "#define VALUE 1\n/// @brief Helps the smoke test.\nvoid helper(void);\n";
     let index = parse(Path::new("defs.h"), source);
@@ -917,7 +963,7 @@ fn lexical_fallback_product_has_lexical_facts_and_no_ast() {
     // from a clean parse by `fallback_used` / `ast_source`.
     let source = "#include \"x.h\"\n#define Z 9\n";
     let ls = super::line_starts(source);
-    let (symbols, includes) = super::extract_symbols_and_includes(source, &ls);
+    let (symbols, includes) = super::extract_symbols_and_includes(source, &ls, false);
     let index = super::lexical_fallback(symbols, includes);
     assert!(index.diagnostics.fallback_used);
     assert_eq!(
@@ -1399,7 +1445,8 @@ fn availability_distinguishes_empty_skipped_and_fallback_ast_vectors() {
 
     let fallback_source = "#include \"x.h\"\n#define ONLY_LEXICAL 1\n";
     let line_starts = super::line_starts(fallback_source);
-    let (symbols, includes) = super::extract_symbols_and_includes(fallback_source, &line_starts);
+    let (symbols, includes) =
+        super::extract_symbols_and_includes(fallback_source, &line_starts, false);
     let fallback = super::lexical_fallback_with_facts(symbols, includes, ParseFacts::ALL);
     assert!(fallback.records.is_empty());
     assert!(fallback.members.is_empty());
@@ -1425,7 +1472,8 @@ fn availability_distinguishes_empty_skipped_and_fallback_ast_vectors() {
         FactAvailability::Unavailable(FactUnavailableReason::LexicalFallback)
     );
 
-    let (symbols, includes) = super::extract_symbols_and_includes(fallback_source, &line_starts);
+    let (symbols, includes) =
+        super::extract_symbols_and_includes(fallback_source, &line_starts, false);
     let fallback_index = super::lexical_fallback_with_facts(symbols, includes, ParseFacts::INDEX);
     assert_eq!(
         fallback_index.fact_availability(FactGroup::Occurrences),
@@ -1446,7 +1494,7 @@ fn availability_distinguishes_empty_skipped_and_fallback_ast_vectors() {
 }
 
 #[test]
-fn callable_full_signatures_are_body_and_whitespace_independent_but_keep_parameter_names() {
+fn c_callable_identity_ignores_parameter_names_extern_body_and_whitespace() {
     let declaration = parse(
         Path::new("api.h"),
         "extern int lookup ( int key , const char * value );\n",
@@ -1479,7 +1527,10 @@ fn callable_full_signatures_are_body_and_whitespace_independent_but_keep_paramet
         declaration.canonical_signature,
         definition.canonical_signature
     );
-    assert_ne!(definition.canonical_signature, renamed.canonical_signature);
+    assert_eq!(definition.canonical_signature, renamed.canonical_signature);
+    assert!(!definition.canonical_signature.contains("extern"));
+    assert!(!definition.canonical_signature.contains("key"));
+    assert!(!definition.canonical_signature.contains("table"));
     assert!(declaration.presentation_signature.ends_with(';'));
     assert!(!definition.presentation_signature.contains("return key"));
     assert!(!definition.presentation_signature.contains('{'));
@@ -1492,6 +1543,49 @@ fn callable_full_signatures_are_body_and_whitespace_independent_but_keep_paramet
             [definition.declaration_range.start_byte..definition.declaration_range.end_byte],
         definition.presentation_signature
     );
+}
+
+#[test]
+fn c_callable_identity_still_rejects_incompatible_parameter_types() {
+    let int_anchor = parse(Path::new("api.h"), "extern int lookup(int value);\n")
+        .callable_anchors
+        .into_iter()
+        .find(|anchor| anchor.name == "lookup")
+        .expect("int anchor");
+    let long_anchor = parse(Path::new("api.c"), "int lookup(long value) { return 0; }\n")
+        .callable_anchors
+        .into_iter()
+        .find(|anchor| anchor.name == "lookup")
+        .expect("long anchor");
+
+    assert_ne!(
+        int_anchor.canonical_signature,
+        long_anchor.canonical_signature
+    );
+}
+
+#[test]
+fn c_callable_identity_ignores_nested_function_pointer_parameter_names() {
+    let declaration = parse(Path::new("api.h"), "int visit(int (*callback)(int));\n")
+        .callable_anchors
+        .into_iter()
+        .find(|anchor| anchor.name == "visit")
+        .expect("declaration anchor");
+    let definition = parse(
+        Path::new("api.c"),
+        "int visit(int (*fn)(int value)) { return fn(value); }\n",
+    )
+    .callable_anchors
+    .into_iter()
+    .find(|anchor| anchor.name == "visit")
+    .expect("definition anchor");
+
+    assert_eq!(
+        declaration.canonical_signature,
+        definition.canonical_signature
+    );
+    assert!(!definition.canonical_signature.contains("fn"));
+    assert!(!definition.canonical_signature.contains("value"));
 }
 
 #[test]

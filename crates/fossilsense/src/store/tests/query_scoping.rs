@@ -35,12 +35,14 @@ fn test_query_and_server_scoping() {
     let reach_set1: HashSet<String> = vec!["reach1.h".to_string()].into_iter().collect();
     let reach_scope1 = crate::reachability::ReachScope {
         files: reach_set1,
+        heuristic_files: Default::default(),
         open: false,
         reason: None,
     };
     let ctx1 = crate::resolver::ResolveContext {
         current_path: None,
         reach: Some(&reach_scope1),
+        direct_external_files: None,
     };
 
     let candidates1 = store
@@ -68,12 +70,14 @@ fn test_query_and_server_scoping() {
     let reach_set2: HashSet<String> = vec!["reach2.h".to_string()].into_iter().collect();
     let reach_scope2 = crate::reachability::ReachScope {
         files: reach_set2,
+        heuristic_files: Default::default(),
         open: false,
         reason: None,
     };
     let ctx2 = crate::resolver::ResolveContext {
         current_path: None,
         reach: Some(&reach_scope2),
+        direct_external_files: None,
     };
 
     let candidates2 = store
@@ -166,12 +170,14 @@ fn open_scope_softens_but_keeps_record_and_field_candidates() {
     // Open scope reaching neither header (e.g. opened by an ambiguous include).
     let reach = crate::reachability::ReachScope {
         files: HashSet::new(),
+        heuristic_files: Default::default(),
         open: true,
         reason: Some(crate::reachability::OpenReason::AmbiguousInclude),
     };
     let ctx = crate::resolver::ResolveContext {
         current_path: None,
         reach: Some(&reach),
+        direct_external_files: None,
     };
 
     // Record candidates soften to Unknown, but both stay (not emptied).

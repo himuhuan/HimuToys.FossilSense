@@ -362,6 +362,13 @@ fn lsp_smoke_completion_definition_and_references() -> Result<()> {
             .and_then(Value::as_bool),
         Some(true)
     );
+    assert_eq!(
+        initialized
+            .get("capabilities")
+            .and_then(|capabilities| capabilities.get("declarationProvider"))
+            .and_then(Value::as_bool),
+        Some(true)
+    );
 
     lsp.notify("initialized", json!({}))?;
     let ready = lsp.wait_index_ready(Duration::from_secs(30))?;
@@ -565,15 +572,33 @@ fn lsp_smoke_completion_definition_and_references() -> Result<()> {
     assert_eq!(
         source_locations.len(),
         1,
-        "source anchor should expose only its proven header counterpart, got {source_jump}"
+        "source definition should stay unique"
     );
     assert_eq!(
         source_locations
             .first()
             .and_then(|location| location.get("uri"))
             .and_then(Value::as_str),
+        Some(ops_source_uri.as_str()),
+        "Definition on a source definition must remain on the implementation"
+    );
+
+    let source_declaration_id = lsp.request(
+        "textDocument/declaration",
+        json!({
+            "textDocument": { "uri": ops_source_uri },
+            "position": { "line": 1, "character": 6 }
+        }),
+    )?;
+    let source_declaration = lsp.wait_response(source_declaration_id, Duration::from_secs(10))?;
+    assert_eq!(
+        source_declaration
+            .as_array()
+            .and_then(|locations| locations.first())
+            .and_then(|location| location.get("uri"))
+            .and_then(Value::as_str),
         Some(ops_header_uri.as_str()),
-        "goto on source definition should return the paired header declaration"
+        "Declaration on a source definition should return the paired header"
     );
 
     let header_jump_id = lsp.request(
@@ -590,7 +615,7 @@ fn lsp_smoke_completion_definition_and_references() -> Result<()> {
     assert_eq!(
         header_locations.len(),
         1,
-        "header anchor should expose only its proven source counterpart, got {header_jump}"
+        "header Definition should expose its proven implementation, got {header_jump}"
     );
     assert_eq!(
         header_locations
@@ -599,6 +624,24 @@ fn lsp_smoke_completion_definition_and_references() -> Result<()> {
             .and_then(Value::as_str),
         Some(ops_source_uri.as_str()),
         "goto on header declaration should return the paired source definition"
+    );
+
+    let header_declaration_id = lsp.request(
+        "textDocument/declaration",
+        json!({
+            "textDocument": { "uri": ops_header_uri },
+            "position": { "line": 1, "character": 6 }
+        }),
+    )?;
+    let header_declaration = lsp.wait_response(header_declaration_id, Duration::from_secs(10))?;
+    assert_eq!(
+        header_declaration
+            .as_array()
+            .and_then(|locations| locations.first())
+            .and_then(|location| location.get("uri"))
+            .and_then(Value::as_str),
+        Some(ops_header_uri.as_str()),
+        "Declaration on a header declaration should stay on that declaration"
     );
 
     let call_jump_id = lsp.request(
@@ -617,6 +660,24 @@ fn lsp_smoke_completion_definition_and_references() -> Result<()> {
             .and_then(Value::as_str),
         Some(ops_source_uri.as_str()),
         "goto from an ordinary call site should keep the source definition first"
+    );
+
+    let call_declaration_id = lsp.request(
+        "textDocument/declaration",
+        json!({
+            "textDocument": { "uri": ops_source_uri },
+            "position": { "line": 2, "character": 28 }
+        }),
+    )?;
+    let call_declaration = lsp.wait_response(call_declaration_id, Duration::from_secs(10))?;
+    assert_eq!(
+        call_declaration
+            .as_array()
+            .and_then(|locations| locations.first())
+            .and_then(|location| location.get("uri"))
+            .and_then(Value::as_str),
+        Some(ops_header_uri.as_str()),
+        "Declaration from a call site should return the visible header prototype"
     );
 
     let complete_line = arity_source

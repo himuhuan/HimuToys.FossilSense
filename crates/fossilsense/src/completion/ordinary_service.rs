@@ -22,6 +22,11 @@ use providers::{
 
 type OrdinaryPipelineCandidate = PipelineCandidate<OrdinaryCompletionPresentation>;
 
+/// A closed primary stage with this many distinct visible names is useful
+/// enough to hide workspace/heuristic rescue rows from the default list. A
+/// smaller result still admits rescue automatically.
+const PRIMARY_COMPLETION_SUFFICIENCY: usize = 8;
+
 #[derive(Clone)]
 pub(crate) struct OrdinaryCompletionInput {
     pub prefix: String,
@@ -118,13 +123,19 @@ pub(crate) fn complete_ordinary_identifier(
             query::CompletionRecallQuotas::default_for_completion_limit(input.limit)
         };
         let prior = input.prior_pools.get(idx).and_then(|pool| pool.as_deref());
-        let (hits, pool, metrics) = table.table.search_completion_recall_pooled_with_project(
+        let (mut hits, pool, metrics) = table.table.search_completion_recall_pooled_with_project(
             &input.prefix,
             quotas,
             input.scope.as_ref(),
             table_project_context,
             prior,
         );
+        if input.parsed_document.is_some() {
+            // The parsed current-document overlay below is source-order aware.
+            // Suppress the positionless durable `Current` projection so a
+            // declaration after the cursor cannot regain the strongest tier.
+            hits.retain(|hit| hit.tier != model::ScopeTier::Current);
+        }
         recall_channels.merge_from(metrics);
         new_pools.push(pool);
         candidates.extend(completion_items_for_indexed_hits(
@@ -232,6 +243,8 @@ pub(crate) fn complete_ordinary_identifier(
         ));
     }
 
+    suppress_rescue_when_primary_is_sufficient(&mut candidates, input.scope.as_ref(), input.limit);
+
     let recall_ms = recall_started.elapsed().as_millis();
     let merge_rank_started = std::time::Instant::now();
     let mut output = super::run_evidence_aware_pipeline_with_context(
@@ -274,6 +287,51 @@ pub(crate) fn complete_ordinary_identifier(
     }
 }
 
+fn suppress_rescue_when_primary_is_sufficient(
+    candidates: &mut Vec<OrdinaryPipelineCandidate>,
+    scope: Option<&query::CompletionScope>,
+    limit: usize,
+) {
+    if scope.is_none_or(|scope| scope.reach.open) {
+        return;
+    }
+    let required = PRIMARY_COMPLETION_SUFFICIENCY.min(limit);
+    if required == 0 {
+        return;
+    }
+    let primary_names: HashSet<&str> = candidates
+        .iter()
+        .filter(|candidate| is_primary_completion_evidence(candidate.evidence))
+        .map(|candidate| candidate.name.as_str())
+        .collect();
+    if primary_names.len() < required {
+        return;
+    }
+    candidates.retain(|candidate| !is_rescue_completion_evidence(candidate.evidence));
+}
+
+fn is_primary_completion_evidence(evidence: CandidateEvidence) -> bool {
+    match evidence.primary_source {
+        CandidateSource::LocalBinding
+        | CandidateSource::CurrentFileOverlay
+        | CandidateSource::LanguageBuiltin => true,
+        CandidateSource::Indexed => matches!(
+            evidence.tier,
+            model::ScopeTier::Current | model::ScopeTier::Reachable | model::ScopeTier::External
+        ),
+        CandidateSource::LocalWord => false,
+    }
+}
+
+fn is_rescue_completion_evidence(evidence: CandidateEvidence) -> bool {
+    evidence.primary_source == CandidateSource::LocalWord
+        || (evidence.primary_source == CandidateSource::Indexed
+            && matches!(
+                evidence.tier,
+                model::ScopeTier::Unknown | model::ScopeTier::Global
+            ))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -287,10 +345,12 @@ mod tests {
     use crate::project_context::{ProjectContext, ProjectContextIndex, ProjectKey};
     use crate::query::{CompletionScope, NameTable, COMPLETION_LIMIT, COMPLETION_LOCALITY_BONUS};
     use crate::reachability::{OpenReason, ReachScope};
+    use crate::store::views::NameTableSymbolRow;
 
     use super::{
-        complete_ordinary_identifier, OrdinaryCompletionInput, OrdinaryCompletionKind,
-        OrdinaryCompletionNameTable,
+        complete_ordinary_identifier, OrdinaryCompletionDocumentationTarget,
+        OrdinaryCompletionInput, OrdinaryCompletionKind, OrdinaryCompletionNameTable,
+        PRIMARY_COMPLETION_SUFFICIENCY,
     };
 
     fn text_and_position(marked: &str) -> (String, u32, u32) {
@@ -305,6 +365,71 @@ mod tests {
             .map(|ch| ch.len_utf16() as u32)
             .sum();
         (text, line, character)
+    }
+
+    fn indexed_duplicate_winner(rows: Vec<NameTableSymbolRow>) -> (i64, parser::SymbolRole) {
+        let output = complete_ordinary_identifier(OrdinaryCompletionInput {
+            prefix: "shared_api".to_string(),
+            text: Arc::from("shared_api"),
+            line: 0,
+            character: 10,
+            parsed_document: None,
+            local_words: Arc::new(HashSet::new()),
+            tables: vec![OrdinaryCompletionNameTable {
+                table: Arc::new(NameTable::build_from_rows_with_project_context(rows, None)),
+            }],
+            scope: None,
+            active_project_context: None,
+            prior_pools: vec![None],
+            intent: CompletionIntent::default(),
+            history_enabled: false,
+            history: CompletionHistorySnapshot::default(),
+            prefix_bucket: "shared_api".to_string(),
+            prefix_ranking: CompletionPrefixRanking::Strict,
+            limit: 10,
+            locality_bonus: COMPLETION_LOCALITY_BONUS,
+        });
+        assert_eq!(output.items.len(), 1);
+        let item = &output.items[0];
+        let symbol_id = match item.documentation_target {
+            Some(OrdinaryCompletionDocumentationTarget::Indexed { symbol_id, .. }) => symbol_id,
+            ref other => panic!("expected indexed documentation target, got {other:?}"),
+        };
+        (symbol_id, item.evidence.role.expect("indexed role"))
+    }
+
+    #[test]
+    fn indexed_header_declaration_stably_wins_over_source_definition() {
+        let header = NameTableSymbolRow {
+            symbol_id: 11,
+            id: 11,
+            label: "shared_api".to_string(),
+            external: false,
+            path: "include/shared.h".to_string(),
+            kind: "function".to_string(),
+            role: "declaration".to_string(),
+            directly_included: false,
+        };
+        let source = NameTableSymbolRow {
+            symbol_id: 22,
+            id: 22,
+            label: "shared_api".to_string(),
+            external: false,
+            path: "src/shared.c".to_string(),
+            kind: "function".to_string(),
+            role: "definition".to_string(),
+            directly_included: false,
+        };
+
+        for rows in [
+            vec![source.clone(), header.clone()],
+            vec![header.clone(), source.clone()],
+        ] {
+            assert_eq!(
+                indexed_duplicate_winner(rows),
+                (11, parser::SymbolRole::Declaration)
+            );
+        }
     }
 
     #[test]
@@ -357,8 +482,10 @@ mod tests {
         ]));
         let scope = CompletionScope {
             current_path: Some("src/main.c".to_string()),
+            direct_external_files: HashSet::from(["sdk/external.h".to_string()]),
             reach: ReachScope {
                 files: HashSet::from(["src/main.c".to_string(), "reachable.h".to_string()]),
+                heuristic_files: Default::default(),
                 open: true,
                 reason: Some(OpenReason::AmbiguousInclude),
             },
@@ -469,6 +596,124 @@ mod tests {
         assert!(output.items.is_empty());
         assert_eq!(output.metrics.input_total, 0);
         assert_eq!(output.metrics.returned_total, 0);
+    }
+
+    #[test]
+    fn closed_sufficient_primary_stage_hides_rescue_but_open_scope_restores_it() {
+        let mut rows = (0..PRIMARY_COMPLETION_SUFFICIENCY)
+            .map(|index| {
+                (
+                    index as i64,
+                    format!("api_visible_{index}"),
+                    false,
+                    "api.h".to_string(),
+                    "function".to_string(),
+                    false,
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.push((
+            100,
+            "api_workspace_fallback".to_string(),
+            false,
+            "other.c".to_string(),
+            "function".to_string(),
+            false,
+        ));
+        let table = Arc::new(NameTable::build_with_paths(rows));
+
+        let complete = |open| {
+            complete_ordinary_identifier(OrdinaryCompletionInput {
+                prefix: "api".to_string(),
+                text: Arc::from("api"),
+                line: 0,
+                character: 3,
+                parsed_document: None,
+                local_words: Arc::new(HashSet::new()),
+                tables: vec![OrdinaryCompletionNameTable {
+                    table: table.clone(),
+                }],
+                scope: Some(CompletionScope {
+                    current_path: Some("main.c".to_string()),
+                    direct_external_files: HashSet::new(),
+                    reach: ReachScope {
+                        files: HashSet::from(["main.c".to_string(), "api.h".to_string()]),
+                        heuristic_files: HashSet::new(),
+                        open,
+                        reason: open.then_some(OpenReason::UnresolvedInclude),
+                    },
+                }),
+                active_project_context: None,
+                prior_pools: vec![None],
+                intent: CompletionIntent::default(),
+                history_enabled: false,
+                history: CompletionHistorySnapshot::default(),
+                prefix_bucket: "api".to_string(),
+                prefix_ranking: CompletionPrefixRanking::Strict,
+                limit: COMPLETION_LIMIT,
+                locality_bonus: COMPLETION_LOCALITY_BONUS,
+            })
+        };
+
+        let closed = complete(false);
+        assert!(closed
+            .items
+            .iter()
+            .all(|item| item.label != "api_workspace_fallback"));
+        let open = complete(true);
+        assert!(open
+            .items
+            .iter()
+            .any(|item| item.label == "api_workspace_fallback"));
+    }
+
+    #[test]
+    fn current_file_index_does_not_reintroduce_a_declaration_after_the_cursor() {
+        let (text, line, character) = text_and_position(
+            "void f(void) { fs/*cursor*/; }\n\
+             int fs_later(void);\n",
+        );
+        let parsed = Arc::new(parser::parse(&PathBuf::from("src/main.c"), &text));
+        let table = Arc::new(NameTable::build_with_paths(vec![(
+            1,
+            "fs_later".to_string(),
+            false,
+            "src/main.c".to_string(),
+            "function".to_string(),
+            false,
+        )]));
+        let scope = CompletionScope {
+            current_path: Some("src/main.c".to_string()),
+            direct_external_files: Default::default(),
+            reach: ReachScope {
+                files: HashSet::from(["src/main.c".to_string()]),
+                heuristic_files: HashSet::new(),
+                open: false,
+                reason: None,
+            },
+        };
+
+        let output = complete_ordinary_identifier(OrdinaryCompletionInput {
+            prefix: "fs".to_string(),
+            text: text.into(),
+            line,
+            character,
+            parsed_document: Some(parsed),
+            local_words: Arc::new(HashSet::new()),
+            tables: vec![OrdinaryCompletionNameTable { table }],
+            scope: Some(scope),
+            active_project_context: None,
+            prior_pools: vec![None],
+            intent: CompletionIntent::default(),
+            history_enabled: false,
+            history: CompletionHistorySnapshot::default(),
+            prefix_bucket: "fs".to_string(),
+            prefix_ranking: CompletionPrefixRanking::Strict,
+            limit: COMPLETION_LIMIT,
+            locality_bonus: COMPLETION_LOCALITY_BONUS,
+        });
+
+        assert!(output.items.iter().all(|item| item.label != "fs_later"));
     }
 
     #[test]
@@ -684,8 +929,10 @@ mod tests {
             }],
             scope: Some(CompletionScope {
                 current_path: Some("a.c".to_string()),
+                direct_external_files: Default::default(),
                 reach: ReachScope {
                     files: HashSet::from(["a.c".to_string()]),
+                    heuristic_files: Default::default(),
                     open: false,
                     reason: None,
                 },
@@ -1031,11 +1278,13 @@ mod tests {
             Some(library_key),
             Some(CompletionScope {
                 current_path: Some("https/server/src/server.c".to_string()),
+                direct_external_files: Default::default(),
                 reach: ReachScope {
                     files: HashSet::from([
                         "https/server/src/server.c".to_string(),
                         "https/server/src/server.h".to_string(),
                     ]),
+                    heuristic_files: Default::default(),
                     open: false,
                     reason: None,
                 },

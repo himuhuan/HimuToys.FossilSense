@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use crate::includes::ResolutionKind;
 use crate::store::views::{IncludeEdgeRow, OpenIncludeRow};
 
 /// Maximum include depth followed before a reachable set is declared "open".
@@ -44,14 +45,42 @@ pub enum OpenReason {
 /// determinate scope keeps `open = false, reason = None`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReachScope {
-    /// Reachable file paths, including the start file itself.
+    /// File paths reached only through exact-resolution edges, including the
+    /// start file itself.
     pub files: HashSet<String>,
+    /// File paths whose best known path crosses at least one suffix-match edge.
+    /// These are recall hints, not compiler-level reachability proof.
+    pub heuristic_files: HashSet<String>,
     /// True when reachability could not be proven complete.
     pub open: bool,
     /// The first cause that opened the scope; `None` when the scope is
     /// determinate. Stable for a given graph generation (BFS visits in a fixed
     /// order).
     pub reason: Option<OpenReason>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReachEdge {
+    target: String,
+    resolution: ResolutionKind,
+}
+
+fn is_strong_resolution(resolution: ResolutionKind) -> bool {
+    matches!(
+        resolution,
+        ResolutionKind::RelativeExact
+            | ResolutionKind::WorkspaceExact
+            | ResolutionKind::ExternalExact
+    )
+}
+
+#[cfg(test)]
+fn legacy_strong_resolution(target: &str) -> ResolutionKind {
+    if Path::new(target).is_absolute() {
+        ResolutionKind::ExternalExact
+    } else {
+        ResolutionKind::WorkspaceExact
+    }
 }
 
 /// In-memory file-to-file include graph with a memoized reachable-set cache.
@@ -63,7 +92,7 @@ pub struct ReachScope {
 /// holding an older engine snapshot cannot observe a mixed generation.
 #[derive(Debug)]
 pub struct ReachGraph {
-    edges: HashMap<String, Vec<String>>,
+    edges: HashMap<String, Vec<ReachEdge>>,
     /// First-cause `OpenReason` for every "open" node (an empty set means a
     /// determinate closure). A node that is both unresolved and ambiguous is
     /// stored once, under `UnresolvedInclude`, per the documented precedence.
@@ -77,14 +106,39 @@ impl ReachGraph {
     /// least one ambiguous (multi-hit, no exact-tier winner) `#include`. A node
     /// present in both lists is recorded under `UnresolvedInclude` (the
     /// stronger statement of incompleteness).
+    #[cfg(test)]
     pub fn new(
         edge_pairs: Vec<(String, String)>,
         unresolved_files: Vec<String>,
         ambiguous_files: Vec<String>,
     ) -> Self {
-        let mut edges: HashMap<String, Vec<String>> = HashMap::new();
-        for (src, dst) in edge_pairs {
-            edges.entry(src).or_default().push(dst);
+        Self::new_with_kinds(
+            edge_pairs
+                .into_iter()
+                .map(|(src, dst)| {
+                    let resolution = legacy_strong_resolution(&dst);
+                    (src, dst, resolution)
+                })
+                .collect(),
+            unresolved_files,
+            ambiguous_files,
+        )
+    }
+
+    /// Build from resolution-aware edges. The legacy [`ReachGraph::new`]
+    /// constructor remains a strong-edge compatibility entry point for tests
+    /// and callers that already proved their pairs elsewhere.
+    pub(crate) fn new_with_kinds(
+        edge_rows: Vec<(String, String, ResolutionKind)>,
+        unresolved_files: Vec<String>,
+        ambiguous_files: Vec<String>,
+    ) -> Self {
+        let mut edges: HashMap<String, Vec<ReachEdge>> = HashMap::new();
+        for (src, dst, resolution) in edge_rows {
+            edges.entry(src).or_default().push(ReachEdge {
+                target: dst,
+                resolution,
+            });
         }
         let mut open: HashMap<String, OpenReason> = HashMap::new();
         for path in ambiguous_files {
@@ -106,9 +160,9 @@ impl ReachGraph {
         unresolved_rows: Vec<OpenIncludeRow>,
         ambiguous_rows: Vec<OpenIncludeRow>,
     ) -> Self {
-        let edge_pairs = edge_rows
+        let edges = edge_rows
             .into_iter()
-            .map(|row| (row.source_path, row.target_path))
+            .map(|row| (row.source_path, row.target_path, row.resolution))
             .collect();
         let unresolved_files = unresolved_rows
             .into_iter()
@@ -118,7 +172,7 @@ impl ReachGraph {
             .into_iter()
             .map(|row| row.source_path)
             .collect();
-        Self::new(edge_pairs, unresolved_files, ambiguous_files)
+        Self::new_with_kinds(edges, unresolved_files, ambiguous_files)
     }
 
     /// Replace the out-edges and open flags for the given source paths, clearing
@@ -131,10 +185,30 @@ impl ReachGraph {
     /// existing edge originating at one of `sources` is removed before the new
     /// edges are added. `open` are `(src, OpenReason)` pairs for sources whose
     /// open status changed; a source not listed here has its open flag removed.
+    #[cfg(test)]
     pub fn refresh_sources(
         &mut self,
         sources: &[String],
         edges: Vec<(String, String)>,
+        open: Vec<(String, crate::reachability::OpenReason)>,
+    ) {
+        self.refresh_sources_with_kinds(
+            sources,
+            edges
+                .into_iter()
+                .map(|(src, dst)| {
+                    let resolution = legacy_strong_resolution(&dst);
+                    (src, dst, resolution)
+                })
+                .collect(),
+            open,
+        );
+    }
+
+    pub(crate) fn refresh_sources_with_kinds(
+        &mut self,
+        sources: &[String],
+        edges: Vec<(String, String, ResolutionKind)>,
         open: Vec<(String, crate::reachability::OpenReason)>,
     ) {
         // Remove stale out-edges for the refreshed sources.
@@ -144,8 +218,11 @@ impl ReachGraph {
         }
 
         // Insert new edges.
-        for (src, dst) in edges {
-            self.edges.entry(src).or_default().push(dst);
+        for (src, dst, resolution) in edges {
+            self.edges.entry(src).or_default().push(ReachEdge {
+                target: dst,
+                resolution,
+            });
         }
 
         // Apply open flags with UnresolvedInclude > AmbiguousInclude precedence.
@@ -176,11 +253,11 @@ impl ReachGraph {
         edges: Vec<IncludeEdgeRow>,
         open: Vec<OpenIncludeRow>,
     ) {
-        self.refresh_sources(
+        self.refresh_sources_with_kinds(
             sources,
             edges
                 .into_iter()
-                .map(|row| (row.source_path, row.target_path))
+                .map(|row| (row.source_path, row.target_path, row.resolution))
                 .collect(),
             open.into_iter()
                 .map(|row| (row.source_path, row.reason))
@@ -207,12 +284,11 @@ impl ReachGraph {
         next
     }
 
-    /// Create a request-local immutable graph by replacing source-scoped
-    /// edges/open flags that were resolved from dirty document snapshots.
-    pub fn with_refreshed_sources(
+    /// Resolution-aware request-local refresh used by dirty document overlays.
+    pub(crate) fn with_refreshed_sources_with_kinds(
         &self,
         sources: &[String],
-        edges: Vec<(String, String)>,
+        edges: Vec<(String, String, ResolutionKind)>,
         open: Vec<(String, OpenReason)>,
     ) -> Self {
         let mut next = Self {
@@ -220,7 +296,7 @@ impl ReachGraph {
             open: self.open.clone(),
             cache: Mutex::new(HashMap::new()),
         };
-        next.refresh_sources(sources, edges, open);
+        next.refresh_sources_with_kinds(sources, edges, open);
         next
     }
 
@@ -247,26 +323,59 @@ impl ReachGraph {
             .iter()
             .filter(|(source, _)| !Path::new(source.as_str()).is_absolute())
             .flat_map(|(_, targets)| targets)
-            .filter(|target| Path::new(target.as_str()).is_absolute())
-            .cloned()
+            .filter(|edge| {
+                edge.resolution == ResolutionKind::ExternalExact
+                    && Path::new(edge.target.as_str()).is_absolute()
+            })
+            .map(|edge| edge.target.clone())
             .collect()
     }
 
-    /// Test one external path against the request-local graph. Exact-name
-    /// candidate queries are strictly bounded, so this avoids materializing a
-    /// workspace-wide set for each such request while still replacing stale
-    /// durable first-layer evidence after a dirty include edit.
-    pub(crate) fn directly_includes_external(&self, target: &str) -> bool {
+    /// Workspace-wide projection retained for the legacy completion name-table
+    /// overlay. Request-scoped candidate resolution must use
+    /// [`ReachGraph::directly_includes_external`] instead.
+    pub(crate) fn any_workspace_directly_includes_external(&self, target: &str) -> bool {
         Path::new(target).is_absolute()
             && self.edges.iter().any(|(source, targets)| {
-                !Path::new(source).is_absolute()
-                    && targets.iter().any(|candidate| candidate == target)
+                !Path::new(source.as_str()).is_absolute()
+                    && targets.iter().any(|edge| {
+                        edge.target == target && edge.resolution == ResolutionKind::ExternalExact
+                    })
             })
+    }
+
+    /// Test origin-specific first-layer external include evidence. Only a
+    /// direct `ExternalExact` edge is strong enough; another workspace source
+    /// including the same target must not affect this request.
+    pub(crate) fn directly_includes_external(&self, source: &str, target: &str) -> bool {
+        Path::new(target).is_absolute()
+            && self.edges.get(source).is_some_and(|targets| {
+                targets.iter().any(|edge| {
+                    edge.target == target && edge.resolution == ResolutionKind::ExternalExact
+                })
+            })
+    }
+
+    /// Strong direct external targets for one request origin. This is the
+    /// completion/coloring counterpart to [`Self::directly_includes_external`]
+    /// and deliberately does not project evidence from other workspace files.
+    pub(crate) fn directly_included_external_paths_from(&self, source: &str) -> HashSet<String> {
+        self.edges
+            .get(source)
+            .into_iter()
+            .flatten()
+            .filter(|edge| {
+                edge.resolution == ResolutionKind::ExternalExact
+                    && Path::new(&edge.target).is_absolute()
+            })
+            .map(|edge| edge.target.clone())
+            .collect()
     }
 
     fn compute(&self, start: &str) -> ReachScope {
         let mut files = HashSet::new();
         files.insert(start.to_string());
+        let mut heuristic_files = HashSet::new();
         let mut open = false;
         let mut reason: Option<OpenReason> = None;
 
@@ -287,9 +396,9 @@ impl ReachGraph {
             }
         };
 
-        let mut queue: VecDeque<(String, usize)> = VecDeque::new();
-        queue.push_back((start.to_string(), 0));
-        while let Some((node, depth)) = queue.pop_front() {
+        let mut queue: VecDeque<(String, usize, bool)> = VecDeque::new();
+        queue.push_back((start.to_string(), 0, false));
+        while let Some((node, depth, path_is_heuristic)) = queue.pop_front() {
             if depth >= MAX_REACH_DEPTH {
                 // Stop descending; we cannot prove what lies deeper.
                 mark_open(&mut open, OpenReason::DepthLimit, &mut reason);
@@ -298,22 +407,34 @@ impl ReachGraph {
             let Some(dsts) = self.edges.get(&node) else {
                 continue;
             };
-            for dst in dsts {
-                if files.len() >= MAX_REACH_NODES {
+            for edge in dsts {
+                let next_is_heuristic = path_is_heuristic || !is_strong_resolution(edge.resolution);
+                let is_new_node =
+                    !files.contains(&edge.target) && !heuristic_files.contains(&edge.target);
+                if is_new_node && files.len() + heuristic_files.len() >= MAX_REACH_NODES {
                     mark_open(&mut open, OpenReason::NodeLimit, &mut reason);
                     break;
                 }
-                if files.insert(dst.clone()) {
-                    if let Some(cause) = self.open.get(dst) {
+                let inserted = if next_is_heuristic {
+                    !files.contains(&edge.target) && heuristic_files.insert(edge.target.clone())
+                } else if files.insert(edge.target.clone()) {
+                    heuristic_files.remove(&edge.target);
+                    true
+                } else {
+                    false
+                };
+                if inserted {
+                    if let Some(cause) = self.open.get(&edge.target) {
                         mark_open(&mut open, *cause, &mut reason);
                     }
-                    queue.push_back((dst.clone(), depth + 1));
+                    queue.push_back((edge.target.clone(), depth + 1, next_is_heuristic));
                 }
             }
         }
 
         ReachScope {
             files,
+            heuristic_files,
             open,
             reason,
         }
@@ -340,10 +461,18 @@ mod tests {
     fn direct_external_projection_only_counts_workspace_first_layer_edges() {
         let direct = absolute_test_path("direct.h");
         let transitive = absolute_test_path("transitive.h");
-        let graph = ReachGraph::new(
+        let graph = ReachGraph::new_with_kinds(
             vec![
-                ("main.c".into(), direct.clone()),
-                (direct.clone(), transitive.clone()),
+                (
+                    "main.c".into(),
+                    direct.clone(),
+                    ResolutionKind::ExternalExact,
+                ),
+                (
+                    direct.clone(),
+                    transitive.clone(),
+                    ResolutionKind::ExternalExact,
+                ),
             ],
             vec![],
             vec![],
@@ -353,9 +482,33 @@ mod tests {
             graph.directly_included_external_paths(),
             HashSet::from([direct.clone()])
         );
-        assert!(graph.directly_includes_external(&direct));
-        assert!(!graph.directly_includes_external(&transitive));
-        assert!(!graph.directly_includes_external("workspace/header.h"));
+        assert!(graph.directly_includes_external("main.c", &direct));
+        assert!(!graph.directly_includes_external("other.c", &direct));
+        assert!(!graph.directly_includes_external("main.c", &transitive));
+        assert!(!graph.directly_includes_external("main.c", "workspace/header.h"));
+        assert_eq!(
+            graph.directly_included_external_paths_from("main.c"),
+            HashSet::from([direct])
+        );
+        assert!(graph
+            .directly_included_external_paths_from("other.c")
+            .is_empty());
+    }
+
+    #[test]
+    fn suffix_match_and_its_descendants_stay_heuristic() {
+        let graph = ReachGraph::new_with_kinds(
+            vec![
+                ("a.c".into(), "b.h".into(), ResolutionKind::SuffixMatch),
+                ("b.h".into(), "c.h".into(), ResolutionKind::RelativeExact),
+            ],
+            vec![],
+            vec![],
+        );
+
+        let scope = graph.reachable("a.c");
+        assert_eq!(scope.files, set(&["a.c"]));
+        assert_eq!(scope.heuristic_files, set(&["b.h", "c.h"]));
     }
 
     #[test]
@@ -746,6 +899,7 @@ mod tests {
             vec![IncludeEdgeRow {
                 source_path: "a.c".to_string(),
                 target_path: "new.h".to_string(),
+                resolution: ResolutionKind::WorkspaceExact,
             }],
             vec![],
         );

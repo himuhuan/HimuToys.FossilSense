@@ -270,8 +270,10 @@ fn scoped_table() -> NameTable {
 fn scope(current: &str, reachable: &[&str], open: bool) -> CompletionScope {
     CompletionScope {
         current_path: Some(current.to_string()),
+        direct_external_files: Default::default(),
         reach: ReachScope {
             files: reachable.iter().map(|s| s.to_string()).collect(),
+            heuristic_files: Default::default(),
             open,
             reason: None,
         },
@@ -1126,6 +1128,7 @@ fn completion_reachable_outranks_unreachable_from_real_index() {
     let reach = graph.reachable("src/main.c");
     let scope = CompletionScope {
         current_path: Some("src/main.c".to_string()),
+        direct_external_files: graph.directly_included_external_paths_from("src/main.c"),
         reach: (*reach).clone(),
     };
     let hits = table.search_ranked_scoped("widget", 10, Some(&scope));
@@ -1186,6 +1189,7 @@ fn completion_external_demotes_below_workspace_reachable() {
     let reach = graph.reachable("src/main.c");
     let scope = CompletionScope {
         current_path: Some("src/main.c".to_string()),
+        direct_external_files: graph.directly_included_external_paths_from("src/main.c"),
         reach: (*reach).clone(),
     };
     let hits = table.search_ranked_scoped("helper", 10, Some(&scope));
@@ -1203,6 +1207,44 @@ fn completion_external_demotes_below_workspace_reachable() {
     );
     assert_eq!(hits[local_pos].tier, ScopeTier::Reachable);
     assert_eq!(hits[ext_pos].tier, ScopeTier::External);
+}
+
+#[test]
+fn completion_direct_external_evidence_is_origin_specific() {
+    let external = "C:/sdk/include/shared.h".to_string();
+    let table = NameTable::build_with_paths(vec![(
+        1,
+        "shared_api".to_string(),
+        true,
+        external.clone(),
+        "function".to_string(),
+        true,
+    )]);
+    let reach = ReachScope {
+        files: HashSet::from(["src/main.c".to_string()]),
+        heuristic_files: HashSet::new(),
+        open: false,
+        reason: None,
+    };
+    let including_origin = CompletionScope {
+        current_path: Some("src/main.c".to_string()),
+        direct_external_files: HashSet::from([external]),
+        reach: reach.clone(),
+    };
+    let unrelated_origin = CompletionScope {
+        current_path: Some("src/other.c".to_string()),
+        direct_external_files: HashSet::new(),
+        reach,
+    };
+
+    assert_eq!(
+        table.exact_name_hits_scoped("shared_api", 1, Some(&including_origin))[0].tier,
+        ScopeTier::External
+    );
+    assert_eq!(
+        table.exact_name_hits_scoped("shared_api", 1, Some(&unrelated_origin))[0].tier,
+        ScopeTier::Global
+    );
 }
 
 #[test]
@@ -1224,6 +1266,7 @@ fn completion_is_truncated_at_limit() {
     let reach = graph.reachable("src/main.c");
     let scope = CompletionScope {
         current_path: Some("src/main.c".to_string()),
+        direct_external_files: graph.directly_included_external_paths_from("src/main.c"),
         reach: (*reach).clone(),
     };
     let limit = 10;
@@ -1301,6 +1344,7 @@ fn completion_same_name_ranks_higher_tier_first() {
     let reach = graph.reachable("src/main.c");
     let scope = CompletionScope {
         current_path: Some("src/main.c".to_string()),
+        direct_external_files: graph.directly_included_external_paths_from("src/main.c"),
         reach: (*reach).clone(),
     };
     let hits = table.search_ranked_scoped("dual_name", 10, Some(&scope));

@@ -139,6 +139,7 @@ pub(super) fn completion_items_for_current_file_overlay(
             let mut evidence = CandidateEvidence::new(source, tier, confidence, hit.match_score);
             evidence.match_score = hit.match_score;
             evidence.proximity_score = hit.proximity_score;
+            evidence.role = hit.role;
             evidence.kind = if is_text {
                 CompletionCandidateKind::Text
             } else {
@@ -183,6 +184,7 @@ pub(super) fn completion_items_for_indexed_hits(
             let mut evidence =
                 CandidateEvidence::new(CandidateSource::Indexed, hit.tier, confidence, hit.score);
             evidence.match_score = hit.base_match;
+            evidence.role = Some(hit.role);
             if active_project_context.is_some()
                 && hit.project_key.as_ref() == active_project_context
             {
@@ -228,6 +230,7 @@ pub(super) fn exact_indexed_completion_candidates_for_local_word(
             let mut evidence =
                 CandidateEvidence::new(CandidateSource::Indexed, hit.tier, confidence, local_score);
             evidence.match_score = hit.base_match;
+            evidence.role = Some(hit.role);
             if active_project_context.is_some()
                 && hit.project_key.as_ref() == active_project_context
             {

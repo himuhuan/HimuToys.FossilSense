@@ -327,11 +327,11 @@ fn same_basename_quote_resolves_local_header_determinate_scope() {
 }
 
 #[test]
-fn multi_hit_include_opens_scope_ambiguous_no_twin_edges() {
+fn multi_hit_include_keeps_all_twins_as_heuristic_edges() {
     // `src/x.c` #include "util.h" with NO exact-tier hit and BOTH lib/util.h
     // and vendor/util.h carrying the basename. Resolution is Ambiguous: the
-    // source's `ambiguous_includes` count goes up, no include_edges are
-    // produced for either twin, and the scope opens with AmbiguousInclude.
+    // source's `ambiguous_includes` count goes up, both possible targets are
+    // retained as weak edges, and the scope opens with AmbiguousInclude.
     use crate::reachability::{OpenReason, ReachGraph};
 
     let dir = tempdir().expect("tempdir");
@@ -359,26 +359,95 @@ fn multi_hit_include_opens_scope_ambiguous_no_twin_edges() {
     .expect("index");
 
     let store = IndexStore::open_readonly(&db).expect("readonly");
-    let edges = store.load_include_edge_paths().expect("edges");
-    // No edges from x.c to either twin — ambiguity adds nothing to the
-    // proven reachable set.
-    assert!(
-        !edges.iter().any(|(src, _)| src == "src/x.c"),
-        "ambiguous include MUST NOT produce proven edges; got {edges:?}"
+    let reach_view = store.reach_graph_view();
+    let edge_rows = reach_view.include_edges().expect("edges");
+    let x_edges: Vec<_> = edge_rows
+        .iter()
+        .filter(|edge| edge.source_path == "src/x.c")
+        .collect();
+    assert_eq!(
+        x_edges.len(),
+        2,
+        "both ambiguous targets survive: {x_edges:?}"
     );
+    assert!(x_edges
+        .iter()
+        .all(|edge| { edge.resolution == crate::includes::ResolutionKind::SuffixMatch }));
 
-    let graph = ReachGraph::new(
-        store.load_include_edge_paths().expect("edges"),
-        store.open_include_file_paths().expect("open"),
-        store.ambiguous_include_file_paths().expect("ambiguous"),
+    let graph = ReachGraph::from_rows(
+        edge_rows,
+        reach_view.unresolved_includes().expect("open"),
+        reach_view.ambiguous_includes().expect("ambiguous"),
     );
     let scope = graph.reachable("src/x.c");
     assert!(scope.open);
+    assert!(scope.files.contains("src/x.c"));
+    assert!(!scope.files.contains("lib/util.h"));
+    assert!(!scope.files.contains("vendor/util.h"));
+    assert!(scope.heuristic_files.contains("lib/util.h"));
+    assert!(scope.heuristic_files.contains("vendor/util.h"));
     assert_eq!(
         scope.reason,
         Some(OpenReason::AmbiguousInclude),
         "an ambiguous include opens the scope with AmbiguousInclude"
     );
+}
+
+#[test]
+fn exact_edge_upgrades_an_earlier_ambiguous_edge_to_the_same_target() {
+    let dir = tempdir().expect("tempdir");
+    fs::create_dir_all(dir.path().join("src")).expect("src");
+    fs::create_dir_all(dir.path().join("lib")).expect("lib");
+    fs::create_dir_all(dir.path().join("vendor")).expect("vendor");
+    fs::write(
+        dir.path().join("src/x.c"),
+        "#include \"util.h\"\n#include \"lib/util.h\"\nint x(void){ return 0; }\n",
+    )
+    .expect("x.c");
+    fs::write(dir.path().join("lib/util.h"), "int lib_util(void);\n").expect("lib/util.h");
+    fs::write(dir.path().join("vendor/util.h"), "int vendor_util(void);\n").expect("vendor/util.h");
+    let db = dir.path().join("index.sqlite");
+
+    index_workspace(
+        dir.path(),
+        IndexOptions {
+            db_path: Some(db.clone()),
+            force: false,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("index");
+
+    let store = IndexStore::open_readonly(&db).expect("readonly");
+    let reach_view = store.reach_graph_view();
+    let rows = reach_view.include_edges().expect("typed edges");
+    let lib = rows
+        .iter()
+        .find(|edge| edge.source_path == "src/x.c" && edge.target_path == "lib/util.h")
+        .expect("lib edge");
+    let vendor = rows
+        .iter()
+        .find(|edge| edge.source_path == "src/x.c" && edge.target_path == "vendor/util.h")
+        .expect("vendor edge");
+    assert_eq!(
+        lib.resolution,
+        crate::includes::ResolutionKind::WorkspaceExact
+    );
+    assert_eq!(
+        vendor.resolution,
+        crate::includes::ResolutionKind::SuffixMatch
+    );
+
+    let graph = crate::reachability::ReachGraph::from_rows(
+        rows,
+        reach_view.unresolved_includes().expect("open"),
+        reach_view.ambiguous_includes().expect("ambiguous"),
+    );
+    let scope = graph.reachable("src/x.c");
+    assert!(scope.open);
+    assert!(scope.files.contains("lib/util.h"));
+    assert!(scope.heuristic_files.contains("vendor/util.h"));
 }
 
 #[test]

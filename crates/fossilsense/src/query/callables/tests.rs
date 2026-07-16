@@ -318,6 +318,7 @@ fn strict_one_to_one_counterpart_drives_consistent_presentations() {
         "src/api.c".to_string(),
         ReachScope {
             files: ["include/api.h".to_string()].into_iter().collect(),
+            heuristic_files: Default::default(),
             open: false,
             reason: None,
         },
@@ -342,6 +343,10 @@ fn strict_one_to_one_counterpart_drives_consistent_presentations() {
     assert_eq!(
         call_definition_presentations(&groups)[0].anchor.path,
         "src/api.c"
+    );
+    assert_eq!(
+        call_declaration_presentations(&groups)[0].anchor.path,
+        "include/api.h"
     );
     assert_eq!(
         anchor_opposite_definition(&groups, &source.anchor.anchor_fingerprint)
@@ -403,6 +408,249 @@ fn presentation_order_uses_the_strongest_tier_of_a_counterpart_group() {
         call_definition_presentations(&groups)[0].anchor.path,
         "src/paired.c"
     );
+}
+
+#[test]
+fn definition_presentations_return_only_definitions_and_keep_competitors() {
+    let declaration = resolved(
+        "include/api.h",
+        AnchorRole::Declaration,
+        ScopeTier::Current,
+        Some(2),
+        Some(2),
+        false,
+    );
+    let first = resolved(
+        "src/first.c",
+        AnchorRole::Definition,
+        ScopeTier::Reachable,
+        Some(2),
+        Some(2),
+        false,
+    );
+    let second = resolved(
+        "src/second.c",
+        AnchorRole::Definition,
+        ScopeTier::Reachable,
+        Some(2),
+        Some(2),
+        false,
+    );
+    let groups = vec![
+        CallableVariantGroup {
+            header_declaration: Some(declaration),
+            source_definition: None,
+            other_variants: Vec::new(),
+            group_tier: ScopeTier::Current,
+            counterpart_evidence: CounterpartEvidence::Unpaired,
+        },
+        CallableVariantGroup {
+            header_declaration: None,
+            source_definition: Some(first),
+            other_variants: Vec::new(),
+            group_tier: ScopeTier::Reachable,
+            counterpart_evidence: CounterpartEvidence::Ambiguous { candidate_edges: 2 },
+        },
+        CallableVariantGroup {
+            header_declaration: None,
+            source_definition: Some(second),
+            other_variants: Vec::new(),
+            group_tier: ScopeTier::Reachable,
+            counterpart_evidence: CounterpartEvidence::Ambiguous { candidate_edges: 2 },
+        },
+    ];
+
+    let paths: Vec<_> = call_definition_presentations(&groups)
+        .into_iter()
+        .map(|anchor| anchor.anchor.path.as_str())
+        .collect();
+    assert_eq!(paths, vec!["src/first.c", "src/second.c"]);
+}
+
+#[test]
+fn strict_pair_dominance_applies_only_at_the_strongest_relevant_tier() {
+    let paired_header = resolved(
+        "include/api.h",
+        AnchorRole::Declaration,
+        ScopeTier::Reachable,
+        Some(2),
+        Some(2),
+        false,
+    );
+    let paired_source = resolved(
+        "src/api.c",
+        AnchorRole::Definition,
+        ScopeTier::Current,
+        Some(2),
+        Some(2),
+        false,
+    );
+    let fallback_definition = resolved(
+        "other/api.c",
+        AnchorRole::Definition,
+        ScopeTier::Global,
+        Some(2),
+        Some(2),
+        false,
+    );
+    let fallback_declaration = resolved(
+        "src/local.h",
+        AnchorRole::Declaration,
+        ScopeTier::Current,
+        Some(2),
+        Some(2),
+        false,
+    );
+    let groups = vec![
+        CallableVariantGroup {
+            header_declaration: Some(paired_header),
+            source_definition: Some(paired_source),
+            other_variants: Vec::new(),
+            group_tier: ScopeTier::Current,
+            counterpart_evidence: CounterpartEvidence::StrictOneToOne,
+        },
+        CallableVariantGroup {
+            header_declaration: None,
+            source_definition: Some(fallback_definition),
+            other_variants: Vec::new(),
+            group_tier: ScopeTier::Global,
+            counterpart_evidence: CounterpartEvidence::Unpaired,
+        },
+        CallableVariantGroup {
+            header_declaration: Some(fallback_declaration),
+            source_definition: None,
+            other_variants: Vec::new(),
+            group_tier: ScopeTier::Current,
+            counterpart_evidence: CounterpartEvidence::Unpaired,
+        },
+    ];
+
+    let definitions = call_definition_presentations(&groups);
+    assert_eq!(definitions.len(), 1);
+    assert_eq!(definitions[0].anchor.path, "src/api.c");
+    let declarations = call_declaration_presentations(&groups);
+    assert_eq!(declarations.len(), 1);
+    assert_eq!(declarations[0].anchor.path, "src/local.h");
+}
+
+#[test]
+fn declaration_presentations_choose_highest_tier_nearest_declaration_then_definition_fallback() {
+    let mut older = resolved(
+        "src/main.c",
+        AnchorRole::Declaration,
+        ScopeTier::Current,
+        Some(2),
+        Some(2),
+        false,
+    );
+    older.anchor.name_range = source_range(10);
+    let mut nearer = older.clone();
+    nearer.anchor.name_range = source_range(40);
+    nearer.anchor.anchor_fingerprint = "nearer".into();
+    let reachable = resolved(
+        "include/api.h",
+        AnchorRole::Declaration,
+        ScopeTier::Reachable,
+        Some(2),
+        Some(2),
+        false,
+    );
+    let declaration_groups = vec![
+        CallableVariantGroup {
+            header_declaration: None,
+            source_definition: None,
+            other_variants: vec![older],
+            group_tier: ScopeTier::Current,
+            counterpart_evidence: CounterpartEvidence::Unpaired,
+        },
+        CallableVariantGroup {
+            header_declaration: None,
+            source_definition: None,
+            other_variants: vec![nearer],
+            group_tier: ScopeTier::Current,
+            counterpart_evidence: CounterpartEvidence::Unpaired,
+        },
+        CallableVariantGroup {
+            header_declaration: Some(reachable),
+            source_definition: None,
+            other_variants: Vec::new(),
+            group_tier: ScopeTier::Reachable,
+            counterpart_evidence: CounterpartEvidence::Unpaired,
+        },
+    ];
+    let declarations = call_declaration_presentations(&declaration_groups);
+    assert_eq!(declarations.len(), 1);
+    assert_eq!(declarations[0].anchor.anchor_fingerprint, "nearer");
+
+    let mut older_definition = resolved(
+        "src/main.c",
+        AnchorRole::Definition,
+        ScopeTier::Current,
+        Some(2),
+        Some(2),
+        false,
+    );
+    older_definition.anchor.name_range = source_range(20);
+    let mut nearer_definition = older_definition.clone();
+    nearer_definition.anchor.name_range = source_range(60);
+    nearer_definition.anchor.anchor_fingerprint = "nearer-definition".into();
+    let definition_groups = vec![
+        CallableVariantGroup {
+            header_declaration: None,
+            source_definition: Some(older_definition),
+            other_variants: Vec::new(),
+            group_tier: ScopeTier::Current,
+            counterpart_evidence: CounterpartEvidence::Unpaired,
+        },
+        CallableVariantGroup {
+            header_declaration: None,
+            source_definition: Some(nearer_definition),
+            other_variants: Vec::new(),
+            group_tier: ScopeTier::Current,
+            counterpart_evidence: CounterpartEvidence::Unpaired,
+        },
+    ];
+    let fallback = call_declaration_presentations(&definition_groups);
+    assert_eq!(fallback.len(), 1);
+    assert_eq!(fallback[0].anchor.anchor_fingerprint, "nearer-definition");
+}
+
+#[test]
+fn declaration_presentations_ignore_same_file_redeclarations_after_the_use() {
+    let mut before = resolved(
+        "src/main.c",
+        AnchorRole::Declaration,
+        ScopeTier::Current,
+        Some(2),
+        Some(2),
+        false,
+    );
+    before.anchor.name_range = source_range(10);
+    before.anchor.anchor_fingerprint = "before".into();
+    let mut after = before.clone();
+    after.anchor.name_range = source_range(40);
+    after.anchor.anchor_fingerprint = "after".into();
+    let groups = vec![
+        CallableVariantGroup {
+            header_declaration: None,
+            source_definition: None,
+            other_variants: vec![before],
+            group_tier: ScopeTier::Current,
+            counterpart_evidence: CounterpartEvidence::Unpaired,
+        },
+        CallableVariantGroup {
+            header_declaration: None,
+            source_definition: None,
+            other_variants: vec![after],
+            group_tier: ScopeTier::Current,
+            counterpart_evidence: CounterpartEvidence::Unpaired,
+        },
+    ];
+
+    let declarations = call_declaration_presentations_at(&groups, "src/main.c", 25);
+
+    assert_eq!(declarations.len(), 1);
+    assert_eq!(declarations[0].anchor.anchor_fingerprint, "before");
 }
 
 #[test]
@@ -475,6 +723,7 @@ fn ambiguity_and_incomplete_coverage_never_claim_unique_counterpart() {
     );
     let closed = ReachScope {
         files: ["include/api.h".to_string()].into_iter().collect(),
+        heuristic_files: Default::default(),
         open: false,
         reason: None,
     };
@@ -490,6 +739,7 @@ fn ambiguity_and_incomplete_coverage_never_claim_unique_counterpart() {
         shadowed_paths: HashSet::new(),
         call_context: None,
         source_reach: reach.clone(),
+        visible_internal_paths: HashSet::new(),
         coverage: CandidateCoverage::complete(3),
     });
     assert_eq!(set.metrics().counterpart_strict, 0);
@@ -511,10 +761,21 @@ fn ambiguity_and_incomplete_coverage_never_claim_unique_counterpart() {
     assert!(groups
         .iter()
         .all(|group| { group.counterpart_evidence == CounterpartEvidence::IncompleteCoverage }));
+
+    let incomplete = CandidateCoverage {
+        scanned: 3,
+        truncated: false,
+        scope_open: true,
+        incomplete_reason: Some(CandidateIncompleteReason::FactsUnavailable),
+    };
+    let groups = resolve_counterparts(&anchors, &reach, &incomplete);
+    assert!(groups
+        .iter()
+        .all(|group| { group.counterpart_evidence == CounterpartEvidence::IncompleteCoverage }));
 }
 
 #[test]
-fn mixed_closed_and_open_source_scopes_never_claim_unique_counterpart() {
+fn unrelated_open_source_does_not_block_a_known_counterpart() {
     let header = resolved(
         "include/api.h",
         AnchorRole::Declaration,
@@ -544,6 +805,7 @@ fn mixed_closed_and_open_source_scopes_never_claim_unique_counterpart() {
             "src/closed.c".to_string(),
             ReachScope {
                 files: ["include/api.h".to_string()].into_iter().collect(),
+                heuristic_files: Default::default(),
                 open: false,
                 reason: None,
             },
@@ -552,25 +814,39 @@ fn mixed_closed_and_open_source_scopes_never_claim_unique_counterpart() {
             "src/open.c".to_string(),
             ReachScope {
                 files: HashSet::new(),
+                heuristic_files: Default::default(),
                 open: true,
                 reason: Some(crate::reachability::OpenReason::UnresolvedInclude),
             },
         ),
     ]);
 
-    let groups = resolve_counterparts(
-        &[header, closed_source, open_source],
-        &reach,
-        &CandidateCoverage::complete(3),
+    let coverage = CandidateCoverage {
+        scanned: 3,
+        truncated: false,
+        scope_open: true,
+        incomplete_reason: None,
+    };
+    let groups = resolve_counterparts(&[header, closed_source, open_source], &reach, &coverage);
+    assert_eq!(groups.len(), 2);
+    assert_eq!(
+        groups
+            .iter()
+            .filter(|group| { group.counterpart_evidence == CounterpartEvidence::StrictOneToOne })
+            .count(),
+        1
     );
-    assert_eq!(groups.len(), 3);
-    assert!(groups
-        .iter()
-        .all(|group| { group.counterpart_evidence == CounterpartEvidence::IncompleteCoverage }));
+    assert_eq!(
+        groups
+            .iter()
+            .filter(|group| group.counterpart_evidence == CounterpartEvidence::Unpaired)
+            .count(),
+        1
+    );
 }
 
 #[test]
-fn counterpart_requires_external_exact_signature_and_closed_reach() {
+fn counterpart_requires_external_exact_signature_and_known_reach() {
     let source = resolved(
         "src/api.C",
         AnchorRole::Definition,
@@ -596,6 +872,7 @@ fn counterpart_requires_external_exact_signature_and_closed_reach() {
                 } else {
                     HashSet::new()
                 },
+                heuristic_files: Default::default(),
                 open,
                 reason: None,
             },
@@ -611,7 +888,22 @@ fn counterpart_requires_external_exact_signature_and_closed_reach() {
             .all(|group| group.counterpart_evidence != CounterpartEvidence::StrictOneToOne));
     };
 
-    assert_unpaired(source.clone(), header.clone(), reach(true, true));
+    let open_coverage = CandidateCoverage {
+        scanned: 2,
+        truncated: false,
+        scope_open: true,
+        incomplete_reason: None,
+    };
+    let groups = resolve_counterparts(
+        &[source.clone(), header.clone()],
+        &reach(true, true),
+        &open_coverage,
+    );
+    assert_eq!(groups.len(), 1);
+    assert_eq!(
+        groups[0].counterpart_evidence,
+        CounterpartEvidence::StrictOneToOne
+    );
     assert_unpaired(source.clone(), header.clone(), reach(false, false));
 
     let mut internal = source.clone();
@@ -649,6 +941,7 @@ fn counterpart_does_not_cross_namespaces_or_pair_record_members() {
         "src/api.cpp".to_string(),
         ReachScope {
             files: ["include/api.hpp".to_string()].into_iter().collect(),
+            heuristic_files: Default::default(),
             open: false,
             reason: None,
         },
@@ -707,6 +1000,7 @@ fn unknown_explicit_owner_is_conservative_but_never_a_strict_counterpart() {
     context.qualified_name = Some("net::pick".to_string());
     let reach = ReachScope {
         files: ["include/api.hpp".to_string()].into_iter().collect(),
+        heuristic_files: Default::default(),
         open: false,
         reason: None,
     };
@@ -717,6 +1011,7 @@ fn unknown_explicit_owner_is_conservative_but_never_a_strict_counterpart() {
         shadowed_paths: HashSet::new(),
         call_context: Some(context),
         source_reach: HashMap::from([("src/api.cpp".to_string(), reach)]),
+        visible_internal_paths: HashSet::new(),
         coverage: CandidateCoverage::complete(2),
     });
 
@@ -758,6 +1053,7 @@ fn unsupported_member_context_cannot_launder_name_candidates() {
         shadowed_paths: HashSet::new(),
         call_context: Some(context),
         source_reach: HashMap::new(),
+        visible_internal_paths: HashSet::new(),
         coverage: CandidateCoverage::complete(2),
     });
 
@@ -785,6 +1081,7 @@ fn candidate_metrics_are_aggregate_and_cover_arity_and_counterparts() {
     );
     let reach = ReachScope {
         files: ["include/api.h".to_string()].into_iter().collect(),
+        heuristic_files: Default::default(),
         open: false,
         reason: None,
     };
@@ -794,6 +1091,7 @@ fn candidate_metrics_are_aggregate_and_cover_arity_and_counterparts() {
         shadowed_paths: HashSet::new(),
         call_context: Some(complete_call(Some(2))),
         source_reach: HashMap::from([("src/api.c".to_string(), reach)]),
+        visible_internal_paths: HashSet::new(),
         coverage: CandidateCoverage::complete(4),
     });
 
@@ -810,6 +1108,41 @@ fn candidate_metrics_are_aggregate_and_cover_arity_and_counterparts() {
             counterpart_ambiguous: 0,
         }
     );
+}
+
+#[test]
+fn internal_linkage_candidates_are_confined_to_the_current_translation_unit() {
+    let mut visible = resolved(
+        "src/current.c",
+        AnchorRole::Definition,
+        ScopeTier::Current,
+        Some(0),
+        Some(0),
+        false,
+    );
+    visible.anchor.linkage = LinkageDomain::Internal("src/current.c".to_string());
+    let mut unrelated = resolved(
+        "src/other.c",
+        AnchorRole::Definition,
+        ScopeTier::Global,
+        Some(0),
+        Some(0),
+        false,
+    );
+    unrelated.anchor.linkage = LinkageDomain::Internal("src/other.c".to_string());
+
+    let set = resolve_callable_candidates(CallableQueryInput {
+        base_anchors: vec![unrelated, visible],
+        overlay_anchors: Vec::new(),
+        shadowed_paths: HashSet::new(),
+        call_context: None,
+        source_reach: HashMap::new(),
+        visible_internal_paths: HashSet::from(["src/current.c".to_string()]),
+        coverage: CandidateCoverage::complete(2),
+    });
+
+    assert_eq!(set.anchors.len(), 1);
+    assert_eq!(set.anchors[0].anchor.path, "src/current.c");
 }
 
 #[test]
@@ -839,6 +1172,7 @@ fn pure_resolver_shadows_base_paths_and_deduplicates_overlay_fingerprints() {
         shadowed_paths: HashSet::from(["include/api.h".to_string()]),
         call_context: Some(complete_call(Some(2))),
         source_reach: HashMap::new(),
+        visible_internal_paths: HashSet::new(),
         coverage: CandidateCoverage::complete(2),
     });
 
@@ -888,6 +1222,7 @@ fn cross_file_fingerprint_collision_cannot_create_a_false_one_to_one_pair() {
         ]
         .into_iter()
         .collect(),
+        heuristic_files: Default::default(),
         open: false,
         reason: None,
     };
@@ -897,6 +1232,7 @@ fn cross_file_fingerprint_collision_cannot_create_a_false_one_to_one_pair() {
         shadowed_paths: HashSet::new(),
         call_context: None,
         source_reach: HashMap::from([("src/pick.c".to_string(), reach)]),
+        visible_internal_paths: HashSet::new(),
         coverage: CandidateCoverage::complete(3),
     });
     assert_eq!(set.anchors.len(), 3);

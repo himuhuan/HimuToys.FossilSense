@@ -17,7 +17,7 @@ fn callable_and_call_site_facts_round_trip_through_active_views() {
     assert_eq!(helper[0].linkage_kind, "internal");
     assert_eq!(helper[0].min_arity, Some(1));
     assert_eq!(helper[0].role, "definition");
-    assert_eq!(helper[0].canonical_signature, "static int helper(int v)");
+    assert_eq!(helper[0].canonical_signature, "static int helper(int)");
     assert_eq!(helper[0].presentation_signature, "static int helper(int v)");
     assert_eq!(
         helper[0].signature_fidelity,
@@ -267,4 +267,29 @@ fn external_headers_contribute_callable_declarations_without_body_calls() {
     assert_eq!(anchors[0].source, "external");
     assert_eq!(anchors[0].role, "declaration");
     assert!(test_call_sites_by_caller(&store, &anchors[0].entity_key).is_empty());
+}
+
+#[test]
+fn bounded_exact_name_anchor_read_can_reserve_a_reachable_path() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("index.sqlite");
+    let mut store = IndexStore::open(&db, dir.path()).unwrap();
+    let noise = "int crowded(void);\n".repeat(300);
+    upsert_source(&mut store, "aaa/noise.h", &noise);
+    upsert_source(&mut store, "zzz/reachable.h", "int crowded(void);\n");
+
+    let (global, global_truncated) = store
+        .call_fact_view()
+        .anchors_by_name_limited("crowded", 256)
+        .unwrap();
+    assert!(global_truncated);
+    assert!(global.iter().all(|row| row.path == "aaa/noise.h"));
+
+    let (reachable, reachable_truncated) = store
+        .call_fact_view()
+        .anchors_by_name_in_paths_limited("crowded", &["zzz/reachable.h".into()], 1)
+        .unwrap();
+    assert!(!reachable_truncated);
+    assert_eq!(reachable.len(), 1);
+    assert_eq!(reachable[0].path, "zzz/reachable.h");
 }

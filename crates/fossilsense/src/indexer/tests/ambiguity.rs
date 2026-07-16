@@ -66,14 +66,17 @@ fn coloring_hard_gate_excludes_wrong_twin_in_same_basename_sample() {
         "local RelativeExact edge present; got {edges:?}"
     );
     assert!(
-        !edges.iter().any(|(_, dst)| dst == "vendor/util.h"),
-        "vendor/util.h twin must not be a proven reachable edge"
+        !edges
+            .iter()
+            .any(|(src, dst)| src == "src/a/foo.c" && dst == "vendor/util.h"),
+        "vendor/util.h twin must not be a proven reachable edge from foo.c"
     );
 
-    let graph = ReachGraph::new(
-        store.load_include_edge_paths().expect("edges"),
-        store.open_include_file_paths().expect("open"),
-        store.ambiguous_include_file_paths().expect("ambiguous"),
+    let reach_view = store.reach_graph_view();
+    let graph = ReachGraph::from_rows(
+        reach_view.include_edges().expect("typed edges"),
+        reach_view.unresolved_includes().expect("open"),
+        reach_view.ambiguous_includes().expect("ambiguous"),
     );
     let scope = graph.reachable("src/a/foo.c");
     assert!(scope.files.contains("src/a/util.h"));
@@ -86,12 +89,14 @@ fn coloring_hard_gate_excludes_wrong_twin_in_same_basename_sample() {
         .expect("scoped");
     assert_eq!(scoped["util_value"].get("function").copied(), Some(1));
 
-    // Multi-hit file's scope is open with AmbiguousInclude; neither twin is
-    // a proven reachable member of its set (no edges from ambiguity).
+    // Multi-hit file's scope is open with AmbiguousInclude; both twins are
+    // retained as heuristic possibilities, never proven reachable members.
     let multi_scope = graph.reachable("multi/multi_hit.c");
     assert!(multi_scope.open);
     assert!(!multi_scope.files.contains("vendor/util.h"));
     assert!(!multi_scope.files.contains("src/a/util.h"));
+    assert!(multi_scope.heuristic_files.contains("vendor/util.h"));
+    assert!(multi_scope.heuristic_files.contains("src/a/util.h"));
     use crate::reachability::OpenReason;
     assert_eq!(multi_scope.reason, Some(OpenReason::AmbiguousInclude));
 }
@@ -128,19 +133,21 @@ fn scoping_off_preserves_global_counts_and_ambiguous_twins_stay_unknown() {
         .expect("unscoped");
     assert_eq!(unscoped["util_value"].get("function").copied(), Some(2));
 
-    let graph = ReachGraph::new(
-        store.load_include_edge_paths().expect("edges"),
-        store.open_include_file_paths().expect("open"),
-        store.ambiguous_include_file_paths().expect("ambiguous"),
+    let reach_view = store.reach_graph_view();
+    let graph = ReachGraph::from_rows(
+        reach_view.include_edges().expect("typed edges"),
+        reach_view.unresolved_includes().expect("open"),
+        reach_view.ambiguous_includes().expect("ambiguous"),
     );
     let scope = graph.reachable("multi/multi_hit.c");
-    // Multi-hit scope is open with AmbiguousInclude; the twins are not
-    // proven reachable, so `scope_tier` classifies them as `Unknown` (the
-    // open-scope soft path) -- surfaced for navigation, NOT proven colored.
+    // Multi-hit scope is open with AmbiguousInclude; the twins are retained as
+    // heuristic paths, so `scope_tier` classifies them as `Unknown` -- surfaced
+    // for navigation, NOT proven colored.
     assert_eq!(scope.reason, Some(OpenReason::AmbiguousInclude));
     let ctx = ResolveContext {
         current_path: Some("multi/multi_hit.c"),
         reach: Some(&scope),
+        direct_external_files: None,
     };
     assert_eq!(
         scope_tier("vendor/util.h", false, false, Some(&ctx)),

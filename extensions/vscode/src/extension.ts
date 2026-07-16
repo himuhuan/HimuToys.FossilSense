@@ -28,6 +28,12 @@ import {
 import { mutualExclusionMessage } from './conflicts';
 import { GroupedReferenceItem, groupedReferencePickRows } from './referencesView';
 import {
+  PossibleTargetItem,
+  PossibleTargetsResponse,
+  possibleTargetPickRows,
+  possibleTargetsCoverageSummary,
+} from './possibleTargets';
+import {
   CallRelationsController,
   registerCallRelationViews,
 } from './callRelationsView';
@@ -53,6 +59,8 @@ const REBUILD_INDEX_COMMAND = 'fossilsense.rebuildIndex';
 const REBUILD_INDEX_LSP_COMMAND = 'fossilsense.lsp.rebuildIndex';
 const GROUPED_REFERENCES_COMMAND = 'fossilsense.findReferencesGrouped';
 const GROUPED_REFERENCES_LSP_COMMAND = 'fossilsense.lsp.groupedReferences';
+const POSSIBLE_TARGETS_COMMAND = 'fossilsense.findAllPossibleTargets';
+const POSSIBLE_TARGETS_LSP_COMMAND = 'fossilsense.lsp.possibleTargets';
 const PROJECT_CONTEXT_MARKER_PATTERNS = [
   '**/Makefile',
   '**/GNUmakefile',
@@ -132,6 +140,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand(REFRESH_INDEX_COMMAND, () => refreshIndex()),
     vscode.commands.registerCommand(REBUILD_INDEX_COMMAND, () => rebuildIndex()),
     vscode.commands.registerCommand(GROUPED_REFERENCES_COMMAND, () => findReferencesGrouped()),
+    vscode.commands.registerCommand(POSSIBLE_TARGETS_COMMAND, () => findAllPossibleTargets()),
     vscode.commands.registerCommand(CLEAR_COMPLETION_HISTORY_COMMAND, () =>
       clearCompletionHistory(),
     ),
@@ -598,6 +607,74 @@ function isLocalCppDocument(document: vscode.TextDocument): boolean {
     document.uri.scheme === 'file' &&
     (document.languageId === 'c' || document.languageId === 'cpp')
   );
+}
+
+// Explicit bounded discovery of the declaration/definition variants that the
+// standard navigation presentation intentionally suppresses. The response is
+// evidence-labeled and never described as compiler-bound or infinitely complete.
+async function findAllPossibleTargets(): Promise<void> {
+  if (!client) {
+    void vscode.window.showWarningMessage('FossilSense server is not running. Start it first.');
+    return;
+  }
+  const editor = vscode.window.activeTextEditor;
+  if (!editor) {
+    void vscode.window.showInformationMessage(
+      'Open a C/C++ file and place the cursor on an identifier.',
+    );
+    return;
+  }
+  const { document, selection } = editor;
+  const position = selection.active;
+  const response = (await client.sendRequest(ExecuteCommandRequest.type, {
+    command: POSSIBLE_TARGETS_LSP_COMMAND,
+    arguments: [
+      {
+        uri: document.uri.toString(),
+        line: position.line,
+        character: position.character,
+      },
+    ],
+  })) as PossibleTargetsResponse | null;
+
+  if (!response || response.items.length === 0) {
+    void vscode.window.showInformationMessage('FossilSense: no possible targets found.');
+    return;
+  }
+
+  const picks = possibleTargetPickRows(
+    response.items,
+    (uri) => vscode.workspace.asRelativePath(vscode.Uri.parse(uri)),
+  ).map((row): vscode.QuickPickItem & { item?: PossibleTargetItem } => {
+    if (row.kind === 'separator') {
+      return { label: row.label, kind: vscode.QuickPickItemKind.Separator };
+    }
+    return {
+      label: row.label,
+      description: row.description,
+      detail: row.detail,
+      item: row.item,
+    };
+  });
+  const coverage = possibleTargetsCoverageSummary(response.coverage);
+  const chosen = await vscode.window.showQuickPick(picks, {
+    placeHolder: `FossilSense ${response.name}: ${response.items.length} possible target(s)${coverage ? ` · ${coverage}` : ''}`,
+    matchOnDescription: true,
+    matchOnDetail: true,
+  });
+  if (!chosen?.item) {
+    return;
+  }
+
+  const target = chosen.item.location;
+  const targetUri = vscode.Uri.parse(target.uri);
+  const range = new vscode.Range(
+    target.range.start.line,
+    target.range.start.character,
+    target.range.end.line,
+    target.range.end.character,
+  );
+  await vscode.window.showTextDocument(targetUri, { selection: range });
 }
 
 // Role-grouped find-references. The standard References panel (textDocument/

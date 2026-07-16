@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::completion_history::{candidate_hash_key, CompletionHistorySnapshot};
 use crate::model::{ResolutionConfidence, ScopeTier};
+use crate::parser::SymbolRole;
 
 use super::prefix_ranking::{compare_name_match, CompletionPrefixRanking};
 use super::{CompletionIntent, CompletionIntentConfidence, CompletionIntentKind};
@@ -195,6 +196,7 @@ pub(crate) struct CandidateEvidence {
     pub proximity_score: i32,
     pub project_score: i32,
     pub kind: CompletionCandidateKind,
+    pub role: Option<SymbolRole>,
     pub history_key: Option<u64>,
     pub history_score: i32,
 }
@@ -218,6 +220,7 @@ impl CandidateEvidence {
             proximity_score: 0,
             project_score: 0,
             kind: CompletionCandidateKind::Unknown,
+            role: None,
             history_key: None,
             history_score: 0,
         }
@@ -226,8 +229,10 @@ impl CandidateEvidence {
     #[allow(dead_code)]
     fn merge_from(&mut self, other: CandidateEvidence) {
         let same_primary_source = self.primary_source == other.primary_source;
+        let other_wins = candidate_beats(other, *self);
+        let winner_role = if other_wins { other.role } else { self.role };
         self.sources.merge(other.sources);
-        if candidate_beats(other, *self) {
+        if other_wins {
             self.primary_source = other.primary_source;
             self.source = other.primary_source;
         }
@@ -243,6 +248,7 @@ impl CandidateEvidence {
         if !same_primary_source && other.kind.priority() > self.kind.priority() {
             self.kind = other.kind;
         }
+        self.role = winner_role;
         if self.history_key.is_none() {
             self.history_key = other.history_key;
         }
@@ -564,7 +570,21 @@ fn candidate_beats(current: CandidateEvidence, previous: CandidateEvidence) -> b
                 || ((current.tier, current.confidence) == (previous.tier, previous.confidence)
                     && (current.project_score > previous.project_score
                         || (current.project_score == previous.project_score
-                            && current.score > previous.score)))))
+                            && (symbol_role_priority(current.role)
+                                > symbol_role_priority(previous.role)
+                                || (symbol_role_priority(current.role)
+                                    == symbol_role_priority(previous.role)
+                                    && current.score > previous.score)))))))
+}
+
+fn symbol_role_priority(role: Option<SymbolRole>) -> u8 {
+    match role {
+        Some(SymbolRole::Declaration) => 4,
+        Some(SymbolRole::TentativeDefinition) => 3,
+        Some(SymbolRole::Definition) => 2,
+        Some(SymbolRole::UnknownDeclarationOrDefinition) => 1,
+        None => 0,
+    }
 }
 
 #[allow(dead_code)]

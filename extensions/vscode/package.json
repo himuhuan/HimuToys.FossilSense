@@ -1,8 +1,8 @@
 {
   "name": "fossilsense-vscode",
   "displayName": "FossilSense",
-  "description": "FossilSense C/C++ best-effort semantics: arity-aware navigation, strict header/source counterparts, full record and typedef hover, completion docs, and call relations.",
-  "version": "1.4.3",
+  "description": "FossilSense C/C++ best-effort semantics: stable Definition/Declaration navigation, C callable normalization, role-aware candidates, reachability evidence, full record hover, and call relations.",
+  "version": "1.4.4",
   "private": true,
   "license": "UNLICENSED",
   "publisher": "himutoys",
@@ -38,6 +38,10 @@
       {
         "command": "fossilsense.findReferencesGrouped",
         "title": "FossilSense: Find References (Grouped by Role)"
+      },
+      {
+        "command": "fossilsense.findAllPossibleTargets",
+        "title": "FossilSense: Find All Possible Definitions / Declarations"
       },
       {
         "command": "fossilsense.clearCompletionHistory",
@@ -112,6 +116,11 @@
     ],
     "menus": {
       "editor/context": [
+        {
+          "command": "fossilsense.findAllPossibleTargets",
+          "when": "editorLangId == c || editorLangId == cpp",
+          "group": "navigation@19"
+        },
         {
           "command": "fossilsense.showCallRelations",
           "when": "editorLangId == c || editorLangId == cpp",

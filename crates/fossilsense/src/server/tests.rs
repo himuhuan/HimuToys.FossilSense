@@ -12,12 +12,12 @@ use std::sync::{Arc, Mutex as StdMutex};
 use tempfile::tempdir;
 use tower_lsp::lsp_types::{
     CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse,
-    DidChangeTextDocumentParams, DidChangeWorkspaceFoldersParams, DidOpenTextDocumentParams,
-    Documentation, ExecuteCommandParams, FileChangeType, FileEvent, GotoDefinitionParams,
-    GotoDefinitionResponse, HoverContents, HoverParams, InitializeParams, Position,
-    SignatureHelpParams, TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
-    TextDocumentPositionParams, Url, VersionedTextDocumentIdentifier, WorkspaceFolder,
-    WorkspaceFoldersChangeEvent,
+    DeclarationCapability, DidChangeTextDocumentParams, DidChangeWorkspaceFoldersParams,
+    DidOpenTextDocumentParams, Documentation, ExecuteCommandParams, FileChangeType, FileEvent,
+    GotoDefinitionParams, GotoDefinitionResponse, HoverContents, HoverParams, InitializeParams,
+    OneOf, Position, SignatureHelpParams, TextDocumentContentChangeEvent, TextDocumentIdentifier,
+    TextDocumentItem, TextDocumentPositionParams, Url, VersionedTextDocumentIdentifier,
+    WorkspaceFolder, WorkspaceFoldersChangeEvent,
 };
 use tower_lsp::{LanguageServer as _, LspService};
 
@@ -723,6 +723,320 @@ async fn goto_definition_returns_multiple_same_signature_implementations() {
         .collect();
     assert!(paths.contains("impl_a.c"), "first implementation missing");
     assert!(paths.contains("impl_b.c"), "second implementation missing");
+}
+
+#[tokio::test]
+async fn declaration_and_definition_keep_stable_operation_semantics() {
+    let (dir, service, main_uri, line, character) = indexed_backend_with_open_doc(
+        &[
+            ("api.h", "extern int read_value(int);\n"),
+            (
+                "api.c",
+                "#include \"api.h\"\nint read_value(int value) { return value; }\n",
+            ),
+        ],
+        "main.c",
+        "#include \"api.h\"\nint run(void) { return read_value/*cursor*/(1); }\n",
+    )
+    .await;
+    let header_uri = Url::from_file_path(dir.path().join("api.h")).expect("header uri");
+    let source_uri = Url::from_file_path(dir.path().join("api.c")).expect("source uri");
+
+    let source_definition = service
+        .inner()
+        .goto_definition(goto_definition_params(source_uri.clone(), 1, 6))
+        .await
+        .expect("source definition request")
+        .expect("source definition response");
+    assert_eq!(definition_locations(source_definition)[0].uri, source_uri);
+
+    let source_declaration = service
+        .inner()
+        .goto_declaration(goto_definition_params(source_uri.clone(), 1, 6))
+        .await
+        .expect("source declaration request")
+        .expect("source declaration response");
+    assert_eq!(definition_locations(source_declaration)[0].uri, header_uri);
+
+    let header_definition = service
+        .inner()
+        .goto_definition(goto_definition_params(header_uri.clone(), 0, 14))
+        .await
+        .expect("header definition request")
+        .expect("header definition response");
+    assert_eq!(definition_locations(header_definition)[0].uri, source_uri);
+
+    let header_declaration = service
+        .inner()
+        .goto_declaration(goto_definition_params(header_uri.clone(), 0, 14))
+        .await
+        .expect("header declaration request")
+        .expect("header declaration response");
+    assert_eq!(definition_locations(header_declaration)[0].uri, header_uri);
+
+    let call_declaration = service
+        .inner()
+        .goto_declaration(goto_definition_params(main_uri, line, character))
+        .await
+        .expect("call declaration request")
+        .expect("call declaration response");
+    assert_eq!(definition_locations(call_declaration)[0].uri, header_uri);
+}
+
+#[tokio::test]
+async fn local_binding_navigation_dominates_workspace_same_name_candidates() {
+    let (_dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[("other.c", "int value(void) { return 1; }\n")],
+        "main.c",
+        "int run(void) {\n    int value;\n    return value/*cursor*/;\n}\n",
+    )
+    .await;
+
+    for response in [
+        service
+            .inner()
+            .goto_definition(goto_definition_params(uri.clone(), line, character))
+            .await
+            .expect("local definition request")
+            .expect("local definition response"),
+        service
+            .inner()
+            .goto_declaration(goto_definition_params(uri.clone(), line, character))
+            .await
+            .expect("local declaration request")
+            .expect("local declaration response"),
+    ] {
+        let locations = definition_locations(response);
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0].uri, uri);
+        assert_eq!(locations[0].range.start.line, 1);
+    }
+}
+
+#[tokio::test]
+async fn label_navigation_is_scoped_to_the_enclosing_function() {
+    let (_dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[("other.c", "int same(void) { return 1; }\n")],
+        "main.c",
+        "void first(void) {\n\
+         same:\n\
+             return;\n\
+         }\n\
+         void second(void) {\n\
+             goto same/*cursor*/;\n\
+         same:\n\
+             return;\n\
+         }\n",
+    )
+    .await;
+
+    for response in [
+        service
+            .inner()
+            .goto_definition(goto_definition_params(uri.clone(), line, character))
+            .await
+            .expect("label definition request")
+            .expect("label definition response"),
+        service
+            .inner()
+            .goto_declaration(goto_definition_params(uri.clone(), line, character))
+            .await
+            .expect("label declaration request")
+            .expect("label declaration response"),
+    ] {
+        let locations = definition_locations(response);
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0].uri, uri);
+        assert_eq!(locations[0].range.start, Position::new(6, 0));
+        assert_eq!(locations[0].range.end, Position::new(6, 4));
+    }
+
+    let possible = service
+        .inner()
+        .execute_command(ExecuteCommandParams {
+            command: super::POSSIBLE_TARGETS_LSP_COMMAND.to_string(),
+            arguments: vec![serde_json::json!({
+                "uri": uri,
+                "line": line,
+                "character": character,
+            })],
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .expect("label possible targets request")
+        .expect("label possible targets response");
+    assert_eq!(possible["items"][0]["kind"], "label");
+    assert_eq!(possible["items"][0]["reason"], "label_namespace");
+    assert_eq!(possible["coverage"]["bounded"], false);
+
+    let (_dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[("other.c", "int missing(void) { return 1; }\n")],
+        "missing.c",
+        "void run(void) { goto missing/*cursor*/; }\n",
+    )
+    .await;
+    assert!(service
+        .inner()
+        .goto_definition(goto_definition_params(uri.clone(), line, character))
+        .await
+        .expect("missing label definition request")
+        .is_none());
+    assert!(service
+        .inner()
+        .goto_declaration(goto_definition_params(uri.clone(), line, character))
+        .await
+        .expect("missing label declaration request")
+        .is_none());
+    assert!(service
+        .inner()
+        .execute_command(ExecuteCommandParams {
+            command: super::POSSIBLE_TARGETS_LSP_COMMAND.to_string(),
+            arguments: vec![serde_json::json!({
+                "uri": uri,
+                "line": line,
+                "character": character,
+            })],
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .expect("missing label possible targets request")
+        .is_none());
+}
+
+#[tokio::test]
+async fn possible_targets_returns_suppressed_callable_variants_and_lexical_local_only() {
+    let (_dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[
+            ("api.h", "int choose(int value);\n"),
+            (
+                "api.c",
+                "#include \"api.h\"\nint choose(int value) { return value; }\n",
+            ),
+            (
+                "alternate.c",
+                "int choose(int value) { return value + 1; }\n",
+            ),
+        ],
+        "main.c",
+        "#include \"api.h\"\nint run(void) { return choose/*cursor*/(1); }\n",
+    )
+    .await;
+
+    let response = service
+        .inner()
+        .execute_command(ExecuteCommandParams {
+            command: super::POSSIBLE_TARGETS_LSP_COMMAND.to_string(),
+            arguments: vec![serde_json::json!({
+                "uri": uri,
+                "line": line,
+                "character": character,
+            })],
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .expect("possible targets command")
+        .expect("possible targets response");
+    let items = response["items"].as_array().expect("items");
+    assert_eq!(items.len(), 3, "all bounded callable variants survive");
+    let roles: HashSet<_> = items
+        .iter()
+        .filter_map(|item| item["role"].as_str())
+        .collect();
+    assert_eq!(roles, HashSet::from(["definition", "declaration"]));
+    assert_eq!(response["coverage"]["bounded"], true);
+
+    let (_dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[("other.c", "int value;\n")],
+        "local.c",
+        "int run(void) { int value; return value/*cursor*/; }\n",
+    )
+    .await;
+    let response = service
+        .inner()
+        .execute_command(ExecuteCommandParams {
+            command: super::POSSIBLE_TARGETS_LSP_COMMAND.to_string(),
+            arguments: vec![serde_json::json!({
+                "uri": uri,
+                "line": line,
+                "character": character,
+            })],
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .expect("local possible targets command")
+        .expect("local possible targets response");
+    let items = response["items"].as_array().expect("local items");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["kind"], "local_binding");
+    assert_eq!(items[0]["reason"], "lexical_binding");
+    assert_eq!(response["coverage"]["bounded"], false);
+}
+
+#[tokio::test]
+async fn external_object_definition_prefers_full_definition_and_declaration_prefers_header() {
+    let (_dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[
+            ("api.h", "extern int count;\n"),
+            ("api.c", "#include \"api.h\"\nint count = 1;\n"),
+        ],
+        "main.c",
+        "#include \"api.h\"\nint run(void) { return count/*cursor*/; }\n",
+    )
+    .await;
+
+    let definition = service
+        .inner()
+        .goto_definition(goto_definition_params(uri.clone(), line, character))
+        .await
+        .expect("object definition request")
+        .expect("object definition response");
+    let definition_paths = definition_locations(definition)
+        .into_iter()
+        .filter_map(|location| location.uri.to_file_path().ok())
+        .collect::<Vec<_>>();
+    assert_eq!(definition_paths.len(), 1);
+    assert_eq!(
+        definition_paths[0].file_name().unwrap().to_string_lossy(),
+        "api.c"
+    );
+
+    let declaration = service
+        .inner()
+        .goto_declaration(goto_definition_params(uri, line, character))
+        .await
+        .expect("object declaration request")
+        .expect("object declaration response");
+    let declaration_paths = definition_locations(declaration)
+        .into_iter()
+        .filter_map(|location| location.uri.to_file_path().ok())
+        .collect::<Vec<_>>();
+    assert_eq!(declaration_paths.len(), 1);
+    assert_eq!(
+        declaration_paths[0].file_name().unwrap().to_string_lossy(),
+        "api.h"
+    );
+}
+
+#[tokio::test]
+async fn static_object_navigation_does_not_cross_translation_units() {
+    let (_dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[("other.c", "static int private_state;\n")],
+        "main.c",
+        "static int private_state;\nint run(void) { return private_state/*cursor*/; }\n",
+    )
+    .await;
+
+    let response = service
+        .inner()
+        .goto_definition(goto_definition_params(uri.clone(), line, character))
+        .await
+        .expect("static object definition request")
+        .expect("static object definition response");
+    let locations = definition_locations(response);
+
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0].uri, uri);
+    assert_eq!(locations[0].range.start.line, 0);
 }
 
 #[tokio::test]
@@ -1833,6 +2147,14 @@ async fn initialize_advertises_project_context_commands() {
         .initialize(InitializeParams::default())
         .await
         .expect("initialize");
+    assert_eq!(
+        initialized.capabilities.declaration_provider,
+        Some(DeclarationCapability::Simple(true))
+    );
+    assert_eq!(
+        initialized.capabilities.definition_provider,
+        Some(OneOf::Left(true))
+    );
     let commands = initialized
         .capabilities
         .execute_command_provider
@@ -1840,6 +2162,7 @@ async fn initialize_advertises_project_context_commands() {
         .commands;
     assert!(commands.contains(&super::PROJECT_CONTEXTS_LSP_COMMAND.to_string()));
     assert!(commands.contains(&super::SET_PROJECT_CONTEXT_LSP_COMMAND.to_string()));
+    assert!(commands.contains(&super::POSSIBLE_TARGETS_LSP_COMMAND.to_string()));
 }
 
 #[tokio::test]
@@ -3888,18 +4211,18 @@ async fn ordinary_completion_compat_fixture_captures_presented_boundary_output()
                 has_history_command: true,
             },
             PresentedCompletion {
-                label: "fs_external_index".to_string(),
-                kind: Some(CompletionItemKind::STRUCT),
-                detail: Some("external".to_string()),
+                label: "fs_global_index".to_string(),
+                kind: Some(CompletionItemKind::CONSTANT),
+                detail: Some("global".to_string()),
                 documentation: Some(
-                    "FossilSense: external candidate (heuristic, external_first_layer)".to_string(),
+                    "FossilSense: global candidate (fallback, global_fallback)".to_string(),
                 ),
                 sort_text: Some("00000005".to_string()),
                 has_history_command: true,
             },
             PresentedCompletion {
-                label: "fs_global_index".to_string(),
-                kind: Some(CompletionItemKind::CONSTANT),
+                label: "fs_unknown_index".to_string(),
+                kind: Some(CompletionItemKind::ENUM_MEMBER),
                 detail: Some("global".to_string()),
                 documentation: Some(
                     "FossilSense: global candidate (fallback, global_fallback)".to_string(),
@@ -3908,8 +4231,8 @@ async fn ordinary_completion_compat_fixture_captures_presented_boundary_output()
                 has_history_command: true,
             },
             PresentedCompletion {
-                label: "fs_unknown_index".to_string(),
-                kind: Some(CompletionItemKind::ENUM_MEMBER),
+                label: "fs_external_index".to_string(),
+                kind: Some(CompletionItemKind::STRUCT),
                 detail: Some("global".to_string()),
                 documentation: Some(
                     "FossilSense: global candidate (fallback, global_fallback)".to_string(),

@@ -8,22 +8,23 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tower_lsp::jsonrpc::Result as LspResult;
+use tower_lsp::lsp_types::request::{GotoDeclarationParams, GotoDeclarationResponse};
 use tower_lsp::lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
     CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
     CallHierarchyServerCapability, Command, CompletionItem, CompletionItemKind, CompletionList,
-    CompletionOptions, CompletionParams, CompletionResponse, DidChangeTextDocumentParams,
-    DidChangeWatchedFilesParams, DidChangeWorkspaceFoldersParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentSymbol, DocumentSymbolParams,
-    DocumentSymbolResponse, Documentation, ExecuteCommandParams, GotoDefinitionParams,
-    GotoDefinitionResponse, Hover, HoverParams, HoverProviderCapability, InitializeParams,
-    InitializeResult, InitializedParams, Location, MessageType, OneOf, ReferenceParams,
-    SaveOptions, SemanticTokenType, SemanticTokens, SemanticTokensFullOptions,
-    SemanticTokensLegend, SemanticTokensOptions, SemanticTokensParams, SemanticTokensRangeParams,
-    SemanticTokensRangeResult, SemanticTokensResult, SemanticTokensServerCapabilities,
-    ServerCapabilities, ServerInfo, SignatureHelp, SignatureHelpParams, SymbolInformation,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
-    TextDocumentSyncSaveOptions, Url, WorkspaceFoldersServerCapabilities,
+    CompletionOptions, CompletionParams, CompletionResponse, DeclarationCapability,
+    DidChangeTextDocumentParams, DidChangeWatchedFilesParams, DidChangeWorkspaceFoldersParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
+    DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, Documentation,
+    ExecuteCommandParams, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams,
+    HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams, Location,
+    MessageType, OneOf, ReferenceParams, SaveOptions, SemanticTokenType, SemanticTokens,
+    SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions, SemanticTokensParams,
+    SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult,
+    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SignatureHelp,
+    SignatureHelpParams, SymbolInformation, TextDocumentSyncCapability, TextDocumentSyncKind,
+    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, Url, WorkspaceFoldersServerCapabilities,
     WorkspaceServerCapabilities, WorkspaceSymbolParams,
 };
 use tower_lsp::{async_trait, Client, LanguageServer, LspService, Server};
@@ -57,7 +58,9 @@ mod indexing;
 mod language_server;
 mod lsp_adapters;
 mod member_completion;
+mod navigation;
 mod options;
+mod possible_targets;
 mod project_context_commands;
 mod semantic_tokens;
 mod signature_help;
@@ -78,6 +81,7 @@ use lsp_adapters::{
     candidate_to_location, grouped_reference_items, hit_to_location, parsed_to_document_symbol,
     record_to_symbol_information, GroupedReferenceItem,
 };
+use navigation::NavigationOperation;
 use options::{
     candidate_reason_log_lines, completion_trigger_characters, empty_completion_list,
     member_completion_is_incomplete, parse_completion_history_mode, parse_completion_mode,
@@ -370,6 +374,7 @@ pub(super) const CLEAR_COMPLETION_HISTORY_LSP_COMMAND: &str =
 /// `{ uri, line, character }` and returns the role-labeled hits the standard
 /// `textDocument/references` cannot carry over the wire.
 const GROUPED_REFERENCES_LSP_COMMAND: &str = "fossilsense.lsp.groupedReferences";
+const POSSIBLE_TARGETS_LSP_COMMAND: &str = "fossilsense.lsp.possibleTargets";
 const PROJECT_CONTEXTS_LSP_COMMAND: &str = "fossilsense.lsp.projectContexts";
 const SET_PROJECT_CONTEXT_LSP_COMMAND: &str = "fossilsense.lsp.setProjectContext";
 const CALL_RELATIONS_LSP_COMMAND: &str = "fossilsense.lsp.callRelations";

@@ -243,10 +243,9 @@ impl IndexStore {
         Ok(())
     }
 
-    /// Resolved include edges as `(src_path, dst_path)` pairs for building the
-    /// in-memory reachability graph. Resolution kind is *not* read here — the
-    /// graph is a plain file-to-file closure; the kind is read where a decision
-    /// needs it (e.g. [`apply_directly_included_derivation`] via in-row SQL).
+    /// Legacy `(src_path, dst_path)` projection. Production reachability loads
+    /// [`crate::store::views::IncludeEdgeRow`] so `ResolutionKind` is retained;
+    /// this compatibility wrapper deliberately treats its pairs as strong.
     #[allow(dead_code)]
     pub fn load_include_edge_paths(&self) -> Result<Vec<(String, String)>> {
         self.reach_graph_view().include_edges().map(|rows| {

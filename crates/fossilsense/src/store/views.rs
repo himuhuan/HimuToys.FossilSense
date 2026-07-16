@@ -4,6 +4,7 @@ use anyhow::Result;
 #[cfg(test)]
 use rusqlite::OptionalExtension;
 
+use crate::includes::ResolutionKind;
 use crate::reachability::OpenReason;
 
 mod call_facts;
@@ -24,6 +25,7 @@ pub struct NameTableSymbolRow {
     pub external: bool,
     pub path: String,
     pub kind: String,
+    pub role: String,
     pub directly_included: bool,
 }
 
@@ -37,6 +39,7 @@ pub struct NameTableSymbolRef<'a> {
     pub external: bool,
     pub path: &'a str,
     pub kind: &'a str,
+    pub role: &'a str,
     pub directly_included: bool,
 }
 
@@ -58,6 +61,7 @@ impl NameTableSymbolRow {
 pub struct IncludeEdgeRow {
     pub source_path: String,
     pub target_path: String,
+    pub resolution: ResolutionKind,
 }
 
 impl IncludeEdgeRow {
@@ -116,7 +120,7 @@ impl<'a> NameTableStoreView<'a> {
 
     pub fn symbol_rows(&self) -> Result<Vec<NameTableSymbolRow>> {
         let mut stmt = self.store.conn.prepare(
-            "SELECT s.id, s.name, f.source, f.path, s.kind, f.directly_included FROM symbols s JOIN files f ON f.id = s.file_id \
+            "SELECT s.id, s.name, f.source, f.path, s.kind, s.role, f.directly_included FROM symbols s JOIN files f ON f.id = s.file_id \
              WHERE s.kind != 'field'",
         )?;
         let rows = stmt.query_map([], name_table_symbol_row)?;
@@ -128,7 +132,7 @@ impl<'a> NameTableStoreView<'a> {
         F: for<'row> FnMut(NameTableSymbolRef<'row>) -> Result<()>,
     {
         let mut stmt = self.store.conn.prepare(
-            "SELECT s.id, s.name, f.source, f.path, s.kind, f.directly_included FROM symbols s JOIN files f ON f.id = s.file_id \
+            "SELECT s.id, s.name, f.source, f.path, s.kind, s.role, f.directly_included FROM symbols s JOIN files f ON f.id = s.file_id \
              WHERE s.kind != 'field'",
         )?;
         let mut rows = stmt.query([])?;
@@ -138,13 +142,15 @@ impl<'a> NameTableStoreView<'a> {
             let source = row.get_ref(2)?.as_str()?;
             let path = row.get_ref(3)?.as_str()?;
             let kind = row.get_ref(4)?.as_str()?;
+            let role = row.get_ref(5)?.as_str()?;
             visitor(NameTableSymbolRef {
                 symbol_id: row.get(0)?,
                 label,
                 external: source == "external",
                 path,
                 kind,
-                directly_included: row.get(5)?,
+                role,
+                directly_included: row.get(6)?,
             })?;
             count += 1;
         }
@@ -176,7 +182,7 @@ impl<'a> NameTableStoreView<'a> {
         for chunk in paths.chunks(400) {
             let placeholders = vec!["?"; chunk.len()].join(",");
             let sql = format!(
-                "SELECT s.id, s.name, f.source, f.path, s.kind, f.directly_included FROM symbols s JOIN files f ON f.id = s.file_id \
+                "SELECT s.id, s.name, f.source, f.path, s.kind, s.role, f.directly_included FROM symbols s JOIN files f ON f.id = s.file_id \
                  WHERE s.kind != 'field' AND f.path IN ({placeholders})"
             );
             let mut stmt = self.store.conn.prepare(&sql)?;
@@ -213,7 +219,7 @@ impl<'a> ReachGraphStoreView<'a> {
 
     pub fn include_edges(&self) -> Result<Vec<IncludeEdgeRow>> {
         let mut stmt = self.store.conn.prepare(
-            "SELECT sf.path, df.path FROM include_edges e \
+            "SELECT sf.path, df.path, e.resolution FROM include_edges e \
              JOIN files sf ON sf.id = e.src_file_id \
              JOIN files df ON df.id = e.dst_file_id",
         )?;
@@ -221,6 +227,7 @@ impl<'a> ReachGraphStoreView<'a> {
             Ok(IncludeEdgeRow {
                 source_path: row.get(0)?,
                 target_path: row.get(1)?,
+                resolution: ResolutionKind::from_str(&row.get::<_, String>(2)?),
             })
         })?;
         collect_rows(rows)
@@ -266,7 +273,7 @@ impl<'a> ReachGraphStoreView<'a> {
             let placeholders = vec!["?"; chunk.len()].join(",");
 
             let edge_sql = format!(
-                "SELECT sf.path, df.path FROM include_edges e \
+                "SELECT sf.path, df.path, e.resolution FROM include_edges e \
                  JOIN files sf ON sf.id = e.src_file_id \
                  JOIN files df ON df.id = e.dst_file_id \
                  WHERE sf.path IN ({placeholders})"
@@ -278,6 +285,7 @@ impl<'a> ReachGraphStoreView<'a> {
                     Ok(IncludeEdgeRow {
                         source_path: row.get(0)?,
                         target_path: row.get(1)?,
+                        resolution: ResolutionKind::from_str(&row.get::<_, String>(2)?),
                     })
                 },
             )?;
@@ -439,6 +447,42 @@ impl<'a> SymbolReadView<'a> {
         records.truncate(limit);
         Ok((records, truncated))
     }
+
+    /// Bounded exact-name read restricted to request-priority paths. This is
+    /// the symbol-table counterpart of
+    /// `CallFactStoreView::anchors_by_name_in_paths_limited`: reachability is
+    /// request-local, while SQLite remains responsible for an indexed,
+    /// LIMIT+1 exact-name lookup rather than a workspace scan.
+    pub fn symbols_by_name_in_paths_limited(
+        &self,
+        name: &str,
+        paths: &[String],
+        limit: usize,
+    ) -> Result<(Vec<SymbolRecord>, bool)> {
+        let mut records = Vec::new();
+        for chunk in paths.chunks(399) {
+            let probe_limit = limit.saturating_sub(records.len()).saturating_add(1);
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "{SELECT_SYMBOL_JOIN} WHERE s.name = ? AND f.path IN ({placeholders}) \
+                 ORDER BY f.path, s.start_line, s.start_col, s.id LIMIT {probe_limit}"
+            );
+            let mut params = Vec::with_capacity(chunk.len() + 1);
+            params.push(name);
+            params.extend(chunk.iter().map(String::as_str));
+            let mut stmt = self.store.conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(params), map_symbol_record)?;
+            for row in rows {
+                records.push(row?);
+            }
+            if records.len() > limit {
+                break;
+            }
+        }
+        let truncated = records.len() > limit;
+        records.truncate(limit);
+        Ok((records, truncated))
+    }
 }
 
 pub struct ReferenceFileStoreView<'a> {
@@ -495,7 +539,8 @@ fn name_table_symbol_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NameTableS
         external: source == "external",
         path: row.get(3)?,
         kind: row.get(4)?,
-        directly_included: row.get::<_, i64>(5)? != 0,
+        role: row.get(5)?,
+        directly_included: row.get::<_, i64>(6)? != 0,
     })
 }
 

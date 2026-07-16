@@ -51,6 +51,11 @@ impl Backend {
             .as_ref()
             .and_then(|context| self.reach_scope_from_context(uri, context))
             .map(|(rel, reach)| query::CompletionScope {
+                direct_external_files: context
+                    .as_ref()
+                    .and_then(|context| context.engine.reach_graph.as_deref())
+                    .map(|graph| graph.directly_included_external_paths_from(&rel))
+                    .unwrap_or_default(),
                 current_path: Some(rel),
                 reach: (*reach).clone(),
             });
