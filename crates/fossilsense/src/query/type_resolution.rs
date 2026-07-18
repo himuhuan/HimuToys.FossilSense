@@ -755,7 +755,7 @@ fn compose_aka_spelling(record: &RecordCandidate, trace: &[TypeAliasCandidate]) 
                 spelling.push(']');
                 form = Form::Array;
             }
-            DeclaratorShape::Unsupported => return None,
+            DeclaratorShape::FunctionPointer { .. } | DeclaratorShape::Unsupported => return None,
         }
     }
     Some(spelling)

@@ -825,6 +825,157 @@ fn cpp_file_scope_object_without_initializer_is_a_full_definition() {
 }
 
 #[test]
+fn usable_ast_keeps_initializer_calls_out_of_function_declarations() {
+    let source = "int value = make(1);\n";
+    let index = parse(Path::new("objects.c"), source);
+
+    assert!(!index.diagnostics.fallback_used);
+    assert_eq!(index.diagnostics.ast_source, super::FactSource::Ast);
+    assert!(index
+        .occurrences
+        .iter()
+        .any(|occ| occ.name == "value" && occ.role == SyntacticRole::Declaration));
+    assert!(index
+        .call_sites
+        .iter()
+        .any(|call| call.callee_name.as_deref() == Some("make")));
+    assert!(
+        index
+            .callable_anchors
+            .iter()
+            .all(|anchor| anchor.name != "make" && anchor.name != "value"),
+        "initializer expressions and objects must not become callable anchors"
+    );
+}
+
+#[test]
+fn usable_cpp_ast_keeps_constructor_style_object_out_of_function_declarations() {
+    let source = "struct Widget { Widget(int); };\nWidget widget(42);\n";
+    let index = parse(Path::new("objects.cpp"), source);
+
+    assert!(!index.diagnostics.fallback_used);
+    assert_eq!(index.diagnostics.ast_source, super::FactSource::Ast);
+    assert!(index
+        .occurrences
+        .iter()
+        .any(|occ| occ.name == "widget" && occ.role == SyntacticRole::Declaration));
+    assert!(
+        index
+            .callable_anchors
+            .iter()
+            .all(|anchor| anchor.name != "widget"),
+        "constructor-style object initialization must not become a callable anchor"
+    );
+}
+
+#[test]
+fn usable_ast_keeps_function_pointer_declarator_out_of_function_declarations() {
+    let source = "int (*handler)(int);\n";
+    let index = parse(Path::new("callbacks.c"), source);
+
+    assert!(!index.diagnostics.fallback_used);
+    assert_eq!(index.diagnostics.ast_source, super::FactSource::Ast);
+    assert!(
+        index
+            .callable_anchors
+            .iter()
+            .all(|anchor| anchor.name != "handler" && anchor.name != "int"),
+        "function pointer declarators must not become callable anchors"
+    );
+}
+
+#[test]
+fn usable_ast_keeps_top_level_macro_invocation_out_of_function_declarations() {
+    let source = "REGISTER(foo);\nint real(void);\n";
+    let index = parse(Path::new("macros.c"), source);
+
+    assert!(!index.diagnostics.fallback_used);
+    assert_eq!(index.diagnostics.ast_source, super::FactSource::Ast);
+    assert!(index
+        .callable_anchors
+        .iter()
+        .any(|anchor| anchor.name == "real"));
+    assert!(
+        index
+            .callable_anchors
+            .iter()
+            .all(|anchor| anchor.name != "REGISTER"),
+        "top-level macro invocations must not become callable anchors"
+    );
+}
+
+#[test]
+fn parser_semantic_candidate_fixtures_cover_required_declaration_shapes() {
+    let c = include_str!("fixtures/semantic_candidates.c");
+    let cpp = include_str!("fixtures/semantic_candidates.cpp");
+    let header = include_str!("fixtures/semantic_candidates.h");
+    let inl = include_str!("fixtures/semantic_candidates.inl");
+
+    for (path, source) in [
+        ("semantic_candidates.c", c),
+        ("semantic_candidates.cpp", cpp),
+        ("semantic_candidates.h", header),
+        ("semantic_candidates.inl", inl),
+    ] {
+        let index = parse(Path::new(path), source);
+        assert!(
+            !index.diagnostics.fallback_used,
+            "{path} should produce a usable syntax tree"
+        );
+        assert_eq!(index.diagnostics.ast_source, super::FactSource::Ast);
+    }
+
+    let c_index = parse(Path::new("semantic_candidates.c"), c);
+    assert!(c_index.diagnostics.parse_error_count > 0);
+    assert!(has_symbol(
+        &c_index,
+        "c_defined_function",
+        SymbolKind::Function
+    ));
+    assert!(has_symbol(
+        &c_index,
+        "c_internal_object",
+        SymbolKind::GlobalVariable
+    ));
+    assert!(c.contains("int c_first_object, c_second_object = 2;"));
+    assert!(c.contains("int (*c_handler)(int);"));
+    assert!(c.contains("REGISTER_CANDIDATE(alpha);"));
+    assert!(c.contains("int c_malformed_object = };"));
+
+    let cpp_index = parse(Path::new("semantic_candidates.cpp"), cpp);
+    assert!(cpp_index
+        .members
+        .iter()
+        .any(|member| member.name == "method"));
+    assert!(cpp.contains("template <typename T>"));
+    assert!(cpp.contains("demo::Widget cpp_global_widget(42);"));
+    assert!(cpp.contains("Widget Widget::operator+"));
+
+    let header_index = parse(Path::new("semantic_candidates.h"), header);
+    assert!(has_symbol(
+        &header_index,
+        "guarded_api",
+        SymbolKind::Function
+    ));
+    assert!(header_index
+        .aliases
+        .iter()
+        .any(|alias| alias.alias == "CandidateRecordPtr"));
+    assert!(header.contains("#ifndef SEMANTIC_CANDIDATES_H"));
+    assert!(header.contains("#ifdef ENABLE_OPTIONAL_CANDIDATE"));
+
+    let inl_index = parse(Path::new("semantic_candidates.inl"), inl);
+    assert!(has_symbol(
+        &inl_index,
+        "qualified_candidate",
+        SymbolKind::Function
+    ));
+    assert!(inl.contains("template <typename T>"));
+    assert!(inl.contains("inline int Widget::method"));
+    assert!(inl.contains("demo::clamp_candidate(3, 1, 5)"));
+}
+
+#[test]
 fn leading_comments_do_not_pollute_symbol_signature_or_start_line() {
     let source = "#define VALUE 1\n/// @brief Helps the smoke test.\nvoid helper(void);\n";
     let index = parse(Path::new("defs.h"), source);
@@ -1046,6 +1197,7 @@ fn parse_fact_masks_document_current_field_contents() {
     let persistent = index.persistent_facts();
     assert_eq!(persistent.symbols.len(), index.symbols.len());
     assert_eq!(persistent.includes.len(), index.includes.len());
+    assert_eq!(persistent.declarations.len(), index.declarations.len());
     assert_eq!(persistent.records.len(), index.records.len());
     assert_eq!(persistent.fields.len(), index.fields.len());
     assert_eq!(persistent.members.len(), index.members.len());
@@ -1063,6 +1215,10 @@ fn parse_fact_masks_document_current_field_contents() {
         .aliases
         .iter()
         .any(|alias| alias.alias == "WidgetAlias"));
+    assert!(index
+        .declarations
+        .iter()
+        .any(|declaration| declaration.name == "use"));
     assert!(index.occurrences.is_empty());
     assert!(index.local_declarations.is_empty());
     assert!(index.local_bindings.is_empty());
@@ -1225,6 +1381,213 @@ int caller(void) { return helper(7); }
 }
 
 #[test]
+fn callable_anchors_project_canonical_function_declaration_facts() {
+    let source = r#"
+static int helper(int value) { return value; }
+int caller(void) { return helper(7); }
+"#;
+    let index = parse(std::path::Path::new("src/main.c"), source);
+    let helper_anchor = index
+        .callable_anchors
+        .iter()
+        .find(|anchor| anchor.name == "helper")
+        .expect("helper anchor");
+    let helper_fact = index
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name == "helper")
+        .expect("helper declaration fact");
+
+    assert_eq!(
+        helper_fact.declaration_kind,
+        crate::semantic_model::SemanticDeclarationKind::Function
+    );
+    assert_eq!(
+        helper_fact.role,
+        crate::semantic_model::SemanticDeclarationRole::Definition
+    );
+    assert_eq!(helper_fact.owner, None);
+    assert_eq!(helper_fact.path, "src/main.c");
+    assert_eq!(helper_fact.name_range, helper_anchor.name_range);
+    assert_eq!(
+        helper_fact.declaration_range,
+        helper_anchor.declaration_range
+    );
+    assert_eq!(
+        helper_fact.canonical_signature.as_deref(),
+        Some(helper_anchor.canonical_signature.as_str())
+    );
+    assert!(matches!(
+        helper_fact.linkage,
+        crate::call_model::LinkageDomain::Internal(_)
+    ));
+    assert_eq!(
+        helper_fact.identity.locator.fingerprint,
+        helper_anchor.anchor_fingerprint
+    );
+    assert_eq!(
+        helper_fact.identity.logical_key.qualified_name,
+        helper_anchor.qualified_name
+    );
+    assert_eq!(
+        helper_fact.identity.language,
+        crate::semantic_model::SemanticLanguage::C
+    );
+    assert_eq!(
+        helper_fact.identity.language_fidelity,
+        crate::semantic_model::LanguageFidelity::Explicit
+    );
+    assert_eq!(
+        helper_fact.identity.provenance,
+        crate::semantic_model::SemanticFactProvenance::Ast
+    );
+    assert_eq!(
+        helper_fact.identity.fact_fidelity,
+        crate::semantic_model::SemanticFactFidelity::Authoritative
+    );
+}
+
+#[test]
+fn callable_anchors_project_canonical_method_declaration_facts() {
+    let source = r#"
+struct Worker {
+  int run(void) { return 1; }
+};
+"#;
+    let index = parse(std::path::Path::new("src/main.cpp"), source);
+    let method_fact = index
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name == "run")
+        .expect("method declaration fact");
+
+    assert_eq!(method_fact.qualified_name, "Worker::run");
+    assert_eq!(method_fact.owner.as_deref(), Some("Worker"));
+    assert_eq!(
+        method_fact.declaration_kind,
+        crate::semantic_model::SemanticDeclarationKind::Method
+    );
+    assert_eq!(
+        method_fact.role,
+        crate::semantic_model::SemanticDeclarationRole::Definition
+    );
+    assert_eq!(
+        method_fact.identity.language,
+        crate::semantic_model::SemanticLanguage::Cpp
+    );
+    assert_eq!(
+        method_fact.identity.logical_key.owner.as_deref(),
+        Some("Worker")
+    );
+    assert_eq!(
+        method_fact.identity.logical_key.declaration_kind,
+        crate::semantic_model::SemanticDeclarationKind::Method
+    );
+}
+
+#[test]
+fn ast_projects_file_scope_object_declaration_facts() {
+    let source = r#"
+extern int declared_object;
+int first_object, second_object = 2;
+static int internal_object;
+int (*handler)(int);
+"#;
+    let index = parse(std::path::Path::new("src/objects.c"), source);
+    let object = |name: &str| {
+        index
+            .declarations
+            .iter()
+            .find(|declaration| declaration.name == name)
+            .unwrap_or_else(|| panic!("missing object declaration fact {name}"))
+    };
+
+    let declared = object("declared_object");
+    assert_eq!(
+        declared.declaration_kind,
+        crate::semantic_model::SemanticDeclarationKind::Object
+    );
+    assert_eq!(
+        declared.role,
+        crate::semantic_model::SemanticDeclarationRole::Declaration
+    );
+    assert_eq!(declared.has_initializer, Some(false));
+
+    let first = object("first_object");
+    let second = object("second_object");
+    assert_eq!(
+        first.role,
+        crate::semantic_model::SemanticDeclarationRole::TentativeDefinition
+    );
+    assert_eq!(
+        second.role,
+        crate::semantic_model::SemanticDeclarationRole::Definition
+    );
+    assert_eq!(first.has_initializer, Some(false));
+    assert_eq!(second.has_initializer, Some(true));
+    assert_ne!(
+        first.identity.locator.fingerprint,
+        second.identity.locator.fingerprint
+    );
+
+    let internal = object("internal_object");
+    assert!(matches!(
+        internal.linkage,
+        crate::call_model::LinkageDomain::Internal(_)
+    ));
+
+    let handler = object("handler");
+    assert!(matches!(
+        handler.declarator_shape,
+        Some(super::DeclaratorShape::FunctionPointer { .. })
+    ));
+    assert_eq!(
+        handler.identity.language,
+        crate::semantic_model::SemanticLanguage::C
+    );
+    assert_eq!(
+        handler.identity.provenance,
+        crate::semantic_model::SemanticFactProvenance::Ast
+    );
+}
+
+#[test]
+fn ast_projects_namespace_scope_cpp_object_declaration_facts() {
+    let source = r#"
+namespace demo {
+struct Widget { explicit Widget(int); };
+Widget widget(42);
+int first, second = 2;
+}
+"#;
+    let index = parse(std::path::Path::new("src/objects.cpp"), source);
+    let widget = index
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name == "widget")
+        .expect("widget object fact");
+    assert_eq!(widget.qualified_name, "demo::widget");
+    assert_eq!(widget.owner.as_deref(), Some("demo"));
+    assert_eq!(
+        widget.role,
+        crate::semantic_model::SemanticDeclarationRole::Definition
+    );
+    assert_eq!(widget.has_initializer, Some(true));
+    assert_eq!(
+        widget.identity.language,
+        crate::semantic_model::SemanticLanguage::Cpp
+    );
+
+    let second = index
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name == "second")
+        .expect("second object fact");
+    assert_eq!(second.qualified_name, "demo::second");
+    assert_eq!(second.has_initializer, Some(true));
+}
+
+#[test]
 fn call_facts_capture_namespace_qualified_free_calls() {
     let source = r#"
 namespace net { int open(int port) { return port; } }
@@ -1334,10 +1697,184 @@ int caller(void) { return (*fp)(); }
     assert!(index.callable_anchors.iter().any(|anchor| {
         anchor.kind == crate::call_model::CallableKind::SyntheticGlobalInitializer
     }));
+    assert!(
+        !index.declarations.iter().any(|declaration| {
+            declaration.name == "<global initialization>"
+                || declaration.identity.provenance
+                    == crate::semantic_model::SemanticFactProvenance::Synthetic
+        }),
+        "synthetic call-relation scopes are not canonical declarations"
+    );
     assert!(index
         .call_sites
         .iter()
         .any(|call| call.form == crate::call_model::CallForm::FunctionPointer));
+}
+
+#[test]
+fn external_call_declaration_retention_updates_canonical_declaration_facts() {
+    let mut index = parse(
+        std::path::Path::new("C:/sdk/api.h"),
+        "int sdk_open(int port) { return port; }\n",
+    );
+    index.retain_external_call_declarations();
+
+    let anchor = index
+        .callable_anchors
+        .iter()
+        .find(|anchor| anchor.name == "sdk_open")
+        .expect("callable anchor");
+    let fact = index
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name == "sdk_open")
+        .expect("declaration fact");
+
+    assert_eq!(anchor.role, crate::call_model::AnchorRole::Declaration);
+    assert_eq!(
+        fact.role,
+        crate::semantic_model::SemanticDeclarationRole::Declaration
+    );
+    assert_eq!(
+        fact.identity.role,
+        crate::semantic_model::SemanticDeclarationRole::Declaration
+    );
+    assert!(index.call_sites.is_empty());
+}
+
+#[test]
+fn out_of_class_method_definition_projects_as_same_method_identity() {
+    let source = r#"
+struct Worker {
+  int run(int value);
+};
+int Worker::run(int value) { return value; }
+"#;
+    let index = parse(std::path::Path::new("src/worker.cpp"), source);
+    let method_anchors: Vec<_> = index
+        .callable_anchors
+        .iter()
+        .filter(|anchor| anchor.name == "run")
+        .collect();
+    assert_eq!(method_anchors.len(), 2);
+    assert!(method_anchors
+        .iter()
+        .all(|anchor| { anchor.owner_kind == Some(crate::call_model::OwnerKindHint::Record) }));
+    assert_eq!(method_anchors[0].entity_key, method_anchors[1].entity_key);
+
+    let method_facts: Vec<_> = index
+        .declarations
+        .iter()
+        .filter(|declaration| declaration.name == "run")
+        .collect();
+    assert_eq!(method_facts.len(), 2);
+    assert!(method_facts.iter().all(|fact| {
+        fact.declaration_kind == crate::semantic_model::SemanticDeclarationKind::Method
+            && fact.identity.logical_key.declaration_kind
+                == crate::semantic_model::SemanticDeclarationKind::Method
+    }));
+    assert_eq!(
+        method_facts[0].identity.logical_key,
+        method_facts[1].identity.logical_key
+    );
+}
+
+#[test]
+fn object_logical_identity_ignores_extern_initializer_and_neighbor_declarators() {
+    let declaration = parse(
+        std::path::Path::new("include/api.h"),
+        "extern int shared_value;\n",
+    );
+    let definition = parse(std::path::Path::new("src/api.c"), "int shared_value = 1;\n");
+    let declaration = declaration
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name == "shared_value")
+        .expect("object declaration");
+    let definition = definition
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name == "shared_value")
+        .expect("object definition");
+    assert_eq!(
+        declaration.identity.logical_key.canonical_signature,
+        Some("int shared_value".to_string())
+    );
+    assert_eq!(
+        declaration.identity.logical_key.canonical_signature,
+        definition.identity.logical_key.canonical_signature
+    );
+
+    let multiple = parse(
+        std::path::Path::new("src/multiple.c"),
+        "int first, second = shared_value;\n",
+    );
+    let first = multiple
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name == "first")
+        .expect("first object");
+    let second = multiple
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name == "second")
+        .expect("second object");
+    assert_eq!(
+        first.identity.logical_key.canonical_signature,
+        Some("int first".to_string())
+    );
+    assert_eq!(
+        second.identity.logical_key.canonical_signature,
+        Some("int second".to_string())
+    );
+}
+
+#[test]
+fn cpp_namespace_scope_const_object_has_internal_linkage_by_default() {
+    let index = parse(
+        std::path::Path::new("src/constants.cpp"),
+        "const int file_local = 1;\nextern const int shared_constant;\n",
+    );
+    let file_local = index
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name == "file_local")
+        .expect("file-local const");
+    let shared = index
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name == "shared_constant")
+        .expect("extern const");
+
+    assert!(matches!(
+        file_local.linkage,
+        crate::call_model::LinkageDomain::Internal(_)
+    ));
+    assert!(matches!(
+        shared.linkage,
+        crate::call_model::LinkageDomain::External
+    ));
+}
+
+#[test]
+fn inl_uses_cpp_language_for_parser_and_canonical_facts() {
+    let source = r#"
+namespace demo {
+struct Widget { int method(int value); };
+}
+inline int demo::Widget::method(int value) { return value; }
+"#;
+    let index = parse(std::path::Path::new("src/widget.inl"), source);
+    assert!(!index.diagnostics.fallback_used);
+    assert_eq!(index.diagnostics.parse_error_count, 0);
+    assert!(!index.declarations.is_empty());
+    assert!(index.declarations.iter().all(|declaration| {
+        declaration.identity.language == crate::semantic_model::SemanticLanguage::Cpp
+    }));
+    assert!(index.callable_anchors.iter().any(|anchor| {
+        anchor.name == "method"
+            && anchor.owner_kind == Some(crate::call_model::OwnerKindHint::Record)
+    }));
 }
 
 #[test]

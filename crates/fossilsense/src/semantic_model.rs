@@ -11,6 +11,120 @@ use crate::call_model::SourceRange;
 /// column layout happens to stay compatible.
 pub const PARSER_FACT_VERSION: i64 = 3;
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct DeclarationLocator {
+    pub workspace_id: String,
+    pub path: String,
+    pub range: SourceRange,
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct LogicalEntityKey {
+    pub qualified_name: String,
+    pub declaration_kind: SemanticDeclarationKind,
+    pub owner: Option<String>,
+    pub canonical_signature: Option<String>,
+    pub linkage_domain: String,
+    pub guard_fingerprint: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
+pub enum SemanticDeclarationKind {
+    Function,
+    Method,
+    Object,
+    Type,
+    Alias,
+    EnumConstant,
+    Macro,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
+pub enum SemanticDeclarationRole {
+    Declaration,
+    Definition,
+    TentativeDefinition,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
+pub enum SemanticLanguage {
+    C,
+    Cpp,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
+pub enum LanguageFidelity {
+    Explicit,
+    Inferred,
+    Heuristic,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
+pub enum SemanticFactProvenance {
+    Ast,
+    LexicalFallback,
+    Synthetic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
+pub enum SemanticFactFidelity {
+    Authoritative,
+    Incomplete,
+    LowFidelity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct DeclarationIdentity {
+    pub locator: DeclarationLocator,
+    pub logical_key: LogicalEntityKey,
+    pub language: SemanticLanguage,
+    pub language_fidelity: LanguageFidelity,
+    pub provenance: SemanticFactProvenance,
+    pub fact_fidelity: SemanticFactFidelity,
+    pub role: SemanticDeclarationRole,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeclarationFact {
+    pub identity: DeclarationIdentity,
+    pub name: String,
+    pub qualified_name: String,
+    pub declaration_kind: SemanticDeclarationKind,
+    pub role: SemanticDeclarationRole,
+    pub path: String,
+    pub name_range: SourceRange,
+    pub declaration_range: SourceRange,
+    pub canonical_signature: Option<String>,
+    pub declarator_shape: Option<DeclaratorShape>,
+    pub has_initializer: Option<bool>,
+    pub owner: Option<String>,
+    pub linkage: crate::call_model::LinkageDomain,
+    pub guard: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Symbol {
     pub name: String,
@@ -172,6 +286,7 @@ pub enum DeclaratorShape {
     Identity,
     Pointer { qualifiers: Vec<String> },
     Array { extent_text: String },
+    FunctionPointer { signature: String },
     Qualified { qualifiers: Vec<String> },
     Unsupported,
 }
@@ -253,10 +368,112 @@ pub struct Occurrence {
 pub struct PersistentFacts<'a> {
     pub symbols: &'a [Symbol],
     pub includes: &'a [Include],
+    pub declarations: &'a [DeclarationFact],
     pub records: &'a [RecordDef],
     pub fields: &'a [FieldDef],
     pub members: &'a [MemberDef],
     pub aliases: &'a [TypeAlias],
     pub callable_anchors: &'a [crate::call_model::CallableAnchor],
     pub call_sites: &'a [crate::call_model::CallSiteFact],
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::call_model::{SourcePosition, SourceRange};
+
+    fn sample_identity() -> DeclarationIdentity {
+        DeclarationIdentity {
+            locator: DeclarationLocator {
+                workspace_id: "workspace".to_string(),
+                path: "include/api.h".to_string(),
+                range: SourceRange {
+                    start: SourcePosition {
+                        line: 4,
+                        character: 8,
+                    },
+                    end: SourcePosition {
+                        line: 4,
+                        character: 22,
+                    },
+                    start_byte: 48,
+                    end_byte: 62,
+                },
+                fingerprint: "decl-0001".to_string(),
+            },
+            logical_key: LogicalEntityKey {
+                qualified_name: "demo::lookup".to_string(),
+                declaration_kind: SemanticDeclarationKind::Function,
+                owner: Some("demo".to_string()),
+                canonical_signature: Some("int lookup(int)".to_string()),
+                linkage_domain: "external".to_string(),
+                guard_fingerprint: Some("guard-a".to_string()),
+            },
+            language: SemanticLanguage::Cpp,
+            language_fidelity: LanguageFidelity::Inferred,
+            provenance: SemanticFactProvenance::Ast,
+            fact_fidelity: SemanticFactFidelity::Authoritative,
+            role: SemanticDeclarationRole::Declaration,
+        }
+    }
+
+    #[test]
+    fn declaration_identity_serializes_with_stable_field_and_enum_names() {
+        let value = serde_json::to_value(sample_identity()).expect("identity json");
+
+        assert_eq!(
+            value,
+            json!({
+                "locator": {
+                    "workspaceId": "workspace",
+                    "path": "include/api.h",
+                    "range": {
+                        "start": { "line": 4, "character": 8 },
+                        "end": { "line": 4, "character": 22 },
+                        "startByte": 48,
+                        "endByte": 62
+                    },
+                    "fingerprint": "decl-0001"
+                },
+                "logicalKey": {
+                    "qualifiedName": "demo::lookup",
+                    "declarationKind": "function",
+                    "owner": "demo",
+                    "canonicalSignature": "int lookup(int)",
+                    "linkageDomain": "external",
+                    "guardFingerprint": "guard-a"
+                },
+                "language": "cpp",
+                "languageFidelity": "inferred",
+                "provenance": "ast",
+                "factFidelity": "authoritative",
+                "role": "declaration"
+            })
+        );
+    }
+
+    #[test]
+    fn declaration_identity_round_trips_and_hashes_by_concrete_locator_and_logical_key() {
+        let identity = sample_identity();
+        let encoded = serde_json::to_string(&identity).expect("encoded identity");
+        let decoded: DeclarationIdentity =
+            serde_json::from_str(&encoded).expect("decoded identity");
+
+        assert_eq!(decoded, identity);
+
+        let mut first = DefaultHasher::new();
+        identity.hash(&mut first);
+        let mut second = DefaultHasher::new();
+        decoded.hash(&mut second);
+        assert_eq!(first.finish(), second.finish());
+
+        let mut other = identity.clone();
+        other.locator.fingerprint = "decl-0002".to_string();
+        assert_ne!(other, identity);
+    }
 }

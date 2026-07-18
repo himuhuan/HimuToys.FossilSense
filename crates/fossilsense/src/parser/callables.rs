@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 
 use crate::call_model::{
@@ -49,6 +50,7 @@ pub(super) struct CallFactCollector<'a> {
     anchors: Vec<CallableAnchor>,
     call_sites: Vec<CallSiteFact>,
     global_entity_key: Option<String>,
+    record_names: HashSet<String>,
 }
 
 impl<'a> CallFactCollector<'a> {
@@ -73,6 +75,7 @@ impl<'a> CallFactCollector<'a> {
             anchors: Vec::new(),
             call_sites: Vec::new(),
             global_entity_key: None,
+            record_names: HashSet::new(),
         }
     }
 
@@ -93,17 +96,21 @@ impl<'a> CallFactCollector<'a> {
                     name,
                 });
             }
-            "struct_specifier" | "union_specifier" | "class_specifier"
-                if node.child_by_field_name("body").is_some() =>
-            {
+            "struct_specifier" | "union_specifier" | "class_specifier" => {
                 let name = node
                     .child_by_field_name("name")
                     .and_then(|name| text(name, self.source))
                     .map(str::to_string);
-                self.scopes.push(ScopeFrame::Record {
-                    node_id: node.id(),
-                    name,
-                });
+                if let Some(record_name) = name.as_deref() {
+                    self.record_names
+                        .insert(self.qualify_record_name(record_name));
+                }
+                if node.child_by_field_name("body").is_some() {
+                    self.scopes.push(ScopeFrame::Record {
+                        node_id: node.id(),
+                        name,
+                    });
+                }
             }
             "lambda_expression" => self.scopes.push(ScopeFrame::Lambda { node_id: node.id() }),
             "function_definition" => {
@@ -118,6 +125,11 @@ impl<'a> CallFactCollector<'a> {
                 });
             }
             "declaration" if self.current_callable().is_none() => {
+                if let Some(anchor) = self.callable_anchor(node, AnchorRole::Declaration) {
+                    self.anchors.push(anchor);
+                }
+            }
+            "field_declaration" if self.current_callable().is_none() => {
                 if let Some(anchor) = self.callable_anchor(node, AnchorRole::Declaration) {
                     self.anchors.push(anchor);
                 }
@@ -172,6 +184,8 @@ impl<'a> CallFactCollector<'a> {
             let namespace = namespaces.join("::");
             let kind = if !namespace.is_empty() && owner == namespace {
                 OwnerKindHint::Namespace
+            } else if self.owner_matches_known_record(&owner, &namespaces) {
+                OwnerKindHint::Record
             } else {
                 OwnerKindHint::Unknown
             };
@@ -367,6 +381,24 @@ impl<'a> CallFactCollector<'a> {
                 _ => None,
             })
             .collect()
+    }
+
+    fn qualify_record_name(&self, record_name: &str) -> String {
+        let mut names = self.namespace_names();
+        names.push(record_name.to_string());
+        names.join("::")
+    }
+
+    fn owner_matches_known_record(&self, owner: &str, namespaces: &[String]) -> bool {
+        if self.record_names.contains(owner) {
+            return true;
+        }
+        if owner.contains("::") || namespaces.is_empty() {
+            return false;
+        }
+        let mut qualified = namespaces.to_vec();
+        qualified.push(owner.to_string());
+        self.record_names.contains(&qualified.join("::"))
     }
 
     fn record_owner(&self) -> Option<Option<String>> {
@@ -727,10 +759,23 @@ fn canonical_callable_signature(
     name: &str,
     source: &str,
     is_cpp: bool,
-    presentation: &str,
+    _presentation: &str,
 ) -> String {
     if is_cpp {
-        return canonical_full_signature(presentation);
+        let declaration_end = declaration
+            .child_by_field_name("body")
+            .map(|body| {
+                trim_ascii_whitespace_end(source, declaration.start_byte(), body.start_byte())
+            })
+            .unwrap_or_else(|| declaration.end_byte());
+        let prefix = source
+            .get(declaration.start_byte()..name_node.start_byte())
+            .map(strip_trailing_cpp_owner_qualification)
+            .unwrap_or_default();
+        let suffix = source
+            .get(name_node.end_byte()..declaration_end)
+            .unwrap_or_default();
+        return canonical_full_signature(&format!("{prefix}{name}{suffix}"));
     }
 
     let prefix = source
@@ -779,6 +824,20 @@ fn canonical_callable_signature(
         value
     });
     canonical_full_signature(&format!("{prefix} {name}{parameter_shape}"))
+}
+
+fn strip_trailing_cpp_owner_qualification(prefix: &str) -> &str {
+    let trimmed = prefix.trim_end();
+    if !trimmed.ends_with("::") {
+        return prefix;
+    }
+    let Some(owner_start) = trimmed[..trimmed.len().saturating_sub(2)]
+        .rfind(|ch: char| ch.is_whitespace() || matches!(ch, '*' | '&' | '('))
+        .map(|index| index + 1)
+    else {
+        return prefix;
+    };
+    &prefix[..owner_start]
 }
 
 fn parameter_declarator_identifier(

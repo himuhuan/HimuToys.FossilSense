@@ -218,6 +218,140 @@ pub struct DefinitionCandidate {
     pub reason: ResolutionReason,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(dead_code)]
+pub enum CandidateDisposition {
+    Exact,
+    Preferred,
+    Ambiguous,
+    Fallback,
+}
+
+impl CandidateDisposition {
+    #[allow(dead_code)]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Preferred => "preferred",
+            Self::Ambiguous => "ambiguous",
+            Self::Fallback => "fallback",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[allow(dead_code)]
+pub struct SharedCandidateCoverage {
+    pub scanned: usize,
+    pub truncated: bool,
+    pub scope_open: bool,
+    pub facts_incomplete: bool,
+    pub generation_mismatch: bool,
+}
+
+impl SharedCandidateCoverage {
+    #[allow(dead_code)]
+    pub fn complete(scanned: usize) -> Self {
+        Self {
+            scanned,
+            ..Self::default()
+        }
+    }
+
+    fn permits_exact(&self) -> bool {
+        !self.truncated && !self.scope_open && !self.facts_incomplete && !self.generation_mismatch
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(dead_code)]
+pub struct CandidateRef {
+    pub group_index: usize,
+    pub candidate_index: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct CandidateGroup<T> {
+    pub logical_key: Option<crate::semantic_model::LogicalEntityKey>,
+    pub declaration_kind: crate::semantic_model::SemanticDeclarationKind,
+    pub tier: ScopeTier,
+    pub authoritative: bool,
+    pub low_fidelity: bool,
+    pub candidates: Vec<T>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct CandidateSet<T> {
+    pub all: Vec<CandidateGroup<T>>,
+    pub focused: Vec<CandidateRef>,
+    pub coverage: SharedCandidateCoverage,
+    pub disposition: CandidateDisposition,
+    pub alternative_count: usize,
+}
+
+impl<T> CandidateSet<T> {
+    #[allow(dead_code)]
+    pub fn new(
+        all: Vec<CandidateGroup<T>>,
+        focused: Vec<CandidateRef>,
+        coverage: SharedCandidateCoverage,
+    ) -> Self {
+        let disposition = classify_candidate_disposition(&all, &focused, &coverage);
+        let focused_count = focused.len();
+        let total_count = all
+            .iter()
+            .map(|group| group.candidates.len())
+            .sum::<usize>();
+        Self {
+            all,
+            focused,
+            coverage,
+            disposition,
+            alternative_count: total_count.saturating_sub(focused_count),
+        }
+    }
+}
+
+fn classify_candidate_disposition<T>(
+    all: &[CandidateGroup<T>],
+    focused: &[CandidateRef],
+    coverage: &SharedCandidateCoverage,
+) -> CandidateDisposition {
+    let has_authoritative = all.iter().any(|group| group.authoritative);
+    if !has_authoritative {
+        return CandidateDisposition::Fallback;
+    }
+
+    let mut focused_groups = Vec::new();
+    for candidate_ref in focused {
+        if !focused_groups.contains(&candidate_ref.group_index) {
+            focused_groups.push(candidate_ref.group_index);
+        }
+    }
+
+    if focused_groups.len() > 1 || focused.len() > 1 {
+        return CandidateDisposition::Ambiguous;
+    }
+
+    let Some(candidate_ref) = focused.first() else {
+        return CandidateDisposition::Fallback;
+    };
+    let Some(group) = all.get(candidate_ref.group_index) else {
+        return CandidateDisposition::Fallback;
+    };
+    if !group.authoritative || group.low_fidelity {
+        return CandidateDisposition::Fallback;
+    }
+
+    if coverage.permits_exact() {
+        CandidateDisposition::Exact
+    } else {
+        CandidateDisposition::Preferred
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordCandidate {
     pub id: i64,
@@ -317,6 +451,23 @@ pub use crate::references::ReferenceHit;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn candidate_group(
+        declaration_kind: crate::semantic_model::SemanticDeclarationKind,
+        tier: ScopeTier,
+        authoritative: bool,
+        low_fidelity: bool,
+        candidates: Vec<&'static str>,
+    ) -> CandidateGroup<&'static str> {
+        CandidateGroup {
+            logical_key: None,
+            declaration_kind,
+            tier,
+            authoritative,
+            low_fidelity,
+            candidates,
+        }
+    }
 
     #[test]
     fn confidence_full_ordering_exact_outranks_fallback() {
@@ -519,5 +670,136 @@ mod tests {
         assert!(doc.contains("external"));
         assert!(doc.contains("heuristic"));
         assert!(doc.contains("external_first_layer"));
+    }
+
+    #[test]
+    fn candidate_set_classifies_complete_unique_authoritative_target_as_exact() {
+        let set = CandidateSet::new(
+            vec![candidate_group(
+                crate::semantic_model::SemanticDeclarationKind::Function,
+                ScopeTier::Reachable,
+                true,
+                false,
+                vec!["decl"],
+            )],
+            vec![CandidateRef {
+                group_index: 0,
+                candidate_index: 0,
+            }],
+            SharedCandidateCoverage::complete(1),
+        );
+
+        assert_eq!(set.disposition, CandidateDisposition::Exact);
+        assert_eq!(set.alternative_count, 0);
+        assert_eq!(set.disposition.as_str(), "exact");
+    }
+
+    #[test]
+    fn candidate_set_classifies_open_or_incomplete_unique_target_as_preferred() {
+        let set = CandidateSet::new(
+            vec![candidate_group(
+                crate::semantic_model::SemanticDeclarationKind::Object,
+                ScopeTier::Reachable,
+                true,
+                false,
+                vec!["object"],
+            )],
+            vec![CandidateRef {
+                group_index: 0,
+                candidate_index: 0,
+            }],
+            SharedCandidateCoverage {
+                scanned: 1,
+                scope_open: true,
+                ..SharedCandidateCoverage::default()
+            },
+        );
+
+        assert_eq!(set.disposition, CandidateDisposition::Preferred);
+        assert_eq!(set.disposition.as_str(), "preferred");
+    }
+
+    #[test]
+    fn candidate_set_classifies_multiple_strongest_targets_as_ambiguous() {
+        let set = CandidateSet::new(
+            vec![
+                candidate_group(
+                    crate::semantic_model::SemanticDeclarationKind::Method,
+                    ScopeTier::Reachable,
+                    true,
+                    false,
+                    vec!["method"],
+                ),
+                candidate_group(
+                    crate::semantic_model::SemanticDeclarationKind::Function,
+                    ScopeTier::Reachable,
+                    true,
+                    false,
+                    vec!["free"],
+                ),
+            ],
+            vec![
+                CandidateRef {
+                    group_index: 0,
+                    candidate_index: 0,
+                },
+                CandidateRef {
+                    group_index: 1,
+                    candidate_index: 0,
+                },
+            ],
+            SharedCandidateCoverage::complete(2),
+        );
+
+        assert_eq!(set.disposition, CandidateDisposition::Ambiguous);
+        assert_eq!(set.disposition.as_str(), "ambiguous");
+    }
+
+    #[test]
+    fn candidate_set_classifies_only_low_fidelity_evidence_as_fallback() {
+        let set = CandidateSet::new(
+            vec![candidate_group(
+                crate::semantic_model::SemanticDeclarationKind::Macro,
+                ScopeTier::Global,
+                false,
+                true,
+                vec!["fallback"],
+            )],
+            vec![CandidateRef {
+                group_index: 0,
+                candidate_index: 0,
+            }],
+            SharedCandidateCoverage {
+                scanned: 1,
+                facts_incomplete: true,
+                ..SharedCandidateCoverage::default()
+            },
+        );
+
+        assert_eq!(set.disposition, CandidateDisposition::Fallback);
+        assert_eq!(set.disposition.as_str(), "fallback");
+    }
+
+    #[test]
+    fn candidate_group_envelope_is_kind_neutral() {
+        let kinds = [
+            crate::semantic_model::SemanticDeclarationKind::Function,
+            crate::semantic_model::SemanticDeclarationKind::Method,
+            crate::semantic_model::SemanticDeclarationKind::Object,
+            crate::semantic_model::SemanticDeclarationKind::Type,
+            crate::semantic_model::SemanticDeclarationKind::Alias,
+            crate::semantic_model::SemanticDeclarationKind::EnumConstant,
+            crate::semantic_model::SemanticDeclarationKind::Macro,
+        ];
+        let groups: Vec<_> = kinds
+            .iter()
+            .copied()
+            .map(|kind| candidate_group(kind, ScopeTier::Global, true, false, vec!["candidate"]))
+            .collect();
+        let set = CandidateSet::new(groups, Vec::new(), SharedCandidateCoverage::complete(7));
+
+        let actual: Vec<_> = set.all.iter().map(|group| group.declaration_kind).collect();
+        assert_eq!(actual, kinds);
+        assert_eq!(set.alternative_count, kinds.len());
     }
 }
