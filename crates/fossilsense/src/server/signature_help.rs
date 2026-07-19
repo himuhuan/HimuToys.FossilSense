@@ -135,11 +135,25 @@ impl Backend {
                     reach_scope.as_deref(),
                     reach_graph.as_deref(),
                 );
+                let semantic_set = service.semantic_candidates(
+                    &call_name,
+                    crate::candidate_service::SemanticIntent::Call,
+                )?;
+                let allowed =
+                    crate::candidate_service::focused_callable_fingerprints(&semantic_set);
+                if allowed.is_empty() {
+                    return Ok((Vec::new(), 0, SemanticRequestPerf::default()));
+                }
                 let candidates =
                     service.callable_candidates(&call_name, Some(call_site_context))?;
                 let mut perf = SemanticRequestPerf::from_callable_set(&candidates);
                 perf.reach_us = reach_us;
-                let presentations = query::signature_presentations(&candidates.groups);
+                let presentations: Vec<_> = query::signature_presentations(&candidates.groups)
+                    .into_iter()
+                    .filter(|candidate| {
+                        allowed.contains(candidate.anchor.anchor_fingerprint.as_str())
+                    })
+                    .collect();
                 let presentations =
                     &presentations[..presentations.len().min(query::SIGNATURE_HELP_LIMIT)];
                 let mut source_paths: Vec<_> = presentations

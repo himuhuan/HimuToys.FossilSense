@@ -8,10 +8,13 @@ use crate::includes::ResolutionKind;
 use crate::reachability::OpenReason;
 
 mod call_facts;
+mod declarations;
 mod member;
 
 #[allow(unused_imports)]
 pub use call_facts::{CallCoverageRow, CallFactStoreView, CallSiteRow, CallableAnchorRow};
+#[allow(unused_imports)]
+pub use declarations::{DeclarationReadRow, DeclarationStoreView};
 #[allow(unused_imports)]
 pub use member::{MemberReadRow, MemberStoreView, RecordReadRow, TypeAliasReadRow};
 

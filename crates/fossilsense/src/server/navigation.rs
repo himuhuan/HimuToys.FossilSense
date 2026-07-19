@@ -128,7 +128,6 @@ impl Backend {
             .reach_scope_from_context(&uri, &context)
             .map(|(_, reach)| reach);
         let mut reach_us = reach_started.elapsed().as_micros();
-        let project_context = context.engine.project_context.clone();
         let semantic_generation = context.engine.semantic_generation;
         let call_read_handle = context.engine.call_read_handle.clone();
         let reach_graph = context.engine.reach_graph.clone();
@@ -167,11 +166,36 @@ impl Backend {
                     reach_graph.as_deref(),
                 );
                 let call_context = service.complete_call_context_at(source_position)?;
-                let callable_set = service.callable_candidates(&word, call_context.clone())?;
-                let mut perf = SemanticRequestPerf::from_callable_set(&callable_set);
+                let semantic_set = service.semantic_candidates(
+                    &word,
+                    if call_context.is_some() {
+                        crate::candidate_service::SemanticIntent::Call
+                    } else {
+                        crate::candidate_service::SemanticIntent::Neutral
+                    },
+                )?;
+                let semantic_count = semantic_set
+                    .all
+                    .iter()
+                    .map(|group| group.candidates.len())
+                    .sum();
+                let callable_fingerprints =
+                    crate::candidate_service::focused_callable_fingerprints(&semantic_set);
+                let callable_set = if callable_fingerprints.is_empty() {
+                    None
+                } else {
+                    Some(service.callable_candidates(&word, call_context.clone())?)
+                };
+                let mut perf = callable_set
+                    .as_ref()
+                    .map(SemanticRequestPerf::from_callable_set)
+                    .unwrap_or_default();
                 perf.reach_us = reach_us;
-                if !callable_set.anchors.is_empty() {
-                    let selected = match operation {
+                if let Some(callable_set) = callable_set
+                    .as_ref()
+                    .filter(|set| !set.anchors.is_empty())
+                {
+                    let mut selected = match operation {
                         NavigationOperation::Definition => {
                             query::call_definition_presentations(&callable_set.groups)
                         }
@@ -183,6 +207,10 @@ impl Backend {
                             )
                         }
                     };
+                    selected.retain(|candidate| {
+                        callable_fingerprints
+                            .contains(candidate.anchor.anchor_fingerprint.as_str())
+                    });
                     let candidates: Vec<_> = selected
                         .iter()
                         .map(|candidate| candidate.candidate.clone())
@@ -201,43 +229,16 @@ impl Backend {
                         .filter_map(|candidate| candidate_to_location(&root, candidate))
                         .collect();
                     perf.returned = locations.len();
-                    return Ok((locations, debug_lines, perf));
+                    if !locations.is_empty() {
+                        return Ok((locations, debug_lines, perf));
+                    }
                 }
 
-                // Non-callable symbols retain the existing navigation policy,
-                // but their durable/live recall still comes through the same
-                // generation-pinned overlay boundary.
-                let records = service.non_callable_symbols(&word)?;
-                let non_callable_count = records.len();
-                let origin_record = records
-                    .iter()
-                    .find(|record| {
-                        record.path == current_rel
-                            && (record.start_line, record.start_col)
-                                <= (source_position.line, source_position.character)
-                            && (source_position.line, source_position.character)
-                                <= (record.end_line, record.end_col)
-                    })
-                    .cloned();
-                let candidates = match operation {
-                    NavigationOperation::Definition => {
-                        query::rank_navigation_candidates_with_scope(
-                            records,
-                            &current_rel,
-                            service.effective_current_reach(),
-                            origin_record.as_ref(),
-                            project_context.as_deref(),
-                        )
-                    }
-                    NavigationOperation::Declaration => {
-                        query::rank_declaration_candidates_with_scope(
-                            records,
-                            &current_rel,
-                            service.effective_current_reach(),
-                        )
-                    }
-                };
-                perf.include_non_callable_candidates(non_callable_count);
+                let candidates = crate::candidate_service::navigation_presentations(
+                    &semantic_set,
+                    operation == NavigationOperation::Declaration,
+                );
+                perf.include_non_callable_candidates(semantic_count);
                 perf.query_us = query_started.elapsed().as_micros();
                 let debug_lines = candidate_reason_log_lines(&candidates, debug_reasons);
                 let locations: Vec<Location> = candidates

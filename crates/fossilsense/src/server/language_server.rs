@@ -535,7 +535,7 @@ impl LanguageServer for Backend {
         let mut table_roots = Vec::new();
         let mut table_semantic_generations = Vec::new();
         let mut table_generations = Vec::new();
-        let mut overlay_names_by_table = Vec::new();
+        let mut candidate_sources = Vec::new();
         let current_root = self.root_for_uri(&uri).await;
         let mut effective_completion_scope = None;
         for context in &contexts {
@@ -549,6 +549,12 @@ impl LanguageServer for Backend {
                         document_request.clone(),
                     )
                     .await;
+                let semantic_current_rel = uri_to_path(&uri)
+                    .and_then(|path| pathing::relative_slash_path(&context.engine.root, &path).ok())
+                    .unwrap_or_default();
+                let semantic_reach_scope = self
+                    .reach_scope_from_context(&uri, context)
+                    .map(|(_, reach)| reach);
                 if current_root.as_deref() == Some(context.engine.root.as_path())
                     && context.settings.scoping_enabled
                 {
@@ -590,14 +596,45 @@ impl LanguageServer for Backend {
                 table_generations.push((context.engine.root.clone(), context.engine.epoch));
                 table_roots.push(context.engine.root.clone());
                 table_semantic_generations.push(context.engine.semantic_generation);
-                overlay_names_by_table.push(
-                    overlay_names
-                        .into_iter()
-                        .map(|entry| (entry.id, entry))
-                        .collect(),
-                );
                 tables.push(OrdinaryCompletionNameTable {
                     table: Arc::new(effective_table),
+                });
+                candidate_sources.push(super::CompletionCandidateSource {
+                    table_index: tables.len() - 1,
+                    handle: context.engine.call_read_handle.clone(),
+                    overlay,
+                    current_rel: semantic_current_rel,
+                    reach_scope: semantic_reach_scope,
+                    reach_graph: context.engine.reach_graph.clone(),
+                });
+            }
+        }
+        if candidate_sources.is_empty() {
+            if let (Some(index), Some(path)) = (parsed_document.as_ref(), uri_to_path(&uri)) {
+                let standalone_root = path.parent().unwrap_or(path.as_path()).to_path_buf();
+                let current_rel = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let overlay = Arc::new(crate::candidate_service::CandidateOverlaySnapshot::new(
+                    completion_overlay_epoch,
+                    vec![
+                        crate::candidate_service::FileCandidateOverlay::from_index_with_text(
+                            current_rel.clone(),
+                            index,
+                            text.clone(),
+                        ),
+                    ],
+                ));
+                table_roots.push(standalone_root);
+                table_semantic_generations.push(SemanticGeneration::MISSING);
+                candidate_sources.push(super::CompletionCandidateSource {
+                    table_index: 0,
+                    handle: None,
+                    overlay,
+                    current_rel,
+                    reach_scope: None,
+                    reach_graph: None,
                 });
             }
         }
@@ -634,6 +671,22 @@ impl LanguageServer for Backend {
         let memo_prefix = prefix.clone();
         let context_ms = ordinary_started.elapsed().as_millis();
 
+        let semantic_intent = match intent.kind {
+            crate::completion::CompletionIntentKind::CallTarget => {
+                crate::candidate_service::SemanticIntent::Call
+            }
+            crate::completion::CompletionIntentKind::TypeName => {
+                crate::candidate_service::SemanticIntent::Type
+            }
+            crate::completion::CompletionIntentKind::ExpressionValue
+            | crate::completion::CompletionIntentKind::DeclarationName => {
+                crate::candidate_service::SemanticIntent::Value
+            }
+            crate::completion::CompletionIntentKind::Neutral
+            | crate::completion::CompletionIntentKind::MacroPreprocessor => {
+                crate::candidate_service::SemanticIntent::Neutral
+            }
+        };
         let service_input = OrdinaryCompletionInput {
             prefix: prefix.clone(),
             text,
@@ -655,7 +708,14 @@ impl LanguageServer for Backend {
         };
 
         let result = tokio::task::spawn_blocking(move || -> Result<_> {
-            Ok(crate::completion::ordinary_service::complete_ordinary_identifier(service_input))
+            let mut output =
+                crate::completion::ordinary_service::complete_ordinary_identifier(service_input);
+            super::hydrate_ordinary_completion_candidates(
+                &mut output,
+                &candidate_sources,
+                semantic_intent,
+            )?;
+            Ok(output)
         })
         .await;
 
@@ -678,7 +738,6 @@ impl LanguageServer for Backend {
                             &uri,
                             &table_roots,
                             &table_semantic_generations,
-                            &overlay_names_by_table,
                             completion_overlay_epoch,
                             version,
                         );

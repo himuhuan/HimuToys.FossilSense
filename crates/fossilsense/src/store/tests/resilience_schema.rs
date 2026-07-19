@@ -285,7 +285,7 @@ fn current_schema_migrate_by_drop_clears_old_data() {
 }
 
 #[test]
-fn opening_schema_15_drops_old_semantic_facts_for_schema_16_rebuild() {
+fn opening_schema_15_drops_old_semantic_facts_for_schema_17_rebuild() {
     let dir = tempdir().expect("tempdir");
     let db = dir.path().join("index.sqlite");
     {
@@ -312,7 +312,7 @@ fn opening_schema_15_drops_old_semantic_facts_for_schema_16_rebuild() {
         .expect("seed schema 15 call facts");
     }
 
-    let store = IndexStore::open(&db, dir.path()).expect("open schema 16");
+    let store = IndexStore::open(&db, dir.path()).expect("open schema 17");
     let version: String = store
         .conn
         .query_row(
@@ -321,7 +321,7 @@ fn opening_schema_15_drops_old_semantic_facts_for_schema_16_rebuild() {
             |row| row.get(0),
         )
         .expect("schema version");
-    assert_eq!(version, "16");
+    assert_eq!(version, "17");
 
     let anchor_count: i64 = store
         .conn

@@ -2,10 +2,9 @@ use super::*;
 
 use crate::call_model::LinkageDomain;
 use crate::candidate_service::{CandidateQueryService, DEFAULT_EXACT_NAME_CANDIDATE_LIMIT};
-use crate::model::{DefinitionCandidate, ScopeTier};
+use crate::model::ScopeTier;
 use crate::query::callables::{ArityCompatibility, CallableVariantGroup, CounterpartEvidence};
 use crate::reachability::{OpenReason, ReachScope};
-use crate::store::SymbolRecord;
 
 const POSSIBLE_TARGETS_PROTOCOL_VERSION: u32 = 1;
 
@@ -179,11 +178,26 @@ impl Backend {
                 reach_graph.as_deref(),
             );
             let call_context = service.complete_call_context_at(cursor)?;
-            let callable_set = service.callable_candidates(&word, call_context)?;
-            if !callable_set.anchors.is_empty() {
-                let items = callable_items(&root, &callable_set.groups, &current_path, cursor_byte);
-                let coverage = callable_coverage(
-                    &callable_set,
+            let semantic_set = service.semantic_candidates(
+                &word,
+                if call_context.is_some() {
+                    crate::candidate_service::SemanticIntent::Call
+                } else {
+                    crate::candidate_service::SemanticIntent::Neutral
+                },
+            )?;
+            let allowed = crate::candidate_service::focused_callable_fingerprints(&semantic_set);
+            if !allowed.is_empty() {
+                let callable_set = service.callable_candidates(&word, call_context)?;
+                let items = callable_items(
+                    &root,
+                    &callable_set.groups,
+                    &allowed,
+                    &current_path,
+                    cursor_byte,
+                );
+                let coverage = semantic_coverage(
+                    &semantic_set,
                     service.effective_current_reach(),
                     semantic_generation,
                     overlay_epoch,
@@ -196,21 +210,13 @@ impl Backend {
                 });
             }
 
-            let records = service.non_callable_symbols(&word)?;
-            let coverage = non_callable_coverage(
-                records.len(),
-                overlay.has_incomplete_facts(),
+            let coverage = semantic_coverage(
+                &semantic_set,
                 service.effective_current_reach(),
                 semantic_generation,
                 overlay_epoch,
             );
-            let items = non_callable_items(
-                &root,
-                records,
-                &current_path,
-                service.effective_current_reach(),
-                cursor,
-            );
+            let items = semantic_items(&root, &semantic_set, &current_path, cursor);
             Ok(PossibleTargetsResponse {
                 protocol_version: POSSIBLE_TARGETS_PROTOCOL_VERSION,
                 name: word,
@@ -282,6 +288,7 @@ fn proven_local_response(
 fn callable_items(
     root: &Path,
     groups: &[CallableVariantGroup],
+    allowed: &std::collections::HashSet<&str>,
     current_path: &str,
     cursor_byte: usize,
 ) -> Vec<PossibleTargetItem> {
@@ -289,6 +296,9 @@ fn callable_items(
         .iter()
         .flat_map(|group| {
             group.variants().filter_map(move |anchor| {
+                if !allowed.contains(anchor.anchor.anchor_fingerprint.as_str()) {
+                    return None;
+                }
                 let candidate = &anchor.candidate;
                 let location = candidate_to_location(root, candidate)?;
                 Some(PossibleTargetItem {
@@ -326,63 +336,58 @@ fn callable_items(
         .collect()
 }
 
-fn non_callable_items(
+fn semantic_items(
     root: &Path,
-    records: Vec<SymbolRecord>,
+    set: &crate::model::CandidateSet<crate::candidate_service::ResolvedDeclarationCandidate>,
     current_path: &str,
-    scope: Option<&ReachScope>,
     cursor: crate::call_model::SourcePosition,
 ) -> Vec<PossibleTargetItem> {
-    let ranked =
-        query::rank_definitions_into_candidates_with_scope(records.clone(), current_path, scope);
-    ranked
+    crate::candidate_service::focused_candidates(set)
         .into_iter()
         .filter_map(|candidate| {
-            let record = matching_record(&records, &candidate)?;
-            let location = candidate_to_location(root, &candidate)?;
+            let presentation = candidate.as_definition_candidate();
+            let location = candidate_to_location(root, &presentation)?;
             Some(PossibleTargetItem {
                 location,
-                name: candidate.name.clone(),
-                kind: candidate.kind.clone(),
-                role: candidate.role.clone(),
+                name: candidate.fact.name.clone(),
+                kind: presentation.kind.clone(),
+                role: presentation.role.clone(),
                 scope_tier: candidate.tier.as_str().into(),
-                linkage: non_callable_linkage(record).into(),
-                guard: record.guard.clone(),
-                signature: record.signature.clone(),
+                linkage: linkage_label(&candidate.fact.linkage).into(),
+                guard: candidate.fact.guard.clone(),
+                signature: candidate
+                    .fact
+                    .canonical_signature
+                    .clone()
+                    .unwrap_or_default(),
                 reason: candidate.reason.as_str().into(),
                 visibility: visibility_for_position(
                     candidate.tier,
-                    &candidate.path,
-                    (candidate.range.start_line, candidate.range.start_col),
+                    &candidate.fact.path,
+                    (
+                        candidate.fact.name_range.start.line,
+                        candidate.fact.name_range.start.character,
+                    ),
                     current_path,
                     (cursor.line, cursor.character),
                 )
                 .into(),
-                source: candidate.source.clone(),
+                source: presentation.source,
                 confidence: candidate.confidence.as_str().into(),
                 arity_compatibility: None,
                 pairing_evidence: None,
-                origin: if record.id < 0 { "overlay" } else { "indexed" }.into(),
+                origin: match candidate.origin {
+                    query::CandidateOrigin::Base => "indexed",
+                    query::CandidateOrigin::Overlay => "overlay",
+                }
+                .into(),
             })
         })
         .collect()
 }
 
-fn matching_record<'a>(
-    records: &'a [SymbolRecord],
-    candidate: &DefinitionCandidate,
-) -> Option<&'a SymbolRecord> {
-    records.iter().find(|record| {
-        record.path == candidate.path
-            && record.kind == candidate.kind
-            && record.role == candidate.role
-            && record.start_line == candidate.range.start_line
-            && record.start_col == candidate.range.start_col
-    })
-}
-
-fn callable_coverage(
-    set: &query::CallableCandidateSet,
+fn semantic_coverage(
+    set: &crate::model::CandidateSet<crate::candidate_service::ResolvedDeclarationCandidate>,
     origin_scope: Option<&ReachScope>,
     semantic_generation: u64,
     overlay_epoch: u64,
@@ -396,32 +401,10 @@ fn callable_coverage(
         open_reason: origin_scope
             .and_then(|scope| scope.reason)
             .map(open_reason_label),
-        incomplete_reason: set.coverage.incomplete_reason.map(incomplete_reason_label),
-        semantic_generation,
-        overlay_epoch,
-        resolver_version: query::CALLABLE_CANDIDATE_RESOLVER_VERSION,
-    }
-}
-
-fn non_callable_coverage(
-    count: usize,
-    facts_incomplete: bool,
-    origin_scope: Option<&ReachScope>,
-    semantic_generation: u64,
-    overlay_epoch: u64,
-) -> PossibleTargetsCoverage {
-    PossibleTargetsCoverage {
-        bounded: true,
-        limit: DEFAULT_EXACT_NAME_CANDIDATE_LIMIT,
-        scanned: count,
-        // The compatibility facade currently discards its store truncation
-        // bit. Treat a full page as truncated until exact recall exposes it.
-        truncated: count >= DEFAULT_EXACT_NAME_CANDIDATE_LIMIT,
-        open: origin_scope.is_some_and(|scope| scope.open),
-        open_reason: origin_scope
-            .and_then(|scope| scope.reason)
-            .map(open_reason_label),
-        incomplete_reason: facts_incomplete.then(|| "facts_unavailable".into()),
+        incomplete_reason: set
+            .coverage
+            .facts_incomplete
+            .then(|| "facts_unavailable".into()),
         semantic_generation,
         overlay_epoch,
         resolver_version: query::CALLABLE_CANDIDATE_RESOLVER_VERSION,
@@ -434,21 +417,6 @@ fn linkage_label(linkage: &LinkageDomain) -> &'static str {
         LinkageDomain::Internal(_) => "internal",
         LinkageDomain::Unknown => "unknown",
     }
-}
-
-fn non_callable_linkage(record: &SymbolRecord) -> &'static str {
-    match record.kind.as_str() {
-        "global_variable" if has_storage_class(&record.signature, "static") => "internal",
-        "global_variable" => "external",
-        "macro" => "preprocessor",
-        _ => "not_applicable",
-    }
-}
-
-fn has_storage_class(signature: &str, storage_class: &str) -> bool {
-    signature
-        .split(|ch: char| !(ch == '_' || ch.is_ascii_alphanumeric()))
-        .any(|token| token == storage_class)
 }
 
 fn visibility_for_byte(
@@ -518,18 +486,6 @@ fn open_reason_label(reason: OpenReason) -> String {
     .into()
 }
 
-fn incomplete_reason_label(reason: query::CandidateIncompleteReason) -> String {
-    match reason {
-        query::CandidateIncompleteReason::ScanLimit => "scan_limit",
-        query::CandidateIncompleteReason::CandidateBudget => "candidate_budget",
-        query::CandidateIncompleteReason::TimeBudget => "time_budget",
-        query::CandidateIncompleteReason::Cancelled => "cancelled",
-        query::CandidateIncompleteReason::FactsUnavailable => "facts_unavailable",
-        query::CandidateIncompleteReason::GenerationMismatch => "generation_mismatch",
-    }
-    .into()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -556,8 +512,19 @@ mod tests {
     }
 
     #[test]
-    fn full_non_callable_page_is_reported_as_bounded_and_truncated() {
-        let coverage = non_callable_coverage(DEFAULT_EXACT_NAME_CANDIDATE_LIMIT, false, None, 9, 4);
+    fn truncated_semantic_page_is_reported_as_bounded_and_truncated() {
+        let set = crate::model::CandidateSet::<
+            crate::candidate_service::ResolvedDeclarationCandidate,
+        >::new(
+            Vec::new(),
+            Vec::new(),
+            crate::model::SharedCandidateCoverage {
+                scanned: DEFAULT_EXACT_NAME_CANDIDATE_LIMIT,
+                truncated: true,
+                ..Default::default()
+            },
+        );
+        let coverage = semantic_coverage(&set, None, 9, 4);
         assert!(coverage.bounded);
         assert!(coverage.truncated);
         assert_eq!(coverage.limit, DEFAULT_EXACT_NAME_CANDIDATE_LIMIT);

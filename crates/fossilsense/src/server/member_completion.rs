@@ -82,6 +82,7 @@ impl Backend {
                     overlay,
                     current_path,
                     reach_graph: context.engine.reach_graph.clone(),
+                    semantic_generation: context.engine.semantic_generation,
                 },
             );
         }
@@ -284,6 +285,8 @@ impl Backend {
                                 remember_member(
                                     &mut member_to_best,
                                     member,
+                                    root.clone(),
+                                    context.semantic_generation,
                                     weak_owner_used,
                                     owner_ambiguous,
                                 );
@@ -318,7 +321,14 @@ impl Backend {
                             .fallback_member_candidates(&prefix, limit)?;
                         owner_incomplete |= fallback_truncated;
                         for candidate in candidates {
-                            remember_member(&mut fallback_best, candidate, false, false);
+                            remember_member(
+                                &mut fallback_best,
+                                candidate,
+                                root.clone(),
+                                context.semantic_generation,
+                                false,
+                                false,
+                            );
                         }
                     }
                     (fallback_best.into_values().collect(), false, true)
@@ -379,10 +389,12 @@ impl Backend {
                             .clone()
                             .and_then(|owner_revision_hash| {
                                 serde_json::to_value(CompletionDocumentationData::Member {
-                                    version: 3,
+                                    version: 4,
+                                    root: presentation.root.to_string_lossy().into_owned(),
                                     uri: uri_owned.clone(),
                                     owner_path: member.owner_path.clone(),
-                                    signature: member.signature.clone(),
+                                    handle: member.handle.clone(),
+                                    semantic_generation: presentation.semantic_generation.0,
                                     owner_revision_hash,
                                     overlay_epoch: completion_overlay_epoch,
                                     document_version: version,
@@ -473,6 +485,8 @@ impl Backend {
 #[derive(Clone)]
 struct MemberPresentation {
     candidate: crate::model::MemberCandidate,
+    root: PathBuf,
+    semantic_generation: crate::call_model::SemanticGeneration,
     weak_receiver: bool,
     ambiguous_owner: bool,
 }
@@ -483,6 +497,7 @@ struct MemberRootQueryContext {
     overlay: Arc<CandidateOverlaySnapshot>,
     current_path: String,
     reach_graph: Option<Arc<crate::reachability::ReachGraph>>,
+    semantic_generation: crate::call_model::SemanticGeneration,
 }
 
 impl MemberRootQueryContext {
@@ -518,12 +533,16 @@ struct MemberCompletionMetrics {
 fn remember_member(
     members: &mut HashMap<(String, MemberKind), MemberPresentation>,
     candidate: crate::model::MemberCandidate,
+    root: PathBuf,
+    semantic_generation: crate::call_model::SemanticGeneration,
     weak_receiver: bool,
     ambiguous_owner: bool,
 ) {
     let key = (candidate.name.to_ascii_lowercase(), candidate.kind);
     let presentation = MemberPresentation {
         candidate,
+        root,
+        semantic_generation,
         weak_receiver,
         ambiguous_owner,
     };
@@ -956,6 +975,14 @@ mod tests {
             confidence,
             owner_path: owner_path.into(),
             owner_revision_hash: Some(format!("revision-{owner_path}")),
+            handle: crate::model::MemberCandidateHandle {
+                persistent_id: None,
+                fingerprint: format!("member-{owner_path}"),
+                start_line: 0,
+                start_col: 0,
+                end_line: 0,
+                end_col: 0,
+            },
         }
     }
 
@@ -978,7 +1005,14 @@ mod tests {
         ] {
             let mut merged = HashMap::new();
             for candidate in order {
-                remember_member(&mut merged, candidate, false, false);
+                remember_member(
+                    &mut merged,
+                    candidate,
+                    PathBuf::from("test-root"),
+                    crate::call_model::SemanticGeneration(1),
+                    false,
+                    false,
+                );
             }
             let selected = merged
                 .get(&("shared".to_string(), MemberKind::Field))

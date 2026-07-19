@@ -5,14 +5,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use crate::config::normalized_extension;
-use crate::semantic_model::{
-    DeclarationFact, DeclarationIdentity, DeclarationLocator, LanguageFidelity, LogicalEntityKey,
-    SemanticDeclarationKind, SemanticDeclarationRole, SemanticFactFidelity, SemanticFactProvenance,
-    SemanticLanguage,
-};
+use crate::semantic_model::{DeclarationFact, SemanticDeclarationRole};
 
 mod ast;
 mod callables;
+mod declarations;
 mod lexical;
 
 use ast::collect_ast_index;
@@ -522,7 +519,7 @@ fn parse_with_handle_control(
     };
     let tree = match parsed_tree {
         Ok(Some(tree)) => tree,
-        Ok(None) | Err(()) => return lexical_fallback_with_facts(symbols, includes, facts),
+        Ok(None) | Err(()) => return lexical_fallback_with_path(path, symbols, includes, facts),
     };
 
     let ast = collect_ast_index(tree.root_node(), path, source, &line_starts, facts);
@@ -537,8 +534,15 @@ fn parse_with_handle_control(
     symbols.reserve(ast.type_symbols.len() + ast.enum_constants.len());
     symbols.extend(ast.type_symbols);
     symbols.extend(ast.enum_constants);
-    let mut declarations = declaration_facts_from_callable_anchors(path, &ast.callable_anchors);
-    declarations.extend(ast.declarations);
+    let declarations = declarations::canonical_declarations(
+        path,
+        &symbols,
+        &ast.records,
+        &ast.aliases,
+        &ast.callable_anchors,
+        ast.declarations,
+        false,
+    );
 
     FileSemanticIndex {
         symbols,
@@ -615,10 +619,21 @@ fn lexical_fallback_with_facts(
     includes: Vec<Include>,
     facts: ParseFacts,
 ) -> FileSemanticIndex {
+    lexical_fallback_with_path(Path::new(""), symbols, includes, facts)
+}
+
+fn lexical_fallback_with_path(
+    path: &Path,
+    symbols: Vec<Symbol>,
+    includes: Vec<Include>,
+    facts: ParseFacts,
+) -> FileSemanticIndex {
+    let declarations =
+        declarations::canonical_declarations(path, &symbols, &[], &[], &[], Vec::new(), true);
     FileSemanticIndex {
         symbols,
         includes,
-        declarations: Vec::new(),
+        declarations,
         occurrences: Vec::new(),
         records: Vec::new(),
         fields: Vec::new(),
@@ -635,113 +650,6 @@ fn lexical_fallback_with_facts(
             ast_source: FactSource::LexicalFallback,
             requested_facts: facts,
         },
-    }
-}
-
-fn declaration_facts_from_callable_anchors(
-    path: &Path,
-    anchors: &[crate::call_model::CallableAnchor],
-) -> Vec<DeclarationFact> {
-    let language = if is_cpp_path(path) {
-        SemanticLanguage::Cpp
-    } else {
-        SemanticLanguage::C
-    };
-    anchors
-        .iter()
-        .filter_map(|anchor| {
-            if anchor.kind != crate::call_model::CallableKind::Function
-                || anchor.role == crate::call_model::AnchorRole::Synthetic
-            {
-                return None;
-            }
-
-            let declaration_kind =
-                if anchor.owner_kind == Some(crate::call_model::OwnerKindHint::Record) {
-                    SemanticDeclarationKind::Method
-                } else {
-                    SemanticDeclarationKind::Function
-                };
-            let role = semantic_role_from_anchor(anchor.role);
-            let fact_fidelity = if anchor.syntax_error_overlap
-                || anchor.signature_fidelity != crate::call_model::SignatureFidelity::AstExact
-            {
-                SemanticFactFidelity::Incomplete
-            } else {
-                SemanticFactFidelity::Authoritative
-            };
-            let guard_fingerprint = anchor
-                .guard
-                .as_ref()
-                .map(|guard| blake3::hash(guard.as_bytes()).to_hex().to_string());
-            let linkage_domain = linkage_domain_key(&anchor.linkage);
-            let logical_key = LogicalEntityKey {
-                qualified_name: anchor.qualified_name.clone(),
-                declaration_kind,
-                owner: anchor.owner.clone(),
-                canonical_signature: Some(anchor.canonical_signature.clone()),
-                linkage_domain,
-                guard_fingerprint,
-            };
-            let locator = DeclarationLocator {
-                workspace_id: String::new(),
-                path: anchor.path.clone(),
-                range: anchor.declaration_range,
-                fingerprint: anchor.anchor_fingerprint.clone(),
-            };
-            Some(DeclarationFact {
-                identity: DeclarationIdentity {
-                    locator,
-                    logical_key,
-                    language,
-                    language_fidelity: LanguageFidelity::Explicit,
-                    provenance: semantic_provenance_from_anchor(anchor.provenance),
-                    fact_fidelity,
-                    role,
-                },
-                name: anchor.name.clone(),
-                qualified_name: anchor.qualified_name.clone(),
-                declaration_kind,
-                role,
-                path: anchor.path.clone(),
-                name_range: anchor.name_range,
-                declaration_range: anchor.declaration_range,
-                canonical_signature: Some(anchor.canonical_signature.clone()),
-                declarator_shape: None,
-                has_initializer: None,
-                owner: anchor.owner.clone(),
-                linkage: anchor.linkage.clone(),
-                guard: anchor.guard.clone(),
-            })
-        })
-        .collect()
-}
-
-fn semantic_role_from_anchor(role: crate::call_model::AnchorRole) -> SemanticDeclarationRole {
-    match role {
-        crate::call_model::AnchorRole::Declaration => SemanticDeclarationRole::Declaration,
-        crate::call_model::AnchorRole::Definition => SemanticDeclarationRole::Definition,
-        crate::call_model::AnchorRole::Synthetic => SemanticDeclarationRole::Definition,
-    }
-}
-
-fn semantic_provenance_from_anchor(
-    provenance: crate::call_model::FactProvenance,
-) -> SemanticFactProvenance {
-    match provenance {
-        crate::call_model::FactProvenance::Ast => SemanticFactProvenance::Ast,
-        crate::call_model::FactProvenance::LexicalFallback => {
-            SemanticFactProvenance::LexicalFallback
-        }
-        crate::call_model::FactProvenance::Synthetic => SemanticFactProvenance::Synthetic,
-    }
-}
-
-fn linkage_domain_key(linkage: &crate::call_model::LinkageDomain) -> String {
-    match linkage {
-        crate::call_model::LinkageDomain::External => "external".to_string(),
-        crate::call_model::LinkageDomain::Internal(path) => format!("internal:{path}"),
-        crate::call_model::LinkageDomain::Unknown => "unknown".to_string(),
     }
 }
 

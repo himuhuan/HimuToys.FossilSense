@@ -9,7 +9,7 @@ use crate::call_model::SourceRange;
 /// This is deliberately independent from the SQLite schema version: changing
 /// how a fact is derived must invalidate persisted rows even when their SQL
 /// column layout happens to stay compatible.
-pub const PARSER_FACT_VERSION: i64 = 3;
+pub const PARSER_FACT_VERSION: i64 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -123,6 +123,20 @@ pub struct DeclarationFact {
     pub owner: Option<String>,
     pub linkage: crate::call_model::LinkageDomain,
     pub guard: Option<String>,
+    /// Parser-established link to the richer fact that owns this declaration.
+    /// Query code follows this link instead of reconstructing identity from
+    /// name/path/range tuples.
+    pub backing: DeclarationBacking,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum DeclarationBacking {
+    CallableAnchor { fingerprint: String },
+    Record { record_key: String },
+    TypeAlias { fingerprint: String },
+    Symbol { start_byte: usize, end_byte: usize },
+    None,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,6 +209,9 @@ pub struct RecordDef {
     pub start_col: usize,
     pub end_line: usize,
     pub end_col: usize,
+    /// Exact range of the tag identifier, or of the typedef identifier for an
+    /// anonymous typedef record.
+    pub name_range: SourceRange,
     /// Exact range of the `{ ... }` body, including both braces.
     pub body_range: SourceRange,
     /// Best-effort enclosing declaration range. When the AST proves direct

@@ -5,7 +5,7 @@ use rusqlite::{params, Connection};
 
 use crate::call_model::SignatureFidelity;
 use crate::semantic_model::{
-    AliasTarget, AliasTargetFidelity, RecordRangeFidelity, PARSER_FACT_VERSION,
+    AliasTarget, AliasTargetFidelity, DeclarationBacking, RecordRangeFidelity, PARSER_FACT_VERSION,
 };
 
 use super::{
@@ -49,6 +49,12 @@ pub(super) fn stage_file_updates(
                     revision_id, file_id, name, kind, role, start_byte, end_byte,
                     start_line, start_col, end_line, end_col, signature, guard, container
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        )?;
+        let mut declaration_stmt = tx.prepare(
+            "INSERT INTO declaration_facts (
+                revision_id, file_id, name, logical_key_digest, locator_fingerprint,
+                fact_json, backing_kind, backing_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )?;
         let mut include_stmt = tx
             .prepare("INSERT INTO include_facts (revision_id, file_id, line, target_text, target_form, target_normalized, target_basename) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")?;
@@ -184,6 +190,8 @@ pub(super) fn stage_file_updates(
             };
             let facts = index.persistent_facts();
 
+            let mut symbol_ids = HashMap::new();
+            let mut symbol_ids_by_name: HashMap<&str, Vec<(usize, i64)>> = HashMap::new();
             for symbol in facts.symbols {
                 symbol_stmt.execute(params![
                     revision_id,
@@ -201,6 +209,12 @@ pub(super) fn stage_file_updates(
                     symbol.guard.as_deref(),
                     symbol.container.as_deref(),
                 ])?;
+                let symbol_id = tx.last_insert_rowid();
+                symbol_ids.insert((symbol.start_byte, symbol.end_byte), symbol_id);
+                symbol_ids_by_name
+                    .entry(symbol.name.as_str())
+                    .or_default()
+                    .push((symbol.start_byte, symbol_id));
             }
 
             for include in facts.includes {
@@ -217,7 +231,7 @@ pub(super) fn stage_file_updates(
                 ])?;
             }
 
-            let mut record_key_to_id = std::collections::HashMap::new();
+            let mut record_key_to_id = HashMap::new();
             let mut record_name_to_ids: std::collections::HashMap<String, Vec<i64>> =
                 std::collections::HashMap::new();
             for record in facts.records {
@@ -297,6 +311,7 @@ pub(super) fn stage_file_updates(
                 }
             }
 
+            let mut alias_fingerprint_to_id = HashMap::new();
             for alias in facts.aliases {
                 let (target_record_id, target_name, target_kind, confidence) = match &alias.target {
                     AliasTarget::RecordKey(key) => {
@@ -337,9 +352,11 @@ pub(super) fn stage_file_updates(
                     confidence,
                     alias.declaration_hash.as_slice(),
                 ])?;
+                alias_fingerprint_to_id.insert(alias.fingerprint.clone(), tx.last_insert_rowid());
             }
 
-            let mut callable_id_by_entity = std::collections::HashMap::new();
+            let mut callable_id_by_entity = HashMap::new();
+            let mut callable_id_by_fingerprint = HashMap::new();
             for anchor in facts.callable_anchors {
                 let (linkage_kind, linkage_file) = match &anchor.linkage {
                     crate::call_model::LinkageDomain::External => (1i64, None),
@@ -404,6 +421,7 @@ pub(super) fn stage_file_updates(
                     fact_flags(anchor.provenance, anchor.syntax_error_overlap),
                 ])?;
                 let anchor_id = tx.last_insert_rowid();
+                callable_id_by_fingerprint.insert(anchor.anchor_fingerprint.clone(), anchor_id);
                 callable_id_by_entity
                     .entry(anchor.entity_key.as_str())
                     .or_insert(anchor_id);
@@ -454,6 +472,71 @@ pub(super) fn stage_file_updates(
                     fact_flags(call.provenance, call.syntax_error_overlap),
                 ])?;
             }
+
+            for declaration in facts.declarations {
+                let mut declaration = declaration.clone();
+                declaration.path.clone_from(&fingerprint.path);
+                declaration
+                    .identity
+                    .locator
+                    .path
+                    .clone_from(&fingerprint.path);
+                if matches!(
+                    declaration.linkage,
+                    crate::call_model::LinkageDomain::Internal(_)
+                ) {
+                    declaration.linkage =
+                        crate::call_model::LinkageDomain::Internal(fingerprint.path.clone());
+                    declaration.identity.logical_key.linkage_domain =
+                        format!("internal:{}", fingerprint.path);
+                }
+                let (backing_kind, backing_id) = match &declaration.backing {
+                    DeclarationBacking::CallableAnchor { fingerprint } => (
+                        "callable_anchor",
+                        callable_id_by_fingerprint.get(fingerprint).copied(),
+                    ),
+                    DeclarationBacking::Record { record_key } => {
+                        ("record", record_key_to_id.get(record_key).copied())
+                    }
+                    DeclarationBacking::TypeAlias { fingerprint } => (
+                        "type_alias",
+                        alias_fingerprint_to_id.get(fingerprint).copied(),
+                    ),
+                    DeclarationBacking::Symbol {
+                        start_byte,
+                        end_byte,
+                    } => (
+                        "symbol",
+                        symbol_ids
+                            .get(&(*start_byte, *end_byte))
+                            .copied()
+                            .or_else(|| {
+                                symbol_ids_by_name.get(declaration.name.as_str()).and_then(
+                                    |symbols| {
+                                        symbols
+                                            .iter()
+                                            .min_by_key(|(candidate_start, _)| {
+                                                candidate_start.abs_diff(*start_byte)
+                                            })
+                                            .map(|(_, id)| *id)
+                                    },
+                                )
+                            }),
+                    ),
+                    DeclarationBacking::None => ("none", None),
+                };
+                let logical_key = serde_json::to_vec(&declaration.identity.logical_key)?;
+                declaration_stmt.execute(params![
+                    revision_id,
+                    file_id,
+                    declaration.name.as_str(),
+                    digest_value(&logical_key),
+                    declaration.identity.locator.fingerprint.as_str(),
+                    serde_json::to_string(&declaration)?,
+                    backing_kind,
+                    backing_id,
+                ])?;
+            }
         }
     }
     tx.commit()?;
@@ -472,6 +555,10 @@ fn digest_bytes(value: &str) -> Result<Vec<u8>> {
             u8::from_str_radix(text, 16).context("call digest contains a non-hexadecimal byte")
         })
         .collect()
+}
+
+fn digest_value(value: &[u8]) -> Vec<u8> {
+    blake3::hash(value).as_bytes()[..12].to_vec()
 }
 
 fn record_range_fidelity_to_str(fidelity: RecordRangeFidelity) -> &'static str {

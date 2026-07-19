@@ -82,13 +82,43 @@ impl Backend {
                 let call_context = service.complete_call_context_at(source_position)?;
                 let is_call_site = call_context.is_some();
                 let origin_anchor = service.anchor_at(source_position)?;
-                let callable_set = service.callable_candidates(&word, call_context)?;
-                let mut perf = SemanticRequestPerf::from_callable_set(&callable_set);
+                let semantic_set = service.semantic_candidates(
+                    &word,
+                    if is_call_site || origin_anchor.is_some() {
+                        crate::candidate_service::SemanticIntent::Call
+                    } else {
+                        crate::candidate_service::SemanticIntent::Neutral
+                    },
+                )?;
+                let semantic_count = semantic_set
+                    .all
+                    .iter()
+                    .map(|group| group.candidates.len())
+                    .sum();
+                let callable_fingerprints =
+                    crate::candidate_service::focused_callable_fingerprints(&semantic_set);
+                let callable_set = if callable_fingerprints.is_empty() {
+                    None
+                } else {
+                    Some(service.callable_candidates(&word, call_context)?)
+                };
+                let mut perf = callable_set
+                    .as_ref()
+                    .map(SemanticRequestPerf::from_callable_set)
+                    .unwrap_or_default();
                 perf.reach_us = reach_us;
                 let hydration_started = std::time::Instant::now();
                 let mut hydration = HydrationStats::default();
-                if !callable_set.anchors.is_empty() && (origin_anchor.is_some() || is_call_site) {
-                    let presentations = query::hover_presentations(&callable_set.groups);
+                if let Some(callable_set) = callable_set.as_ref().filter(|set| {
+                    !set.anchors.is_empty() && (origin_anchor.is_some() || is_call_site)
+                }) {
+                    let presentations: Vec<_> = query::hover_presentations(&callable_set.groups)
+                        .into_iter()
+                        .filter(|candidate| {
+                            callable_fingerprints
+                                .contains(candidate.anchor.anchor_fingerprint.as_str())
+                        })
+                        .collect();
                     let source_paths = presentation_paths(&presentations);
                     let source_revisions = service.source_revisions(&source_paths)?;
                     perf.query_us = query_started.elapsed().as_micros();
@@ -109,33 +139,54 @@ impl Backend {
                     return Ok((markdown, perf));
                 }
 
-                let type_candidates = service.type_candidates(&word)?;
-                perf.include_type_candidates(&type_candidates);
-                if !type_candidates.aliases.candidates.is_empty()
-                    || !type_candidates.records.candidates.is_empty()
+                let type_candidates =
+                    if crate::candidate_service::focused_has_kind(&semantic_set, |kind| {
+                        matches!(
+                            kind,
+                            crate::semantic_model::SemanticDeclarationKind::Type
+                                | crate::semantic_model::SemanticDeclarationKind::Alias
+                        )
+                    }) {
+                        Some(service.type_candidates_for_set(&word, &semantic_set)?)
+                    } else {
+                        None
+                    };
+                if let Some(type_candidates) = type_candidates.as_ref() {
+                    perf.include_type_candidates(type_candidates);
+                    if !type_candidates.aliases.candidates.is_empty()
+                        || !type_candidates.records.candidates.is_empty()
+                    {
+                        perf.query_us = query_started.elapsed().as_micros();
+                        let markdown = hover_markdown_for_type_candidates(
+                            &root,
+                            &current_rel,
+                            current_text.as_ref(),
+                            &overlay,
+                            type_candidates,
+                            &mut hydration,
+                        );
+                        perf.returned = type_candidates
+                            .aliases
+                            .candidates
+                            .len()
+                            .saturating_add(type_candidates.records.candidates.len())
+                            .min(query::HOVER_CANDIDATE_LIMIT);
+                        perf.hydration_us = hydration_started.elapsed().as_micros();
+                        perf.hydration_count = hydration.count;
+                        perf.hydration_bytes = hydration.bytes;
+                        return Ok((markdown, perf));
+                    }
+                }
+                if let Some(callable_set) =
+                    callable_set.as_ref().filter(|set| !set.anchors.is_empty())
                 {
-                    perf.query_us = query_started.elapsed().as_micros();
-                    let markdown = hover_markdown_for_type_candidates(
-                        &root,
-                        &current_rel,
-                        current_text.as_ref(),
-                        &overlay,
-                        &type_candidates,
-                        &mut hydration,
-                    );
-                    perf.returned = type_candidates
-                        .aliases
-                        .candidates
-                        .len()
-                        .saturating_add(type_candidates.records.candidates.len())
-                        .min(query::HOVER_CANDIDATE_LIMIT);
-                    perf.hydration_us = hydration_started.elapsed().as_micros();
-                    perf.hydration_count = hydration.count;
-                    perf.hydration_bytes = hydration.bytes;
-                    return Ok((markdown, perf));
-                }
-                if !callable_set.anchors.is_empty() {
-                    let presentations = query::hover_presentations(&callable_set.groups);
+                    let presentations: Vec<_> = query::hover_presentations(&callable_set.groups)
+                        .into_iter()
+                        .filter(|candidate| {
+                            callable_fingerprints
+                                .contains(candidate.anchor.anchor_fingerprint.as_str())
+                        })
+                        .collect();
                     let source_paths = presentation_paths(&presentations);
                     let source_revisions = service.source_revisions(&source_paths)?;
                     perf.query_us = query_started.elapsed().as_micros();
@@ -156,22 +207,25 @@ impl Backend {
                     return Ok((markdown, perf));
                 }
 
-                // Types, macros, enum constants and variables intentionally keep
-                // the generic symbol path. Functions never fall back to it.
-                let non_callable_symbols = service.non_callable_symbols(&word)?;
-                let source_paths: Vec<_> = non_callable_symbols
+                let documentation_ranked: Vec<_> =
+                    crate::candidate_service::focused_candidates(&semantic_set)
+                        .iter()
+                        .map(|candidate| query::RankedHoverCandidate {
+                            candidate: candidate.as_definition_candidate(),
+                            signature: candidate
+                                .fact
+                                .canonical_signature
+                                .clone()
+                                .unwrap_or_else(|| candidate.fact.name.clone()),
+                            guard: candidate.fact.guard.clone(),
+                        })
+                        .collect();
+                let source_paths: Vec<_> = documentation_ranked
                     .iter()
-                    .map(|candidate| candidate.path.clone())
+                    .map(|candidate| candidate.candidate.path.clone())
                     .collect();
-                let non_callable_count = non_callable_symbols.len();
                 let source_revisions = service.source_revisions(&source_paths)?;
-                let documentation_ranked = query::rank_hover_candidates(
-                    non_callable_symbols,
-                    &current_rel,
-                    service.effective_current_reach(),
-                    32,
-                );
-                perf.include_non_callable_candidates(non_callable_count);
+                perf.include_non_callable_candidates(semantic_count);
                 perf.query_us = query_started.elapsed().as_micros();
                 let candidates: Vec<_> = documentation_ranked
                     .iter()

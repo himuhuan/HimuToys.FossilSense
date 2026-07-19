@@ -9,9 +9,9 @@ use super::{
 };
 use crate::call_model::{SourcePosition, SourceRange};
 use crate::semantic_model::{
-    DeclarationFact, DeclarationIdentity, DeclarationLocator, LanguageFidelity, LogicalEntityKey,
-    SemanticDeclarationKind, SemanticDeclarationRole, SemanticFactFidelity, SemanticFactProvenance,
-    SemanticLanguage,
+    DeclarationBacking, DeclarationFact, DeclarationIdentity, DeclarationLocator, LanguageFidelity,
+    LogicalEntityKey, SemanticDeclarationKind, SemanticDeclarationRole, SemanticFactFidelity,
+    SemanticFactProvenance, SemanticLanguage,
 };
 
 pub(super) struct AstIndex {
@@ -138,7 +138,8 @@ pub(super) fn collect_ast_index(
                     .and_then(|name| node_text(name, source))
                     .map(str::to_string);
 
-                let typedef_name = parent_typedef_name(node, source);
+                let typedef = parent_typedef_name_node(node, source);
+                let typedef_name = typedef.as_ref().map(|(_, name)| name.clone());
 
                 if tag_name.is_some() || typedef_name.is_some() {
                     let kind = match node.kind() {
@@ -181,6 +182,10 @@ pub(super) fn collect_ast_index(
                     let declaration = enclosing_record_declaration(node).unwrap_or(node);
                     let declaration_range = record_declaration_range(node, source, line_starts);
                     let declaration_hash = source_range_hash(source, declaration_range);
+                    let name_range = name_node
+                        .or_else(|| typedef.as_ref().map(|(node, _)| *node))
+                        .map(|node| source_range(node, source, line_starts))
+                        .unwrap_or_else(|| source_range(node, source, line_starts));
                     let range_fidelity = if contains_error_or_missing(declaration) {
                         RecordRangeFidelity::Malformed
                     } else {
@@ -199,6 +204,7 @@ pub(super) fn collect_ast_index(
                         start_col,
                         end_line,
                         end_col,
+                        name_range,
                         body_range: source_range(body, source, line_starts),
                         declaration_range,
                         declaration_hash,
@@ -815,6 +821,10 @@ fn collect_object_declarations(
             owner,
             linkage,
             guard: None,
+            backing: DeclarationBacking::Symbol {
+                start_byte: name_range.start_byte,
+                end_byte: name_range.end_byte,
+            },
         });
     }
 }
@@ -1259,6 +1269,7 @@ fn push_synthetic_nested_record(
         start_col: byte_to_utf16_col(source, start_line_byte, start_byte),
         end_line,
         end_col: byte_to_utf16_col(source, end_line_byte, end_byte),
+        name_range: source_range(type_node, source, line_starts),
         body_range: type_node
             .child_by_field_name("body")
             .map(|body| source_range(body, source, line_starts))
@@ -1578,13 +1589,16 @@ fn source_range_hash(source: &str, range: SourceRange) -> [u8; 32] {
     *blake3::hash(bytes).as_bytes()
 }
 
-fn parent_typedef_name(node: tree_sitter::Node<'_>, source: &str) -> Option<String> {
+fn parent_typedef_name_node<'tree>(
+    node: tree_sitter::Node<'tree>,
+    source: &'tree str,
+) -> Option<(tree_sitter::Node<'tree>, String)> {
     let parent = node.parent()?;
     if parent.kind() == "type_definition" {
         let mut cursor = parent.walk();
         for decl in parent.children_by_field_name("declarator", &mut cursor) {
-            if let Some((_, alias)) = declarator_identifier(decl, source) {
-                return Some(alias.to_string());
+            if let Some((alias_node, alias)) = declarator_identifier(decl, source) {
+                return Some((alias_node, alias.to_string()));
             }
         }
     }

@@ -1878,6 +1878,89 @@ inline int demo::Widget::method(int value) { return value; }
 }
 
 #[test]
+fn canonical_declarations_cover_all_public_semantic_kinds_with_backing() {
+    use crate::semantic_model::{DeclarationBacking, SemanticDeclarationKind};
+
+    let source = "#define LIMIT 4\n\
+                  struct Widget { void run(); int value; };\n\
+                  typedef Widget WidgetAlias;\n\
+                  enum Mode { Fast };\n\
+                  int global_value;\n\
+                  void free_fn(void) {}\n";
+    let index = parse(std::path::Path::new("model.cpp"), source);
+    for (name, kind) in [
+        ("LIMIT", SemanticDeclarationKind::Macro),
+        ("Widget", SemanticDeclarationKind::Type),
+        ("WidgetAlias", SemanticDeclarationKind::Alias),
+        ("Fast", SemanticDeclarationKind::EnumConstant),
+        ("global_value", SemanticDeclarationKind::Object),
+        ("free_fn", SemanticDeclarationKind::Function),
+        ("run", SemanticDeclarationKind::Method),
+    ] {
+        let declaration = index
+            .declarations
+            .iter()
+            .find(|declaration| declaration.name == name && declaration.declaration_kind == kind)
+            .unwrap_or_else(|| panic!("missing canonical {kind:?} declaration for {name}"));
+        assert!(!declaration.identity.locator.fingerprint.is_empty());
+        assert!(!matches!(declaration.backing, DeclarationBacking::None));
+    }
+}
+
+#[test]
+fn canonical_declarations_preserve_c_tag_and_object_namespaces() {
+    use crate::semantic_model::SemanticDeclarationKind;
+
+    let index = parse(
+        std::path::Path::new("namespaces.c"),
+        "struct Foo { int field; };\nint Foo;\n",
+    );
+    assert!(index.declarations.iter().any(|declaration| {
+        declaration.name == "Foo" && declaration.declaration_kind == SemanticDeclarationKind::Type
+    }));
+    assert!(index.declarations.iter().any(|declaration| {
+        declaration.name == "Foo" && declaration.declaration_kind == SemanticDeclarationKind::Object
+    }));
+}
+
+#[test]
+fn record_declaration_uses_exact_tag_name_range() {
+    use crate::semantic_model::SemanticDeclarationKind;
+
+    let source = "struct Widget {\n    int field;\n};\n";
+    let index = parse(std::path::Path::new("record.c"), source);
+    let declaration = index
+        .declarations
+        .iter()
+        .find(|declaration| {
+            declaration.name == "Widget"
+                && declaration.declaration_kind == SemanticDeclarationKind::Type
+        })
+        .expect("record declaration");
+
+    assert_eq!(
+        &source[declaration.name_range.start_byte..declaration.name_range.end_byte],
+        "Widget"
+    );
+    assert!(declaration.declaration_range.end_byte > declaration.name_range.end_byte);
+}
+
+#[test]
+fn lexical_fallback_still_emits_low_fidelity_candidate_identity() {
+    let source = "#define FALLBACK_VALUE 1\nint fallback_object;\n";
+    let line_starts = super::line_starts(source);
+    let (symbols, includes) = super::extract_symbols_and_includes(source, &line_starts, false);
+    let index = super::lexical_fallback_with_facts(symbols, includes, ParseFacts::ALL);
+    assert!(!index.declarations.is_empty());
+    assert!(index.declarations.iter().all(|declaration| {
+        declaration.identity.fact_fidelity
+            == crate::semantic_model::SemanticFactFidelity::LowFidelity
+            && declaration.identity.provenance
+                == crate::semantic_model::SemanticFactProvenance::LexicalFallback
+    }));
+}
+
+#[test]
 fn call_relation_fact_mask_is_explicit() {
     let source = "int caller(void) { return callee(); }\n";
     let skipped = parse_with_handle(

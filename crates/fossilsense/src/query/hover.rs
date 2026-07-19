@@ -1,10 +1,13 @@
 use crate::model::DefinitionCandidate;
+#[cfg(test)]
 use crate::reachability::ReachScope;
+#[cfg(test)]
 use crate::store::SymbolRecord;
 
 #[cfg(test)]
 use super::comments::{comment_markdown_for_symbol, CommentAnchor};
 use super::comments::{comment_markdown_from_signature, CommentRenderOptions};
+#[cfg(test)]
 use super::definitions::rank_definition_records_with_scope;
 
 pub const HOVER_CANDIDATE_LIMIT: usize = 4;
@@ -16,6 +19,7 @@ pub struct RankedHoverCandidate {
     pub guard: Option<String>,
 }
 
+#[cfg(test)]
 pub fn rank_hover_candidates(
     records: Vec<SymbolRecord>,
     current_rel_path: &str,

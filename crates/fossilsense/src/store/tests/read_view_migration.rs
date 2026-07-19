@@ -16,6 +16,16 @@ fn assert_absent(path: &str, forbidden: &[&str]) {
     }
 }
 
+fn assert_present(path: &str, required: &[&str]) {
+    let source = read(path);
+    for pattern in required {
+        assert!(
+            source.contains(pattern),
+            "{path} must route semantic results through `{pattern}`"
+        );
+    }
+}
+
 #[test]
 fn read_model_cache_rebuilds_use_typed_store_views() {
     assert_absent(
@@ -62,6 +72,37 @@ fn feature_and_cli_call_sites_use_read_views_for_exact_store_queries() {
             "store.load_symbol_names(",
             "store.symbols_by_ids(",
             "store.symbols_by_name(",
+        ],
+    );
+}
+
+#[test]
+fn core_symbol_features_route_through_candidate_sets_and_stable_handles() {
+    for path in [
+        "src/server/hover.rs",
+        "src/server/navigation.rs",
+        "src/server/signature_help.rs",
+        "src/server/possible_targets.rs",
+    ] {
+        assert_present(path, &["semantic_candidates("]);
+        assert_absent(path, &["non_callable_symbols("]);
+    }
+    assert_present(
+        "src/server/language_server.rs",
+        &["hydrate_ordinary_completion_candidates("],
+    );
+    assert_present(
+        "src/server/completion_candidate_documentation.rs",
+        &["resolve_candidate_handle(&handle)"],
+    );
+    assert_absent(
+        "src/server/completion_documentation.rs",
+        &[
+            "CompletionDocumentationData::Indexed",
+            "CompletionDocumentationData::CurrentDocument",
+            "CompletionDocumentationData::Overlay",
+            "member.name == label",
+            "member.signature == signature",
         ],
     );
 }

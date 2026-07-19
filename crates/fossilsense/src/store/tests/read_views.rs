@@ -11,6 +11,59 @@ fn file_id(store: &IndexStore, path: &str) -> i64 {
 }
 
 #[test]
+fn declaration_view_round_trips_canonical_identity_and_backing() {
+    use crate::semantic_model::{DeclarationBacking, SemanticDeclarationKind};
+
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+    let mut store = IndexStore::open(&db, dir.path()).expect("store");
+    upsert_source(
+        &mut store,
+        "model.cpp",
+        "#define LIMIT 4\n\
+         struct Widget { void run(); int value; };\n\
+         typedef Widget WidgetAlias;\n\
+         enum Mode { Fast };\n\
+         int global_value;\n\
+         void free_fn(void) {}\n",
+    );
+
+    let reader = IndexStore::open_readonly(&db).expect("readonly");
+    for (name, kind) in [
+        ("LIMIT", SemanticDeclarationKind::Macro),
+        ("Widget", SemanticDeclarationKind::Type),
+        ("WidgetAlias", SemanticDeclarationKind::Alias),
+        ("Fast", SemanticDeclarationKind::EnumConstant),
+        ("global_value", SemanticDeclarationKind::Object),
+        ("free_fn", SemanticDeclarationKind::Function),
+        ("run", SemanticDeclarationKind::Method),
+    ] {
+        let (rows, truncated) = reader
+            .declaration_view()
+            .by_name_limited(name, 8)
+            .expect("declaration rows");
+        assert!(!truncated);
+        let row = rows
+            .into_iter()
+            .find(|row| row.fact.declaration_kind == kind)
+            .unwrap_or_else(|| panic!("missing canonical {kind:?} declaration for {name}"));
+        assert!(!row.fact.identity.locator.fingerprint.is_empty());
+        assert_eq!(row.fact.identity.logical_key.declaration_kind, kind);
+        assert!(
+            !matches!(row.fact.backing, DeclarationBacking::None),
+            "{name} must retain an explicit specialized backing"
+        );
+        assert!(row.backing_id.is_some(), "{name} backing id must resolve");
+        let (same_entity, limited) = reader
+            .declaration_view()
+            .by_logical_key_limited(&row.fact.identity.logical_key, 8)
+            .expect("logical entity rows");
+        assert!(!limited);
+        assert!(same_entity.iter().any(|candidate| candidate.id == row.id));
+    }
+}
+
+#[test]
 fn name_table_read_view_exposes_typed_symbol_rows_and_legacy_wrapper_parity() {
     let dir = tempdir().expect("tempdir");
     let db = dir.path().join("index.sqlite");

@@ -2672,12 +2672,24 @@ async fn indexed_completion_resolve_rejects_cross_generation_context_before_over
     let item = CompletionItem {
         label: "dirty".into(),
         data: Some(
-            serde_json::to_value(super::CompletionDocumentationData::Indexed {
-                version: 3,
+            serde_json::to_value(super::CompletionDocumentationData::Candidate {
+                version: 4,
                 root: root.to_string_lossy().into_owned(),
                 uri: uri.to_string(),
-                label: "dirty".into(),
-                symbol_id: 1,
+                handle: crate::candidate_service::CandidateHandle {
+                    locator: crate::candidate_service::CandidateHandleLocator::Persistent {
+                        declaration_id: 1,
+                    },
+                    logical_key: crate::semantic_model::LogicalEntityKey {
+                        qualified_name: "dirty".into(),
+                        declaration_kind: crate::semantic_model::SemanticDeclarationKind::Function,
+                        owner: None,
+                        canonical_signature: None,
+                        linkage_domain: "external".into(),
+                        guard_fingerprint: None,
+                    },
+                    locator_fingerprint: "stale".into(),
+                },
                 semantic_generation: 11,
                 overlay_epoch: service
                     .inner()
@@ -4187,7 +4199,7 @@ async fn ordinary_completion_compat_fixture_captures_presented_boundary_output()
             PresentedCompletion {
                 label: "fs_overlay_type".to_string(),
                 kind: Some(CompletionItemKind::STRUCT),
-                detail: Some("current".to_string()),
+                detail: Some("int".to_string()),
                 documentation: None,
                 sort_text: Some("00000002".to_string()),
                 has_history_command: true,
@@ -4195,7 +4207,7 @@ async fn ordinary_completion_compat_fixture_captures_presented_boundary_output()
             PresentedCompletion {
                 label: "fs_overlay_macro".to_string(),
                 kind: Some(CompletionItemKind::CONSTANT),
-                detail: Some("current".to_string()),
+                detail: Some("#define fs_overlay_macro 1".to_string()),
                 documentation: None,
                 sort_text: Some("00000003".to_string()),
                 has_history_command: true,
@@ -4529,12 +4541,14 @@ async fn ordinary_completion_uses_unsaved_current_file_overlay() {
     }
     let items = completion_items(response);
 
-    assert!(items
+    assert!(items.iter().any(
+        |item| item.label == "FS_MAGIC" && item.detail.as_deref() == Some("#define FS_MAGIC 1")
+    ));
+    let alias = items
         .iter()
-        .any(|item| item.label == "FS_MAGIC" && item.detail.as_deref() == Some("current")));
-    assert!(items
-        .iter()
-        .any(|item| item.label == "FsAlias" && item.detail.as_deref() == Some("current")));
+        .find(|item| item.label == "FsAlias")
+        .expect("FsAlias completion");
+    assert_eq!(alias.detail.as_deref(), Some("typedef int FsAlias;"));
 
     let magic = items
         .into_iter()
@@ -4822,6 +4836,31 @@ async fn local_binding_pipeline_uses_open_document_bindings_before_local_words()
 
     assert_eq!(cursor.kind, Some(CompletionItemKind::VARIABLE));
     assert_eq!(cursor.detail.as_deref(), Some("local: int"));
+}
+
+#[tokio::test]
+async fn local_binding_completion_is_not_hydrated_from_same_name_global() {
+    let (_dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[("other.c", "int count(void) { return 1; }\n")],
+        "main.c",
+        "int f(int count) {\n    return cou/*cursor*/;\n}\n",
+    )
+    .await;
+
+    let response = service
+        .inner()
+        .completion(completion_params(uri, line, character))
+        .await
+        .expect("completion request")
+        .expect("completion response");
+    let count = completion_items(response)
+        .into_iter()
+        .find(|item| item.label == "count")
+        .expect("local count completion");
+
+    assert_eq!(count.kind, Some(CompletionItemKind::VARIABLE));
+    assert_eq!(count.detail.as_deref(), Some("parameter: int"));
+    assert!(count.data.is_none());
 }
 
 // --- R7: watcher/debounce IndexScheduleState machine tests ---------------

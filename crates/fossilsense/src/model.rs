@@ -383,6 +383,69 @@ pub struct MemberCandidate {
     /// Blake3 hash of the exact owner source revision that produced this
     /// member. Completion resolve validates it before reading lazy docs.
     pub owner_revision_hash: Option<String>,
+    pub handle: MemberCandidateHandle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemberCandidateHandle {
+    pub persistent_id: Option<i64>,
+    pub fingerprint: String,
+    pub start_line: u32,
+    pub start_col: u32,
+    pub end_line: u32,
+    pub end_col: u32,
+}
+
+impl MemberCandidateHandle {
+    pub fn new(
+        persistent_id: Option<i64>,
+        owner_path: &str,
+        record_key: &str,
+        member: &crate::semantic_model::MemberDef,
+    ) -> Self {
+        Self::from_parts(
+            persistent_id,
+            owner_path,
+            record_key,
+            &member.name,
+            member.kind,
+            member.start_byte,
+            member.end_byte,
+            member.start_line as u32,
+            member.start_col as u32,
+            member.end_line as u32,
+            member.end_col as u32,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_parts(
+        persistent_id: Option<i64>,
+        owner_path: &str,
+        _record_key: &str,
+        name: &str,
+        kind: crate::semantic_model::MemberKind,
+        start_byte: usize,
+        end_byte: usize,
+        start_line: u32,
+        start_col: u32,
+        end_line: u32,
+        end_col: u32,
+    ) -> Self {
+        let identity = format!(
+            "{owner_path}|{name}|{}|{start_byte}|{end_byte}|{start_line}|{start_col}",
+            kind.as_str(),
+        );
+        Self {
+            persistent_id,
+            fingerprint: blake3::hash(identity.as_bytes()).to_hex().to_string(),
+            start_line,
+            start_col,
+            end_line,
+            end_col,
+        }
+    }
 }
 
 /// User-visible best-effort label for a completion candidate (R6). `detail` is a

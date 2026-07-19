@@ -2,6 +2,7 @@
 use std::collections::HashSet;
 
 use crate::model::{CandidateRange, DefinitionCandidate};
+#[cfg(test)]
 use crate::project_context::ProjectContextIndex;
 use crate::reachability::ReachScope;
 use crate::resolver::{self, ResolveContext};
@@ -262,6 +263,7 @@ pub fn rank_definitions_into_candidates_with_scope(
 /// no declaration fact exists do full/tentative definitions become fallback
 /// anchors.  Unknown/legacy roles are retained as a final best-effort fallback
 /// only when neither of those known role classes is available.
+#[cfg(test)]
 pub fn rank_declaration_candidates_with_scope(
     candidates: Vec<SymbolRecord>,
     current_rel_path: &str,
@@ -295,6 +297,7 @@ pub fn rank_declaration_candidates_with_scope(
 /// the strict candidate graph; this compatibility entry point deliberately
 /// ignores the old origin/project toggle so it cannot become a second function
 /// identity policy.
+#[cfg(test)]
 pub fn rank_navigation_candidates_with_scope(
     mut candidates: Vec<SymbolRecord>,
     current_rel_path: &str,
@@ -319,6 +322,7 @@ pub fn rank_navigation_candidates_with_scope(
         .collect()
 }
 
+#[cfg(test)]
 fn definition_role_priority(role: &str) -> u8 {
     match role {
         "definition" => 3,

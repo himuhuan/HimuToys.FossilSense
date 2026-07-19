@@ -120,6 +120,7 @@ impl RecordReadRow {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberReadRow {
+    pub id: i64,
     pub name: String,
     pub kind: crate::semantic_model::MemberKind,
     pub signature: String,
@@ -129,10 +130,29 @@ pub struct MemberReadRow {
     pub external: bool,
     pub directly_included: bool,
     pub revision_hash: String,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub start_line: u32,
+    pub start_col: u32,
+    pub end_line: u32,
+    pub end_col: u32,
 }
 
 impl MemberReadRow {
     fn into_candidate(self, ctx: Option<&ResolveContext<'_>>) -> MemberCandidate {
+        let handle = crate::model::MemberCandidateHandle::from_parts(
+            Some(self.id),
+            &self.owner_path,
+            "",
+            &self.name,
+            self.kind,
+            self.start_byte,
+            self.end_byte,
+            self.start_line,
+            self.start_col,
+            self.end_line,
+            self.end_col,
+        );
         MemberCandidate {
             name: self.name,
             kind: self.kind,
@@ -147,6 +167,7 @@ impl MemberReadRow {
             confidence: self.confidence,
             owner_path: self.owner_path,
             owner_revision_hash: Some(self.revision_hash),
+            handle,
         }
     }
 }
@@ -260,7 +281,7 @@ impl<'a> MemberStoreView<'a> {
         }
         let placeholders = vec!["?"; record_ids.len()].join(",");
         let mut sql = format!(
-            "SELECT m.name, m.kind, m.signature, m.confidence, m.type_name, f.path, f.source, f.directly_included, rev.hash \
+            "SELECT m.id, m.name, m.kind, m.signature, m.confidence, m.type_name, f.path, f.source, f.directly_included, rev.hash, m.start_byte, m.end_byte, m.start_line, m.start_col, m.end_line, m.end_col \
              FROM members m \
              JOIN record_defs r ON r.id = m.record_id \
              JOIN files f ON f.id = r.file_id \
@@ -318,7 +339,7 @@ impl<'a> MemberStoreView<'a> {
         }
         let pattern = format!("{}%", prefix.replace('%', "\\%").replace('_', "\\_"));
         let mut stmt = self.store.conn.prepare(
-            "SELECT m.name, m.kind, m.confidence, m.signature, m.type_name, f.path, f.source, f.directly_included, rev.hash \
+            "SELECT m.id, m.name, m.kind, m.signature, m.confidence, m.type_name, f.path, f.source, f.directly_included, rev.hash, m.start_byte, m.end_byte, m.start_line, m.start_col, m.end_line, m.end_col \
              FROM members m \
              JOIN record_defs r ON r.id = m.record_id \
              JOIN files f ON f.id = r.file_id \
@@ -697,20 +718,27 @@ fn source_range(row: &rusqlite::Row<'_>, start: usize) -> rusqlite::Result<Sourc
 }
 
 fn member_read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemberReadRow> {
-    let kind_str: String = row.get(1)?;
-    let confidence_str: String = row.get(3)?;
-    let source_str: String = row.get(6)?;
-    let directly_included: i64 = row.get(7)?;
+    let kind_str: String = row.get(2)?;
+    let confidence_str: String = row.get(4)?;
+    let source_str: String = row.get(7)?;
+    let directly_included: i64 = row.get(8)?;
     Ok(MemberReadRow {
-        name: row.get(0)?,
+        id: row.get(0)?,
+        name: row.get(1)?,
         kind: member_kind_from_str(&kind_str),
-        signature: row.get(2)?,
+        signature: row.get(3)?,
         confidence: member_confidence_from_str(&confidence_str),
-        type_name: row.get(4)?,
-        owner_path: row.get(5)?,
+        type_name: row.get(5)?,
+        owner_path: row.get(6)?,
         external: source_str == "external",
         directly_included: directly_included != 0,
-        revision_hash: row.get(8)?,
+        revision_hash: row.get(9)?,
+        start_byte: row.get::<_, i64>(10)? as usize,
+        end_byte: row.get::<_, i64>(11)? as usize,
+        start_line: row.get::<_, i64>(12)? as u32,
+        start_col: row.get::<_, i64>(13)? as u32,
+        end_line: row.get::<_, i64>(14)? as u32,
+        end_col: row.get::<_, i64>(15)? as u32,
     })
 }
 

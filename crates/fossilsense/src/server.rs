@@ -51,6 +51,7 @@ use crate::store::IndexStore;
 
 mod call_hierarchy;
 mod candidate_context;
+mod completion_candidate_documentation;
 mod completion_documentation;
 mod hover;
 mod include_completion;
@@ -242,42 +243,22 @@ fn apply_final_completion_sort_text(items: &mut [CompletionItem]) {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 enum CompletionDocumentationData {
-    Indexed {
+    Candidate {
         version: u8,
         root: String,
         uri: String,
-        label: String,
-        symbol_id: i64,
-        semantic_generation: u64,
-        overlay_epoch: u64,
-        document_version: i32,
-    },
-    CurrentDocument {
-        version: u8,
-        uri: String,
-        start_line: u32,
-        overlay_epoch: u64,
-        document_version: i32,
-    },
-    Overlay {
-        version: u8,
-        root: String,
-        uri: String,
-        label: String,
-        path: String,
-        start_line: u32,
-        start_col: u32,
-        end_line: u32,
-        end_col: u32,
+        handle: crate::candidate_service::CandidateHandle,
         semantic_generation: u64,
         overlay_epoch: u64,
         document_version: i32,
     },
     Member {
         version: u8,
+        root: String,
         uri: String,
         owner_path: String,
-        signature: String,
+        handle: crate::model::MemberCandidateHandle,
+        semantic_generation: u64,
         owner_revision_hash: String,
         overlay_epoch: u64,
         document_version: i32,
@@ -289,53 +270,33 @@ fn ordinary_completion_item_to_lsp(
     uri: &Url,
     table_roots: &[PathBuf],
     table_semantic_generations: &[SemanticGeneration],
-    overlay_names: &[HashMap<i64, crate::candidate_service::OverlayCompletionName>],
     overlay_epoch: u64,
     document_version: i32,
 ) -> CompletionItem {
-    let documentation_label = item.label.clone();
     let data = item.documentation_target.and_then(|target| {
         let target = match target {
+            OrdinaryCompletionDocumentationTarget::Candidate {
+                table_index,
+                handle,
+            } => CompletionDocumentationData::Candidate {
+                version: 4,
+                root: table_roots.get(table_index)?.to_string_lossy().into_owned(),
+                uri: uri.to_string(),
+                handle,
+                semantic_generation: table_semantic_generations.get(table_index)?.0,
+                overlay_epoch,
+                document_version,
+            },
             OrdinaryCompletionDocumentationTarget::Indexed {
                 table_index,
                 symbol_id,
-            } => match overlay_names
-                .get(table_index)
-                .and_then(|locators| locators.get(&symbol_id))
-            {
-                Some(locator) => CompletionDocumentationData::Overlay {
-                    version: 3,
-                    root: table_roots.get(table_index)?.to_string_lossy().into_owned(),
-                    uri: uri.to_string(),
-                    label: documentation_label.clone(),
-                    path: locator.path.clone(),
-                    start_line: locator.start_line,
-                    start_col: locator.start_col,
-                    end_line: locator.end_line,
-                    end_col: locator.end_col,
-                    semantic_generation: table_semantic_generations.get(table_index)?.0,
-                    overlay_epoch,
-                    document_version,
-                },
-                None => CompletionDocumentationData::Indexed {
-                    version: 3,
-                    root: table_roots.get(table_index)?.to_string_lossy().into_owned(),
-                    uri: uri.to_string(),
-                    label: documentation_label.clone(),
-                    symbol_id,
-                    semantic_generation: table_semantic_generations.get(table_index)?.0,
-                    overlay_epoch,
-                    document_version,
-                },
-            },
+            } => {
+                let _ = (table_index, symbol_id);
+                return None;
+            }
             OrdinaryCompletionDocumentationTarget::CurrentDocument { start_line } => {
-                CompletionDocumentationData::CurrentDocument {
-                    version: 3,
-                    uri: uri.to_string(),
-                    start_line,
-                    overlay_epoch,
-                    document_version,
-                }
+                let _ = start_line;
+                return None;
             }
         };
         serde_json::to_value(target).ok()
@@ -348,6 +309,94 @@ fn ordinary_completion_item_to_lsp(
         sort_text: item.initial_sort_text,
         data,
         ..Default::default()
+    }
+}
+
+struct CompletionCandidateSource {
+    table_index: usize,
+    handle: Option<Arc<crate::call_service::CallReadHandle>>,
+    overlay: Arc<crate::candidate_service::CandidateOverlaySnapshot>,
+    current_rel: String,
+    reach_scope: Option<Arc<crate::reachability::ReachScope>>,
+    reach_graph: Option<Arc<crate::reachability::ReachGraph>>,
+}
+
+fn hydrate_ordinary_completion_candidates(
+    output: &mut crate::completion::ordinary_service::OrdinaryCompletionOutput,
+    sources: &[CompletionCandidateSource],
+    intent: crate::candidate_service::SemanticIntent,
+) -> Result<()> {
+    for item in &mut output.items {
+        if item.evidence.primary_source == crate::completion::CandidateSource::LocalBinding {
+            item.documentation_target = None;
+            continue;
+        }
+        let preferred_table = match item.documentation_target.as_ref() {
+            Some(OrdinaryCompletionDocumentationTarget::Indexed { table_index, .. }) => {
+                Some(*table_index)
+            }
+            Some(OrdinaryCompletionDocumentationTarget::CurrentDocument { .. }) => None,
+            Some(OrdinaryCompletionDocumentationTarget::Candidate { .. }) | None => continue,
+        };
+        let mut selected = None;
+        for source in sources.iter().filter(|source| {
+            preferred_table.is_none_or(|table_index| source.table_index == table_index)
+        }) {
+            let service = crate::candidate_service::CandidateQueryService::new(
+                source.handle.as_deref(),
+                &source.overlay,
+                &source.current_rel,
+                source.reach_scope.as_deref(),
+                source.reach_graph.as_deref(),
+            );
+            let set = service.semantic_candidates(&item.label, intent)?;
+            let focused = crate::candidate_service::focused_candidates(&set);
+            if let Some(candidate) = set
+                .all
+                .iter()
+                .flat_map(|group| group.candidates.iter())
+                .find(|candidate| {
+                    ordinary_completion_kind_for_declaration(candidate.fact.declaration_kind)
+                        == item.kind
+                })
+                .or_else(|| focused.first().copied())
+            {
+                selected = Some((source.table_index, candidate.clone()));
+                break;
+            }
+        }
+        let Some((table_index, candidate)) = selected else {
+            // Local bindings, language builtins and pure text recall do not
+            // pretend to have a workspace semantic identity.
+            item.documentation_target = None;
+            continue;
+        };
+        item.kind = ordinary_completion_kind_for_declaration(candidate.fact.declaration_kind);
+        item.detail = candidate.fact.canonical_signature.clone();
+        item.evidence.tier = candidate.tier;
+        item.evidence.confidence = candidate.confidence;
+        item.documentation_target = Some(OrdinaryCompletionDocumentationTarget::Candidate {
+            table_index,
+            handle: candidate.handle(),
+        });
+    }
+    Ok(())
+}
+
+fn ordinary_completion_kind_for_declaration(
+    kind: crate::semantic_model::SemanticDeclarationKind,
+) -> OrdinaryCompletionKind {
+    use crate::semantic_model::SemanticDeclarationKind;
+    match kind {
+        SemanticDeclarationKind::Function | SemanticDeclarationKind::Method => {
+            OrdinaryCompletionKind::Function
+        }
+        SemanticDeclarationKind::Type | SemanticDeclarationKind::Alias => {
+            OrdinaryCompletionKind::Type
+        }
+        SemanticDeclarationKind::Macro => OrdinaryCompletionKind::Macro,
+        SemanticDeclarationKind::EnumConstant => OrdinaryCompletionKind::EnumConstant,
+        SemanticDeclarationKind::Object => OrdinaryCompletionKind::Variable,
     }
 }
 

@@ -30,8 +30,18 @@ use crate::query::{
 };
 use crate::reachability::{ReachGraph, ReachScope};
 use crate::resolver::{self, ResolveContext};
-use crate::semantic_model::{Include, MemberDef, RecordDef, Symbol, SymbolRole, TypeAlias};
+use crate::semantic_model::{
+    DeclarationFact, Include, MemberDef, RecordDef, Symbol, SymbolRole, TypeAlias,
+};
 use crate::store::SymbolRecord;
+
+mod semantic;
+#[allow(unused_imports)]
+pub use semantic::CandidateHandleLocator;
+pub use semantic::{
+    focused_callable_fingerprints, focused_candidates, focused_has_kind, navigation_presentations,
+    CandidateHandle, ResolvedDeclarationCandidate, SemanticIntent,
+};
 
 pub const DEFAULT_EXACT_NAME_CANDIDATE_LIMIT: usize = 256;
 const MEMBER_FALLBACK_OVERLAY_SCAN_LIMIT: usize = 8_192;
@@ -75,6 +85,7 @@ pub struct BoundedMemberCandidates {
 #[derive(Debug, Clone)]
 pub struct FileCandidateOverlay {
     pub path: String,
+    pub declarations: Vec<DeclarationFact>,
     pub anchors: Vec<CallableAnchor>,
     pub calls: Vec<CallSiteFact>,
     pub symbols: Vec<Symbol>,
@@ -103,6 +114,7 @@ impl FileCandidateOverlay {
         }
         Self {
             path,
+            declarations: Vec::new(),
             anchors,
             calls,
             symbols: Vec::new(),
@@ -122,6 +134,21 @@ impl FileCandidateOverlay {
             index.call_sites.clone(),
         );
         overlay.symbols.clone_from(&index.symbols);
+        overlay.declarations = index
+            .declarations
+            .iter()
+            .cloned()
+            .map(|mut declaration| {
+                declaration.path.clone_from(&overlay.path);
+                declaration.identity.locator.path.clone_from(&overlay.path);
+                if matches!(declaration.linkage, LinkageDomain::Internal(_)) {
+                    declaration.linkage = LinkageDomain::Internal(overlay.path.clone());
+                    declaration.identity.logical_key.linkage_domain =
+                        format!("internal:{}", overlay.path);
+                }
+                declaration
+            })
+            .collect();
         overlay.records.clone_from(&index.records);
         overlay.members.clone_from(&index.members);
         overlay.aliases.clone_from(&index.aliases);
@@ -171,6 +198,12 @@ pub struct OverlaySymbolFact {
 }
 
 #[derive(Debug, Clone)]
+pub struct OverlayDeclarationFact {
+    pub path: String,
+    pub fact: DeclarationFact,
+}
+
+#[derive(Debug, Clone)]
 struct OverlayMemberFact {
     path: String,
     name_lower: String,
@@ -198,6 +231,8 @@ pub struct CandidateOverlaySnapshot {
     shadowed_paths: HashSet<String>,
     callable_by_name: HashMap<String, Vec<CallableAnchor>>,
     callable_by_path: HashMap<String, Vec<CallableAnchor>>,
+    declaration_by_name: HashMap<String, Vec<OverlayDeclarationFact>>,
+    declaration_by_fingerprint: HashMap<String, OverlayDeclarationFact>,
     symbol_by_name: HashMap<String, Vec<OverlaySymbolFact>>,
     record_by_name: HashMap<String, Vec<OverlayRecordFact>>,
     record_by_key: HashMap<(String, String), OverlayRecordFact>,
@@ -236,6 +271,21 @@ impl CandidateOverlaySnapshot {
             snapshot
                 .callable_by_path
                 .insert(file.path.clone(), file.anchors.clone());
+            for declaration in file.declarations {
+                let entry = OverlayDeclarationFact {
+                    path: file.path.clone(),
+                    fact: declaration,
+                };
+                snapshot.declaration_by_fingerprint.insert(
+                    entry.fact.identity.locator.fingerprint.clone(),
+                    entry.clone(),
+                );
+                snapshot
+                    .declaration_by_name
+                    .entry(entry.fact.name.clone())
+                    .or_default()
+                    .push(entry);
+            }
             for anchor in file.anchors {
                 snapshot
                     .callable_by_name
@@ -338,6 +388,25 @@ impl CandidateOverlaySnapshot {
                     .cmp(&right.path)
                     .then_with(|| left.name_range.start_byte.cmp(&right.name_range.start_byte))
                     .then_with(|| left.anchor_fingerprint.cmp(&right.anchor_fingerprint))
+            });
+        }
+        for declarations in snapshot.declaration_by_name.values_mut() {
+            declarations.sort_by(|left, right| {
+                left.path
+                    .cmp(&right.path)
+                    .then_with(|| {
+                        left.fact
+                            .name_range
+                            .start_byte
+                            .cmp(&right.fact.name_range.start_byte)
+                    })
+                    .then_with(|| {
+                        left.fact
+                            .identity
+                            .locator
+                            .fingerprint
+                            .cmp(&right.fact.identity.locator.fingerprint)
+                    })
             });
         }
         for symbols in snapshot.symbol_by_name.values_mut() {
@@ -547,6 +616,7 @@ impl CandidateOverlaySnapshot {
                     .get(&path)
                     .cloned()
                     .unwrap_or_default(),
+                declarations: Vec::new(),
                 calls: self
                     .call_sites_by_path
                     .get(&path)
@@ -587,6 +657,17 @@ impl CandidateOverlaySnapshot {
             .get(name)
             .map(Vec::as_slice)
             .unwrap_or_default()
+    }
+
+    pub fn declarations(&self, name: &str) -> &[OverlayDeclarationFact] {
+        self.declaration_by_name
+            .get(name)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    pub fn declaration_by_fingerprint(&self, fingerprint: &str) -> Option<&OverlayDeclarationFact> {
+        self.declaration_by_fingerprint.get(fingerprint)
     }
 
     pub fn callable_by_path(&self, path: &str) -> &[CallableAnchor] {
@@ -1138,6 +1219,7 @@ impl<'a> CandidateQueryService<'a> {
     /// Durable + live fallback symbols for non-callable features. Function
     /// consumers must use `callable_candidates`; filtering here prevents the
     /// legacy symbol table from silently becoming a second callable source.
+    #[cfg(test)]
     pub fn non_callable_symbols(&self, name: &str) -> Result<Vec<SymbolRecord>> {
         let mut records: Vec<_> = self
             .overlays
@@ -1233,11 +1315,13 @@ impl<'a> CandidateQueryService<'a> {
         Ok(records)
     }
 
+    #[cfg(test)]
     fn non_callable_record_is_visible(&self, record: &SymbolRecord) -> bool {
         !symbol_record_has_internal_linkage(record)
             || self.path_is_in_current_translation_unit(&record.path)
     }
 
+    #[cfg(test)]
     fn path_is_in_current_translation_unit(&self, path: &str) -> bool {
         path == self.current_path
             || self
@@ -1627,6 +1711,9 @@ impl<'a> CandidateQueryService<'a> {
                     confidence: member.confidence,
                     owner_path: path.clone(),
                     owner_revision_hash: owner_revision_hash.clone(),
+                    handle: crate::model::MemberCandidateHandle::new(
+                        None, path, record_key, member,
+                    ),
                 });
             }
             if truncated {
@@ -1728,6 +1815,12 @@ impl<'a> CandidateQueryService<'a> {
                 confidence: member.confidence,
                 owner_path: path.clone(),
                 owner_revision_hash,
+                handle: crate::model::MemberCandidateHandle::new(
+                    None,
+                    path,
+                    &member.record_key,
+                    member,
+                ),
             });
         }
         members.sort_by(|left, right| {
@@ -1864,6 +1957,7 @@ fn overlay_symbol_record(fact: &OverlaySymbolFact) -> SymbolRecord {
     }
 }
 
+#[cfg(test)]
 fn symbol_record_has_internal_linkage(record: &SymbolRecord) -> bool {
     record.kind == "global_variable"
         && record
@@ -2840,6 +2934,26 @@ mod tests {
             .iter()
             .any(|candidate| candidate.path == "zzz/reachable.h"));
 
+        let semantic_callables = service
+            .semantic_candidates("crowded", SemanticIntent::Call)
+            .expect("semantic callable candidates");
+        assert!(semantic_callables.coverage.truncated);
+        assert!(semantic_callables
+            .all
+            .iter()
+            .flat_map(|group| &group.candidates)
+            .any(|candidate| candidate.fact.path == "zzz/reachable.h"));
+
+        let semantic_values = service
+            .semantic_candidates("crowded_value", SemanticIntent::Value)
+            .expect("semantic value candidates");
+        assert!(semantic_values.coverage.truncated);
+        assert!(semantic_values
+            .all
+            .iter()
+            .flat_map(|group| &group.candidates)
+            .any(|candidate| candidate.fact.path == "zzz/reachable.h"));
+
         let current_service =
             CandidateQueryService::new(Some(&handle), &clean, "zzz/reachable.h", None, None);
         assert!(current_service
@@ -2885,5 +2999,40 @@ mod tests {
             .expect("dirty non-callable candidates")
             .iter()
             .all(|candidate| candidate.path != "zzz/reachable.h"));
+    }
+
+    #[test]
+    fn navigation_preserves_same_role_physical_alternatives() {
+        let first = parse_with_handle(
+            Path::new("first.c"),
+            "int shared_value = 1;\n",
+            None,
+            ParseFacts::HOVER_SEMANTICS,
+        );
+        let second = parse_with_handle(
+            Path::new("second.c"),
+            "int shared_value = 2;\n",
+            None,
+            ParseFacts::HOVER_SEMANTICS,
+        );
+        let snapshot = CandidateOverlaySnapshot::new(
+            1,
+            vec![
+                FileCandidateOverlay::from_index("first.c".into(), &first),
+                FileCandidateOverlay::from_index("second.c".into(), &second),
+            ],
+        );
+        let semantic = CandidateQueryService::new(None, &snapshot, "main.c", None, None)
+            .semantic_candidates("shared_value", SemanticIntent::Value)
+            .expect("semantic object candidates");
+
+        let presentations = navigation_presentations(&semantic, false);
+        assert_eq!(
+            presentations
+                .iter()
+                .map(|candidate| candidate.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first.c", "second.c"]
+        );
     }
 }

@@ -75,8 +75,20 @@ pub(crate) struct OrdinaryCompletionItem {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum OrdinaryCompletionDocumentationTarget {
-    Indexed { table_index: usize, symbol_id: i64 },
-    CurrentDocument { start_line: u32 },
+    Indexed {
+        table_index: usize,
+        symbol_id: i64,
+    },
+    CurrentDocument {
+        start_line: u32,
+    },
+    /// Exact semantic identity selected from the shared CandidateSet. The
+    /// legacy variants above are recall-stage hints only and must never cross
+    /// the LSP boundary.
+    Candidate {
+        table_index: usize,
+        handle: crate::candidate_service::CandidateHandle,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

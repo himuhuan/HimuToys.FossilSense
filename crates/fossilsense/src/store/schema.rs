@@ -1,11 +1,12 @@
-// Version 16 adds full callable signatures, exact record ranges, and
-// declarator-aware alias facts. Schema 15 rows are rebuilt, never dual-read.
-pub(crate) const SCHEMA_VERSION: i64 = 16;
+// Version 17 persists canonical declaration identity and explicit backing
+// links. Older rows are rebuilt; semantic queries never dual-read symbols.
+pub(crate) const SCHEMA_VERSION: i64 = 17;
 
 pub(crate) const DROP_DATA_TABLES_SQL: &str = "
     DROP TABLE IF EXISTS pending_file_revisions;
     DROP TABLE IF EXISTS index_builds;
     DROP TABLE IF EXISTS active_file_revisions;
+    DROP TABLE IF EXISTS declaration_facts;
     DROP TABLE IF EXISTS type_alias_facts;
     DROP TABLE IF EXISTS call_site_facts;
     DROP TABLE IF EXISTS callable_anchor_facts;
@@ -95,6 +96,19 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
         signature TEXT NOT NULL,
         guard TEXT,
         container TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS declaration_facts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        revision_id INTEGER NOT NULL REFERENCES file_revisions(id) ON DELETE CASCADE,
+        file_id INTEGER NOT NULL REFERENCES file_entries(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        logical_key_digest BLOB NOT NULL
+            CHECK(typeof(logical_key_digest) = 'blob' AND length(logical_key_digest) = 12),
+        locator_fingerprint TEXT NOT NULL,
+        fact_json TEXT NOT NULL,
+        backing_kind TEXT NOT NULL,
+        backing_id INTEGER
     );
 
     CREATE TABLE IF NOT EXISTS include_facts (
@@ -271,6 +285,11 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
         JOIN active_file_revisions a
           ON a.file_id = f.file_id AND a.revision_id = f.revision_id;
 
+    CREATE VIEW IF NOT EXISTS declarations AS
+        SELECT f.* FROM declaration_facts f
+        JOIN active_file_revisions a
+          ON a.file_id = f.file_id AND a.revision_id = f.revision_id;
+
     CREATE VIEW IF NOT EXISTS includes AS
         SELECT f.* FROM include_facts f
         JOIN active_file_revisions a
@@ -308,6 +327,7 @@ pub(crate) const CREATE_LOOKUP_INDEXES_SQL: &str = "
     CREATE INDEX IF NOT EXISTS idx_file_revisions_file_id ON file_revisions(file_id);
     CREATE INDEX IF NOT EXISTS idx_symbol_facts_name ON symbol_facts(name);
     CREATE INDEX IF NOT EXISTS idx_symbol_facts_file_id ON symbol_facts(file_id);
+    CREATE INDEX IF NOT EXISTS idx_declaration_facts_name ON declaration_facts(name);
     CREATE INDEX IF NOT EXISTS idx_type_alias_facts_alias ON type_alias_facts(alias);
     CREATE INDEX IF NOT EXISTS idx_type_alias_facts_fingerprint ON type_alias_facts(fingerprint);
     CREATE INDEX IF NOT EXISTS idx_type_alias_facts_file_id ON type_alias_facts(file_id);

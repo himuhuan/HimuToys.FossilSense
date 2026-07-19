@@ -41,14 +41,21 @@ pub use comments::RenderedSymbolComment;
 
 #[allow(unused_imports)]
 pub use current_file_overlay::{current_file_overlay_candidates, CurrentFileOverlayCandidate};
+#[allow(unused_imports)]
+pub use definitions::rank_definitions_into_candidates_with_scope;
+#[cfg(test)]
+#[allow(unused_imports)]
 pub use definitions::{
-    rank_declaration_candidates_with_scope, rank_definitions_into_candidates_with_scope,
-    rank_navigation_candidates_with_scope,
+    rank_declaration_candidates_with_scope, rank_navigation_candidates_with_scope,
 };
 pub use documentation::{rank_documentation_candidates, DocumentationCandidate};
+#[cfg(test)]
+#[allow(unused_imports)]
+pub use hover::rank_hover_candidates;
+#[allow(unused_imports)]
 pub use hover::{
-    comment_documentation_for_candidate_symbol, hover_markdown_for_candidate,
-    rank_hover_candidates, RankedHoverCandidate, HOVER_CANDIDATE_LIMIT,
+    comment_documentation_for_candidate_symbol, hover_markdown_for_candidate, RankedHoverCandidate,
+    HOVER_CANDIDATE_LIMIT,
 };
 pub use local_completion::{
     local_completion_candidates, visible_local_binding, LocalCompletionCandidate,
@@ -256,6 +263,8 @@ struct NameSegment {
 /// dirty publication appends small changed-file segments and updates only the
 /// per-path active override map. Virtual entry indices remain stable for the
 /// lifetime of one engine snapshot and are invalidated with its completion memo.
+/// This is a prefix-recall accelerator only: consumers must hydrate every
+/// semantic presentation through `CandidateQueryService::semantic_candidates`.
 pub struct NameTable {
     base: Arc<NameSegment>,
     deltas: Arc<Vec<Arc<NameSegment>>>,
