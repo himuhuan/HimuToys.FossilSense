@@ -77,6 +77,7 @@ VS Code 设置中常用的选项：
 - `fossilsense.completion.prefixRanking`：默认 `strict`，优先精确名和字面前缀；`scopeFirst` 更重视作用域证据。
 - `fossilsense.projectContext.mode`：自动项目证据、歧义时询问或关闭。
 - `fossilsense.semanticColoring.mode`：启用或关闭 FossilSense 着色。
+- `fossilsense.resourceMonitor.enabled`：在状态栏显示 FossilSense 进程内存和索引数据库磁盘占用，默认开启，每 5 秒刷新；关闭仅隐藏状态栏，不影响服务行为。
 
 ## 能力边界
 

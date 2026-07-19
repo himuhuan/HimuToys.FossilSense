@@ -233,6 +233,11 @@
           "default": false,
           "markdownDescription": "Show `:line` suffixes in the **Find References (Grouped by Role)** QuickPick. Off by default to keep labels focused on relative paths; selection still navigates to the full returned range."
         },
+        "fossilsense.resourceMonitor.enabled": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Show a status bar item with the FossilSense server's process memory and the on-disk size of its index cache. Updates every 5 seconds while the server is running. Does not affect server behavior; turning it off only hides the item."
+        },
         "fossilsense.includePaths": {
           "type": "array",
           "items": {

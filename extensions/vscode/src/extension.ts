@@ -8,6 +8,7 @@ import {
   Trace,
 } from 'vscode-languageclient/node';
 import {
+  normalizeBoolean,
   normalizeCompletionPrefixRanking,
   normalizeIncludeScopingMode,
   normalizeOnOffAuto,
@@ -52,6 +53,11 @@ import {
   shouldPromptForProjectContext,
   validStoredProjectContextSelection,
 } from './projectContext';
+import {
+  ResourceUsage,
+  resourceUsageStatusText,
+  resourceUsageTooltip,
+} from './resourceUsage';
 
 const REFRESH_INDEX_COMMAND = 'fossilsense.refreshIndex';
 const REFRESH_INDEX_LSP_COMMAND = 'fossilsense.lsp.refreshIndex';
@@ -86,6 +92,7 @@ const CONFLICT_EXTENSIONS = [
 let client: LanguageClient | undefined;
 let statusBar: vscode.StatusBarItem;
 let projectContextStatusBar: vscode.StatusBarItem;
+let resourceStatusBar: vscode.StatusBarItem;
 let callRelationsController: CallRelationsController;
 let output: vscode.OutputChannel;
 let configWarning: string | undefined;
@@ -129,12 +136,16 @@ export function activate(context: vscode.ExtensionContext): void {
   projectContextStatusBar.command = SELECT_PROJECT_CONTEXT_COMMAND;
   setProjectContextStatus(undefined);
   projectContextStatusBar.show();
+  resourceStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 98);
+  resourceStatusBar.tooltip = '';
+  resourceStatusBar.hide();
   callRelationsController = registerCallRelationViews(context, () => client);
 
   context.subscriptions.push(
     output,
     statusBar,
     projectContextStatusBar,
+    resourceStatusBar,
     vscode.commands.registerCommand('fossilsense.startServer', () => startServer(context)),
     vscode.commands.registerCommand('fossilsense.stopServer', () => stopServer()),
     vscode.commands.registerCommand(REFRESH_INDEX_COMMAND, () => refreshIndex()),
@@ -162,6 +173,16 @@ export function activate(context: vscode.ExtensionContext): void {
       if (event.affectsConfiguration('fossilsense.projectContext.mode') && client) {
         await applyProjectContextSelectionFromState(context);
         await updateProjectContextForActiveEditor(context);
+        return;
+      }
+      if (event.affectsConfiguration('fossilsense.resourceMonitor.enabled')) {
+        if (!resourceMonitorEnabledFromConfig()) {
+          resourceStatusBar.hide();
+          resourceStatusBar.text = '';
+          resourceStatusBar.tooltip = '';
+        }
+        // When turning on, do nothing here: the next `fossilsense/resourceUsage`
+        // notification (if the server is running) will show the status bar.
         return;
       }
       if (
@@ -337,6 +358,12 @@ async function startServer(context: vscode.ExtensionContext): Promise<void> {
       updateProjectContextForActiveEditor(context),
     );
   });
+  client.onNotification('fossilsense/resourceUsage', (usage: ResourceUsage) => {
+    if (!resourceMonitorEnabledFromConfig()) {
+      return;
+    }
+    setResourceStatus(usage.memoryBytes, usage.indexDiskBytes);
+  });
 
   try {
     await client.start();
@@ -372,6 +399,9 @@ async function stopServer(): Promise<void> {
 
   setStatus('stopped');
   setProjectContextStatus(undefined);
+  resourceStatusBar.hide();
+  resourceStatusBar.text = '';
+  resourceStatusBar.tooltip = '';
 }
 
 function scheduleWatchPlanRestart(context: vscode.ExtensionContext): void {
@@ -786,6 +816,13 @@ function fossilsenseModeFromConfig(): string {
   return normalizeOnOffAuto(setting);
 }
 
+function resourceMonitorEnabledFromConfig(): boolean {
+  const value = vscode.workspace
+    .getConfiguration('fossilsense')
+    .get<unknown>('resourceMonitor.enabled', true);
+  return normalizeBoolean(value);
+}
+
 function completionPrefixRankingFromConfig(): string {
   const setting = vscode.workspace
     .getConfiguration('fossilsense')
@@ -945,4 +982,10 @@ function setProjectContextStatus(status: ProjectContextStatus | undefined): void
   projectContextStatusBar.text = projectContextStatusText(mode, status);
   projectContextStatusBar.tooltip = projectContextTooltip(mode, status);
   projectContextStatusBar.command = SELECT_PROJECT_CONTEXT_COMMAND;
+}
+
+function setResourceStatus(memoryBytes: number, diskBytes: number): void {
+  resourceStatusBar.text = resourceUsageStatusText(memoryBytes, diskBytes);
+  resourceStatusBar.tooltip = resourceUsageTooltip(memoryBytes, diskBytes);
+  resourceStatusBar.show();
 }

@@ -381,6 +381,7 @@ pub async fn run_stdio() -> Result<()> {
         debug_candidate_reasons: AtomicBool::new(false),
         perf_logging_enabled: AtomicBool::new(false),
         config_cache: Arc::new(Mutex::new(HashMap::new())),
+        resource_monitor_shutdown: Arc::new(tokio::sync::Notify::new()),
     });
 
     Server::new(stdin, stdout, socket).serve(service).await;
@@ -435,6 +436,10 @@ struct Backend {
     /// Invalidated when `fossilsense.json` itself changes (which triggers
     /// `WatchDecision::Full` and reloads the config in the index path).
     config_cache: Arc<Mutex<HashMap<PathBuf, WorkspaceConfig>>>,
+    /// Cancels the `fossilsense/resourceUsage` background reporter when the
+    /// server shuts down. The reporter is spawned in `initialized` and stopped
+    /// in `shutdown`.
+    resource_monitor_shutdown: Arc<tokio::sync::Notify>,
 }
 
 impl Backend {

@@ -20,6 +20,7 @@ mod query;
 mod reachability;
 mod references;
 mod resolver;
+mod resource;
 mod scanner;
 #[cfg(test)]
 mod semantic_benchmark;

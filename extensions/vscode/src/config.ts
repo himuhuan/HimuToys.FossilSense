@@ -20,3 +20,12 @@ export function normalizeCompletionPrefixRanking(
 ): CompletionPrefixRanking {
   return value === 'scopeFirst' ? 'scopeFirst' : 'strict';
 }
+
+/**
+ * Normalize a boolean configuration value. Only an explicit `false` disables
+ * the feature; any other value (including `undefined` from a missing setting)
+ * is treated as enabled, matching the `default: true` contract.
+ */
+export function normalizeBoolean(value: unknown): boolean {
+  return value !== false;
+}

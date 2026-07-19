@@ -133,9 +133,15 @@ impl LanguageServer for Backend {
             .await;
         self.preload_completion_history().await;
         self.spawn_index_roots(None).await;
+        crate::resource::spawn_resource_usage_reporter(
+            self.client.clone(),
+            self.workspace_roots.clone(),
+            self.resource_monitor_shutdown.clone(),
+        );
     }
 
     async fn shutdown(&self) -> LspResult<()> {
+        self.resource_monitor_shutdown.notify_one();
         self.client
             .log_message(MessageType::INFO, "FossilSense shutting down")
             .await;

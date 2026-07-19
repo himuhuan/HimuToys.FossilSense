@@ -48,6 +48,7 @@ fn test_backend_service() -> LspService<super::Backend> {
         debug_candidate_reasons: AtomicBool::new(false),
         perf_logging_enabled: AtomicBool::new(false),
         config_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        resource_monitor_shutdown: Arc::new(tokio::sync::Notify::new()),
     });
     service
 }

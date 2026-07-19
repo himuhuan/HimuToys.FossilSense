@@ -71,6 +71,7 @@ All fields are optional. Invalid configuration falls back to safe defaults and p
 - `fossilsense.projectContext.mode`: use automatic project evidence, prompt when ambiguous, or disable it.
 - `fossilsense.semanticColoring.mode`: enable or disable FossilSense semantic coloring.
 - `fossilsense.references.showRanges`: show line suffixes in grouped reference rows.
+- `fossilsense.resourceMonitor.enabled`: show a status bar item with the server's process memory and the on-disk size of its index cache. On by default; updates every 5 seconds while the server is running. Turning it off only hides the item.
 - `fossilsense.debug.candidateReasons`: log definition-candidate scope, confidence, and reason.
 
 ## Current limitations

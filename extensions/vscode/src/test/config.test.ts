@@ -2,6 +2,7 @@ import * as assert from 'assert';
 import * as fs from 'fs';
 import * as path from 'path';
 import {
+  normalizeBoolean,
   normalizeCompletionPrefixRanking,
   normalizeIncludeScopingMode,
   normalizeOnOffAuto,
@@ -28,6 +29,12 @@ assert.strictEqual(normalizeCompletionPrefixRanking('scopeFirst'), 'scopeFirst')
 assert.strictEqual(normalizeCompletionPrefixRanking('unexpected'), 'strict');
 assert.strictEqual(normalizeCompletionPrefixRanking(undefined), 'strict');
 
+assert.strictEqual(normalizeBoolean(true), true);
+assert.strictEqual(normalizeBoolean(false), false);
+assert.strictEqual(normalizeBoolean(undefined), true);
+assert.strictEqual(normalizeBoolean('unexpected'), true);
+assert.strictEqual(normalizeBoolean(0), true);
+
 const packageJson = JSON.parse(
   fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8'),
 );
@@ -42,3 +49,8 @@ assert.strictEqual(semanticIndexBudget.type, 'integer');
 assert.strictEqual(semanticIndexBudget.default, 256);
 assert.strictEqual(semanticIndexBudget.minimum, 0);
 assert.strictEqual(semanticIndexBudget.maximum, 16384);
+
+const resourceMonitorEnabled =
+  packageJson.contributes.configuration.properties['fossilsense.resourceMonitor.enabled'];
+assert.strictEqual(resourceMonitorEnabled.type, 'boolean');
+assert.strictEqual(resourceMonitorEnabled.default, true);

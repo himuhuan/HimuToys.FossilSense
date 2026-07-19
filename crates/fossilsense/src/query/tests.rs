@@ -1,32 +1,6 @@
 use super::*;
 use crate::reachability::ReachScope;
-
-#[cfg(windows)]
-fn current_private_bytes() -> u64 {
-    use windows_sys::Win32::System::ProcessStatus::{
-        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
-    };
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-
-    let mut counters = PROCESS_MEMORY_COUNTERS_EX {
-        cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
-        ..Default::default()
-    };
-    let loaded = unsafe {
-        K32GetProcessMemoryInfo(
-            GetCurrentProcess(),
-            (&mut counters as *mut PROCESS_MEMORY_COUNTERS_EX).cast::<PROCESS_MEMORY_COUNTERS>(),
-            std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
-        )
-    };
-    assert_ne!(loaded, 0, "GetProcessMemoryInfo failed");
-    counters.PrivateUsage as u64
-}
-
-#[cfg(not(windows))]
-fn current_private_bytes() -> u64 {
-    0
-}
+use crate::resource::current_process_memory_bytes;
 
 #[test]
 #[ignore = "diagnostic large-workspace NameTable benchmark; set FOSSILSENSE_BENCH_DB"]
@@ -66,7 +40,7 @@ fn benchmark_large_name_table_build_and_dirty_update() {
 
     let paths = std::collections::HashSet::from([changed_path]);
     let mut dirty_us = Vec::new();
-    let private_before = current_private_bytes();
+    let private_before = current_process_memory_bytes();
     let peak_private = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(private_before));
     let stop_sampling = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sampler = {
@@ -75,7 +49,7 @@ fn benchmark_large_name_table_build_and_dirty_update() {
         std::thread::spawn(move || {
             while !stop_sampling.load(std::sync::atomic::Ordering::Relaxed) {
                 peak_private.fetch_max(
-                    current_private_bytes(),
+                    current_process_memory_bytes(),
                     std::sync::atomic::Ordering::Relaxed,
                 );
                 std::thread::sleep(std::time::Duration::from_millis(1));
@@ -97,7 +71,7 @@ fn benchmark_large_name_table_build_and_dirty_update() {
         assert_eq!(table.len(), expected_len);
     }
     let segments_before_compaction = table.delta_segment_count();
-    let compaction_private_before = current_private_bytes();
+    let compaction_private_before = current_process_memory_bytes();
     let compaction_peak_private =
         std::sync::Arc::new(std::sync::atomic::AtomicU64::new(compaction_private_before));
     let stop_compaction_sampling = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -107,7 +81,7 @@ fn benchmark_large_name_table_build_and_dirty_update() {
         std::thread::spawn(move || {
             while !stop_sampling.load(std::sync::atomic::Ordering::Relaxed) {
                 peak_private.fetch_max(
-                    current_private_bytes(),
+                    current_process_memory_bytes(),
                     std::sync::atomic::Ordering::Relaxed,
                 );
                 std::thread::sleep(std::time::Duration::from_millis(1));
