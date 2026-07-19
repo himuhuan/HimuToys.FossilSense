@@ -44,10 +44,9 @@ use crate::includes::{self, IncludeForm};
 use crate::parser::{self, FileSemanticIndex};
 use crate::pathing;
 use crate::project_context::ProjectContextSelection;
-use crate::query::{self, NameTable};
+use crate::query;
 use crate::reachability;
 use crate::references;
-use crate::store::IndexStore;
 
 mod call_hierarchy;
 mod candidate_context;
@@ -79,8 +78,8 @@ use indexing::{
 };
 use indexing::{watched_change_in_scope, IndexScheduleState, WatchDecision};
 use lsp_adapters::{
-    candidate_to_location, grouped_reference_items, hit_to_location, parsed_to_document_symbol,
-    record_to_symbol_information, GroupedReferenceItem,
+    candidate_to_location, declaration_core_to_symbol_information, grouped_reference_items,
+    hit_to_location, parsed_to_document_symbol, GroupedReferenceItem,
 };
 use navigation::NavigationOperation;
 use options::{
@@ -88,7 +87,7 @@ use options::{
     member_completion_is_incomplete, parse_completion_history_mode, parse_completion_mode,
     parse_completion_prefix_ranking, parse_debug_candidate_reasons, parse_debug_perf_logs,
     parse_include_paths, parse_include_scoping_enabled, parse_initial_project_context_selection,
-    parse_semantic_coloring_mode, signature_help_options,
+    parse_semantic_coloring_mode, parse_semantic_index_memory_budget_mb, signature_help_options,
 };
 use workspace::{
     CacheLedger, CachePublishReport, DocumentRequestSnapshot, DocumentStore, RequestContext,
@@ -241,8 +240,21 @@ fn apply_final_completion_sort_text(items: &mut [CompletionItem]) {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 enum CompletionDocumentationData {
+    Declaration {
+        version: u8,
+        root: String,
+        uri: String,
+        declaration_id: i64,
+        semantic_generation: u64,
+        overlay_epoch: u64,
+        document_version: i32,
+    },
     Candidate {
         version: u8,
         root: String,
@@ -287,13 +299,18 @@ fn ordinary_completion_item_to_lsp(
                 overlay_epoch,
                 document_version,
             },
-            OrdinaryCompletionDocumentationTarget::Indexed {
+            OrdinaryCompletionDocumentationTarget::Declaration {
                 table_index,
-                symbol_id,
-            } => {
-                let _ = (table_index, symbol_id);
-                return None;
-            }
+                declaration_id,
+            } => CompletionDocumentationData::Declaration {
+                version: 5,
+                root: table_roots.get(table_index)?.to_string_lossy().into_owned(),
+                uri: uri.to_string(),
+                declaration_id,
+                semantic_generation: table_semantic_generations.get(table_index)?.0,
+                overlay_epoch,
+                document_version,
+            },
             OrdinaryCompletionDocumentationTarget::CurrentDocument { start_line } => {
                 let _ = start_line;
                 return None;
@@ -309,94 +326,6 @@ fn ordinary_completion_item_to_lsp(
         sort_text: item.initial_sort_text,
         data,
         ..Default::default()
-    }
-}
-
-struct CompletionCandidateSource {
-    table_index: usize,
-    handle: Option<Arc<crate::call_service::CallReadHandle>>,
-    overlay: Arc<crate::candidate_service::CandidateOverlaySnapshot>,
-    current_rel: String,
-    reach_scope: Option<Arc<crate::reachability::ReachScope>>,
-    reach_graph: Option<Arc<crate::reachability::ReachGraph>>,
-}
-
-fn hydrate_ordinary_completion_candidates(
-    output: &mut crate::completion::ordinary_service::OrdinaryCompletionOutput,
-    sources: &[CompletionCandidateSource],
-    intent: crate::candidate_service::SemanticIntent,
-) -> Result<()> {
-    for item in &mut output.items {
-        if item.evidence.primary_source == crate::completion::CandidateSource::LocalBinding {
-            item.documentation_target = None;
-            continue;
-        }
-        let preferred_table = match item.documentation_target.as_ref() {
-            Some(OrdinaryCompletionDocumentationTarget::Indexed { table_index, .. }) => {
-                Some(*table_index)
-            }
-            Some(OrdinaryCompletionDocumentationTarget::CurrentDocument { .. }) => None,
-            Some(OrdinaryCompletionDocumentationTarget::Candidate { .. }) | None => continue,
-        };
-        let mut selected = None;
-        for source in sources.iter().filter(|source| {
-            preferred_table.is_none_or(|table_index| source.table_index == table_index)
-        }) {
-            let service = crate::candidate_service::CandidateQueryService::new(
-                source.handle.as_deref(),
-                &source.overlay,
-                &source.current_rel,
-                source.reach_scope.as_deref(),
-                source.reach_graph.as_deref(),
-            );
-            let set = service.semantic_candidates(&item.label, intent)?;
-            let focused = crate::candidate_service::focused_candidates(&set);
-            if let Some(candidate) = set
-                .all
-                .iter()
-                .flat_map(|group| group.candidates.iter())
-                .find(|candidate| {
-                    ordinary_completion_kind_for_declaration(candidate.fact.declaration_kind)
-                        == item.kind
-                })
-                .or_else(|| focused.first().copied())
-            {
-                selected = Some((source.table_index, candidate.clone()));
-                break;
-            }
-        }
-        let Some((table_index, candidate)) = selected else {
-            // Local bindings, language builtins and pure text recall do not
-            // pretend to have a workspace semantic identity.
-            item.documentation_target = None;
-            continue;
-        };
-        item.kind = ordinary_completion_kind_for_declaration(candidate.fact.declaration_kind);
-        item.detail = candidate.fact.canonical_signature.clone();
-        item.evidence.tier = candidate.tier;
-        item.evidence.confidence = candidate.confidence;
-        item.documentation_target = Some(OrdinaryCompletionDocumentationTarget::Candidate {
-            table_index,
-            handle: candidate.handle(),
-        });
-    }
-    Ok(())
-}
-
-fn ordinary_completion_kind_for_declaration(
-    kind: crate::semantic_model::SemanticDeclarationKind,
-) -> OrdinaryCompletionKind {
-    use crate::semantic_model::SemanticDeclarationKind;
-    match kind {
-        SemanticDeclarationKind::Function | SemanticDeclarationKind::Method => {
-            OrdinaryCompletionKind::Function
-        }
-        SemanticDeclarationKind::Type | SemanticDeclarationKind::Alias => {
-            OrdinaryCompletionKind::Type
-        }
-        SemanticDeclarationKind::Macro => OrdinaryCompletionKind::Macro,
-        SemanticDeclarationKind::EnumConstant => OrdinaryCompletionKind::EnumConstant,
-        SemanticDeclarationKind::Object => OrdinaryCompletionKind::Variable,
     }
 }
 

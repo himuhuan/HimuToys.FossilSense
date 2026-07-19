@@ -5,7 +5,9 @@ use rusqlite::{params, Connection};
 
 use crate::call_model::SignatureFidelity;
 use crate::semantic_model::{
-    AliasTarget, AliasTargetFidelity, DeclarationBacking, RecordRangeFidelity, PARSER_FACT_VERSION,
+    AliasTarget, AliasTargetFidelity, DeclarationBacking, LanguageFidelity, RecordRangeFidelity,
+    SemanticDeclarationKind, SemanticDeclarationRole, SemanticFactFidelity, SemanticFactProvenance,
+    SemanticLanguage, PARSER_FACT_VERSION,
 };
 
 use super::{
@@ -52,9 +54,22 @@ pub(super) fn stage_file_updates(
         )?;
         let mut declaration_stmt = tx.prepare(
             "INSERT INTO declaration_facts (
-                revision_id, file_id, name, logical_key_digest, locator_fingerprint,
-                fact_json, backing_kind, backing_id
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                revision_id, file_id, name, qualified_name, declaration_kind, role,
+                name_start_byte, name_end_byte, name_start_line, name_start_col,
+                name_end_line, name_end_col,
+                declaration_start_byte, declaration_end_byte, declaration_start_line,
+                declaration_start_col, declaration_end_line, declaration_end_col,
+                canonical_signature, declarator_shape_json, has_initializer, owner,
+                linkage_kind, guard, language, language_fidelity, provenance, fact_fidelity,
+                logical_key_digest, locator_fingerprint, logical_linkage_domain,
+                guard_fingerprint, backing_kind, backing_id, backing_key,
+                backing_start_byte, backing_end_byte
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
+                ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35,
+                ?36, ?37
+             )",
         )?;
         let mut include_stmt = tx
             .prepare("INSERT INTO include_facts (revision_id, file_id, line, target_text, target_form, target_normalized, target_basename) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")?;
@@ -490,51 +505,103 @@ pub(super) fn stage_file_updates(
                     declaration.identity.logical_key.linkage_domain =
                         format!("internal:{}", fingerprint.path);
                 }
-                let (backing_kind, backing_id) = match &declaration.backing {
-                    DeclarationBacking::CallableAnchor { fingerprint } => (
-                        "callable_anchor",
-                        callable_id_by_fingerprint.get(fingerprint).copied(),
-                    ),
-                    DeclarationBacking::Record { record_key } => {
-                        ("record", record_key_to_id.get(record_key).copied())
-                    }
-                    DeclarationBacking::TypeAlias { fingerprint } => (
-                        "type_alias",
-                        alias_fingerprint_to_id.get(fingerprint).copied(),
-                    ),
-                    DeclarationBacking::Symbol {
-                        start_byte,
-                        end_byte,
-                    } => (
-                        "symbol",
-                        symbol_ids
-                            .get(&(*start_byte, *end_byte))
-                            .copied()
-                            .or_else(|| {
-                                symbol_ids_by_name.get(declaration.name.as_str()).and_then(
-                                    |symbols| {
-                                        symbols
-                                            .iter()
-                                            .min_by_key(|(candidate_start, _)| {
-                                                candidate_start.abs_diff(*start_byte)
-                                            })
-                                            .map(|(_, id)| *id)
-                                    },
-                                )
-                            }),
-                    ),
-                    DeclarationBacking::None => ("none", None),
-                };
+                let (backing_kind, backing_id, backing_key, backing_start, backing_end) =
+                    match &declaration.backing {
+                        DeclarationBacking::CallableAnchor { fingerprint } => (
+                            "callable_anchor",
+                            callable_id_by_fingerprint.get(fingerprint).copied(),
+                            Some(fingerprint.clone()),
+                            None,
+                            None,
+                        ),
+                        DeclarationBacking::Record { record_key } => (
+                            "record",
+                            record_key_to_id.get(record_key).copied(),
+                            Some(record_key.clone()),
+                            None,
+                            None,
+                        ),
+                        DeclarationBacking::TypeAlias { fingerprint } => (
+                            "type_alias",
+                            alias_fingerprint_to_id.get(fingerprint).copied(),
+                            Some(fingerprint.clone()),
+                            None,
+                            None,
+                        ),
+                        DeclarationBacking::Symbol {
+                            start_byte,
+                            end_byte,
+                        } => (
+                            "symbol",
+                            symbol_ids
+                                .get(&(*start_byte, *end_byte))
+                                .copied()
+                                .or_else(|| {
+                                    symbol_ids_by_name.get(declaration.name.as_str()).and_then(
+                                        |symbols| {
+                                            symbols
+                                                .iter()
+                                                .min_by_key(|(candidate_start, _)| {
+                                                    candidate_start.abs_diff(*start_byte)
+                                                })
+                                                .map(|(_, id)| *id)
+                                        },
+                                    )
+                                }),
+                            None,
+                            Some(*start_byte as i64),
+                            Some(*end_byte as i64),
+                        ),
+                        DeclarationBacking::None => ("none", None, None, None, None),
+                    };
                 let logical_key = serde_json::to_vec(&declaration.identity.logical_key)?;
+                let declarator_shape_json = declaration
+                    .declarator_shape
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?;
                 declaration_stmt.execute(params![
                     revision_id,
                     file_id,
                     declaration.name.as_str(),
+                    declaration.qualified_name.as_str(),
+                    declaration_kind_code(declaration.declaration_kind),
+                    declaration_role_code(declaration.role),
+                    declaration.name_range.start_byte as i64,
+                    declaration.name_range.end_byte as i64,
+                    declaration.name_range.start.line as i64,
+                    declaration.name_range.start.character as i64,
+                    declaration.name_range.end.line as i64,
+                    declaration.name_range.end.character as i64,
+                    declaration.declaration_range.start_byte as i64,
+                    declaration.declaration_range.end_byte as i64,
+                    declaration.declaration_range.start.line as i64,
+                    declaration.declaration_range.start.character as i64,
+                    declaration.declaration_range.end.line as i64,
+                    declaration.declaration_range.end.character as i64,
+                    declaration.canonical_signature.as_deref(),
+                    declarator_shape_json,
+                    declaration.has_initializer.map(i64::from),
+                    declaration.owner.as_deref(),
+                    linkage_kind_code(&declaration.linkage),
+                    declaration.guard.as_deref(),
+                    semantic_language_code(declaration.identity.language),
+                    language_fidelity_code(declaration.identity.language_fidelity),
+                    semantic_provenance_code(declaration.identity.provenance),
+                    semantic_fidelity_code(declaration.identity.fact_fidelity),
                     digest_value(&logical_key),
                     declaration.identity.locator.fingerprint.as_str(),
-                    serde_json::to_string(&declaration)?,
+                    declaration.identity.logical_key.linkage_domain.as_str(),
+                    declaration
+                        .identity
+                        .logical_key
+                        .guard_fingerprint
+                        .as_deref(),
                     backing_kind,
                     backing_id,
+                    backing_key,
+                    backing_start,
+                    backing_end,
                 ])?;
             }
         }
@@ -559,6 +626,68 @@ fn digest_bytes(value: &str) -> Result<Vec<u8>> {
 
 fn digest_value(value: &[u8]) -> Vec<u8> {
     blake3::hash(value).as_bytes()[..12].to_vec()
+}
+
+fn declaration_kind_code(kind: SemanticDeclarationKind) -> i64 {
+    match kind {
+        SemanticDeclarationKind::Function => 0,
+        SemanticDeclarationKind::Method => 1,
+        SemanticDeclarationKind::Object => 2,
+        SemanticDeclarationKind::Type => 3,
+        SemanticDeclarationKind::Alias => 4,
+        SemanticDeclarationKind::EnumConstant => 5,
+        SemanticDeclarationKind::Macro => 6,
+    }
+}
+
+fn declaration_role_code(role: SemanticDeclarationRole) -> i64 {
+    match role {
+        SemanticDeclarationRole::Declaration => 0,
+        SemanticDeclarationRole::Definition => 1,
+        SemanticDeclarationRole::TentativeDefinition => 2,
+        SemanticDeclarationRole::Unknown => 3,
+    }
+}
+
+fn linkage_kind_code(linkage: &crate::call_model::LinkageDomain) -> i64 {
+    match linkage {
+        crate::call_model::LinkageDomain::External => 0,
+        crate::call_model::LinkageDomain::Internal(_) => 1,
+        crate::call_model::LinkageDomain::Unknown => 2,
+    }
+}
+
+fn semantic_language_code(language: SemanticLanguage) -> i64 {
+    match language {
+        SemanticLanguage::C => 0,
+        SemanticLanguage::Cpp => 1,
+        SemanticLanguage::Unknown => 2,
+    }
+}
+
+fn language_fidelity_code(fidelity: LanguageFidelity) -> i64 {
+    match fidelity {
+        LanguageFidelity::Explicit => 0,
+        LanguageFidelity::Inferred => 1,
+        LanguageFidelity::Heuristic => 2,
+        LanguageFidelity::Unknown => 3,
+    }
+}
+
+fn semantic_provenance_code(provenance: SemanticFactProvenance) -> i64 {
+    match provenance {
+        SemanticFactProvenance::Ast => 0,
+        SemanticFactProvenance::LexicalFallback => 1,
+        SemanticFactProvenance::Synthetic => 2,
+    }
+}
+
+fn semantic_fidelity_code(fidelity: SemanticFactFidelity) -> i64 {
+    match fidelity {
+        SemanticFactFidelity::Authoritative => 0,
+        SemanticFactFidelity::Incomplete => 1,
+        SemanticFactFidelity::LowFidelity => 2,
+    }
 }
 
 fn record_range_fidelity_to_str(fidelity: RecordRangeFidelity) -> &'static str {

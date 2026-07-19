@@ -117,6 +117,9 @@ pub(super) fn completion_items_for_local_bindings(
 pub(super) fn completion_items_for_current_file_overlay(
     hits: Vec<query::CurrentFileOverlayCandidate>,
     text: &str,
+    parsed_document: Option<&parser::FileSemanticIndex>,
+    current_table_index: Option<usize>,
+    use_canonical_detail: bool,
 ) -> Vec<OrdinaryPipelineCandidate> {
     hits.into_iter()
         .map(|hit| {
@@ -147,6 +150,61 @@ pub(super) fn completion_items_for_current_file_overlay(
             };
             set_completion_history_key(&mut evidence, &hit.name);
 
+            let declaration = (!is_text)
+                .then_some(parsed_document)
+                .flatten()
+                .and_then(|index| {
+                    index
+                        .declarations
+                        .iter()
+                        .filter(|declaration| declaration.name == hit.name)
+                        .min_by_key(|declaration| {
+                            declaration
+                                .name_range
+                                .start_byte
+                                .abs_diff(hit.source_start_byte)
+                        })
+                });
+            let symbol_detail = parsed_document.and_then(|index| {
+                index
+                    .symbols
+                    .iter()
+                    .filter(|symbol| symbol.name == hit.name && !symbol.signature.is_empty())
+                    .min_by_key(|symbol| symbol.start_byte.abs_diff(hit.source_start_byte))
+                    .map(|symbol| symbol.signature.clone())
+            });
+            let detail = if use_canonical_detail {
+                declaration
+                    .and_then(|declaration| declaration.canonical_signature.clone())
+                    .or(symbol_detail)
+                    .or(hit.detail)
+            } else {
+                symbol_detail.or(hit.detail)
+            };
+            let semantic_target =
+                declaration
+                    .zip(current_table_index)
+                    .map(|(declaration, table_index)| {
+                        OrdinaryCompletionDocumentationTarget::Candidate {
+                            table_index,
+                            handle: crate::candidate_service::CandidateHandle {
+                                locator:
+                                    crate::candidate_service::CandidateHandleLocator::Overlay {
+                                        fingerprint: declaration
+                                            .identity
+                                            .locator
+                                            .fingerprint
+                                            .clone(),
+                                    },
+                                logical_key: declaration.identity.logical_key.clone(),
+                                locator_fingerprint: declaration
+                                    .identity
+                                    .locator
+                                    .fingerprint
+                                    .clone(),
+                            },
+                        }
+                    });
             OrdinaryPipelineCandidate::new(
                 hit.name.clone(),
                 evidence,
@@ -156,37 +214,46 @@ pub(super) fn completion_items_for_current_file_overlay(
                     } else {
                         ordinary_kind_from_parser(hit.kind)
                     },
-                    detail: hit.detail,
+                    detail,
                     documentation: None,
                     initial_sort_text: None,
-                    documentation_target: (!is_text).then_some(
-                        OrdinaryCompletionDocumentationTarget::CurrentDocument {
-                            start_line: line_for_byte(text, hit.source_start_byte),
-                        },
-                    ),
+                    documentation_target: semantic_target.or_else(|| {
+                        (!is_text).then_some(
+                            OrdinaryCompletionDocumentationTarget::CurrentDocument {
+                                start_line: line_for_byte(text, hit.source_start_byte),
+                            },
+                        )
+                    }),
                 },
             )
         })
         .collect()
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct IndexedCompletionContext<'a> {
+    pub table_index: usize,
+    pub overlay_handles:
+        &'a std::collections::HashMap<i64, crate::candidate_service::CandidateHandle>,
+    pub active_project_context: Option<&'a ProjectKey>,
+    pub open_reason: Option<reachability::OpenReason>,
+}
+
 pub(super) fn completion_items_for_indexed_hits(
     hits: Vec<query::RankedNameHit>,
-    open_reason: Option<reachability::OpenReason>,
-    active_project_context: Option<&ProjectKey>,
-    table_index: usize,
+    context: IndexedCompletionContext<'_>,
 ) -> Vec<OrdinaryPipelineCandidate> {
     hits.into_iter()
         .map(|hit| {
             let (confidence, reason) =
-                resolver::confidence_reason_for(hit.tier, false, open_reason);
+                resolver::confidence_reason_for(hit.tier, false, context.open_reason);
             let label = model::completion_scope_label(hit.tier, confidence, reason);
             let mut evidence =
                 CandidateEvidence::new(CandidateSource::Indexed, hit.tier, confidence, hit.score);
             evidence.match_score = hit.base_match;
             evidence.role = Some(hit.role);
-            if active_project_context.is_some()
-                && hit.project_key.as_ref() == active_project_context
+            if context.active_project_context.is_some()
+                && hit.project_key.as_ref() == context.active_project_context
             {
                 evidence.project_score = PROJECT_CONTEXT_MAX_BOOST;
             }
@@ -200,10 +267,19 @@ pub(super) fn completion_items_for_indexed_hits(
                     initial_sort_text: Some(format!("{:08}", 100_000_000 - hit.score)),
                     detail: label.as_ref().map(|value| value.detail.to_string()),
                     documentation: label.map(|value| value.documentation),
-                    documentation_target: Some(OrdinaryCompletionDocumentationTarget::Indexed {
-                        table_index,
-                        symbol_id: hit.id,
-                    }),
+                    documentation_target: if hit.id >= 0 {
+                        Some(OrdinaryCompletionDocumentationTarget::Declaration {
+                            table_index: context.table_index,
+                            declaration_id: hit.id,
+                        })
+                    } else {
+                        context.overlay_handles.get(&hit.id).cloned().map(|handle| {
+                            OrdinaryCompletionDocumentationTarget::Candidate {
+                                table_index: context.table_index,
+                                handle,
+                            }
+                        })
+                    },
                 },
             )
         })
@@ -211,28 +287,26 @@ pub(super) fn completion_items_for_indexed_hits(
 }
 
 pub(super) fn exact_indexed_completion_candidates_for_local_word(
-    table: (&NameTable, usize),
+    table: &NameTable,
     word: &str,
     local_score: i32,
     scope: Option<&query::CompletionScope>,
-    active_project_context: Option<&ProjectKey>,
-    open_reason: Option<reachability::OpenReason>,
     limit: usize,
+    context: IndexedCompletionContext<'_>,
 ) -> Vec<OrdinaryPipelineCandidate> {
-    let (table, table_index) = table;
     table
         .exact_name_hits_scoped(word, limit, scope)
         .into_iter()
         .map(|hit| {
             let (confidence, reason) =
-                resolver::confidence_reason_for(hit.tier, false, open_reason);
+                resolver::confidence_reason_for(hit.tier, false, context.open_reason);
             let label = model::completion_scope_label(hit.tier, confidence, reason);
             let mut evidence =
                 CandidateEvidence::new(CandidateSource::Indexed, hit.tier, confidence, local_score);
             evidence.match_score = hit.base_match;
             evidence.role = Some(hit.role);
-            if active_project_context.is_some()
-                && hit.project_key.as_ref() == active_project_context
+            if context.active_project_context.is_some()
+                && hit.project_key.as_ref() == context.active_project_context
             {
                 evidence.project_score = PROJECT_CONTEXT_MAX_BOOST;
             }
@@ -246,10 +320,19 @@ pub(super) fn exact_indexed_completion_candidates_for_local_word(
                     initial_sort_text: Some(format!("{:08}", 100_000_000 - local_score)),
                     detail: label.as_ref().map(|value| value.detail.to_string()),
                     documentation: label.map(|value| value.documentation),
-                    documentation_target: Some(OrdinaryCompletionDocumentationTarget::Indexed {
-                        table_index,
-                        symbol_id: hit.id,
-                    }),
+                    documentation_target: if hit.id >= 0 {
+                        Some(OrdinaryCompletionDocumentationTarget::Declaration {
+                            table_index: context.table_index,
+                            declaration_id: hit.id,
+                        })
+                    } else {
+                        context.overlay_handles.get(&hit.id).cloned().map(|handle| {
+                            OrdinaryCompletionDocumentationTarget::Candidate {
+                                table_index: context.table_index,
+                                handle,
+                            }
+                        })
+                    },
                 },
             )
         })

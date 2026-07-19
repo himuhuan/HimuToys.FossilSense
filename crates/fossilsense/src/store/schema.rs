@@ -1,6 +1,7 @@
-// Version 17 persists canonical declaration identity and explicit backing
-// links. Older rows are rebuilt; semantic queries never dual-read symbols.
-pub(crate) const SCHEMA_VERSION: i64 = 17;
+// Version 18 stores canonical declarations as typed columns instead of a
+// duplicated full-object JSON payload. Older rows are rebuilt; semantic
+// queries never dual-read symbols.
+pub(crate) const SCHEMA_VERSION: i64 = 18;
 
 pub(crate) const DROP_DATA_TABLES_SQL: &str = "
     DROP TABLE IF EXISTS pending_file_revisions;
@@ -103,12 +104,41 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
         revision_id INTEGER NOT NULL REFERENCES file_revisions(id) ON DELETE CASCADE,
         file_id INTEGER NOT NULL REFERENCES file_entries(id) ON DELETE CASCADE,
         name TEXT NOT NULL,
+        qualified_name TEXT NOT NULL,
+        declaration_kind INTEGER NOT NULL CHECK(declaration_kind BETWEEN 0 AND 6),
+        role INTEGER NOT NULL CHECK(role BETWEEN 0 AND 3),
+        name_start_byte INTEGER NOT NULL CHECK(name_start_byte >= 0),
+        name_end_byte INTEGER NOT NULL CHECK(name_end_byte >= name_start_byte),
+        name_start_line INTEGER NOT NULL,
+        name_start_col INTEGER NOT NULL,
+        name_end_line INTEGER NOT NULL,
+        name_end_col INTEGER NOT NULL,
+        declaration_start_byte INTEGER NOT NULL CHECK(declaration_start_byte >= 0),
+        declaration_end_byte INTEGER NOT NULL CHECK(declaration_end_byte >= declaration_start_byte),
+        declaration_start_line INTEGER NOT NULL,
+        declaration_start_col INTEGER NOT NULL,
+        declaration_end_line INTEGER NOT NULL,
+        declaration_end_col INTEGER NOT NULL,
+        canonical_signature TEXT,
+        declarator_shape_json TEXT,
+        has_initializer INTEGER CHECK(has_initializer IN (0, 1)),
+        owner TEXT,
+        linkage_kind INTEGER NOT NULL CHECK(linkage_kind BETWEEN 0 AND 2),
+        guard TEXT,
+        language INTEGER NOT NULL CHECK(language BETWEEN 0 AND 2),
+        language_fidelity INTEGER NOT NULL CHECK(language_fidelity BETWEEN 0 AND 3),
+        provenance INTEGER NOT NULL CHECK(provenance BETWEEN 0 AND 2),
+        fact_fidelity INTEGER NOT NULL CHECK(fact_fidelity BETWEEN 0 AND 2),
         logical_key_digest BLOB NOT NULL
             CHECK(typeof(logical_key_digest) = 'blob' AND length(logical_key_digest) = 12),
         locator_fingerprint TEXT NOT NULL,
-        fact_json TEXT NOT NULL,
+        logical_linkage_domain TEXT NOT NULL,
+        guard_fingerprint TEXT,
         backing_kind TEXT NOT NULL,
-        backing_id INTEGER
+        backing_id INTEGER,
+        backing_key TEXT,
+        backing_start_byte INTEGER,
+        backing_end_byte INTEGER
     );
 
     CREATE TABLE IF NOT EXISTS include_facts (
@@ -328,6 +358,9 @@ pub(crate) const CREATE_LOOKUP_INDEXES_SQL: &str = "
     CREATE INDEX IF NOT EXISTS idx_symbol_facts_name ON symbol_facts(name);
     CREATE INDEX IF NOT EXISTS idx_symbol_facts_file_id ON symbol_facts(file_id);
     CREATE INDEX IF NOT EXISTS idx_declaration_facts_name ON declaration_facts(name);
+    CREATE INDEX IF NOT EXISTS idx_declaration_facts_file_id ON declaration_facts(file_id);
+    CREATE INDEX IF NOT EXISTS idx_declaration_facts_logical_key ON declaration_facts(logical_key_digest);
+    CREATE INDEX IF NOT EXISTS idx_declaration_facts_locator ON declaration_facts(locator_fingerprint);
     CREATE INDEX IF NOT EXISTS idx_type_alias_facts_alias ON type_alias_facts(alias);
     CREATE INDEX IF NOT EXISTS idx_type_alias_facts_fingerprint ON type_alias_facts(fingerprint);
     CREATE INDEX IF NOT EXISTS idx_type_alias_facts_file_id ON type_alias_facts(file_id);

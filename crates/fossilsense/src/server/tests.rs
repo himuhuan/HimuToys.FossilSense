@@ -213,6 +213,49 @@ fn semantic_candidate_perf_log_contains_only_aggregate_contract_fields() {
 }
 
 #[test]
+fn indexed_completion_uses_compact_v5_declaration_handle() {
+    let uri = Url::parse("file:///workspace/main.c").expect("uri");
+    let item = crate::completion::ordinary_service::OrdinaryCompletionItem {
+        label: "target".into(),
+        kind: crate::completion::ordinary_service::OrdinaryCompletionKind::Function,
+        detail: None,
+        documentation: None,
+        initial_sort_text: None,
+        evidence: crate::completion::CandidateEvidence::new(
+            crate::completion::CandidateSource::Indexed,
+            crate::model::ScopeTier::Global,
+            crate::model::ResolutionConfidence::Fallback,
+            1,
+        ),
+        documentation_target: Some(
+            crate::completion::ordinary_service::OrdinaryCompletionDocumentationTarget::Declaration {
+                table_index: 0,
+                declaration_id: 42,
+            },
+        ),
+    };
+    let rendered = super::ordinary_completion_item_to_lsp(
+        item,
+        &uri,
+        &[PathBuf::from("/workspace")],
+        &[crate::call_model::SemanticGeneration(7)],
+        3,
+        11,
+    );
+    let data = rendered.data.expect("compact declaration data");
+    assert_eq!(
+        data.get("version").and_then(serde_json::Value::as_u64),
+        Some(5)
+    );
+    assert_eq!(
+        data.get("declarationId")
+            .and_then(serde_json::Value::as_i64),
+        Some(42)
+    );
+    assert!(data.get("handle").is_none());
+}
+
+#[test]
 fn live_parse_perf_log_never_contains_document_identity_or_revision() {
     for event in [
         super::LiveParseCacheEvent::Hit,
@@ -247,6 +290,7 @@ async fn workspace_folder_removal_drops_root_and_published_snapshot() {
             root: root.clone(),
             epoch: super::state::EngineEpoch::published(1),
             semantic_generation: crate::call_model::SemanticGeneration(1),
+            declaration_index: None,
             name_table: None,
             reach_graph: None,
             include_table: None,
@@ -317,12 +361,16 @@ async fn name_index_compaction_publishes_only_for_the_expected_engine_epoch() {
         );
     }
     let initial_epoch = cache.allocate_engine_epoch();
+    let declaration_index = Arc::new(
+        crate::declaration_index::SemanticDeclarationIndex::from_name_table_for_test(table),
+    );
     cache
         .publish_engine_snapshot(super::workspace::EngineSnapshot {
             root: root.clone(),
             epoch: initial_epoch,
             semantic_generation: crate::call_model::SemanticGeneration(7),
-            name_table: Some(Arc::new(table)),
+            declaration_index: Some(declaration_index.clone()),
+            name_table: Some(declaration_index.name_table_arc()),
             reach_graph: None,
             include_table: None,
             indexed_files: None,
@@ -1943,6 +1991,7 @@ async fn project_context_commands_validate_selection_and_outside_uri_has_no_auto
             root: root_path,
             epoch: service.inner().session.cache.allocate_engine_epoch(),
             semantic_generation: current.semantic_generation,
+            declaration_index: current.declaration_index.clone(),
             name_table: current.name_table.clone(),
             reach_graph: current.reach_graph.clone(),
             include_table: current.include_table.clone(),
@@ -2547,6 +2596,7 @@ async fn candidate_overlay_does_not_adopt_a_new_graph_after_request_publication(
             root: root.clone(),
             epoch: super::state::EngineEpoch::published(1),
             semantic_generation: generation,
+            declaration_index: None,
             name_table: None,
             reach_graph: Some(Arc::new(crate::reachability::ReachGraph::new(
                 vec![("unrelated.c".into(), "old.h".into())],
@@ -2575,6 +2625,7 @@ async fn candidate_overlay_does_not_adopt_a_new_graph_after_request_publication(
             root: root.clone(),
             epoch: super::state::EngineEpoch::published(2),
             semantic_generation: generation,
+            declaration_index: None,
             name_table: None,
             reach_graph: Some(Arc::new(crate::reachability::ReachGraph::new(
                 vec![("unrelated.c".into(), "new.h".into())],
@@ -2614,6 +2665,7 @@ async fn candidate_overlay_cache_rejects_a_late_build_after_publication() {
             root: root.clone(),
             epoch: super::state::EngineEpoch::published(8),
             semantic_generation: generation,
+            declaration_index: None,
             name_table: None,
             reach_graph: None,
             include_table: None,
@@ -2660,6 +2712,7 @@ async fn indexed_completion_resolve_rejects_cross_generation_context_before_over
             root: root.clone(),
             epoch: super::state::EngineEpoch::published(2),
             semantic_generation: crate::call_model::SemanticGeneration(12),
+            declaration_index: None,
             name_table: None,
             reach_graph: None,
             include_table: None,
@@ -2739,6 +2792,7 @@ async fn reach_scope_uses_captured_request_context_graph() {
             root: root.clone(),
             epoch: super::state::EngineEpoch::missing(),
             semantic_generation: crate::call_model::SemanticGeneration::MISSING,
+            declaration_index: None,
             name_table: None,
             reach_graph: Some(captured_graph),
             include_table: None,

@@ -222,6 +222,7 @@ pub struct OverlayCompletionName {
     pub start_col: u32,
     pub end_line: u32,
     pub end_col: u32,
+    pub candidate_handle: Option<CandidateHandle>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -774,6 +775,28 @@ impl CandidateOverlaySnapshot {
                     start_col: fact.symbol.start_col as u32,
                     end_line: fact.symbol.end_line as u32,
                     end_col: fact.symbol.end_col as u32,
+                    candidate_handle: self
+                        .declarations(&fact.symbol.name)
+                        .iter()
+                        .min_by_key(|declaration| {
+                            declaration
+                                .fact
+                                .name_range
+                                .start_byte
+                                .abs_diff(fact.symbol.start_byte)
+                        })
+                        .map(|declaration| CandidateHandle {
+                            locator: CandidateHandleLocator::Overlay {
+                                fingerprint: declaration.fact.identity.locator.fingerprint.clone(),
+                            },
+                            logical_key: declaration.fact.identity.logical_key.clone(),
+                            locator_fingerprint: declaration
+                                .fact
+                                .identity
+                                .locator
+                                .fingerprint
+                                .clone(),
+                        }),
                 }
             })
             .collect()
@@ -828,6 +851,7 @@ fn candidate_origin_priority(origin: CandidateOrigin) -> u8 {
 /// callable consumers. The pure arity/counterpart policy remains in `query`.
 pub struct CandidateQueryService<'a> {
     handle: Option<&'a CallReadHandle>,
+    declaration_index: Option<&'a crate::declaration_index::SemanticDeclarationIndex>,
     overlays: &'a CandidateOverlaySnapshot,
     current_path: &'a str,
     current_reach: Option<Arc<ReachScope>>,
@@ -849,12 +873,26 @@ impl<'a> CandidateQueryService<'a> {
             .or_else(|| current_reach.cloned().map(Arc::new));
         Self {
             handle,
+            declaration_index: None,
             overlays,
             current_path,
             current_reach,
             reach_graph,
             exact_name_limit: DEFAULT_EXACT_NAME_CANDIDATE_LIMIT,
         }
+    }
+
+    pub fn new_with_declarations(
+        handle: Option<&'a CallReadHandle>,
+        declaration_index: Option<&'a crate::declaration_index::SemanticDeclarationIndex>,
+        overlays: &'a CandidateOverlaySnapshot,
+        current_path: &'a str,
+        current_reach: Option<&'a ReachScope>,
+        reach_graph: Option<&'a ReachGraph>,
+    ) -> Self {
+        let mut service = Self::new(handle, overlays, current_path, current_reach, reach_graph);
+        service.declaration_index = declaration_index;
+        service
     }
 
     /// Durable paths that must be recalled before a workspace-wide exact-name
@@ -2999,6 +3037,70 @@ mod tests {
             .expect("dirty non-callable candidates")
             .iter()
             .all(|candidate| candidate.path != "zzz/reachable.h"));
+    }
+
+    #[test]
+    fn declaration_index_batches_cold_payloads_once_and_warm_query_reads_zero_sql() {
+        let dir = tempdir().expect("tempdir");
+        let db = dir.path().join("index.sqlite");
+        let mut store = IndexStore::open(&db, dir.path()).expect("store");
+        upsert_candidate_test_file(&mut store, "api.h", "int shared_api(int value);\n");
+        upsert_candidate_test_file(
+            &mut store,
+            "api.c",
+            "int shared_api(int value) { return value; }\n",
+        );
+        drop(store);
+
+        let reader = IndexStore::open_readonly(&db).expect("readonly");
+        let mut cores = Vec::new();
+        reader
+            .declaration_view()
+            .visit_core_rows(|row| {
+                cores.push(row);
+                Ok(())
+            })
+            .expect("declaration cores");
+        drop(reader);
+        let index =
+            crate::declaration_index::SemanticDeclarationIndex::build(cores, None, 1024 * 1024);
+        let handle = CallReadHandle::capture(db).expect("read handle");
+        let overlay = CandidateOverlaySnapshot::default();
+        let service = CandidateQueryService::new_with_declarations(
+            Some(&handle),
+            Some(&index),
+            &overlay,
+            "main.c",
+            None,
+            None,
+        );
+
+        let cold = service
+            .semantic_candidates("shared_api", SemanticIntent::Neutral)
+            .expect("cold semantic candidates");
+        assert_eq!(
+            cold.all
+                .iter()
+                .map(|group| group.candidates.len())
+                .sum::<usize>(),
+            2
+        );
+        let after_cold = index.payload_cache_stats();
+        assert_eq!(after_cold.sql_reads, 1);
+
+        let warm = service
+            .semantic_candidates("shared_api", SemanticIntent::Neutral)
+            .expect("warm semantic candidates");
+        assert_eq!(
+            warm.all
+                .iter()
+                .map(|group| group.candidates.len())
+                .sum::<usize>(),
+            2
+        );
+        let after_warm = index.payload_cache_stats();
+        assert_eq!(after_warm.sql_reads, 1, "warm query must read zero SQL");
+        assert!(after_warm.hits >= 2);
     }
 
     #[test]

@@ -13,6 +13,9 @@ impl LanguageServer for Backend {
             let mut stored = self.include_paths.lock().await;
             *stored = parse_include_paths(&params);
         }
+        self.session
+            .cache
+            .set_semantic_index_memory_budget_mb(parse_semantic_index_memory_budget_mb(&params));
 
         let completion_mode = parse_completion_mode(&params);
         self.completion_enabled
@@ -319,17 +322,16 @@ impl LanguageServer for Backend {
         &self,
         params: WorkspaceSymbolParams,
     ) -> LspResult<Option<Vec<SymbolInformation>>> {
-        let tables: Vec<(PathBuf, u64, Arc<NameTable>)> = {
+        let tables: Vec<(
+            PathBuf,
+            Arc<crate::declaration_index::SemanticDeclarationIndex>,
+        )> = {
             let roots = self.workspace_roots.lock().await.clone();
             let mut tables = Vec::new();
             for root in roots {
                 let context = self.request_context_for_root(root).await;
-                if let Some(table) = context.engine.name_table.clone() {
-                    tables.push((
-                        context.engine.root.clone(),
-                        context.engine.semantic_generation.0,
-                        table,
-                    ));
+                if let Some(index) = context.engine.declaration_index.clone() {
+                    tables.push((context.engine.root.clone(), index));
                 }
             }
             tables
@@ -341,8 +343,11 @@ impl LanguageServer for Backend {
         let query_text = params.query;
         let result = tokio::task::spawn_blocking(move || -> Result<Vec<SymbolInformation>> {
             let mut hits = Vec::new();
-            for (root_index, (_, _, table)) in tables.iter().enumerate() {
-                for hit in table.search_ranked(&query_text, query::WORKSPACE_SYMBOL_LIMIT) {
+            for (root_index, (_, index)) in tables.iter().enumerate() {
+                for hit in index
+                    .name_table()
+                    .search_ranked(&query_text, query::WORKSPACE_SYMBOL_LIMIT)
+                {
                     hits.push((root_index, hit));
                 }
             }
@@ -359,33 +364,14 @@ impl LanguageServer for Backend {
                 return Ok(Vec::new());
             }
 
-            let mut records_by_root_and_id = HashMap::new();
-            let mut ids_by_root: HashMap<usize, Vec<i64>> = HashMap::new();
-            for (root_index, hit) in &hits {
-                ids_by_root.entry(*root_index).or_default().push(hit.id);
-            }
-
-            for (root_index, ids) in ids_by_root {
-                let (root, generation, _) = &tables[root_index];
-                let db_path = pathing::default_index_path(root)?;
-                if !db_path.exists() {
-                    continue;
-                }
-                let records = IndexStore::read_at_generation(&db_path, *generation, |store| {
-                    store.symbol_read_view().symbols_by_ids(&ids)
-                })?;
-                for record in records {
-                    records_by_root_and_id.insert((root_index, record.id), record);
-                }
-            }
-
             Ok(hits
                 .into_iter()
                 .filter_map(|(root_index, hit)| {
                     let root = &tables[root_index].0;
-                    records_by_root_and_id
-                        .get(&(root_index, hit.id))
-                        .and_then(|record| record_to_symbol_information(root, record))
+                    tables[root_index]
+                        .1
+                        .core_by_id(hit.id)
+                        .and_then(|row| declaration_core_to_symbol_information(root, row))
                 })
                 .collect())
         })
@@ -523,7 +509,8 @@ impl LanguageServer for Backend {
         };
         let local_words = self.local_words_for(&uri, version, &text).await;
 
-        let contexts = {
+        let current_root = self.root_for_uri(&uri).await;
+        let mut contexts = {
             let roots = self.workspace_roots.lock().await.clone();
             let mut contexts = Vec::with_capacity(roots.len());
             for root in roots {
@@ -531,12 +518,12 @@ impl LanguageServer for Backend {
             }
             contexts
         };
+        contexts
+            .sort_by_key(|context| current_root.as_deref() != Some(context.engine.root.as_path()));
         let mut tables = Vec::new();
         let mut table_roots = Vec::new();
         let mut table_semantic_generations = Vec::new();
         let mut table_generations = Vec::new();
-        let mut candidate_sources = Vec::new();
-        let current_root = self.root_for_uri(&uri).await;
         let mut effective_completion_scope = None;
         for context in &contexts {
             if let Some(table) = context.engine.name_table.clone() {
@@ -549,12 +536,6 @@ impl LanguageServer for Backend {
                         document_request.clone(),
                     )
                     .await;
-                let semantic_current_rel = uri_to_path(&uri)
-                    .and_then(|path| pathing::relative_slash_path(&context.engine.root, &path).ok())
-                    .unwrap_or_default();
-                let semantic_reach_scope = self
-                    .reach_scope_from_context(&uri, context)
-                    .map(|(_, reach)| reach);
                 if current_root.as_deref() == Some(context.engine.root.as_path())
                     && context.settings.scoping_enabled
                 {
@@ -577,6 +558,15 @@ impl LanguageServer for Backend {
                         });
                 }
                 let overlay_names = overlay.completion_names();
+                let overlay_handles = overlay_names
+                    .iter()
+                    .filter_map(|entry| {
+                        entry
+                            .candidate_handle
+                            .clone()
+                            .map(|handle| (entry.id, handle))
+                    })
+                    .collect();
                 let rows = overlay_names
                     .iter()
                     .map(|entry| {
@@ -598,43 +588,19 @@ impl LanguageServer for Backend {
                 table_semantic_generations.push(context.engine.semantic_generation);
                 tables.push(OrdinaryCompletionNameTable {
                     table: Arc::new(effective_table),
-                });
-                candidate_sources.push(super::CompletionCandidateSource {
-                    table_index: tables.len() - 1,
-                    handle: context.engine.call_read_handle.clone(),
-                    overlay,
-                    current_rel: semantic_current_rel,
-                    reach_scope: semantic_reach_scope,
-                    reach_graph: context.engine.reach_graph.clone(),
+                    overlay_handles,
                 });
             }
         }
-        if candidate_sources.is_empty() {
-            if let (Some(index), Some(path)) = (parsed_document.as_ref(), uri_to_path(&uri)) {
+        if tables.is_empty() {
+            if let (Some(_), Some(path)) = (parsed_document.as_ref(), uri_to_path(&uri)) {
                 let standalone_root = path.parent().unwrap_or(path.as_path()).to_path_buf();
-                let current_rel = path
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                let overlay = Arc::new(crate::candidate_service::CandidateOverlaySnapshot::new(
-                    completion_overlay_epoch,
-                    vec![
-                        crate::candidate_service::FileCandidateOverlay::from_index_with_text(
-                            current_rel.clone(),
-                            index,
-                            text.clone(),
-                        ),
-                    ],
-                ));
+                table_generations.push((standalone_root.clone(), state::EngineEpoch::missing()));
                 table_roots.push(standalone_root);
                 table_semantic_generations.push(SemanticGeneration::MISSING);
-                candidate_sources.push(super::CompletionCandidateSource {
-                    table_index: 0,
-                    handle: None,
-                    overlay,
-                    current_rel,
-                    reach_scope: None,
-                    reach_graph: None,
+                tables.push(OrdinaryCompletionNameTable {
+                    table: Arc::new(crate::query::NameTable::build(Vec::new())),
+                    overlay_handles: std::collections::HashMap::new(),
                 });
             }
         }
@@ -671,22 +637,6 @@ impl LanguageServer for Backend {
         let memo_prefix = prefix.clone();
         let context_ms = ordinary_started.elapsed().as_millis();
 
-        let semantic_intent = match intent.kind {
-            crate::completion::CompletionIntentKind::CallTarget => {
-                crate::candidate_service::SemanticIntent::Call
-            }
-            crate::completion::CompletionIntentKind::TypeName => {
-                crate::candidate_service::SemanticIntent::Type
-            }
-            crate::completion::CompletionIntentKind::ExpressionValue
-            | crate::completion::CompletionIntentKind::DeclarationName => {
-                crate::candidate_service::SemanticIntent::Value
-            }
-            crate::completion::CompletionIntentKind::Neutral
-            | crate::completion::CompletionIntentKind::MacroPreprocessor => {
-                crate::candidate_service::SemanticIntent::Neutral
-            }
-        };
         let service_input = OrdinaryCompletionInput {
             prefix: prefix.clone(),
             text,
@@ -708,14 +658,7 @@ impl LanguageServer for Backend {
         };
 
         let result = tokio::task::spawn_blocking(move || -> Result<_> {
-            let mut output =
-                crate::completion::ordinary_service::complete_ordinary_identifier(service_input);
-            super::hydrate_ordinary_completion_candidates(
-                &mut output,
-                &candidate_sources,
-                semantic_intent,
-            )?;
-            Ok(output)
+            Ok(crate::completion::ordinary_service::complete_ordinary_identifier(service_input))
         })
         .await;
 

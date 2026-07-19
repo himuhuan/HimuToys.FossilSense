@@ -50,6 +50,7 @@ impl Backend {
         let mut reach_us = reach_started.elapsed().as_micros();
         let semantic_generation = context.engine.semantic_generation;
         let call_read_handle = context.engine.call_read_handle.clone();
+        let declaration_index = context.engine.declaration_index.clone();
         let reach_graph = context.engine.reach_graph.clone();
         let overlay_started = std::time::Instant::now();
         let overlay = self
@@ -128,8 +129,9 @@ impl Backend {
         let result = tokio::task::spawn_blocking(
             move || -> Result<(Vec<SignatureInformation>, usize, SemanticRequestPerf)> {
                 let query_started = std::time::Instant::now();
-                let service = CandidateQueryService::new(
+                let service = CandidateQueryService::new_with_declarations(
                     call_read_handle.as_deref(),
+                    declaration_index.as_deref(),
                     &overlay,
                     &current_rel,
                     reach_scope.as_deref(),

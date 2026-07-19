@@ -130,6 +130,23 @@ pub(super) fn parse_include_paths(params: &InitializeParams) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Byte budget for lazily hydrated declaration payloads. The compact core
+/// index is always resident and is intentionally outside this budget.
+pub(super) fn parse_semantic_index_memory_budget_mb(params: &InitializeParams) -> u64 {
+    params
+        .initialization_options
+        .as_ref()
+        .and_then(|opts| opts.as_object())
+        .and_then(|object| object.get("fossilsense"))
+        .and_then(|value| value.as_object())
+        .and_then(|object| object.get("semanticIndex"))
+        .and_then(|value| value.as_object())
+        .and_then(|object| object.get("memoryBudgetMB"))
+        .and_then(|value| value.as_u64())
+        .unwrap_or(256)
+        .min(16_384)
+}
+
 pub(super) fn completion_trigger_characters() -> Vec<String> {
     let mut chars = Vec::with_capacity(55);
     chars.extend(('a'..='z').map(|ch| ch.to_string()));
@@ -487,6 +504,28 @@ mod tests {
         );
         // Missing / non-array -> empty, never panics.
         assert!(parse_include_paths(&InitializeParams::default()).is_empty());
+    }
+
+    #[test]
+    fn semantic_index_memory_budget_defaults_and_clamps() {
+        assert_eq!(
+            parse_semantic_index_memory_budget_mb(&InitializeParams::default()),
+            256
+        );
+        let configured = InitializeParams {
+            initialization_options: Some(serde_json::json!({
+                "fossilsense": { "semanticIndex": { "memoryBudgetMB": 0 } }
+            })),
+            ..Default::default()
+        };
+        assert_eq!(parse_semantic_index_memory_budget_mb(&configured), 0);
+        let oversized = InitializeParams {
+            initialization_options: Some(serde_json::json!({
+                "fossilsense": { "semanticIndex": { "memoryBudgetMB": 99999 } }
+            })),
+            ..Default::default()
+        };
+        assert_eq!(parse_semantic_index_memory_budget_mb(&oversized), 16_384);
     }
 
     #[test]

@@ -13,6 +13,7 @@ use crate::call_model::SemanticGeneration;
 use crate::call_service::CallReadHandle;
 use crate::candidate_service::CandidateOverlaySnapshot;
 use crate::completion_words;
+use crate::declaration_index::SemanticDeclarationIndex;
 use crate::parser::{FileSemanticIndex, ParseFacts};
 use crate::pathing;
 use crate::project_context::ProjectContextIndex;
@@ -492,6 +493,7 @@ pub(super) struct CacheLedger {
     pub(in crate::server) reference_search_cache: Arc<references::ReferenceSearchCache>,
     pub(in crate::server) completion_memo: Arc<Mutex<HashMap<Url, state::CompletionMemo>>>,
     candidate_overlays: Arc<Mutex<CandidateOverlayCache>>,
+    semantic_index_memory_budget_bytes: Arc<AtomicU64>,
 }
 
 #[derive(Default)]
@@ -526,6 +528,7 @@ pub(in crate::server) struct EngineSnapshot {
     pub(in crate::server) root: PathBuf,
     pub(in crate::server) epoch: state::EngineEpoch,
     pub(in crate::server) semantic_generation: SemanticGeneration,
+    pub(in crate::server) declaration_index: Option<Arc<SemanticDeclarationIndex>>,
     pub(in crate::server) name_table: Option<Arc<NameTable>>,
     pub(in crate::server) reach_graph: Option<Arc<ReachGraph>>,
     pub(in crate::server) include_table: Option<Arc<IncludeCompletionTable>>,
@@ -542,6 +545,7 @@ impl EngineSnapshot {
             root,
             epoch: state::EngineEpoch::missing(),
             semantic_generation: SemanticGeneration::MISSING,
+            declaration_index: None,
             name_table: None,
             reach_graph: None,
             include_table: None,
@@ -563,7 +567,23 @@ impl Default for CacheLedger {
             reference_search_cache: Arc::new(references::ReferenceSearchCache::new()),
             completion_memo: Arc::new(Mutex::new(HashMap::new())),
             candidate_overlays: Arc::new(Mutex::new(CandidateOverlayCache::default())),
+            semantic_index_memory_budget_bytes: Arc::new(AtomicU64::new(256 * 1024 * 1024)),
         }
+    }
+}
+
+impl CacheLedger {
+    pub(super) fn set_semantic_index_memory_budget_mb(&self, budget_mb: u64) {
+        self.semantic_index_memory_budget_bytes
+            .store(budget_mb.saturating_mul(1024 * 1024), Ordering::Release);
+    }
+
+    pub(in crate::server) fn semantic_index_memory_budget_bytes(&self) -> usize {
+        usize::try_from(
+            self.semantic_index_memory_budget_bytes
+                .load(Ordering::Acquire),
+        )
+        .unwrap_or(usize::MAX)
     }
 }
 
@@ -819,6 +839,7 @@ impl CacheLedger {
             root,
             epoch: self.allocate_engine_epoch(),
             semantic_generation: current.semantic_generation,
+            declaration_index: current.declaration_index.clone(),
             name_table: Some(table),
             reach_graph: current.reach_graph.clone(),
             include_table: current.include_table.clone(),
@@ -844,6 +865,7 @@ impl CacheLedger {
             root,
             epoch: self.allocate_engine_epoch(),
             semantic_generation: current.semantic_generation,
+            declaration_index: current.declaration_index.clone(),
             name_table: current.name_table.clone(),
             reach_graph: current.reach_graph.clone(),
             include_table: current.include_table.clone(),
@@ -865,6 +887,7 @@ impl CacheLedger {
             root,
             epoch: self.allocate_engine_epoch(),
             semantic_generation: current.semantic_generation,
+            declaration_index: current.declaration_index.clone(),
             name_table: current.name_table.clone(),
             reach_graph: Some(graph),
             include_table: current.include_table.clone(),

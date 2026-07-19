@@ -79,6 +79,7 @@ impl Backend {
                 root.clone(),
                 MemberRootQueryContext {
                     handle: context.engine.call_read_handle.clone(),
+                    declaration_index: context.engine.declaration_index.clone(),
                     overlay,
                     current_path,
                     reach_graph: context.engine.reach_graph.clone(),
@@ -494,6 +495,7 @@ struct MemberPresentation {
 #[derive(Clone)]
 struct MemberRootQueryContext {
     handle: Option<Arc<CallReadHandle>>,
+    declaration_index: Option<Arc<crate::declaration_index::SemanticDeclarationIndex>>,
     overlay: Arc<CandidateOverlaySnapshot>,
     current_path: String,
     reach_graph: Option<Arc<crate::reachability::ReachGraph>>,
@@ -502,8 +504,9 @@ struct MemberRootQueryContext {
 
 impl MemberRootQueryContext {
     fn service(&self) -> CandidateQueryService<'_> {
-        CandidateQueryService::new(
+        CandidateQueryService::new_with_declarations(
             self.handle.as_deref(),
+            self.declaration_index.as_deref(),
             self.overlay.as_ref(),
             &self.current_path,
             None,

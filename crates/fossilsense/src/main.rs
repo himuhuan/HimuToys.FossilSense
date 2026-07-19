@@ -7,6 +7,7 @@ mod completion;
 mod completion_history;
 mod completion_words;
 mod config;
+mod declaration_index;
 mod includes;
 mod indexer;
 mod language_builtins;
@@ -240,13 +241,30 @@ fn run_query(kind: QueryCommand) -> Result<()> {
         } => {
             let db_path = resolve_db_path(db, &workspace)?;
             let store = IndexStore::open_readonly(&db_path)?;
-            let table = query::NameTable::build_from_store_view(&store.name_table_view(), None)?;
-            let ids: Vec<i64> = table.search(&text, query::WORKSPACE_SYMBOL_LIMIT);
-            let records = store.symbol_read_view().symbols_by_ids(&ids)?;
+            let mut cores = Vec::new();
+            store.declaration_view().visit_core_rows(|row| {
+                cores.push(row);
+                Ok(())
+            })?;
+            let index = declaration_index::SemanticDeclarationIndex::build(cores, None, 0);
+            let ids: Vec<i64> = index
+                .name_table()
+                .search_ranked(&text, query::WORKSPACE_SYMBOL_LIMIT)
+                .into_iter()
+                .map(|hit| hit.id)
+                .collect();
+            let records: std::collections::HashMap<_, _> = store
+                .declaration_view()
+                .by_ids(&ids)?
+                .into_iter()
+                .map(|row| (row.id, row))
+                .collect();
 
-            println!("symbols: {} (of {} names)", records.len(), table.len());
-            for record in records {
-                print_record(&record);
+            println!("symbols: {} (of {} names)", records.len(), index.len());
+            for id in ids {
+                if let Some(record) = records.get(&id) {
+                    print_declaration(&record.fact);
+                }
             }
             Ok(())
         }
@@ -424,19 +442,19 @@ fn resolve_db_path(db: Option<PathBuf>, workspace: &Path) -> Result<PathBuf> {
     }
 }
 
-fn print_record(record: &store::SymbolRecord) {
+fn print_declaration(record: &semantic_model::DeclarationFact) {
     let guard = record
         .guard
         .as_deref()
         .map(|guard| format!("  [{guard}]"))
         .unwrap_or_default();
     println!(
-        "{}\t{}\t{}\t{}:{}{}",
+        "{}\t{:?}\t{:?}\t{}:{}{}",
         record.name,
-        record.kind,
+        record.declaration_kind,
         record.role,
         record.path,
-        record.start_line + 1,
+        record.name_range.start.line + 1,
         guard
     );
 }

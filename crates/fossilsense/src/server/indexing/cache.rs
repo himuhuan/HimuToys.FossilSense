@@ -8,10 +8,10 @@ use tower_lsp::Client;
 
 use crate::call_model::SemanticGeneration;
 use crate::call_service::CallReadHandle;
+use crate::declaration_index::SemanticDeclarationIndex;
 use crate::pathing;
 use crate::progress::DegradedCapabilities;
 use crate::project_context::{self, ProjectContextIndex};
-use crate::query::NameTable;
 use crate::reachability::ReachGraph;
 use crate::server::workspace::EngineSnapshot;
 use crate::server::{CacheLedger, CachePublishReport, IncludeCompletionTable};
@@ -29,17 +29,32 @@ async fn load_semantic_generation(root: PathBuf) -> Result<SemanticGeneration> {
     .await?
 }
 
-/// Build the in-memory fuzzy name table for `root` from one committed SQLite
-/// view. The result remains private until the complete engine snapshot is
-/// atomically published.
-async fn rebuild_name_table(
+/// Build the generation-scoped declaration read model from one committed
+/// SQLite view. The result remains private until the complete engine snapshot
+/// is atomically published.
+async fn rebuild_declaration_index(
     root: PathBuf,
     project_context: Option<Arc<ProjectContextIndex>>,
-) -> Result<Arc<NameTable>> {
-    let built = tokio::task::spawn_blocking(move || -> Result<NameTable> {
+    payload_budget_bytes: usize,
+) -> Result<Arc<SemanticDeclarationIndex>> {
+    let built = tokio::task::spawn_blocking(move || -> Result<SemanticDeclarationIndex> {
         let db_path = pathing::default_index_path(&root)?;
         let store = IndexStore::open_readonly(&db_path)?;
-        NameTable::build_from_store_view(&store.name_table_view(), project_context.as_deref())
+        let mut rows = Vec::new();
+        store.declaration_view().visit_core_rows(|row| {
+            rows.push(row);
+            Ok(())
+        })?;
+        let index =
+            SemanticDeclarationIndex::build(rows, project_context.as_deref(), payload_budget_bytes);
+        // A deliberately large budget opts into eager payload residency. The
+        // factor is conservative: core rows contain the hot identity/range
+        // strings, while complete typed payloads additionally carry signature,
+        // declarator shape, linkage, guard, and backing data.
+        if index.should_preload_all_payloads() {
+            index.preload_payloads(store.declaration_view().all()?);
+        }
+        Ok(index)
     })
     .await;
 
@@ -60,39 +75,56 @@ fn capture_call_read_handle(
     )))
 }
 
-async fn update_name_table_paths(
-    previous: Option<&NameTable>,
+async fn update_declaration_index_paths(
+    previous: Option<&SemanticDeclarationIndex>,
     root: PathBuf,
     paths: &[String],
     project_context: Option<Arc<ProjectContextIndex>>,
-) -> Result<Arc<NameTable>> {
+    payload_budget_bytes: usize,
+) -> Result<Arc<SemanticDeclarationIndex>> {
     let Some(previous) = previous else {
-        return rebuild_name_table(root, project_context).await;
+        return rebuild_declaration_index(root, project_context, payload_budget_bytes).await;
     };
 
     let paths_vec = paths.to_vec();
+    let read_payloads = SemanticDeclarationIndex::budget_prefers_eager_payloads(
+        payload_budget_bytes,
+        previous.accounted_core_bytes(),
+    );
+    let query_root = root.clone();
     let built = tokio::task::spawn_blocking(
-        move || -> Result<Vec<crate::store::views::NameTableSymbolRow>> {
-            let db_path = pathing::default_index_path(&root)?;
+        move ||
+              -> Result<(
+            Vec<crate::store::views::DeclarationCoreRow>,
+            Option<Vec<crate::store::views::DeclarationReadRow>>,
+        )> {
+            let db_path = pathing::default_index_path(&query_root)?;
             let store = IndexStore::open_readonly(&db_path)?;
-            store.name_table_view().symbol_rows_for_paths(&paths_vec)
+            let core_rows = store.declaration_view().core_rows_for_paths(&paths_vec)?;
+            let payload_rows = read_payloads
+                .then(|| store.declaration_view().all())
+                .transpose()?;
+            Ok((core_rows, payload_rows))
         },
     )
     .await;
 
-    let fresh_names = match built {
-        Ok(Ok(names)) => names,
+    let (fresh_names, payload_rows) = match built {
+        Ok(Ok(rows)) => rows,
         Ok(Err(err)) => return Err(err),
         Err(err) => return Err(err.into()),
     };
     let path_set: HashSet<String> = paths.iter().cloned().collect();
-    Ok(Arc::new(
-        previous.with_updated_path_rows_with_project_context(
-            &path_set,
-            fresh_names,
-            project_context.as_deref(),
-        ),
-    ))
+    let index = previous.with_updated_paths(
+        &path_set,
+        fresh_names,
+        project_context.as_deref(),
+        payload_budget_bytes,
+    );
+    if index.should_preload_all_payloads() {
+        index.preload_payloads(payload_rows.unwrap_or_default());
+    }
+    Ok(Arc::new(index))
 }
 
 async fn rebuild_project_context(
@@ -332,9 +364,25 @@ impl CacheLedger {
 
         let nt_started = tokio::time::Instant::now();
         let project_context = rebuild_project_context(client, root.clone()).await;
-        let name_table = rebuild_name_table(root.clone(), project_context.clone()).await?;
-        let symbol_count = name_table.len();
+        let declaration_index = rebuild_declaration_index(
+            root.clone(),
+            project_context.clone(),
+            self.semantic_index_memory_budget_bytes(),
+        )
+        .await?;
+        let symbol_count = declaration_index.len();
         let name_table_ms = nt_started.elapsed().as_millis();
+        client
+            .log_message(
+                MessageType::LOG,
+                format!(
+                    "semantic declaration index: declarations={}, core_bytes={}, payload_budget_bytes={}",
+                    symbol_count,
+                    declaration_index.accounted_core_bytes(),
+                    self.semantic_index_memory_budget_bytes(),
+                ),
+            )
+            .await;
         let call_read_handle = capture_call_read_handle(&root, semantic_generation)?;
 
         let rg_started = tokio::time::Instant::now();
@@ -379,7 +427,8 @@ impl CacheLedger {
             root,
             epoch,
             semantic_generation,
-            name_table: Some(name_table),
+            declaration_index: Some(declaration_index.clone()),
+            name_table: Some(declaration_index.name_table_arc()),
             reach_graph,
             include_table,
             indexed_files,
@@ -419,18 +468,19 @@ impl CacheLedger {
             .and_then(|snapshot| snapshot.project_context.clone());
 
         let nt_started = tokio::time::Instant::now();
-        let name_table = update_name_table_paths(
+        let declaration_index = update_declaration_index_paths(
             previous
                 .as_ref()
-                .and_then(|snapshot| snapshot.name_table.as_deref()),
+                .and_then(|snapshot| snapshot.declaration_index.as_deref()),
             root.clone(),
             rel_paths,
             project_context.clone(),
+            self.semantic_index_memory_budget_bytes(),
         )
         .await?;
-        let symbol_count = name_table.len();
+        let symbol_count = declaration_index.len();
         let name_table_ms = nt_started.elapsed().as_millis();
-        let should_compact_name_index = name_table.needs_compaction();
+        let should_compact_name_index = declaration_index.needs_compaction();
         let call_read_handle = capture_call_read_handle(&root, semantic_generation)?;
 
         let rg_started = tokio::time::Instant::now();
@@ -491,7 +541,8 @@ impl CacheLedger {
             root: root.clone(),
             epoch,
             semantic_generation,
-            name_table: Some(name_table),
+            declaration_index: Some(declaration_index.clone()),
+            name_table: Some(declaration_index.name_table_arc()),
             reach_graph,
             include_table,
             indexed_files,
@@ -570,14 +621,14 @@ impl CacheLedger {
         if snapshot.epoch != expected_epoch {
             return Ok(false);
         }
-        let Some(name_table) = snapshot.name_table.clone() else {
+        let Some(declaration_index) = snapshot.declaration_index.clone() else {
             return Ok(false);
         };
-        if !name_table.needs_compaction() {
+        if !declaration_index.needs_compaction() {
             return Ok(false);
         }
         let compacted =
-            tokio::task::spawn_blocking(move || Arc::new(name_table.compacted())).await?;
+            tokio::task::spawn_blocking(move || Arc::new(declaration_index.compacted())).await?;
 
         let _publish_guard = self.publish_gate.lock().await;
         let Some(current) = self.current_engine_snapshot(&root).await else {
@@ -590,7 +641,8 @@ impl CacheLedger {
             root,
             epoch: self.allocate_engine_epoch(),
             semantic_generation: current.semantic_generation,
-            name_table: Some(compacted),
+            declaration_index: Some(compacted.clone()),
+            name_table: Some(compacted.name_table_arc()),
             reach_graph: current.reach_graph.clone(),
             include_table: current.include_table.clone(),
             indexed_files: current.indexed_files.clone(),
@@ -620,12 +672,12 @@ impl CacheLedger {
         let project_count = project_context
             .as_ref()
             .map_or(0, |index| index.projects().len());
-        let previous_name_table = previous
-            .name_table
+        let previous_declaration_index = previous
+            .declaration_index
             .as_ref()
-            .context("project context refresh requires a published name table")?;
-        let name_table =
-            Arc::new(previous_name_table.with_project_context(project_context.as_deref()));
+            .context("project context refresh requires a published declaration index")?;
+        let declaration_index =
+            Arc::new(previous_declaration_index.with_project_context(project_context.as_deref()));
         let mut degraded = previous.degraded.clone();
         degraded.project_context = project_context.is_none();
 
@@ -633,7 +685,8 @@ impl CacheLedger {
             root,
             epoch: self.allocate_engine_epoch(),
             semantic_generation: previous.semantic_generation,
-            name_table: Some(name_table),
+            declaration_index: Some(declaration_index.clone()),
+            name_table: Some(declaration_index.name_table_arc()),
             reach_graph: previous.reach_graph.clone(),
             include_table: previous.include_table.clone(),
             indexed_files: previous.indexed_files.clone(),

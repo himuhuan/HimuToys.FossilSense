@@ -911,7 +911,9 @@ fn lsp_smoke_completion_definition_and_references() -> Result<()> {
         .get("documentation")
         .and_then(|documentation| documentation.get("value"))
         .and_then(Value::as_str)
-        .context("resolved completion missing Markdown documentation")?;
+        .with_context(|| {
+            format!("resolved completion missing Markdown documentation: {resolved_completion}")
+        })?;
     assert!(
         resolved_completion_docs.contains("Helps the smoke test.")
             && resolved_completion_docs.contains("### Parameters")

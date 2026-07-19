@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -20,6 +21,7 @@ use super::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum SemanticIntent {
     Neutral,
     Call,
@@ -64,19 +66,6 @@ impl ResolvedDeclarationCandidate {
             base_match: 1_000,
             confidence: self.confidence,
             reason: self.reason,
-        }
-    }
-
-    pub fn handle(&self) -> CandidateHandle {
-        CandidateHandle {
-            locator: match self.persistent_id {
-                Some(id) => CandidateHandleLocator::Persistent { declaration_id: id },
-                None => CandidateHandleLocator::Overlay {
-                    fingerprint: self.fact.identity.locator.fingerprint.clone(),
-                },
-            },
-            logical_key: self.fact.identity.logical_key.clone(),
-            locator_fingerprint: self.fact.identity.locator.fingerprint.clone(),
         }
     }
 }
@@ -211,30 +200,61 @@ impl CandidateQueryService<'_> {
         };
 
         if let Some(handle) = self.handle {
-            let (current_paths, reachable_paths) = self.durable_priority_path_groups();
-            let (rows, limited) = handle.read(|store| {
-                let view = store.declaration_view();
-                let (global, mut limited) = view.by_name_limited(name, self.exact_name_limit)?;
-                if !limited {
-                    return Ok((global, false));
-                }
+            let (rows, limited) = if let Some(index) = self.declaration_index {
+                let scope =
+                    self.current_reach
+                        .as_deref()
+                        .map(|reach| crate::query::CompletionScope {
+                            reach: reach.clone(),
+                            current_path: Some(self.current_path.to_string()),
+                            direct_external_files: self
+                                .reach_graph
+                                .map(|graph| {
+                                    graph.directly_included_external_paths_from(self.current_path)
+                                })
+                                .unwrap_or_default(),
+                        });
+                let cores = index.exact_name_cores_scoped(
+                    name,
+                    self.exact_name_limit.saturating_add(1),
+                    scope.as_ref(),
+                );
+                let limited = cores.len() > self.exact_name_limit;
+                let ids: Vec<_> = cores
+                    .into_iter()
+                    .take(self.exact_name_limit)
+                    .map(|(_, core)| core.id)
+                    .collect();
+                (index.payloads_by_ids(handle, &ids)?, limited)
+            } else {
+                let (current_paths, reachable_paths) = self.durable_priority_path_groups();
+                let (rows, limited) = handle.read(|store| {
+                    let view = store.declaration_view();
+                    let (global, mut limited) =
+                        view.by_name_limited(name, self.exact_name_limit)?;
+                    if !limited {
+                        return Ok((global, false));
+                    }
 
-                let mut rows = Vec::new();
-                for paths in [&current_paths, &reachable_paths] {
-                    let remaining = self.exact_name_limit.saturating_sub(rows.len());
-                    let (priority, priority_limited) =
-                        view.by_name_in_paths_limited(name, paths, remaining)?;
-                    rows.extend(priority);
-                    limited |= priority_limited;
-                }
-                rows.extend(global);
-                let mut seen = HashSet::new();
-                rows.retain(|row| seen.insert(row.id));
-                Ok((rows, limited))
-            })?;
+                    let mut rows = Vec::new();
+                    for paths in [&current_paths, &reachable_paths] {
+                        let remaining = self.exact_name_limit.saturating_sub(rows.len());
+                        let (priority, priority_limited) =
+                            view.by_name_in_paths_limited(name, paths, remaining)?;
+                        rows.extend(priority);
+                        limited |= priority_limited;
+                    }
+                    rows.extend(global);
+                    let mut seen = HashSet::new();
+                    rows.retain(|row| seen.insert(row.id));
+                    Ok((rows, limited))
+                })?;
+                (rows.into_iter().map(Arc::new).collect(), limited)
+            };
             scanned += rows.len();
             truncated |= limited;
-            candidates.extend(rows.into_iter().filter_map(|mut row| {
+            candidates.extend(rows.into_iter().filter_map(|row| {
+                let mut row = (*row).clone();
                 if self.overlays.shadows(&row.fact.path) {
                     return None;
                 }

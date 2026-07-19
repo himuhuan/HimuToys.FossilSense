@@ -87,6 +87,26 @@ impl Backend {
         };
 
         let comment = match data {
+            CompletionDocumentationData::Declaration {
+                version,
+                root,
+                uri,
+                declaration_id,
+                semantic_generation,
+                overlay_epoch,
+                document_version,
+            } => {
+                self.declaration_completion_documentation(
+                    version,
+                    root,
+                    uri,
+                    declaration_id,
+                    semantic_generation,
+                    overlay_epoch,
+                    document_version,
+                )
+                .await
+            }
             CompletionDocumentationData::Candidate {
                 version,
                 root,

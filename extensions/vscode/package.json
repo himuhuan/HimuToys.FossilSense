@@ -221,6 +221,13 @@
           "default": "auto",
           "markdownDescription": "Limited `#include` reachability scoping. When 'auto' (default), coloring and completion are narrowed using the current file's resolved include graph: coloring accepts exact reachable definitions, direct external headers, and bounded heuristic include targets, while excluding unrelated whole-workspace definitions when the scope is open; conflicting macro/type/enum kind evidence stays uncolored. Completion ranks stronger scope evidence first without dropping global fallback candidates. 'off' reverts both to whole-index behavior. This trades a little precision and recall for far less cross-file noise in large workspaces; it never errors."
         },
+        "fossilsense.semanticIndex.memoryBudgetMB": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 16384,
+          "default": 256,
+          "markdownDescription": "Memory budget in MiB for lazily hydrated semantic declaration payloads. The compact completion/navigation index is always resident. `0` keeps only that core and reads selected payloads from SQLite; larger values cache resolved payloads using byte-bounded LRU eviction."
+        },
         "fossilsense.references.showRanges": {
           "type": "boolean",
           "default": false,

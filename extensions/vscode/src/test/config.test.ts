@@ -35,3 +35,10 @@ const prefixRanking =
   packageJson.contributes.configuration.properties['fossilsense.completion.prefixRanking'];
 assert.deepStrictEqual(prefixRanking.enum, ['strict', 'scopeFirst']);
 assert.strictEqual(prefixRanking.default, 'strict');
+
+const semanticIndexBudget =
+  packageJson.contributes.configuration.properties['fossilsense.semanticIndex.memoryBudgetMB'];
+assert.strictEqual(semanticIndexBudget.type, 'integer');
+assert.strictEqual(semanticIndexBudget.default, 256);
+assert.strictEqual(semanticIndexBudget.minimum, 0);
+assert.strictEqual(semanticIndexBudget.maximum, 16384);

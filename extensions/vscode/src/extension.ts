@@ -172,6 +172,7 @@ export function activate(context: vscode.ExtensionContext): void {
           event.affectsConfiguration('fossilsense.completionHistory.mode') ||
           event.affectsConfiguration('fossilsense.semanticColoring.mode') ||
           event.affectsConfiguration('fossilsense.includeScoping.mode') ||
+          event.affectsConfiguration('fossilsense.semanticIndex.memoryBudgetMB') ||
           event.affectsConfiguration('fossilsense.debug.candidateReasons') ||
           event.affectsConfiguration('fossilsense.trace.server'))
       ) {
@@ -300,6 +301,9 @@ async function startServer(context: vscode.ExtensionContext): Promise<void> {
         },
         projectContext: {
           mode: projectContextModeFromConfig(),
+        },
+        semanticIndex: {
+          memoryBudgetMB: semanticIndexMemoryBudgetMBFromConfig(),
         },
         includePaths: includePathsFromConfig(),
         debug: {
@@ -797,6 +801,13 @@ function includeScopingModeFromConfig(): string {
     .getConfiguration('fossilsense')
     .get<string>('includeScoping.mode', 'auto');
   return normalizeIncludeScopingMode(setting);
+}
+
+function semanticIndexMemoryBudgetMBFromConfig(): number {
+  const value = vscode.workspace
+    .getConfiguration('fossilsense')
+    .get<number>('semanticIndex.memoryBudgetMB', 256);
+  return Number.isFinite(value) ? Math.max(0, Math.min(16384, Math.trunc(value))) : 256;
 }
 
 function traceFromConfig(): Trace {

@@ -156,6 +156,7 @@ impl Backend {
             .reach_scope_from_context(&uri, &context)
             .map(|(_, reach)| reach);
         let call_read_handle = context.engine.call_read_handle.clone();
+        let declaration_index = context.engine.declaration_index.clone();
         let reach_graph = context.engine.reach_graph.clone();
         let semantic_epoch = context.engine.semantic_generation;
         let indexed_files = context.engine.indexed_files.clone();
@@ -170,8 +171,9 @@ impl Backend {
             .await;
 
         let result = tokio::task::spawn_blocking(move || -> Result<PossibleTargetsResponse> {
-            let service = CandidateQueryService::new(
+            let service = CandidateQueryService::new_with_declarations(
                 call_read_handle.as_deref(),
+                declaration_index.as_deref(),
                 &overlay,
                 &current_path,
                 reach_scope.as_deref(),

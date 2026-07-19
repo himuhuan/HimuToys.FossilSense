@@ -96,3 +96,15 @@ cargo test --release -p fossilsense `
 ```
 
 Report elapsed time together with memory and disk cost. An elapsed-only improvement is not sufficient when it causes unbounded memory, database growth, incomplete results without coverage, or correctness regression.
+
+For ordinary-completion hot-path diagnostics, use a current schema-18 U-Boot
+database and run the declaration-index benchmark. It asserts that list recall
+performs zero SQLite payload reads and reports p50/p95 lookup latency plus the
+resident core byte estimate:
+
+```powershell
+$env:FOSSILSENSE_BENCH_DB = (Resolve-Path 'target/benchmark/index-u-boot-rebuild.sqlite').Path
+cargo test --release -p fossilsense `
+  declaration_index::tests::benchmark_large_declaration_index_completion_hot_path -- `
+  --ignored --exact --nocapture
+```

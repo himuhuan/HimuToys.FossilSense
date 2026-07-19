@@ -18,6 +18,7 @@ use providers::{
     completion_items_for_current_file_overlay, completion_items_for_indexed_hits,
     completion_items_for_language_builtins, completion_items_for_local_bindings,
     exact_indexed_completion_candidates_for_local_word, set_completion_history_key,
+    IndexedCompletionContext,
 };
 
 type OrdinaryPipelineCandidate = PipelineCandidate<OrdinaryCompletionPresentation>;
@@ -51,6 +52,17 @@ pub(crate) struct OrdinaryCompletionInput {
 #[derive(Clone)]
 pub(crate) struct OrdinaryCompletionNameTable {
     pub table: Arc<NameTable>,
+    pub overlay_handles: std::collections::HashMap<i64, crate::candidate_service::CandidateHandle>,
+}
+
+impl OrdinaryCompletionNameTable {
+    #[cfg(test)]
+    fn test(table: Arc<NameTable>) -> Self {
+        Self {
+            table,
+            overlay_handles: std::collections::HashMap::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,16 +87,13 @@ pub(crate) struct OrdinaryCompletionItem {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum OrdinaryCompletionDocumentationTarget {
-    Indexed {
+    Declaration {
         table_index: usize,
-        symbol_id: i64,
+        declaration_id: i64,
     },
     CurrentDocument {
         start_line: u32,
     },
-    /// Exact semantic identity selected from the shared CandidateSet. The
-    /// legacy variants above are recall-stage hints only and must never cross
-    /// the LSP boundary.
     Candidate {
         table_index: usize,
         handle: crate::candidate_service::CandidateHandle,
@@ -152,9 +161,12 @@ pub(crate) fn complete_ordinary_identifier(
         new_pools.push(pool);
         candidates.extend(completion_items_for_indexed_hits(
             hits,
-            open_reason,
-            table_project_context,
-            idx,
+            IndexedCompletionContext {
+                table_index: idx,
+                overlay_handles: &table.overlay_handles,
+                active_project_context: table_project_context,
+                open_reason,
+            },
         ));
     }
 
@@ -201,9 +213,17 @@ pub(crate) fn complete_ordinary_identifier(
         .filter(|hit| !hit.semantic || hit.detail.as_deref() == Some("text"))
         .map(|hit| hit.name.clone())
         .collect();
+    let current_table_index = (!input.tables.is_empty()).then_some(0);
+    let use_canonical_overlay_detail = input
+        .tables
+        .first()
+        .is_some_and(|table| table.table.len() > 0);
     candidates.extend(completion_items_for_current_file_overlay(
         current_file_overlay_hits,
         &input.text,
+        input.parsed_document.as_deref(),
+        current_table_index,
+        use_canonical_overlay_detail,
     ));
     candidates.extend(completion_items_for_language_builtins(&input.prefix));
 
@@ -222,13 +242,17 @@ pub(crate) fn complete_ordinary_identifier(
         let mut exact_indexed = Vec::new();
         for (table_index, table) in input.tables.iter().enumerate() {
             exact_indexed.extend(exact_indexed_completion_candidates_for_local_word(
-                (table.table.as_ref(), table_index),
+                table.table.as_ref(),
                 word,
                 word_score,
                 input.scope.as_ref(),
-                input.active_project_context.as_ref(),
-                open_reason,
                 input.limit,
+                IndexedCompletionContext {
+                    table_index,
+                    overlay_handles: &table.overlay_handles,
+                    active_project_context: input.active_project_context.as_ref(),
+                    open_reason,
+                },
             ));
         }
         if !exact_indexed.is_empty() {
@@ -346,7 +370,7 @@ fn is_rescue_completion_evidence(evidence: CandidateEvidence) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -389,6 +413,7 @@ mod tests {
             local_words: Arc::new(HashSet::new()),
             tables: vec![OrdinaryCompletionNameTable {
                 table: Arc::new(NameTable::build_from_rows_with_project_context(rows, None)),
+                overlay_handles: HashMap::new(),
             }],
             scope: None,
             active_project_context: None,
@@ -403,11 +428,13 @@ mod tests {
         });
         assert_eq!(output.items.len(), 1);
         let item = &output.items[0];
-        let symbol_id = match item.documentation_target {
-            Some(OrdinaryCompletionDocumentationTarget::Indexed { symbol_id, .. }) => symbol_id,
+        let declaration_id = match item.documentation_target {
+            Some(OrdinaryCompletionDocumentationTarget::Declaration { declaration_id, .. }) => {
+                declaration_id
+            }
             ref other => panic!("expected indexed documentation target, got {other:?}"),
         };
-        (symbol_id, item.evidence.role.expect("indexed role"))
+        (declaration_id, item.evidence.role.expect("indexed role"))
     }
 
     #[test]
@@ -513,7 +540,7 @@ mod tests {
             character,
             parsed_document: Some(parsed),
             local_words,
-            tables: vec![OrdinaryCompletionNameTable { table }],
+            tables: vec![OrdinaryCompletionNameTable::test(table)],
             scope: Some(scope),
             active_project_context: None,
             prior_pools: vec![None],
@@ -592,6 +619,7 @@ mod tests {
             local_words: Arc::new(HashSet::new()),
             tables: vec![OrdinaryCompletionNameTable {
                 table: Arc::new(NameTable::build_with_paths(Vec::new())),
+                overlay_handles: HashMap::new(),
             }],
             scope: None,
             active_project_context: None,
@@ -644,6 +672,7 @@ mod tests {
                 local_words: Arc::new(HashSet::new()),
                 tables: vec![OrdinaryCompletionNameTable {
                     table: table.clone(),
+                    overlay_handles: HashMap::new(),
                 }],
                 scope: Some(CompletionScope {
                     current_path: Some("main.c".to_string()),
@@ -712,7 +741,7 @@ mod tests {
             character,
             parsed_document: Some(parsed),
             local_words: Arc::new(HashSet::new()),
-            tables: vec![OrdinaryCompletionNameTable { table }],
+            tables: vec![OrdinaryCompletionNameTable::test(table)],
             scope: Some(scope),
             active_project_context: None,
             prior_pools: vec![None],
@@ -744,6 +773,7 @@ mod tests {
                 local_words: Arc::new(HashSet::new()),
                 tables: vec![OrdinaryCompletionNameTable {
                     table: Arc::new(NameTable::build_with_paths(Vec::new())),
+                    overlay_handles: HashMap::new(),
                 }],
                 scope: None,
                 active_project_context: None,
@@ -786,6 +816,7 @@ mod tests {
                     "type".to_string(),
                     false,
                 )])),
+                overlay_handles: HashMap::new(),
             }],
             scope: None,
             active_project_context: None,
@@ -833,6 +864,7 @@ mod tests {
             local_words: Arc::new(HashSet::new()),
             tables: vec![OrdinaryCompletionNameTable {
                 table: Arc::new(NameTable::build_with_paths(Vec::new())),
+                overlay_handles: HashMap::new(),
             }],
             scope: None,
             active_project_context: None,
@@ -873,6 +905,7 @@ mod tests {
             local_words: Arc::new(HashSet::from(["signal_name".to_string()])),
             tables: vec![OrdinaryCompletionNameTable {
                 table: Arc::new(NameTable::build_with_paths(Vec::new())),
+                overlay_handles: HashMap::new(),
             }],
             scope: None,
             active_project_context: None,
@@ -938,6 +971,7 @@ mod tests {
                         false,
                     ),
                 ])),
+                overlay_handles: HashMap::new(),
             }],
             scope: Some(CompletionScope {
                 current_path: Some("a.c".to_string()),
@@ -1003,6 +1037,7 @@ mod tests {
             local_words: Arc::new(HashSet::new()),
             tables: vec![OrdinaryCompletionNameTable {
                 table: Arc::new(NameTable::build_with_paths(rows)),
+                overlay_handles: HashMap::new(),
             }],
             scope: None,
             active_project_context: None,
@@ -1103,7 +1138,7 @@ mod tests {
             character: 3,
             parsed_document: None,
             local_words: Arc::new(HashSet::new()),
-            tables: vec![OrdinaryCompletionNameTable { table }],
+            tables: vec![OrdinaryCompletionNameTable::test(table)],
             scope,
             active_project_context,
             prior_pools: vec![None],
@@ -1181,7 +1216,7 @@ mod tests {
             character: 3,
             parsed_document: None,
             local_words: Arc::new(HashSet::new()),
-            tables: vec![OrdinaryCompletionNameTable { table }],
+            tables: vec![OrdinaryCompletionNameTable::test(table)],
             scope: None,
             active_project_context: Some(selected_key),
             prior_pools: vec![None],
@@ -1258,9 +1293,11 @@ mod tests {
             tables: vec![
                 OrdinaryCompletionNameTable {
                     table: selected_table,
+                    overlay_handles: HashMap::new(),
                 },
                 OrdinaryCompletionNameTable {
                     table: unrelated_table,
+                    overlay_handles: HashMap::new(),
                 },
             ],
             scope: None,

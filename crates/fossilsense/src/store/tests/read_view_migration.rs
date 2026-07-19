@@ -87,13 +87,27 @@ fn core_symbol_features_route_through_candidate_sets_and_stable_handles() {
         assert_present(path, &["semantic_candidates("]);
         assert_absent(path, &["non_callable_symbols("]);
     }
-    assert_present(
+    assert_absent(
         "src/server/language_server.rs",
-        &["hydrate_ordinary_completion_candidates("],
+        &[
+            "hydrate_ordinary_completion_candidates(",
+            "semantic_candidates(&item.label",
+        ],
+    );
+    assert_present(
+        "src/server.rs",
+        &["CompletionDocumentationData::Declaration"],
     );
     assert_present(
         "src/server/completion_candidate_documentation.rs",
-        &["resolve_candidate_handle(&handle)"],
+        &[
+            "new_with_declarations(",
+            "resolve_candidate_handle(&handle)",
+        ],
+    );
+    assert_present(
+        "src/candidate_service/semantic.rs",
+        &["payloads_by_ids(handle, &ids)"],
     );
     assert_absent(
         "src/server/completion_documentation.rs",

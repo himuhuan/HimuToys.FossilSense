@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::project_context::{ProjectContextIndex, ProjectKey};
+#[cfg(test)]
 use crate::store::views::NameTableSymbolRef;
 
 use super::{
@@ -42,6 +43,7 @@ impl<'a> NameIndexBuilder<'a> {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn push(&mut self, row: NameTableSymbolRef<'_>) {
         let name_id = self.intern_name(row.label, None);
         let path_id = self.intern_path(row.path, row.external);

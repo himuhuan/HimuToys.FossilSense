@@ -10,7 +10,9 @@ use crate::parser::{SymbolKind as ParserKind, SymbolRole};
 use crate::project_context::{ProjectContextIndex, ProjectKey};
 use crate::reachability::ReachScope;
 use crate::resolver::{self, ResolveContext};
-use crate::store::views::{NameTableStoreView, NameTableSymbolRow};
+#[cfg(test)]
+use crate::store::views::NameTableStoreView;
+use crate::store::views::{DeclarationCoreRow, NameTableSymbolRow};
 
 pub mod callables;
 mod comments;
@@ -350,6 +352,13 @@ impl NameTable {
         Self::from_entries(entries)
     }
 
+    pub(crate) fn build_from_declaration_rows_with_project_context(
+        rows: Vec<DeclarationCoreRow>,
+        project_context: Option<&ProjectContextIndex>,
+    ) -> Self {
+        Self::from_entries(declaration_name_entries(rows, project_context))
+    }
+
     #[cfg(test)]
     pub fn build_with_paths_and_project_context(
         names: Vec<(i64, String, bool, String, String, bool)>,
@@ -377,6 +386,7 @@ impl NameTable {
         Self::from_entries(entries)
     }
 
+    #[cfg(test)]
     pub(crate) fn build_from_store_view(
         view: &NameTableStoreView<'_>,
         project_context: Option<&ProjectContextIndex>,
@@ -585,14 +595,13 @@ impl NameTable {
         self.with_updated_entries(paths, fresh_entries)
     }
 
-    pub fn with_updated_path_rows_with_project_context(
+    pub(crate) fn with_updated_declaration_rows_with_project_context(
         &self,
         paths: &HashSet<String>,
-        rows: Vec<NameTableSymbolRow>,
+        rows: Vec<DeclarationCoreRow>,
         project_context: Option<&ProjectContextIndex>,
     ) -> Self {
-        let fresh_entries = name_entries_from_rows_with_project_context(rows, project_context);
-        self.with_updated_entries(paths, fresh_entries)
+        self.with_updated_entries(paths, declaration_name_entries(rows, project_context))
     }
 
     pub fn project_indices(&self, key: &ProjectKey) -> Option<Vec<usize>> {
@@ -856,6 +865,7 @@ impl NameTable {
     }
 
     /// Return up to `limit` matching symbol ids, best match first.
+    #[cfg(test)]
     pub fn search(&self, query: &str, limit: usize) -> Vec<i64> {
         self.search_ranked(query, limit)
             .into_iter()
@@ -1430,6 +1440,7 @@ fn name_entry_from_row_with_project_context(
     )
 }
 
+#[cfg(test)]
 fn name_entries_from_rows_with_project_context(
     rows: Vec<NameTableSymbolRow>,
     project_context: Option<&ProjectContextIndex>,
@@ -1456,6 +1467,65 @@ fn name_entries_from_rows_with_project_context(
                 row.directly_included,
                 project_key,
             )
+        })
+        .collect()
+}
+
+fn declaration_name_entries(
+    rows: Vec<DeclarationCoreRow>,
+    project_context: Option<&ProjectContextIndex>,
+) -> Vec<NameEntry> {
+    let mut project_by_path = HashMap::<String, Option<ProjectKey>>::new();
+    rows.into_iter()
+        .map(|row| {
+            let project_key = if row.external {
+                None
+            } else if let Some(project) = project_by_path.get(&row.path) {
+                project.clone()
+            } else {
+                let project = project_context.and_then(|index| index.nearest_for_file(&row.path));
+                project_by_path.insert(row.path.clone(), project.clone());
+                project
+            };
+            let lower = row.name.to_ascii_lowercase();
+            NameEntry {
+                id: row.id,
+                name: Arc::from(row.name),
+                lower: Arc::from(lower),
+                external: row.external,
+                directly_included: row.directly_included,
+                path: Arc::from(row.path),
+                kind: match row.declaration_kind {
+                    crate::semantic_model::SemanticDeclarationKind::Function
+                    | crate::semantic_model::SemanticDeclarationKind::Method => {
+                        ParserKind::Function
+                    }
+                    crate::semantic_model::SemanticDeclarationKind::Object => {
+                        ParserKind::GlobalVariable
+                    }
+                    crate::semantic_model::SemanticDeclarationKind::Type
+                    | crate::semantic_model::SemanticDeclarationKind::Alias => ParserKind::Type,
+                    crate::semantic_model::SemanticDeclarationKind::EnumConstant => {
+                        ParserKind::EnumConstant
+                    }
+                    crate::semantic_model::SemanticDeclarationKind::Macro => ParserKind::Macro,
+                },
+                role: match row.role {
+                    crate::semantic_model::SemanticDeclarationRole::Declaration => {
+                        SymbolRole::Declaration
+                    }
+                    crate::semantic_model::SemanticDeclarationRole::Definition => {
+                        SymbolRole::Definition
+                    }
+                    crate::semantic_model::SemanticDeclarationRole::TentativeDefinition => {
+                        SymbolRole::TentativeDefinition
+                    }
+                    crate::semantic_model::SemanticDeclarationRole::Unknown => {
+                        SymbolRole::UnknownDeclarationOrDefinition
+                    }
+                },
+                project_key,
+            }
         })
         .collect()
 }

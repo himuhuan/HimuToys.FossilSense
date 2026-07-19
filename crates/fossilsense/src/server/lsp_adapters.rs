@@ -8,18 +8,8 @@ use tower_lsp::lsp_types::{
 use crate::model;
 use crate::parser::{Symbol, SymbolKind as ParserSymbolKind};
 use crate::references::{self, ReferenceHit};
-use crate::store::SymbolRecord;
-
-fn lsp_symbol_kind(kind: &str) -> SymbolKind {
-    match kind {
-        "function" => SymbolKind::FUNCTION,
-        "macro" => SymbolKind::CONSTANT,
-        "type" => SymbolKind::STRUCT,
-        "enum_constant" => SymbolKind::ENUM_MEMBER,
-        "global_variable" => SymbolKind::VARIABLE,
-        _ => SymbolKind::VARIABLE,
-    }
-}
+use crate::semantic_model::SemanticDeclarationKind;
+use crate::store::views::DeclarationCoreRow;
 
 fn lsp_kind_from_parser(kind: ParserSymbolKind) -> SymbolKind {
     match kind {
@@ -42,28 +32,6 @@ fn lsp_completion_kind(kind: &str) -> CompletionItemKind {
         "global_variable" => CompletionItemKind::VARIABLE,
         _ => CompletionItemKind::TEXT,
     }
-}
-
-pub(super) fn record_range(record: &SymbolRecord) -> Range {
-    Range {
-        start: Position {
-            line: record.start_line,
-            character: record.start_col,
-        },
-        end: Position {
-            line: record.end_line,
-            character: record.end_col,
-        },
-    }
-}
-
-pub(super) fn record_to_location(root: &Path, record: &SymbolRecord) -> Option<Location> {
-    let relative = record.path.replace('/', std::path::MAIN_SEPARATOR_STR);
-    let uri = Url::from_file_path(root.join(relative)).ok()?;
-    Some(Location {
-        uri,
-        range: record_range(record),
-    })
 }
 
 /// Build an LSP `Location` from a labeled `DefinitionCandidate`. Positions are
@@ -135,19 +103,39 @@ pub(super) fn grouped_reference_items(
 }
 
 #[allow(deprecated)]
-pub(super) fn record_to_symbol_information(
+pub(super) fn declaration_core_to_symbol_information(
     root: &Path,
-    record: &SymbolRecord,
+    row: &DeclarationCoreRow,
 ) -> Option<SymbolInformation> {
-    let location = record_to_location(root, record)?;
+    let path = row.path.replace('/', std::path::MAIN_SEPARATOR_STR);
+    let uri = Url::from_file_path(root.join(path)).ok()?;
     Some(SymbolInformation {
-        name: record.name.clone(),
-        kind: lsp_symbol_kind(&record.kind),
+        name: row.name.clone(),
+        kind: match row.declaration_kind {
+            SemanticDeclarationKind::Function | SemanticDeclarationKind::Method => {
+                SymbolKind::FUNCTION
+            }
+            SemanticDeclarationKind::Type | SemanticDeclarationKind::Alias => SymbolKind::STRUCT,
+            SemanticDeclarationKind::Macro => SymbolKind::CONSTANT,
+            SemanticDeclarationKind::EnumConstant => SymbolKind::ENUM_MEMBER,
+            SemanticDeclarationKind::Object => SymbolKind::VARIABLE,
+        },
         tags: None,
         deprecated: None,
-        location,
-        // Surface the conditional-compilation guard as the container hint.
-        container_name: record.guard.clone(),
+        location: Location {
+            uri,
+            range: Range {
+                start: Position {
+                    line: row.name_range.start.line,
+                    character: row.name_range.start.character,
+                },
+                end: Position {
+                    line: row.name_range.end.line,
+                    character: row.name_range.end.character,
+                },
+            },
+        },
+        container_name: None,
     })
 }
 

@@ -61,7 +61,7 @@ fn schema_17_persists_full_typed_callable_signatures() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, "17");
+    assert_eq!(version, "18");
 
     let anchor_columns: Vec<(String, String)> = store
         .conn

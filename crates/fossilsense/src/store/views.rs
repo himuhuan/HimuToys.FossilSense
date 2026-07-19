@@ -14,7 +14,7 @@ mod member;
 #[allow(unused_imports)]
 pub use call_facts::{CallCoverageRow, CallFactStoreView, CallSiteRow, CallableAnchorRow};
 #[allow(unused_imports)]
-pub use declarations::{DeclarationReadRow, DeclarationStoreView};
+pub use declarations::{DeclarationCoreRow, DeclarationReadRow, DeclarationStoreView};
 #[allow(unused_imports)]
 pub use member::{MemberReadRow, MemberStoreView, RecordReadRow, TypeAliasReadRow};
 
@@ -36,6 +36,7 @@ pub struct NameTableSymbolRow {
 /// intern the SQLite text directly, avoiding a workspace-sized temporary
 /// `Vec<NameTableSymbolRow>` and its four owned strings per symbol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub struct NameTableSymbolRef<'a> {
     pub symbol_id: i64,
     pub label: &'a str,
@@ -130,6 +131,7 @@ impl<'a> NameTableStoreView<'a> {
         collect_rows(rows)
     }
 
+    #[cfg(test)]
     pub fn visit_symbol_rows<F>(&self, mut visitor: F) -> Result<usize>
     where
         F: for<'row> FnMut(NameTableSymbolRef<'row>) -> Result<()>,

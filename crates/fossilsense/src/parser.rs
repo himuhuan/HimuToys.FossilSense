@@ -67,11 +67,16 @@ bitflags::bitflags! {
                             | Self::FIELDS.bits()
                             | Self::ALIASES.bits();
 
-        /// Ordinary identifier completion: lexical symbols plus local and
-        /// parameter bindings, without records, fields, occurrences, or calls.
+        /// Ordinary identifier completion: lexical symbols, canonical aliases
+        /// and callables, plus local/parameter bindings. Canonical declaration
+        /// facts let the list attach an overlay identity directly without a
+        /// post-recall semantic hydration query; a later resolve parse produces
+        /// the same locator for functions and methods.
         const COMPLETION    = Self::SYMBOLS.bits()
                             | Self::INCLUDES.bits()
-                            | Self::LOCAL_DECLS.bits();
+                            | Self::LOCAL_DECLS.bits()
+                            | Self::ALIASES.bits()
+                            | Self::CALL_RELATIONS.bits();
 
         /// Semantic coloring: identifier occurrences plus local bindings.
         const COLOR_LIVE    = Self::COLOR_REF.bits()
