@@ -16,6 +16,41 @@ if ($LASTEXITCODE -ne 0) {
 if (@($defaultCases | Where-Object { $_ -like 'v142-*' }).Count -ne 0) {
     throw 'v1.4.2 semantic cases leaked into the default benchmark plan.'
 }
+if ($defaultCases -contains 'u-boot-engine-hydration') {
+    throw 'The U-Boot engine hydration case leaked into the default benchmark plan.'
+}
+
+$engineCases = @(
+    & powershell -NoProfile -ExecutionPolicy Bypass -File $benchmarkScript `
+        -ListCases -IncludeEngineHydration 2>&1 |
+        ForEach-Object { $_.ToString() }
+)
+if ($LASTEXITCODE -ne 0 -or $engineCases -notcontains 'u-boot-engine-hydration') {
+    throw "Engine hydration benchmark case listing failed:`n$($engineCases -join "`n")"
+}
+$combinedGateCases = @(
+    & powershell -NoProfile -ExecutionPolicy Bypass -File $benchmarkScript `
+        -ListCases -IncludeFullIndex -IncludeEngineHydration `
+        -CaseFilter 'u-boot-full-index,u-boot-engine-hydration' 2>&1 |
+        ForEach-Object { $_.ToString() }
+)
+if ($LASTEXITCODE -ne 0 -or
+    $combinedGateCases.Count -ne 2 -or
+    $combinedGateCases -notcontains 'u-boot-full-index' -or
+    $combinedGateCases -notcontains 'u-boot-engine-hydration') {
+    throw "Combined full-index and hydration filtering failed:`n$($combinedGateCases -join "`n")"
+}
+$engineHarness = Join-Path $PSScriptRoot 'benchmark_engine_hydration.ps1'
+if (-not (Test-Path -LiteralPath $engineHarness -PathType Leaf)) {
+    throw 'The engine hydration benchmark harness is missing.'
+}
+$engineHarnessSource = Get-Content -Raw -LiteralPath $engineHarness
+if ($engineHarnessSource -notmatch 'cargo test' -or
+    $engineHarnessSource -notmatch 'uboot_engine_hydration_stays_below_private_memory_gate' -or
+    $engineHarnessSource -notmatch 'FOSSILSENSE_BENCH_DB' -or
+    $engineHarnessSource -notmatch 'FOSSILSENSE_BENCH_ROOT') {
+    throw 'The engine hydration harness does not execute the release U-Boot memory gate.'
+}
 
 $allCases = @(
     & powershell -NoProfile -ExecutionPolicy Bypass -File $benchmarkScript `

@@ -9,7 +9,7 @@ use crate::model;
 use crate::parser::{Symbol, SymbolKind as ParserSymbolKind};
 use crate::references::{self, ReferenceHit};
 use crate::semantic_model::SemanticDeclarationKind;
-use crate::store::views::DeclarationCoreRow;
+use crate::store::views::DeclarationReadRow;
 
 fn lsp_kind_from_parser(kind: ParserSymbolKind) -> SymbolKind {
     match kind {
@@ -103,15 +103,16 @@ pub(super) fn grouped_reference_items(
 }
 
 #[allow(deprecated)]
-pub(super) fn declaration_core_to_symbol_information(
+pub(super) fn declaration_to_symbol_information(
     root: &Path,
-    row: &DeclarationCoreRow,
+    row: &DeclarationReadRow,
 ) -> Option<SymbolInformation> {
-    let path = row.path.replace('/', std::path::MAIN_SEPARATOR_STR);
+    let declaration = &row.fact;
+    let path = declaration.path.replace('/', std::path::MAIN_SEPARATOR_STR);
     let uri = Url::from_file_path(root.join(path)).ok()?;
     Some(SymbolInformation {
-        name: row.name.clone(),
-        kind: match row.declaration_kind {
+        name: declaration.name.clone(),
+        kind: match declaration.declaration_kind {
             SemanticDeclarationKind::Function | SemanticDeclarationKind::Method => {
                 SymbolKind::FUNCTION
             }
@@ -126,12 +127,12 @@ pub(super) fn declaration_core_to_symbol_information(
             uri,
             range: Range {
                 start: Position {
-                    line: row.name_range.start.line,
-                    character: row.name_range.start.character,
+                    line: declaration.name_range.start.line,
+                    character: declaration.name_range.start.character,
                 },
                 end: Position {
-                    line: row.name_range.end.line,
-                    character: row.name_range.end.character,
+                    line: declaration.name_range.end.line,
+                    character: declaration.name_range.end.character,
                 },
             },
         },

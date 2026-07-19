@@ -242,14 +242,9 @@ fn run_query(kind: QueryCommand) -> Result<()> {
         } => {
             let db_path = resolve_db_path(db, &workspace)?;
             let store = IndexStore::open_readonly(&db_path)?;
-            let mut cores = Vec::new();
-            store.declaration_view().visit_core_rows(|row| {
-                cores.push(row);
-                Ok(())
-            })?;
-            let index = declaration_index::SemanticDeclarationIndex::build(cores, None, 0);
-            let ids: Vec<i64> = index
-                .name_table()
+            let names =
+                query::NameTable::build_from_declaration_view(&store.declaration_view(), None)?;
+            let ids: Vec<i64> = names
                 .search_ranked(&text, query::WORKSPACE_SYMBOL_LIMIT)
                 .into_iter()
                 .map(|hit| hit.id)
@@ -261,7 +256,7 @@ fn run_query(kind: QueryCommand) -> Result<()> {
                 .map(|row| (row.id, row))
                 .collect();
 
-            println!("symbols: {} (of {} names)", records.len(), index.len());
+            println!("symbols: {} (of {} names)", records.len(), names.len());
             for id in ids {
                 if let Some(record) = records.get(&id) {
                     print_declaration(&record.fact);

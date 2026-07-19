@@ -3,6 +3,7 @@
 //! `tower-lsp` request types so the scoring/ranking can be unit-tested.
 
 use std::collections::{HashMap, HashSet};
+use std::mem::size_of;
 use std::sync::Arc;
 
 use crate::model::ScopeTier;
@@ -12,7 +13,7 @@ use crate::reachability::ReachScope;
 use crate::resolver::{self, ResolveContext};
 #[cfg(test)]
 use crate::store::views::NameTableStoreView;
-use crate::store::views::{DeclarationCoreRow, NameTableSymbolRow};
+use crate::store::views::{DeclarationNameRow, DeclarationStoreView, NameTableSymbolRow};
 
 pub mod callables;
 mod comments;
@@ -352,8 +353,21 @@ impl NameTable {
         Self::from_entries(entries)
     }
 
-    pub(crate) fn build_from_declaration_rows_with_project_context(
-        rows: Vec<DeclarationCoreRow>,
+    pub(crate) fn build_from_declaration_view(
+        view: &DeclarationStoreView<'_>,
+        project_context: Option<&ProjectContextIndex>,
+    ) -> anyhow::Result<Self> {
+        let mut builder = name_index_builder::NameIndexBuilder::new(project_context);
+        view.visit_name_rows(|row| {
+            builder.push_declaration(row);
+            Ok(())
+        })?;
+        Ok(builder.finish())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn build_from_declaration_name_rows_with_project_context(
+        rows: Vec<DeclarationNameRow>,
         project_context: Option<&ProjectContextIndex>,
     ) -> Self {
         Self::from_entries(declaration_name_entries(rows, project_context))
@@ -572,9 +586,131 @@ impl NameSegment {
             .get(path)
             .map(|id| self.paths[*id as usize].clone())
     }
+
+    fn accounted_bytes(&self) -> usize {
+        let arc_header = size_of::<usize>().saturating_mul(2);
+        let names = self.names.iter().fold(0usize, |bytes, name| {
+            bytes
+                .saturating_add(name.original.len())
+                .saturating_add(arc_header)
+                .saturating_add(name.lower.len())
+                .saturating_add(arc_header)
+        });
+        let paths = self.paths.iter().fold(0usize, |bytes, path| {
+            bytes.saturating_add(path.len()).saturating_add(arc_header)
+        });
+        let projects = self.projects.iter().fold(0usize, |bytes, project| {
+            bytes
+                .saturating_add(project.workspace_root_id.len())
+                .saturating_add(project.project_path.len())
+        });
+        let by_project = self
+            .by_project
+            .iter()
+            .fold(0usize, |bytes, (key, indices)| {
+                bytes
+                    .saturating_add(key.workspace_root_id.len())
+                    .saturating_add(key.project_path.len())
+                    .saturating_add(indices.capacity().saturating_mul(size_of::<usize>()))
+            });
+
+        size_of::<Self>()
+            .saturating_add(
+                self.entries
+                    .capacity()
+                    .saturating_mul(size_of::<CompactNameEntry>()),
+            )
+            .saturating_add(
+                self.names
+                    .capacity()
+                    .saturating_mul(size_of::<NameString>()),
+            )
+            .saturating_add(names)
+            .saturating_add(self.paths.capacity().saturating_mul(size_of::<Arc<str>>()))
+            .saturating_add(paths)
+            .saturating_add(hash_table_bytes::<Arc<str>, u32>(self.path_ids.capacity()))
+            .saturating_add(
+                self.path_counts
+                    .capacity()
+                    .saturating_mul(size_of::<usize>()),
+            )
+            .saturating_add(
+                self.path_is_external
+                    .capacity()
+                    .saturating_mul(size_of::<bool>()),
+            )
+            .saturating_add(
+                self.projects
+                    .capacity()
+                    .saturating_mul(size_of::<ProjectKey>()),
+            )
+            .saturating_add(projects)
+            .saturating_add(self.sorted.capacity().saturating_mul(size_of::<usize>()))
+            .saturating_add(hash_table_bytes::<ProjectKey, Vec<usize>>(
+                self.by_project.capacity(),
+            ))
+            .saturating_add(by_project)
+    }
+}
+
+fn hash_table_bytes<K, V>(capacity: usize) -> usize {
+    // hashbrown stores a control byte beside each bucket. This remains an
+    // estimate rather than an allocator promise, so the process-level gate is
+    // still authoritative.
+    capacity.saturating_mul(size_of::<(K, V)>().saturating_add(1))
+}
+
+fn string_set_bytes(values: &HashSet<String>) -> usize {
+    hash_table_bytes::<String, ()>(values.capacity()).saturating_add(
+        values
+            .iter()
+            .fold(0usize, |bytes, value| bytes.saturating_add(value.len())),
+    )
 }
 
 impl NameTable {
+    pub(crate) fn accounted_bytes(&self) -> usize {
+        let arc_header = size_of::<usize>().saturating_mul(2);
+        let delta_segments = self.deltas.iter().fold(0usize, |bytes, segment| {
+            bytes.saturating_add(segment.accounted_bytes())
+        });
+        let path_overrides = self.path_overrides.iter().fold(0usize, |bytes, (path, _)| {
+            bytes.saturating_add(path.len()).saturating_add(arc_header)
+        });
+        let direct_overrides = self
+            .direct_include_overrides
+            .keys()
+            .fold(0usize, |bytes, path| bytes.saturating_add(path.len()));
+        let reach = self.all_workspace_reach.as_ref();
+
+        size_of::<Self>()
+            .saturating_add(arc_header)
+            .saturating_add(self.base.accounted_bytes())
+            .saturating_add(
+                self.deltas
+                    .capacity()
+                    .saturating_mul(size_of::<Arc<NameSegment>>()),
+            )
+            .saturating_add(delta_segments)
+            .saturating_add(hash_table_bytes::<Arc<str>, Option<usize>>(
+                self.path_overrides.capacity(),
+            ))
+            .saturating_add(path_overrides)
+            .saturating_add(
+                self.delta_offsets
+                    .capacity()
+                    .saturating_mul(size_of::<usize>()),
+            )
+            .saturating_add(hash_table_bytes::<String, bool>(
+                self.direct_include_overrides.capacity(),
+            ))
+            .saturating_add(direct_overrides)
+            .saturating_add(arc_header)
+            .saturating_add(size_of::<ReachScope>())
+            .saturating_add(string_set_bytes(&reach.files))
+            .saturating_add(string_set_bytes(&reach.heuristic_files))
+    }
+
     #[allow(dead_code)]
     pub fn with_updated_paths(
         &self,
@@ -595,10 +731,10 @@ impl NameTable {
         self.with_updated_entries(paths, fresh_entries)
     }
 
-    pub(crate) fn with_updated_declaration_rows_with_project_context(
+    pub(crate) fn with_updated_declaration_name_rows_with_project_context(
         &self,
         paths: &HashSet<String>,
-        rows: Vec<DeclarationCoreRow>,
+        rows: Vec<DeclarationNameRow>,
         project_context: Option<&ProjectContextIndex>,
     ) -> Self {
         self.with_updated_entries(paths, declaration_name_entries(rows, project_context))
@@ -1472,7 +1608,7 @@ fn name_entries_from_rows_with_project_context(
 }
 
 fn declaration_name_entries(
-    rows: Vec<DeclarationCoreRow>,
+    rows: Vec<DeclarationNameRow>,
     project_context: Option<&ProjectContextIndex>,
 ) -> Vec<NameEntry> {
     let mut project_by_path = HashMap::<String, Option<ProjectKey>>::new();
@@ -1495,39 +1631,41 @@ fn declaration_name_entries(
                 external: row.external,
                 directly_included: row.directly_included,
                 path: Arc::from(row.path),
-                kind: match row.declaration_kind {
-                    crate::semantic_model::SemanticDeclarationKind::Function
-                    | crate::semantic_model::SemanticDeclarationKind::Method => {
-                        ParserKind::Function
-                    }
-                    crate::semantic_model::SemanticDeclarationKind::Object => {
-                        ParserKind::GlobalVariable
-                    }
-                    crate::semantic_model::SemanticDeclarationKind::Type
-                    | crate::semantic_model::SemanticDeclarationKind::Alias => ParserKind::Type,
-                    crate::semantic_model::SemanticDeclarationKind::EnumConstant => {
-                        ParserKind::EnumConstant
-                    }
-                    crate::semantic_model::SemanticDeclarationKind::Macro => ParserKind::Macro,
-                },
-                role: match row.role {
-                    crate::semantic_model::SemanticDeclarationRole::Declaration => {
-                        SymbolRole::Declaration
-                    }
-                    crate::semantic_model::SemanticDeclarationRole::Definition => {
-                        SymbolRole::Definition
-                    }
-                    crate::semantic_model::SemanticDeclarationRole::TentativeDefinition => {
-                        SymbolRole::TentativeDefinition
-                    }
-                    crate::semantic_model::SemanticDeclarationRole::Unknown => {
-                        SymbolRole::UnknownDeclarationOrDefinition
-                    }
-                },
+                kind: parser_kind_from_declaration_kind(row.declaration_kind),
+                role: symbol_role_from_declaration_role(row.role),
                 project_key,
             }
         })
         .collect()
+}
+
+fn parser_kind_from_declaration_kind(
+    kind: crate::semantic_model::SemanticDeclarationKind,
+) -> ParserKind {
+    match kind {
+        crate::semantic_model::SemanticDeclarationKind::Function
+        | crate::semantic_model::SemanticDeclarationKind::Method => ParserKind::Function,
+        crate::semantic_model::SemanticDeclarationKind::Object => ParserKind::GlobalVariable,
+        crate::semantic_model::SemanticDeclarationKind::Type
+        | crate::semantic_model::SemanticDeclarationKind::Alias => ParserKind::Type,
+        crate::semantic_model::SemanticDeclarationKind::EnumConstant => ParserKind::EnumConstant,
+        crate::semantic_model::SemanticDeclarationKind::Macro => ParserKind::Macro,
+    }
+}
+
+fn symbol_role_from_declaration_role(
+    role: crate::semantic_model::SemanticDeclarationRole,
+) -> SymbolRole {
+    match role {
+        crate::semantic_model::SemanticDeclarationRole::Declaration => SymbolRole::Declaration,
+        crate::semantic_model::SemanticDeclarationRole::Definition => SymbolRole::Definition,
+        crate::semantic_model::SemanticDeclarationRole::TentativeDefinition => {
+            SymbolRole::TentativeDefinition
+        }
+        crate::semantic_model::SemanticDeclarationRole::Unknown => {
+            SymbolRole::UnknownDeclarationOrDefinition
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

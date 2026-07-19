@@ -127,6 +127,21 @@ fn full_build_defers_call_indexes_until_facts_are_complete() {
     let dir = tempdir().expect("tempdir");
     let db = dir.path().join("index.sqlite");
     let mut store = IndexStore::open_for_full_rebuild(&db, dir.path()).expect("bulk store");
+    let wal_autocheckpoint: i64 = store
+        .conn
+        .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))
+        .expect("bulk WAL auto-checkpoint mode");
+    assert_eq!(wal_autocheckpoint, 0);
+    let journal_mode: String = store
+        .conn
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .expect("bulk journal mode");
+    assert_eq!(journal_mode.to_ascii_lowercase(), "memory");
+    let synchronous: i64 = store
+        .conn
+        .query_row("PRAGMA synchronous", [], |row| row.get(0))
+        .expect("bulk synchronous mode");
+    assert_eq!(synchronous, 0);
     let call_index_count = |store: &IndexStore| -> i64 {
         store
             .conn

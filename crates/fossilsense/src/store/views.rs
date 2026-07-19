@@ -14,7 +14,9 @@ mod member;
 #[allow(unused_imports)]
 pub use call_facts::{CallCoverageRow, CallFactStoreView, CallSiteRow, CallableAnchorRow};
 #[allow(unused_imports)]
-pub use declarations::{DeclarationCoreRow, DeclarationReadRow, DeclarationStoreView};
+pub use declarations::{
+    DeclarationNameRef, DeclarationNameRow, DeclarationReadRow, DeclarationStoreView,
+};
 #[allow(unused_imports)]
 pub use member::{MemberReadRow, MemberStoreView, RecordReadRow, TypeAliasReadRow};
 

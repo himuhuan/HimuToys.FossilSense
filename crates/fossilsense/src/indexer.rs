@@ -244,6 +244,15 @@ pub fn index_workspace(
         drop(store);
         publish_default_index(&workspace, &db_path, stats.semantic_generation)?;
         stats.publication_ms = publication_started.elapsed().as_millis();
+    } else if defer_call_indexes {
+        progress(IndexStatus::indexing_phase(
+            workspace_display.clone(),
+            &stats,
+            "checkpointing database",
+        ));
+        let publication_started = Instant::now();
+        store.checkpoint_full_rebuild()?;
+        stats.publication_ms = publication_started.elapsed().as_millis();
     }
     stats.elapsed_ms = started.elapsed().as_millis();
     progress(IndexStatus::ready(workspace_display, &stats));

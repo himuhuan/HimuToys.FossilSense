@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::project_context::{ProjectContextIndex, ProjectKey};
+use crate::store::views::DeclarationNameRef;
 #[cfg(test)]
 use crate::store::views::NameTableSymbolRef;
 
@@ -66,6 +67,33 @@ impl<'a> NameIndexBuilder<'a> {
             project_id,
             kind: crate::parser::kind_from_str(row.kind),
             role: super::symbol_role_from_str(row.role),
+            external: row.external,
+            directly_included: row.directly_included,
+        });
+    }
+
+    pub(super) fn push_declaration(&mut self, row: DeclarationNameRef<'_>) {
+        let name_id = self.intern_name(row.name, None);
+        let path_id = self.intern_path(row.path, row.external);
+        let project_id = if row.external {
+            NO_PROJECT_ID
+        } else if let Some(project_id) = self.project_by_path.get(&path_id) {
+            *project_id
+        } else {
+            let project_id = self
+                .project_context
+                .and_then(|index| index.nearest_for_file(row.path))
+                .map_or(NO_PROJECT_ID, |project| self.intern_project(project));
+            self.project_by_path.insert(path_id, project_id);
+            project_id
+        };
+        self.push_compact(CompactNameEntry {
+            id: row.id,
+            name_id,
+            path_id,
+            project_id,
+            kind: super::parser_kind_from_declaration_kind(row.declaration_kind),
+            role: super::symbol_role_from_declaration_role(row.role),
             external: row.external,
             directly_included: row.directly_included,
         });

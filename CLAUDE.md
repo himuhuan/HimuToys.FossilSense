@@ -49,6 +49,16 @@ Rust 引擎      crates/fossilsense/src
 
 新增能力先搜索现有模型和服务，优先复用已有语义事实、resolver、candidate service、read view 和 request snapshot。不要仅凭文档名称创建平行的 `smart` / `semantic` 模型。
 
+## 符号事实与查询架构
+
+符号链路保持单向：parser 从容错语法树和词法 fallback 提取声明事实，indexer 把带稳定 declaration ID、role、range、signature、linkage、guard 和 revision 的事实写入 SQLite；store 的 typed read view 是持久化语义边界；`CandidateQueryService` 在同一 semantic generation 内合并这些事实、include reachability、项目证据和未保存文档 overlay；server 最后才转换成 LSP 类型。
+
+普通补全列表因为每次键入都会触发，单独使用常驻的 compact `NameTable` 做有界召回。它只保存 name、kind、role、path、scope 信号和 canonical declaration ID，不复制完整 declaration payload，也不能在列表热路径读取 SQLite。这个分支是性能索引，不是第二套语义模型：completion resolve 必须携带 ID 和原始 name 回到 `CandidateQueryService`；Hover、Definition、Declaration、Find All、Signature Help 和 workspace symbol 的最终展示同样按 ID 水合 typed `DeclarationReadRow`。因此补全详情与导航共享 role、range、signature、linkage、guard 和 overlay 规则；禁止重新引入常驻 `DeclarationCoreRow`、`core_by_id` 或从轻量召回项直接构造最终语义结果。
+
+`semanticIndex.memoryBudgetMB` 是 declaration semantic index 的总目标：先扣除不可回收的 compact recall bytes，余量才给 canonical payload cache；`0` 仍保留 recall core。进程 runtime、reach graph、include table、文件表、项目上下文和原子发布时的双代快照不在这个局部预算里，必须由大型仓库进程门禁覆盖。
+
+完整重建目标在构建期间不得被请求读取，可以使用 in-memory rollback journal、exclusive connection 和一次性 bulk cache；成功前必须执行 SQLite quick/foreign-key check，再发布或返回。普通增量写仍使用 WAL + `synchronous=NORMAL`，不能把 full-build 的 disposable 假设带入在线数据库。
+
 ## 修改守则
 
 - 修改前先读实现和相邻测试；修改后添加能覆盖失败模式的测试。
@@ -90,6 +100,7 @@ mini-c 只适合快速功能验证。以下情况必须使用 **U-Boot 或 Wine*
 
 ```powershell
 cargo build --release -p fossilsense
+cargo test --release -p fossilsense --bin fossilsense --no-run
 
 # 二选一；发布前可同时运行
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark_large_workspace.ps1 `
@@ -97,9 +108,16 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark_large_work
 
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark_large_workspace.ps1 `
   -Repeats 1 -IncludeFullIndex -CaseFilter wine-full-index -TimeoutSeconds 60
+
+# declaration read model、补全、查询或发布架构变化还必须运行 U-Boot 内存门禁
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark_large_workspace.ps1 `
+  -Repeats 1 -IncludeFullIndex -IncludeEngineHydration `
+  -CaseFilter u-boot-full-index,u-boot-engine-hydration -TimeoutSeconds 60
 ```
 
 `60s` 是硬门禁，不是观察值。任一必测 full-index case 的进程耗时或输出 `elapsed_ms` **高于 60,000 ms，即判定此次功能失败**；不能用平均值、机器波动或“小样本已经通过”放行。报告同时保留样本版本、机器信息、命令、`elapsed_ms`、`write_ms`、峰值内存和数据库大小。详细复现方法见 `docs/benchmark/`。
+
+U-Boot engine hydration case 还必须包含至少 500,000 个声明和 10,000 个文件；完整单代读模型不超过 384 MiB，旧快照存活时旁路构建第二代的绝对峰值不超过 512 MiB。Windows 判断 Private Bytes，Linux/macOS 判断 RSS；任一断言失败都不能放行。
 
 ## 编译
 

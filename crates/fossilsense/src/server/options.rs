@@ -130,8 +130,9 @@ pub(super) fn parse_include_paths(params: &InitializeParams) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Byte budget for lazily hydrated declaration payloads. The compact core
-/// index is always resident and is intentionally outside this budget.
+/// Total byte target for the semantic declaration index. The compact recall
+/// core is always resident; only the remaining budget may be used by lazily
+/// hydrated canonical declaration payloads.
 pub(super) fn parse_semantic_index_memory_budget_mb(params: &InitializeParams) -> u64 {
     params
         .initialization_options

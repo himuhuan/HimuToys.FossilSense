@@ -28,15 +28,9 @@ const SELECT: &str = "SELECT
     JOIN file_entries f ON f.id = d.file_id
     JOIN file_revisions rev ON rev.id = d.revision_id";
 
-const SELECT_CORE: &str = "SELECT
-    d.id, d.name, d.declaration_kind, d.role, d.fact_fidelity,
-    d.name_start_byte, d.name_end_byte, d.name_start_line, d.name_start_col,
-    d.name_end_line, d.name_end_col,
-    d.declaration_start_byte, d.declaration_end_byte, d.declaration_start_line,
-    d.declaration_start_col, d.declaration_end_line, d.declaration_end_col,
-    d.logical_key_digest, d.locator_fingerprint, d.backing_kind, d.backing_id,
-    f.path, rev.source, f.directly_included,
-    rev.id, rev.size, rev.mtime_ns, rev.hash
+const SELECT_NAME: &str = "SELECT
+    d.id, d.name, d.declaration_kind, d.role,
+    f.path, rev.source, f.directly_included
     FROM declarations d
     JOIN file_entries f ON f.id = d.file_id
     JOIN file_revisions rev ON rev.id = d.revision_id";
@@ -56,26 +50,32 @@ pub struct DeclarationReadRow {
     pub revision_hash: String,
 }
 
+/// Owned projection used only for changed-path deltas. Full cold publication
+/// streams the borrowed counterpart directly into the compact name index.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeclarationCoreRow {
+pub struct DeclarationNameRow {
     pub id: i64,
     pub name: String,
     pub declaration_kind: SemanticDeclarationKind,
     pub role: SemanticDeclarationRole,
-    pub fact_fidelity: SemanticFactFidelity,
-    pub name_range: SourceRange,
-    pub declaration_range: SourceRange,
-    pub logical_key_digest: Vec<u8>,
-    pub locator_fingerprint: String,
-    pub backing_kind: String,
-    pub backing_id: Option<i64>,
     pub path: String,
     pub external: bool,
     pub directly_included: bool,
-    pub revision_id: i64,
-    pub revision_size: u64,
-    pub revision_mtime_ns: i64,
-    pub revision_hash: String,
+}
+
+/// Borrowed declaration-name projection. It deliberately contains only recall
+/// evidence; Hover, navigation, signature help, and completion resolve hydrate
+/// the canonical [`DeclarationReadRow`] by ID instead of trusting this view as
+/// a second semantic truth source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeclarationNameRef<'a> {
+    pub id: i64,
+    pub name: &'a str,
+    pub declaration_kind: SemanticDeclarationKind,
+    pub role: SemanticDeclarationRole,
+    pub path: &'a str,
+    pub external: bool,
+    pub directly_included: bool,
 }
 
 pub struct DeclarationStoreView<'a> {
@@ -93,39 +93,48 @@ impl<'a> DeclarationStoreView<'a> {
         Self { store }
     }
 
-    pub fn all(&self) -> Result<Vec<DeclarationReadRow>> {
-        let sql = format!("{SELECT} ORDER BY d.id");
-        self.read(&sql, [])
-    }
-
-    pub fn visit_core_rows<F>(&self, mut visitor: F) -> Result<usize>
+    pub fn visit_name_rows<F>(&self, mut visitor: F) -> Result<usize>
     where
-        F: FnMut(DeclarationCoreRow) -> Result<()>,
+        F: for<'row> FnMut(DeclarationNameRef<'row>) -> Result<()>,
     {
-        let sql = format!("{SELECT_CORE} ORDER BY d.id");
+        let sql = format!("{SELECT_NAME} ORDER BY d.id");
         let mut stmt = self.store.conn.prepare(&sql)?;
         let mut rows = stmt.query([])?;
         let mut count = 0;
         while let Some(row) = rows.next()? {
-            visitor(declaration_core_row(row)?)?;
+            let id = row.get(0)?;
+            let name = row.get_ref(1)?.as_str()?;
+            let path = row.get_ref(4)?.as_str()?;
+            let source = row.get_ref(5)?.as_str()?;
+            visitor(DeclarationNameRef {
+                id,
+                name,
+                declaration_kind: declaration_kind(row.get(2)?)
+                    .with_context(|| format!("invalid declaration kind for row {id}"))?,
+                role: declaration_role(row.get(3)?)
+                    .with_context(|| format!("invalid declaration role for row {id}"))?,
+                path,
+                external: source == "external",
+                directly_included: row.get::<_, i64>(6)? != 0,
+            })?;
             count += 1;
         }
         Ok(count)
     }
 
-    pub fn core_rows_for_paths(&self, paths: &[String]) -> Result<Vec<DeclarationCoreRow>> {
+    pub fn name_rows_for_paths(&self, paths: &[String]) -> Result<Vec<DeclarationNameRow>> {
         let mut output = Vec::new();
         for chunk in paths.chunks(400) {
             if chunk.is_empty() {
                 continue;
             }
             let placeholders = vec!["?"; chunk.len()].join(",");
-            let sql = format!("{SELECT_CORE} WHERE f.path IN ({placeholders}) ORDER BY d.id");
+            let sql = format!("{SELECT_NAME} WHERE f.path IN ({placeholders}) ORDER BY d.id");
             let mut stmt = self.store.conn.prepare(&sql)?;
             let mut rows =
                 stmt.query(rusqlite::params_from_iter(chunk.iter().map(String::as_str)))?;
             while let Some(row) = rows.next()? {
-                output.push(declaration_core_row(row)?);
+                output.push(declaration_name_row(row)?);
             }
         }
         Ok(output)
@@ -219,35 +228,18 @@ impl<'a> DeclarationStoreView<'a> {
     }
 }
 
-fn declaration_core_row(row: &rusqlite::Row<'_>) -> Result<DeclarationCoreRow> {
+fn declaration_name_row(row: &rusqlite::Row<'_>) -> Result<DeclarationNameRow> {
     let id: i64 = row.get(0)?;
-    let logical_key_digest: Vec<u8> = row.get(17)?;
-    anyhow::ensure!(
-        logical_key_digest.len() == 12,
-        "invalid logical key digest for declaration row {id}"
-    );
-    Ok(DeclarationCoreRow {
+    Ok(DeclarationNameRow {
         id,
         name: row.get(1)?,
         declaration_kind: declaration_kind(row.get(2)?)
             .with_context(|| format!("invalid declaration kind for row {id}"))?,
         role: declaration_role(row.get(3)?)
             .with_context(|| format!("invalid declaration role for row {id}"))?,
-        fact_fidelity: semantic_fidelity(row.get(4)?)
-            .with_context(|| format!("invalid fact fidelity for declaration row {id}"))?,
-        name_range: source_range(row, 5)?,
-        declaration_range: source_range(row, 11)?,
-        logical_key_digest,
-        locator_fingerprint: row.get(18)?,
-        backing_kind: row.get(19)?,
-        backing_id: row.get(20)?,
-        path: row.get(21)?,
-        external: row.get::<_, String>(22)? == "external",
-        directly_included: row.get::<_, i64>(23)? != 0,
-        revision_id: row.get(24)?,
-        revision_size: row.get::<_, i64>(25)? as u64,
-        revision_mtime_ns: row.get(26)?,
-        revision_hash: row.get(27)?,
+        path: row.get(4)?,
+        external: row.get::<_, String>(5)? == "external",
+        directly_included: row.get::<_, i64>(6)? != 0,
     })
 }
 

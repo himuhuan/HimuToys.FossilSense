@@ -271,6 +271,7 @@ pub(super) fn completion_items_for_indexed_hits(
                         Some(OrdinaryCompletionDocumentationTarget::Declaration {
                             table_index: context.table_index,
                             declaration_id: hit.id,
+                            declaration_name: hit.name.clone(),
                         })
                     } else {
                         context.overlay_handles.get(&hit.id).cloned().map(|handle| {
@@ -324,6 +325,7 @@ pub(super) fn exact_indexed_completion_candidates_for_local_word(
                         Some(OrdinaryCompletionDocumentationTarget::Declaration {
                             table_index: context.table_index,
                             declaration_id: hit.id,
+                            declaration_name: hit.name.clone(),
                         })
                     } else {
                         context.overlay_handles.get(&hit.id).cloned().map(|handle| {

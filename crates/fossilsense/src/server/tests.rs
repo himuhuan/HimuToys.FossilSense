@@ -214,7 +214,7 @@ fn semantic_candidate_perf_log_contains_only_aggregate_contract_fields() {
 }
 
 #[test]
-fn indexed_completion_uses_compact_v5_declaration_handle() {
+fn indexed_completion_uses_compact_v6_declaration_handle() {
     let uri = Url::parse("file:///workspace/main.c").expect("uri");
     let item = crate::completion::ordinary_service::OrdinaryCompletionItem {
         label: "target".into(),
@@ -232,6 +232,7 @@ fn indexed_completion_uses_compact_v5_declaration_handle() {
             crate::completion::ordinary_service::OrdinaryCompletionDocumentationTarget::Declaration {
                 table_index: 0,
                 declaration_id: 42,
+                declaration_name: "answer".to_string(),
             },
         ),
     };
@@ -246,12 +247,17 @@ fn indexed_completion_uses_compact_v5_declaration_handle() {
     let data = rendered.data.expect("compact declaration data");
     assert_eq!(
         data.get("version").and_then(serde_json::Value::as_u64),
-        Some(5)
+        Some(6)
     );
     assert_eq!(
         data.get("declarationId")
             .and_then(serde_json::Value::as_i64),
         Some(42)
+    );
+    assert_eq!(
+        data.get("declarationName")
+            .and_then(serde_json::Value::as_str),
+        Some("answer")
     );
     assert!(data.get("handle").is_none());
 }

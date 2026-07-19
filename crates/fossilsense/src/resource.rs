@@ -1,24 +1,11 @@
 //! Cross-platform process memory and index disk usage reporting.
 //!
-//! Used by the LSP server to push `fossilsense/resourceUsage` notifications
-//! every 5 seconds so the VS Code extension can render a status bar item
-//! showing the server's resident memory and the on-disk size of its index
-//! cache. Collectors are best-effort: any failure returns 0 rather than
-//! panicking, so resource reporting can never destabilize the server.
+//! The protocol-neutral collectors are consumed by the LSP adapter and by
+//! large-workspace memory gates. Failures return 0 rather than panicking.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
-
-use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, Notify};
-use tokio::time::{interval, Duration};
-use tower_lsp::lsp_types::notification::Notification;
-use tower_lsp::Client;
 
 use crate::pathing;
-
-const REPORT_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Best-effort current process memory in bytes.
 ///
@@ -171,64 +158,6 @@ fn directory_size(path: &Path) -> u64 {
         }
     }
     total
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ResourceUsage {
-    pub memory_bytes: u64,
-    pub index_disk_bytes: u64,
-    pub timestamp: u64,
-}
-
-pub enum ResourceUsageNotification {}
-
-impl Notification for ResourceUsageNotification {
-    type Params = ResourceUsage;
-    const METHOD: &'static str = "fossilsense/resourceUsage";
-}
-
-/// Spawn a background task that pushes `fossilsense/resourceUsage` every 5
-/// seconds until `shutdown` is notified. Safe to call from `initialized`.
-///
-/// The first `interval` tick completes immediately; we consume it before
-/// entering the loop so the first report lands after a full interval. This
-/// avoids racing `index_directory_disk_bytes` against an index directory that
-/// may not exist yet on a freshly started server.
-pub fn spawn_resource_usage_reporter(
-    client: Client,
-    workspace_roots: Arc<Mutex<Vec<PathBuf>>>,
-    shutdown: Arc<Notify>,
-) {
-    tokio::spawn(async move {
-        let mut ticker = interval(REPORT_INTERVAL);
-        ticker.tick().await;
-        loop {
-            tokio::select! {
-                _ = ticker.tick() => {
-                    let roots = workspace_roots.lock().await.clone();
-                    let memory_bytes = current_process_memory_bytes();
-                    let disk_bytes = tokio::task::spawn_blocking(move || {
-                        index_directory_disk_bytes(&roots)
-                    })
-                    .await
-                    .unwrap_or(0);
-                    let timestamp = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    client
-                        .send_notification::<ResourceUsageNotification>(ResourceUsage {
-                            memory_bytes,
-                            index_disk_bytes: disk_bytes,
-                            timestamp,
-                        })
-                        .await;
-                }
-                _ = shutdown.notified() => break,
-            }
-        }
-    });
 }
 
 #[cfg(test)]

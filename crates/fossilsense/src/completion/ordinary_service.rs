@@ -90,6 +90,7 @@ pub(crate) enum OrdinaryCompletionDocumentationTarget {
     Declaration {
         table_index: usize,
         declaration_id: i64,
+        declaration_name: String,
     },
     CurrentDocument {
         start_line: u32,

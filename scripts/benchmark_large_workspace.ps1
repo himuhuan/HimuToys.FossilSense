@@ -7,6 +7,7 @@ param(
     [ValidateRange(5, 3600)]
     [int]$TimeoutSeconds = 600,
     [switch]$IncludeFullIndex,
+    [switch]$IncludeEngineHydration,
     [switch]$IncludeV142SemanticCases,
     [string]$V142Harness = '',
     [switch]$ListCases,
@@ -167,6 +168,16 @@ function Convert-WhitelistedMetrics([string[]]$Lines) {
         coverage_open = $true
         coverage_truncated = $true
         fallback_used = $true
+        engine_hydration_declarations = $true
+        engine_hydration_files = $true
+        engine_hydration_recall_bytes = $true
+        engine_hydration_memory_before_bytes = $true
+        engine_hydration_single_private_bytes = $true
+        engine_hydration_single_peak_private_bytes = $true
+        engine_hydration_two_generation_private_bytes = $true
+        engine_hydration_peak_private_bytes = $true
+        engine_hydration_first_build_ms = $true
+        engine_hydration_second_build_ms = $true
     }
     $metrics = [ordered]@{}
     foreach ($line in $Lines) {
@@ -221,6 +232,36 @@ if ($IncludeFullIndex) {
             ResetDatabase = $database
             Arguments = @('index', $workspace, '--db', $database, '--force')
         }
+    }
+}
+
+if ($IncludeEngineHydration) {
+    $engineHydrationHarness = Resolve-FullPath (
+        Join-Path $PSScriptRoot 'benchmark_engine_hydration.ps1'
+    )
+    if (-not (Test-Path -LiteralPath $engineHydrationHarness -PathType Leaf)) {
+        throw "engine hydration benchmark harness not found: $engineHydrationHarness"
+    }
+    $engineWorkspace = Join-Path $repoRoot 'samples\u-boot'
+    $engineDatabase = Join-Path $benchmarkPath 'index-u-boot-rebuild.sqlite'
+    $cases += [pscustomobject]@{
+        Id = 'u-boot-engine-hydration'
+        Executable = 'powershell.exe'
+        Workspace = $engineWorkspace
+        Database = $engineDatabase
+        ResetDatabase = $null
+        OuterMetricsComparable = $false
+        Arguments = @(
+            '-NoProfile',
+            '-ExecutionPolicy',
+            'Bypass',
+            '-File',
+            $engineHydrationHarness,
+            '-Database',
+            $engineDatabase,
+            '-Workspace',
+            $engineWorkspace
+        )
     }
 }
 
@@ -284,13 +325,22 @@ if ($IncludeV142SemanticCases) {
 }
 
 if ($CaseFilter.Count -gt 0) {
+    # `powershell -File` passes comma-separated string-array values as one
+    # argument. Accept both native arrays and comma-separated CLI spelling so
+    # a full-index case and its hydration gate can be selected together.
+    $normalizedCaseFilter = @(
+        $CaseFilter |
+            ForEach-Object { $_ -split ',' } |
+            ForEach-Object { $_.Trim() } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
     $requested = [System.Collections.Generic.HashSet[string]]::new(
-        $CaseFilter,
+        [string[]]$normalizedCaseFilter,
         [System.StringComparer]::OrdinalIgnoreCase
     )
     $cases = @($cases | Where-Object { $requested.Contains($_.Id) })
     if ($cases.Count -ne $requested.Count) {
-        $available = ($cases.Id | Sort-Object) -join ', '
+        $available = @($cases | ForEach-Object { $_.Id } | Sort-Object) -join ', '
         throw "one or more benchmark case filters did not match; selected: $available"
     }
 }
@@ -471,6 +521,32 @@ if ($v142Results.Count -gt 0) {
             "$(& $metric 'query_us') | $(& $metric 'coverage_scanned') | " +
             "$(& $metric 'coverage_open') | $(& $metric 'coverage_truncated') | " +
             "$(& $metric 'fallback_used') | $(& $metric 'hydration_count') |"
+        )
+    }
+}
+$engineHydrationResults = @(
+    $results | Where-Object { $_.case_id -eq 'u-boot-engine-hydration' }
+)
+if ($engineHydrationResults.Count -gt 0) {
+    $markdown.Add('')
+    $markdown.Add('## Engine hydration memory gate')
+    $markdown.Add('')
+    $markdown.Add('The Rust process samples its own Private Bytes on Windows and RSS on Linux/macOS. The gate is 384 MiB after one generation and 512 MiB while immutable generations coexist during publication.')
+    $markdown.Add('')
+    $markdown.Add('| Run | Declarations | Files | Recall MiB | Single MiB | Single peak MiB | Two generations MiB | Absolute peak MiB | First build ms | Second build ms |')
+    $markdown.Add('|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|')
+    foreach ($result in $engineHydrationResults) {
+        $metrics = $result.metrics
+        $markdown.Add(
+            "| $($result.run) | $($metrics.engine_hydration_declarations) | " +
+            "$($metrics.engine_hydration_files) | " +
+            "$([Math]::Round($metrics.engine_hydration_recall_bytes / 1MB, 2)) | " +
+            "$([Math]::Round($metrics.engine_hydration_single_private_bytes / 1MB, 2)) | " +
+            "$([Math]::Round($metrics.engine_hydration_single_peak_private_bytes / 1MB, 2)) | " +
+            "$([Math]::Round($metrics.engine_hydration_two_generation_private_bytes / 1MB, 2)) | " +
+            "$([Math]::Round($metrics.engine_hydration_peak_private_bytes / 1MB, 2)) | " +
+            "$($metrics.engine_hydration_first_build_ms) | " +
+            "$($metrics.engine_hydration_second_build_ms) |"
         )
     }
 }

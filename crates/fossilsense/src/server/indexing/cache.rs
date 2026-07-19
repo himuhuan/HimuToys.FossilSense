@@ -35,26 +35,11 @@ async fn load_semantic_generation(root: PathBuf) -> Result<SemanticGeneration> {
 async fn rebuild_declaration_index(
     root: PathBuf,
     project_context: Option<Arc<ProjectContextIndex>>,
-    payload_budget_bytes: usize,
+    total_budget_bytes: usize,
 ) -> Result<Arc<SemanticDeclarationIndex>> {
     let built = tokio::task::spawn_blocking(move || -> Result<SemanticDeclarationIndex> {
         let db_path = pathing::default_index_path(&root)?;
-        let store = IndexStore::open_readonly(&db_path)?;
-        let mut rows = Vec::new();
-        store.declaration_view().visit_core_rows(|row| {
-            rows.push(row);
-            Ok(())
-        })?;
-        let index =
-            SemanticDeclarationIndex::build(rows, project_context.as_deref(), payload_budget_bytes);
-        // A deliberately large budget opts into eager payload residency. The
-        // factor is conservative: core rows contain the hot identity/range
-        // strings, while complete typed payloads additionally carry signature,
-        // declarator shape, linkage, guard, and backing data.
-        if index.should_preload_all_payloads() {
-            index.preload_payloads(store.declaration_view().all()?);
-        }
-        Ok(index)
+        build_declaration_index_from_db(&db_path, project_context.as_deref(), total_budget_bytes)
     })
     .await;
 
@@ -63,6 +48,19 @@ async fn rebuild_declaration_index(
         Ok(Err(err)) => Err(err),
         Err(err) => Err(err.into()),
     }
+}
+
+fn build_declaration_index_from_db(
+    db_path: &Path,
+    project_context: Option<&ProjectContextIndex>,
+    total_budget_bytes: usize,
+) -> Result<SemanticDeclarationIndex> {
+    let store = IndexStore::open_readonly(db_path)?;
+    let names = crate::query::NameTable::build_from_declaration_view(
+        &store.declaration_view(),
+        project_context,
+    )?;
+    Ok(SemanticDeclarationIndex::build(names, total_budget_bytes))
 }
 
 fn capture_call_read_handle(
@@ -80,36 +78,22 @@ async fn update_declaration_index_paths(
     root: PathBuf,
     paths: &[String],
     project_context: Option<Arc<ProjectContextIndex>>,
-    payload_budget_bytes: usize,
+    total_budget_bytes: usize,
 ) -> Result<Arc<SemanticDeclarationIndex>> {
     let Some(previous) = previous else {
-        return rebuild_declaration_index(root, project_context, payload_budget_bytes).await;
+        return rebuild_declaration_index(root, project_context, total_budget_bytes).await;
     };
 
     let paths_vec = paths.to_vec();
-    let read_payloads = SemanticDeclarationIndex::budget_prefers_eager_payloads(
-        payload_budget_bytes,
-        previous.accounted_core_bytes(),
-    );
     let query_root = root.clone();
-    let built = tokio::task::spawn_blocking(
-        move ||
-              -> Result<(
-            Vec<crate::store::views::DeclarationCoreRow>,
-            Option<Vec<crate::store::views::DeclarationReadRow>>,
-        )> {
-            let db_path = pathing::default_index_path(&query_root)?;
-            let store = IndexStore::open_readonly(&db_path)?;
-            let core_rows = store.declaration_view().core_rows_for_paths(&paths_vec)?;
-            let payload_rows = read_payloads
-                .then(|| store.declaration_view().all())
-                .transpose()?;
-            Ok((core_rows, payload_rows))
-        },
-    )
+    let built = tokio::task::spawn_blocking(move || -> Result<_> {
+        let db_path = pathing::default_index_path(&query_root)?;
+        let store = IndexStore::open_readonly(&db_path)?;
+        store.declaration_view().name_rows_for_paths(&paths_vec)
+    })
     .await;
 
-    let (fresh_names, payload_rows) = match built {
+    let fresh_names = match built {
         Ok(Ok(rows)) => rows,
         Ok(Err(err)) => return Err(err),
         Err(err) => return Err(err.into()),
@@ -119,11 +103,8 @@ async fn update_declaration_index_paths(
         &path_set,
         fresh_names,
         project_context.as_deref(),
-        payload_budget_bytes,
+        total_budget_bytes,
     );
-    if index.should_preload_all_payloads() {
-        index.preload_payloads(payload_rows.unwrap_or_default());
-    }
     Ok(Arc::new(index))
 }
 
@@ -164,13 +145,7 @@ async fn rebuild_project_context(
 async fn load_reach_graph(root: PathBuf) -> Result<Arc<ReachGraph>> {
     let built = tokio::task::spawn_blocking(move || -> Result<ReachGraph> {
         let db_path = pathing::default_index_path(&root)?;
-        let store = IndexStore::open_readonly(&db_path)?;
-        let reach_view = store.reach_graph_view();
-        Ok(ReachGraph::from_rows(
-            reach_view.include_edges()?,
-            reach_view.unresolved_includes()?,
-            reach_view.ambiguous_includes()?,
-        ))
+        build_reach_graph_from_db(&db_path)
     })
     .await;
 
@@ -179,6 +154,16 @@ async fn load_reach_graph(root: PathBuf) -> Result<Arc<ReachGraph>> {
         Ok(Err(err)) => Err(err),
         Err(err) => Err(err.into()),
     }
+}
+
+fn build_reach_graph_from_db(db_path: &Path) -> Result<ReachGraph> {
+    let store = IndexStore::open_readonly(db_path)?;
+    let reach_view = store.reach_graph_view();
+    Ok(ReachGraph::from_rows(
+        reach_view.include_edges()?,
+        reach_view.unresolved_includes()?,
+        reach_view.ambiguous_includes()?,
+    ))
 }
 
 async fn rebuild_reach_graph(client: &Client, root: PathBuf) -> Option<Arc<ReachGraph>> {
@@ -258,11 +243,7 @@ pub(in crate::server) async fn rebuild_include_table(
 ) -> Result<Arc<IncludeCompletionTable>> {
     let built = tokio::task::spawn_blocking(move || -> Result<IncludeCompletionTable> {
         let db_path = pathing::default_index_path(&root)?;
-        let store = IndexStore::open_readonly(&db_path)?;
-        Ok(IncludeCompletionTable::build_from_rows(
-            store.include_table_view().workspace_paths()?,
-            store.reach_graph_view().include_edges()?,
-        ))
+        build_include_table_from_db(&db_path)
     })
     .await;
 
@@ -273,22 +254,21 @@ pub(in crate::server) async fn rebuild_include_table(
     }
 }
 
+fn build_include_table_from_db(db_path: &Path) -> Result<IncludeCompletionTable> {
+    let store = IndexStore::open_readonly(db_path)?;
+    Ok(IncludeCompletionTable::build_from_rows(
+        store.include_table_view().workspace_paths()?,
+        store.reach_graph_view().include_edges()?,
+    ))
+}
+
 pub(in crate::server) async fn rebuild_indexed_file_list(
     root: PathBuf,
 ) -> Result<Arc<Vec<(String, PathBuf)>>> {
     let build_root = root.clone();
     let built = tokio::task::spawn_blocking(move || -> Result<Vec<(String, PathBuf)>> {
         let db_path = pathing::default_index_path(&build_root)?;
-        let store = IndexStore::open_readonly(&db_path)?;
-        Ok(store
-            .reference_file_view()
-            .indexed_workspace_files()?
-            .into_iter()
-            .map(|row| {
-                let abs = build_root.join(row.path.replace('/', std::path::MAIN_SEPARATOR_STR));
-                (row.path, abs)
-            })
-            .collect())
+        build_indexed_file_list_from_db(&db_path, &build_root)
     })
     .await;
 
@@ -297,6 +277,19 @@ pub(in crate::server) async fn rebuild_indexed_file_list(
         Ok(Err(err)) => Err(err),
         Err(err) => Err(err.into()),
     }
+}
+
+fn build_indexed_file_list_from_db(db_path: &Path, root: &Path) -> Result<Vec<(String, PathBuf)>> {
+    let store = IndexStore::open_readonly(db_path)?;
+    Ok(store
+        .reference_file_view()
+        .indexed_workspace_files()?
+        .into_iter()
+        .map(|row| {
+            let abs = root.join(row.path.replace('/', std::path::MAIN_SEPARATOR_STR));
+            (row.path, abs)
+        })
+        .collect())
 }
 
 async fn update_indexed_file_list(
@@ -376,10 +369,11 @@ impl CacheLedger {
             .log_message(
                 MessageType::LOG,
                 format!(
-                    "semantic declaration index: declarations={}, core_bytes={}, payload_budget_bytes={}",
+                    "semantic declaration index: declarations={}, core_bytes={}, total_budget_bytes={}, payload_budget_bytes={}",
                     symbol_count,
                     declaration_index.accounted_core_bytes(),
-                    self.semantic_index_memory_budget_bytes(),
+                    declaration_index.total_budget_bytes(),
+                    declaration_index.payload_budget_bytes(),
                 ),
             )
             .await;
@@ -698,5 +692,232 @@ impl CacheLedger {
         self.invalidate_after_index_change().await;
         self.completion_memo.lock().await.clear();
         Ok(project_count)
+    }
+}
+
+#[cfg(test)]
+mod memory_tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use super::{
+        build_declaration_index_from_db, build_include_table_from_db,
+        build_indexed_file_list_from_db, build_reach_graph_from_db,
+    };
+    use crate::call_model::SemanticGeneration;
+    use crate::call_service::CallReadHandle;
+    use crate::config::WorkspaceConfig;
+    use crate::declaration_index::SemanticDeclarationIndex;
+    use crate::project_context::{self, ProjectContextIndex};
+    use crate::reachability::ReachGraph;
+    use crate::resource::current_process_memory_bytes;
+    use crate::server::IncludeCompletionTable;
+    use crate::store::IndexStore;
+
+    const MIB: u64 = 1024 * 1024;
+    const SEMANTIC_INDEX_TOTAL_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+    const SINGLE_GENERATION_PRIVATE_LIMIT_BYTES: u64 = 384 * MIB;
+    const SIDE_BY_SIDE_PEAK_PRIVATE_LIMIT_BYTES: u64 = 512 * MIB;
+    const MINIMUM_UBOOT_DECLARATIONS: usize = 500_000;
+    const MINIMUM_UBOOT_FILES: usize = 10_000;
+
+    #[cfg(debug_assertions)]
+    fn require_release_memory_gate() {
+        panic!("the memory gate must run with cargo test --release");
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn require_release_memory_gate() {}
+
+    struct HydratedEngineReadModel {
+        declarations: SemanticDeclarationIndex,
+        reach_graph: ReachGraph,
+        include_table: IncludeCompletionTable,
+        indexed_files: Vec<(String, PathBuf)>,
+        project_context: ProjectContextIndex,
+        call_read_handle: CallReadHandle,
+    }
+
+    impl HydratedEngineReadModel {
+        fn build(root: &Path, db_path: &Path) -> anyhow::Result<Self> {
+            let (config, _) = WorkspaceConfig::load(root);
+            let project_context = project_context::discover_project_contexts(root, &config)?;
+            let declarations = build_declaration_index_from_db(
+                db_path,
+                Some(&project_context),
+                SEMANTIC_INDEX_TOTAL_BUDGET_BYTES,
+            )?;
+            let reach_graph = build_reach_graph_from_db(db_path)?;
+            let include_table = build_include_table_from_db(db_path)?;
+            let indexed_files = build_indexed_file_list_from_db(db_path, root)?;
+            let store = IndexStore::open_readonly(db_path)?;
+            let guard = store.begin_semantic_read(None)?;
+            let semantic_generation = SemanticGeneration(guard.generation());
+            guard.finish()?;
+            let call_read_handle =
+                CallReadHandle::at_generation(db_path.to_path_buf(), semantic_generation);
+            Ok(Self {
+                declarations,
+                reach_graph,
+                include_table,
+                indexed_files,
+                project_context,
+                call_read_handle,
+            })
+        }
+
+        fn retain_all_components(&self) {
+            std::hint::black_box((
+                &self.declarations,
+                &self.reach_graph,
+                &self.include_table,
+                &self.indexed_files,
+                &self.project_context,
+                &self.call_read_handle,
+            ));
+        }
+    }
+
+    struct PeakMemorySampler {
+        peak: Arc<AtomicU64>,
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl PeakMemorySampler {
+        fn start() -> Self {
+            let peak = Arc::new(AtomicU64::new(current_process_memory_bytes()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread = {
+                let peak = peak.clone();
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        peak.fetch_max(current_process_memory_bytes(), Ordering::Relaxed);
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    peak.fetch_max(current_process_memory_bytes(), Ordering::Relaxed);
+                })
+            };
+            Self {
+                peak,
+                stop,
+                thread: Some(thread),
+            }
+        }
+
+        fn peak_bytes(&self) -> u64 {
+            self.peak.load(Ordering::Relaxed)
+        }
+
+        fn finish(mut self) -> u64 {
+            self.stop.store(true, Ordering::Relaxed);
+            self.thread
+                .take()
+                .expect("memory sampler thread")
+                .join()
+                .expect("memory sampler must finish before evaluating the engine hydration gate");
+            self.peak_bytes()
+        }
+    }
+
+    impl Drop for PeakMemorySampler {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "U-Boot engine hydration memory gate; set FOSSILSENSE_BENCH_DB and FOSSILSENSE_BENCH_ROOT"]
+    fn uboot_engine_hydration_stays_below_private_memory_gate() {
+        require_release_memory_gate();
+        let db_path = std::env::var_os("FOSSILSENSE_BENCH_DB")
+            .map(PathBuf::from)
+            .expect("set FOSSILSENSE_BENCH_DB to a current-schema U-Boot database");
+        let root = std::env::var_os("FOSSILSENSE_BENCH_ROOT")
+            .map(PathBuf::from)
+            .expect("set FOSSILSENSE_BENCH_ROOT to the indexed U-Boot checkout");
+        assert!(db_path.is_file(), "benchmark database does not exist");
+        assert!(root.is_dir(), "benchmark workspace does not exist");
+        let memory_before = current_process_memory_bytes();
+        assert!(
+            memory_before > 0,
+            "process private/RSS memory collection is unavailable"
+        );
+
+        let sampler = PeakMemorySampler::start();
+        let first_started = Instant::now();
+        let first = HydratedEngineReadModel::build(&root, &db_path)
+            .expect("hydrate first U-Boot engine read model");
+        first.retain_all_components();
+        let first_build_ms = first_started.elapsed().as_millis();
+        let single_generation_private_bytes = current_process_memory_bytes();
+        let single_generation_peak_private_bytes =
+            sampler.peak_bytes().max(single_generation_private_bytes);
+
+        assert!(
+            first.declarations.len() >= MINIMUM_UBOOT_DECLARATIONS,
+            "memory gate requires a full U-Boot declaration set (observed {})",
+            first.declarations.len()
+        );
+        assert!(
+            first.indexed_files.len() >= MINIMUM_UBOOT_FILES,
+            "memory gate requires a full U-Boot file set (observed {})",
+            first.indexed_files.len()
+        );
+        assert!(
+            single_generation_private_bytes <= SINGLE_GENERATION_PRIVATE_LIMIT_BYTES,
+            "one hydrated engine generation uses {} MiB; limit is {} MiB",
+            single_generation_private_bytes / MIB,
+            SINGLE_GENERATION_PRIVATE_LIMIT_BYTES / MIB
+        );
+        assert!(
+            single_generation_peak_private_bytes <= SINGLE_GENERATION_PRIVATE_LIMIT_BYTES,
+            "first-generation engine hydration peaks at {} MiB; limit is {} MiB",
+            single_generation_peak_private_bytes / MIB,
+            SINGLE_GENERATION_PRIVATE_LIMIT_BYTES / MIB
+        );
+
+        // Publication is side-by-side: an in-flight request may retain the
+        // first immutable snapshot while the replacement is fully hydrated.
+        let second_started = Instant::now();
+        let second = HydratedEngineReadModel::build(&root, &db_path)
+            .expect("hydrate replacement U-Boot engine read model");
+        first.retain_all_components();
+        second.retain_all_components();
+        let second_build_ms = second_started.elapsed().as_millis();
+        let two_generation_private_bytes = current_process_memory_bytes();
+        let peak_private_bytes = sampler.finish();
+
+        println!(
+            "engine_hydration_declarations: {}",
+            first.declarations.len()
+        );
+        println!("engine_hydration_files: {}", first.indexed_files.len());
+        println!(
+            "engine_hydration_recall_bytes: {}",
+            first.declarations.accounted_core_bytes()
+        );
+        println!("engine_hydration_memory_before_bytes: {memory_before}");
+        println!("engine_hydration_single_private_bytes: {single_generation_private_bytes}");
+        println!(
+            "engine_hydration_single_peak_private_bytes: {single_generation_peak_private_bytes}"
+        );
+        println!("engine_hydration_two_generation_private_bytes: {two_generation_private_bytes}");
+        println!("engine_hydration_peak_private_bytes: {peak_private_bytes}");
+        println!("engine_hydration_first_build_ms: {first_build_ms}");
+        println!("engine_hydration_second_build_ms: {second_build_ms}");
+
+        assert!(
+            peak_private_bytes <= SIDE_BY_SIDE_PEAK_PRIVATE_LIMIT_BYTES,
+            "side-by-side engine hydration peaks at {} MiB; hard limit is {} MiB",
+            peak_private_bytes / MIB,
+            SIDE_BY_SIDE_PEAK_PRIVATE_LIMIT_BYTES / MIB
+        );
     }
 }

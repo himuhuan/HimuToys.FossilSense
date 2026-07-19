@@ -133,7 +133,7 @@ impl LanguageServer for Backend {
             .await;
         self.preload_completion_history().await;
         self.spawn_index_roots(None).await;
-        crate::resource::spawn_resource_usage_reporter(
+        super::resource_monitor::spawn_resource_usage_reporter(
             self.client.clone(),
             self.workspace_roots.clone(),
             self.resource_monitor_shutdown.clone(),
@@ -331,13 +331,17 @@ impl LanguageServer for Backend {
         let tables: Vec<(
             PathBuf,
             Arc<crate::declaration_index::SemanticDeclarationIndex>,
+            Arc<crate::call_service::CallReadHandle>,
         )> = {
             let roots = self.workspace_roots.lock().await.clone();
             let mut tables = Vec::new();
             for root in roots {
                 let context = self.request_context_for_root(root).await;
-                if let Some(index) = context.engine.declaration_index.clone() {
-                    tables.push((context.engine.root.clone(), index));
+                if let (Some(index), Some(read_handle)) = (
+                    context.engine.declaration_index.clone(),
+                    context.engine.call_read_handle.clone(),
+                ) {
+                    tables.push((context.engine.root.clone(), index, read_handle));
                 }
             }
             tables
@@ -349,7 +353,7 @@ impl LanguageServer for Backend {
         let query_text = params.query;
         let result = tokio::task::spawn_blocking(move || -> Result<Vec<SymbolInformation>> {
             let mut hits = Vec::new();
-            for (root_index, (_, index)) in tables.iter().enumerate() {
+            for (root_index, (_, index, _)) in tables.iter().enumerate() {
                 for hit in index
                     .name_table()
                     .search_ranked(&query_text, query::WORKSPACE_SYMBOL_LIMIT)
@@ -370,14 +374,29 @@ impl LanguageServer for Backend {
                 return Ok(Vec::new());
             }
 
+            let mut payloads = Vec::with_capacity(tables.len());
+            for (root_index, (_, index, read_handle)) in tables.iter().enumerate() {
+                let ids: Vec<_> = hits
+                    .iter()
+                    .filter(|(candidate_root, _)| *candidate_root == root_index)
+                    .map(|(_, hit)| hit.id)
+                    .collect();
+                payloads.push(
+                    index
+                        .payloads_by_ids(read_handle, &ids)?
+                        .into_iter()
+                        .map(|row| (row.id, row))
+                        .collect::<HashMap<_, _>>(),
+                );
+            }
+
             Ok(hits
                 .into_iter()
                 .filter_map(|(root_index, hit)| {
                     let root = &tables[root_index].0;
-                    tables[root_index]
-                        .1
-                        .core_by_id(hit.id)
-                        .and_then(|row| declaration_core_to_symbol_information(root, row))
+                    payloads[root_index]
+                        .get(&hit.id)
+                        .and_then(|row| declaration_to_symbol_information(root, row))
                 })
                 .collect())
         })

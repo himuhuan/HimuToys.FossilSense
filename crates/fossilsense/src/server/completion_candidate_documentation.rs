@@ -16,11 +16,12 @@ impl Backend {
         root: String,
         uri: String,
         declaration_id: i64,
+        declaration_name: String,
         semantic_generation: u64,
         overlay_epoch: u64,
         document_version: i32,
     ) -> Option<String> {
-        if version != 5 {
+        if version != 6 {
             return None;
         }
         let root = PathBuf::from(root);
@@ -46,7 +47,6 @@ impl Backend {
             return None;
         }
         let declaration_index = context.engine.declaration_index.clone()?;
-        let declaration_name = declaration_index.core_by_id(declaration_id)?.name.clone();
         let generation = context.engine.semantic_generation;
         let (current_rel, current_text) =
             current_document_for_root(request_uri.as_ref(), &root, documents.current.as_ref());

@@ -226,7 +226,7 @@
           "minimum": 0,
           "maximum": 16384,
           "default": 256,
-          "markdownDescription": "Memory budget in MiB for lazily hydrated semantic declaration payloads. The compact completion/navigation index is always resident. `0` keeps only that core and reads selected payloads from SQLite; larger values cache resolved payloads using byte-bounded LRU eviction."
+          "markdownDescription": "Total memory target in MiB for the semantic declaration index. The compact completion recall core is always resident and is deducted first; the remainder caches canonical declaration payloads shared by completion resolve, Hover, and navigation. `0` keeps only the recall core and reads selected payloads from SQLite. Process/runtime memory is guarded separately by the large-workspace benchmark."
         },
         "fossilsense.references.showRanges": {
           "type": "boolean",

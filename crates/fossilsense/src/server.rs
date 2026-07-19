@@ -62,6 +62,7 @@ mod navigation;
 mod options;
 mod possible_targets;
 mod project_context_commands;
+mod resource_monitor;
 mod semantic_tokens;
 mod signature_help;
 mod state;
@@ -78,7 +79,7 @@ use indexing::{
 };
 use indexing::{watched_change_in_scope, IndexScheduleState, WatchDecision};
 use lsp_adapters::{
-    candidate_to_location, declaration_core_to_symbol_information, grouped_reference_items,
+    candidate_to_location, declaration_to_symbol_information, grouped_reference_items,
     hit_to_location, parsed_to_document_symbol, GroupedReferenceItem,
 };
 use navigation::NavigationOperation;
@@ -251,6 +252,7 @@ enum CompletionDocumentationData {
         root: String,
         uri: String,
         declaration_id: i64,
+        declaration_name: String,
         semantic_generation: u64,
         overlay_epoch: u64,
         document_version: i32,
@@ -302,11 +304,13 @@ fn ordinary_completion_item_to_lsp(
             OrdinaryCompletionDocumentationTarget::Declaration {
                 table_index,
                 declaration_id,
+                declaration_name,
             } => CompletionDocumentationData::Declaration {
-                version: 5,
+                version: 6,
                 root: table_roots.get(table_index)?.to_string_lossy().into_owned(),
                 uri: uri.to_string(),
                 declaration_id,
+                declaration_name,
                 semantic_generation: table_semantic_generations.get(table_index)?.0,
                 overlay_epoch,
                 document_version,

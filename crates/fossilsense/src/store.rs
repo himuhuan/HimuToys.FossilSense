@@ -196,6 +196,20 @@ impl IndexStore {
     pub fn open_for_full_rebuild(path: &Path, workspace_root: &Path) -> Result<Self> {
         let new_database = !path.exists();
         let mut store = Self::open_with_call_indexes(path, workspace_root, false)?;
+        // A full rebuild writes an unpublished database from start to finish.
+        // Replaying the growing WAL into the main file every ~1,000 pages makes
+        // bulk insertion highly sensitive to storage latency. Use an in-memory
+        // rollback journal and an exclusive connection for this disposable
+        // build target; normal/index-incremental opens restore WAL + NORMAL.
+        // The completed side-by-side database is validated before publication.
+        store.conn.pragma_update(None, "journal_mode", "MEMORY")?;
+        store.conn.pragma_update(None, "synchronous", "OFF")?;
+        store
+            .conn
+            .pragma_update(None, "locking_mode", "EXCLUSIVE")?;
+        store.conn.pragma_update(None, "temp_store", "MEMORY")?;
+        store.conn.pragma_update(None, "cache_size", -32_768)?;
+        store.conn.pragma_update(None, "wal_autocheckpoint", 0)?;
         if new_database {
             store.bulk_call_string_ids = Some(HashMap::new());
         } else {
@@ -252,6 +266,13 @@ impl IndexStore {
     /// Validate and checkpoint a side-by-side database before its file name can
     /// become visible through the active manifest.
     pub fn prepare_full_build_publication(&self) -> Result<()> {
+        self.validate_full_build()?;
+        self.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        Ok(())
+    }
+
+    fn validate_full_build(&self) -> Result<()> {
         let check: String = self
             .conn
             .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
@@ -262,6 +283,14 @@ impl IndexStore {
             "SQLite foreign_key_check reported a violation"
         );
         drop(foreign_key_check);
+        Ok(())
+    }
+
+    /// Finish an explicit-path bulk build whose database does not need the
+    /// side-by-side manifest validation step. Full publication calls
+    /// [`Self::prepare_full_build_publication`] instead.
+    pub fn checkpoint_full_rebuild(&self) -> Result<()> {
+        self.validate_full_build()?;
         self.conn
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         Ok(())

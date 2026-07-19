@@ -19,6 +19,12 @@ It is designed for firmware, embedded systems, drivers, kernels, legacy code, ve
 
 FossilSense ranks evidence from the current file, reachable includes, direct external headers, and global fallback. Version 1.4.4 preserves how include edges were resolved: exact edges provide strong reachability; unique suffix matches and every possible target of an ambiguous include remain heuristic; and direct-external evidence is evaluated from the current query origin. Limited semantic coloring lets those bounded heuristic include targets contribute macro, type, and enum-kind evidence, while unrelated whole-workspace definitions remain excluded when the include scope is open; conflicting kind evidence stays uncolored. If an exact-name global window reaches its cap, Current and strongly reachable paths are recalled first. Indexed object candidates also distinguish declarations, C tentative definitions, full definitions, and unknown declaration/definition roles. When parsing or include information is incomplete, results degrade conservatively and expose ambiguity, confidence, or coverage instead of claiming compiler-level precision.
 
+## Where symbols come from
+
+The tolerant parser extracts typed declaration facts from C/C++ source, with a conservative lexical fallback for incomplete syntax. The local SQLite index stores each declaration's stable ID, name, declaration/definition role, source range, signature, linkage, conditional guard, and file revision. Hover, navigation, Signature Help, Find All, and workspace symbols all use the same candidate service over those facts, include reachability, project evidence, and unsaved-document overlays.
+
+Ordinary completion has a deliberately separate first stage because it runs on every keystroke. A compact in-memory index recalls only names, kinds, paths, scope signals, and canonical declaration IDs without loading every full declaration. Completion resolve then sends the selected ID and name through the same candidate service used by Hover and navigation. This is a split between fast recall and semantic hydration, not two semantic models, so resolved completion details keep the same signature, role, location, and live-overlay behavior as the other features.
+
 ## Install and start
 
 Install `fossilsense-vscode-1.4.4_BUILD*.vsix` with:
@@ -72,6 +78,7 @@ All fields are optional. Invalid configuration falls back to safe defaults and p
 - `fossilsense.semanticColoring.mode`: enable or disable FossilSense semantic coloring.
 - `fossilsense.references.showRanges`: show line suffixes in grouped reference rows.
 - `fossilsense.resourceMonitor.enabled`: show a status bar item with the server's process memory and the on-disk size of its index cache. On by default; updates every 5 seconds while the server is running. Turning it off only hides the item.
+- `fossilsense.semanticIndex.memoryBudgetMB`: total target for the declaration semantic index. The always-resident compact completion recall index is charged first; the remainder caches canonical declaration payloads shared by completion resolve, Hover, and navigation. `0` retains recall and loads selected facts from the local database on demand.
 - `fossilsense.debug.candidateReasons`: log definition-candidate scope, confidence, and reason.
 
 ## Current limitations

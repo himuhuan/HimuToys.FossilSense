@@ -36,6 +36,12 @@ FossilSense 主要解决一种很实际的问题：代码就在眼前，但完�
 
 FossilSense 会优先展示当前文件、include 可达文件和直接外部头中的候选，再使用全局 fallback。`1.4.4` 会保留 include 解析方式的证据强度：精确解析的边可提供强可达性；唯一后缀匹配和 ambiguous include 的所有可能目标只作为启发式证据；外部头证据也按当前查询来源判断，避免把其他文件的关系借给本次跳转或补全。有限语义着色允许这些有界启发式 include 目标参与宏、类型和枚举量的种类判定，但不会因为 include scope 处于 open 状态而放开无关的全库定义；种类证据冲突时仍不着色。exact-name 全局窗口触顶时会先抢救 Current 和强可达候选。遇到 include 缺失、语法不完整或结果被截断时，界面会保留降级、歧义或 coverage 信息，而不是假装结果完全精确。
 
+## 符号从哪里来，为什么补全分两段
+
+FossilSense 的 parser 会从 C/C++ 源码的容错语法树中提取声明；语法不完整时使用保守的词法 fallback。索引器把名称、声明/定义角色、位置、签名、链接属性、条件 guard 和文件 revision 等 typed facts 写入本地 SQLite。Hover、跳转、Signature Help、Find All 和 workspace symbol 都通过同一个候选服务读取这些事实，并叠加 include 可达性、项目范围和当前未保存文档，因此它们不会各自维护一套“符号真相”。
+
+普通补全列表必须跟随每次键入即时响应，所以它先走一条只包含名称、种类、路径、作用域信号和稳定 declaration ID 的紧凑内存索引；这一步只负责快速召回，不加载全库的完整声明。选中候选、解析补全详情时，会带着同一个 ID 回到上述候选服务，水合与 Hover/跳转相同的声明事实。分开的只是高频召回路径，不是语义规则：补全详情中的签名、角色、位置和注释仍以统一事实与当前未保存内容为准。
+
 ## 常用命令
 
 打开命令面板并输入 `FossilSense`：
@@ -78,6 +84,7 @@ VS Code 设置中常用的选项：
 - `fossilsense.projectContext.mode`：自动项目证据、歧义时询问或关闭。
 - `fossilsense.semanticColoring.mode`：启用或关闭 FossilSense 着色。
 - `fossilsense.resourceMonitor.enabled`：在状态栏显示 FossilSense 进程内存和索引数据库磁盘占用，默认开启，每 5 秒刷新；关闭仅隐藏状态栏，不影响服务行为。
+- `fossilsense.semanticIndex.memoryBudgetMB`：声明语义索引的总内存目标。常驻的紧凑补全召回索引先占用预算，剩余部分缓存 Hover、跳转和补全详情共享的声明 payload；设为 `0` 仍保留召回索引，并按需从本地数据库读取选中的事实。
 
 ## 能力边界
 

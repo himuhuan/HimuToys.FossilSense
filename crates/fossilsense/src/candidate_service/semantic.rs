@@ -214,16 +214,16 @@ impl CandidateQueryService<'_> {
                                 })
                                 .unwrap_or_default(),
                         });
-                let cores = index.exact_name_cores_scoped(
+                let hits = index.exact_name_hits_scoped(
                     name,
                     self.exact_name_limit.saturating_add(1),
                     scope.as_ref(),
                 );
-                let limited = cores.len() > self.exact_name_limit;
-                let ids: Vec<_> = cores
+                let limited = hits.len() > self.exact_name_limit;
+                let ids: Vec<_> = hits
                     .into_iter()
                     .take(self.exact_name_limit)
-                    .map(|(_, core)| core.id)
+                    .map(|hit| hit.id)
                     .collect();
                 (index.payloads_by_ids(handle, &ids)?, limited)
             } else {

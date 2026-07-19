@@ -47,6 +47,30 @@ The build is outside the measured process. The full-index process and reported `
 
 For a release candidate, run both cases when both checkouts are available. Record the source revision of the sample, machine CPU/RAM/storage, exact command, `elapsed_ms`, `write_ms`, phase timings, peak Working Set/Private Bytes, and final database size.
 
+## Required engine-hydration memory gate
+
+Changes to the declaration read model, completion recall/resolve, semantic query services, runtime caches, or atomic publication must also run the U-Boot engine-hydration gate. Build the release test binary before measurement, then create a current database and hydrate it:
+
+```powershell
+cargo test --release -p fossilsense --bin fossilsense --no-run
+
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark_large_workspace.ps1 `
+  -Repeats 1 -IncludeFullIndex -IncludeEngineHydration `
+  -CaseFilter u-boot-full-index,u-boot-engine-hydration -TimeoutSeconds 60
+```
+
+The cases run in order: `u-boot-full-index` replaces `target/benchmark/index-u-boot-rebuild.sqlite`, then `u-boot-engine-hydration` reads that exact database. The Rust process samples its own memory every millisecond and retains every read-model component. It first asserts a representative input of at least 500,000 declarations and 10,000 indexed files. A complete single generation must use at most 384 MiB; while that immutable generation remains live, fully building a replacement generation must peak at no more than the 512 MiB hard limit. Windows uses Private Bytes, while Linux and macOS use RSS.
+
+The second measurement represents the real publication contract: requests may retain the old snapshot until the replacement declaration index, reach graph, include table, indexed-file list, project context, and call handle are ready. The PowerShell wrapper's memory columns are `N/A` because it launches cargo as a child; the report's `engine_hydration_*` metrics come from the measured Rust test process and are the authoritative values.
+
+If a current U-Boot database already exists, run only the gate harness with:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark_engine_hydration.ps1 `
+  -Database target/benchmark/index-u-boot-rebuild.sqlite `
+  -Workspace samples/u-boot
+```
+
 ## Repeated diagnostic runs
 
 After the hard gate passes, repeated runs can be used to compare branches:
@@ -97,10 +121,10 @@ cargo test --release -p fossilsense `
 
 Report elapsed time together with memory and disk cost. An elapsed-only improvement is not sufficient when it causes unbounded memory, database growth, incomplete results without coverage, or correctness regression.
 
-For ordinary-completion hot-path diagnostics, use a current schema-18 U-Boot
+For ordinary-completion hot-path diagnostics, use a current-schema U-Boot
 database and run the declaration-index benchmark. It asserts that list recall
 performs zero SQLite payload reads and reports p50/p95 lookup latency plus the
-resident core byte estimate:
+resident compact-recall byte estimate:
 
 ```powershell
 $env:FOSSILSENSE_BENCH_DB = (Resolve-Path 'target/benchmark/index-u-boot-rebuild.sqlite').Path

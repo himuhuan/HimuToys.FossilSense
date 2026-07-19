@@ -41,6 +41,18 @@ fn read_model_cache_rebuilds_use_typed_store_views() {
             "store.indexed_workspace_files(",
         ],
     );
+    assert_present(
+        "src/server/indexing/cache.rs",
+        &["NameTable::build_from_declaration_view("],
+    );
+    assert_absent(
+        "src/server/indexing/cache.rs",
+        &[
+            "visit_core_rows(",
+            "core_rows_for_paths(",
+            "DeclarationCoreRow",
+        ],
+    );
 }
 
 #[test]
@@ -103,11 +115,17 @@ fn core_symbol_features_route_through_candidate_sets_and_stable_handles() {
         &[
             "new_with_declarations(",
             "resolve_candidate_handle(&handle)",
+            "semantic_candidates(",
+            "persistent_id == Some(declaration_id)",
         ],
+    );
+    assert_absent(
+        "src/server/completion_candidate_documentation.rs",
+        &["core_by_id("],
     );
     assert_present(
         "src/candidate_service/semantic.rs",
-        &["payloads_by_ids(handle, &ids)"],
+        &["exact_name_hits_scoped(", "payloads_by_ids(handle, &ids)"],
     );
     assert_absent(
         "src/server/completion_documentation.rs",
@@ -117,6 +135,36 @@ fn core_symbol_features_route_through_candidate_sets_and_stable_handles() {
             "CompletionDocumentationData::Overlay",
             "member.name == label",
             "member.signature == signature",
+        ],
+    );
+}
+
+#[test]
+fn completion_recall_core_cannot_grow_into_a_parallel_semantic_model() {
+    for path in [
+        "src/declaration_index.rs",
+        "src/query.rs",
+        "src/server/indexing/cache.rs",
+        "src/server/language_server.rs",
+        "src/server/lsp_adapters.rs",
+        "src/store/views/declarations.rs",
+    ] {
+        assert_absent(path, &["DeclarationCoreRow", "core_by_id("]);
+    }
+    assert_present(
+        "src/declaration_index.rs",
+        &[
+            "names: Arc<NameTable>",
+            "payloads_by_ids(",
+            "total_budget_bytes.saturating_sub(accounted_core_bytes)",
+        ],
+    );
+    assert_present(
+        "src/completion/ordinary_service/providers.rs",
+        &[
+            "OrdinaryCompletionDocumentationTarget::Declaration",
+            "declaration_id: hit.id",
+            "declaration_name: hit.name.clone()",
         ],
     );
 }

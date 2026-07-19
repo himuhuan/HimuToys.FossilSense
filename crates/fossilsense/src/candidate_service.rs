@@ -3053,17 +3053,11 @@ mod tests {
         drop(store);
 
         let reader = IndexStore::open_readonly(&db).expect("readonly");
-        let mut cores = Vec::new();
-        reader
-            .declaration_view()
-            .visit_core_rows(|row| {
-                cores.push(row);
-                Ok(())
-            })
-            .expect("declaration cores");
+        let names =
+            crate::query::NameTable::build_from_declaration_view(&reader.declaration_view(), None)
+                .expect("declaration names");
         drop(reader);
-        let index =
-            crate::declaration_index::SemanticDeclarationIndex::build(cores, None, 1024 * 1024);
+        let index = crate::declaration_index::SemanticDeclarationIndex::build(names, 1024 * 1024);
         let handle = CallReadHandle::capture(db).expect("read handle");
         let overlay = CandidateOverlaySnapshot::default();
         let service = CandidateQueryService::new_with_declarations(
@@ -3078,13 +3072,51 @@ mod tests {
         let cold = service
             .semantic_candidates("shared_api", SemanticIntent::Neutral)
             .expect("cold semantic candidates");
+        let recall = index
+            .name_table()
+            .exact_name_hits_scoped("shared_api", 10, None);
+        let mut recall_ids: Vec<_> = recall.iter().map(|hit| hit.id).collect();
+        let semantic_candidates: Vec<_> = cold
+            .all
+            .iter()
+            .flat_map(|group| group.candidates.iter())
+            .collect();
+        let mut semantic_ids: Vec<_> = semantic_candidates
+            .iter()
+            .filter_map(|candidate| candidate.persistent_id)
+            .collect();
+        recall_ids.sort_unstable();
+        semantic_ids.sort_unstable();
         assert_eq!(
-            cold.all
-                .iter()
-                .map(|group| group.candidates.len())
-                .sum::<usize>(),
-            2
+            recall_ids, semantic_ids,
+            "completion recall IDs must hydrate the exact candidate set shared by Hover/navigation"
         );
+        for hit in &recall {
+            let candidate = semantic_candidates
+                .iter()
+                .find(|candidate| candidate.persistent_id == Some(hit.id))
+                .expect("every completion recall ID must hydrate");
+            assert_eq!(candidate.fact.name, hit.name);
+            assert_eq!(
+                candidate.fact.role,
+                match hit.role {
+                    crate::parser::SymbolRole::Declaration => {
+                        crate::semantic_model::SemanticDeclarationRole::Declaration
+                    }
+                    crate::parser::SymbolRole::Definition => {
+                        crate::semantic_model::SemanticDeclarationRole::Definition
+                    }
+                    crate::parser::SymbolRole::TentativeDefinition => {
+                        crate::semantic_model::SemanticDeclarationRole::TentativeDefinition
+                    }
+                    crate::parser::SymbolRole::UnknownDeclarationOrDefinition => {
+                        crate::semantic_model::SemanticDeclarationRole::Unknown
+                    }
+                },
+                "recall presentation evidence must be projected from the same persisted declaration"
+            );
+        }
+        assert_eq!(semantic_candidates.len(), 2);
         let after_cold = index.payload_cache_stats();
         assert_eq!(after_cold.sql_reads, 1);
 
