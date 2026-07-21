@@ -563,7 +563,9 @@ mod tests {
             .map(|occ| occ.name.as_str())
             .filter(|name| !defs.macro_defs.contains(*name) && !defs.type_defs.contains(*name))
             .collect();
-        let counts = reader.kind_counts_by_names(&wanted).expect("counts");
+        let counts = reader
+            .declaration_kind_counts_by_names(&wanted)
+            .expect("counts");
 
         let tokens = classify_occurrences(
             &targets.occurrences,
@@ -630,7 +632,9 @@ mod tests {
                     && !defs.enum_defs.contains(*name)
             })
             .collect();
-        let counts = reader.kind_counts_by_names(&wanted).expect("counts");
+        let counts = reader
+            .declaration_kind_counts_by_names(&wanted)
+            .expect("counts");
 
         let tokens = classify_occurrences(
             &targets.occurrences,
@@ -999,7 +1003,9 @@ mod tests {
             .map(|occ| occ.name.as_str())
             .filter(|name| !defs.type_defs.contains(*name))
             .collect();
-        let counts = reader.kind_counts_by_names(&wanted).expect("counts");
+        let counts = reader
+            .declaration_kind_counts_by_names(&wanted)
+            .expect("counts");
 
         let tokens = classify_occurrences(
             &targets.occurrences,
@@ -1079,8 +1085,8 @@ mod tests {
         let wanted_set: HashSet<&str> = wanted.iter().copied().collect();
 
         let reader = IndexStore::open_readonly(&db).expect("readonly");
-        let table =
-            NameTable::build_with_paths(reader.load_symbol_names_with_paths().expect("names"));
+        let table = NameTable::build_from_declaration_view(&reader.declaration_view(), None)
+            .expect("declaration names");
 
         let classify = |counts: &HashMap<String, HashMap<String, usize>>| {
             classify_occurrences(
@@ -1096,7 +1102,7 @@ mod tests {
         // `colorable_kind_counts` with `None` (synthesizes an all-workspace
         // reachable set, preserving the prior unscoped gate via `scope_tier`).
         let sql_unscoped = reader
-            .kind_counts_by_names_scoped(&wanted, None)
+            .declaration_kind_counts_by_names_scoped(&wanted, None)
             .expect("sql unscoped");
         let mem_unscoped = table.colorable_kind_counts(&wanted_set, None);
         assert_eq!(
@@ -1112,7 +1118,7 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         let sql_scoped = reader
-            .kind_counts_by_names_scoped(&wanted, Some(&scope_files))
+            .declaration_kind_counts_by_names_scoped(&wanted, Some(&scope_files))
             .expect("sql scoped");
         // Build a CompletionScope carrying the reachable set + closed scope,
         // routed through the shared `scope_tier` primitive.

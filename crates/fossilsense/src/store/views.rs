@@ -1,8 +1,4 @@
-use std::collections::HashMap;
-
 use anyhow::Result;
-#[cfg(test)]
-use rusqlite::OptionalExtension;
 
 use crate::includes::ResolutionKind;
 use crate::reachability::OpenReason;
@@ -20,48 +16,7 @@ pub use declarations::{
 #[allow(unused_imports)]
 pub use member::{MemberReadRow, MemberStoreView, RecordReadRow, TypeAliasReadRow};
 
-use super::{map_symbol_record, IndexStore, SymbolRecord, SELECT_SYMBOL_JOIN};
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NameTableSymbolRow {
-    pub symbol_id: i64,
-    pub id: i64,
-    pub label: String,
-    pub external: bool,
-    pub path: String,
-    pub kind: String,
-    pub role: String,
-    pub directly_included: bool,
-}
-
-/// Borrowed projection used by cold name-index construction. The callback may
-/// intern the SQLite text directly, avoiding a workspace-sized temporary
-/// `Vec<NameTableSymbolRow>` and its four owned strings per symbol.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg(test)]
-pub struct NameTableSymbolRef<'a> {
-    pub symbol_id: i64,
-    pub label: &'a str,
-    pub external: bool,
-    pub path: &'a str,
-    pub kind: &'a str,
-    pub role: &'a str,
-    pub directly_included: bool,
-}
-
-impl NameTableSymbolRow {
-    #[allow(dead_code)]
-    pub fn into_legacy_tuple(self) -> (i64, String, bool, String, String, bool) {
-        (
-            self.symbol_id,
-            self.label,
-            self.external,
-            self.path,
-            self.kind,
-            self.directly_included,
-        )
-    }
-}
+use super::IndexStore;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IncludeEdgeRow {
@@ -115,103 +70,54 @@ pub struct ReferenceFileRow {
     pub path: String,
 }
 
-pub struct NameTableStoreView<'a> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FallbackCompletionRow {
+    pub id: i64,
+    pub name: String,
+    pub kind_hint: i64,
+    pub path: String,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub start_line: u32,
+    pub start_col: u32,
+    pub end_line: u32,
+    pub end_col: u32,
+    pub detail: Option<String>,
+}
+
+pub struct FallbackCompletionStoreView<'a> {
     store: &'a IndexStore,
 }
 
-impl<'a> NameTableStoreView<'a> {
+impl<'a> FallbackCompletionStoreView<'a> {
     pub(super) fn new(store: &'a IndexStore) -> Self {
         Self { store }
     }
 
-    pub fn symbol_rows(&self) -> Result<Vec<NameTableSymbolRow>> {
+    pub fn all(&self) -> Result<Vec<FallbackCompletionRow>> {
         let mut stmt = self.store.conn.prepare(
-            "SELECT s.id, s.name, f.source, f.path, s.kind, s.role, f.directly_included FROM symbols s JOIN files f ON f.id = s.file_id \
-             WHERE s.kind != 'field'",
+            "SELECT c.id, c.name, c.kind_hint, f.path, c.start_byte, c.end_byte,
+                    c.start_line, c.start_col, c.end_line, c.end_col, c.detail
+             FROM fallback_completions c
+             JOIN files f ON f.id = c.file_id
+             ORDER BY lower(c.name), c.name, f.path, c.start_byte, c.id",
         )?;
-        let rows = stmt.query_map([], name_table_symbol_row)?;
+        let rows = stmt.query_map([], |row| {
+            Ok(FallbackCompletionRow {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                kind_hint: row.get(2)?,
+                path: row.get(3)?,
+                start_byte: row.get::<_, i64>(4)? as usize,
+                end_byte: row.get::<_, i64>(5)? as usize,
+                start_line: row.get::<_, i64>(6)? as u32,
+                start_col: row.get::<_, i64>(7)? as u32,
+                end_line: row.get::<_, i64>(8)? as u32,
+                end_col: row.get::<_, i64>(9)? as u32,
+                detail: row.get(10)?,
+            })
+        })?;
         collect_rows(rows)
-    }
-
-    #[cfg(test)]
-    pub fn visit_symbol_rows<F>(&self, mut visitor: F) -> Result<usize>
-    where
-        F: for<'row> FnMut(NameTableSymbolRef<'row>) -> Result<()>,
-    {
-        let mut stmt = self.store.conn.prepare(
-            "SELECT s.id, s.name, f.source, f.path, s.kind, s.role, f.directly_included FROM symbols s JOIN files f ON f.id = s.file_id \
-             WHERE s.kind != 'field'",
-        )?;
-        let mut rows = stmt.query([])?;
-        let mut count = 0;
-        while let Some(row) = rows.next()? {
-            let label = row.get_ref(1)?.as_str()?;
-            let source = row.get_ref(2)?.as_str()?;
-            let path = row.get_ref(3)?.as_str()?;
-            let kind = row.get_ref(4)?.as_str()?;
-            let role = row.get_ref(5)?.as_str()?;
-            visitor(NameTableSymbolRef {
-                symbol_id: row.get(0)?,
-                label,
-                external: source == "external",
-                path,
-                kind,
-                role,
-                directly_included: row.get(6)?,
-            })?;
-            count += 1;
-        }
-        Ok(count)
-    }
-
-    #[cfg(test)]
-    pub fn largest_symbol_path(&self) -> Result<Option<(String, usize)>> {
-        let row: Option<(String, i64)> = self
-            .store
-            .conn
-            .query_row(
-                "SELECT f.path, COUNT(*) AS symbol_count FROM symbols s JOIN files f ON f.id = s.file_id \
-                 WHERE s.kind != 'field' GROUP BY f.id ORDER BY symbol_count DESC, f.path ASC LIMIT 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(anyhow::Error::from)?;
-        Ok(row.map(|(path, count)| (path, count.max(0) as usize)))
-    }
-
-    pub fn symbol_rows_for_paths(&self, paths: &[String]) -> Result<Vec<NameTableSymbolRow>> {
-        let mut names = Vec::new();
-        if paths.is_empty() {
-            return Ok(names);
-        }
-
-        for chunk in paths.chunks(400) {
-            let placeholders = vec!["?"; chunk.len()].join(",");
-            let sql = format!(
-                "SELECT s.id, s.name, f.source, f.path, s.kind, s.role, f.directly_included FROM symbols s JOIN files f ON f.id = s.file_id \
-                 WHERE s.kind != 'field' AND f.path IN ({placeholders})"
-            );
-            let mut stmt = self.store.conn.prepare(&sql)?;
-            let rows = stmt.query_map(
-                rusqlite::params_from_iter(chunk.iter().map(String::as_str)),
-                name_table_symbol_row,
-            )?;
-            for row in rows {
-                names.push(row?);
-            }
-        }
-
-        Ok(names)
-    }
-
-    #[allow(dead_code)]
-    pub fn symbol_name_rows(&self) -> Result<Vec<(i64, String, bool)>> {
-        self.symbol_rows().map(|rows| {
-            rows.into_iter()
-                .map(|row| (row.symbol_id, row.label, row.external))
-                .collect()
-        })
     }
 }
 
@@ -391,107 +297,6 @@ impl<'a> IncludeTableStoreView<'a> {
     }
 }
 
-pub struct SymbolReadView<'a> {
-    store: &'a IndexStore,
-}
-
-impl<'a> SymbolReadView<'a> {
-    pub(super) fn new(store: &'a IndexStore) -> Self {
-        Self { store }
-    }
-
-    pub fn symbols_by_ids(&self, ids: &[i64]) -> Result<Vec<SymbolRecord>> {
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut id_to_record: HashMap<i64, SymbolRecord> = HashMap::new();
-        for chunk in ids.chunks(400) {
-            let placeholders = vec!["?"; chunk.len()].join(",");
-            let sql = format!("{SELECT_SYMBOL_JOIN} WHERE s.id IN ({placeholders})");
-            let mut stmt = self.store.conn.prepare(&sql)?;
-            let rows = stmt.query_map(
-                rusqlite::params_from_iter(chunk.iter().copied()),
-                map_symbol_record,
-            )?;
-            for row in rows {
-                let record = row?;
-                id_to_record.insert(record.id, record);
-            }
-        }
-
-        Ok(ids
-            .iter()
-            .filter_map(|id| id_to_record.get(id).cloned())
-            .collect())
-    }
-
-    pub fn symbols_by_name(&self, name: &str) -> Result<Vec<SymbolRecord>> {
-        let mut stmt = self
-            .store
-            .conn
-            .prepare(&format!("{SELECT_SYMBOL_JOIN} WHERE s.name = ?1"))?;
-        let rows = stmt.query_map([name], map_symbol_record)?;
-        collect_rows(rows)
-    }
-
-    /// Bounded exact-name fallback read for semantic consumers whose richer
-    /// parser fact is unavailable. The extra row distinguishes an exact cap
-    /// hit from a complete result without scanning the rest of the name set.
-    pub fn symbols_by_name_limited(
-        &self,
-        name: &str,
-        limit: usize,
-    ) -> Result<(Vec<SymbolRecord>, bool)> {
-        let fetch = limit.saturating_add(1).min(i64::MAX as usize) as i64;
-        let mut stmt = self.store.conn.prepare(&format!(
-            "{SELECT_SYMBOL_JOIN} WHERE s.name = ?1 \
-             ORDER BY f.path, s.start_line, s.start_col, s.id LIMIT ?2"
-        ))?;
-        let rows = stmt.query_map(rusqlite::params![name, fetch], map_symbol_record)?;
-        let mut records = collect_rows(rows)?;
-        let truncated = records.len() > limit;
-        records.truncate(limit);
-        Ok((records, truncated))
-    }
-
-    /// Bounded exact-name read restricted to request-priority paths. This is
-    /// the symbol-table counterpart of
-    /// `CallFactStoreView::anchors_by_name_in_paths_limited`: reachability is
-    /// request-local, while SQLite remains responsible for an indexed,
-    /// LIMIT+1 exact-name lookup rather than a workspace scan.
-    pub fn symbols_by_name_in_paths_limited(
-        &self,
-        name: &str,
-        paths: &[String],
-        limit: usize,
-    ) -> Result<(Vec<SymbolRecord>, bool)> {
-        let mut records = Vec::new();
-        for chunk in paths.chunks(399) {
-            let probe_limit = limit.saturating_sub(records.len()).saturating_add(1);
-            let placeholders = vec!["?"; chunk.len()].join(",");
-            let sql = format!(
-                "{SELECT_SYMBOL_JOIN} WHERE s.name = ? AND f.path IN ({placeholders}) \
-                 ORDER BY f.path, s.start_line, s.start_col, s.id LIMIT {probe_limit}"
-            );
-            let mut params = Vec::with_capacity(chunk.len() + 1);
-            params.push(name);
-            params.extend(chunk.iter().map(String::as_str));
-            let mut stmt = self.store.conn.prepare(&sql)?;
-            let rows = stmt.query_map(rusqlite::params_from_iter(params), map_symbol_record)?;
-            for row in rows {
-                records.push(row?);
-            }
-            if records.len() > limit {
-                break;
-            }
-        }
-        let truncated = records.len() > limit;
-        records.truncate(limit);
-        Ok((records, truncated))
-    }
-}
-
 pub struct ReferenceFileStoreView<'a> {
     store: &'a IndexStore,
 }
@@ -534,21 +339,6 @@ impl<'a> ReferenceFileStoreView<'a> {
         }
         Ok(files)
     }
-}
-
-fn name_table_symbol_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NameTableSymbolRow> {
-    let id = row.get(0)?;
-    let source: String = row.get(2)?;
-    Ok(NameTableSymbolRow {
-        symbol_id: id,
-        id,
-        label: row.get(1)?,
-        external: source == "external",
-        path: row.get(3)?,
-        kind: row.get(4)?,
-        role: row.get(5)?,
-        directly_included: row.get::<_, i64>(6)? != 0,
-    })
 }
 
 fn collect_rows<T>(

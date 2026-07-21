@@ -1,7 +1,8 @@
 use super::*;
+use crate::semantic_model::{SemanticDeclarationKind, SemanticDeclarationRole};
 
 #[test]
-fn writes_symbols_and_cleans_deleted_files() {
+fn writes_declarations_and_cleans_deleted_files() {
     let dir = tempdir().expect("tempdir");
     let db = dir.path().join("index.sqlite");
     let mut store = IndexStore::open(&db, dir.path()).expect("store");
@@ -18,17 +19,17 @@ fn writes_symbols_and_cleans_deleted_files() {
     store
         .upsert_file_index(&fingerprint, &index)
         .expect("upsert");
-    assert_eq!(store.symbol_count().expect("count"), 1);
+    assert_eq!(store.declaration_count().expect("count"), 1);
 
     let deleted = store
         .delete_missing_files(&Default::default())
         .expect("delete missing");
     assert_eq!(deleted, 1);
-    assert_eq!(store.symbol_count().expect("count"), 0);
+    assert_eq!(store.declaration_count().expect("count"), 0);
 }
 
 #[test]
-fn reads_symbols_by_name_and_id() {
+fn reads_declarations_by_name_and_id() {
     let dir = tempdir().expect("tempdir");
     let db = dir.path().join("index.sqlite");
     let mut store = IndexStore::open(&db, dir.path()).expect("store");
@@ -47,20 +48,26 @@ fn reads_symbols_by_name_and_id() {
 
     let reader = IndexStore::open_readonly(&db).expect("readonly");
 
-    let names = reader.load_symbol_names().expect("names");
-    assert!(names.iter().any(|(_, name, _)| name == "hello_value"));
+    let names = reader.declaration_name_rows().expect("names");
+    assert!(names.iter().any(|row| row.name == "hello_value"));
 
-    let by_name = reader.symbols_by_name("hello_value").expect("by name");
+    let by_name = reader.declarations_by_name("hello_value").expect("by name");
     assert_eq!(by_name.len(), 1);
     let record = &by_name[0];
-    assert_eq!(record.kind, "function");
-    assert_eq!(record.role, "definition");
-    assert_eq!(record.path, "src/hello.c");
+    assert_eq!(
+        record.fact.declaration_kind,
+        SemanticDeclarationKind::Function
+    );
+    assert_eq!(record.fact.role, SemanticDeclarationRole::Definition);
+    assert_eq!(record.fact.path, "src/hello.c");
 
-    let by_id = reader.symbols_by_ids(&[record.id]).expect("by id");
+    let by_id = reader.declarations_by_ids(&[record.id]).expect("by id");
     assert_eq!(by_id, by_name);
 
-    assert!(reader.symbols_by_name("missing").expect("miss").is_empty());
+    assert!(reader
+        .declarations_by_name("missing")
+        .expect("miss")
+        .is_empty());
 }
 
 #[test]
@@ -89,14 +96,25 @@ typedef struct xxxa {
     upsert_source(&mut store, "macro_typedef.h", source);
 
     let reader = IndexStore::open_readonly(&db).expect("readonly");
-    let xxx_defs = reader.symbols_by_name("xxx_t").expect("xxx_t");
+    let xxx_defs = reader.declarations_by_name("xxx_t").expect("xxx_t");
     assert_eq!(xxx_defs.len(), 1);
-    assert_eq!(xxx_defs[0].kind, "type");
-    assert_eq!(xxx_defs[0].role, "definition");
-    assert!(xxx_defs[0].signature.starts_with("typedef struct xxx"));
-    assert!(!xxx_defs[0].signature.contains("while (0)"));
+    assert_eq!(
+        xxx_defs[0].fact.declaration_kind,
+        SemanticDeclarationKind::Alias
+    );
+    assert_eq!(xxx_defs[0].fact.role, SemanticDeclarationRole::Definition);
+    let signature = xxx_defs[0]
+        .fact
+        .canonical_signature
+        .as_deref()
+        .unwrap_or_default();
+    assert!(signature.starts_with("typedef struct xxx"));
+    assert!(!signature.contains("while (0)"));
 
-    assert_eq!(reader.symbols_by_name("xxxa_t").expect("xxxa_t").len(), 1);
+    assert_eq!(
+        reader.declarations_by_name("xxxa_t").expect("xxxa_t").len(),
+        1
+    );
     assert_eq!(
         fields_by_record_names(&reader, &["xxx_t"]),
         vec!["value".to_string()]
@@ -122,7 +140,7 @@ fn marking_file_error_clears_old_symbols() {
         .expect("upsert");
     assert_eq!(
         store
-            .symbols_by_name("stale_symbol")
+            .declarations_by_name("stale_symbol")
             .expect("symbol before error")
             .len(),
         1
@@ -137,7 +155,7 @@ fn marking_file_error_clears_old_symbols() {
         .expect("mark error");
 
     assert!(store
-        .symbols_by_name("stale_symbol")
+        .declarations_by_name("stale_symbol")
         .expect("symbol after error")
         .is_empty());
 }
@@ -182,7 +200,7 @@ fn counts_definition_kinds_by_name() {
 
     let reader = IndexStore::open_readonly(&db).expect("readonly");
     let counts = reader
-        .kind_counts_by_names(&["WRAP", "widget_t", "absent"])
+        .declaration_kind_counts_by_names(&["WRAP", "widget_t", "absent"])
         .expect("counts");
 
     let wrap = counts.get("WRAP").expect("wrap counts");
@@ -193,5 +211,8 @@ fn counts_definition_kinds_by_name() {
     assert_eq!(widget.get("type").copied(), Some(1));
 
     assert!(!counts.contains_key("absent"));
-    assert!(reader.kind_counts_by_names(&[]).expect("empty").is_empty());
+    assert!(reader
+        .declaration_kind_counts_by_names(&[])
+        .expect("empty")
+        .is_empty());
 }

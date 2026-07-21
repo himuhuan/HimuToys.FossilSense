@@ -38,9 +38,11 @@ FossilSense 会优先展示当前文件、include 可达文件和直接外部头
 
 ## 符号从哪里来，为什么补全分两段
 
-FossilSense 的 parser 会从 C/C++ 源码的容错语法树中提取声明；语法不完整时使用保守的词法 fallback。索引器把名称、声明/定义角色、位置、签名、链接属性、条件 guard 和文件 revision 等 typed facts 写入本地 SQLite。Hover、跳转、Signature Help、Find All 和 workspace symbol 都通过同一个候选服务读取这些事实，并叠加 include 可达性、项目范围和当前未保存文档，因此它们不会各自维护一套“符号真相”。
+FossilSense 的 parser 会从 C/C++ 源码的容错语法树中提取声明；局部语法错误仍使用 AST，只有 parser 无法形成任何可用结构时才启用保守、补全专用的词法 fallback。索引器把名称、声明/定义角色、位置、签名、链接属性、条件 guard 和文件 revision 等 typed facts 写入本地 SQLite。Hover、跳转、Signature Help、Find All 和 workspace symbol 都通过同一个候选服务读取这些事实，并叠加 include 可达性、项目范围和当前未保存文档，因此它们不会各自维护一套“符号真相”。
 
 普通补全列表必须跟随每次键入即时响应，所以它先走一条只包含名称、种类、路径、作用域信号和稳定 declaration ID 的紧凑内存索引；这一步只负责快速召回，不加载全库的完整声明。选中候选、解析补全详情时，会带着同一个 ID 回到上述候选服务，水合与 Hover/跳转相同的声明事实。分开的只是高频召回路径，不是语义规则：补全详情中的签名、角色、位置和注释仍以统一事实与当前未保存内容为准。
+
+C++ 记录类型中的方法名会作为 function-kind 名称进入普通标识符补全召回。这是有意的宽召回：它让没有接收者上下文时仍可发现方法拼写，但不代表 FossilSense 已经完成接收者绑定；`.` / `->` 成员补全仍使用独立的记录类型证据过滤候选。
 
 ## 常用命令
 
@@ -66,13 +68,20 @@ FossilSense 的 parser 会从 C/C++ 源码的容错语法树中提取声明；�
   "include": ["src/", "include/"],
   "exclude": ["src/generated/"],
   "extensions": ["c", "h", "cpp", "hpp"],
-  "includePaths": ["C:/toolchain/include"]
+  "includePaths": ["C:/toolchain/include"],
+  "languageOverrides": [
+    { "glob": "legacy-c/**/*.h", "language": "c" },
+    { "glob": "generated/cpp/**/*.h", "language": "cpp" }
+  ]
 }
 ```
 
 - `include` / `exclude` 控制工作区内哪些目录参与索引。
 - `extensions` 控制识别的源码扩展名。
 - `includePaths` 指向工作区外的 SDK 或工具链头文件目录，必须使用绝对路径。
+- `languageOverrides` 只接受 `c` / `cpp`。匹配不区分大小写；工作区文件按规范化的 `/` 相对路径匹配，外部头文件按规范化绝对路径匹配；多条规则命中时最后一条生效。无效规则会产生 warning，但不会丢弃其他有效配置。
+
+语言默认值为：`.c` 使用 C；`.h/.inl/.cpp/.hpp/.cc/.hh/.cxx/.hxx` 使用 C++；配置额外加入的未知扩展名仍按 C 处理。磁盘索引和未保存文档使用同一个语言判定器，不读取编辑器 `languageId` 作为另一套事实来源。
 
 配置缺失时扫描整个工作区的默认源码类型；配置错误时会显示 warning 并降级到安全默认值。
 
@@ -89,6 +98,12 @@ VS Code 设置中常用的选项：
 ## 能力边界
 
 FossilSense 不支持完整的 C++ 继承、模板、重载决议、宏展开、访问控制、命名空间绑定或复杂表达式类型推断。成员调用、函数指针和 callable object 也不会被伪装成已经精确绑定的自由函数关系。
+
+声明、Hover、跳转、着色、文档符号和调用关系只接受 AST 事实。轻量扫描始终只负责 `#include`；只有 AST 完全不可用时才产生隔离、最低优先级且不可跳转的补全提示。这类提示不进入声明表、语义候选服务或文档解析。
+
+只要 tree-sitter 仍能形成可用树，即使树中带有语法错误，FossilSense 也保留 Partial AST 路径，不把整份文档切换到词法声明扫描。尚未形成受支持声明节点、只落在 `ERROR` 区域中的名字可能暂时不参与声明、导航、着色或补全；这样做是为了避免给半写完的文本制造错误的 canonical identity。编辑恢复出可识别结构后，这些事实会随下一次解析出现。
+
+索引日志使用 `declarations` 表示 canonical declaration 数量。为兼容现有 VS Code 扩展，索引进度通知的 JSON 字段暂时仍名为 `symbols`，但其值同样是 canonical declaration 数量，不再代表旧的正则 symbol 记录。
 
 引用是文本候选加语法角色分类，可能包含注释或字符串中的同名文本。导航与补全索引会区分声明、C tentative definition、完整定义和无法判定的声明/定义，并在同级候选中使用这些角色；这仍不是编译器级的链接决议。
 

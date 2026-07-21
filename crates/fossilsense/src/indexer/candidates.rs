@@ -181,7 +181,7 @@ pub(super) fn discover_external_candidates(
         if over_cap {
             issues.push(ConfigIssue {
                 message: format!(
-                    "includePaths root exceeds cap (>{max_files} files or >{max_bytes} bytes); indexing paths only, no symbols: {}",
+                    "includePaths root exceeds cap (>{max_files} files or >{max_bytes} bytes); indexing paths only, no declarations: {}",
                     root.display()
                 ),
             });

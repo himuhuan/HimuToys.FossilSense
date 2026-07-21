@@ -171,20 +171,23 @@ mod tests {
             "int pair_lookup(int value) { return value; }\n",
         );
         let header = header
-            .symbols
+            .declarations
             .iter()
             .find(|symbol| symbol.name == "pair_lookup")
             .expect("header symbol");
         let source = source
-            .symbols
+            .declarations
             .iter()
             .find(|symbol| symbol.name == "pair_lookup")
             .expect("source symbol");
         assert!(
-            signatures_compatible(&header.signature, &source.signature),
+            signatures_compatible(
+                header.canonical_signature.as_deref().unwrap_or_default(),
+                source.canonical_signature.as_deref().unwrap_or_default(),
+            ),
             "header={:?}, source={:?}",
-            header.signature,
-            source.signature
+            header.canonical_signature,
+            source.canonical_signature
         );
     }
 }

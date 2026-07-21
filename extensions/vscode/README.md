@@ -25,6 +25,8 @@ The tolerant parser extracts typed declaration facts from C/C++ source, with a c
 
 Ordinary completion has a deliberately separate first stage because it runs on every keystroke. A compact in-memory index recalls only names, kinds, paths, scope signals, and canonical declaration IDs without loading every full declaration. Completion resolve then sends the selected ID and name through the same candidate service used by Hover and navigation. This is a split between fast recall and semantic hydration, not two semantic models, so resolved completion details keep the same signature, role, location, and live-overlay behavior as the other features.
 
+C++ record methods intentionally participate in ordinary identifier recall as function-kind names. This broad recall makes method spellings discoverable without a receiver context; it does not claim receiver binding. `.` / `->` completion still filters through separate record-type evidence.
+
 ## Install and start
 
 Install `fossilsense-vscode-1.4.4_BUILD*.vsix` with:
@@ -60,11 +62,15 @@ An optional `fossilsense.json` at the workspace root controls source scope and e
   "include": ["src/", "include/"],
   "exclude": ["src/generated/"],
   "extensions": ["c", "h", "cpp", "hpp"],
-  "includePaths": ["C:/toolchain/include"]
+  "includePaths": ["C:/toolchain/include"],
+  "languageOverrides": [
+    { "glob": "legacy-c/**/*.h", "language": "c" },
+    { "glob": "generated/cpp/**/*.h", "language": "cpp" }
+  ]
 }
 ```
 
-All fields are optional. Invalid configuration falls back to safe defaults and produces a visible warning.
+All fields are optional. `.c` defaults to C; `.h`, `.inl`, and the standard C++ source/header extensions default to C++. `languageOverrides` accepts only `c` or `cpp`, matches case-insensitively over normalized `/` paths, and applies the last matching rule. Invalid rules are skipped with a visible warning without discarding the other configuration fields.
 
 ## Main settings
 
@@ -84,6 +90,8 @@ All fields are optional. Invalid configuration falls back to safe defaults and p
 ## Current limitations
 
 FossilSense is a best-effort navigation engine, not a compiler model. It does not support full C++ inheritance, template instantiation, overload resolution, macro expansion, access control, namespace binding, or complex expression type inference.
+
+Declarations, Hover, navigation, coloring, document symbols, and call relations accept AST facts only. If tree-sitter still produces a usable tree with syntax errors, FossilSense keeps the Partial AST path instead of switching the whole document to lexical declaration scanning. A name that exists only inside an unsupported `ERROR` region may temporarily be absent from declarations, navigation, coloring, and completion until the edit forms a recognizable declaration. Lexical fallback is reserved for a hard AST failure and contributes only isolated, lowest-priority, non-navigable completion hints.
 
 References start from whole-word text matches and can include same-name text in comments or strings. Function declaration/definition pairing requires compatible normalized signatures, linkage, and include evidence. C signature matching ignores parameter names and an unrelated standalone `extern`, while retaining parameter-type shape. Unsupported or ambiguous cases remain multiple ordinary candidates or fallbacks; they do not become a guessed unique result.
 

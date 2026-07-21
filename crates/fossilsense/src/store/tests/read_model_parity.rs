@@ -1,4 +1,5 @@
 use super::*;
+use crate::semantic_model::SemanticDeclarationKind;
 
 fn file_id(store: &IndexStore, path: &str) -> i64 {
     store
@@ -37,10 +38,10 @@ fn open_readonly_reads_committed_wal_backed_index() {
 
     let reader = IndexStore::open_readonly(&db).expect("readonly");
     let symbols = reader
-        .symbols_by_name("wal_backed_symbol")
+        .declarations_by_name("wal_backed_symbol")
         .expect("symbols");
     assert_eq!(symbols.len(), 1);
-    assert_eq!(symbols[0].path, "src/wal.c");
+    assert_eq!(symbols[0].fact.path, "src/wal.c");
 }
 
 #[test]
@@ -68,30 +69,45 @@ fn name_table_loader_rows_preserve_source_path_kind_and_direct_external_evidence
         .expect("direct external");
 
     let reader = IndexStore::open_readonly(&db).expect("readonly");
-    let rows = reader.load_symbol_names_with_paths().expect("names");
+    let rows = reader.declaration_name_rows().expect("names");
     let main = rows
         .iter()
-        .find(|(_, name, _, _, _, _)| name == "main_entry")
+        .find(|row| row.name == "main_entry")
         .expect("main row");
     assert_eq!(
-        (main.2, main.3.as_str(), main.4.as_str(), main.5),
-        (false, "src/main.c", "function", false)
+        (
+            main.external,
+            main.path.as_str(),
+            main.declaration_kind,
+            main.directly_included,
+        ),
+        (
+            false,
+            "src/main.c",
+            SemanticDeclarationKind::Function,
+            false,
+        )
     );
     let external = rows
         .iter()
-        .find(|(_, name, _, _, _, _)| name == "ext_size_t")
+        .find(|row| row.name == "ext_size_t")
         .expect("external row");
     assert_eq!(
         (
-            external.2,
-            external.3.as_str(),
-            external.4.as_str(),
-            external.5
+            external.external,
+            external.path.as_str(),
+            external.declaration_kind,
+            external.directly_included
         ),
-        (true, "C:/sdk/include/ext_size.h", "type", true)
+        (
+            true,
+            "C:/sdk/include/ext_size.h",
+            SemanticDeclarationKind::Alias,
+            true,
+        )
     );
 
-    let table = NameTable::build_with_paths(rows);
+    let table = NameTable::build_from_declaration_name_rows_with_project_context(rows, None);
     let scope = CompletionScope {
         current_path: Some("src/main.c".to_string()),
         direct_external_files: ["C:/sdk/include/ext_size.h".to_string()]

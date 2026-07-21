@@ -349,10 +349,10 @@ async fn index_roots(
                     .log_message(
                         MessageType::INFO,
                         format!(
-                            "index complete for {}: {} files, {} symbols, elapsed={}ms (discover={}ms, parse={}ms, write={}ms, secondary_index={}ms, publication={}ms, check={}ms, include_edge={}ms)",
+                            "index complete for {}: {} files, {} declarations, elapsed={}ms (discover={}ms, parse={}ms, write={}ms, secondary_index={}ms, publication={}ms, check={}ms, include_edge={}ms)",
                             display_root,
                             stats.total_files,
-                            stats.symbols,
+                            stats.declarations,
                             stats.elapsed_ms,
                             stats.discover_ms,
                             stats.parse_ms,
@@ -393,7 +393,7 @@ async fn index_roots(
                                 },
                                 ready_cache_message(
                                     "name table ready",
-                                    report.symbol_count,
+                                    report.declaration_count,
                                     report.include_count,
                                     report.reference_file_count,
                                     stats.name_table_ms,
@@ -566,12 +566,12 @@ async fn index_dirty_roots(
                     .log_message(
                         MessageType::INFO,
                         format!(
-                            "dirty update complete for {}: {} files, indexed={}, deleted={}, symbols={}, elapsed={}ms (parse={}ms, write={}ms, check={}ms, include_edge={}ms)",
+                            "dirty update complete for {}: {} files, indexed={}, deleted={}, declarations={}, elapsed={}ms (parse={}ms, write={}ms, check={}ms, include_edge={}ms)",
                             display_root,
                             stats.total_files,
                             stats.indexed_files,
                             stats.deleted_files,
-                            stats.symbols,
+                            stats.declarations,
                             stats.elapsed_ms,
                             stats.parse_ms,
                             stats.write_ms,
@@ -617,7 +617,7 @@ async fn index_dirty_roots(
                                 },
                                 ready_cache_message(
                                     "name table updated",
-                                    report.symbol_count,
+                                    report.declaration_count,
                                     report.include_count,
                                     report.reference_file_count,
                                     stats.name_table_ms,

@@ -21,7 +21,7 @@ fn corrupted_db_errors_on_query_not_panic() {
     std::fs::write(&bad_db, b"\x00\xFF\x00\xFF\xDE\xAD\xBE\xEF").expect("write");
     // Open may or may not succeed — if it does, querying must fail.
     if let Ok(store) = IndexStore::open_readonly(&bad_db) {
-        let result = store.load_symbol_names();
+        let result = store.declaration_view().all_name_rows();
         assert!(result.is_err(), "query on garbage DB must return Err");
     }
     // If open fails, that's also fine — we just verify no panic.
@@ -33,7 +33,7 @@ fn empty_db_file_errors_on_query_not_panic() {
     let empty_db = dir.path().join("empty.sqlite");
     std::fs::write(&empty_db, b"").expect("write");
     if let Ok(store) = IndexStore::open_readonly(&empty_db) {
-        let result = store.load_symbol_names();
+        let result = store.declaration_view().all_name_rows();
         assert!(result.is_err(), "query on empty file must return Err");
     }
 }
@@ -285,14 +285,33 @@ fn current_schema_migrate_by_drop_clears_old_data() {
 }
 
 #[test]
-fn opening_schema_15_drops_old_semantic_facts_for_schema_18_rebuild() {
+fn opening_schema_18_parser_fact_4_drops_old_symbol_data_for_schema_19_rebuild() {
     let dir = tempdir().expect("tempdir");
     let db = dir.path().join("index.sqlite");
     {
         let conn = rusqlite::Connection::open(&db).expect("conn");
         conn.execute_batch(
             "CREATE TABLE meta (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);
-             INSERT INTO meta (key, value) VALUES ('schema_version', '15');
+             INSERT INTO meta (key, value) VALUES ('schema_version', '18');
+             CREATE TABLE file_entries (id INTEGER PRIMARY KEY, path TEXT NOT NULL);
+             CREATE TABLE file_revisions (
+                 id INTEGER PRIMARY KEY,
+                 file_id INTEGER NOT NULL,
+                 parser_version INTEGER NOT NULL
+             );
+             CREATE TABLE active_file_revisions (
+                 file_id INTEGER PRIMARY KEY,
+                 revision_id INTEGER NOT NULL
+             );
+             INSERT INTO file_entries (id, path) VALUES (1, 'polluted.h');
+             INSERT INTO file_revisions (id, file_id, parser_version) VALUES (1, 1, 4);
+             INSERT INTO active_file_revisions (file_id, revision_id) VALUES (1, 1);
+             CREATE TABLE symbol_facts (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 name TEXT NOT NULL
+             );
+             INSERT INTO symbol_facts (name) VALUES ('polluted_fake_function');
+             CREATE VIEW symbols AS SELECT * FROM symbol_facts;
              CREATE TABLE callable_anchor_facts (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
                  entity_key TEXT NOT NULL,
@@ -309,10 +328,10 @@ fn opening_schema_15_drops_old_semantic_facts_for_schema_18_rebuild() {
              CREATE VIEW callable_anchors AS SELECT * FROM callable_anchor_facts;
              CREATE VIEW call_sites AS SELECT * FROM call_site_facts;",
         )
-        .expect("seed schema 15 call facts");
+        .expect("seed schema 18 parser-fact-4 data");
     }
 
-    let store = IndexStore::open(&db, dir.path()).expect("open schema 18");
+    let store = IndexStore::open(&db, dir.path()).expect("open schema 19");
     let version: String = store
         .conn
         .query_row(
@@ -321,7 +340,7 @@ fn opening_schema_15_drops_old_semantic_facts_for_schema_18_rebuild() {
             |row| row.get(0),
         )
         .expect("schema version");
-    assert_eq!(version, "18");
+    assert_eq!(version, "19");
 
     let anchor_count: i64 = store
         .conn
@@ -334,6 +353,15 @@ fn opening_schema_15_drops_old_semantic_facts_for_schema_18_rebuild() {
         .query_row("SELECT COUNT(*) FROM call_site_facts", [], |row| row.get(0))
         .expect("site count");
     assert_eq!((anchor_count, site_count), (0, 0));
+    let old_symbol_objects: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('symbol_facts', 'symbols')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("old symbol objects");
+    assert_eq!(old_symbol_objects, 0);
 
     let anchor_columns: Vec<String> = store
         .conn
@@ -379,11 +407,24 @@ fn parser_fact_version_mismatch_invalidates_and_rebuilds_current_schema() {
             row.get(0)
         })
         .expect("active revisions");
-    let symbols: i64 = store
+    let declarations: i64 = store
         .conn
-        .query_row("SELECT COUNT(*) FROM symbol_facts", [], |row| row.get(0))
-        .expect("symbol facts");
-    assert_eq!((active_revisions, symbols), (0, 0));
+        .query_row("SELECT COUNT(*) FROM declaration_facts", [], |row| {
+            row.get(0)
+        })
+        .expect("declaration facts");
+    let old_symbol_tables: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('symbol_facts', 'symbols')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("old symbol objects");
+    assert_eq!(
+        (active_revisions, declarations, old_symbol_tables),
+        (0, 0, 0)
+    );
     drop(store);
     assert!(IndexStore::has_current_schema(&db).expect("rebuilt schema"));
 }

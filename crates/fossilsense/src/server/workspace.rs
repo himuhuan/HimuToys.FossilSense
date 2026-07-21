@@ -6,21 +6,27 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tower_lsp::lsp_types::{Position, TextDocumentContentChangeEvent, Url};
 
-use super::include_completion::IncludeCompletionTable;
 use super::state;
 use super::LocalWordCache;
 use crate::call_model::SemanticGeneration;
-use crate::call_service::CallReadHandle;
 use crate::candidate_service::CandidateOverlaySnapshot;
 use crate::completion_words;
-use crate::declaration_index::SemanticDeclarationIndex;
 use crate::parser::{FileSemanticIndex, ParseFacts};
 use crate::pathing;
-use crate::project_context::ProjectContextIndex;
+#[cfg(test)]
 use crate::query::NameTable;
+#[cfg(test)]
 use crate::reachability::ReachGraph;
-use crate::references;
 use crate::store::IndexStore;
+
+mod models;
+mod session;
+use models::{invalidate_candidate_overlay_root, CandidateOverlayCacheKey};
+pub(super) use models::{
+    CacheLedger, CachePublishReport, CompletionMemoLookup, EngineSnapshot, RequestContext,
+    RequestSettings,
+};
+pub(super) use session::WorkspaceSession;
 
 type LiveParseCache = Arc<RwLock<HashMap<Url, (i32, ParseFacts, Arc<FileSemanticIndex>)>>>;
 type LiveParseGates = Arc<Mutex<HashMap<Url, Arc<Mutex<()>>>>>;
@@ -484,146 +490,6 @@ fn utf16_position_to_byte(text: &str, position: Position) -> Option<usize> {
     (utf16_units == target).then_some(line_end)
 }
 
-#[derive(Clone)]
-pub(super) struct CacheLedger {
-    pub(in crate::server) engine_snapshots: EngineSnapshots,
-    pub(in crate::server) publish_gate: Arc<Mutex<()>>,
-    next_engine_epoch: Arc<AtomicU64>,
-    pub(in crate::server) reference_role_cache: Arc<references::ReferenceRoleCache>,
-    pub(in crate::server) reference_search_cache: Arc<references::ReferenceSearchCache>,
-    pub(in crate::server) completion_memo: Arc<Mutex<HashMap<Url, state::CompletionMemo>>>,
-    candidate_overlays: Arc<Mutex<CandidateOverlayCache>>,
-    semantic_index_memory_budget_bytes: Arc<AtomicU64>,
-}
-
-#[derive(Default)]
-struct CandidateOverlayCache {
-    entries: HashMap<CandidateOverlayCacheKey, Arc<CandidateOverlaySnapshot>>,
-    /// Changes at both sides of an EngineSnapshot publication. It prevents a
-    /// build that started before (or inside) the publication window from
-    /// repopulating a key after the publication invalidated it.
-    root_revisions: HashMap<PathBuf, u64>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct CandidateOverlayCacheKey {
-    root: PathBuf,
-    semantic_generation: SemanticGeneration,
-    overlay_epoch: u64,
-}
-
-fn invalidate_candidate_overlay_root(cache: &mut CandidateOverlayCache, root: &Path) {
-    cache.entries.retain(|key, _| key.root != root);
-    let revision = cache.root_revisions.entry(root.to_path_buf()).or_default();
-    *revision = revision.wrapping_add(1).max(1);
-}
-
-pub(in crate::server) type EngineSnapshots = Arc<Mutex<HashMap<PathBuf, Arc<EngineSnapshot>>>>;
-
-/// Complete immutable read-model state published for one workspace. Every
-/// request holds one `Arc<EngineSnapshot>` for its entire indexed read, so a
-/// later index publication cannot change any component under that request.
-#[derive(Clone)]
-pub(in crate::server) struct EngineSnapshot {
-    pub(in crate::server) root: PathBuf,
-    pub(in crate::server) epoch: state::EngineEpoch,
-    pub(in crate::server) semantic_generation: SemanticGeneration,
-    pub(in crate::server) declaration_index: Option<Arc<SemanticDeclarationIndex>>,
-    pub(in crate::server) name_table: Option<Arc<NameTable>>,
-    pub(in crate::server) reach_graph: Option<Arc<ReachGraph>>,
-    pub(in crate::server) include_table: Option<Arc<IncludeCompletionTable>>,
-    pub(in crate::server) indexed_files: Option<Arc<Vec<(String, PathBuf)>>>,
-    pub(in crate::server) project_context: Option<Arc<ProjectContextIndex>>,
-    pub(in crate::server) call_read_handle: Option<Arc<CallReadHandle>>,
-    #[allow(dead_code)] // Captured now; request capability-health routing is the next phase.
-    pub(in crate::server) degraded: crate::progress::DegradedCapabilities,
-}
-
-impl EngineSnapshot {
-    fn empty(root: PathBuf) -> Self {
-        Self {
-            root,
-            epoch: state::EngineEpoch::missing(),
-            semantic_generation: SemanticGeneration::MISSING,
-            declaration_index: None,
-            name_table: None,
-            reach_graph: None,
-            include_table: None,
-            indexed_files: None,
-            project_context: None,
-            call_read_handle: None,
-            degraded: crate::progress::DegradedCapabilities::default(),
-        }
-    }
-}
-
-impl Default for CacheLedger {
-    fn default() -> Self {
-        Self {
-            engine_snapshots: Arc::new(Mutex::new(HashMap::new())),
-            publish_gate: Arc::new(Mutex::new(())),
-            next_engine_epoch: Arc::new(AtomicU64::new(1)),
-            reference_role_cache: Arc::new(references::ReferenceRoleCache::new()),
-            reference_search_cache: Arc::new(references::ReferenceSearchCache::new()),
-            completion_memo: Arc::new(Mutex::new(HashMap::new())),
-            candidate_overlays: Arc::new(Mutex::new(CandidateOverlayCache::default())),
-            semantic_index_memory_budget_bytes: Arc::new(AtomicU64::new(256 * 1024 * 1024)),
-        }
-    }
-}
-
-impl CacheLedger {
-    pub(super) fn set_semantic_index_memory_budget_mb(&self, budget_mb: u64) {
-        self.semantic_index_memory_budget_bytes
-            .store(budget_mb.saturating_mul(1024 * 1024), Ordering::Release);
-    }
-
-    pub(in crate::server) fn semantic_index_memory_budget_bytes(&self) -> usize {
-        usize::try_from(
-            self.semantic_index_memory_budget_bytes
-                .load(Ordering::Acquire),
-        )
-        .unwrap_or(usize::MAX)
-    }
-}
-
-pub(super) struct CompletionMemoLookup {
-    pub(super) prior_pools: Vec<Option<Vec<usize>>>,
-    pub(super) hit_kind: &'static str,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub(super) struct RequestSettings {
-    pub(super) completion_enabled: bool,
-    pub(super) prefix_ranking: crate::completion::CompletionPrefixRanking,
-    pub(super) semantic_coloring_enabled: bool,
-    pub(super) scoping_enabled: bool,
-    pub(super) perf_logging_enabled: bool,
-}
-
-/// Indexed inputs and request-scoped settings captured before a feature begins.
-/// Document text/revision remains owned by `DocumentStore` and will be folded
-/// into this context in the next request-boundary phase.
-#[derive(Clone)]
-pub(super) struct RequestContext {
-    pub(super) engine: Arc<EngineSnapshot>,
-    pub(super) settings: RequestSettings,
-}
-
-#[derive(Clone)]
-pub(super) struct CachePublishReport {
-    pub(super) semantic_generation: SemanticGeneration,
-    pub(super) symbol_count: usize,
-    pub(super) include_count: usize,
-    pub(super) reference_file_count: usize,
-    pub(super) name_table_ms: u128,
-    pub(super) reach_graph_ms: u128,
-    pub(super) degraded: crate::progress::DegradedCapabilities,
-    pub(super) epoch: state::EngineEpoch,
-    pub(super) include_table_error: Option<String>,
-    pub(super) reference_file_list_error: Option<String>,
-}
-
 impl CacheLedger {
     pub(in crate::server) async fn current_engine_snapshot(
         &self,
@@ -841,6 +707,7 @@ impl CacheLedger {
             semantic_generation: current.semantic_generation,
             declaration_index: current.declaration_index.clone(),
             name_table: Some(table),
+            fallback_completion_table: current.fallback_completion_table.clone(),
             reach_graph: current.reach_graph.clone(),
             include_table: current.include_table.clone(),
             indexed_files: current.indexed_files.clone(),
@@ -867,6 +734,7 @@ impl CacheLedger {
             semantic_generation: current.semantic_generation,
             declaration_index: current.declaration_index.clone(),
             name_table: current.name_table.clone(),
+            fallback_completion_table: current.fallback_completion_table.clone(),
             reach_graph: current.reach_graph.clone(),
             include_table: current.include_table.clone(),
             indexed_files: Some(files),
@@ -889,6 +757,7 @@ impl CacheLedger {
             semantic_generation: current.semantic_generation,
             declaration_index: current.declaration_index.clone(),
             name_table: current.name_table.clone(),
+            fallback_completion_table: current.fallback_completion_table.clone(),
             reach_graph: Some(graph),
             include_table: current.include_table.clone(),
             indexed_files: current.indexed_files.clone(),
@@ -913,70 +782,5 @@ impl CacheLedger {
     #[cfg(test)]
     pub(super) fn reference_search_cache_len_for_test(&self) -> usize {
         self.reference_search_cache.len_for_test()
-    }
-}
-
-#[derive(Clone)]
-pub(super) struct WorkspaceSession {
-    pub(super) documents: DocumentStore,
-    pub(super) cache: CacheLedger,
-}
-
-impl WorkspaceSession {
-    pub(super) fn new(documents: DocumentStore, cache: CacheLedger) -> Self {
-        Self { documents, cache }
-    }
-
-    pub(super) async fn open_document(&self, uri: Url, version: i32, text: String) {
-        self.documents.open_document(uri, version, text).await;
-    }
-
-    #[cfg(test)]
-    pub(super) async fn change_document(&self, uri: Url, version: i32, text: String) {
-        self.documents
-            .change_document(uri.clone(), version, text)
-            .await;
-        self.cache.invalidate_references();
-    }
-
-    pub(super) async fn apply_document_changes(
-        &self,
-        uri: &Url,
-        version: i32,
-        changes: Vec<TextDocumentContentChangeEvent>,
-    ) -> bool {
-        let applied = self
-            .documents
-            .apply_document_changes(uri, version, changes)
-            .await;
-        if applied {
-            self.cache.invalidate_references();
-        }
-        applied
-    }
-
-    pub(super) async fn close_document(&self, uri: &Url) {
-        self.documents.close_document(uri).await;
-        self.cache.clear_completion_memo(uri).await;
-    }
-
-    pub(super) async fn save_document(&self, uri: &Url, generation: SemanticGeneration) {
-        self.documents.save_document(uri, generation).await;
-        self.cache.invalidate_references();
-    }
-
-    #[cfg(test)]
-    pub(super) async fn request_context_for_root(&self, root: PathBuf) -> RequestContext {
-        self.cache
-            .request_context(root, RequestSettings::default())
-            .await
-    }
-
-    pub(super) async fn request_context_for_root_with_settings(
-        &self,
-        root: PathBuf,
-        settings: RequestSettings,
-    ) -> RequestContext {
-        self.cache.request_context(root, settings).await
     }
 }

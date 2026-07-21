@@ -85,7 +85,7 @@ fn coloring_hard_gate_excludes_wrong_twin_in_same_basename_sample() {
     // Coloring's hard gate: scoped counts exclude the vendor twin
     // (not in the reachable set) -- only the local definition counts.
     let scoped = store
-        .kind_counts_by_names_scoped(&["util_value"], Some(&scope.files))
+        .declaration_kind_counts_by_names_scoped(&["util_value"], Some(&scope.files))
         .expect("scoped");
     assert_eq!(scoped["util_value"].get("function").copied(), Some(1));
 
@@ -129,7 +129,7 @@ fn scoping_off_preserves_global_counts_and_ambiguous_twins_stay_unknown() {
     let store = IndexStore::open_readonly(&db).expect("readonly");
     // Unscoped (scoping-off) counts: both workspace util_value defs count.
     let unscoped = store
-        .kind_counts_by_names(&["util_value"])
+        .declaration_kind_counts_by_names(&["util_value"])
         .expect("unscoped");
     assert_eq!(unscoped["util_value"].get("function").copied(), Some(2));
 

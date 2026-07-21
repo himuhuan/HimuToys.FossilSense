@@ -55,6 +55,104 @@ fn path_matches_glob_entry_wildcards() {
     assert!(!path_matches_glob_entry("src/c.c", "src/[ab].c"));
 }
 
+#[test]
+fn source_language_defaults_make_headers_and_inl_cpp() {
+    assert_eq!(
+        SourceLanguage::default_for_path(Path::new("include/widget.h")),
+        SourceLanguage::Cpp
+    );
+    assert_eq!(
+        SourceLanguage::default_for_path(Path::new("include/widget.inl")),
+        SourceLanguage::Cpp
+    );
+    assert_eq!(
+        SourceLanguage::default_for_path(Path::new("src/widget.c")),
+        SourceLanguage::C
+    );
+    assert_eq!(
+        SourceLanguage::default_for_path(Path::new("generated/widget.custom")),
+        SourceLanguage::C
+    );
+}
+
+#[test]
+fn language_overrides_use_relative_globs_and_last_match_wins() {
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path();
+    fs::write(
+        root.join("fossilsense.json"),
+        r#"{
+          "languageOverrides": [
+            { "glob": "legacy-c/**/*.h", "language": "c" },
+            { "glob": "legacy-c/special/*.h", "language": "cpp" },
+            { "glob": "legacy-c/special/final.h", "language": "c" }
+          ]
+        }"#,
+    )
+    .expect("config");
+    let (config, issue) = WorkspaceConfig::load(root);
+    assert!(issue.is_none());
+    let resolver = LanguageResolver::from_workspace_config(root, &config);
+
+    assert_eq!(
+        resolver.language_for_path(&root.join("legacy-c/direct.h")),
+        SourceLanguage::C,
+        "** must match zero intermediate directories"
+    );
+    assert_eq!(
+        resolver.language_for_path(&root.join("legacy-c/special/other.h")),
+        SourceLanguage::Cpp
+    );
+    assert_eq!(
+        resolver.language_for_path(&root.join("legacy-c/special/final.h")),
+        SourceLanguage::C,
+        "the final matching rule must win"
+    );
+}
+
+#[test]
+fn language_override_external_paths_match_normalized_absolute_globs() {
+    let dir = tempdir().expect("tempdir");
+    let workspace = dir.path().join("workspace");
+    let external = dir.path().join("sdk/include/api.h");
+    fs::create_dir_all(&workspace).expect("workspace");
+    let absolute_glob = normalize_language_match_path(&dir.path().join("sdk/**/*.h"));
+    let resolver = LanguageResolver::new(
+        Some(&workspace),
+        vec![LanguageOverride {
+            glob: absolute_glob,
+            language: SourceLanguage::C,
+        }],
+    );
+    assert_eq!(resolver.language_for_path(&external), SourceLanguage::C);
+}
+
+#[test]
+fn malformed_language_rules_do_not_discard_other_config_fields() {
+    let dir = tempdir().expect("tempdir");
+    fs::write(
+        dir.path().join("fossilsense.json"),
+        r#"{
+          "include": ["src"],
+          "extensions": ["c", "h", "custom"],
+          "languageOverrides": [
+            { "glob": "legacy/**/*.h", "language": "rust" },
+            { "glob": 42, "language": "c" },
+            { "glob": "generated/**/*.h", "language": "cpp" }
+          ]
+        }"#,
+    )
+    .expect("config");
+    let (config, issue) = WorkspaceConfig::load(dir.path());
+    let issue = issue.expect("invalid rules must be reported");
+    assert!(issue.message.contains("invalid language"));
+    assert!(issue.message.contains("malformed"));
+    assert_eq!(config.include, vec!["src"]);
+    assert_eq!(config.extensions, vec!["c", "h", "custom"]);
+    assert_eq!(config.language_overrides.len(), 1);
+    assert_eq!(config.language_overrides[0].language, SourceLanguage::Cpp);
+}
+
 // ---- is_in_scope ----
 
 #[test]

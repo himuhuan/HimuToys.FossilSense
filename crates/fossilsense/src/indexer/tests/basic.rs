@@ -36,7 +36,7 @@ fn indexes_mini_workspace_and_skips_unchanged_files() {
 
     assert_eq!(first.total_files, 2);
     assert_eq!(first.indexed_files, 2);
-    assert!(first.symbols >= 2);
+    assert!(first.declarations >= 2);
     assert_eq!(first.callable_anchors, 2);
     assert_eq!(first.call_sites, 1);
 
@@ -56,6 +56,62 @@ fn indexes_mini_workspace_and_skips_unchanged_files() {
     assert_eq!(second.skipped_files, 2);
     assert_eq!(second.callable_anchors, 2);
     assert_eq!(second.call_sites, 1);
+}
+
+#[test]
+fn indexer_uses_language_overrides_for_header_declaration_metadata() {
+    let dir = tempdir().expect("tempdir");
+    fs::create_dir_all(dir.path().join("legacy")).expect("legacy");
+    fs::write(
+        dir.path().join("fossilsense.json"),
+        r#"{
+          "languageOverrides": [
+            { "glob": "**/*.h", "language": "cpp" },
+            { "glob": "legacy/**/*.h", "language": "c" }
+          ]
+        }"#,
+    )
+    .expect("config");
+    fs::write(dir.path().join("legacy/api.h"), "int legacy_object;\n").expect("legacy header");
+    fs::write(dir.path().join("modern.h"), "int modern_object;\n").expect("modern header");
+    let db = dir.path().join("index.sqlite");
+
+    index_workspace(
+        dir.path(),
+        IndexOptions {
+            db_path: Some(db.clone()),
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("index");
+
+    let store = IndexStore::open_readonly(&db).expect("store");
+    let legacy = store
+        .declarations_by_name("legacy_object")
+        .expect("legacy declaration");
+    let modern = store
+        .declarations_by_name("modern_object")
+        .expect("modern declaration");
+    assert_eq!(legacy.len(), 1);
+    assert_eq!(modern.len(), 1);
+    assert_eq!(
+        legacy[0].fact.identity.language,
+        crate::semantic_model::SemanticLanguage::C
+    );
+    assert_eq!(
+        legacy[0].fact.role,
+        crate::semantic_model::SemanticDeclarationRole::TentativeDefinition
+    );
+    assert_eq!(
+        modern[0].fact.identity.language,
+        crate::semantic_model::SemanticLanguage::Cpp
+    );
+    assert_eq!(
+        modern[0].fact.role,
+        crate::semantic_model::SemanticDeclarationRole::Definition
+    );
 }
 
 #[test]
@@ -87,7 +143,7 @@ fn default_full_rebuild_publishes_side_by_side_and_preserves_old_reader() {
     let old_reader = IndexStore::open_readonly(&first_path).expect("old reader");
     assert_eq!(
         old_reader
-            .symbols_by_name("first_generation")
+            .declarations_by_name("first_generation")
             .expect("first symbol")
             .len(),
         1
@@ -113,19 +169,19 @@ fn default_full_rebuild_publishes_side_by_side_and_preserves_old_reader() {
 
     assert_eq!(
         old_reader
-            .symbols_by_name("first_generation")
+            .declarations_by_name("first_generation")
             .expect("old snapshot remains readable")
             .len(),
         1
     );
     let new_reader = IndexStore::open_readonly(&second_path).expect("new reader");
     assert!(new_reader
-        .symbols_by_name("first_generation")
+        .declarations_by_name("first_generation")
         .expect("old symbol removed")
         .is_empty());
     assert_eq!(
         new_reader
-            .symbols_by_name("second_generation")
+            .declarations_by_name("second_generation")
             .expect("new symbol")
             .len(),
         1
@@ -149,7 +205,7 @@ fn default_full_rebuild_publishes_side_by_side_and_preserves_old_reader() {
     let recovered_reader = IndexStore::open_readonly(&recovered_path).expect("recovered reader");
     assert_eq!(
         recovered_reader
-            .symbols_by_name("recovered_generation")
+            .declarations_by_name("recovered_generation")
             .expect("recovered symbol")
             .len(),
         1
@@ -206,12 +262,12 @@ fn dirty_file_update_reindexes_only_changed_file() {
 
     let store = IndexStore::open_readonly(&db).expect("store");
     assert!(store
-        .symbols_by_name("old_name")
+        .declarations_by_name("old_name")
         .expect("old symbols")
         .is_empty());
     assert_eq!(
         store
-            .symbols_by_name("new_name")
+            .declarations_by_name("new_name")
             .expect("new symbols")
             .len(),
         1
@@ -295,11 +351,11 @@ fn indexes_external_headers_and_marks_first_layer() {
     assert_eq!(stats.call_sites, 0, "external bodies are navigation leaves");
 
     let store = IndexStore::open_readonly(&db).expect("readonly");
-    assert!(store.external_symbol_count().expect("ext count") > 0);
+    assert!(store.external_declaration_count().expect("ext count") > 0);
 
     // ext.h is first-layer (directly included) → its defs color.
     let first = store
-        .kind_counts_by_names(&["size_t", "ExtType"])
+        .declaration_kind_counts_by_names(&["size_t", "ExtType"])
         .expect("first");
     assert!(
         first.contains_key("size_t"),
@@ -311,16 +367,18 @@ fn indexes_external_headers_and_marks_first_layer() {
     );
 
     // deep.h is transitively included only → excluded from coloring.
-    let deep = store.kind_counts_by_names(&["DeepType"]).expect("deep");
+    let deep = store
+        .declaration_kind_counts_by_names(&["DeepType"])
+        .expect("deep");
     assert!(
         !deep.contains_key("DeepType"),
         "transitive header must not color"
     );
 
     // size_t resolves to an external definition with an absolute path.
-    let defs = store.symbols_by_name("size_t").expect("size_t defs");
-    assert!(defs.iter().any(|r| r.source == "external"));
-    assert!(defs.iter().all(|r| r.path.contains('/')));
+    let defs = store.declarations_by_name("size_t").expect("size_t defs");
+    assert!(defs.iter().any(|r| r.external));
+    assert!(defs.iter().all(|r| r.fact.path.contains('/')));
     let _ = pathing::normalize_abs_path(ext.path());
 }
 
@@ -353,7 +411,7 @@ fn external_root_over_cap_indexes_no_symbols() {
 
     let store = IndexStore::open_readonly(&db).expect("readonly");
     // Over-cap root contributes no symbols; path resolution still works on disk.
-    assert_eq!(store.external_symbol_count().expect("ext count"), 0);
+    assert_eq!(store.external_declaration_count().expect("ext count"), 0);
 }
 
 #[test]
@@ -401,5 +459,5 @@ fn bounded_parse_write_pipeline_crosses_multiple_batches() {
 
     assert_eq!(stats.indexed_files, 300);
     assert_eq!(stats.total_files, 300);
-    assert_eq!(stats.symbols, 300);
+    assert_eq!(stats.declarations, 300);
 }

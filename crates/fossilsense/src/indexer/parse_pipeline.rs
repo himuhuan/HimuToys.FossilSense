@@ -9,7 +9,8 @@ use rayon::ThreadPoolBuilder;
 
 use super::candidates::FileCandidate;
 use super::ProgressLimiter;
-use crate::parser::{parse_thread_local_with_facts, FileSemanticIndex, ParseFacts};
+use crate::config::LanguageResolver;
+use crate::parser::{parse_thread_local_with_language, FileSemanticIndex, ParseFacts};
 use crate::progress::{IndexStats, IndexStatus};
 use crate::store::{FileIndexPayload, FileIndexUpdate, FileSource, IndexBuild, IndexStore};
 
@@ -24,9 +25,14 @@ struct ParsedFile {
     result: Result<FileSemanticIndex, String>,
 }
 
+pub(super) struct ParsePipelineConfig {
+    pub parse_threads: usize,
+    pub language_resolver: LanguageResolver,
+}
+
 pub(super) fn parse_and_write_changed(
     changed: Vec<FileCandidate>,
-    parse_threads: usize,
+    config: ParsePipelineConfig,
     build: IndexBuild,
     store: &mut IndexStore,
     workspace_display: &str,
@@ -45,12 +51,12 @@ pub(super) fn parse_and_write_changed(
 
     let parse_started = Instant::now();
     let pool = ThreadPoolBuilder::new()
-        .num_threads(parse_threads)
+        .num_threads(config.parse_threads)
         .stack_size(PARSER_THREAD_STACK_SIZE)
         .thread_name(|idx| format!("fossilsense-parser-{idx}"))
         .build()
         .context("failed to create parser thread pool")?;
-    let channel_capacity = parse_threads.saturating_mul(2).max(1);
+    let channel_capacity = config.parse_threads.saturating_mul(2).max(1);
     let (sender, receiver) = mpsc::sync_channel::<ParsedFile>(channel_capacity);
     let mut index_progress = ProgressLimiter::new();
     std::thread::scope(|scope| -> Result<()> {
@@ -61,7 +67,7 @@ pub(super) fn parse_and_write_changed(
                     .for_each_with(sender, |sender, candidate| {
                         // A closed receiver means the SQLite consumer failed; stop
                         // retaining parsed products and let the producer drain.
-                        let _ = sender.send(parse_candidate(candidate));
+                        let _ = sender.send(parse_candidate(candidate, &config.language_resolver));
                     });
             });
         });
@@ -116,11 +122,11 @@ fn write_parsed_batch(
     index_progress: &mut ProgressLimiter,
 ) -> Result<()> {
     let mut updates = Vec::with_capacity(batch.len());
-    let mut chunk_symbols = 0usize;
+    let mut chunk_declarations = 0usize;
     for parsed in batch {
         match &parsed.result {
             Ok(index) => {
-                chunk_symbols += index.persistent_facts().symbols.len();
+                chunk_declarations += index.persistent_facts().declarations.len();
                 updates.push(FileIndexUpdate {
                     fingerprint: &parsed.fingerprint,
                     source: parsed.source,
@@ -140,7 +146,7 @@ fn write_parsed_batch(
     stats.write_ms = stats
         .write_ms
         .saturating_add(write_started.elapsed().as_millis());
-    stats.symbols += chunk_symbols;
+    stats.declarations += chunk_declarations;
     stats.indexed_files += batch.len();
     stats.processed_files += batch.len();
     index_progress.maybe_emit(progress, workspace_display, stats, "indexing");
@@ -161,7 +167,7 @@ pub(super) fn parse_thread_count(override_threads: Option<usize>) -> usize {
     requested.max(1).min(available)
 }
 
-fn parse_candidate(candidate: FileCandidate) -> ParsedFile {
+fn parse_candidate(candidate: FileCandidate, language_resolver: &LanguageResolver) -> ParsedFile {
     let mut fingerprint = candidate.fingerprint;
     let result = match fs::read(&candidate.absolute_path) {
         Ok(bytes) => {
@@ -169,13 +175,17 @@ fn parse_candidate(candidate: FileCandidate) -> ParsedFile {
                 fingerprint.hash = blake3::hash(&bytes).to_hex().to_string();
             }
             let source = String::from_utf8_lossy(&bytes);
-            // `parse_thread_local_with_facts` uses the INDEX mask, skipping
+            // The thread-local parser uses the INDEX mask, skipping
             // request-time occurrence and local-declaration collection (those
             // vectors would be cleared before writing anyway).
             // It is infallible for ordinary parse problems (degrades to the
-            // lexical-fallback product), so the only error here is the file read.
-            let mut index =
-                parse_thread_local_with_facts(&candidate.absolute_path, &source, ParseFacts::INDEX);
+            // isolated completion fallback), so the only error here is the file read.
+            let mut index = parse_thread_local_with_language(
+                &candidate.absolute_path,
+                &source,
+                language_resolver.language_for_path(&candidate.absolute_path),
+                ParseFacts::INDEX,
+            );
             if candidate.source == FileSource::External {
                 index.retain_external_call_declarations();
             }

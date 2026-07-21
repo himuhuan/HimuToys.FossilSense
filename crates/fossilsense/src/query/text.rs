@@ -326,6 +326,18 @@ pub(super) fn is_boundary(bytes: &[u8], i: usize) -> bool {
 pub fn completion_word_score(prefix: &str, word: &str, locality_bonus: i32) -> Option<i32> {
     let needle = prefix.to_ascii_lowercase();
     let hay = word.to_ascii_lowercase();
+    completion_word_score_lowered(&needle, word, &hay, locality_bonus)
+}
+
+/// Allocation-free form for immutable name indexes that cache lowercase
+/// spellings. `needle` and `hay` must be the lowercase forms of `prefix` and
+/// `word`; keeping the original word preserves camel/underscore boundaries.
+pub(crate) fn completion_word_score_lowered(
+    needle: &str,
+    word: &str,
+    hay: &str,
+    locality_bonus: i32,
+) -> Option<i32> {
     if needle.len() < super::MIN_PREFIX_LEN || hay.len() < super::MIN_PREFIX_LEN {
         return None;
     }
@@ -335,12 +347,12 @@ pub fn completion_word_score(prefix: &str, word: &str, locality_bonus: i32) -> O
         return Some(700 + locality_bonus);
     }
 
-    let starts = hay.starts_with(&needle);
+    let starts = hay.starts_with(needle);
     if starts {
         return Some(550 + locality_bonus);
     }
 
-    let at = hay.find(&needle)?;
+    let at = hay.find(needle)?;
     if needle.len() < super::SHORT_PREFIX_MIN_LEN && !is_boundary(word.as_bytes(), at) {
         return None;
     }

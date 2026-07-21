@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 
 use crate::parser::{
-    FactAvailability, FactGroup, FactSource, FileSemanticIndex, SymbolKind, SymbolRole, TypeAlias,
+    FactAvailability, FactGroup, FactSource, FileSemanticIndex, SymbolKind, SymbolRole,
 };
+use crate::semantic_model::{SemanticDeclarationKind, SemanticDeclarationRole};
 
 use super::{byte_offset_at, completion_word_score};
 
@@ -38,68 +39,38 @@ pub fn current_file_overlay_candidates(
     let request_facts = index.request_facts();
     let usage_stats = occurrence_usage_stats(request_facts.occurrences, cursor_byte, prefix);
 
-    for symbol in persistent_facts.symbols {
+    for declaration in persistent_facts.declarations {
         // C declarations become visible in source order.  The durable name
         // table has no cursor dimension, so the open-document overlay is the
         // authority for `Current` candidates and must not publish anchors
         // which have not appeared yet.
-        if symbol.start_byte >= cursor_byte {
+        if declaration.name_range.start_byte >= cursor_byte {
             continue;
         }
-        if !is_overlay_symbol(symbol.kind, symbol.role) {
+        let Some((kind, role)) =
+            declaration_presentation(declaration.declaration_kind, declaration.role)
+        else {
             continue;
-        }
-        let Some(match_score) = completion_word_score(prefix, &symbol.name, 0) else {
+        };
+        let Some(match_score) = completion_word_score(prefix, &declaration.name, 0) else {
             continue;
         };
         let proximity_score = usage_stats
-            .get(&symbol.name)
+            .get(&declaration.name)
             .map_or(0, |stats| proximity_score(stats, cursor_byte));
         keep_best(
             &mut by_name,
             CurrentFileOverlayCandidate {
-                name: symbol.name.clone(),
-                kind: symbol.kind,
-                role: Some(symbol.role),
-                detail: Some("current".to_string()),
+                name: declaration.name.clone(),
+                kind,
+                role: Some(role),
+                detail: declaration
+                    .canonical_signature
+                    .clone()
+                    .or_else(|| Some("current".to_string())),
                 match_score,
                 proximity_score,
-                source_start_byte: symbol.start_byte,
-                semantic: true,
-            },
-            cursor_byte,
-        );
-    }
-
-    for alias in persistent_facts.aliases {
-        if alias.start_byte >= cursor_byte {
-            continue;
-        }
-        add_alias_candidate(&mut by_name, alias, prefix, cursor_byte, &usage_stats);
-    }
-
-    add_cpp_using_alias_candidates(&mut by_name, text, cursor_byte, prefix, &usage_stats);
-
-    for record in persistent_facts.records {
-        if record.start_byte >= cursor_byte {
-            continue;
-        }
-        let Some(match_score) = completion_word_score(prefix, &record.display_name, 0) else {
-            continue;
-        };
-        let proximity_score = usage_stats
-            .get(&record.display_name)
-            .map_or(0, |stats| proximity_score(stats, cursor_byte));
-        keep_best(
-            &mut by_name,
-            CurrentFileOverlayCandidate {
-                name: record.display_name.clone(),
-                kind: SymbolKind::Type,
-                role: Some(SymbolRole::Definition),
-                detail: Some("current".to_string()),
-                match_score,
-                proximity_score,
-                source_start_byte: record.start_byte,
+                source_start_byte: declaration.name_range.start_byte,
                 semantic: true,
             },
             cursor_byte,
@@ -137,130 +108,24 @@ pub fn current_file_overlay_candidates(
     hits
 }
 
-fn is_overlay_symbol(kind: SymbolKind, role: SymbolRole) -> bool {
-    match kind {
-        SymbolKind::Function => matches!(role, SymbolRole::Definition | SymbolRole::Declaration),
-        SymbolKind::GlobalVariable => matches!(
-            role,
-            SymbolRole::Definition
-                | SymbolRole::Declaration
-                | SymbolRole::TentativeDefinition
-                | SymbolRole::UnknownDeclarationOrDefinition
-        ),
-        SymbolKind::Macro | SymbolKind::Type | SymbolKind::EnumConstant => {
-            role == SymbolRole::Definition
-        }
-        SymbolKind::Field => false,
-    }
-}
-
-fn add_alias_candidate(
-    by_name: &mut HashMap<String, CurrentFileOverlayCandidate>,
-    alias: &TypeAlias,
-    prefix: &str,
-    cursor_byte: usize,
-    usage_stats: &HashMap<String, UsageStats>,
-) {
-    let Some(match_score) = completion_word_score(prefix, &alias.alias, 0) else {
-        return;
+fn declaration_presentation(
+    kind: SemanticDeclarationKind,
+    role: SemanticDeclarationRole,
+) -> Option<(SymbolKind, SymbolRole)> {
+    let kind = match kind {
+        SemanticDeclarationKind::Function | SemanticDeclarationKind::Method => SymbolKind::Function,
+        SemanticDeclarationKind::Object => SymbolKind::GlobalVariable,
+        SemanticDeclarationKind::Type | SemanticDeclarationKind::Alias => SymbolKind::Type,
+        SemanticDeclarationKind::EnumConstant => SymbolKind::EnumConstant,
+        SemanticDeclarationKind::Macro => SymbolKind::Macro,
     };
-    let proximity_score = usage_stats
-        .get(&alias.alias)
-        .map_or(0, |stats| proximity_score(stats, cursor_byte));
-    keep_best(
-        by_name,
-        CurrentFileOverlayCandidate {
-            name: alias.alias.clone(),
-            kind: SymbolKind::Type,
-            role: Some(SymbolRole::Definition),
-            detail: Some("current".to_string()),
-            match_score,
-            proximity_score,
-            source_start_byte: alias.start_byte,
-            semantic: true,
-        },
-        cursor_byte,
-    );
-}
-
-fn add_cpp_using_alias_candidates(
-    by_name: &mut HashMap<String, CurrentFileOverlayCandidate>,
-    text: &str,
-    cursor_byte: usize,
-    prefix: &str,
-    usage_stats: &HashMap<String, UsageStats>,
-) {
-    for (alias, start_byte) in cpp_using_aliases_before_cursor(text, cursor_byte) {
-        let Some(match_score) = completion_word_score(prefix, &alias, 0) else {
-            continue;
-        };
-        let proximity_score = usage_stats
-            .get(&alias)
-            .map_or(0, |stats| proximity_score(stats, cursor_byte));
-        keep_best(
-            by_name,
-            CurrentFileOverlayCandidate {
-                name: alias,
-                kind: SymbolKind::Type,
-                role: Some(SymbolRole::Definition),
-                detail: Some("current".to_string()),
-                match_score,
-                proximity_score,
-                source_start_byte: start_byte,
-                semantic: true,
-            },
-            cursor_byte,
-        );
-    }
-}
-
-fn cpp_using_aliases_before_cursor(text: &str, cursor_byte: usize) -> Vec<(String, usize)> {
-    let end = cursor_byte.min(text.len());
-    let bytes = text.as_bytes();
-    let mut aliases = Vec::new();
-    let mut index = 0usize;
-
-    while index < end {
-        if !keyword_at(bytes, index, end, b"using") {
-            index += 1;
-            continue;
-        }
-
-        let mut cursor = skip_ascii_whitespace(bytes, index + b"using".len(), end);
-        if cursor >= end || !is_ident_start(bytes[cursor]) {
-            index += b"using".len();
-            continue;
-        }
-
-        let alias_start = cursor;
-        cursor += 1;
-        while cursor < end && is_ident_continue(bytes[cursor]) {
-            cursor += 1;
-        }
-        let alias_end = cursor;
-        cursor = skip_ascii_whitespace(bytes, cursor, end);
-        if cursor < end && bytes[cursor] == b'=' {
-            aliases.push((text[alias_start..alias_end].to_string(), alias_start));
-        }
-        index = cursor.saturating_add(1);
-    }
-
-    aliases
-}
-
-fn keyword_at(bytes: &[u8], index: usize, end: usize, keyword: &[u8]) -> bool {
-    let keyword_end = index.saturating_add(keyword.len());
-    keyword_end <= end
-        && bytes[index..keyword_end].eq(keyword)
-        && (index == 0 || !is_ident_continue(bytes[index - 1]))
-        && (keyword_end >= end || !is_ident_continue(bytes[keyword_end]))
-}
-
-fn skip_ascii_whitespace(bytes: &[u8], mut index: usize, end: usize) -> usize {
-    while index < end && bytes[index].is_ascii_whitespace() {
-        index += 1;
-    }
-    index
+    let role = match role {
+        SemanticDeclarationRole::Declaration => SymbolRole::Declaration,
+        SemanticDeclarationRole::Definition => SymbolRole::Definition,
+        SemanticDeclarationRole::TentativeDefinition => SymbolRole::TentativeDefinition,
+        SemanticDeclarationRole::Unknown => SymbolRole::UnknownDeclarationOrDefinition,
+    };
+    Some((kind, role))
 }
 
 #[derive(Debug, Clone)]
@@ -493,7 +358,7 @@ mod tests {
             .expect("function declaration overlay candidate");
 
         assert_eq!(hit.kind, crate::parser::SymbolKind::Function);
-        assert_eq!(hit.detail.as_deref(), Some("current"));
+        assert_eq!(hit.detail.as_deref(), Some("int fs_do_work(void)"));
         assert!(hit.semantic);
     }
 
@@ -555,8 +420,23 @@ mod tests {
             .expect("C++ using alias overlay candidate");
 
         assert_eq!(hit.kind, crate::parser::SymbolKind::Type);
-        assert_eq!(hit.detail.as_deref(), Some("current"));
+        assert_eq!(hit.detail.as_deref(), Some("using FsAlias = int;"));
         assert!(hit.semantic);
+    }
+
+    #[test]
+    fn cpp_using_text_in_comments_never_becomes_a_semantic_overlay_alias() {
+        let (text, line, character) = cursor_from_marker(
+            "// using PhantomAlias = int;\n\
+             void f(void) { Pha/*cursor*/ }\n",
+        );
+        let parsed = crate::parser::parse(std::path::Path::new("a.cpp"), &text);
+
+        let hits = current_file_overlay_candidates(&parsed, &text, line, character, "Pha", 20);
+        assert!(hits
+            .iter()
+            .filter(|hit| hit.name == "PhantomAlias")
+            .all(|hit| !hit.semantic));
     }
 
     #[test]
@@ -593,7 +473,7 @@ mod tests {
         );
         let mut parsed = crate::parser::parse(std::path::Path::new("a.c"), &text);
         parsed.occurrences.clear();
-        parsed.symbols.clear();
+        parsed.declarations.clear();
         parsed.aliases.clear();
         parsed.records.clear();
 
@@ -614,7 +494,7 @@ mod tests {
              }\n",
         );
         let mut parsed = crate::parser::parse(std::path::Path::new("a.c"), &text);
-        parsed.symbols.clear();
+        parsed.declarations.clear();
         parsed.aliases.clear();
         parsed.records.clear();
 

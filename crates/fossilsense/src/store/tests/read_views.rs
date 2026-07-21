@@ -53,7 +53,20 @@ fn declaration_view_round_trips_canonical_identity_and_backing() {
             !matches!(row.fact.backing, DeclarationBacking::None),
             "{name} must retain an explicit specialized backing"
         );
-        assert!(row.backing_id.is_some(), "{name} backing id must resolve");
+        match row.fact.backing {
+            DeclarationBacking::CallableAnchor { .. }
+            | DeclarationBacking::Record { .. }
+            | DeclarationBacking::TypeAlias { .. } => {
+                assert!(row.backing_id.is_some(), "{name} backing id must resolve")
+            }
+            DeclarationBacking::SourceRange { .. } => {
+                assert!(
+                    row.backing_id.is_none(),
+                    "source ranges have no database foreign key"
+                )
+            }
+            DeclarationBacking::None => unreachable!(),
+        }
         let (same_entity, limited) = reader
             .declaration_view()
             .by_logical_key_limited(&row.fact.identity.logical_key, 8)
@@ -64,7 +77,7 @@ fn declaration_view_round_trips_canonical_identity_and_backing() {
 }
 
 #[test]
-fn name_table_read_view_exposes_typed_symbol_rows_and_legacy_wrapper_parity() {
+fn declaration_name_view_exposes_typed_rows_and_streaming_parity() {
     let dir = tempdir().expect("tempdir");
     let db = dir.path().join("index.sqlite");
     let mut store = IndexStore::open(&db, dir.path()).expect("store");
@@ -85,34 +98,36 @@ fn name_table_read_view_exposes_typed_symbol_rows_and_legacy_wrapper_parity() {
         .expect("direct external");
 
     let reader = IndexStore::open_readonly(&db).expect("readonly");
-    let rows = reader.name_table_view().symbol_rows().expect("rows");
+    let rows = reader.declaration_view().all_name_rows().expect("rows");
     let external = rows
         .iter()
-        .find(|row| row.label == "ext_size_t")
+        .find(|row| row.name == "ext_size_t")
         .expect("external row");
-    assert_eq!(external.symbol_id, external.id);
     assert!(external.external);
     assert_eq!(external.path, "C:/sdk/include/ext_size.h");
-    assert_eq!(external.kind, "type");
+    assert_eq!(
+        external.declaration_kind,
+        crate::semantic_model::SemanticDeclarationKind::Alias
+    );
     assert!(external.directly_included);
 
     let path_rows = reader
-        .name_table_view()
-        .symbol_rows_for_paths(&["src/main.c".to_string()])
+        .declaration_view()
+        .name_rows_for_paths(&["src/main.c".to_string()])
         .expect("path rows");
     assert_eq!(path_rows.len(), 1);
-    assert_eq!(path_rows[0].label, "main_entry");
+    assert_eq!(path_rows[0].name, "main_entry");
 
     let mut visited = Vec::new();
     let visited_count = reader
-        .name_table_view()
-        .visit_symbol_rows(|row| {
+        .declaration_view()
+        .visit_name_rows(|row| {
             visited.push((
-                row.symbol_id,
-                row.label.to_string(),
+                row.id,
+                row.name.to_string(),
                 row.external,
                 row.path.to_string(),
-                row.kind.to_string(),
+                row.declaration_kind,
                 row.directly_included,
             ));
             Ok(())
@@ -120,18 +135,20 @@ fn name_table_read_view_exposes_typed_symbol_rows_and_legacy_wrapper_parity() {
         .expect("visit rows");
     assert_eq!(visited_count, rows.len());
 
-    let view_tuples: Vec<_> = rows
+    let owned: Vec<_> = rows
         .into_iter()
-        .map(crate::store::views::NameTableSymbolRow::into_legacy_tuple)
+        .map(|row| {
+            (
+                row.id,
+                row.name,
+                row.external,
+                row.path,
+                row.declaration_kind,
+                row.directly_included,
+            )
+        })
         .collect();
-    assert_eq!(
-        view_tuples,
-        reader
-            .load_symbol_names_with_paths()
-            .expect("compat wrapper"),
-        "compatibility wrapper must preserve the old tuple shape and ordering"
-    );
-    assert_eq!(visited, view_tuples);
+    assert_eq!(visited, owned);
 }
 
 #[test]
@@ -218,7 +235,7 @@ fn include_read_views_expose_typed_reach_and_completion_rows() {
 }
 
 #[test]
-fn symbol_reference_and_member_read_views_preserve_existing_domain_shapes() {
+fn declaration_reference_and_member_read_views_preserve_domain_shapes() {
     use crate::parser::MemberKind;
 
     let dir = tempdir().expect("tempdir");
@@ -233,15 +250,17 @@ fn symbol_reference_and_member_read_views_preserve_existing_domain_shapes() {
     );
 
     let reader = IndexStore::open_readonly(&db).expect("readonly");
-    let symbols = reader
-        .symbol_read_view()
-        .symbols_by_name("use_base")
-        .expect("symbol");
-    assert_eq!(symbols, reader.symbols_by_name("use_base").expect("compat"));
-    let ids: Vec<i64> = symbols.iter().map(|symbol| symbol.id).collect();
+    let declarations = reader
+        .declaration_view()
+        .by_name("use_base")
+        .expect("declaration");
+    let ids: Vec<i64> = declarations
+        .iter()
+        .map(|declaration| declaration.id)
+        .collect();
     assert_eq!(
-        reader.symbol_read_view().symbols_by_ids(&ids).expect("ids"),
-        reader.symbols_by_ids(&ids).expect("compat ids")
+        reader.declaration_view().by_ids(&ids).expect("ids"),
+        declarations
     );
 
     assert_eq!(
@@ -295,7 +314,7 @@ fn symbol_reference_and_member_read_views_preserve_existing_domain_shapes() {
 }
 
 #[test]
-fn bounded_exact_name_symbol_read_can_reserve_a_reachable_path() {
+fn bounded_exact_name_declaration_read_can_reserve_a_reachable_path() {
     let dir = tempdir().expect("tempdir");
     let db = dir.path().join("index.sqlite");
     let mut store = IndexStore::open(&db, dir.path()).expect("store");
@@ -304,17 +323,17 @@ fn bounded_exact_name_symbol_read_can_reserve_a_reachable_path() {
     upsert_source(&mut store, "zzz/reachable.h", "int crowded_value = 1;\n");
 
     let (global, global_truncated) = store
-        .symbol_read_view()
-        .symbols_by_name_limited("crowded_value", 256)
+        .declaration_view()
+        .by_name_limited("crowded_value", 256)
         .expect("global exact-name rows");
     assert!(global_truncated);
-    assert!(global.iter().all(|row| row.path == "aaa/noise.h"));
+    assert!(global.iter().all(|row| row.fact.path == "aaa/noise.h"));
 
     let (reachable, reachable_truncated) = store
-        .symbol_read_view()
-        .symbols_by_name_in_paths_limited("crowded_value", &["zzz/reachable.h".into()], 1)
+        .declaration_view()
+        .by_name_in_paths_limited("crowded_value", &["zzz/reachable.h".into()], 1)
         .expect("reachable exact-name rows");
     assert!(!reachable_truncated);
     assert_eq!(reachable.len(), 1);
-    assert_eq!(reachable[0].path, "zzz/reachable.h");
+    assert_eq!(reachable[0].fact.path, "zzz/reachable.h");
 }

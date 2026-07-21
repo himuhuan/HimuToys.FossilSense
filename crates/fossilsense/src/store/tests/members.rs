@@ -23,8 +23,8 @@ fn fields_by_record_and_alias_normalization() {
     assert_eq!(by_alias, by_tag);
 
     // Fields never leak into the fuzzy name table (no member in normal completion).
-    let names = reader.load_symbol_names().expect("names");
-    assert!(!names.iter().any(|(_, name, _)| name == "a"));
+    let names = reader.declaration_name_rows().expect("names");
+    assert!(!names.iter().any(|row| row.name == "a"));
 }
 
 #[test]
@@ -333,9 +333,9 @@ fn member_completion_pipeline_resolves_cross_file_and_falls_back() {
 #[test]
 fn name_table_from_index_carries_correct_kind_without_second_store() {
     // Pipeline test: after indexing, build the NameTable directly from the
-    // store's name loader. Each hit carries the cached `kind` so the
+    // canonical declaration-name loader. Each hit carries the cached `kind` so the
     // completion hot path can render an icon without re-opening the store
-    // or calling `symbols_by_ids`.
+    // or hydrating a declaration row by ID.
     use crate::parser::SymbolKind;
 
     let dir = tempdir().expect("tempdir");
@@ -358,9 +358,10 @@ fn name_table_from_index_carries_correct_kind_without_second_store() {
 
     let reader = IndexStore::open_readonly(&db).expect("readonly");
     // Build the NameTable from the name loader only — no second store open,
-    // no `symbols_by_ids`. Kind is cached inline.
-    let names = reader.load_symbol_names_with_paths().expect("names");
-    let table = crate::query::NameTable::build_with_paths(names);
+    // Declaration kind is cached inline; no secondary symbol hydration exists.
+    let table =
+        crate::query::NameTable::build_from_declaration_view(&reader.declaration_view(), None)
+            .expect("declaration names");
 
     // hello_value is a function (declared in the header, defined in the
     // source; at least one hit must carry Function).
@@ -397,11 +398,11 @@ fn name_table_from_index_carries_correct_kind_without_second_store() {
         "fields must not appear in the name table"
     );
     assert!(
-        !table
+        table
             .search_ranked("resize", 10)
             .iter()
-            .any(|h| h.name == "resize"),
-        "member methods must not appear in the name table"
+            .any(|h| h.name == "resize" && h.kind == SymbolKind::Function),
+        "canonical method declarations participate in ordinary name recall"
     );
 }
 

@@ -5,15 +5,14 @@ use rusqlite::{params, Connection};
 
 use crate::call_model::SignatureFidelity;
 use crate::semantic_model::{
-    AliasTarget, AliasTargetFidelity, DeclarationBacking, LanguageFidelity, RecordRangeFidelity,
-    SemanticDeclarationKind, SemanticDeclarationRole, SemanticFactFidelity, SemanticFactProvenance,
-    SemanticLanguage, PARSER_FACT_VERSION,
+    AliasTarget, AliasTargetFidelity, CompletionKindHint, DeclarationBacking, LanguageFidelity,
+    ParseOutcome, RecordRangeFidelity, SemanticDeclarationKind, SemanticDeclarationRole,
+    SemanticFactFidelity, SemanticFactProvenance, SemanticLanguage, PARSER_FACT_VERSION,
 };
 
 use super::{
     include_normalized_metadata, member_confidence_to_str, member_kind_to_str, now_unix_secs,
-    record_confidence_to_str, record_kind_to_str, symbol_kind, symbol_role, FileIndexPayload,
-    FileIndexUpdate, IndexBuild,
+    record_confidence_to_str, record_kind_to_str, FileIndexPayload, FileIndexUpdate, IndexBuild,
 };
 
 pub(super) fn stage_file_updates(
@@ -46,11 +45,11 @@ pub(super) fn stage_file_updates(
              VALUES (?1, ?2, ?3)
              ON CONFLICT(build_id, file_id) DO UPDATE SET revision_id = excluded.revision_id",
         )?;
-        let mut symbol_stmt = tx.prepare(
-            "INSERT INTO symbol_facts (
-                    revision_id, file_id, name, kind, role, start_byte, end_byte,
-                    start_line, start_col, end_line, end_col, signature, guard, container
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        let mut fallback_completion_stmt = tx.prepare(
+            "INSERT INTO fallback_completion_facts (
+                    revision_id, file_id, name, kind_hint, start_byte, end_byte,
+                    start_line, start_col, end_line, end_col, detail
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         )?;
         let mut declaration_stmt = tx.prepare(
             "INSERT INTO declaration_facts (
@@ -205,31 +204,53 @@ pub(super) fn stage_file_updates(
             };
             let facts = index.persistent_facts();
 
-            let mut symbol_ids = HashMap::new();
-            let mut symbol_ids_by_name: HashMap<&str, Vec<(usize, i64)>> = HashMap::new();
-            for symbol in facts.symbols {
-                symbol_stmt.execute(params![
+            match facts.parse_outcome {
+                ParseOutcome::Ast | ParseOutcome::PartialAst if fallback_used != 0 => {
+                    anyhow::bail!("AST parse outcome cannot be persisted as a fallback revision");
+                }
+                ParseOutcome::LexicalFallback if fallback_used == 0 => {
+                    anyhow::bail!("lexical fallback outcome requires a fallback revision");
+                }
+                _ => {}
+            }
+
+            if fallback_used == 0 && !facts.fallback_completions.is_empty() {
+                anyhow::bail!("AST revision attempted to persist fallback completions");
+            }
+            if fallback_used != 0 && !facts.declarations.is_empty() {
+                anyhow::bail!("fallback revision attempted to persist declarations");
+            }
+            if fallback_used != 0
+                && (!facts.records.is_empty()
+                    || !facts.fields.is_empty()
+                    || !facts.members.is_empty()
+                    || !facts.aliases.is_empty()
+                    || !facts.callable_anchors.is_empty()
+                    || !facts.call_sites.is_empty())
+            {
+                anyhow::bail!("fallback revision attempted to persist AST semantic facts");
+            }
+            if facts
+                .declarations
+                .iter()
+                .any(|fact| fact.identity.provenance != SemanticFactProvenance::Ast)
+            {
+                anyhow::bail!("canonical declaration persistence requires AST provenance");
+            }
+            for fallback in facts.fallback_completions {
+                fallback_completion_stmt.execute(params![
                     revision_id,
                     file_id,
-                    symbol.name.as_str(),
-                    symbol_kind(symbol.kind),
-                    symbol_role(symbol.role),
-                    symbol.start_byte as i64,
-                    symbol.end_byte as i64,
-                    symbol.start_line as i64,
-                    symbol.start_col as i64,
-                    symbol.end_line as i64,
-                    symbol.end_col as i64,
-                    symbol.signature.as_str(),
-                    symbol.guard.as_deref(),
-                    symbol.container.as_deref(),
+                    fallback.name.as_str(),
+                    completion_kind_hint_code(fallback.kind_hint),
+                    fallback.range.start_byte as i64,
+                    fallback.range.end_byte as i64,
+                    fallback.range.start.line as i64,
+                    fallback.range.start.character as i64,
+                    fallback.range.end.line as i64,
+                    fallback.range.end.character as i64,
+                    fallback.detail.as_deref(),
                 ])?;
-                let symbol_id = tx.last_insert_rowid();
-                symbol_ids.insert((symbol.start_byte, symbol.end_byte), symbol_id);
-                symbol_ids_by_name
-                    .entry(symbol.name.as_str())
-                    .or_default()
-                    .push((symbol.start_byte, symbol_id));
             }
 
             for include in facts.includes {
@@ -528,30 +549,19 @@ pub(super) fn stage_file_updates(
                             None,
                             None,
                         ),
-                        DeclarationBacking::Symbol {
-                            start_byte,
-                            end_byte,
-                        } => (
-                            "symbol",
-                            symbol_ids
-                                .get(&(*start_byte, *end_byte))
-                                .copied()
-                                .or_else(|| {
-                                    symbol_ids_by_name.get(declaration.name.as_str()).and_then(
-                                        |symbols| {
-                                            symbols
-                                                .iter()
-                                                .min_by_key(|(candidate_start, _)| {
-                                                    candidate_start.abs_diff(*start_byte)
-                                                })
-                                                .map(|(_, id)| *id)
-                                        },
-                                    )
-                                }),
-                            None,
-                            Some(*start_byte as i64),
-                            Some(*end_byte as i64),
-                        ),
+                        DeclarationBacking::SourceRange { range } => {
+                            debug_assert_eq!(
+                                range, &declaration.name_range,
+                                "source-range declaration backing must round-trip through the stored name range"
+                            );
+                            (
+                                "source_range",
+                                None,
+                                None,
+                                Some(range.start_byte as i64),
+                                Some(range.end_byte as i64),
+                            )
+                        }
                         DeclarationBacking::None => ("none", None, None, None, None),
                     };
                 let logical_key = serde_json::to_vec(&declaration.identity.logical_key)?;
@@ -640,6 +650,15 @@ fn declaration_kind_code(kind: SemanticDeclarationKind) -> i64 {
     }
 }
 
+fn completion_kind_hint_code(kind: CompletionKindHint) -> i64 {
+    match kind {
+        CompletionKindHint::Function => 0,
+        CompletionKindHint::Macro => 1,
+        CompletionKindHint::Type => 2,
+        CompletionKindHint::Object => 3,
+    }
+}
+
 fn declaration_role_code(role: SemanticDeclarationRole) -> i64 {
     match role {
         SemanticDeclarationRole::Declaration => 0,
@@ -677,8 +696,6 @@ fn language_fidelity_code(fidelity: LanguageFidelity) -> i64 {
 fn semantic_provenance_code(provenance: SemanticFactProvenance) -> i64 {
     match provenance {
         SemanticFactProvenance::Ast => 0,
-        SemanticFactProvenance::LexicalFallback => 1,
-        SemanticFactProvenance::Synthetic => 2,
     }
 }
 
@@ -708,7 +725,6 @@ fn alias_target_fidelity_to_str(fidelity: AliasTargetFidelity) -> &'static str {
 fn signature_fidelity_code(fidelity: SignatureFidelity) -> i64 {
     match fidelity {
         SignatureFidelity::AstExact => 0,
-        SignatureFidelity::LexicalFallback => 1,
         SignatureFidelity::Malformed => 2,
     }
 }
@@ -756,7 +772,6 @@ fn call_form_code(form: crate::call_model::CallForm) -> i64 {
 fn fact_flags(provenance: crate::call_model::FactProvenance, syntax_error: bool) -> i64 {
     let provenance = match provenance {
         crate::call_model::FactProvenance::Ast => 0,
-        crate::call_model::FactProvenance::LexicalFallback => 1,
         crate::call_model::FactProvenance::Synthetic => 2,
     };
     provenance | (i64::from(syntax_error) << 8)

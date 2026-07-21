@@ -2,18 +2,77 @@ use std::sync::OnceLock;
 
 use regex::Regex;
 
-use super::{Include, Symbol, SymbolKind, SymbolRole};
+use super::{Include, RawDeclaration, SymbolKind, SymbolRole};
+use crate::call_model::{SourcePosition, SourceRange};
+use crate::config::SourceLanguage;
+use crate::semantic_model::{CompletionKindHint, FallbackCompletionFact};
 
-/// Line-based lexical extraction of top-level symbols and `#include` lines. Pure
-/// string scanning — no tree-sitter — so it cannot fail and is the basis of the
-/// lexical-fallback path when tree-sitter yields no usable tree.
-pub(super) fn extract_symbols_and_includes(
+mod declarators;
+
+use declarators::*;
+
+/// The only lexical pass that runs on every parse.
+pub(super) fn scan_includes(source: &str) -> Vec<Include> {
+    let mut in_leading_block_comment = false;
+    source
+        .lines()
+        .enumerate()
+        .filter_map(|(line, text)| {
+            let code = strip_leading_comments(text, &mut in_leading_block_comment);
+            capture_include(code.trim(), line)
+        })
+        .collect()
+}
+
+/// Last-resort name hints. These facts deliberately carry no semantic identity
+/// or navigation locator and are only exposed through the fallback completion
+/// channel.
+pub(super) fn extract_fallback_completions(
+    source: &str,
+    language: SourceLanguage,
+) -> Vec<FallbackCompletionFact> {
+    let starts = super::line_starts(source);
+    let symbols =
+        extract_fallback_declarations_raw(source, &starts, language == SourceLanguage::Cpp);
+    symbols
+        .into_iter()
+        .filter_map(|symbol| {
+            let kind_hint = match symbol.kind {
+                SymbolKind::Function => CompletionKindHint::Function,
+                SymbolKind::Macro => CompletionKindHint::Macro,
+                SymbolKind::Type => CompletionKindHint::Type,
+                SymbolKind::GlobalVariable | SymbolKind::EnumConstant => CompletionKindHint::Object,
+                SymbolKind::Field => return None,
+            };
+            Some(FallbackCompletionFact {
+                name: symbol.name,
+                kind_hint,
+                range: SourceRange {
+                    start: SourcePosition {
+                        line: symbol.start_line as u32,
+                        character: symbol.start_col as u32,
+                    },
+                    end: SourcePosition {
+                        line: symbol.end_line as u32,
+                        character: symbol.end_col as u32,
+                    },
+                    start_byte: symbol.start_byte,
+                    end_byte: symbol.end_byte,
+                },
+                detail: (!symbol.signature.is_empty()).then_some(symbol.signature),
+            })
+        })
+        .collect()
+}
+
+/// Private staging for completion-only name hints. Its declaration-shaped
+/// records never leave this module and are converted to `FallbackCompletionFact`.
+fn extract_fallback_declarations_raw(
     source: &str,
     line_starts: &[usize],
     is_cpp: bool,
-) -> (Vec<Symbol>, Vec<Include>) {
+) -> Vec<RawDeclaration> {
     let mut symbols = Vec::new();
-    let mut includes = Vec::new();
     let mut guard_stack = Vec::new();
     let mut brace_depth = 0isize;
     let mut brace_state = BraceScanState::default();
@@ -33,12 +92,6 @@ pub(super) fn extract_symbols_and_includes(
         } else {
             code_brace_delta(&line, &mut brace_state)
         };
-
-        if directive_start {
-            if let Some(include) = capture_include(trimmed, line_index) {
-                includes.push(include);
-            }
-        }
 
         if directive_start {
             if let Some(symbol) = capture_macro(
@@ -78,7 +131,19 @@ pub(super) fn extract_symbols_and_includes(
         preprocessor_continuation = preprocessor_line && line_continues_preprocessor(&line);
     }
 
-    (symbols, includes)
+    symbols
+}
+
+#[cfg(test)]
+pub(super) fn extract_symbols_and_includes(
+    source: &str,
+    line_starts: &[usize],
+    is_cpp: bool,
+) -> (Vec<RawDeclaration>, Vec<Include>) {
+    (
+        extract_fallback_declarations_raw(source, line_starts, is_cpp),
+        scan_includes(source),
+    )
 }
 
 fn strip_leading_comments(line: &str, in_block_comment: &mut bool) -> String {
@@ -126,7 +191,7 @@ fn capture_macro(
     line_starts: &[usize],
     source: &str,
     guard: Option<String>,
-) -> Option<Symbol> {
+) -> Option<RawDeclaration> {
     let captures = macro_regex().captures(line.trim())?;
     let name = captures.get(1)?.as_str();
     Some(make_symbol(
@@ -148,7 +213,7 @@ fn capture_statement_symbols(
     source: &str,
     guard: Option<String>,
     is_cpp: bool,
-) -> Vec<Symbol> {
+) -> Vec<RawDeclaration> {
     // All regex classification must see code only. In particular, flattening a
     // multi-line record before removing `//` comments can turn
     // `// ... class\nconst char *name;` into the false tag declaration
@@ -290,7 +355,7 @@ fn capture_function(
     line_starts: &[usize],
     source: &str,
     guard: Option<String>,
-) -> Option<Symbol> {
+) -> Option<RawDeclaration> {
     let captures = function_regex().captures(compact)?;
     let name = captures.get(1)?.as_str();
 
@@ -326,7 +391,7 @@ fn capture_typedefs(
     line_starts: &[usize],
     source: &str,
     guard: Option<String>,
-) -> Vec<Symbol> {
+) -> Vec<RawDeclaration> {
     if !compact.starts_with("typedef ") && compact != "typedef" {
         return Vec::new();
     }
@@ -366,7 +431,7 @@ fn capture_tag_types(
     line_starts: &[usize],
     source: &str,
     guard: Option<String>,
-) -> Vec<Symbol> {
+) -> Vec<RawDeclaration> {
     tag_type_regex()
         .captures_iter(compact)
         .filter_map(|captures| captures.get(2).map(|name| name.as_str()))
@@ -393,7 +458,7 @@ fn capture_global_variable(
     source: &str,
     guard: Option<String>,
     is_cpp: bool,
-) -> Option<Symbol> {
+) -> Option<RawDeclaration> {
     if compact.contains('(')
         || compact.starts_with("typedef ")
         || compact.starts_with("struct ")
@@ -482,10 +547,10 @@ pub(super) fn make_symbol(
     source: &str,
     signature: String,
     guard: Option<String>,
-) -> Symbol {
+) -> RawDeclaration {
     let start_byte = line_starts.get(start_line).copied().unwrap_or(0);
     let end_byte = line_end_byte(source, line_starts, end_line);
-    Symbol {
+    RawDeclaration {
         name: name.to_string(),
         kind,
         role,
@@ -498,6 +563,7 @@ pub(super) fn make_symbol(
         signature,
         guard,
         container: None,
+        incomplete: false,
     }
 }
 
@@ -688,378 +754,23 @@ fn skip_quoted_bytes(bytes: &[u8], quote_start: usize) -> usize {
     bytes.len()
 }
 
-fn record_typedef_aliases(text: &str) -> Vec<String> {
-    if !starts_with_typedef_keyword(text) {
-        return Vec::new();
-    }
-    let chars: Vec<char> = text.chars().collect();
-    let Some(open) = first_code_char(&chars, '{') else {
-        return Vec::new();
-    };
-    let Some(close) = matching_code_delimiter(&chars, open, '{', '}') else {
-        return Vec::new();
-    };
-    let Some(semi) = first_code_char_from(&chars, ';', close + 1) else {
-        return Vec::new();
-    };
-    if !looks_like_record_typedef_prefix(&chars[..open]) {
-        return Vec::new();
-    }
-
-    split_top_level_declarators(&chars[close + 1..semi])
-        .into_iter()
-        .filter_map(|segment| declarator_alias_name(&segment))
-        .collect()
-}
-
-fn starts_with_typedef_keyword(text: &str) -> bool {
-    let trimmed = text.trim_start();
-    trimmed == "typedef"
-        || trimmed
-            .strip_prefix("typedef")
-            .is_some_and(|rest| rest.starts_with(char::is_whitespace))
-}
-
-fn looks_like_record_typedef_prefix(chars: &[char]) -> bool {
-    let text: String = chars.iter().collect();
-    record_keyword_regex().is_match(&text)
-}
-
-fn first_code_char(chars: &[char], needle: char) -> Option<usize> {
-    first_code_char_from(chars, needle, 0)
-}
-
-fn first_code_char_from(chars: &[char], needle: char, start: usize) -> Option<usize> {
-    let mut i = start;
-    let mut in_block_comment = false;
-    while i < chars.len() {
-        if in_block_comment {
-            if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
-                in_block_comment = false;
-                i += 2;
-            } else {
-                i += 1;
-            }
-            continue;
-        }
-        if chars[i] == '/' && chars.get(i + 1) == Some(&'/') {
-            while i < chars.len() && chars[i] != '\n' {
-                i += 1;
-            }
-            continue;
-        }
-        if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
-            in_block_comment = true;
-            i += 2;
-            continue;
-        }
-        if chars[i] == '"' || chars[i] == '\'' {
-            i = skip_quoted_chars(chars, i);
-            continue;
-        }
-        if chars[i] == needle {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
-}
-
-fn matching_code_delimiter(
-    chars: &[char],
-    open_pos: usize,
-    open: char,
-    close: char,
-) -> Option<usize> {
-    let mut depth = 0usize;
-    let mut i = open_pos;
-    let mut in_block_comment = false;
-    while i < chars.len() {
-        if in_block_comment {
-            if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
-                in_block_comment = false;
-                i += 2;
-            } else {
-                i += 1;
-            }
-            continue;
-        }
-        if chars[i] == '/' && chars.get(i + 1) == Some(&'/') {
-            while i < chars.len() && chars[i] != '\n' {
-                i += 1;
-            }
-            continue;
-        }
-        if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
-            in_block_comment = true;
-            i += 2;
-            continue;
-        }
-        if chars[i] == '"' || chars[i] == '\'' {
-            i = skip_quoted_chars(chars, i);
-            continue;
-        }
-        if chars[i] == open {
-            depth += 1;
-        } else if chars[i] == close {
-            depth = depth.saturating_sub(1);
-            if depth == 0 {
-                return Some(i);
-            }
-        }
-        i += 1;
-    }
-    None
-}
-
-fn split_top_level_declarators(chars: &[char]) -> Vec<Vec<char>> {
-    let mut parts = Vec::new();
-    let mut start = 0usize;
-    let mut i = 0usize;
-    let mut paren = 0usize;
-    let mut bracket = 0usize;
-    while i < chars.len() {
-        match chars[i] {
-            '"' | '\'' => i = skip_quoted_chars(chars, i),
-            '(' => {
-                paren += 1;
-                i += 1;
-            }
-            ')' => {
-                paren = paren.saturating_sub(1);
-                i += 1;
-            }
-            '[' => {
-                bracket += 1;
-                i += 1;
-            }
-            ']' => {
-                bracket = bracket.saturating_sub(1);
-                i += 1;
-            }
-            ',' if paren == 0 && bracket == 0 => {
-                parts.push(chars[start..i].to_vec());
-                start = i + 1;
-                i += 1;
-            }
-            _ => i += 1,
-        }
-    }
-    if start < chars.len() {
-        parts.push(chars[start..].to_vec());
-    }
-    parts
-}
-
-fn declarator_alias_name(segment: &[char]) -> Option<String> {
-    let mut chars = strip_known_attributes(segment);
-    trim_char_vec(&mut chars);
-
-    loop {
-        trim_char_vec(&mut chars);
-        let last = chars.last().copied()?;
-        if last == ']' {
-            let open = matching_open_delimiter(&chars, chars.len() - 1, '[', ']')?;
-            chars.truncate(open);
-            continue;
-        }
-        if last == ')' {
-            let open = matching_open_delimiter(&chars, chars.len() - 1, '(', ')')?;
-            if open == 0 {
-                break;
-            }
-            chars.truncate(open);
-            continue;
-        }
-        break;
-    }
-
-    let text: String = chars.iter().collect();
-    identifier_regex()
-        .find_iter(&text)
-        .map(|m| m.as_str())
-        .filter(|ident| !TYPEDEF_DECLARATOR_SKIP_WORDS.contains(ident))
-        .last()
-        .map(str::to_string)
-}
-
-fn strip_known_attributes(chars: &[char]) -> Vec<char> {
-    let mut out = Vec::with_capacity(chars.len());
-    let mut i = 0usize;
-    while i < chars.len() {
-        if chars[i] == '[' && chars.get(i + 1) == Some(&'[') {
-            if let Some(close) = find_double_bracket_close(chars, i + 2) {
-                i = close + 2;
-                continue;
-            }
-        }
-
-        if is_ident_start(chars[i]) {
-            let start = i;
-            i += 1;
-            while i < chars.len() && is_ident_continue(chars[i]) {
-                i += 1;
-            }
-            let word: String = chars[start..i].iter().collect();
-            if matches!(
-                word.as_str(),
-                "__attribute__" | "__declspec" | "_Alignas" | "alignas"
-            ) {
-                let mut j = i;
-                while j < chars.len() && chars[j].is_whitespace() {
-                    j += 1;
-                }
-                if chars.get(j) == Some(&'(') {
-                    if let Some(close) = matching_code_delimiter(chars, j, '(', ')') {
-                        i = close + 1;
-                        continue;
-                    }
-                }
-            }
-            out.extend(chars[start..i].iter());
-            continue;
-        }
-
-        out.push(chars[i]);
-        i += 1;
-    }
-    out
-}
-
-fn find_double_bracket_close(chars: &[char], start: usize) -> Option<usize> {
-    let mut i = start;
-    while i + 1 < chars.len() {
-        if chars[i] == ']' && chars[i + 1] == ']' {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
-}
-
-fn matching_open_delimiter(
-    chars: &[char],
-    close_pos: usize,
-    open: char,
-    close: char,
-) -> Option<usize> {
-    let mut depth = 0usize;
-    for i in (0..=close_pos).rev() {
-        if chars[i] == close {
-            depth += 1;
-        } else if chars[i] == open {
-            depth = depth.saturating_sub(1);
-            if depth == 0 {
-                return Some(i);
-            }
-        }
-    }
-    None
-}
-
-fn trim_char_vec(chars: &mut Vec<char>) {
-    while chars.first().is_some_and(|ch| ch.is_whitespace()) {
-        chars.remove(0);
-    }
-    while chars.last().is_some_and(|ch| ch.is_whitespace()) {
-        chars.pop();
-    }
-}
-
-fn skip_quoted_chars(chars: &[char], quote_start: usize) -> usize {
-    let quote = chars[quote_start];
-    let mut i = quote_start + 1;
-    while i < chars.len() {
-        if chars[i] == '\\' {
-            i = (i + 2).min(chars.len());
-            continue;
-        }
-        if chars[i] == quote {
-            return i + 1;
-        }
-        i += 1;
-    }
-    chars.len()
-}
-
-fn is_ident_start(ch: char) -> bool {
-    ch == '_' || ch.is_ascii_alphabetic()
-}
-
-fn is_ident_continue(ch: char) -> bool {
-    ch == '_' || ch.is_ascii_alphanumeric()
-}
-
-const TYPEDEF_DECLARATOR_SKIP_WORDS: &[&str] = &[
-    "const",
-    "volatile",
-    "restrict",
-    "_Atomic",
-    "__attribute__",
-    "__declspec",
-    "_Alignas",
-    "alignas",
-];
-
-fn include_regex() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| Regex::new(r#"^#\s*include\s+(.+)$"#).expect("include regex"))
-}
-
-fn macro_regex() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| {
-        Regex::new(r#"^#\s*define\s+([A-Za-z_][A-Za-z0-9_]*)"#).expect("macro regex")
-    })
-}
-
-fn function_regex() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| {
-        Regex::new(r#"([A-Za-z_][A-Za-z0-9_]*)\s*\([^;{}]*\)\s*(?:;|\{|\{.*\})$"#)
-            .expect("function regex")
-    })
-}
-
-fn typedef_regex() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| {
-        Regex::new(r#"\btypedef\b.*\b([A-Za-z_][A-Za-z0-9_]*)\s*;"#).expect("typedef regex")
-    })
-}
-
-fn record_keyword_regex() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| {
-        Regex::new(r#"\btypedef\b[\s\S]*\b(struct|union|enum|class)\b"#)
-            .expect("record typedef regex")
-    })
-}
-
-fn identifier_regex() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| Regex::new(r#"[A-Za-z_][A-Za-z0-9_]*"#).expect("identifier regex"))
-}
-
-fn tag_type_regex() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| {
-        Regex::new(r#"\b(struct|union|enum|class)\s+([A-Za-z_][A-Za-z0-9_]*)"#)
-            .expect("tag type regex")
-    })
-}
-
-fn global_var_regex() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| {
-        Regex::new(r#"([A-Za-z_][A-Za-z0-9_]*)\s*(?:\[[^\]]*\])?\s*(?:=[^;]*)?;"#)
-            .expect("global variable regex")
-    })
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{extract_symbols_and_includes, mask_comments_and_literals};
+    use super::{extract_symbols_and_includes, mask_comments_and_literals, scan_includes};
+
+    #[test]
+    fn include_scan_ignores_directives_inside_multiline_block_comments() {
+        let source = "/* disabled includes\n\
+                      #include \"phantom.h\"\n\
+                      */\n\
+                      #include \"real.h\"\n";
+
+        let includes = scan_includes(source);
+
+        assert_eq!(includes.len(), 1);
+        assert_eq!(includes[0].line, 3);
+        assert_eq!(includes[0].target_text, "\"real.h\"");
+    }
 
     #[test]
     fn masking_keeps_comment_and_literal_words_out_of_regex_input() {

@@ -1,130 +1,13 @@
 use super::*;
 
+mod commands;
+mod initialization;
+mod watched_files;
+
 #[async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> LspResult<InitializeResult> {
-        let roots = workspace_roots_from_initialize(&params);
-        {
-            let mut stored = self.workspace_roots.lock().await;
-            *stored = roots;
-        }
-
-        {
-            let mut stored = self.include_paths.lock().await;
-            *stored = parse_include_paths(&params);
-        }
-        self.session
-            .cache
-            .set_semantic_index_memory_budget_mb(parse_semantic_index_memory_budget_mb(&params));
-
-        let completion_mode = parse_completion_mode(&params);
-        self.completion_enabled
-            .store(completion_mode.is_enabled(), Ordering::Relaxed);
-        self.strict_prefix_ranking.store(
-            parse_completion_prefix_ranking(&params) == completion::CompletionPrefixRanking::Strict,
-            Ordering::Relaxed,
-        );
-        *self.completion_history_mode.lock().await = parse_completion_history_mode(&params);
-        *self.project_context_selection.lock().await =
-            parse_initial_project_context_selection(&params);
-
-        let completion_provider = if self.completion_enabled.load(Ordering::Relaxed) {
-            Some(CompletionOptions {
-                trigger_characters: Some(completion_trigger_characters()),
-                resolve_provider: Some(true),
-                ..Default::default()
-            })
-        } else {
-            None
-        };
-
-        let semantic_mode = parse_semantic_coloring_mode(&params);
-        self.semantic_coloring_enabled
-            .store(semantic_mode.is_enabled(), Ordering::Relaxed);
-
-        self.scoping_enabled
-            .store(parse_include_scoping_enabled(&params), Ordering::Relaxed);
-
-        self.debug_candidate_reasons
-            .store(parse_debug_candidate_reasons(&params), Ordering::Relaxed);
-        self.perf_logging_enabled
-            .store(parse_debug_perf_logs(&params), Ordering::Relaxed);
-
-        let semantic_tokens_provider = if self.semantic_coloring_enabled.load(Ordering::Relaxed) {
-            Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
-                SemanticTokensOptions {
-                    // Legend order defines the token-type indices used when
-                    // encoding (macro = 0, type = 1, enumMember = 2,
-                    // parameter = 3, variable = 4); no modifiers are declared.
-                    legend: SemanticTokensLegend {
-                        token_types: vec![
-                            SemanticTokenType::MACRO,
-                            SemanticTokenType::TYPE,
-                            SemanticTokenType::ENUM_MEMBER,
-                            SemanticTokenType::PARAMETER,
-                            SemanticTokenType::VARIABLE,
-                        ],
-                        token_modifiers: vec![],
-                    },
-                    range: Some(true),
-                    full: Some(SemanticTokensFullOptions::Bool(true)),
-                    ..Default::default()
-                },
-            ))
-        } else {
-            None
-        };
-
-        Ok(InitializeResult {
-            capabilities: ServerCapabilities {
-                text_document_sync: Some(TextDocumentSyncCapability::Options(
-                    TextDocumentSyncOptions {
-                        open_close: Some(true),
-                        change: Some(TextDocumentSyncKind::INCREMENTAL),
-                        save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
-                            include_text: Some(false),
-                        })),
-                        ..TextDocumentSyncOptions::default()
-                    },
-                )),
-                workspace: Some(WorkspaceServerCapabilities {
-                    workspace_folders: Some(WorkspaceFoldersServerCapabilities {
-                        supported: Some(true),
-                        change_notifications: Some(OneOf::Left(true)),
-                    }),
-                    file_operations: None,
-                }),
-                definition_provider: Some(OneOf::Left(true)),
-                declaration_provider: Some(DeclarationCapability::Simple(true)),
-                references_provider: Some(OneOf::Left(true)),
-                workspace_symbol_provider: Some(OneOf::Left(true)),
-                document_symbol_provider: Some(OneOf::Left(true)),
-                hover_provider: Some(HoverProviderCapability::Simple(true)),
-                completion_provider,
-                signature_help_provider: Some(signature_help_options()),
-                semantic_tokens_provider,
-                call_hierarchy_provider: Some(CallHierarchyServerCapability::Simple(true)),
-                execute_command_provider: Some(tower_lsp::lsp_types::ExecuteCommandOptions {
-                    commands: vec![
-                        REFRESH_INDEX_LSP_COMMAND.to_string(),
-                        REBUILD_INDEX_LSP_COMMAND.to_string(),
-                        GROUPED_REFERENCES_LSP_COMMAND.to_string(),
-                        POSSIBLE_TARGETS_LSP_COMMAND.to_string(),
-                        COMPLETION_ACCEPTED_LSP_COMMAND.to_string(),
-                        CLEAR_COMPLETION_HISTORY_LSP_COMMAND.to_string(),
-                        PROJECT_CONTEXTS_LSP_COMMAND.to_string(),
-                        SET_PROJECT_CONTEXT_LSP_COMMAND.to_string(),
-                        CALL_RELATIONS_LSP_COMMAND.to_string(),
-                    ],
-                    ..Default::default()
-                }),
-                ..ServerCapabilities::default()
-            },
-            server_info: Some(ServerInfo {
-                name: "FossilSense".to_string(),
-                version: Some(env!("CARGO_PKG_VERSION").to_string()),
-            }),
-        })
+        self.initialize_server(params).await
     }
 
     async fn initialized(&self, _: InitializedParams) {
@@ -426,7 +309,7 @@ impl LanguageServer for Backend {
                 &path,
                 version,
                 &text,
-                parser::ParseFacts::SYMBOLS | parser::ParseFacts::INCLUDES,
+                parser::ParseFacts::DECLARATIONS | parser::ParseFacts::INCLUDES,
             )
             .await;
         let Some(index) = index else {
@@ -435,9 +318,9 @@ impl LanguageServer for Backend {
         // Extract persistent symbols synchronously from the cached index.
         let document_symbols: Vec<DocumentSymbol> = index
             .persistent_facts()
-            .symbols
+            .declarations
             .iter()
-            .map(parsed_to_document_symbol)
+            .map(declaration_to_document_symbol)
             .collect();
         self.perf_log(|| {
             format!(
@@ -608,12 +491,25 @@ impl LanguageServer for Backend {
                 let effective_table = table
                     .with_updated_paths(overlay.shadowed_paths(), rows)
                     .with_direct_include_overrides(overlay.direct_include_overrides());
+                let overlay_fallbacks = overlay.fallback_completion_facts().iter().map(|entry| {
+                    crate::completion::ordinary_service::FallbackCompletionName {
+                        name: entry.fact.name.clone(),
+                        kind_hint: entry.fact.kind_hint,
+                        detail: entry.fact.detail.clone(),
+                        path: entry.path.clone(),
+                    }
+                });
+                let effective_fallback_table = context
+                    .engine
+                    .fallback_completion_table
+                    .with_updated_paths(overlay.shadowed_paths(), overlay_fallbacks);
                 table_generations.push((context.engine.root.clone(), context.engine.epoch));
                 table_roots.push(context.engine.root.clone());
                 table_semantic_generations.push(context.engine.semantic_generation);
                 tables.push(OrdinaryCompletionNameTable {
                     table: Arc::new(effective_table),
                     overlay_handles,
+                    fallback_table: Arc::new(effective_fallback_table),
                 });
             }
         }
@@ -626,6 +522,9 @@ impl LanguageServer for Backend {
                 tables.push(OrdinaryCompletionNameTable {
                     table: Arc::new(crate::query::NameTable::build(Vec::new())),
                     overlay_handles: std::collections::HashMap::new(),
+                    fallback_table: Arc::new(
+                        crate::completion::ordinary_service::FallbackCompletionNameTable::default(),
+                    ),
                 });
             }
         }
@@ -811,63 +710,7 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
-        let roots = self.workspace_roots.lock().await.clone();
-        let mut dirty_changes = Vec::new();
-        let mut project_context_roots = Vec::new();
-        let mut needs_full = false;
-
-        // Ensure the config cache is populated for each root (on first event)
-        // and reused across events in this batch. The cache avoids re-reading
-        // `fossilsense.json` on every file save. `fossilsense.json` changes
-        // themselves trigger `WatchDecision::Full` which bypasses the cache.
-        {
-            let mut cache = self.config_cache.lock().await;
-            for root in &roots {
-                if !cache.contains_key(root) {
-                    let (config, _) = WorkspaceConfig::load(root);
-                    cache.insert(root.clone(), config);
-                }
-            }
-        }
-
-        for change in &params.changes {
-            match watched_change_in_scope(&roots, change, &self.config_cache).await {
-                Some(WatchDecision::Full) => needs_full = true,
-                Some(WatchDecision::ProjectContext(root)) => project_context_roots.push(root),
-                Some(WatchDecision::Dirty(dirty)) => dirty_changes.push(dirty),
-                None => {}
-            }
-        }
-
-        let relevant_changes =
-            dirty_changes.len() + project_context_roots.len() + usize::from(needs_full);
-        let dirty_count = dirty_changes.len();
-        if relevant_changes > 0 {
-            self.session.cache.invalidate_references();
-        }
-        self.client
-            .log_message(
-                MessageType::LOG,
-                format!(
-                    "received {} watched file changes ({} in FossilSense scope, {} dirty files)",
-                    params.changes.len(),
-                    relevant_changes,
-                    dirty_count
-                ),
-            )
-            .await;
-
-        if needs_full {
-            self.spawn_index_roots(None).await;
-        } else {
-            if !dirty_changes.is_empty() {
-                self.spawn_dirty_files(dirty_changes).await;
-            }
-            if !project_context_roots.is_empty() {
-                self.refresh_project_context_roots(project_context_roots)
-                    .await;
-            }
-        }
+        self.handle_watched_file_changes(params).await;
     }
 
     async fn did_change_workspace_folders(&self, params: DidChangeWorkspaceFoldersParams) {
@@ -942,147 +785,6 @@ impl LanguageServer for Backend {
     }
 
     async fn execute_command(&self, params: ExecuteCommandParams) -> LspResult<Option<Value>> {
-        if params.command == REFRESH_INDEX_LSP_COMMAND || params.command == REFRESH_INDEX_COMMAND {
-            self.client
-                .log_message(MessageType::INFO, "refreshing index (incremental)")
-                .await;
-            self.spawn_index_roots(Some(false)).await;
-            Ok(None)
-        } else if params.command == REBUILD_INDEX_LSP_COMMAND
-            || params.command == REBUILD_INDEX_COMMAND
-        {
-            self.client
-                .log_message(MessageType::INFO, "rebuilding index (force)")
-                .await;
-            self.spawn_index_roots(Some(true)).await;
-            Ok(None)
-        } else if params.command == CALL_RELATIONS_LSP_COMMAND {
-            let Some(arg) = params.arguments.first() else {
-                return Ok(None);
-            };
-            Ok(self.rich_relations_command(arg).await)
-        } else if params.command == POSSIBLE_TARGETS_LSP_COMMAND {
-            let Some(arg) = params.arguments.first() else {
-                return Ok(None);
-            };
-            Ok(self.possible_targets_command(arg).await)
-        } else if params.command == GROUPED_REFERENCES_LSP_COMMAND {
-            // Role-grouped find-references: same cached search as the standard
-            // `references` request, but the result carries each hit's role so
-            // the client can group/label it (the LSP `Location` cannot).
-            let Some(arg) = params.arguments.first() else {
-                return Ok(None);
-            };
-            let Some(uri) = arg
-                .get("uri")
-                .and_then(|v| v.as_str())
-                .and_then(|s| Url::parse(s).ok())
-            else {
-                return Ok(None);
-            };
-            let line = arg.get("line").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-            let character = arg.get("character").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-
-            let Some(text) = self.document_text(&uri).await else {
-                return Ok(None);
-            };
-            let line_text = text.lines().nth(line as usize).unwrap_or_default();
-            let Some(word) = query::word_at(line_text, character) else {
-                return Ok(None);
-            };
-            let Some(root) = self.root_for_uri(&uri).await else {
-                return Ok(None);
-            };
-            let role_cache = self.session.cache.reference_role_cache.clone();
-            let search_cache = self.session.cache.reference_search_cache.clone();
-            let context = self.request_context_for_root(root.clone()).await;
-            let indexed_generation = context.engine.epoch.as_u64();
-            let indexed_files = context.engine.indexed_files.clone();
-            let result = tokio::task::spawn_blocking(
-                move || -> Result<(Vec<GroupedReferenceItem>, bool, references::ReferencesTiming)> {
-                    // Reuses the full search-result cache shared with standard
-                    // references; on a cache hit this does not redo discovery or
-                    // the text-search pass.
-                    let (mut hits, truncated, timing) =
-                        references::search_references_with_shared_files(
-                            &root,
-                            &word,
-                            &role_cache,
-                            &search_cache,
-                            indexed_generation,
-                            indexed_files,
-                        )?;
-                    references::sort_hits_by_role(&mut hits);
-                    Ok((grouped_reference_items(&root, &hits), truncated, timing))
-                },
-            )
-            .await;
-            match self.unwrap_query("grouped references", result).await {
-                Some((items, truncated, timing)) => {
-                    self.perf_log(|| format!(
-                        "[perf] grouped_references total={}ms discover={}ms search={}ms classify={}ms occs={} cached={} truncated={}",
-                        timing.total_ms,
-                        timing.discover_ms,
-                        timing.search_ms,
-                        timing.classify_ms,
-                        timing.total_occurrences,
-                        timing.cached,
-                        truncated,
-                    ))
-                    .await;
-                    Ok(Some(serde_json::to_value(items).unwrap_or(Value::Null)))
-                }
-                None => Ok(None),
-            }
-        } else if params.command == PROJECT_CONTEXTS_LSP_COMMAND {
-            let uri =
-                project_context_commands::project_context_command_uri(params.arguments.first());
-            let status = self.project_context_status(uri.as_ref()).await;
-            Ok(serde_json::to_value(status).ok())
-        } else if params.command == SET_PROJECT_CONTEXT_LSP_COMMAND {
-            let uri =
-                project_context_commands::project_context_command_uri(params.arguments.first());
-            let selection =
-                project_context_commands::project_context_selection_arg(params.arguments.first())
-                    .unwrap_or(ProjectContextSelection::Auto);
-            let status = self
-                .set_project_context_selection(selection, uri.as_ref())
-                .await;
-            Ok(serde_json::to_value(status).ok())
-        } else if params.command == COMPLETION_ACCEPTED_LSP_COMMAND {
-            if let Some(event) = completion_accept_event_from_arg(params.arguments.first()) {
-                if self.record_completion_accept(event).await.is_err() {
-                    self.client
-                        .log_message(
-                            MessageType::ERROR,
-                            "FossilSense completion history record failed",
-                        )
-                        .await;
-                }
-            }
-            Ok(None)
-        } else if params.command == CLEAR_COMPLETION_HISTORY_LSP_COMMAND {
-            match self.clear_completion_history().await {
-                Ok(removed) => {
-                    self.client
-                        .log_message(
-                            MessageType::INFO,
-                            format!("FossilSense completion history cleared entries={removed}"),
-                        )
-                        .await;
-                }
-                Err(_) => {
-                    self.client
-                        .log_message(
-                            MessageType::ERROR,
-                            "FossilSense completion history clear failed",
-                        )
-                        .await;
-                }
-            }
-            Ok(None)
-        } else {
-            Ok(None)
-        }
+        self.execute_server_command(params).await
     }
 }

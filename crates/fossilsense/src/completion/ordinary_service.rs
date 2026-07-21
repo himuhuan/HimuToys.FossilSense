@@ -7,6 +7,8 @@ use crate::parser::{FactAvailability, FactGroup, FileSemanticIndex};
 use crate::project_context::ProjectKey;
 use crate::query::{self, NameTable};
 use crate::resolver;
+use crate::semantic_model::CompletionKindHint;
+use crate::store::views::FallbackCompletionRow;
 
 use super::{
     CandidateEvidence, CandidateSource, CompletionCandidateKind, CompletionIntent,
@@ -53,6 +55,7 @@ pub(crate) struct OrdinaryCompletionInput {
 pub(crate) struct OrdinaryCompletionNameTable {
     pub table: Arc<NameTable>,
     pub overlay_handles: std::collections::HashMap<i64, crate::candidate_service::CandidateHandle>,
+    pub fallback_table: Arc<FallbackCompletionNameTable>,
 }
 
 impl OrdinaryCompletionNameTable {
@@ -61,8 +64,256 @@ impl OrdinaryCompletionNameTable {
         Self {
             table,
             overlay_handles: std::collections::HashMap::new(),
+            fallback_table: Arc::new(FallbackCompletionNameTable::default()),
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FallbackCompletionName {
+    pub name: String,
+    pub kind_hint: CompletionKindHint,
+    pub detail: Option<String>,
+    pub path: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IndexedFallbackCompletionName {
+    value: FallbackCompletionName,
+    lower: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FallbackCompletionNameTable {
+    entries: Arc<[IndexedFallbackCompletionName]>,
+    match_index: Arc<std::collections::HashMap<u32, Vec<usize>>>,
+    shadowed_paths: Arc<HashSet<String>>,
+    overlay_entries: Arc<[IndexedFallbackCompletionName]>,
+}
+
+impl FallbackCompletionNameTable {
+    pub(crate) fn build(rows: Vec<FallbackCompletionRow>) -> Self {
+        let entries: Vec<_> = rows
+            .into_iter()
+            .filter_map(|row| {
+                let kind_hint = match row.kind_hint {
+                    0 => CompletionKindHint::Function,
+                    1 => CompletionKindHint::Macro,
+                    2 => CompletionKindHint::Type,
+                    3 => CompletionKindHint::Object,
+                    _ => return None,
+                };
+                Some(FallbackCompletionName {
+                    name: row.name,
+                    kind_hint,
+                    detail: row.detail,
+                    path: row.path,
+                })
+            })
+            .collect();
+        Self::from_entries(entries)
+    }
+
+    fn from_entries(mut entries: Vec<FallbackCompletionName>) -> Self {
+        sort_and_dedup_fallback_entries(&mut entries);
+        let entries: Vec<_> = entries
+            .into_iter()
+            .map(IndexedFallbackCompletionName::new)
+            .collect();
+        let match_index = fallback_match_index(&entries);
+        Self {
+            entries: entries.into(),
+            match_index: Arc::new(match_index),
+            shadowed_paths: Arc::new(HashSet::new()),
+            overlay_entries: Arc::from([]),
+        }
+    }
+
+    fn matching(&self, prefix: &str, limit: usize) -> Vec<ScoredFallbackCompletionName> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let needle = prefix.to_ascii_lowercase();
+        let Some(key) = fallback_match_key(needle.as_bytes()) else {
+            return Vec::new();
+        };
+        let mut scored: Vec<_> = self
+            .match_index
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .filter_map(|&index| {
+                let entry = &self.entries[index];
+                (!self.shadowed_paths.contains(&entry.value.path))
+                    .then(|| score_indexed_fallback(&needle, entry))
+                    .flatten()
+            })
+            .chain(
+                self.overlay_entries
+                    .iter()
+                    .filter_map(|entry| score_indexed_fallback(&needle, entry)),
+            )
+            .collect();
+        sort_scored_fallbacks(&mut scored);
+        scored.truncate(limit);
+        scored
+    }
+
+    pub(crate) fn with_updated_paths(
+        &self,
+        shadowed_paths: &HashSet<String>,
+        overlay_entries: impl IntoIterator<Item = FallbackCompletionName>,
+    ) -> Self {
+        let mut overlay_entries: Vec<_> = overlay_entries.into_iter().collect();
+        sort_and_dedup_fallback_entries(&mut overlay_entries);
+        Self {
+            entries: self.entries.clone(),
+            match_index: self.match_index.clone(),
+            shadowed_paths: Arc::new(shadowed_paths.clone()),
+            overlay_entries: overlay_entries
+                .into_iter()
+                .map(IndexedFallbackCompletionName::new)
+                .collect::<Vec<_>>()
+                .into(),
+        }
+    }
+}
+
+impl IndexedFallbackCompletionName {
+    fn new(value: FallbackCompletionName) -> Self {
+        let lower = value.name.to_ascii_lowercase();
+        Self { value, lower }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ScoredFallbackCompletionName {
+    score: i32,
+    value: FallbackCompletionName,
+}
+
+fn fallback_matches<'a>(
+    entries: impl Iterator<Item = &'a FallbackCompletionName>,
+    prefix: &str,
+    limit: usize,
+) -> Vec<ScoredFallbackCompletionName> {
+    let mut scored: Vec<_> = entries
+        .filter_map(|entry| {
+            query::completion_word_score(prefix, &entry.name, 0).map(|score| {
+                ScoredFallbackCompletionName {
+                    score,
+                    value: entry.clone(),
+                }
+            })
+        })
+        .collect();
+    sort_scored_fallbacks(&mut scored);
+    scored.truncate(limit);
+    scored
+}
+
+fn score_indexed_fallback(
+    needle: &str,
+    entry: &IndexedFallbackCompletionName,
+) -> Option<ScoredFallbackCompletionName> {
+    query::completion_word_score_lowered(needle, &entry.value.name, &entry.lower, 0).map(|score| {
+        ScoredFallbackCompletionName {
+            score,
+            value: entry.value.clone(),
+        }
+    })
+}
+
+fn sort_scored_fallbacks(entries: &mut [ScoredFallbackCompletionName]) {
+    entries.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| left.value.name.cmp(&right.value.name))
+            .then_with(|| left.value.path.cmp(&right.value.path))
+    });
+}
+
+fn sort_and_dedup_fallback_entries(entries: &mut Vec<FallbackCompletionName>) {
+    entries.sort_by(|left, right| {
+        left.name
+            .to_ascii_lowercase()
+            .cmp(&right.name.to_ascii_lowercase())
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| {
+                completion_hint_rank(left.kind_hint).cmp(&completion_hint_rank(right.kind_hint))
+            })
+            .then_with(|| left.detail.cmp(&right.detail))
+    });
+    entries.dedup();
+}
+
+fn completion_hint_rank(kind: CompletionKindHint) -> u8 {
+    match kind {
+        CompletionKindHint::Function => 0,
+        CompletionKindHint::Macro => 1,
+        CompletionKindHint::Type => 2,
+        CompletionKindHint::Object => 3,
+    }
+}
+
+/// Index the first 1-2 bytes of every identifier boundary and every 3-byte
+/// substring. Fallback scoring only accepts boundary substrings for short
+/// prefixes and contiguous substrings thereafter, so this is a complete cold-
+/// request candidate set without rescoring the entire table.
+fn fallback_match_index(
+    entries: &[IndexedFallbackCompletionName],
+) -> std::collections::HashMap<u32, Vec<usize>> {
+    let mut index: std::collections::HashMap<u32, Vec<usize>> = std::collections::HashMap::new();
+    for (entry_index, entry) in entries.iter().enumerate() {
+        let original = entry.value.name.as_bytes();
+        let lower = entry.lower.as_bytes();
+        let mut keys = HashSet::new();
+        for start in 0..lower.len() {
+            if fallback_name_boundary(original, start) {
+                for width in 1..=2 {
+                    if let Some(key) =
+                        fallback_match_key(lower.get(start..start + width).unwrap_or_default())
+                    {
+                        keys.insert(key);
+                    }
+                }
+            }
+        }
+        for bytes in lower.windows(3) {
+            if let Some(key) = fallback_match_key(bytes) {
+                keys.insert(key);
+            }
+        }
+        for key in keys {
+            index.entry(key).or_default().push(entry_index);
+        }
+    }
+    index
+}
+
+fn fallback_match_key(bytes: &[u8]) -> Option<u32> {
+    let width = bytes.len().min(3);
+    if width == 0 || !bytes[..width].iter().all(u8::is_ascii) {
+        return None;
+    }
+    let mut key = (width as u32) << 24;
+    for (offset, byte) in bytes[..width].iter().enumerate() {
+        key |= (*byte as u32) << (offset * 8);
+    }
+    Some(key)
+}
+
+fn fallback_name_boundary(bytes: &[u8], index: usize) -> bool {
+    if index == 0 {
+        return true;
+    }
+    let previous = bytes[index - 1];
+    let current = bytes[index];
+    (previous == b'_' && current != b'_')
+        || (previous.is_ascii_lowercase() && current.is_ascii_uppercase())
+        || (previous.is_ascii_alphabetic() && current.is_ascii_digit())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -228,6 +479,51 @@ pub(crate) fn complete_ordinary_identifier(
     ));
     candidates.extend(completion_items_for_language_builtins(&input.prefix));
 
+    let mut fallback_names = Vec::new();
+    for table in &input.tables {
+        fallback_names.extend(table.fallback_table.matching(&input.prefix, input.limit));
+    }
+    if let Some(parsed) = input.parsed_document.as_ref() {
+        let current: Vec<_> = parsed
+            .fallback_completions
+            .iter()
+            .map(|fact| FallbackCompletionName {
+                name: fact.name.clone(),
+                kind_hint: fact.kind_hint,
+                detail: fact.detail.clone(),
+                path: String::new(),
+            })
+            .collect();
+        fallback_names.extend(fallback_matches(current.iter(), &input.prefix, input.limit));
+    }
+    for fallback in fallback_names {
+        let score = fallback.score;
+        let fallback = fallback.value;
+        let mut evidence = CandidateEvidence::new(
+            CandidateSource::LexicalFallback,
+            model::ScopeTier::Global,
+            model::ResolutionConfidence::Fallback,
+            score,
+        );
+        evidence.kind = match fallback.kind_hint {
+            CompletionKindHint::Function => CompletionCandidateKind::Function,
+            CompletionKindHint::Macro => CompletionCandidateKind::Macro,
+            CompletionKindHint::Type => CompletionCandidateKind::Type,
+            CompletionKindHint::Object => CompletionCandidateKind::Variable,
+        };
+        candidates.push(OrdinaryPipelineCandidate::new(
+            fallback.name,
+            evidence,
+            OrdinaryCompletionPresentation {
+                kind: ordinary_kind_from_hint(fallback.kind_hint),
+                detail: fallback.detail,
+                documentation: None,
+                initial_sort_text: None,
+                documentation_target: None,
+            },
+        ));
+    }
+
     for word in input.local_words.iter() {
         if word == &input.prefix {
             continue;
@@ -324,6 +620,15 @@ pub(crate) fn complete_ordinary_identifier(
     }
 }
 
+fn ordinary_kind_from_hint(kind: CompletionKindHint) -> OrdinaryCompletionKind {
+    match kind {
+        CompletionKindHint::Function => OrdinaryCompletionKind::Function,
+        CompletionKindHint::Macro => OrdinaryCompletionKind::Macro,
+        CompletionKindHint::Type => OrdinaryCompletionKind::Type,
+        CompletionKindHint::Object => OrdinaryCompletionKind::Variable,
+    }
+}
+
 fn suppress_rescue_when_primary_is_sufficient(
     candidates: &mut Vec<OrdinaryPipelineCandidate>,
     scope: Option<&query::CompletionScope>,
@@ -357,11 +662,13 @@ fn is_primary_completion_evidence(evidence: CandidateEvidence) -> bool {
             model::ScopeTier::Current | model::ScopeTier::Reachable | model::ScopeTier::External
         ),
         CandidateSource::LocalWord => false,
+        CandidateSource::LexicalFallback => false,
     }
 }
 
 fn is_rescue_completion_evidence(evidence: CandidateEvidence) -> bool {
     evidence.primary_source == CandidateSource::LocalWord
+        || evidence.primary_source == CandidateSource::LexicalFallback
         || (evidence.primary_source == CandidateSource::Indexed
             && matches!(
                 evidence.tier,
@@ -382,10 +689,12 @@ mod tests {
     use crate::project_context::{ProjectContext, ProjectContextIndex, ProjectKey};
     use crate::query::{CompletionScope, NameTable, COMPLETION_LIMIT, COMPLETION_LOCALITY_BONUS};
     use crate::reachability::{OpenReason, ReachScope};
-    use crate::store::views::NameTableSymbolRow;
+    use crate::semantic_model::{SemanticDeclarationKind, SemanticDeclarationRole};
+    use crate::store::views::DeclarationNameRow;
 
     use super::{
-        complete_ordinary_identifier, OrdinaryCompletionDocumentationTarget,
+        complete_ordinary_identifier, fallback_matches, FallbackCompletionName,
+        FallbackCompletionNameTable, OrdinaryCompletionDocumentationTarget,
         OrdinaryCompletionInput, OrdinaryCompletionKind, OrdinaryCompletionNameTable,
         PRIMARY_COMPLETION_SUFFICIENCY,
     };
@@ -404,7 +713,7 @@ mod tests {
         (text, line, character)
     }
 
-    fn indexed_duplicate_winner(rows: Vec<NameTableSymbolRow>) -> (i64, parser::SymbolRole) {
+    fn indexed_duplicate_winner(rows: Vec<DeclarationNameRow>) -> (i64, parser::SymbolRole) {
         let output = complete_ordinary_identifier(OrdinaryCompletionInput {
             prefix: "shared_api".to_string(),
             text: Arc::from("shared_api"),
@@ -413,8 +722,11 @@ mod tests {
             parsed_document: None,
             local_words: Arc::new(HashSet::new()),
             tables: vec![OrdinaryCompletionNameTable {
-                table: Arc::new(NameTable::build_from_rows_with_project_context(rows, None)),
+                table: Arc::new(
+                    NameTable::build_from_declaration_name_rows_with_project_context(rows, None),
+                ),
                 overlay_handles: HashMap::new(),
+                fallback_table: Arc::new(FallbackCompletionNameTable::default()),
             }],
             scope: None,
             active_project_context: None,
@@ -440,24 +752,22 @@ mod tests {
 
     #[test]
     fn indexed_header_declaration_stably_wins_over_source_definition() {
-        let header = NameTableSymbolRow {
-            symbol_id: 11,
+        let header = DeclarationNameRow {
             id: 11,
-            label: "shared_api".to_string(),
+            name: "shared_api".to_string(),
             external: false,
             path: "include/shared.h".to_string(),
-            kind: "function".to_string(),
-            role: "declaration".to_string(),
+            declaration_kind: SemanticDeclarationKind::Function,
+            role: SemanticDeclarationRole::Declaration,
             directly_included: false,
         };
-        let source = NameTableSymbolRow {
-            symbol_id: 22,
+        let source = DeclarationNameRow {
             id: 22,
-            label: "shared_api".to_string(),
+            name: "shared_api".to_string(),
             external: false,
             path: "src/shared.c".to_string(),
-            kind: "function".to_string(),
-            role: "definition".to_string(),
+            declaration_kind: SemanticDeclarationKind::Function,
+            role: SemanticDeclarationRole::Definition,
             directly_included: false,
         };
 
@@ -469,6 +779,137 @@ mod tests {
                 indexed_duplicate_winner(rows),
                 (11, parser::SymbolRole::Declaration)
             );
+        }
+    }
+
+    #[test]
+    fn lexical_fallback_is_below_local_words_and_has_no_resolve_target() {
+        let fallback_table =
+            FallbackCompletionNameTable::from_entries(vec![FallbackCompletionName {
+                name: "fallback_regex".to_string(),
+                kind_hint: crate::semantic_model::CompletionKindHint::Function,
+                detail: Some("regex guess".to_string()),
+                path: "broken.c".to_string(),
+            }]);
+        let output = complete_ordinary_identifier(OrdinaryCompletionInput {
+            prefix: "fallback_".to_string(),
+            text: Arc::from("fallback_"),
+            line: 0,
+            character: 9,
+            parsed_document: None,
+            local_words: Arc::new(HashSet::from(["fallback_local".to_string()])),
+            tables: vec![OrdinaryCompletionNameTable {
+                table: Arc::new(NameTable::build(Vec::new())),
+                overlay_handles: HashMap::new(),
+                fallback_table: Arc::new(fallback_table),
+            }],
+            scope: None,
+            active_project_context: None,
+            prior_pools: vec![None],
+            intent: CompletionIntent::default(),
+            history_enabled: false,
+            history: CompletionHistorySnapshot::default(),
+            prefix_bucket: "fallback_".to_string(),
+            prefix_ranking: CompletionPrefixRanking::Strict,
+            limit: 10,
+            locality_bonus: COMPLETION_LOCALITY_BONUS,
+        });
+
+        let local = output
+            .items
+            .iter()
+            .position(|item| item.label == "fallback_local")
+            .expect("local word");
+        let fallback = output
+            .items
+            .iter()
+            .position(|item| item.label == "fallback_regex")
+            .expect("fallback completion");
+        assert!(local < fallback);
+        assert_eq!(
+            output.items[fallback].evidence.primary_source,
+            CandidateSource::LexicalFallback
+        );
+        assert!(output.items[fallback].documentation_target.is_none());
+        assert!(output.items[fallback].documentation.is_none());
+    }
+
+    #[test]
+    fn dirty_fallback_overlay_tombstones_stale_durable_hints() {
+        let base = FallbackCompletionNameTable::from_entries(vec![
+            FallbackCompletionName {
+                name: "stale_guess".to_string(),
+                kind_hint: crate::semantic_model::CompletionKindHint::Function,
+                detail: None,
+                path: "dirty.h".to_string(),
+            },
+            FallbackCompletionName {
+                name: "clean_guess".to_string(),
+                kind_hint: crate::semantic_model::CompletionKindHint::Object,
+                detail: None,
+                path: "clean.h".to_string(),
+            },
+        ]);
+        let updated = base.with_updated_paths(
+            &HashSet::from(["dirty.h".to_string()]),
+            [FallbackCompletionName {
+                name: "current_guess".to_string(),
+                kind_hint: crate::semantic_model::CompletionKindHint::Type,
+                detail: None,
+                path: "dirty.h".to_string(),
+            }],
+        );
+        assert!(
+            Arc::ptr_eq(&base.entries, &updated.entries)
+                && Arc::ptr_eq(&base.match_index, &updated.match_index),
+            "dirty overlays must share the immutable fallback index"
+        );
+        let names: HashSet<_> = updated
+            .matching("guess", 10)
+            .into_iter()
+            .map(|entry| entry.value.name)
+            .collect();
+        assert_eq!(
+            names,
+            HashSet::from(["clean_guess".to_string(), "current_guess".to_string()])
+        );
+    }
+
+    #[test]
+    fn fallback_match_index_is_equivalent_to_full_table_scoring() {
+        let table = FallbackCompletionNameTable::from_entries(
+            [
+                "alpha",
+                "AlphaBeta",
+                "HTTPServer2",
+                "alpha_beta",
+                "xAlpha",
+                "_privateValue",
+                "banana",
+            ]
+            .into_iter()
+            .map(|name| FallbackCompletionName {
+                name: name.to_string(),
+                kind_hint: crate::semantic_model::CompletionKindHint::Object,
+                detail: None,
+                path: format!("{name}.h"),
+            })
+            .collect(),
+        );
+
+        for prefix in [
+            "a", "al", "h", "ht", "tps", "s", "se", "2", "b", "be", "bet", "pha", "na", "v", "val",
+            "zz",
+        ] {
+            for limit in [1, 3, 100] {
+                let indexed = table.matching(prefix, limit);
+                let full = fallback_matches(
+                    table.entries.iter().map(|entry| &entry.value),
+                    prefix,
+                    limit,
+                );
+                assert_eq!(indexed, full, "prefix={prefix:?}, limit={limit}");
+            }
         }
     }
 
@@ -621,6 +1062,7 @@ mod tests {
             tables: vec![OrdinaryCompletionNameTable {
                 table: Arc::new(NameTable::build_with_paths(Vec::new())),
                 overlay_handles: HashMap::new(),
+                fallback_table: Arc::new(FallbackCompletionNameTable::default()),
             }],
             scope: None,
             active_project_context: None,
@@ -674,6 +1116,7 @@ mod tests {
                 tables: vec![OrdinaryCompletionNameTable {
                     table: table.clone(),
                     overlay_handles: HashMap::new(),
+                    fallback_table: Arc::new(FallbackCompletionNameTable::default()),
                 }],
                 scope: Some(CompletionScope {
                     current_path: Some("main.c".to_string()),
@@ -775,6 +1218,7 @@ mod tests {
                 tables: vec![OrdinaryCompletionNameTable {
                     table: Arc::new(NameTable::build_with_paths(Vec::new())),
                     overlay_handles: HashMap::new(),
+                    fallback_table: Arc::new(FallbackCompletionNameTable::default()),
                 }],
                 scope: None,
                 active_project_context: None,
@@ -818,6 +1262,7 @@ mod tests {
                     false,
                 )])),
                 overlay_handles: HashMap::new(),
+                fallback_table: Arc::new(FallbackCompletionNameTable::default()),
             }],
             scope: None,
             active_project_context: None,
@@ -866,6 +1311,7 @@ mod tests {
             tables: vec![OrdinaryCompletionNameTable {
                 table: Arc::new(NameTable::build_with_paths(Vec::new())),
                 overlay_handles: HashMap::new(),
+                fallback_table: Arc::new(FallbackCompletionNameTable::default()),
             }],
             scope: None,
             active_project_context: None,
@@ -907,6 +1353,7 @@ mod tests {
             tables: vec![OrdinaryCompletionNameTable {
                 table: Arc::new(NameTable::build_with_paths(Vec::new())),
                 overlay_handles: HashMap::new(),
+                fallback_table: Arc::new(FallbackCompletionNameTable::default()),
             }],
             scope: None,
             active_project_context: None,
@@ -973,6 +1420,7 @@ mod tests {
                     ),
                 ])),
                 overlay_handles: HashMap::new(),
+                fallback_table: Arc::new(FallbackCompletionNameTable::default()),
             }],
             scope: Some(CompletionScope {
                 current_path: Some("a.c".to_string()),
@@ -1039,6 +1487,7 @@ mod tests {
             tables: vec![OrdinaryCompletionNameTable {
                 table: Arc::new(NameTable::build_with_paths(rows)),
                 overlay_handles: HashMap::new(),
+                fallback_table: Arc::new(FallbackCompletionNameTable::default()),
             }],
             scope: None,
             active_project_context: None,
@@ -1295,10 +1744,12 @@ mod tests {
                 OrdinaryCompletionNameTable {
                     table: selected_table,
                     overlay_handles: HashMap::new(),
+                    fallback_table: Arc::new(FallbackCompletionNameTable::default()),
                 },
                 OrdinaryCompletionNameTable {
                     table: unrelated_table,
                     overlay_handles: HashMap::new(),
+                    fallback_table: Arc::new(FallbackCompletionNameTable::default()),
                 },
             ],
             scope: None,

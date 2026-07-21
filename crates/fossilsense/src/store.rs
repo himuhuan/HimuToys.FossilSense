@@ -6,8 +6,8 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
 use crate::semantic_model::{
-    MemberConfidence, MemberKind, PersistentFacts, RecordConfidence, RecordKind, SymbolKind,
-    SymbolRole, PARSER_FACT_VERSION,
+    MemberConfidence, MemberKind, PersistentFacts, RecordConfidence, RecordKind,
+    PARSER_FACT_VERSION,
 };
 
 mod generations;
@@ -33,33 +33,6 @@ impl FileSource {
         }
     }
 }
-
-/// A symbol joined with its containing file path, ready for query responses.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SymbolRecord {
-    pub id: i64,
-    pub name: String,
-    pub kind: String,
-    pub role: String,
-    pub path: String,
-    pub start_line: u32,
-    pub start_col: u32,
-    pub end_line: u32,
-    pub end_col: u32,
-    pub signature: String,
-    pub guard: Option<String>,
-    /// `"workspace"` or `"external"` — drives workspace-before-external ranking.
-    pub source: String,
-    /// True when this is an external file directly `#include`d by a workspace
-    /// file (first layer). Used by goto-definition to label first-layer external
-    /// candidates; always `false` for workspace files.
-    pub directly_included: bool,
-}
-
-const SELECT_SYMBOL_JOIN: &str = "SELECT s.id, s.name, s.kind, s.role, f.path, \
-     s.start_line, s.start_col, s.end_line, s.end_col, s.signature, s.guard, f.source, \
-     f.directly_included \
-     FROM symbols s JOIN files f ON f.id = s.file_id";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileFingerprint {
@@ -350,19 +323,19 @@ impl IndexStore {
         Ok(value)
     }
 
-    /// Reachability-scoped variant of [`kind_counts_by_names`]: only definitions
+    /// Reachability-scoped variant of [`declaration_kind_counts_by_names`]: only definitions
     /// whose containing file path is in `scope` are counted. With `scope = None`
     /// this falls back to the unscoped `workspace OR directly_included` behavior.
-    /// Retired from production alongside [`kind_counts_by_names`]; kept as the
+    /// Retired from production; kept as the
     /// parity oracle for `query::NameTable::colorable_kind_counts`.
     #[cfg(test)]
-    pub fn kind_counts_by_names_scoped(
+    pub fn declaration_kind_counts_by_names_scoped(
         &self,
         names: &[&str],
         scope: Option<&HashSet<String>>,
     ) -> Result<HashMap<String, HashMap<String, usize>>> {
         let Some(scope) = scope else {
-            return self.kind_counts_by_names(names);
+            return self.declaration_kind_counts_by_names(names);
         };
         let mut counts: HashMap<String, HashMap<String, usize>> = HashMap::new();
         if names.is_empty() {
@@ -387,11 +360,22 @@ impl IndexStore {
         for chunk in names.chunks(400) {
             let placeholders = vec!["?"; chunk.len()].join(",");
             let sql = format!(
-                "SELECT s.name, s.kind, COUNT(*) FROM symbols s \
-                 JOIN files f ON f.id = s.file_id \
+                "SELECT d.name,
+                        CASE d.declaration_kind
+                            WHEN 0 THEN 'function'
+                            WHEN 1 THEN 'function'
+                            WHEN 2 THEN 'global_variable'
+                            WHEN 3 THEN 'type'
+                            WHEN 4 THEN 'type'
+                            WHEN 5 THEN 'enum_constant'
+                            WHEN 6 THEN 'macro'
+                        END,
+                        COUNT(*)
+                 FROM declarations d \
+                 JOIN file_entries f ON f.id = d.file_id \
                  JOIN reach_scope r ON r.path = f.path \
-                 WHERE s.role = 'definition' AND s.name IN ({placeholders}) \
-                 GROUP BY s.name, s.kind"
+                 WHERE d.role = 1 AND d.name IN ({placeholders}) \
+                 GROUP BY d.name, d.declaration_kind"
             );
             let mut stmt = self.conn.prepare(&sql)?;
             let rows =
@@ -437,18 +421,19 @@ impl IndexStore {
             .map(|rows| rows.into_iter().map(|row| row.path).collect())
     }
 
-    /// Count of indexed symbols belonging to external files (test/diagnostic).
+    /// Count of canonical declarations belonging to external files (test/diagnostic).
     #[allow(dead_code)]
-    pub fn external_symbol_count(&self) -> Result<usize> {
+    pub fn external_declaration_count(&self) -> Result<usize> {
         self.conn
             .query_row(
-                "SELECT COUNT(*) FROM symbols s JOIN files f ON f.id = s.file_id \
-                 WHERE f.source = 'external'",
+                "SELECT COUNT(*) FROM declarations d \
+                 JOIN file_revisions r ON r.id = d.revision_id \
+                 WHERE r.source = 'external'",
                 [],
                 |row| row.get::<_, i64>(0),
             )
             .map(|count| count as usize)
-            .context("failed to count external symbols")
+            .context("failed to count external declarations")
     }
 
     #[allow(dead_code)]
@@ -591,13 +576,28 @@ impl IndexStore {
         Ok(deleted)
     }
 
-    pub fn symbol_count(&self) -> Result<usize> {
+    pub fn declaration_count(&self) -> Result<usize> {
         self.conn
-            .query_row("SELECT COUNT(*) FROM symbols", [], |row| {
+            .query_row("SELECT COUNT(*) FROM declarations", [], |row| {
                 row.get::<_, i64>(0)
             })
             .map(|count| count as usize)
-            .context("failed to count symbols")
+            .context("failed to count declarations")
+    }
+
+    #[cfg(test)]
+    pub fn declarations_by_name(&self, name: &str) -> Result<Vec<views::DeclarationReadRow>> {
+        self.declaration_view().by_name(name)
+    }
+
+    #[cfg(test)]
+    pub fn declarations_by_ids(&self, ids: &[i64]) -> Result<Vec<views::DeclarationReadRow>> {
+        self.declaration_view().by_ids(ids)
+    }
+
+    #[cfg(test)]
+    pub fn declaration_name_rows(&self) -> Result<Vec<views::DeclarationNameRow>> {
+        self.declaration_view().all_name_rows()
     }
 
     fn migrate(&self, workspace_root: &Path, create_call_indexes: bool) -> Result<()> {
@@ -632,6 +632,7 @@ impl IndexStore {
                 "members",
                 "record_defs",
                 "includes",
+                "fallback_completions",
                 "symbols",
                 "files",
             ] {
@@ -688,10 +689,6 @@ impl IndexStore {
         Ok(())
     }
 
-    pub fn name_table_view(&self) -> views::NameTableStoreView<'_> {
-        views::NameTableStoreView::new(self)
-    }
-
     pub fn reach_graph_view(&self) -> views::ReachGraphStoreView<'_> {
         views::ReachGraphStoreView::new(self)
     }
@@ -700,8 +697,8 @@ impl IndexStore {
         views::IncludeTableStoreView::new(self)
     }
 
-    pub fn symbol_read_view(&self) -> views::SymbolReadView<'_> {
-        views::SymbolReadView::new(self)
+    pub fn fallback_completion_view(&self) -> views::FallbackCompletionStoreView<'_> {
+        views::FallbackCompletionStoreView::new(self)
     }
 
     pub fn reference_file_view(&self) -> views::ReferenceFileStoreView<'_> {
@@ -745,35 +742,6 @@ fn parser_facts_are_current(conn: &Connection) -> Result<bool> {
     Ok(stale_active_revisions == 0)
 }
 
-fn map_symbol_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SymbolRecord> {
-    Ok(SymbolRecord {
-        id: row.get(0)?,
-        name: row.get(1)?,
-        kind: row.get(2)?,
-        role: row.get(3)?,
-        path: row.get(4)?,
-        start_line: row.get::<_, i64>(5)? as u32,
-        start_col: row.get::<_, i64>(6)? as u32,
-        end_line: row.get::<_, i64>(7)? as u32,
-        end_col: row.get::<_, i64>(8)? as u32,
-        signature: row.get(9)?,
-        guard: row.get(10)?,
-        source: row.get(11)?,
-        directly_included: row.get::<_, i64>(12)? != 0,
-    })
-}
-
-fn symbol_kind(kind: SymbolKind) -> &'static str {
-    match kind {
-        SymbolKind::Function => "function",
-        SymbolKind::Macro => "macro",
-        SymbolKind::Type => "type",
-        SymbolKind::EnumConstant => "enum_constant",
-        SymbolKind::GlobalVariable => "global_variable",
-        SymbolKind::Field => "field",
-    }
-}
-
 fn record_kind_to_str(k: RecordKind) -> &'static str {
     match k {
         RecordKind::Struct => "struct",
@@ -805,15 +773,6 @@ fn member_kind_to_str(k: MemberKind) -> &'static str {
 
 fn member_confidence_to_str(c: MemberConfidence) -> &'static str {
     c.as_str()
-}
-
-fn symbol_role(role: SymbolRole) -> &'static str {
-    match role {
-        SymbolRole::Definition => "definition",
-        SymbolRole::Declaration => "declaration",
-        SymbolRole::TentativeDefinition => "tentative_definition",
-        SymbolRole::UnknownDeclarationOrDefinition => "unknown_declaration_or_definition",
-    }
 }
 
 fn now_unix_secs() -> i64 {

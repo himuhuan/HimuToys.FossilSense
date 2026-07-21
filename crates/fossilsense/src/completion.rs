@@ -638,6 +638,7 @@ mod tests {
                 current_file_overlay: 1,
                 language_builtin: 1,
                 local_word: 1,
+                lexical_fallback: 0,
             },
             returned_sources: SourceCounts {
                 indexed: 1,
@@ -645,6 +646,7 @@ mod tests {
                 current_file_overlay: 1,
                 language_builtin: 1,
                 local_word: 0,
+                lexical_fallback: 0,
             },
             final_rank: FinalRankSummary {
                 guarded_low_trust: 2,
@@ -803,6 +805,7 @@ mod tests {
                 current_file_overlay: 0,
                 language_builtin: 0,
                 local_word: 1,
+                lexical_fallback: 0,
             },
             returned_sources: SourceCounts {
                 indexed: 0,
@@ -810,6 +813,7 @@ mod tests {
                 current_file_overlay: 0,
                 language_builtin: 0,
                 local_word: 1,
+                lexical_fallback: 0,
             },
             final_rank: FinalRankSummary::default(),
             shadow: Some(ShadowRankSummary {

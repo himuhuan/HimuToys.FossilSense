@@ -42,7 +42,7 @@ fn read_model_cache_rebuilds_use_typed_store_views() {
         ],
     );
     assert_present(
-        "src/server/indexing/cache.rs",
+        "src/server/indexing/cache/declaration_models.rs",
         &["NameTable::build_from_declaration_view("],
     );
     assert_absent(
@@ -86,6 +86,10 @@ fn feature_and_cli_call_sites_use_read_views_for_exact_store_queries() {
             "store.symbols_by_name(",
         ],
     );
+    assert_present(
+        "src/main.rs",
+        &["CandidateQueryService::new(", "semantic_candidates("],
+    );
 }
 
 #[test]
@@ -107,7 +111,7 @@ fn core_symbol_features_route_through_candidate_sets_and_stable_handles() {
         ],
     );
     assert_present(
-        "src/server.rs",
+        "src/server/completion_adapter.rs",
         &["CompletionDocumentationData::Declaration"],
     );
     assert_present(

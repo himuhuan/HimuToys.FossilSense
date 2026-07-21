@@ -362,8 +362,7 @@ impl<'a> CallFactStoreView<'a> {
                     a.body_start_byte, a.body_end_byte, a.body_start_line,
                     a.body_start_col, a.body_end_line, a.body_end_col,
                     guard_text.text,
-                    CASE (a.flags & 255) WHEN 1 THEN 'lexical_fallback'
-                         WHEN 2 THEN 'synthetic' ELSE 'ast' END,
+                    CASE (a.flags & 255) WHEN 2 THEN 'synthetic' ELSE 'ast' END,
                     ((a.flags & 256) != 0), f.directly_included
              FROM callable_anchors a
              JOIN files f ON f.id = a.file_id
@@ -427,8 +426,7 @@ impl<'a> CallFactStoreView<'a> {
                          WHEN 6 THEN 'function_pointer' WHEN 7 THEN 'callable_object'
                          WHEN 8 THEN 'explicit_construction' ELSE 'unsupported' END,
                     c.argument_count, guard_text.text,
-                    CASE (c.flags & 255) WHEN 1 THEN 'lexical_fallback'
-                         WHEN 2 THEN 'synthetic' ELSE 'ast' END,
+                    'ast',
                     ((c.flags & 256) != 0)
              FROM call_sites c
              JOIN files f ON f.id = c.file_id
@@ -482,7 +480,6 @@ fn map_anchor(row: &rusqlite::Row<'_>) -> rusqlite::Result<CallableAnchorRow> {
 
 fn signature_fidelity(code: i64) -> SignatureFidelity {
     match code {
-        1 => SignatureFidelity::LexicalFallback,
         2 => SignatureFidelity::Malformed,
         _ => SignatureFidelity::AstExact,
     }

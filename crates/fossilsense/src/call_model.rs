@@ -117,7 +117,6 @@ pub enum LinkageDomain {
 #[serde(rename_all = "snake_case")]
 pub enum FactProvenance {
     Ast,
-    LexicalFallback,
     Synthetic,
 }
 
@@ -125,7 +124,6 @@ impl FactProvenance {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Ast => "ast",
-            Self::LexicalFallback => "lexical_fallback",
             Self::Synthetic => "synthetic",
         }
     }
@@ -153,7 +151,6 @@ pub struct SignatureShape {
 pub enum SignatureFidelity {
     #[default]
     AstExact,
-    LexicalFallback,
     Malformed,
 }
 

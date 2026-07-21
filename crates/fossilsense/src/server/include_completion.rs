@@ -5,7 +5,6 @@ use std::sync::{Arc, Mutex as StdMutex};
 use anyhow::Result;
 use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind, Location, Position, Range, Url};
 
-use crate::config::WorkspaceConfig;
 use crate::includes::IncludeForm;
 use crate::pathing;
 use crate::store::IndexStore;
@@ -22,12 +21,10 @@ pub(super) struct CachedDirListing {
 }
 
 pub(super) fn configured_include_paths(
-    workspace_root: Option<&Path>,
+    workspace_paths: &[String],
     client_paths: &[String],
 ) -> Vec<String> {
-    let mut paths = workspace_root
-        .map(|root| WorkspaceConfig::load(root).0.include_paths)
-        .unwrap_or_default();
+    let mut paths = workspace_paths.to_vec();
     paths.extend(client_paths.iter().cloned());
 
     let mut seen = HashSet::new();
@@ -656,6 +653,7 @@ fn push_include_candidate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::WorkspaceConfig;
     use crate::indexer::{self, IndexOptions};
     use std::collections::HashMap;
     use std::fs;
@@ -798,7 +796,8 @@ mod tests {
         )
         .expect("config");
 
-        let paths = configured_include_paths(Some(ws.path()), std::slice::from_ref(&client_path));
+        let workspace_paths = WorkspaceConfig::load(ws.path()).0.include_paths;
+        let paths = configured_include_paths(&workspace_paths, std::slice::from_ref(&client_path));
         assert!(paths.contains(&json_path));
         assert!(paths.contains(&client_path));
     }

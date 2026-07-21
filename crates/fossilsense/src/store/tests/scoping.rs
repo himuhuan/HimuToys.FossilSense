@@ -14,27 +14,27 @@ fn kind_counts_scoped_filters_to_reachable_files() {
 
     // Unscoped: both definitions count.
     let unscoped = reader
-        .kind_counts_by_names(&["widget_t"])
+        .declaration_kind_counts_by_names(&["widget_t"])
         .expect("unscoped");
     assert_eq!(unscoped["widget_t"].get("type").copied(), Some(2));
 
     // Scoped to only the reachable header: a single definition counts.
     let reachable: HashSet<String> = ["inc/b.h".to_string()].into_iter().collect();
     let scoped = reader
-        .kind_counts_by_names_scoped(&["widget_t"], Some(&reachable))
+        .declaration_kind_counts_by_names_scoped(&["widget_t"], Some(&reachable))
         .expect("scoped");
     assert_eq!(scoped["widget_t"].get("type").copied(), Some(1));
 
     // Scope that reaches neither header: the name is absent (would not color).
     let elsewhere: HashSet<String> = ["src/a.c".to_string()].into_iter().collect();
     let none = reader
-        .kind_counts_by_names_scoped(&["widget_t"], Some(&elsewhere))
+        .declaration_kind_counts_by_names_scoped(&["widget_t"], Some(&elsewhere))
         .expect("none");
     assert!(!none.contains_key("widget_t"));
 
     // None scope behaves exactly like the unscoped query (open/fallback).
     let passthrough = reader
-        .kind_counts_by_names_scoped(&["widget_t"], None)
+        .declaration_kind_counts_by_names_scoped(&["widget_t"], None)
         .expect("passthrough");
     assert_eq!(passthrough["widget_t"].get("type").copied(), Some(2));
 }

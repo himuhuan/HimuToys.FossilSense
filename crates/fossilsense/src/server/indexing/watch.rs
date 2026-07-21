@@ -1,9 +1,10 @@
 use super::*;
+use crate::server::WorkspaceRootConfig;
 
 pub(in crate::server) async fn watched_change_in_scope(
     roots: &[PathBuf],
     change: &FileEvent,
-    config_cache: &Arc<tokio::sync::Mutex<HashMap<PathBuf, crate::config::WorkspaceConfig>>>,
+    config_cache: &Arc<tokio::sync::Mutex<HashMap<PathBuf, WorkspaceRootConfig>>>,
 ) -> Option<WatchDecision> {
     let path = uri_to_path(&change.uri)?;
     let root = roots
@@ -30,7 +31,10 @@ pub(in crate::server) async fn watched_change_in_scope(
     let config = match config {
         Some(c) => c,
         None => {
-            let (conf, _) = crate::config::WorkspaceConfig::load(root);
+            let load_root = root.clone();
+            let conf = tokio::task::spawn_blocking(move || WorkspaceRootConfig::load(&load_root))
+                .await
+                .unwrap_or_else(|_| WorkspaceRootConfig::fallback(root));
             config_cache.lock().await.insert(root.clone(), conf.clone());
             conf
         }
@@ -40,12 +44,12 @@ pub(in crate::server) async fn watched_change_in_scope(
         .file_name()
         .and_then(|name| name.to_str())
         .is_some_and(crate::project_context::is_supported_marker_file_name)
-        && config.is_project_marker_in_scope(&rel)
+        && config.workspace.is_project_marker_in_scope(&rel)
     {
         return Some(WatchDecision::ProjectContext(root.clone()));
     }
 
-    if config.is_in_scope(&rel) {
+    if config.workspace.is_in_scope(&rel) {
         let kind = if change.typ == FileChangeType::DELETED {
             indexer::DirtyFileKind::Delete
         } else {

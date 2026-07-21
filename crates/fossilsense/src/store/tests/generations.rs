@@ -34,8 +34,8 @@ fn staged_file_revision_is_invisible_until_manifest_flip() {
         )
         .unwrap();
 
-    assert!(store.symbols_by_name("old_name").unwrap().len() == 1);
-    assert!(store.symbols_by_name("new_name").unwrap().is_empty());
+    assert!(store.declarations_by_name("old_name").unwrap().len() == 1);
+    assert!(store.declarations_by_name("new_name").unwrap().is_empty());
     assert_eq!(store.semantic_generation().unwrap(), 1);
 
     let published = store
@@ -43,8 +43,8 @@ fn staged_file_revision_is_invisible_until_manifest_flip() {
         .unwrap();
     assert_eq!(published.generation, 2);
     assert!(published.cleanup_warning.is_none());
-    assert!(store.symbols_by_name("old_name").unwrap().is_empty());
-    assert!(store.symbols_by_name("new_name").unwrap().len() == 1);
+    assert!(store.declarations_by_name("old_name").unwrap().is_empty());
+    assert!(store.declarations_by_name("new_name").unwrap().len() == 1);
 }
 
 #[test]
@@ -58,7 +58,7 @@ fn sqlite_reader_keeps_one_active_generation_across_publish() {
     let transaction = reader.conn.transaction().unwrap();
     let before_count: i64 = transaction
         .query_row(
-            "SELECT COUNT(*) FROM symbols WHERE name = 'before'",
+            "SELECT COUNT(*) FROM declarations WHERE name = 'before'",
             [],
             |row| row.get(0),
         )
@@ -85,21 +85,21 @@ fn sqlite_reader_keeps_one_active_generation_across_publish() {
 
     let old_after_publish: i64 = transaction
         .query_row(
-            "SELECT COUNT(*) FROM symbols WHERE name = 'before'",
+            "SELECT COUNT(*) FROM declarations WHERE name = 'before'",
             [],
             |row| row.get(0),
         )
         .unwrap();
     let new_after_publish: i64 = transaction
         .query_row(
-            "SELECT COUNT(*) FROM symbols WHERE name = 'after'",
+            "SELECT COUNT(*) FROM declarations WHERE name = 'after'",
             [],
             |row| row.get(0),
         )
         .unwrap();
     assert_eq!((old_after_publish, new_after_publish), (1, 0));
     transaction.commit().unwrap();
-    assert_eq!(writer.symbols_by_name("after").unwrap().len(), 1);
+    assert_eq!(writer.declarations_by_name("after").unwrap().len(), 1);
 }
 
 #[test]
@@ -129,7 +129,7 @@ fn request_generation_guard_rejects_a_newer_active_manifest() {
         .unwrap();
 
     let error = IndexStore::read_at_generation(&db, captured_generation, |reader| {
-        reader.symbols_by_name("after")
+        reader.declarations_by_name("after")
     })
     .expect_err("a request snapshot must not mix with a newer database generation");
     assert!(error.to_string().contains("generation"));
@@ -158,12 +158,12 @@ fn abandoned_build_cannot_replace_active_facts() {
         .unwrap();
 
     let replacement = store.begin_index_build(false).unwrap();
-    assert!(store.symbols_by_name("stable").unwrap().len() == 1);
-    assert!(store.symbols_by_name("abandoned").unwrap().is_empty());
+    assert!(store.declarations_by_name("stable").unwrap().len() == 1);
+    assert!(store.declarations_by_name("abandoned").unwrap().is_empty());
     store
         .commit_index_build(replacement, &IncludeGraphUpdate::default())
         .unwrap();
-    assert!(store.symbols_by_name("stable").unwrap().len() == 1);
+    assert!(store.declarations_by_name("stable").unwrap().len() == 1);
 }
 
 #[test]
@@ -187,8 +187,8 @@ fn full_rebuild_switches_the_complete_file_set_once() {
             }],
         )
         .unwrap();
-    assert!(store.symbols_by_name("old_only").unwrap().len() == 1);
-    assert!(store.symbols_by_name("new_only").unwrap().is_empty());
+    assert!(store.declarations_by_name("old_only").unwrap().len() == 1);
+    assert!(store.declarations_by_name("new_only").unwrap().is_empty());
 
     store
         .commit_index_build(
@@ -199,8 +199,8 @@ fn full_rebuild_switches_the_complete_file_set_once() {
             },
         )
         .unwrap();
-    assert!(store.symbols_by_name("old_only").unwrap().is_empty());
-    assert!(store.symbols_by_name("new_only").unwrap().len() == 1);
+    assert!(store.declarations_by_name("old_only").unwrap().is_empty());
+    assert!(store.declarations_by_name("new_only").unwrap().len() == 1);
 }
 
 #[test]
@@ -274,7 +274,10 @@ fn semantic_read_guard_rejects_a_mismatched_snapshot_generation() {
 
     let guard = reader.begin_semantic_read(Some(1)).unwrap();
     assert_eq!(guard.generation(), 1);
-    assert_eq!(guard.store().symbols_by_name("current").unwrap().len(), 1);
+    assert_eq!(
+        guard.store().declarations_by_name("current").unwrap().len(),
+        1
+    );
     guard.finish().unwrap();
 
     let error = reader.begin_semantic_read(Some(9)).err().unwrap();
@@ -325,6 +328,12 @@ fn cleanup_failure_does_not_turn_a_committed_generation_into_failure() {
         .as_deref()
         .is_some_and(|warning| warning.contains("injected cleanup failure")));
     assert_eq!(store.semantic_generation().unwrap(), 2);
-    assert!(store.symbols_by_name("before_cleanup").unwrap().is_empty());
-    assert_eq!(store.symbols_by_name("after_cleanup").unwrap().len(), 1);
+    assert!(store
+        .declarations_by_name("before_cleanup")
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        store.declarations_by_name("after_cleanup").unwrap().len(),
+        1
+    );
 }

@@ -1,6 +1,39 @@
 use super::*;
 
 #[test]
+fn block_commented_include_never_creates_an_index_edge() {
+    use crate::store::IndexStore;
+
+    let dir = tempdir().expect("tempdir");
+    fs::write(
+        dir.path().join("main.c"),
+        "/* disabled\n#include \"phantom.h\"\n*/\n#include \"real.h\"\n",
+    )
+    .expect("main.c");
+    fs::write(dir.path().join("phantom.h"), "int phantom;\n").expect("phantom.h");
+    fs::write(dir.path().join("real.h"), "int real;\n").expect("real.h");
+    let db = dir.path().join("index.sqlite");
+
+    index_workspace(
+        dir.path(),
+        IndexOptions {
+            db_path: Some(db.clone()),
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("index");
+
+    let store = IndexStore::open_readonly(&db).expect("readonly");
+    let edges = store.load_include_edge_paths().expect("edges");
+    assert_eq!(
+        edges,
+        vec![("main.c".to_string(), "real.h".to_string())],
+        "a directive inside a multiline block comment must not enter the include graph"
+    );
+}
+
+#[test]
 fn builds_include_edges_and_reachability_scopes_coloring() {
     use crate::reachability::ReachGraph;
     use crate::store::IndexStore;
@@ -67,13 +100,13 @@ fn builds_include_edges_and_reachability_scopes_coloring() {
     // Coloring is scoped to a.c's reachable set: widget_t counts once (b.h),
     // not twice — the unreachable other/c.h definition is excluded.
     let scoped = store
-        .kind_counts_by_names_scoped(&["widget_t"], Some(&scope_a.files))
+        .declaration_kind_counts_by_names_scoped(&["widget_t"], Some(&scope_a.files))
         .expect("scoped counts");
     assert_eq!(scoped["widget_t"].get("type").copied(), Some(1));
 
     // Unscoped (the open/fallback path) still sees both workspace defs.
     let unscoped = store
-        .kind_counts_by_names(&["widget_t"])
+        .declaration_kind_counts_by_names(&["widget_t"])
         .expect("unscoped counts");
     assert_eq!(unscoped["widget_t"].get("type").copied(), Some(2));
 }
@@ -518,10 +551,12 @@ fn quote_resolving_local_does_not_flag_external_twin_directly_included() {
     // External `util.h` symbol is present but NOT first-layer (its
     // directly_included flag is false because no workspace file has an
     // ExternalExact edge to it).
-    let defs = store.symbols_by_name("util_value").expect("util_value");
+    let defs = store
+        .declarations_by_name("util_value")
+        .expect("util_value");
     let ext_def = defs
         .iter()
-        .find(|r| r.path == ext_path)
+        .find(|r| r.fact.path == ext_path)
         .expect("external util.h indexed");
     assert!(
         !ext_def.directly_included,
@@ -529,7 +564,9 @@ fn quote_resolving_local_does_not_flag_external_twin_directly_included() {
     );
     // Coloring: the external twin (not first-layer) is excluded from kind
     // counts; the local workspace definition alone counts.
-    let counts = store.kind_counts_by_names(&["util_value"]).expect("counts");
+    let counts = store
+        .declaration_kind_counts_by_names(&["util_value"])
+        .expect("counts");
     assert_eq!(counts["util_value"].get("function").copied(), Some(1));
 }
 
@@ -584,6 +621,8 @@ fn angle_external_include_flags_target_first_layer() {
         "angle external include resolves ExternalExact; got {kind:?}"
     );
     // First-layer flag derives from the ExternalExact edge → size_t colors.
-    let counts = store.kind_counts_by_names(&["size_t"]).expect("counts");
+    let counts = store
+        .declaration_kind_counts_by_names(&["size_t"])
+        .expect("counts");
     assert_eq!(counts["size_t"].get("type").copied(), Some(1));
 }

@@ -13,11 +13,12 @@ use tempfile::tempdir;
 use tower_lsp::lsp_types::{
     CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse,
     DeclarationCapability, DidChangeTextDocumentParams, DidChangeWorkspaceFoldersParams,
-    DidOpenTextDocumentParams, Documentation, ExecuteCommandParams, FileChangeType, FileEvent,
-    GotoDefinitionParams, GotoDefinitionResponse, HoverContents, HoverParams, InitializeParams,
-    OneOf, Position, SignatureHelpParams, TextDocumentContentChangeEvent, TextDocumentIdentifier,
-    TextDocumentItem, TextDocumentPositionParams, Url, VersionedTextDocumentIdentifier,
-    WorkspaceFolder, WorkspaceFoldersChangeEvent,
+    DidOpenTextDocumentParams, DocumentSymbolParams, DocumentSymbolResponse, Documentation,
+    ExecuteCommandParams, FileChangeType, FileEvent, GotoDefinitionParams, GotoDefinitionResponse,
+    HoverContents, HoverParams, InitializeParams, OneOf, Position, SignatureHelpParams,
+    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
+    TextDocumentPositionParams, Url, VersionedTextDocumentIdentifier, WorkspaceFolder,
+    WorkspaceFoldersChangeEvent, WorkspaceSymbolParams,
 };
 use tower_lsp::{LanguageServer as _, LspService};
 
@@ -299,6 +300,7 @@ async fn workspace_folder_removal_drops_root_and_published_snapshot() {
             semantic_generation: crate::call_model::SemanticGeneration(1),
             declaration_index: None,
             name_table: None,
+            fallback_completion_table: Arc::new(Default::default()),
             reach_graph: None,
             include_table: None,
             indexed_files: None,
@@ -378,6 +380,7 @@ async fn name_index_compaction_publishes_only_for_the_expected_engine_epoch() {
             semantic_generation: crate::call_model::SemanticGeneration(7),
             declaration_index: Some(declaration_index.clone()),
             name_table: Some(declaration_index.name_table_arc()),
+            fallback_completion_table: Arc::new(Default::default()),
             reach_graph: None,
             include_table: None,
             indexed_files: None,
@@ -479,6 +482,245 @@ async fn indexed_backend_with_open_doc(
         .expect("publish test index");
     open_test_document(&service, uri.clone(), 1, open_text).await;
     (dir, service, uri, line, character)
+}
+
+#[tokio::test]
+async fn lexical_fallback_is_completion_only_across_lsp_consumers() {
+    let broken_text = "((( guessed(value);\n";
+    let (dir, service, main_uri, line, character) = indexed_backend_with_open_doc(
+        &[("broken.c", broken_text)],
+        "main.c",
+        "void f(void) { gue/*cursor*/; }\n",
+    )
+    .await;
+
+    let completion = service
+        .inner()
+        .completion(completion_params(main_uri, line, character))
+        .await
+        .expect("completion request")
+        .expect("fallback completion response");
+    let guessed = completion_items(completion)
+        .into_iter()
+        .find(|item| item.label == "guessed")
+        .expect("isolated lexical fallback completion");
+    assert_eq!(guessed.kind, Some(CompletionItemKind::FUNCTION));
+    assert!(
+        guessed.data.is_none(),
+        "fallback must have no resolve handle"
+    );
+    assert!(guessed.documentation.is_none());
+
+    let (open_broken_text, broken_line, broken_character) =
+        text_and_position("((( gue/*cursor*/ssed(value);\n");
+    assert_eq!(open_broken_text, broken_text);
+    let broken_uri = Url::from_file_path(dir.path().join("broken.c")).expect("broken uri");
+    open_test_document(&service, broken_uri.clone(), 1, open_broken_text).await;
+
+    assert!(service
+        .inner()
+        .hover(hover_params(
+            broken_uri.clone(),
+            broken_line,
+            broken_character
+        ))
+        .await
+        .expect("hover request")
+        .is_none());
+    assert!(service
+        .inner()
+        .goto_definition(goto_definition_params(
+            broken_uri.clone(),
+            broken_line,
+            broken_character
+        ))
+        .await
+        .expect("definition request")
+        .is_none());
+
+    let symbols = service
+        .inner()
+        .document_symbol(DocumentSymbolParams {
+            text_document: TextDocumentIdentifier {
+                uri: broken_uri.clone(),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .expect("document symbol request")
+        .expect("empty document symbol response");
+    match symbols {
+        DocumentSymbolResponse::Nested(symbols) => assert!(symbols.is_empty()),
+        DocumentSymbolResponse::Flat(symbols) => assert!(symbols.is_empty()),
+    }
+
+    let workspace_symbols = service
+        .inner()
+        .symbol(WorkspaceSymbolParams {
+            query: "guessed".to_string(),
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .expect("workspace symbol request")
+        .unwrap_or_default();
+    assert!(workspace_symbols
+        .iter()
+        .all(|symbol| symbol.name != "guessed"));
+}
+
+#[tokio::test]
+async fn cpp_constructor_style_object_is_one_object_in_completion_hover_and_navigation() {
+    let indexed_source = "struct Widget { explicit Widget(int); };\n\
+                          Widget stale_widget(1);\n\
+                          void use(void) { stale_widget/*cursor*/; }\n";
+    let (_dir, service, uri, _line, _character) =
+        indexed_backend_with_open_doc(&[], "main.cpp", indexed_source).await;
+    let (dirty_source, line, character) = text_and_position(
+        "struct Widget { explicit Widget(int); };\n\
+         Widget widget(42);\n\
+         void use(void) { widget/*cursor*/; }\n",
+    );
+    open_test_document(&service, uri.clone(), 2, dirty_source).await;
+
+    let completion = service
+        .inner()
+        .completion(completion_params(uri.clone(), line, character))
+        .await
+        .expect("completion request")
+        .expect("completion response");
+    let widgets: Vec<_> = completion_items(completion)
+        .into_iter()
+        .filter(|item| item.label == "widget")
+        .collect();
+    assert_eq!(
+        widgets.len(),
+        1,
+        "canonical declaration must deduplicate overlays"
+    );
+    assert_eq!(widgets[0].kind, Some(CompletionItemKind::VARIABLE));
+
+    let hover = service
+        .inner()
+        .hover(hover_params(uri.clone(), line, character))
+        .await
+        .expect("hover request")
+        .expect("object hover");
+    let hover = hover_text(hover.contents);
+    assert!(hover.contains("Widget widget"), "{hover}");
+
+    let definition = service
+        .inner()
+        .goto_definition(goto_definition_params(uri.clone(), line, character))
+        .await
+        .expect("definition request")
+        .expect("object definition");
+    let locations = definition_locations(definition);
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0].uri, uri);
+    assert_eq!(locations[0].range.start.line, 1);
+}
+
+#[tokio::test]
+async fn unsaved_header_overlay_uses_the_same_configured_language_as_indexing() {
+    let config = r#"{
+      "languageOverrides": [
+        { "glob": "legacy/**/*.h", "language": "cpp" },
+        { "glob": "legacy/api.h", "language": "c" }
+      ]
+    }"#;
+    let (dir, service, uri, _line, _character) = indexed_backend_with_open_doc(
+        &[("fossilsense.json", config)],
+        "legacy/api.h",
+        "int live_object/*cursor*/;\n",
+    )
+    .await;
+    let path = dir.path().join("legacy/api.h");
+    let document = service
+        .inner()
+        .session
+        .documents
+        .snapshot(&uri)
+        .await
+        .expect("open document");
+    let parsed = service
+        .inner()
+        .get_or_parse_document(
+            &uri,
+            &path,
+            document.version,
+            &document.text,
+            crate::parser::ParseFacts::DECLARATIONS,
+        )
+        .await
+        .expect("live parse");
+    let declaration = parsed
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name == "live_object")
+        .expect("live declaration");
+    assert_eq!(
+        declaration.identity.language,
+        crate::semantic_model::SemanticLanguage::C
+    );
+    assert_eq!(
+        declaration.role,
+        crate::semantic_model::SemanticDeclarationRole::TentativeDefinition
+    );
+}
+
+#[tokio::test]
+async fn live_parse_language_reuses_cached_workspace_resolver_until_invalidation() {
+    let service = test_backend_service();
+    let dir = tempdir().expect("root");
+    let root = dir.path().to_path_buf();
+    let header = root.join("legacy/api.h");
+    fs::create_dir_all(header.parent().expect("parent")).expect("legacy dir");
+    fs::write(
+        root.join("fossilsense.json"),
+        r#"{"languageOverrides":[{"glob":"legacy/**/*.h","language":"c"}]}"#,
+    )
+    .expect("initial config");
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(root.clone());
+
+    assert_eq!(
+        service.inner().source_language_for_path(&header).await,
+        crate::config::SourceLanguage::C
+    );
+    fs::write(
+        root.join("fossilsense.json"),
+        r#"{"languageOverrides":[{"glob":"legacy/**/*.h","language":"cpp"}]}"#,
+    )
+    .expect("updated config");
+    assert_eq!(
+        service.inner().source_language_for_path(&header).await,
+        crate::config::SourceLanguage::C,
+        "request hot paths must reuse the cached resolver instead of rereading the file"
+    );
+
+    service.inner().config_cache.lock().await.remove(&root);
+    assert_eq!(
+        service.inner().source_language_for_path(&header).await,
+        crate::config::SourceLanguage::Cpp,
+        "explicit invalidation must reload the derived resolver"
+    );
+}
+
+#[tokio::test]
+async fn non_file_uri_language_uses_the_uri_path_extension_not_the_workspace_root() {
+    let service = test_backend_service();
+    let uri = Url::parse("untitled:/scratch/header.h").expect("untitled URI");
+
+    assert_eq!(
+        service.inner().source_language_for_uri(&uri).await,
+        crate::config::SourceLanguage::Cpp
+    );
 }
 
 #[tokio::test]
@@ -1028,6 +1270,48 @@ async fn possible_targets_returns_suppressed_callable_variants_and_lexical_local
 }
 
 #[tokio::test]
+async fn possible_targets_reports_facts_unavailable_for_dirty_hard_parse_failure() {
+    let (_dir, service, uri, _line, _character) =
+        indexed_backend_with_open_doc(&[], "broken.c", "int guessed/*cursor*/;\n").await;
+    let (broken, line, character) = text_and_position("((( guessed/*cursor*/(value);\n");
+    service
+        .inner()
+        .did_change(DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier {
+                uri: uri.clone(),
+                version: 2,
+            },
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: broken,
+            }],
+        })
+        .await;
+
+    let response = service
+        .inner()
+        .execute_command(ExecuteCommandParams {
+            command: super::POSSIBLE_TARGETS_LSP_COMMAND.to_string(),
+            arguments: vec![serde_json::json!({
+                "uri": uri,
+                "line": line,
+                "character": character,
+            })],
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .expect("possible targets command")
+        .expect("incomplete possible targets response");
+
+    assert_eq!(response["items"].as_array().map(Vec::len), Some(0));
+    assert_eq!(
+        response["coverage"]["incompleteReason"],
+        "facts_unavailable"
+    );
+}
+
+#[tokio::test]
 async fn external_object_definition_prefers_full_definition_and_declaration_prefers_header() {
     let (_dir, service, uri, line, character) = indexed_backend_with_open_doc(
         &[
@@ -1482,7 +1766,7 @@ async fn cache_ledger_publishes_full_and_dirty_read_models_with_generations() {
         .publish_full_index(&service.inner().client, root_path.clone())
         .await
         .expect("publish full");
-    assert_eq!(full.symbol_count, 1);
+    assert_eq!(full.declaration_count, 1);
     assert_eq!(full.reference_file_count, 1);
     let full_context = service
         .inner()
@@ -1527,7 +1811,7 @@ async fn cache_ledger_publishes_full_and_dirty_read_models_with_generations() {
         )
         .await
         .expect("publish dirty");
-    assert_eq!(dirty.symbol_count, 2);
+    assert_eq!(dirty.declaration_count, 2);
     let dirty_context = service
         .inner()
         .session
@@ -1580,7 +1864,7 @@ async fn marker_only_refresh_retags_names_publishes_epoch_and_clears_memos() {
         .expect("available")
         .projects()
         .is_empty());
-    let published_symbol_count = before
+    let published_declaration_count = before
         .engine
         .name_table
         .as_ref()
@@ -1621,7 +1905,7 @@ async fn marker_only_refresh_retags_names_publishes_epoch_and_clears_memos() {
             .as_ref()
             .expect("retagged table")
             .len(),
-        published_symbol_count
+        published_declaration_count
     );
     let project = after_create
         .engine
@@ -1811,9 +2095,9 @@ async fn watcher_routes_nested_workspace_changes_to_the_most_specific_root() {
     let cache = Arc::new(tokio::sync::Mutex::new(HashMap::from([
         (
             outer_root.clone(),
-            crate::config::WorkspaceConfig::default(),
+            super::WorkspaceRootConfig::fallback(&outer_root),
         ),
-        (inner.clone(), crate::config::WorkspaceConfig::default()),
+        (inner.clone(), super::WorkspaceRootConfig::fallback(&inner)),
     ])));
     let event = |path: &std::path::Path, typ| FileEvent {
         uri: Url::from_file_path(path).expect("uri"),
@@ -2000,6 +2284,7 @@ async fn project_context_commands_validate_selection_and_outside_uri_has_no_auto
             semantic_generation: current.semantic_generation,
             declaration_index: current.declaration_index.clone(),
             name_table: current.name_table.clone(),
+            fallback_completion_table: current.fallback_completion_table.clone(),
             reach_graph: current.reach_graph.clone(),
             include_table: current.include_table.clone(),
             indexed_files: current.indexed_files.clone(),
@@ -2605,6 +2890,7 @@ async fn candidate_overlay_does_not_adopt_a_new_graph_after_request_publication(
             semantic_generation: generation,
             declaration_index: None,
             name_table: None,
+            fallback_completion_table: Arc::new(Default::default()),
             reach_graph: Some(Arc::new(crate::reachability::ReachGraph::new(
                 vec![("unrelated.c".into(), "old.h".into())],
                 vec![],
@@ -2634,6 +2920,7 @@ async fn candidate_overlay_does_not_adopt_a_new_graph_after_request_publication(
             semantic_generation: generation,
             declaration_index: None,
             name_table: None,
+            fallback_completion_table: Arc::new(Default::default()),
             reach_graph: Some(Arc::new(crate::reachability::ReachGraph::new(
                 vec![("unrelated.c".into(), "new.h".into())],
                 vec![],
@@ -2674,6 +2961,7 @@ async fn candidate_overlay_cache_rejects_a_late_build_after_publication() {
             semantic_generation: generation,
             declaration_index: None,
             name_table: None,
+            fallback_completion_table: Arc::new(Default::default()),
             reach_graph: None,
             include_table: None,
             indexed_files: None,
@@ -2721,6 +3009,7 @@ async fn indexed_completion_resolve_rejects_cross_generation_context_before_over
             semantic_generation: crate::call_model::SemanticGeneration(12),
             declaration_index: None,
             name_table: None,
+            fallback_completion_table: Arc::new(Default::default()),
             reach_graph: None,
             include_table: None,
             indexed_files: None,
@@ -2801,6 +3090,7 @@ async fn reach_scope_uses_captured_request_context_graph() {
             semantic_generation: crate::call_model::SemanticGeneration::MISSING,
             declaration_index: None,
             name_table: None,
+            fallback_completion_table: Arc::new(Default::default()),
             reach_graph: Some(captured_graph),
             include_table: None,
             indexed_files: None,
@@ -4260,7 +4550,7 @@ async fn ordinary_completion_compat_fixture_captures_presented_boundary_output()
             PresentedCompletion {
                 label: "fs_overlay_type".to_string(),
                 kind: Some(CompletionItemKind::STRUCT),
-                detail: Some("int".to_string()),
+                detail: Some("typedef int fs_overlay_type;".to_string()),
                 documentation: None,
                 sort_text: Some("00000002".to_string()),
                 has_history_command: true,
@@ -5121,7 +5411,7 @@ fn ready_cache_message_names_degraded_capabilities() {
 
     let message = super::ready_cache_message("name table ready", 7, 3, 2, 11, 13, &degraded);
 
-    assert!(message.contains("name table ready: 7 symbols"));
+    assert!(message.contains("name table ready: 7 declarations"));
     assert!(message.contains("include table=3 paths"));
     assert!(message.contains("reference files=2"));
     assert!(message.contains("degraded=reachGraph,includeTable"));

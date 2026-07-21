@@ -1,5 +1,7 @@
 use super::*;
 
+use serde::Serialize;
+
 use crate::call_model::LinkageDomain;
 use crate::candidate_service::{CandidateQueryService, DEFAULT_EXACT_NAME_CANDIDATE_LIMIT};
 use crate::model::ScopeTier;
@@ -79,10 +81,13 @@ impl Backend {
         }
 
         let root = self.root_for_uri(&uri).await?;
-        let current_path = uri_to_path(&uri)
-            .and_then(|path| pathing::relative_slash_path(&root, &path).ok())
+        let current_abs = uri_to_path(&uri);
+        let current_path = current_abs
+            .as_deref()
+            .and_then(|path| pathing::relative_slash_path(&root, path).ok())
             .unwrap_or_default();
         let context = self.request_context_for_root(root.clone()).await;
+        let source_language = self.source_language_for_uri(&uri).await;
         let semantic_generation = context.engine.semantic_generation.0;
         let cursor = crate::call_model::SourcePosition { line, character };
         let lsp_cursor = tower_lsp::lsp_types::Position { line, character };
@@ -100,6 +105,7 @@ impl Backend {
                     &label_text,
                     &label_word,
                     cursor_byte,
+                    source_language,
                 )
             })
             .await
@@ -134,6 +140,7 @@ impl Backend {
                     &local_text,
                     &local_word,
                     lsp_cursor,
+                    source_language,
                 )
             })
             .await

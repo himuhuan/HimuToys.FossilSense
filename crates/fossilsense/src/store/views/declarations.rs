@@ -122,6 +122,39 @@ impl<'a> DeclarationStoreView<'a> {
         Ok(count)
     }
 
+    #[cfg(test)]
+    pub fn all_name_rows(&self) -> Result<Vec<DeclarationNameRow>> {
+        let sql = format!("{SELECT_NAME} ORDER BY d.id");
+        let mut stmt = self.store.conn.prepare(&sql)?;
+        let mut rows = stmt.query([])?;
+        let mut output = Vec::new();
+        while let Some(row) = rows.next()? {
+            output.push(declaration_name_row(row)?);
+        }
+        Ok(output)
+    }
+
+    #[cfg(test)]
+    pub fn largest_declaration_path(&self) -> Result<Option<(String, usize)>> {
+        use rusqlite::OptionalExtension;
+
+        let row: Option<(String, i64)> = self
+            .store
+            .conn
+            .query_row(
+                "SELECT f.path, COUNT(*) AS declaration_count
+                 FROM declarations d
+                 JOIN file_entries f ON f.id = d.file_id
+                 GROUP BY f.id
+                 ORDER BY declaration_count DESC, f.path ASC
+                 LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        Ok(row.map(|(path, count)| (path, count.max(0) as usize)))
+    }
+
     pub fn name_rows_for_paths(&self, paths: &[String]) -> Result<Vec<DeclarationNameRow>> {
         let mut output = Vec::new();
         for chunk in paths.chunks(400) {
@@ -148,6 +181,12 @@ impl<'a> DeclarationStoreView<'a> {
         let sql = format!("{SELECT} WHERE d.name = ?1 ORDER BY d.id LIMIT ?2");
         let rows = self.read(&sql, params![name, limit.saturating_add(1) as i64])?;
         Ok(truncate(rows, limit))
+    }
+
+    #[cfg(test)]
+    pub fn by_name(&self, name: &str) -> Result<Vec<DeclarationReadRow>> {
+        let sql = format!("{SELECT} WHERE d.name = ?1 ORDER BY d.id");
+        self.read(&sql, params![name])
     }
 
     /// Bounded exact-name read for request-priority paths. Callers use this
@@ -180,16 +219,18 @@ impl<'a> DeclarationStoreView<'a> {
     }
 
     pub fn by_ids(&self, ids: &[i64]) -> Result<Vec<DeclarationReadRow>> {
-        let mut output = Vec::new();
+        let mut by_id = std::collections::HashMap::new();
         for chunk in ids.chunks(400) {
             if chunk.is_empty() {
                 continue;
             }
             let placeholders = vec!["?"; chunk.len()].join(",");
             let sql = format!("{SELECT} WHERE d.id IN ({placeholders}) ORDER BY d.id");
-            output.extend(self.read(&sql, rusqlite::params_from_iter(chunk.iter().copied()))?);
+            for row in self.read(&sql, rusqlite::params_from_iter(chunk.iter().copied()))? {
+                by_id.insert(row.id, row);
+            }
         }
-        Ok(output)
+        Ok(ids.iter().filter_map(|id| by_id.get(id).cloned()).collect())
     }
 
     pub fn by_logical_key_limited(
@@ -290,7 +331,14 @@ fn declaration_row(row: &rusqlite::Row<'_>) -> Result<DeclarationReadRow> {
     let backing_key: Option<String> = row.get(33)?;
     let backing_start: Option<i64> = row.get(34)?;
     let backing_end: Option<i64> = row.get(35)?;
-    let backing = declaration_backing(id, &backing_kind, backing_key, backing_start, backing_end)?;
+    let backing = declaration_backing(
+        id,
+        &backing_kind,
+        backing_key,
+        backing_start,
+        backing_end,
+        name_range,
+    )?;
 
     let logical_key = LogicalEntityKey {
         qualified_name: qualified_name.clone(),
@@ -367,6 +415,7 @@ fn declaration_backing(
     key: Option<String>,
     start: Option<i64>,
     end: Option<i64>,
+    name_range: SourceRange,
 ) -> Result<DeclarationBacking> {
     Ok(match kind {
         "callable_anchor" => DeclarationBacking::CallableAnchor {
@@ -378,13 +427,16 @@ fn declaration_backing(
         "type_alias" => DeclarationBacking::TypeAlias {
             fingerprint: key.context("alias declaration backing is missing its fingerprint")?,
         },
-        "symbol" => DeclarationBacking::Symbol {
-            start_byte: start
-                .with_context(|| format!("symbol declaration row {id} is missing start byte"))?
-                as usize,
-            end_byte: end
-                .with_context(|| format!("symbol declaration row {id} is missing end byte"))?
-                as usize,
+        "source_range" => DeclarationBacking::SourceRange {
+            range: SourceRange {
+                start_byte: start.with_context(|| {
+                    format!("source range declaration row {id} is missing start byte")
+                })? as usize,
+                end_byte: end.with_context(|| {
+                    format!("source range declaration row {id} is missing end byte")
+                })? as usize,
+                ..name_range
+            },
         },
         "none" => DeclarationBacking::None,
         value => anyhow::bail!("invalid backing kind {value:?} for declaration row {id}"),
@@ -436,8 +488,6 @@ fn language_fidelity(value: i64) -> Result<LanguageFidelity> {
 fn semantic_provenance(value: i64) -> Result<SemanticFactProvenance> {
     Ok(match value {
         0 => SemanticFactProvenance::Ast,
-        1 => SemanticFactProvenance::LexicalFallback,
-        2 => SemanticFactProvenance::Synthetic,
         _ => anyhow::bail!("unknown semantic provenance code {value}"),
     })
 }

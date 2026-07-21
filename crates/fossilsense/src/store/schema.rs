@@ -1,12 +1,13 @@
-// Version 18 stores canonical declarations as typed columns instead of a
-// duplicated full-object JSON payload. Older rows are rebuilt; semantic
-// queries never dual-read symbols.
-pub(crate) const SCHEMA_VERSION: i64 = 18;
+// Version 19 removes the legacy symbol fact model and isolates lexical fallback
+// names in a completion-only table.
+pub(crate) const SCHEMA_VERSION: i64 = 19;
 
 pub(crate) const DROP_DATA_TABLES_SQL: &str = "
     DROP TABLE IF EXISTS pending_file_revisions;
     DROP TABLE IF EXISTS index_builds;
     DROP TABLE IF EXISTS active_file_revisions;
+    DROP TABLE IF EXISTS symbol_facts;
+    DROP TABLE IF EXISTS fallback_completion_facts;
     DROP TABLE IF EXISTS declaration_facts;
     DROP TABLE IF EXISTS type_alias_facts;
     DROP TABLE IF EXISTS call_site_facts;
@@ -16,7 +17,6 @@ pub(crate) const DROP_DATA_TABLES_SQL: &str = "
     DROP TABLE IF EXISTS record_facts;
     DROP TABLE IF EXISTS include_edges;
     DROP TABLE IF EXISTS include_facts;
-    DROP TABLE IF EXISTS symbol_facts;
     DROP TABLE IF EXISTS file_revisions;
     DROP TABLE IF EXISTS fields;
     DROP TABLE IF EXISTS file_entries;
@@ -58,7 +58,7 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
         parser_version INTEGER NOT NULL,
         fact_mask INTEGER NOT NULL DEFAULT 0,
         parse_error_count INTEGER NOT NULL DEFAULT 0,
-        fallback_used INTEGER NOT NULL DEFAULT 0
+        fallback_used INTEGER NOT NULL DEFAULT 0 CHECK(fallback_used IN (0, 1))
     );
 
     CREATE TABLE IF NOT EXISTS active_file_revisions (
@@ -81,22 +81,19 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
         PRIMARY KEY (build_id, file_id)
     ) WITHOUT ROWID;
 
-    CREATE TABLE IF NOT EXISTS symbol_facts (
+    CREATE TABLE IF NOT EXISTS fallback_completion_facts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         revision_id INTEGER NOT NULL REFERENCES file_revisions(id) ON DELETE CASCADE,
         file_id INTEGER NOT NULL REFERENCES file_entries(id) ON DELETE CASCADE,
         name TEXT NOT NULL,
-        kind TEXT NOT NULL,
-        role TEXT NOT NULL,
+        kind_hint INTEGER NOT NULL CHECK(kind_hint BETWEEN 0 AND 3),
         start_byte INTEGER NOT NULL,
         end_byte INTEGER NOT NULL,
         start_line INTEGER NOT NULL,
         start_col INTEGER NOT NULL,
         end_line INTEGER NOT NULL,
         end_col INTEGER NOT NULL,
-        signature TEXT NOT NULL,
-        guard TEXT,
-        container TEXT
+        detail TEXT
     );
 
     CREATE TABLE IF NOT EXISTS declaration_facts (
@@ -127,7 +124,7 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
         guard TEXT,
         language INTEGER NOT NULL CHECK(language BETWEEN 0 AND 2),
         language_fidelity INTEGER NOT NULL CHECK(language_fidelity BETWEEN 0 AND 3),
-        provenance INTEGER NOT NULL CHECK(provenance BETWEEN 0 AND 2),
+        provenance INTEGER NOT NULL CHECK(provenance = 0),
         fact_fidelity INTEGER NOT NULL CHECK(fact_fidelity BETWEEN 0 AND 2),
         logical_key_digest BLOB NOT NULL
             CHECK(typeof(logical_key_digest) = 'blob' AND length(logical_key_digest) = 12),
@@ -259,7 +256,7 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
         signature_id INTEGER NOT NULL REFERENCES call_strings(id),
         canonical_signature_id INTEGER NOT NULL REFERENCES call_strings(id),
         presentation_signature_id INTEGER NOT NULL REFERENCES call_strings(id),
-        signature_fidelity INTEGER NOT NULL CHECK(signature_fidelity IN (0, 1, 2)),
+        signature_fidelity INTEGER NOT NULL CHECK(signature_fidelity IN (0, 2)),
         min_arity INTEGER,
         max_arity INTEGER,
         variadic INTEGER NOT NULL CHECK(variadic IN (0, 1)),
@@ -282,7 +279,7 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
         body_end_line INTEGER,
         body_end_col INTEGER,
         guard_id INTEGER REFERENCES call_strings(id),
-        flags INTEGER NOT NULL CHECK((flags & 255) IN (0, 1, 2) AND (flags & -512) = 0)
+        flags INTEGER NOT NULL CHECK((flags & 255) IN (0, 2) AND (flags & -512) = 0)
     );
 
     CREATE TABLE IF NOT EXISTS call_site_facts (
@@ -303,15 +300,43 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
         call_form INTEGER NOT NULL CHECK(call_form BETWEEN 0 AND 9),
         argument_count INTEGER,
         guard_id INTEGER REFERENCES call_strings(id),
-        flags INTEGER NOT NULL CHECK((flags & 255) IN (0, 1, 2) AND (flags & -512) = 0)
+        flags INTEGER NOT NULL CHECK((flags & 255) = 0 AND (flags & -512) = 0)
     );
+
+    CREATE TRIGGER IF NOT EXISTS declaration_facts_require_ast_revision
+    BEFORE INSERT ON declaration_facts
+    WHEN (SELECT fallback_used FROM file_revisions WHERE id = NEW.revision_id) != 0
+    BEGIN
+        SELECT RAISE(ABORT, 'fallback revisions cannot store declarations');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS declaration_facts_update_requires_ast_revision
+    BEFORE UPDATE ON declaration_facts
+    WHEN (SELECT fallback_used FROM file_revisions WHERE id = NEW.revision_id) != 0
+    BEGIN
+        SELECT RAISE(ABORT, 'fallback revisions cannot store declarations');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS fallback_completion_facts_require_fallback_revision
+    BEFORE INSERT ON fallback_completion_facts
+    WHEN (SELECT fallback_used FROM file_revisions WHERE id = NEW.revision_id) != 1
+    BEGIN
+        SELECT RAISE(ABORT, 'AST revisions cannot store fallback completions');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS fallback_completion_facts_update_requires_fallback_revision
+    BEFORE UPDATE ON fallback_completion_facts
+    WHEN (SELECT fallback_used FROM file_revisions WHERE id = NEW.revision_id) != 1
+    BEGIN
+        SELECT RAISE(ABORT, 'AST revisions cannot store fallback completions');
+    END;
 
     CREATE VIEW IF NOT EXISTS files AS
         SELECT f.* FROM file_entries f
         JOIN active_file_revisions a ON a.file_id = f.id;
 
-    CREATE VIEW IF NOT EXISTS symbols AS
-        SELECT f.* FROM symbol_facts f
+    CREATE VIEW IF NOT EXISTS fallback_completions AS
+        SELECT f.* FROM fallback_completion_facts f
         JOIN active_file_revisions a
           ON a.file_id = f.file_id AND a.revision_id = f.revision_id;
 
@@ -355,8 +380,8 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
 pub(crate) const CREATE_LOOKUP_INDEXES_SQL: &str = "
     CREATE INDEX IF NOT EXISTS idx_files_source ON file_entries(source);
     CREATE INDEX IF NOT EXISTS idx_file_revisions_file_id ON file_revisions(file_id);
-    CREATE INDEX IF NOT EXISTS idx_symbol_facts_name ON symbol_facts(name);
-    CREATE INDEX IF NOT EXISTS idx_symbol_facts_file_id ON symbol_facts(file_id);
+    CREATE INDEX IF NOT EXISTS idx_fallback_completion_name ON fallback_completion_facts(name);
+    CREATE INDEX IF NOT EXISTS idx_fallback_completion_file_id ON fallback_completion_facts(file_id);
     CREATE INDEX IF NOT EXISTS idx_declaration_facts_name ON declaration_facts(name);
     CREATE INDEX IF NOT EXISTS idx_declaration_facts_file_id ON declaration_facts(file_id);
     CREATE INDEX IF NOT EXISTS idx_declaration_facts_logical_key ON declaration_facts(logical_key_digest);

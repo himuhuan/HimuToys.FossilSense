@@ -1,14 +1,8 @@
 use crate::model::DefinitionCandidate;
-#[cfg(test)]
-use crate::reachability::ReachScope;
-#[cfg(test)]
-use crate::store::SymbolRecord;
 
 #[cfg(test)]
 use super::comments::{comment_markdown_for_symbol, CommentAnchor};
 use super::comments::{comment_markdown_from_signature, CommentRenderOptions};
-#[cfg(test)]
-use super::definitions::rank_definition_records_with_scope;
 
 pub const HOVER_CANDIDATE_LIMIT: usize = 4;
 
@@ -17,24 +11,6 @@ pub struct RankedHoverCandidate {
     pub candidate: DefinitionCandidate,
     pub signature: String,
     pub guard: Option<String>,
-}
-
-#[cfg(test)]
-pub fn rank_hover_candidates(
-    records: Vec<SymbolRecord>,
-    current_rel_path: &str,
-    scope: Option<&ReachScope>,
-    limit: usize,
-) -> Vec<RankedHoverCandidate> {
-    rank_definition_records_with_scope(records, current_rel_path, scope)
-        .into_iter()
-        .take(limit)
-        .map(|ranked| RankedHoverCandidate {
-            signature: ranked.record.signature,
-            guard: ranked.record.guard,
-            candidate: ranked.candidate,
-        })
-        .collect()
 }
 
 /// Recover comment Markdown near a symbol using the shared comments pipeline.
@@ -204,83 +180,49 @@ fn sanitize_markdown(value: &str) -> String {
 mod tests {
     use super::*;
 
-    fn symbol_record(
+    fn ranked_candidate(
         name: &str,
         kind: &str,
         role: &str,
         path: &str,
         line: u32,
         signature: &str,
-    ) -> SymbolRecord {
-        SymbolRecord {
-            id: 0,
-            name: name.to_string(),
-            kind: kind.to_string(),
-            role: role.to_string(),
-            path: path.to_string(),
-            start_line: line,
-            start_col: 0,
-            end_line: line,
-            end_col: 0,
+        current: bool,
+    ) -> RankedHoverCandidate {
+        let tier = if current {
+            crate::model::ScopeTier::Current
+        } else {
+            crate::model::ScopeTier::Global
+        };
+        RankedHoverCandidate {
+            candidate: DefinitionCandidate {
+                name: name.to_string(),
+                kind: kind.to_string(),
+                role: role.to_string(),
+                path: path.to_string(),
+                range: crate::model::CandidateRange {
+                    start_line: line,
+                    start_col: 0,
+                    end_line: line,
+                    end_col: 0,
+                },
+                source: "workspace".to_string(),
+                tier,
+                base_match: 0,
+                confidence: if current {
+                    crate::model::ResolutionConfidence::Exact
+                } else {
+                    crate::model::ResolutionConfidence::Fallback
+                },
+                reason: if current {
+                    crate::model::ResolutionReason::CurrentFile
+                } else {
+                    crate::model::ResolutionReason::GlobalFallback
+                },
+            },
             signature: signature.to_string(),
             guard: None,
-            source: "workspace".to_string(),
-            directly_included: false,
         }
-    }
-
-    #[test]
-    fn hover_candidates_preserve_signatures_and_scope_order() {
-        let records = vec![
-            symbol_record(
-                "foo",
-                "function",
-                "definition",
-                "other/foo.c",
-                20,
-                "int foo(float x)",
-            ),
-            symbol_record(
-                "foo",
-                "macro",
-                "definition",
-                "src/main.c",
-                2,
-                "#define foo(x) (x)",
-            ),
-            symbol_record(
-                "foo",
-                "function",
-                "declaration",
-                "inc/foo.h",
-                7,
-                "int foo(int x);",
-            ),
-        ];
-        let reach = ReachScope {
-            files: ["src/main.c".to_string(), "inc/foo.h".to_string()]
-                .into_iter()
-                .collect(),
-            heuristic_files: Default::default(),
-            open: false,
-            reason: None,
-        };
-        let ranked = rank_hover_candidates(records, "src/main.c", Some(&reach), 4);
-        assert_eq!(ranked[0].candidate.path, "src/main.c");
-        assert_eq!(ranked[0].signature, "#define foo(x) (x)");
-        assert_eq!(ranked[1].candidate.path, "inc/foo.h");
-        assert_eq!(ranked[1].signature, "int foo(int x);");
-    }
-
-    #[test]
-    fn hover_candidates_cap_after_ranking() {
-        let records = vec![
-            symbol_record("foo", "function", "definition", "b.c", 0, "int foo(int b)"),
-            symbol_record("foo", "function", "definition", "a.c", 0, "int foo(int a)"),
-        ];
-        let ranked = rank_hover_candidates(records, "main.c", None, 1);
-        assert_eq!(ranked.len(), 1);
-        assert_eq!(ranked[0].candidate.path, "a.c");
     }
 
     #[test]
@@ -558,20 +500,15 @@ mod tests {
 
     #[test]
     fn hover_markdown_uses_signature_and_hides_source_ranges() {
-        let ranked = rank_hover_candidates(
-            vec![symbol_record(
-                "foo",
-                "function",
-                "definition",
-                "src/foo.c",
-                42,
-                "int foo(int x)",
-            )],
-            "src/main.c",
-            None,
-            1,
-        )
-        .remove(0);
+        let ranked = ranked_candidate(
+            "foo",
+            "function",
+            "definition",
+            "src/foo.c",
+            42,
+            "int foo(int x)",
+            false,
+        );
         let markdown = hover_markdown_for_candidate(&ranked, Some("Does work."));
         assert!(markdown.contains("```c\n// In src/foo.c\nint foo(int x)\n```"));
         assert!(markdown.contains("Does work."));
@@ -582,20 +519,15 @@ mod tests {
 
     #[test]
     fn hover_markdown_renders_quiet_source_header_and_metadata() {
-        let ranked = rank_hover_candidates(
-            vec![symbol_record(
-                "ff_sws_lut3d_test_fmt",
-                "function",
-                "definition",
-                "libswscale/lut3d.c",
-                12,
-                "bool ff_sws_lut3d_test_fmt(enum AVPixelFormat fmt, int output)",
-            )],
+        let ranked = ranked_candidate(
+            "ff_sws_lut3d_test_fmt",
+            "function",
+            "definition",
             "libswscale/lut3d.c",
-            None,
-            1,
-        )
-        .remove(0);
+            12,
+            "bool ff_sws_lut3d_test_fmt(enum AVPixelFormat fmt, int output)",
+            true,
+        );
 
         let markdown = hover_markdown_for_candidate(&ranked, None);
 
@@ -611,20 +543,15 @@ mod tests {
 
     #[test]
     fn hover_markdown_splits_signature_comment_and_omits_header_guard_wrapper() {
-        let mut ranked = rank_hover_candidates(
-            vec![symbol_record(
+        let mut ranked = ranked_candidate(
                 "ff_sws_lut3d_test_fmt",
                 "function",
                 "declaration",
                 "libswscale/lut3d.h",
                 5,
                 "/** * Test to see if a given format is supported by the 3DLUT input/output code. */ bool ff_sws_lut3d_test_fmt(enum AVPixelFormat fmt, int output);",
-            )],
-            "libswscale/lut3d.c",
-            None,
-            1,
-        )
-        .remove(0);
+                false,
+            );
         ranked.guard = Some("#ifndef SWSCALE_LUT3D_H".to_string());
 
         let markdown = hover_markdown_for_candidate(&ranked, None);
@@ -644,20 +571,15 @@ mod tests {
 
     #[test]
     fn hover_markdown_keeps_non_header_guard_wrapper() {
-        let mut ranked = rank_hover_candidates(
-            vec![symbol_record(
-                "platform_init",
-                "function",
-                "declaration",
-                "include/platform.h",
-                8,
-                "void platform_init(void);",
-            )],
-            "src/main.c",
-            None,
-            1,
-        )
-        .remove(0);
+        let mut ranked = ranked_candidate(
+            "platform_init",
+            "function",
+            "declaration",
+            "include/platform.h",
+            8,
+            "void platform_init(void);",
+            false,
+        );
         ranked.guard = Some("#ifdef CONFIG_PLATFORM_INIT".to_string());
 
         let markdown = hover_markdown_for_candidate(&ranked, None);

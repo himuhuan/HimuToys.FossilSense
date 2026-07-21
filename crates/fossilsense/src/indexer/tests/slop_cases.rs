@@ -65,26 +65,29 @@ fn shadow_kinds_different_kinds_same_name_all_indexed() {
     .expect("index");
 
     let store = IndexStore::open_readonly(&db).expect("readonly");
-    let names = store.load_symbol_names_with_paths().expect("names");
+    let names = store.declaration_name_rows().expect("names");
 
     // All five SHADOW entities are indexed — verify no panic and distinct kinds.
-    let shadow_entries: Vec<_> = names
-        .iter()
-        .filter(|(_, name, _, _, _, _)| name == "SHADOW")
-        .collect();
+    let shadow_entries: Vec<_> = names.iter().filter(|row| row.name == "SHADOW").collect();
     assert!(
         shadow_entries.len() >= 3,
         "at least macro, typedef, function kinds indexed (locals may not be global symbols)"
     );
-    let kinds: Vec<&str> = shadow_entries
+    let kinds: Vec<crate::semantic_model::SemanticDeclarationKind> = shadow_entries
         .iter()
-        .map(|(_, _, _, _, kind, _)| kind.as_str())
+        .map(|row| row.declaration_kind)
         .collect();
     // Verify at least macro, type, and function are present with distinct kinds.
-    assert!(kinds.contains(&"macro"), "SHADOW macro must be indexed");
-    assert!(kinds.contains(&"type"), "SHADOW typedef must be indexed");
     assert!(
-        kinds.contains(&"function"),
+        kinds.contains(&crate::semantic_model::SemanticDeclarationKind::Macro),
+        "SHADOW macro must be indexed"
+    );
+    assert!(
+        kinds.contains(&crate::semantic_model::SemanticDeclarationKind::Alias),
+        "SHADOW typedef must be indexed"
+    );
+    assert!(
+        kinds.contains(&crate::semantic_model::SemanticDeclarationKind::Function),
         "SHADOW function must be indexed"
     );
 }
@@ -107,18 +110,13 @@ fn typedef_alias_same_name_different_reach_sets() {
     .expect("index");
 
     let store = IndexStore::open_readonly(&db).expect("readonly");
-    let names = store.load_symbol_names_with_paths().expect("names");
-    let foo_entries: Vec<_> = names
-        .iter()
-        .filter(|(_, name, _, _, _, _)| name == "FooT")
-        .collect();
+    let names = store.declaration_name_rows().expect("names");
+    let foo_entries: Vec<_> = names.iter().filter(|row| row.name == "FooT").collect();
     // At least the main.c FooT is indexed; others may or may not be depending
     // on whether they were parsed. The key is no panic and the reachable one is
     // distinguishable by path from the unreachable ones.
     assert!(!foo_entries.is_empty(), "at least one FooT is indexed");
-    let has_main = foo_entries
-        .iter()
-        .any(|(_, _, _, path, _, _)| path == "src/main.c");
+    let has_main = foo_entries.iter().any(|row| row.path == "src/main.c");
     assert!(has_main, "FooT from src/main.c is indexed");
 
     // Build the include graph. Since main.c does not include util.h or vendor.h,
@@ -151,16 +149,16 @@ fn struct_multi_def_different_fields() {
 
     let store = IndexStore::open_readonly(&db).expect("readonly");
     // Verify both struct W definitions exist in the store with different paths.
-    let names = store.load_symbol_names_with_paths().expect("names");
+    let names = store.declaration_name_rows().expect("names");
     let w_types: Vec<_> = names
         .iter()
-        .filter(|(_, name, _, _, kind, _)| name == "W" && kind == "type")
+        .filter(|row| {
+            row.name == "W"
+                && row.declaration_kind == crate::semantic_model::SemanticDeclarationKind::Type
+        })
         .collect();
     assert_eq!(w_types.len(), 2, "both struct W definitions indexed");
-    let paths: Vec<&str> = w_types
-        .iter()
-        .map(|(_, _, _, path, _, _)| path.as_str())
-        .collect();
+    let paths: Vec<&str> = w_types.iter().map(|row| row.path.as_str()).collect();
     assert!(paths.contains(&"src/main.c"));
     assert!(paths.contains(&"src/other.h"));
 
@@ -214,16 +212,16 @@ fn multi_root_same_name_candidates() {
     let store_a = IndexStore::open_readonly(&db_a).expect("readonly a");
     let store_b = IndexStore::open_readonly(&db_b).expect("readonly b");
 
-    let names_a = store_a.load_symbol_names_with_paths().expect("names a");
-    let names_b = store_b.load_symbol_names_with_paths().expect("names b");
+    let names_a = store_a.declaration_name_rows().expect("names a");
+    let names_b = store_b.declaration_name_rows().expect("names b");
 
     let a_init: Vec<_> = names_a
         .iter()
-        .filter(|(_, n, _, _, _, _)| n == "api_init")
+        .filter(|row| row.name == "api_init")
         .collect();
     let b_init: Vec<_> = names_b
         .iter()
-        .filter(|(_, n, _, _, _, _)| n == "api_init")
+        .filter(|row| row.name == "api_init")
         .collect();
 
     assert_eq!(a_init.len(), 1, "root-a has one api_init");

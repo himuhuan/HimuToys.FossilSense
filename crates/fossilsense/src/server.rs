@@ -4,7 +4,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tower_lsp::jsonrpc::Result as LspResult;
@@ -12,34 +11,31 @@ use tower_lsp::lsp_types::request::{GotoDeclarationParams, GotoDeclarationRespon
 use tower_lsp::lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
     CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
-    CallHierarchyServerCapability, Command, CompletionItem, CompletionItemKind, CompletionList,
-    CompletionOptions, CompletionParams, CompletionResponse, DeclarationCapability,
-    DidChangeTextDocumentParams, DidChangeWatchedFilesParams, DidChangeWorkspaceFoldersParams,
-    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
-    DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, Documentation,
-    ExecuteCommandParams, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams,
-    HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams, Location,
-    MessageType, OneOf, ReferenceParams, SaveOptions, SemanticTokenType, SemanticTokens,
-    SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions, SemanticTokensParams,
-    SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult,
-    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SignatureHelp,
-    SignatureHelpParams, SymbolInformation, TextDocumentSyncCapability, TextDocumentSyncKind,
-    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, Url, WorkspaceFoldersServerCapabilities,
+    CallHierarchyServerCapability, Command, CompletionItem, CompletionList, CompletionOptions,
+    CompletionParams, CompletionResponse, DeclarationCapability, DidChangeTextDocumentParams,
+    DidChangeWatchedFilesParams, DidChangeWorkspaceFoldersParams, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentSymbol, DocumentSymbolParams,
+    DocumentSymbolResponse, ExecuteCommandParams, GotoDefinitionParams, GotoDefinitionResponse,
+    Hover, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
+    InitializedParams, Location, MessageType, OneOf, ReferenceParams, SaveOptions,
+    SemanticTokenType, SemanticTokens, SemanticTokensFullOptions, SemanticTokensLegend,
+    SemanticTokensOptions, SemanticTokensParams, SemanticTokensRangeParams,
+    SemanticTokensRangeResult, SemanticTokensResult, SemanticTokensServerCapabilities,
+    ServerCapabilities, ServerInfo, SignatureHelp, SignatureHelpParams, SymbolInformation,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
+    TextDocumentSyncSaveOptions, Url, WorkspaceFoldersServerCapabilities,
     WorkspaceServerCapabilities, WorkspaceSymbolParams,
 };
 use tower_lsp::{async_trait, Client, LanguageServer, LspService, Server};
 
 use crate::call_model::SemanticGeneration;
-use crate::completion::ordinary_service::{
-    OrdinaryCompletionDocumentationTarget, OrdinaryCompletionInput, OrdinaryCompletionItem,
-    OrdinaryCompletionKind, OrdinaryCompletionNameTable,
-};
+use crate::completion::ordinary_service::{OrdinaryCompletionInput, OrdinaryCompletionNameTable};
 use crate::completion::{self, CandidateEvidence};
 use crate::completion_history::{
     candidate_hash, candidate_hash_key_from_hex, CompletionAcceptEvent, CompletionHistoryMode,
     CompletionHistorySnapshot, CompletionHistoryStore,
 };
-use crate::config::WorkspaceConfig;
+use crate::config::{LanguageResolver, SourceLanguage, WorkspaceConfig};
 use crate::includes::{self, IncludeForm};
 use crate::parser::{self, FileSemanticIndex};
 use crate::pathing;
@@ -79,8 +75,8 @@ use indexing::{
 };
 use indexing::{watched_change_in_scope, IndexScheduleState, WatchDecision};
 use lsp_adapters::{
-    candidate_to_location, declaration_to_symbol_information, grouped_reference_items,
-    hit_to_location, parsed_to_document_symbol, GroupedReferenceItem,
+    candidate_to_location, declaration_to_document_symbol, declaration_to_symbol_information,
+    grouped_reference_items, hit_to_location, GroupedReferenceItem,
 };
 use navigation::NavigationOperation;
 use options::{
@@ -99,251 +95,16 @@ type LocalWordEntry = (i32, Arc<HashSet<String>>);
 type LocalWordCache = Arc<Mutex<HashMap<Url, LocalWordEntry>>>;
 type IndexSchedule = Arc<Mutex<IndexScheduleState>>;
 
-/// Privacy-safe aggregate diagnostics for semantic candidate requests. This
-/// deliberately carries no symbol, signature, path, URI, or source text.
-#[derive(Clone, Copy, Debug, Default)]
-struct SemanticRequestPerf {
-    candidates: query::CallableCandidateMetrics,
-    returned: usize,
-    hydration_count: usize,
-    hydration_bytes: usize,
-    query_us: u128,
-    hydration_us: u128,
-    reach_us: u128,
-    coverage_open: bool,
-    coverage_truncated: bool,
-    coverage_incomplete: bool,
-    coverage_reason: u8,
-    arity_fallback: bool,
-}
-
-impl SemanticRequestPerf {
-    fn from_callable_set(set: &query::CallableCandidateSet) -> Self {
-        Self {
-            candidates: set.metrics(),
-            coverage_open: set.coverage.scope_open,
-            coverage_truncated: set.coverage.truncated,
-            coverage_incomplete: set.coverage.incomplete_reason.is_some(),
-            coverage_reason: coverage_reason_code(set.coverage.incomplete_reason),
-            arity_fallback: set.arity_mismatch_fallback,
-            ..Self::default()
-        }
-    }
-
-    fn log_line(self, feature: &'static str, total_us: u128) -> String {
-        format!(
-            "[perf] semantic_candidates feature={feature} total_us={total_us} query_us={} reach_us={} hydration_us={} raw={} filtered={} grouped={} returned={} arity_compatible={} arity_unknown={} arity_incompatible={} counterpart_strict={} counterpart_ambiguous={} hydration_count={} hydration_bytes={} coverage_open={} coverage_truncated={} coverage_incomplete={} coverage_reason={} arity_fallback={}",
-            self.query_us,
-            self.reach_us,
-            self.hydration_us,
-            self.candidates.raw_candidates,
-            self.candidates.filtered_candidates,
-            self.candidates.grouped_candidates,
-            self.returned,
-            self.candidates.arity_compatible,
-            self.candidates.arity_unknown,
-            self.candidates.arity_incompatible,
-            self.candidates.counterpart_strict,
-            self.candidates.counterpart_ambiguous,
-            self.hydration_count,
-            self.hydration_bytes,
-            self.coverage_open as u8,
-            self.coverage_truncated as u8,
-            self.coverage_incomplete as u8,
-            self.coverage_reason,
-            self.arity_fallback as u8,
-        )
-    }
-
-    fn include_type_candidates(&mut self, bundle: &crate::candidate_service::TypeCandidateBundle) {
-        let coverage = if bundle.records.coverage.scanned >= bundle.aliases.coverage.scanned {
-            &bundle.records.coverage
-        } else {
-            &bundle.aliases.coverage
-        };
-        self.candidates.raw_candidates = self
-            .candidates
-            .raw_candidates
-            .saturating_add(coverage.scanned);
-        self.candidates.filtered_candidates = self
-            .candidates
-            .filtered_candidates
-            .saturating_add(bundle.records.candidates.len())
-            .saturating_add(bundle.aliases.candidates.len());
-        self.candidates.grouped_candidates = self
-            .candidates
-            .grouped_candidates
-            .saturating_add(bundle.records.candidates.len())
-            .saturating_add(bundle.alias_resolutions.len());
-        self.coverage_open |= coverage.scope_open;
-        self.coverage_truncated |= coverage.truncated;
-        self.coverage_incomplete |= coverage.incomplete_reason.is_some();
-        if self.coverage_reason == 0 {
-            self.coverage_reason = coverage_reason_code(coverage.incomplete_reason);
-        }
-    }
-
-    fn include_non_callable_candidates(&mut self, count: usize) {
-        self.candidates.raw_candidates = self.candidates.raw_candidates.saturating_add(count);
-        self.candidates.filtered_candidates =
-            self.candidates.filtered_candidates.saturating_add(count);
-        self.candidates.grouped_candidates =
-            self.candidates.grouped_candidates.saturating_add(count);
-    }
-}
-
-fn coverage_reason_code(reason: Option<query::CandidateIncompleteReason>) -> u8 {
-    match reason {
-        None => 0,
-        Some(query::CandidateIncompleteReason::ScanLimit) => 1,
-        Some(query::CandidateIncompleteReason::CandidateBudget) => 2,
-        Some(query::CandidateIncompleteReason::TimeBudget) => 3,
-        Some(query::CandidateIncompleteReason::Cancelled) => 4,
-        Some(query::CandidateIncompleteReason::FactsUnavailable) => 5,
-        Some(query::CandidateIncompleteReason::GenerationMismatch) => 6,
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct HydrationStats {
-    count: usize,
-    bytes: usize,
-}
-
-#[derive(Clone, Copy)]
-enum LiveParseCacheEvent {
-    Hit,
-    Coalesced,
-    Miss,
-}
-
-fn live_parse_cache_log(event: LiveParseCacheEvent) -> &'static str {
-    match event {
-        LiveParseCacheEvent::Hit => "[perf] live_parse_cache state=hit",
-        LiveParseCacheEvent::Coalesced => "[perf] live_parse_cache state=coalesced",
-        LiveParseCacheEvent::Miss => "[perf] live_parse_cache state=miss",
-    }
-}
-
-impl HydrationStats {
-    fn record(&mut self, source: Option<&str>) {
-        if let Some(source) = source {
-            self.count += 1;
-            self.bytes = self.bytes.saturating_add(source.len());
-        }
-    }
-}
-
-fn apply_final_completion_sort_text(items: &mut [CompletionItem]) {
-    for (index, item) in items.iter_mut().enumerate() {
-        item.sort_text = Some(format!("{index:08}"));
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(
-    tag = "kind",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase"
-)]
-enum CompletionDocumentationData {
-    Declaration {
-        version: u8,
-        root: String,
-        uri: String,
-        declaration_id: i64,
-        declaration_name: String,
-        semantic_generation: u64,
-        overlay_epoch: u64,
-        document_version: i32,
-    },
-    Candidate {
-        version: u8,
-        root: String,
-        uri: String,
-        handle: crate::candidate_service::CandidateHandle,
-        semantic_generation: u64,
-        overlay_epoch: u64,
-        document_version: i32,
-    },
-    Member {
-        version: u8,
-        root: String,
-        uri: String,
-        owner_path: String,
-        handle: crate::model::MemberCandidateHandle,
-        semantic_generation: u64,
-        owner_revision_hash: String,
-        overlay_epoch: u64,
-        document_version: i32,
-    },
-}
-
-fn ordinary_completion_item_to_lsp(
-    item: OrdinaryCompletionItem,
-    uri: &Url,
-    table_roots: &[PathBuf],
-    table_semantic_generations: &[SemanticGeneration],
-    overlay_epoch: u64,
-    document_version: i32,
-) -> CompletionItem {
-    let data = item.documentation_target.and_then(|target| {
-        let target = match target {
-            OrdinaryCompletionDocumentationTarget::Candidate {
-                table_index,
-                handle,
-            } => CompletionDocumentationData::Candidate {
-                version: 4,
-                root: table_roots.get(table_index)?.to_string_lossy().into_owned(),
-                uri: uri.to_string(),
-                handle,
-                semantic_generation: table_semantic_generations.get(table_index)?.0,
-                overlay_epoch,
-                document_version,
-            },
-            OrdinaryCompletionDocumentationTarget::Declaration {
-                table_index,
-                declaration_id,
-                declaration_name,
-            } => CompletionDocumentationData::Declaration {
-                version: 6,
-                root: table_roots.get(table_index)?.to_string_lossy().into_owned(),
-                uri: uri.to_string(),
-                declaration_id,
-                declaration_name,
-                semantic_generation: table_semantic_generations.get(table_index)?.0,
-                overlay_epoch,
-                document_version,
-            },
-            OrdinaryCompletionDocumentationTarget::CurrentDocument { start_line } => {
-                let _ = start_line;
-                return None;
-            }
-        };
-        serde_json::to_value(target).ok()
-    });
-    CompletionItem {
-        label: item.label,
-        kind: Some(ordinary_completion_kind_to_lsp(item.kind)),
-        detail: item.detail,
-        documentation: item.documentation.map(Documentation::String),
-        sort_text: item.initial_sort_text,
-        data,
-        ..Default::default()
-    }
-}
-
-fn ordinary_completion_kind_to_lsp(kind: OrdinaryCompletionKind) -> CompletionItemKind {
-    match kind {
-        OrdinaryCompletionKind::Text => CompletionItemKind::TEXT,
-        OrdinaryCompletionKind::Keyword => CompletionItemKind::KEYWORD,
-        OrdinaryCompletionKind::Function => CompletionItemKind::FUNCTION,
-        OrdinaryCompletionKind::Macro => CompletionItemKind::CONSTANT,
-        OrdinaryCompletionKind::Type => CompletionItemKind::STRUCT,
-        OrdinaryCompletionKind::Variable => CompletionItemKind::VARIABLE,
-        OrdinaryCompletionKind::EnumConstant => CompletionItemKind::ENUM_MEMBER,
-    }
-}
+mod completion_adapter;
+use completion_adapter::{
+    apply_final_completion_sort_text, ordinary_completion_item_to_lsp, CompletionDocumentationData,
+};
+mod request_metrics;
+use request_metrics::{
+    live_parse_cache_log, HydrationStats, LiveParseCacheEvent, SemanticRequestPerf,
+};
+mod include_requests;
+mod workspace_config;
 
 const REFRESH_INDEX_COMMAND: &str = "fossilsense.refreshIndex";
 const REFRESH_INDEX_LSP_COMMAND: &str = "fossilsense.lsp.refreshIndex";
@@ -435,166 +196,43 @@ struct Backend {
     /// Whether `[perf]` request/index timings are sent to the output panel.
     /// Off by default; enabled by `RUST_LOG` debug/trace or client init options.
     perf_logging_enabled: AtomicBool,
-    /// Cache for `WorkspaceConfig` per workspace root. Avoids re-reading and
-    /// re-parsing `fossilsense.json` on every `did_change_watched_files` event.
-    /// Invalidated when `fossilsense.json` itself changes (which triggers
-    /// `WatchDecision::Full` and reloads the config in the index path).
-    config_cache: Arc<Mutex<HashMap<PathBuf, WorkspaceConfig>>>,
+    /// Cache for workspace configuration and its derived language resolver.
+    /// Request hot paths never read or parse `fossilsense.json`; the entry is
+    /// invalidated when that file changes or its workspace root is removed.
+    config_cache: Arc<Mutex<HashMap<PathBuf, WorkspaceRootConfig>>>,
     /// Cancels the `fossilsense/resourceUsage` background reporter when the
     /// server shuts down. The reporter is spawned in `initialized` and stopped
     /// in `shutdown`.
     resource_monitor_shutdown: Arc<tokio::sync::Notify>,
 }
 
+#[derive(Clone)]
+struct WorkspaceRootConfig {
+    workspace: WorkspaceConfig,
+    language: LanguageResolver,
+}
+
+impl WorkspaceRootConfig {
+    fn load(root: &Path) -> Self {
+        let workspace = WorkspaceConfig::load(root).0;
+        let language = LanguageResolver::from_workspace_config(root, &workspace);
+        Self {
+            workspace,
+            language,
+        }
+    }
+
+    fn fallback(root: &Path) -> Self {
+        let workspace = WorkspaceConfig::default();
+        let language = LanguageResolver::from_workspace_config(root, &workspace);
+        Self {
+            workspace,
+            language,
+        }
+    }
+}
+
 impl Backend {
-    /// Resolve an `#include` directive to the header file(s) it names and return
-    /// a location at the top of each. One match jumps; several return a ranked
-    /// candidate list; none returns nothing (we never fabricate a target).
-    async fn goto_include(
-        &self,
-        uri: &Url,
-        form: IncludeForm,
-        rel: String,
-    ) -> LspResult<Option<GotoDefinitionResponse>> {
-        let current_dir = uri_to_path(uri).and_then(|p| p.parent().map(|d| d.to_path_buf()));
-        let client_include_roots = self.include_paths.lock().await.clone();
-        let workspace_root = self.root_for_uri(uri).await;
-        let semantic_generation = match &workspace_root {
-            Some(root) => Some(
-                self.request_context_for_root(root.clone())
-                    .await
-                    .engine
-                    .semantic_generation
-                    .0,
-            ),
-            None => None,
-        };
-        let include_roots =
-            configured_include_paths(workspace_root.as_deref(), &client_include_roots);
-        let db_path = workspace_root
-            .as_ref()
-            .and_then(|root| pathing::default_index_path(root).ok());
-
-        let result = tokio::task::spawn_blocking(move || -> Result<Vec<Location>> {
-            let resolved = resolve_include_paths(
-                form,
-                &rel,
-                current_dir.as_deref(),
-                workspace_root.as_deref(),
-                &include_roots,
-                db_path.as_deref(),
-                semantic_generation,
-            )?;
-            Ok(resolved
-                .iter()
-                .filter_map(|path| location_at_file_start(path))
-                .collect())
-        })
-        .await;
-
-        match self.unwrap_query("include definition", result).await {
-            Some(locations) if !locations.is_empty() => {
-                Ok(Some(GotoDefinitionResponse::Array(locations)))
-            }
-            _ => Ok(None),
-        }
-    }
-
-    /// Header-path completion inside an `#include` directive: list matching files
-    /// and sub-directories from the current file's directory, indexed workspace
-    /// headers' roots, and the configured include paths. Headers only — never
-    /// symbols. The delimiter form influences ranking, not which candidates show.
-    async fn complete_include(
-        &self,
-        uri: &Url,
-        form: IncludeForm,
-        partial: String,
-        text: &str,
-    ) -> LspResult<Option<CompletionResponse>> {
-        let (dir_part, seg) = includes::split_partial(&partial);
-        let current_dir = uri_to_path(uri).and_then(|p| p.parent().map(|d| d.to_path_buf()));
-        let client_include_roots = self.include_paths.lock().await.clone();
-        let workspace_root = self.root_for_uri(uri).await;
-        let current_rel_path = workspace_root.as_ref().and_then(|root| {
-            uri_to_path(uri).and_then(|path| pathing::relative_slash_path(root, &path).ok())
-        });
-        let current_rel_dir = current_rel_path
-            .as_deref()
-            .and_then(|path| path.rsplit_once('/').map(|(dir, _)| dir.to_string()));
-        let request_context = match &workspace_root {
-            Some(root) => Some(self.request_context_for_root(root.clone()).await),
-            None => None,
-        };
-        let include_table = request_context
-            .as_ref()
-            .and_then(|context| context.engine.include_table.clone());
-        let semantic_generation = request_context
-            .as_ref()
-            .map(|context| context.engine.semantic_generation.0);
-        let include_roots =
-            configured_include_paths(workspace_root.as_deref(), &client_include_roots);
-        let db_path = workspace_root
-            .as_ref()
-            .and_then(|root| pathing::default_index_path(root).ok());
-        let external_cache = self.external_include_dir_cache.clone();
-        let limit = query::COMPLETION_LIMIT;
-        let text = text.to_string();
-
-        let started = tokio::time::Instant::now();
-        let hit_memory = include_table.is_some();
-        let hit_db = db_path.as_ref().is_some_and(|path| path.exists());
-        let result = tokio::task::spawn_blocking(
-            move || -> Result<(Vec<CompletionItem>, include_completion::IncludeCompletionMetrics)> {
-                let evidence =
-                    CurrentIncludeEvidence::from_text(&text, current_rel_path.as_deref());
-                Ok(collect_include_candidates_with_table_and_evidence(
-                    form,
-                    &dir_part,
-                    &seg,
-                    current_dir.as_deref(),
-                    workspace_root.as_deref(),
-                    &include_roots,
-                    db_path.as_deref(),
-                    semantic_generation,
-                    include_table.as_deref(),
-                    Some(&external_cache),
-                    current_rel_dir.as_deref(),
-                    Some(&evidence),
-                    limit,
-                ))
-            },
-        )
-        .await;
-        let total_ms = started.elapsed().as_millis();
-        let metrics = result
-            .as_ref()
-            .ok()
-            .and_then(|inner| inner.as_ref().ok().map(|(_, metrics)| *metrics))
-            .unwrap_or_default();
-        self.perf_log(|| {
-            format!(
-                "[perf] include_completion total={}ms workspace_table={} workspace_index={} same_directory={} recent={} sibling={} basename={} depth_penalty={}",
-                total_ms,
-                if hit_memory { "memory" } else { "unavailable" },
-                if hit_db { "available" } else { "unavailable" },
-                metrics.same_directory,
-                metrics.recent,
-                metrics.sibling,
-                metrics.basename,
-                metrics.depth_penalty,
-            )
-        })
-        .await;
-
-        match self.unwrap_query("include completion", result).await {
-            Some((items, _metrics)) if !items.is_empty() => {
-                Ok(Some(CompletionResponse::Array(items)))
-            }
-            // Stay incomplete so the editor re-queries as the path is typed.
-            _ => Ok(Some(empty_completion_list(true))),
-        }
-    }
-
     /// Text of an open buffer, falling back to the file on disk.
     async fn document_text(&self, uri: &Url) -> Option<Arc<str>> {
         self.document_snapshot(uri).await.map(|(_, text)| text)
@@ -652,13 +290,15 @@ impl Backend {
         text: &str,
         requested_facts: parser::ParseFacts,
     ) -> Option<Arc<FileSemanticIndex>> {
+        let language = self.source_language_for_path(path).await;
         if version == 0 {
             let path_owned = path.to_path_buf();
             let text_owned = text.to_string();
             return tokio::task::spawn_blocking(move || {
-                Arc::new(parser::parse_thread_local_with_facts(
+                Arc::new(parser::parse_thread_local_with_language(
                     &path_owned,
                     &text_owned,
+                    language,
                     requested_facts,
                 ))
             })
@@ -713,15 +353,17 @@ impl Backend {
             .await;
         let parse_cancellation = cancellation.clone();
         let index = tokio::task::spawn_blocking(move || {
-            Arc::new(parser::parse_thread_local_with_facts_cancel(
+            parser::parse_thread_local_with_language_cancel(
                 &path_owned,
                 &text_owned,
+                language,
                 facts,
                 &parse_cancellation,
-            ))
+            )
+            .map(Arc::new)
         })
         .await
-        .ok()?;
+        .ok()??;
         if cancellation.load(Ordering::Relaxed) {
             return None;
         }

@@ -165,21 +165,14 @@ pub(super) fn completion_items_for_current_file_overlay(
                                 .abs_diff(hit.source_start_byte)
                         })
                 });
-            let symbol_detail = parsed_document.and_then(|index| {
-                index
-                    .symbols
-                    .iter()
-                    .filter(|symbol| symbol.name == hit.name && !symbol.signature.is_empty())
-                    .min_by_key(|symbol| symbol.start_byte.abs_diff(hit.source_start_byte))
-                    .map(|symbol| symbol.signature.clone())
-            });
             let detail = if use_canonical_detail {
                 declaration
                     .and_then(|declaration| declaration.canonical_signature.clone())
-                    .or(symbol_detail)
                     .or(hit.detail)
             } else {
-                symbol_detail.or(hit.detail)
+                declaration
+                    .and_then(|declaration| declaration.canonical_signature.clone())
+                    .or(hit.detail)
             };
             let semantic_target =
                 declaration

@@ -5,21 +5,29 @@ import {
   LanguageClient,
   LanguageClientOptions,
   ServerOptions,
-  Trace,
 } from 'vscode-languageclient/node';
 import {
-  normalizeBoolean,
-  normalizeCompletionPrefixRanking,
-  normalizeIncludeScopingMode,
-  normalizeOnOffAuto,
-  normalizeProjectContextMode,
-} from './config';
+  completionHistoryModeFromConfig,
+  completionModeFromConfig,
+  completionPrefixRankingFromConfig,
+  debugCandidateReasonsFromConfig,
+  detectedCppLanguageServers,
+  fossilsenseModeFromConfig,
+  includePathsFromConfig,
+  includeScopingModeFromConfig,
+  perfLogsFromConfig,
+  projectContextModeFromConfig,
+  resolveServerPath,
+  resourceMonitorEnabledFromConfig,
+  semanticColoringModeFromConfig,
+  semanticIndexMemoryBudgetMBFromConfig,
+  traceFromConfig,
+} from './extensionConfig';
 import {
   CLEAR_COMPLETION_HISTORY_COMMAND,
   clearCompletionHistoryRequest,
   completionHistoryInitializationOptions,
 } from './completionHistory';
-import { resolveServerPathFromCandidates } from './serverPath';
 import { extensionsFromConfigText, sourceWatchGlob } from './watchPlan';
 import {
   DegradedCapabilities,
@@ -27,13 +35,7 @@ import {
   statusTooltip,
 } from './status';
 import { mutualExclusionMessage } from './conflicts';
-import { GroupedReferenceItem, groupedReferencePickRows } from './referencesView';
-import {
-  PossibleTargetItem,
-  PossibleTargetsResponse,
-  possibleTargetPickRows,
-  possibleTargetsCoverageSummary,
-} from './possibleTargets';
+import { findAllPossibleTargets, findReferencesGrouped } from './navigationCommands';
 import {
   CallRelationsController,
   registerCallRelationViews,
@@ -64,9 +66,7 @@ const REFRESH_INDEX_LSP_COMMAND = 'fossilsense.lsp.refreshIndex';
 const REBUILD_INDEX_COMMAND = 'fossilsense.rebuildIndex';
 const REBUILD_INDEX_LSP_COMMAND = 'fossilsense.lsp.rebuildIndex';
 const GROUPED_REFERENCES_COMMAND = 'fossilsense.findReferencesGrouped';
-const GROUPED_REFERENCES_LSP_COMMAND = 'fossilsense.lsp.groupedReferences';
 const POSSIBLE_TARGETS_COMMAND = 'fossilsense.findAllPossibleTargets';
-const POSSIBLE_TARGETS_LSP_COMMAND = 'fossilsense.lsp.possibleTargets';
 const PROJECT_CONTEXT_MARKER_PATTERNS = [
   '**/Makefile',
   '**/GNUmakefile',
@@ -81,12 +81,6 @@ const PROJECT_CONTEXT_MARKER_PATTERNS = [
   '**/BUILD.bazel',
   '**/WORKSPACE',
   '**/WORKSPACE.bazel',
-];
-
-const CONFLICT_EXTENSIONS = [
-  { id: 'llvm-vs-code-extensions.vscode-clangd', name: 'clangd' },
-  { id: 'ms-vscode.cpptools', name: 'Microsoft C/C++' },
-  { id: 'ccls-project.ccls', name: 'ccls' },
 ];
 
 let client: LanguageClient | undefined;
@@ -112,6 +106,7 @@ interface IndexStatus {
   totalFiles: number;
   indexedFiles: number;
   skippedFiles: number;
+  /** Compatibility wire name; the value is the canonical declaration count. */
   symbols: number;
   semanticGeneration: number;
   elapsedMs: number;
@@ -150,8 +145,8 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('fossilsense.stopServer', () => stopServer()),
     vscode.commands.registerCommand(REFRESH_INDEX_COMMAND, () => refreshIndex()),
     vscode.commands.registerCommand(REBUILD_INDEX_COMMAND, () => rebuildIndex()),
-    vscode.commands.registerCommand(GROUPED_REFERENCES_COMMAND, () => findReferencesGrouped()),
-    vscode.commands.registerCommand(POSSIBLE_TARGETS_COMMAND, () => findAllPossibleTargets()),
+    vscode.commands.registerCommand(GROUPED_REFERENCES_COMMAND, () => findReferencesGrouped(client)),
+    vscode.commands.registerCommand(POSSIBLE_TARGETS_COMMAND, () => findAllPossibleTargets(client)),
     vscode.commands.registerCommand(CLEAR_COMPLETION_HISTORY_COMMAND, () =>
       clearCompletionHistory(),
     ),
@@ -643,268 +638,6 @@ function isLocalCppDocument(document: vscode.TextDocument): boolean {
   );
 }
 
-// Explicit bounded discovery of the declaration/definition variants that the
-// standard navigation presentation intentionally suppresses. The response is
-// evidence-labeled and never described as compiler-bound or infinitely complete.
-async function findAllPossibleTargets(): Promise<void> {
-  if (!client) {
-    void vscode.window.showWarningMessage('FossilSense server is not running. Start it first.');
-    return;
-  }
-  const editor = vscode.window.activeTextEditor;
-  if (!editor) {
-    void vscode.window.showInformationMessage(
-      'Open a C/C++ file and place the cursor on an identifier.',
-    );
-    return;
-  }
-  const { document, selection } = editor;
-  const position = selection.active;
-  const response = (await client.sendRequest(ExecuteCommandRequest.type, {
-    command: POSSIBLE_TARGETS_LSP_COMMAND,
-    arguments: [
-      {
-        uri: document.uri.toString(),
-        line: position.line,
-        character: position.character,
-      },
-    ],
-  })) as PossibleTargetsResponse | null;
-
-  if (!response || response.items.length === 0) {
-    void vscode.window.showInformationMessage('FossilSense: no possible targets found.');
-    return;
-  }
-
-  const picks = possibleTargetPickRows(
-    response.items,
-    (uri) => vscode.workspace.asRelativePath(vscode.Uri.parse(uri)),
-  ).map((row): vscode.QuickPickItem & { item?: PossibleTargetItem } => {
-    if (row.kind === 'separator') {
-      return { label: row.label, kind: vscode.QuickPickItemKind.Separator };
-    }
-    return {
-      label: row.label,
-      description: row.description,
-      detail: row.detail,
-      item: row.item,
-    };
-  });
-  const coverage = possibleTargetsCoverageSummary(response.coverage);
-  const chosen = await vscode.window.showQuickPick(picks, {
-    placeHolder: `FossilSense ${response.name}: ${response.items.length} possible target(s)${coverage ? ` · ${coverage}` : ''}`,
-    matchOnDescription: true,
-    matchOnDetail: true,
-  });
-  if (!chosen?.item) {
-    return;
-  }
-
-  const target = chosen.item.location;
-  const targetUri = vscode.Uri.parse(target.uri);
-  const range = new vscode.Range(
-    target.range.start.line,
-    target.range.start.character,
-    target.range.end.line,
-    target.range.end.character,
-  );
-  await vscode.window.showTextDocument(targetUri, { selection: range });
-}
-
-// Role-grouped find-references. The standard References panel (textDocument/
-// references) returns plain Locations in role-grouped order but cannot show a
-// per-item role; this command asks the server for the same hits *with* their
-// best-effort syntactic role and presents them grouped and labeled in a
-// QuickPick. Roles are syntactic guesses, not resolved bindings.
-async function findReferencesGrouped(): Promise<void> {
-  if (!client) {
-    void vscode.window.showWarningMessage('FossilSense server is not running. Start it first.');
-    return;
-  }
-  const editor = vscode.window.activeTextEditor;
-  if (!editor) {
-    void vscode.window.showInformationMessage('Open a C/C++ file and place the cursor on an identifier.');
-    return;
-  }
-  const { document, selection } = editor;
-  const position = selection.active;
-
-  const items = (await client.sendRequest(ExecuteCommandRequest.type, {
-    command: GROUPED_REFERENCES_LSP_COMMAND,
-    arguments: [
-      {
-        uri: document.uri.toString(),
-        line: position.line,
-        character: position.character,
-      },
-    ],
-  })) as GroupedReferenceItem[] | null;
-
-  if (!items || items.length === 0) {
-    void vscode.window.showInformationMessage('FossilSense: no references found.');
-    return;
-  }
-
-  // Build a QuickPick with a separator per role group; items already arrive in
-  // role-grouped order from the server, so a role change starts a new section.
-  const picks = groupedReferencePickRows(
-    items,
-    showReferenceRangesFromConfig(),
-    (uri) => vscode.workspace.asRelativePath(vscode.Uri.parse(uri)),
-  ).map((row): vscode.QuickPickItem & { item?: GroupedReferenceItem } => {
-    if (row.kind === 'separator') {
-      return { label: row.label, kind: vscode.QuickPickItemKind.Separator };
-    }
-    return { label: row.label, description: row.description, item: row.item };
-  });
-
-  const chosen = await vscode.window.showQuickPick(picks, {
-    placeHolder: `FossilSense references (${items.length}), grouped by role`,
-    matchOnDescription: true,
-  });
-  if (!chosen?.item) {
-    return;
-  }
-  const target = chosen.item.location;
-  const uri = vscode.Uri.parse(target.uri);
-  const range = new vscode.Range(
-    target.range.start.line,
-    target.range.start.character,
-    target.range.end.line,
-    target.range.end.character,
-  );
-  await vscode.window.showTextDocument(uri, { selection: range });
-}
-
-function resolveServerPath(context: vscode.ExtensionContext): string | undefined {
-  const configured = vscode.workspace
-    .getConfiguration('fossilsense')
-    .get<string>('serverPath', '')
-    .trim();
-  return resolveServerPathFromCandidates({
-    platform: process.platform,
-    configuredPath: configured,
-    extensionPath: context.extensionPath,
-    exists: fs.existsSync,
-  });
-}
-
-function includePathsFromConfig(): string[] {
-  return vscode.workspace
-    .getConfiguration('fossilsense')
-    .get<string[]>('includePaths', [])
-    .map((entry) => entry.trim())
-    .filter((entry) => entry.length > 0);
-}
-
-function debugCandidateReasonsFromConfig(): boolean {
-  return vscode.workspace
-    .getConfiguration('fossilsense')
-    .get<boolean>('debug.candidateReasons', false);
-}
-
-function showReferenceRangesFromConfig(): boolean {
-  return vscode.workspace
-    .getConfiguration('fossilsense')
-    .get<boolean>('references.showRanges', false);
-}
-
-function fossilsenseModeFromConfig(): string {
-  const setting = vscode.workspace
-    .getConfiguration('fossilsense')
-    .get<string>('mode', 'auto');
-  return normalizeOnOffAuto(setting);
-}
-
-function resourceMonitorEnabledFromConfig(): boolean {
-  const value = vscode.workspace
-    .getConfiguration('fossilsense')
-    .get<unknown>('resourceMonitor.enabled', true);
-  return normalizeBoolean(value);
-}
-
-function completionPrefixRankingFromConfig(): string {
-  const setting = vscode.workspace
-    .getConfiguration('fossilsense')
-    .get<string>('completion.prefixRanking', 'strict');
-  return normalizeCompletionPrefixRanking(setting);
-}
-
-// Limited include-reachability scoping. Unlike completion/coloring there is no
-// conflict deference: scoping only narrows FossilSense's own output, so it is
-// either auto (on) or off.
-function includeScopingModeFromConfig(): string {
-  const setting = vscode.workspace
-    .getConfiguration('fossilsense')
-    .get<string>('includeScoping.mode', 'auto');
-  return normalizeIncludeScopingMode(setting);
-}
-
-function semanticIndexMemoryBudgetMBFromConfig(): number {
-  const value = vscode.workspace
-    .getConfiguration('fossilsense')
-    .get<number>('semanticIndex.memoryBudgetMB', 256);
-  return Number.isFinite(value) ? Math.max(0, Math.min(16384, Math.trunc(value))) : 256;
-}
-
-function traceFromConfig(): Trace {
-  const value = vscode.workspace
-    .getConfiguration('fossilsense')
-    .get<string>('trace.server', 'off');
-
-  switch (value) {
-    case 'messages':
-      return Trace.Messages;
-    case 'verbose':
-      return Trace.Verbose;
-    default:
-      return Trace.Off;
-  }
-}
-
-function perfLogsFromConfig(): boolean {
-  return vscode.workspace
-    .getConfiguration('fossilsense')
-    .get<string>('trace.server', 'off') === 'verbose';
-}
-
-function completionModeFromConfig(): string {
-  const setting = vscode.workspace
-    .getConfiguration('fossilsense')
-    .get<string>('completion.mode', 'auto');
-
-  return normalizeOnOffAuto(setting);
-}
-
-function completionHistoryModeFromConfig(): string {
-  const setting = vscode.workspace
-    .getConfiguration('fossilsense')
-    .get<string>('completionHistory.mode', 'auto');
-
-  return normalizeOnOffAuto(setting);
-}
-
-function projectContextModeFromConfig(): ReturnType<typeof normalizeProjectContextMode> {
-  const setting = vscode.workspace
-    .getConfiguration('fossilsense')
-    .get<string>('projectContext.mode', 'auto');
-  return normalizeProjectContextMode(setting);
-}
-
-function semanticColoringModeFromConfig(): string {
-  const setting = vscode.workspace
-    .getConfiguration('fossilsense')
-    .get<string>('semanticColoring.mode', 'auto');
-
-  return normalizeOnOffAuto(setting);
-}
-
-function detectedCppLanguageServers(): string[] {
-  return CONFLICT_EXTENSIONS.filter((extension) => {
-    return vscode.extensions.getExtension(extension.id) !== undefined;
-  }).map((extension) => extension.name);
-}
-
 async function showMutualExclusionWarning(conflictingExtensions: string[]): Promise<void> {
   if (mutualExclusionWarningShown) {
     return;
@@ -943,7 +676,7 @@ function handleIndexStatus(status: IndexStatus): void {
       capabilityWarning = degradedCapabilityWarning(status.degradedCapabilities);
       setStatus('ready');
       output.appendLine(
-        `Index ready: ${status.workspace}; files=${status.totalFiles}, indexed=${status.indexedFiles}, skipped=${status.skippedFiles}, symbols=${status.symbols}, elapsed=${status.elapsedMs}ms (discover=${status.discoverMs}ms, check=${status.checkMs}ms, parse=${status.parseMs}ms, write=${status.writeMs}ms, include_edge=${status.includeEdgeMs}ms, name_table=${status.nameTableMs}ms, reach_graph=${status.reachGraphMs}ms)${capabilityWarning ? `; degraded=${capabilityWarning}` : ''}`,
+        `Index ready: ${status.workspace}; files=${status.totalFiles}, indexed=${status.indexedFiles}, skipped=${status.skippedFiles}, declarations=${status.symbols}, elapsed=${status.elapsedMs}ms (discover=${status.discoverMs}ms, check=${status.checkMs}ms, parse=${status.parseMs}ms, write=${status.writeMs}ms, include_edge=${status.includeEdgeMs}ms, name_table=${status.nameTableMs}ms, reach_graph=${status.reachGraphMs}ms)${capabilityWarning ? `; degraded=${capabilityWarning}` : ''}`,
       );
       break;
     case 'failed':

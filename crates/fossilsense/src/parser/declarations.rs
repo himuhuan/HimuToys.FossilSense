@@ -2,29 +2,43 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use crate::call_model::{LinkageDomain, SourcePosition, SourceRange};
+use crate::config::SourceLanguage;
 use crate::semantic_model::{
     DeclarationBacking, DeclarationFact, DeclarationIdentity, DeclarationLocator, LanguageFidelity,
     LogicalEntityKey, RecordDef, RecordRangeFidelity, SemanticDeclarationKind,
     SemanticDeclarationRole, SemanticFactFidelity, SemanticFactProvenance, SemanticLanguage,
-    Symbol, SymbolKind, SymbolRole, TypeAlias,
+    SymbolKind, SymbolRole, TypeAlias,
 };
+
+pub(super) struct CanonicalDeclarationInputs<'a> {
+    pub source: &'a str,
+    pub type_symbols: &'a [super::RawDeclaration],
+    pub enum_constants: &'a [super::RawDeclaration],
+    pub records: &'a [RecordDef],
+    pub aliases: &'a [TypeAlias],
+    pub anchors: &'a [crate::call_model::CallableAnchor],
+    pub declarations: Vec<DeclarationFact>,
+}
 
 pub(super) fn canonical_declarations(
     path: &Path,
-    symbols: &[Symbol],
-    records: &[RecordDef],
-    aliases: &[TypeAlias],
-    anchors: &[crate::call_model::CallableAnchor],
-    mut declarations: Vec<DeclarationFact>,
-    lexical_fallback: bool,
+    language: SourceLanguage,
+    inputs: CanonicalDeclarationInputs<'_>,
 ) -> Vec<DeclarationFact> {
-    declarations.extend(callable_declarations(path, anchors));
+    let mut declarations = inputs.declarations;
+    declarations.extend(callable_declarations(path, language, inputs.anchors));
     declarations.extend(
-        records
+        inputs
+            .records
             .iter()
-            .filter_map(|record| record_declaration(path, record)),
+            .filter_map(|record| record_declaration(path, language, record)),
     );
-    declarations.extend(aliases.iter().map(|alias| alias_declaration(path, alias)));
+    declarations.extend(
+        inputs
+            .aliases
+            .iter()
+            .map(|alias| alias_declaration(path, language, inputs.source, alias)),
+    );
 
     let canonical: HashSet<_> = declarations
         .iter()
@@ -35,11 +49,17 @@ pub(super) fn canonical_declarations(
             )
         })
         .collect();
-    declarations.extend(symbols.iter().filter_map(|symbol| {
-        let kind = declaration_kind(symbol.kind)?;
-        (!canonical.contains(&(symbol.name.clone(), lexical_suppression_kind(kind))))
-            .then(|| symbol_declaration(path, symbol, kind, lexical_fallback))
-    }));
+    declarations.extend(
+        inputs
+            .type_symbols
+            .iter()
+            .chain(inputs.enum_constants)
+            .filter_map(|symbol| {
+                let kind = declaration_kind(symbol.kind)?;
+                (!canonical.contains(&(symbol.name.clone(), lexical_suppression_kind(kind))))
+                    .then(|| ast_symbol_declaration(path, language, symbol, kind))
+            }),
+    );
     declarations.sort_by(|left, right| {
         left.path
             .cmp(&right.path)
@@ -53,6 +73,7 @@ pub(super) fn canonical_declarations(
 
 fn callable_declarations(
     path: &Path,
+    language: SourceLanguage,
     anchors: &[crate::call_model::CallableAnchor],
 ) -> Vec<DeclarationFact> {
     anchors
@@ -60,6 +81,7 @@ fn callable_declarations(
         .filter(|anchor| {
             anchor.kind == crate::call_model::CallableKind::Function
                 && anchor.role != crate::call_model::AnchorRole::Synthetic
+                && anchor.provenance == crate::call_model::FactProvenance::Ast
         })
         .map(|anchor| {
             let declaration_kind =
@@ -80,16 +102,10 @@ fn callable_declarations(
             } else {
                 SemanticFactFidelity::Authoritative
             };
-            let provenance = match anchor.provenance {
-                crate::call_model::FactProvenance::Ast => SemanticFactProvenance::Ast,
-                crate::call_model::FactProvenance::LexicalFallback => {
-                    SemanticFactProvenance::LexicalFallback
-                }
-                crate::call_model::FactProvenance::Synthetic => SemanticFactProvenance::Synthetic,
-            };
             let guard_fingerprint = anchor.guard.as_ref().map(|guard| digest(guard));
             fact(
                 path,
+                language,
                 anchor.name.clone(),
                 anchor.qualified_name.clone(),
                 declaration_kind,
@@ -100,7 +116,7 @@ fn callable_declarations(
                 anchor.owner.clone(),
                 anchor.linkage.clone(),
                 anchor.guard.clone(),
-                provenance,
+                SemanticFactProvenance::Ast,
                 fidelity,
                 anchor.anchor_fingerprint.clone(),
                 guard_fingerprint,
@@ -112,7 +128,11 @@ fn callable_declarations(
         .collect()
 }
 
-fn record_declaration(path: &Path, record: &RecordDef) -> Option<DeclarationFact> {
+fn record_declaration(
+    path: &Path,
+    language: SourceLanguage,
+    record: &RecordDef,
+) -> Option<DeclarationFact> {
     let name = record
         .tag_name
         .as_ref()
@@ -125,6 +145,7 @@ fn record_declaration(path: &Path, record: &RecordDef) -> Option<DeclarationFact
     };
     Some(fact(
         path,
+        language,
         name.clone(),
         name,
         SemanticDeclarationKind::Type,
@@ -145,7 +166,12 @@ fn record_declaration(path: &Path, record: &RecordDef) -> Option<DeclarationFact
     ))
 }
 
-fn alias_declaration(path: &Path, alias: &TypeAlias) -> DeclarationFact {
+fn alias_declaration(
+    path: &Path,
+    language: SourceLanguage,
+    source: &str,
+    alias: &TypeAlias,
+) -> DeclarationFact {
     let name_range = SourceRange {
         start: SourcePosition {
             line: alias.start_line as u32,
@@ -165,13 +191,19 @@ fn alias_declaration(path: &Path, alias: &TypeAlias) -> DeclarationFact {
     };
     fact(
         path,
+        language,
         alias.alias.clone(),
         alias.alias.clone(),
         SemanticDeclarationKind::Alias,
         SemanticDeclarationRole::Definition,
         name_range,
         alias.declaration_range,
-        Some(alias.underlying_spelling.clone()),
+        source
+            .get(alias.declaration_range.start_byte..alias.declaration_range.end_byte)
+            .map(str::trim)
+            .filter(|signature| !signature.is_empty())
+            .map(str::to_string)
+            .or_else(|| Some(alias.underlying_spelling.clone())),
         None,
         LinkageDomain::External,
         None,
@@ -185,11 +217,11 @@ fn alias_declaration(path: &Path, alias: &TypeAlias) -> DeclarationFact {
     )
 }
 
-fn symbol_declaration(
+fn ast_symbol_declaration(
     path: &Path,
-    symbol: &Symbol,
+    language: SourceLanguage,
+    symbol: &super::RawDeclaration,
     kind: SemanticDeclarationKind,
-    lexical_fallback: bool,
 ) -> DeclarationFact {
     let range = SourceRange {
         start: SourcePosition {
@@ -225,6 +257,7 @@ fn symbol_declaration(
     ));
     fact(
         path,
+        language,
         symbol.name.clone(),
         qualified_name,
         kind,
@@ -235,24 +268,22 @@ fn symbol_declaration(
         owner,
         LinkageDomain::Unknown,
         symbol.guard.clone(),
-        SemanticFactProvenance::LexicalFallback,
-        if lexical_fallback || symbol.role == SymbolRole::UnknownDeclarationOrDefinition {
-            SemanticFactFidelity::LowFidelity
+        SemanticFactProvenance::Ast,
+        if symbol.incomplete || symbol.role == SymbolRole::UnknownDeclarationOrDefinition {
+            SemanticFactFidelity::Incomplete
         } else {
             SemanticFactFidelity::Authoritative
         },
         fingerprint,
         guard_fingerprint,
-        DeclarationBacking::Symbol {
-            start_byte: symbol.start_byte,
-            end_byte: symbol.end_byte,
-        },
+        DeclarationBacking::SourceRange { range },
     )
 }
 
 #[allow(clippy::too_many_arguments)]
 fn fact(
     path: &Path,
+    language: SourceLanguage,
     name: String,
     qualified_name: String,
     declaration_kind: SemanticDeclarationKind,
@@ -287,7 +318,10 @@ fn fact(
                 fingerprint,
             },
             logical_key,
-            language: language(path.as_ref()),
+            language: match language {
+                SourceLanguage::C => SemanticLanguage::C,
+                SourceLanguage::Cpp => SemanticLanguage::Cpp,
+            },
             language_fidelity: LanguageFidelity::Explicit,
             provenance,
             fact_fidelity,
@@ -343,22 +377,6 @@ fn lexical_suppression_kind(kind: SemanticDeclarationKind) -> SemanticDeclaratio
 
 fn path_text(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
-}
-
-fn language(path: &str) -> SemanticLanguage {
-    if ["cpp", "hpp", "cc", "hh", "cxx", "hxx", "inl"]
-        .iter()
-        .any(|extension| {
-            path.to_ascii_lowercase()
-                .ends_with(&format!(".{extension}"))
-        })
-    {
-        SemanticLanguage::Cpp
-    } else if path.is_empty() {
-        SemanticLanguage::Unknown
-    } else {
-        SemanticLanguage::C
-    }
 }
 
 fn linkage_key(linkage: &LinkageDomain) -> String {

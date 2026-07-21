@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::completion_history::{candidate_hash_key, CompletionHistorySnapshot};
 use crate::model::{ResolutionConfidence, ScopeTier};
@@ -6,6 +6,9 @@ use crate::parser::SymbolRole;
 
 use super::prefix_ranking::{compare_name_match, CompletionPrefixRanking};
 use super::{CompletionIntent, CompletionIntentConfidence, CompletionIntentKind};
+
+mod metrics;
+pub(crate) use metrics::{compare_shadow_ranks, completion_perf_summary};
 
 #[allow(dead_code)]
 const SOURCE_LOCAL_BINDING: i32 = 12_000;
@@ -17,6 +20,8 @@ const SOURCE_INDEXED: i32 = 5_000;
 const SOURCE_LANGUAGE_BUILTIN: i32 = 2_000;
 #[allow(dead_code)]
 const SOURCE_LOCAL_WORD: i32 = 0;
+#[allow(dead_code)]
+const SOURCE_LEXICAL_FALLBACK: i32 = -1_000;
 
 #[allow(dead_code)]
 const SCOPE_CURRENT: i32 = 6_000;
@@ -127,6 +132,7 @@ pub(crate) enum CandidateSource {
     CurrentFileOverlay,
     LanguageBuiltin,
     LocalWord,
+    LexicalFallback,
 }
 
 impl CandidateSource {
@@ -137,6 +143,7 @@ impl CandidateSource {
             CandidateSource::Indexed => 3,
             CandidateSource::LanguageBuiltin => 2,
             CandidateSource::LocalWord => 1,
+            CandidateSource::LexicalFallback => 0,
         }
     }
 }
@@ -148,6 +155,7 @@ pub(crate) struct EvidenceSources {
     pub current_file_overlay: bool,
     pub language_builtin: bool,
     pub local_word: bool,
+    pub lexical_fallback: bool,
 }
 
 impl EvidenceSources {
@@ -164,6 +172,7 @@ impl EvidenceSources {
             CandidateSource::CurrentFileOverlay => self.current_file_overlay = true,
             CandidateSource::LanguageBuiltin => self.language_builtin = true,
             CandidateSource::LocalWord => self.local_word = true,
+            CandidateSource::LexicalFallback => self.lexical_fallback = true,
         }
     }
 
@@ -174,6 +183,7 @@ impl EvidenceSources {
         self.current_file_overlay |= other.current_file_overlay;
         self.language_builtin |= other.language_builtin;
         self.local_word |= other.local_word;
+        self.lexical_fallback |= other.lexical_fallback;
     }
 
     #[allow(dead_code)]
@@ -280,6 +290,7 @@ pub(crate) struct SourceCounts {
     pub current_file_overlay: usize,
     pub language_builtin: usize,
     pub local_word: usize,
+    pub lexical_fallback: usize,
 }
 
 impl SourceCounts {
@@ -290,6 +301,7 @@ impl SourceCounts {
             CandidateSource::CurrentFileOverlay => self.current_file_overlay += 1,
             CandidateSource::LanguageBuiltin => self.language_builtin += 1,
             CandidateSource::LocalWord => self.local_word += 1,
+            CandidateSource::LexicalFallback => self.lexical_fallback += 1,
         }
     }
 }
@@ -674,6 +686,7 @@ fn intent_adjustment(evidence: CandidateEvidence, intent: CompletionIntent) -> i
         CompletionIntentKind::DeclarationName => {
             if evidence.sources.has_strong_current_or_local()
                 || evidence.primary_source == CandidateSource::LocalWord
+                || evidence.primary_source == CandidateSource::LexicalFallback
             {
                 INTENT_MEDIUM_MATCH
             } else if evidence.primary_source == CandidateSource::LanguageBuiltin
@@ -708,6 +721,7 @@ fn source_prior(source: CandidateSource) -> i32 {
         CandidateSource::Indexed => SOURCE_INDEXED,
         CandidateSource::LanguageBuiltin => SOURCE_LANGUAGE_BUILTIN,
         CandidateSource::LocalWord => SOURCE_LOCAL_WORD,
+        CandidateSource::LexicalFallback => SOURCE_LEXICAL_FALLBACK,
     }
 }
 
@@ -741,79 +755,4 @@ fn count_sources<'a, T: 'a>(
         counts.increment(candidate.evidence.primary_source);
     }
     counts
-}
-
-pub(crate) fn compare_shadow_ranks(display: &[String], shadow: &[String]) -> ShadowRankSummary {
-    let shadow_ranks: HashMap<&str, usize> = shadow
-        .iter()
-        .enumerate()
-        .map(|(idx, name)| (name.as_str(), idx))
-        .collect();
-    let mut moved_names = HashSet::new();
-    let mut max_delta = 0;
-    for (display_idx, name) in display.iter().enumerate() {
-        if let Some(shadow_idx) = shadow_ranks.get(name.as_str()) {
-            let delta = display_idx.abs_diff(*shadow_idx);
-            if delta > 0 {
-                moved_names.insert(name.as_str());
-                max_delta = max_delta.max(delta);
-            }
-        }
-    }
-    ShadowRankSummary {
-        moved: moved_names.len(),
-        max_delta,
-    }
-}
-
-pub(crate) fn completion_perf_summary(
-    prefix: &str,
-    memo_hit: &str,
-    document_version: i32,
-    engine_generation: u64,
-    timings: &CompletionStageTimings,
-    metrics: &CompletionPipelineMetrics,
-) -> String {
-    let shadow = metrics.shadow.unwrap_or_default();
-    format!(
-        "[perf] completion total={}ms context={}ms recall={}ms merge_rank={}ms render={}ms document_version={} engine_generation={} prefix_len={} hit={} intent={} intent_confidence={} history_enabled={} history_boosted={} history_max_boost={} project_boosted={} project_max_boost={} candidates_in={} after_dedup={} returned={} indexed={} local_binding={} current_file_overlay={} language_builtin={} local_word={} returned_indexed={} returned_local_binding={} returned_current_file_overlay={} returned_language_builtin={} returned_local_word={} recall_reachable={} recall_external={} recall_unknown={} recall_global={} recall_same_project={} recall_pool={} guarded_low_trust={} shadow_moved={} shadow_max_delta={}",
-        timings.total_ms,
-        timings.context_ms,
-        timings.recall_ms,
-        timings.merge_rank_ms,
-        timings.render_ms,
-        document_version,
-        engine_generation,
-        prefix.chars().count(),
-        memo_hit,
-        metrics.intent_kind.as_summary_str(),
-        metrics.intent_confidence.as_summary_str(),
-        metrics.history_enabled,
-        metrics.history_boosted,
-        metrics.history_max_boost,
-        metrics.project_boosted,
-        metrics.project_max_boost,
-        metrics.input_total,
-        metrics.after_dedup_total,
-        metrics.returned_total,
-        metrics.input_sources.indexed,
-        metrics.input_sources.local_binding,
-        metrics.input_sources.current_file_overlay,
-        metrics.input_sources.language_builtin,
-        metrics.input_sources.local_word,
-        metrics.returned_sources.indexed,
-        metrics.returned_sources.local_binding,
-        metrics.returned_sources.current_file_overlay,
-        metrics.returned_sources.language_builtin,
-        metrics.returned_sources.local_word,
-        metrics.recall_channels.reachable,
-        metrics.recall_channels.external,
-        metrics.recall_channels.unknown,
-        metrics.recall_channels.global,
-        metrics.recall_channels.same_project,
-        metrics.recall_channels.pool_total,
-        metrics.final_rank.guarded_low_trust,
-        shadow.moved,
-        shadow.max_delta,
-    )
 }

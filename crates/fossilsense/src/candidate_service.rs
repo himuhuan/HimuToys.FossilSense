@@ -1,10 +1,10 @@
 //! Generation-pinned semantic candidate recall and dirty-document overlays.
 //!
-//! The overlay index is deliberately independent from the ordinary completion
-//! overlay.  It contains canonical parser facts for only divergent open
-//! documents, shadows the matching durable path even when the new document no
-//! longer contains a fact, and supports exact-name lookup without scanning all
-//! open buffers on every request.
+//! It contains canonical parser facts for only divergent open documents,
+//! shadows the matching durable path even when the new document no longer
+//! contains a fact, and supports exact-name lookup without scanning all open
+//! buffers on every request. Completion-only fallback hints remain a separate
+//! typed projection and are never read by semantic candidate APIs.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -13,10 +13,7 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::call_catalog::rows::{anchor_from_row, call_from_row};
-use crate::call_model::{
-    AnchorRole, CallSiteFact, CallableAnchor, CallableKind, FactProvenance, LinkageDomain,
-    SignatureFidelity, SignatureShape, SourcePosition, SourceRange,
-};
+use crate::call_model::{CallSiteFact, CallableAnchor, LinkageDomain, SourcePosition, SourceRange};
 use crate::call_service::CallReadHandle;
 use crate::model::{CandidateRange, DefinitionCandidate, MemberCandidate};
 use crate::parser::{FactAvailability, FactGroup, FileSemanticIndex};
@@ -31,56 +28,24 @@ use crate::query::{
 use crate::reachability::{ReachGraph, ReachScope};
 use crate::resolver::{self, ResolveContext};
 use crate::semantic_model::{
-    DeclarationFact, Include, MemberDef, RecordDef, Symbol, SymbolRole, TypeAlias,
+    DeclarationFact, FallbackCompletionFact, Include, MemberDef, RecordDef, TypeAlias,
 };
-use crate::store::SymbolRecord;
 
+mod callable_queries;
 mod semantic;
+mod type_queries;
+pub use callable_queries::CandidateQueryService;
 #[allow(unused_imports)]
 pub use semantic::CandidateHandleLocator;
 pub use semantic::{
     focused_callable_fingerprints, focused_candidates, focused_has_kind, navigation_presentations,
     CandidateHandle, ResolvedDeclarationCandidate, SemanticIntent,
 };
+#[allow(unused_imports)]
+pub use type_queries::{BoundedMemberCandidates, TypeCandidateBundle, TypeRecordResolution};
 
 pub const DEFAULT_EXACT_NAME_CANDIDATE_LIMIT: usize = 256;
 const MEMBER_FALLBACK_OVERLAY_SCAN_LIMIT: usize = 8_192;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TypeCandidateBundle {
-    pub records: RecordCandidateSet,
-    pub aliases: TypeAliasCandidateSet,
-    pub alias_resolutions: Vec<AliasResolution>,
-    /// Durable evidence hidden by a dirty-path tombstone anywhere in the
-    /// bounded resolution trace. This distinguishes an authoritative deletion
-    /// from a genuine miss and prevents legacy readers reviving stale rows.
-    pub shadowed_evidence: bool,
-    /// The complete bounded working set used to resolve alias chains. Root
-    /// presentation should use `records`/`aliases`, not expose this directly.
-    pub trace_records: Vec<RecordCandidate>,
-}
-
-/// Terminal record evidence retained for member completion. `authoritative`
-/// distinguishes a genuine miss from a dirty-path tombstone, while
-/// `incomplete` and `ambiguous` prevent a merged best-effort member list from
-/// being presented as a closed, compiler-bound result.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TypeRecordResolution {
-    pub records: Vec<RecordCandidate>,
-    pub authoritative: bool,
-    pub incomplete: bool,
-    pub ambiguous: bool,
-}
-
-/// One bounded resolved-owner member read. `scanned` is the shared-budget
-/// charge across overlay and durable rows; `truncated` means at least one
-/// additional row was deliberately left unread.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BoundedMemberCandidates {
-    pub candidates: Vec<MemberCandidate>,
-    pub scanned: usize,
-    pub truncated: bool,
-}
 
 #[derive(Debug, Clone)]
 pub struct FileCandidateOverlay {
@@ -88,11 +53,11 @@ pub struct FileCandidateOverlay {
     pub declarations: Vec<DeclarationFact>,
     pub anchors: Vec<CallableAnchor>,
     pub calls: Vec<CallSiteFact>,
-    pub symbols: Vec<Symbol>,
     pub records: Vec<RecordDef>,
     pub members: Vec<MemberDef>,
     pub aliases: Vec<TypeAlias>,
     pub includes: Vec<Include>,
+    pub fallback_completions: Vec<FallbackCompletionFact>,
     pub text: Option<Arc<str>>,
     /// False when any semantic fact group needed by the candidate facade is
     /// unavailable. This includes cancelled parses and lexical fallback: an
@@ -117,11 +82,11 @@ impl FileCandidateOverlay {
             declarations: Vec::new(),
             anchors,
             calls,
-            symbols: Vec::new(),
             records: Vec::new(),
             members: Vec::new(),
             aliases: Vec::new(),
             includes: Vec::new(),
+            fallback_completions: Vec::new(),
             text: None,
             facts_complete: true,
         }
@@ -133,7 +98,6 @@ impl FileCandidateOverlay {
             index.callable_anchors.clone(),
             index.call_sites.clone(),
         );
-        overlay.symbols.clone_from(&index.symbols);
         overlay.declarations = index
             .declarations
             .iter()
@@ -153,6 +117,9 @@ impl FileCandidateOverlay {
         overlay.members.clone_from(&index.members);
         overlay.aliases.clone_from(&index.aliases);
         overlay.includes.clone_from(&index.includes);
+        overlay
+            .fallback_completions
+            .clone_from(&index.fallback_completions);
         overlay.facts_complete = [
             FactGroup::CallableAnchors,
             FactGroup::CallSites,
@@ -192,12 +159,6 @@ pub struct OverlayAliasFact {
 }
 
 #[derive(Debug, Clone)]
-pub struct OverlaySymbolFact {
-    pub path: String,
-    pub symbol: Symbol,
-}
-
-#[derive(Debug, Clone)]
 pub struct OverlayDeclarationFact {
     pub path: String,
     pub fact: DeclarationFact,
@@ -225,6 +186,12 @@ pub struct OverlayCompletionName {
     pub candidate_handle: Option<CandidateHandle>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverlayFallbackCompletionFact {
+    pub path: String,
+    pub fact: FallbackCompletionFact,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct CandidateOverlaySnapshot {
     #[allow(dead_code)] // Captured for request tracing and cross-snapshot diagnostics.
@@ -234,7 +201,6 @@ pub struct CandidateOverlaySnapshot {
     callable_by_path: HashMap<String, Vec<CallableAnchor>>,
     declaration_by_name: HashMap<String, Vec<OverlayDeclarationFact>>,
     declaration_by_fingerprint: HashMap<String, OverlayDeclarationFact>,
-    symbol_by_name: HashMap<String, Vec<OverlaySymbolFact>>,
     record_by_name: HashMap<String, Vec<OverlayRecordFact>>,
     record_by_key: HashMap<(String, String), OverlayRecordFact>,
     records_by_path: HashMap<String, Vec<OverlayRecordFact>>,
@@ -244,6 +210,7 @@ pub struct CandidateOverlaySnapshot {
     call_sites_by_path: HashMap<String, Vec<CallSiteFact>>,
     source_by_path: HashMap<String, Arc<str>>,
     includes_by_path: HashMap<String, Vec<Include>>,
+    fallback_completions: Vec<OverlayFallbackCompletionFact>,
     incomplete_paths: HashSet<String>,
     effective_reach_graph: Option<Arc<ReachGraph>>,
     /// Only external paths whose workspace-wide first-layer status differs
@@ -270,6 +237,14 @@ impl CandidateOverlaySnapshot {
                 .includes_by_path
                 .insert(file.path.clone(), file.includes.clone());
             snapshot
+                .fallback_completions
+                .extend(file.fallback_completions.into_iter().map(|fact| {
+                    OverlayFallbackCompletionFact {
+                        path: file.path.clone(),
+                        fact,
+                    }
+                }));
+            snapshot
                 .callable_by_path
                 .insert(file.path.clone(), file.anchors.clone());
             for declaration in file.declarations {
@@ -293,16 +268,6 @@ impl CandidateOverlaySnapshot {
                     .entry(anchor.name.clone())
                     .or_default()
                     .push(anchor);
-            }
-            for symbol in file.symbols {
-                snapshot
-                    .symbol_by_name
-                    .entry(symbol.name.clone())
-                    .or_default()
-                    .push(OverlaySymbolFact {
-                        path: file.path.clone(),
-                        symbol,
-                    });
             }
             for record in file.records {
                 let fact = OverlayRecordFact {
@@ -408,14 +373,6 @@ impl CandidateOverlaySnapshot {
                             .fingerprint
                             .cmp(&right.fact.identity.locator.fingerprint)
                     })
-            });
-        }
-        for symbols in snapshot.symbol_by_name.values_mut() {
-            symbols.sort_by(|left, right| {
-                left.path
-                    .cmp(&right.path)
-                    .then_with(|| left.symbol.start_byte.cmp(&right.symbol.start_byte))
-                    .then_with(|| left.symbol.end_byte.cmp(&right.symbol.end_byte))
             });
         }
         for records in snapshot.record_by_name.values_mut() {
@@ -623,11 +580,11 @@ impl CandidateOverlaySnapshot {
                     .get(&path)
                     .cloned()
                     .unwrap_or_default(),
-                symbols: Vec::new(),
                 records: Vec::new(),
                 members: Vec::new(),
                 aliases: Vec::new(),
                 includes: Vec::new(),
+                fallback_completions: Vec::new(),
                 text: self.source_by_path.get(&path).cloned(),
                 facts_complete: !self.incomplete_paths.contains(&path),
                 path,
@@ -731,13 +688,6 @@ impl CandidateOverlaySnapshot {
         (matches, truncated)
     }
 
-    pub fn symbols(&self, name: &str) -> &[OverlaySymbolFact] {
-        self.symbol_by_name
-            .get(name)
-            .map(Vec::as_slice)
-            .unwrap_or_default()
-    }
-
     /// Stable projection used to replace shadowed NameTable paths in ordinary
     /// completion. Do not truncate before NameTable applies the request's
     /// actual matcher: every dirty path is tombstoned, so dropping a later
@@ -745,15 +695,17 @@ impl CandidateOverlaySnapshot {
     /// Negative ids are request-local locators and can never be mistaken for
     /// durable SQLite symbol ids.
     pub fn completion_names(&self) -> Vec<OverlayCompletionName> {
-        let mut facts: Vec<_> = self.symbol_by_name.values().flatten().collect();
+        let mut facts: Vec<_> = self.declaration_by_name.values().flatten().collect();
         facts.sort_by(|left, right| {
             left.path
                 .cmp(&right.path)
-                .then_with(|| left.symbol.start_byte.cmp(&right.symbol.start_byte))
-                .then_with(|| left.symbol.name.cmp(&right.symbol.name))
                 .then_with(|| {
-                    symbol_kind_name(left.symbol.kind).cmp(symbol_kind_name(right.symbol.kind))
+                    left.fact
+                        .name_range
+                        .start_byte
+                        .cmp(&right.fact.name_range.start_byte)
                 })
+                .then_with(|| left.fact.name.cmp(&right.fact.name))
         });
         facts
             .into_iter()
@@ -766,40 +718,31 @@ impl CandidateOverlaySnapshot {
                     });
                 OverlayCompletionName {
                     id: -((index as i64) + 1),
-                    name: fact.symbol.name.clone(),
+                    name: fact.fact.name.clone(),
                     path: fact.path.clone(),
-                    kind: symbol_kind_name(fact.symbol.kind).to_string(),
+                    kind: declaration_kind_name(fact.fact.declaration_kind).to_string(),
                     external,
                     directly_included,
-                    start_line: fact.symbol.start_line as u32,
-                    start_col: fact.symbol.start_col as u32,
-                    end_line: fact.symbol.end_line as u32,
-                    end_col: fact.symbol.end_col as u32,
-                    candidate_handle: self
-                        .declarations(&fact.symbol.name)
-                        .iter()
-                        .min_by_key(|declaration| {
-                            declaration
-                                .fact
-                                .name_range
-                                .start_byte
-                                .abs_diff(fact.symbol.start_byte)
-                        })
-                        .map(|declaration| CandidateHandle {
-                            locator: CandidateHandleLocator::Overlay {
-                                fingerprint: declaration.fact.identity.locator.fingerprint.clone(),
-                            },
-                            logical_key: declaration.fact.identity.logical_key.clone(),
-                            locator_fingerprint: declaration
-                                .fact
-                                .identity
-                                .locator
-                                .fingerprint
-                                .clone(),
-                        }),
+                    start_line: fact.fact.name_range.start.line,
+                    start_col: fact.fact.name_range.start.character,
+                    end_line: fact.fact.name_range.end.line,
+                    end_col: fact.fact.name_range.end.character,
+                    candidate_handle: Some(CandidateHandle {
+                        locator: CandidateHandleLocator::Overlay {
+                            fingerprint: fact.fact.identity.locator.fingerprint.clone(),
+                        },
+                        logical_key: fact.fact.identity.logical_key.clone(),
+                        locator_fingerprint: fact.fact.identity.locator.fingerprint.clone(),
+                    }),
                 }
             })
             .collect()
+    }
+
+    /// Completion-only degraded hints from dirty documents. Semantic candidate
+    /// APIs deliberately do not consult this projection.
+    pub fn fallback_completion_facts(&self) -> &[OverlayFallbackCompletionFact] {
+        &self.fallback_completions
     }
 
     pub fn aliases(&self, name: &str) -> &[OverlayAliasFact] {
@@ -823,14 +766,15 @@ impl CandidateOverlaySnapshot {
     }
 }
 
-fn symbol_kind_name(kind: crate::semantic_model::SymbolKind) -> &'static str {
+fn declaration_kind_name(kind: crate::semantic_model::SemanticDeclarationKind) -> &'static str {
     match kind {
-        crate::semantic_model::SymbolKind::Function => "function",
-        crate::semantic_model::SymbolKind::Macro => "macro",
-        crate::semantic_model::SymbolKind::Type => "type",
-        crate::semantic_model::SymbolKind::EnumConstant => "enum_constant",
-        crate::semantic_model::SymbolKind::GlobalVariable => "global_variable",
-        crate::semantic_model::SymbolKind::Field => "field",
+        crate::semantic_model::SemanticDeclarationKind::Function => "function",
+        crate::semantic_model::SemanticDeclarationKind::Method => "method",
+        crate::semantic_model::SemanticDeclarationKind::Macro => "macro",
+        crate::semantic_model::SemanticDeclarationKind::Type => "type",
+        crate::semantic_model::SemanticDeclarationKind::Alias => "type",
+        crate::semantic_model::SemanticDeclarationKind::EnumConstant => "enum_constant",
+        crate::semantic_model::SemanticDeclarationKind::Object => "global_variable",
     }
 }
 
@@ -844,1280 +788,6 @@ fn candidate_origin_priority(origin: CandidateOrigin) -> u8 {
         CandidateOrigin::Base => 0,
         CandidateOrigin::Overlay => 1,
     }
-}
-
-/// Generation-pinned facade that recalls narrow durable rows, shadows them
-/// with all divergent open documents, and hands a single candidate set to all
-/// callable consumers. The pure arity/counterpart policy remains in `query`.
-pub struct CandidateQueryService<'a> {
-    handle: Option<&'a CallReadHandle>,
-    declaration_index: Option<&'a crate::declaration_index::SemanticDeclarationIndex>,
-    overlays: &'a CandidateOverlaySnapshot,
-    current_path: &'a str,
-    current_reach: Option<Arc<ReachScope>>,
-    reach_graph: Option<&'a ReachGraph>,
-    exact_name_limit: usize,
-}
-
-impl<'a> CandidateQueryService<'a> {
-    pub fn new(
-        handle: Option<&'a CallReadHandle>,
-        overlays: &'a CandidateOverlaySnapshot,
-        current_path: &'a str,
-        current_reach: Option<&'a ReachScope>,
-        reach_graph: Option<&'a ReachGraph>,
-    ) -> Self {
-        let reach_graph = overlays.effective_reach_graph(reach_graph);
-        let current_reach = reach_graph
-            .map(|graph| graph.reachable(current_path))
-            .or_else(|| current_reach.cloned().map(Arc::new));
-        Self {
-            handle,
-            declaration_index: None,
-            overlays,
-            current_path,
-            current_reach,
-            reach_graph,
-            exact_name_limit: DEFAULT_EXACT_NAME_CANDIDATE_LIMIT,
-        }
-    }
-
-    pub fn new_with_declarations(
-        handle: Option<&'a CallReadHandle>,
-        declaration_index: Option<&'a crate::declaration_index::SemanticDeclarationIndex>,
-        overlays: &'a CandidateOverlaySnapshot,
-        current_path: &'a str,
-        current_reach: Option<&'a ReachScope>,
-        reach_graph: Option<&'a ReachGraph>,
-    ) -> Self {
-        let mut service = Self::new(handle, overlays, current_path, current_reach, reach_graph);
-        service.declaration_index = declaration_index;
-        service
-    }
-
-    /// Durable paths that must be recalled before a workspace-wide exact-name
-    /// cap is allowed to spend the request budget. Dirty paths are omitted:
-    /// their overlay is authoritative even when it is an empty tombstone.
-    fn durable_priority_path_groups(&self) -> (Vec<String>, Vec<String>) {
-        let current = if self.overlays.shadows(self.current_path) {
-            Vec::new()
-        } else {
-            vec![self.current_path.to_string()]
-        };
-        let mut reachable: Vec<_> = self
-            .current_reach
-            .as_ref()
-            .into_iter()
-            .flat_map(|scope| scope.files.iter())
-            .filter(|path| path.as_str() != self.current_path && !self.overlays.shadows(path))
-            .cloned()
-            .collect();
-        reachable.sort();
-        reachable.dedup();
-        (current, reachable)
-    }
-
-    pub fn callable_candidates(
-        &self,
-        name: &str,
-        call_context: Option<CallSiteContext>,
-    ) -> Result<CallableCandidateSet> {
-        if call_context.as_ref().is_some_and(|context| {
-            context.reliability == ContextReliability::UnsupportedCallForm
-                || !matches!(
-                    context.form,
-                    crate::call_model::CallForm::DirectName
-                        | crate::call_model::CallForm::QualifiedName
-                        | crate::call_model::CallForm::ParenthesizedName
-                )
-        }) {
-            return Ok(CallableCandidateSet {
-                anchors: Vec::new(),
-                groups: Vec::new(),
-                coverage: CandidateCoverage::default(),
-                arity_mismatch_fallback: false,
-            });
-        }
-        let (current_paths, reachable_paths) = self.durable_priority_path_groups();
-        let (base_rows, fallback_symbol_rows, mut truncated) = match self.handle {
-            Some(handle) => handle.read(|store| {
-                let call_view = store.call_fact_view();
-                let (global_anchors, mut anchor_truncated) =
-                    call_view.anchors_by_name_limited(name, self.exact_name_limit)?;
-                let mut anchors = Vec::new();
-                if anchor_truncated {
-                    for paths in [&current_paths, &reachable_paths] {
-                        let remaining = self.exact_name_limit.saturating_sub(anchors.len());
-                        let (rows, limited) =
-                            call_view.anchors_by_name_in_paths_limited(name, paths, remaining)?;
-                        anchors.extend(rows);
-                        anchor_truncated |= limited;
-                    }
-                }
-                // The global LIMIT+1 read remains the ordinary fast path. A
-                // scope-priority rescue runs only after it proves truncation.
-                anchors.extend(global_anchors);
-                let mut seen_anchor_ids = HashSet::new();
-                anchors.retain(|row| seen_anchor_ids.insert(row.id));
-
-                let symbol_view = store.symbol_read_view();
-                let (global_symbols, mut symbol_truncated) =
-                    symbol_view.symbols_by_name_limited(name, self.exact_name_limit)?;
-                let mut symbols = Vec::new();
-                if symbol_truncated {
-                    for paths in [&current_paths, &reachable_paths] {
-                        let remaining = self.exact_name_limit.saturating_sub(symbols.len());
-                        let (rows, limited) =
-                            symbol_view.symbols_by_name_in_paths_limited(name, paths, remaining)?;
-                        symbols.extend(rows);
-                        symbol_truncated |= limited;
-                    }
-                }
-                symbols.extend(global_symbols);
-                let mut seen_symbol_ids = HashSet::new();
-                symbols.retain(|record| seen_symbol_ids.insert(record.id));
-                Ok((anchors, symbols, anchor_truncated || symbol_truncated))
-            })?,
-            None => (Vec::new(), Vec::new(), false),
-        };
-        let scanned = base_rows.len()
-            + fallback_symbol_rows.len()
-            + self.overlays.callable_anchors(name).len()
-            + self.overlays.symbols(name).len();
-        let resolve_context = ResolveContext {
-            current_path: Some(self.current_path),
-            reach: self.current_reach.as_deref(),
-            direct_external_files: None,
-        };
-        let mut base_anchors: Vec<ResolvedCallableAnchor> = base_rows
-            .into_iter()
-            .filter(|row| !self.overlays.shadows(&row.path))
-            .map(|row| {
-                let source = row.source.clone();
-                let (external, directly_included) =
-                    self.path_evidence(&row.path, source == "external", row.directly_included);
-                let tier = resolver::scope_tier(
-                    &row.path,
-                    external,
-                    directly_included,
-                    Some(&resolve_context),
-                );
-                let anchor = anchor_from_row(row);
-                resolved_anchor(anchor, source, tier, CandidateOrigin::Base)
-            })
-            .collect();
-        let base_fact_paths: HashSet<_> = base_anchors
-            .iter()
-            .map(|candidate| candidate.anchor.path.clone())
-            .collect();
-        let mut fallback_used = false;
-        for mut record in fallback_symbol_rows.into_iter().filter(|record| {
-            record.kind == "function"
-                && !self.overlays.shadows(&record.path)
-                && !base_fact_paths.contains(&record.path)
-        }) {
-            let (external, directly_included) = self.path_evidence(
-                &record.path,
-                record.source == "external",
-                record.directly_included,
-            );
-            record.directly_included = directly_included;
-            let tier = resolver::scope_tier(
-                &record.path,
-                external,
-                directly_included,
-                Some(&resolve_context),
-            );
-            base_anchors.push(resolved_lexical_function(
-                record,
-                tier,
-                CandidateOrigin::Base,
-            ));
-            fallback_used = true;
-        }
-        let mut overlay_anchors = self
-            .overlays
-            .callable_anchors(name)
-            .iter()
-            .cloned()
-            .map(|anchor| {
-                let (external, directly_included) =
-                    self.path_evidence(&anchor.path, Path::new(&anchor.path).is_absolute(), false);
-                let tier = resolver::scope_tier(
-                    &anchor.path,
-                    external,
-                    directly_included,
-                    Some(&resolve_context),
-                );
-                let source = if external { "external" } else { "workspace" };
-                resolved_anchor(anchor, source.into(), tier, CandidateOrigin::Overlay)
-            })
-            .collect::<Vec<_>>();
-        let overlay_fact_paths: HashSet<_> = overlay_anchors
-            .iter()
-            .map(|candidate| candidate.anchor.path.clone())
-            .collect();
-        for fact in self.overlays.symbols(name).iter().filter(|fact| {
-            fact.symbol.kind == crate::semantic_model::SymbolKind::Function
-                && !overlay_fact_paths.contains(&fact.path)
-        }) {
-            let mut record = overlay_symbol_record(fact);
-            let (external, directly_included) = self.path_evidence(
-                &fact.path,
-                record.source == "external",
-                record.directly_included,
-            );
-            record.directly_included = directly_included;
-            let tier = resolver::scope_tier(
-                &fact.path,
-                external,
-                directly_included,
-                Some(&resolve_context),
-            );
-            overlay_anchors.push(resolved_lexical_function(
-                record,
-                tier,
-                CandidateOrigin::Overlay,
-            ));
-            fallback_used = true;
-        }
-        // Spend the final candidate budget by semantic tier, across both
-        // durable and live facts. Overlay freshness wins only within an equal
-        // tier; a dirty Global candidate cannot displace a durable Current or
-        // Reachable candidate merely because overlays are merged first.
-        let mut recalled = Vec::with_capacity(base_anchors.len() + overlay_anchors.len());
-        recalled.extend(base_anchors);
-        recalled.extend(overlay_anchors);
-        recalled.sort_by(|left, right| {
-            right
-                .candidate
-                .tier
-                .rank()
-                .cmp(&left.candidate.tier.rank())
-                .then_with(|| {
-                    candidate_origin_priority(right.origin)
-                        .cmp(&candidate_origin_priority(left.origin))
-                })
-                .then_with(|| left.anchor.path.cmp(&right.anchor.path))
-                .then_with(|| {
-                    left.anchor
-                        .name_range
-                        .start_byte
-                        .cmp(&right.anchor.name_range.start_byte)
-                })
-                .then_with(|| {
-                    left.anchor
-                        .anchor_fingerprint
-                        .cmp(&right.anchor.anchor_fingerprint)
-                })
-        });
-        if recalled.len() > self.exact_name_limit {
-            recalled.truncate(self.exact_name_limit);
-            truncated = true;
-        }
-        let mut base_anchors = Vec::new();
-        let mut overlay_anchors = Vec::new();
-        for candidate in recalled {
-            match candidate.origin {
-                CandidateOrigin::Base => base_anchors.push(candidate),
-                CandidateOrigin::Overlay => overlay_anchors.push(candidate),
-            }
-        }
-        let source_paths: HashSet<_> = base_anchors
-            .iter()
-            .chain(overlay_anchors.iter())
-            .filter(|candidate| crate::query::is_source_path(&candidate.anchor.path))
-            .map(|candidate| candidate.anchor.path.clone())
-            .collect();
-        let mut source_reach: HashMap<String, ReachScope> = HashMap::new();
-        if let Some(graph) = self.reach_graph {
-            for path in &source_paths {
-                source_reach
-                    .entry(path.clone())
-                    .or_insert_with(|| graph.reachable(path).as_ref().clone());
-            }
-        }
-        let coverage = CandidateCoverage {
-            scanned,
-            truncated,
-            // Counterpart uniqueness needs a closed scope for every source
-            // that could match a declaration, not only the current request.
-            scope_open: source_paths
-                .iter()
-                .any(|path| source_reach.get(path).is_none_or(|scope| scope.open)),
-            incomplete_reason: if self.overlays.has_incomplete_facts() {
-                Some(crate::query::CandidateIncompleteReason::Cancelled)
-            } else {
-                fallback_used.then_some(crate::query::CandidateIncompleteReason::FactsUnavailable)
-            },
-        };
-        let mut visible_internal_paths = self
-            .current_reach
-            .as_ref()
-            .map(|scope| scope.files.clone())
-            .unwrap_or_default();
-        visible_internal_paths.insert(self.current_path.to_string());
-        Ok(resolve_callable_candidates(CallableQueryInput {
-            base_anchors,
-            overlay_anchors,
-            shadowed_paths: self.overlays.shadowed_paths().clone(),
-            call_context,
-            source_reach,
-            visible_internal_paths,
-            coverage,
-        }))
-    }
-
-    /// Request-local reach scope after dirty include edges replace their
-    /// published counterparts. Generic consumers use this instead of ranking
-    /// live symbols against the stale base graph.
-    pub fn effective_current_reach(&self) -> Option<&ReachScope> {
-        self.current_reach.as_deref()
-    }
-
-    /// Normalize source provenance and first-layer evidence against the same
-    /// request-local graph used for reachability. Durable bits are retained
-    /// only when no graph exists; once dirty edges have produced an effective
-    /// graph, it is the authoritative evidence for bounded candidate ranking.
-    fn path_evidence(
-        &self,
-        path: &str,
-        durable_external: bool,
-        durable_directly_included: bool,
-    ) -> (bool, bool) {
-        let external = durable_external || Path::new(path).is_absolute();
-        if !external {
-            return (false, false);
-        }
-        let directly_included = self.reach_graph.map_or(durable_directly_included, |graph| {
-            graph.directly_includes_external(self.current_path, path)
-        });
-        (true, directly_included)
-    }
-
-    /// Return parser-produced complete-call evidence only when the cursor is
-    /// on the callee token. A shadowed path never falls through to stale rows.
-    pub fn complete_call_context_at(
-        &self,
-        position: SourcePosition,
-    ) -> Result<Option<CallSiteContext>> {
-        let calls = if self.overlays.shadows(self.current_path) {
-            self.overlays
-                .call_sites_at(self.current_path, position)
-                .into_iter()
-                .cloned()
-                .collect()
-        } else {
-            match self.handle {
-                Some(handle) => handle.read(|store| {
-                    let (rows, _) = store.call_fact_view().call_sites_at_limited(
-                        self.current_path,
-                        position.line,
-                        position.character,
-                        DEFAULT_EXACT_NAME_CANDIDATE_LIMIT,
-                    )?;
-                    Ok(rows.into_iter().map(call_from_row).collect())
-                })?,
-                None => Vec::new(),
-            }
-        };
-        Ok(calls
-            .iter()
-            .find_map(|call| CallSiteContext::from_complete_call(call, position)))
-    }
-
-    /// Find an exact callable anchor under the cursor for the special
-    /// declaration/definition opposite-only Definition policy.
-    pub fn anchor_at(&self, position: SourcePosition) -> Result<Option<CallableAnchor>> {
-        if self.overlays.shadows(self.current_path) {
-            return Ok(self
-                .overlays
-                .callable_by_path(self.current_path)
-                .iter()
-                .find(|anchor| position_in_range(position, anchor.name_range))
-                .cloned());
-        }
-        let Some(handle) = self.handle else {
-            return Ok(None);
-        };
-        handle.read(|store| {
-            let (rows, _) = store.call_fact_view().anchors_at_limited(
-                self.current_path,
-                position.line,
-                position.character,
-                DEFAULT_EXACT_NAME_CANDIDATE_LIMIT,
-            )?;
-            Ok(rows
-                .into_iter()
-                .map(anchor_from_row)
-                .find(|anchor| position_in_range(position, anchor.name_range)))
-        })
-    }
-
-    /// Durable + live fallback symbols for non-callable features. Function
-    /// consumers must use `callable_candidates`; filtering here prevents the
-    /// legacy symbol table from silently becoming a second callable source.
-    #[cfg(test)]
-    pub fn non_callable_symbols(&self, name: &str) -> Result<Vec<SymbolRecord>> {
-        let mut records: Vec<_> = self
-            .overlays
-            .symbols(name)
-            .iter()
-            .filter(|fact| fact.symbol.kind != crate::semantic_model::SymbolKind::Function)
-            .map(|fact| {
-                let mut record = overlay_symbol_record(fact);
-                let (external, directly_included) = self.path_evidence(
-                    &record.path,
-                    record.source == "external",
-                    record.directly_included,
-                );
-                record.source = if external { "external" } else { "workspace" }.into();
-                record.directly_included = directly_included;
-                record
-            })
-            .filter(|record| self.non_callable_record_is_visible(record))
-            .collect();
-        let (current_paths, reachable_paths) = self.durable_priority_path_groups();
-        let mut base = match self.handle {
-            Some(handle) => handle.read(|store| {
-                let view = store.symbol_read_view();
-                let (global, truncated) =
-                    view.symbols_by_name_limited(name, DEFAULT_EXACT_NAME_CANDIDATE_LIMIT)?;
-                let mut base = Vec::new();
-                if truncated {
-                    for paths in [&current_paths, &reachable_paths] {
-                        let remaining =
-                            DEFAULT_EXACT_NAME_CANDIDATE_LIMIT.saturating_sub(base.len());
-                        let (rows, _) =
-                            view.symbols_by_name_in_paths_limited(name, paths, remaining)?;
-                        base.extend(rows);
-                    }
-                }
-                // Preserve a bounded unscoped fallback for projects whose
-                // reach graph is absent/open, then remove overlap by row id.
-                base.extend(global);
-                let mut seen_ids = HashSet::new();
-                base.retain(|record| seen_ids.insert(record.id));
-                Ok(base)
-            })?,
-            None => Vec::new(),
-        };
-        base.retain(|record| {
-            record.kind != "function"
-                && !self.overlays.shadows(&record.path)
-                && self.non_callable_record_is_visible(record)
-        });
-        for record in &mut base {
-            let (external, directly_included) = self.path_evidence(
-                &record.path,
-                record.source == "external",
-                record.directly_included,
-            );
-            record.source = if external { "external" } else { "workspace" }.into();
-            record.directly_included = directly_included;
-        }
-        records.extend(base);
-        let resolve_context = ResolveContext {
-            current_path: Some(self.current_path),
-            reach: self.current_reach.as_deref(),
-            direct_external_files: None,
-        };
-        records.sort_by(|left, right| {
-            let left_tier = resolver::scope_tier(
-                &left.path,
-                left.source == "external",
-                left.directly_included,
-                Some(&resolve_context),
-            );
-            let right_tier = resolver::scope_tier(
-                &right.path,
-                right.source == "external",
-                right.directly_included,
-                Some(&resolve_context),
-            );
-            right_tier
-                .rank()
-                .cmp(&left_tier.rank())
-                .then_with(|| left.path.cmp(&right.path))
-                .then(left.start_line.cmp(&right.start_line))
-                .then(left.start_col.cmp(&right.start_col))
-                .then(left.kind.cmp(&right.kind))
-        });
-        records.dedup_by(|left, right| {
-            left.path == right.path
-                && left.start_line == right.start_line
-                && left.start_col == right.start_col
-                && left.kind == right.kind
-        });
-        records.truncate(DEFAULT_EXACT_NAME_CANDIDATE_LIMIT);
-        Ok(records)
-    }
-
-    #[cfg(test)]
-    fn non_callable_record_is_visible(&self, record: &SymbolRecord) -> bool {
-        !symbol_record_has_internal_linkage(record)
-            || self.path_is_in_current_translation_unit(&record.path)
-    }
-
-    #[cfg(test)]
-    fn path_is_in_current_translation_unit(&self, path: &str) -> bool {
-        path == self.current_path
-            || self
-                .current_reach
-                .as_ref()
-                .is_some_and(|scope| scope.files.contains(path))
-    }
-
-    /// Revision evidence for bounded lazy source hydration. The metadata comes
-    /// from the same generation-pinned handle as candidate recall, so a later
-    /// disk edit cannot be mistaken for the candidate's source revision.
-    pub fn source_revisions(&self, paths: &[String]) -> Result<HashMap<String, CandidateRevision>> {
-        let Some(handle) = self.handle else {
-            return Ok(HashMap::new());
-        };
-        handle.read(|store| {
-            store.stored_files(paths).map(|files| {
-                files
-                    .into_iter()
-                    .map(|(path, file)| {
-                        (
-                            path,
-                            CandidateRevision {
-                                id: file.id,
-                                size: file.size,
-                                mtime_ns: file.mtime_ns,
-                                hash: file.hash,
-                            },
-                        )
-                    })
-                    .collect()
-            })
-        })
-    }
-
-    /// Recall record and alias facts for one exact-name request, expanding
-    /// only exact alias targets under a strict visit bound. All durable rows
-    /// remain generation-pinned and every dirty path shadows its base rows.
-    pub fn type_candidates(&self, name: &str) -> Result<TypeCandidateBundle> {
-        let resolve_context = ResolveContext {
-            current_path: Some(self.current_path),
-            reach: self.current_reach.as_deref(),
-            direct_external_files: None,
-        };
-        let mut names = vec![name.to_string()];
-        let mut visited_names = HashSet::new();
-        let mut records = Vec::new();
-        let mut aliases = Vec::new();
-        let mut scanned = 0usize;
-        let mut truncated = false;
-        let mut shadowed_evidence = false;
-
-        while let Some(next_name) = names.pop() {
-            if visited_names.len() >= ALIAS_RESOLUTION_MAX_VISITS
-                || !visited_names.insert(next_name.clone())
-            {
-                if visited_names.len() >= ALIAS_RESOLUTION_MAX_VISITS {
-                    truncated = true;
-                }
-                continue;
-            }
-            let (base_records, record_truncated, base_aliases, alias_truncated) = match self.handle
-            {
-                Some(handle) => handle.read(|store| {
-                    let (record_rows, record_truncated) = store
-                        .member_view()
-                        .record_rows_by_name_limited(&next_name, TYPE_CANDIDATE_LIMIT)?;
-                    let (alias_rows, alias_truncated) = store
-                        .member_view()
-                        .alias_rows_by_name_limited(&next_name, TYPE_CANDIDATE_LIMIT)?;
-                    Ok((record_rows, record_truncated, alias_rows, alias_truncated))
-                })?,
-                None => (Vec::new(), false, Vec::new(), false),
-            };
-            scanned += base_records.len() + base_aliases.len();
-            truncated |= record_truncated || alias_truncated;
-            for row in base_records {
-                if self.overlays.shadows(&row.path) {
-                    shadowed_evidence = true;
-                    continue;
-                }
-                let (external, directly_included) =
-                    self.path_evidence(&row.path, row.external, row.directly_included);
-                let tier = resolver::scope_tier(
-                    &row.path,
-                    external,
-                    directly_included,
-                    Some(&resolve_context),
-                );
-                records.push(RecordCandidate::from_read_row(row, tier));
-            }
-            let mut converted_aliases = Vec::new();
-            for row in base_aliases {
-                if self.overlays.shadows(&row.path) {
-                    shadowed_evidence = true;
-                    continue;
-                }
-                if let Some(alias) = {
-                    let (external, directly_included) =
-                        self.path_evidence(&row.path, row.external, row.directly_included);
-                    let tier = resolver::scope_tier(
-                        &row.path,
-                        external,
-                        directly_included,
-                        Some(&resolve_context),
-                    );
-                    TypeAliasCandidate::from_read_row(row, tier)
-                } {
-                    converted_aliases.push(alias);
-                }
-            }
-            enqueue_alias_targets(&converted_aliases, &mut names);
-            aliases.extend(converted_aliases);
-
-            let overlay_records = self.overlays.records(&next_name);
-            let overlay_aliases = self.overlays.aliases(&next_name);
-            scanned += overlay_records.len() + overlay_aliases.len();
-            records.extend(overlay_records.iter().map(|fact| {
-                let (external, directly_included) =
-                    self.path_evidence(&fact.path, Path::new(&fact.path).is_absolute(), false);
-                let tier = resolver::scope_tier(
-                    &fact.path,
-                    external,
-                    directly_included,
-                    Some(&resolve_context),
-                );
-                RecordCandidate::from_overlay(fact.path.clone(), fact.record.clone(), tier)
-            }));
-            let converted_overlay_aliases: Vec<_> = overlay_aliases
-                .iter()
-                .map(|fact| {
-                    let (external, directly_included) =
-                        self.path_evidence(&fact.path, Path::new(&fact.path).is_absolute(), false);
-                    let tier = resolver::scope_tier(
-                        &fact.path,
-                        external,
-                        directly_included,
-                        Some(&resolve_context),
-                    );
-                    let mut alias = TypeAliasCandidate::from_overlay(
-                        fact.path.clone(),
-                        fact.alias.clone(),
-                        tier,
-                    );
-                    bind_overlay_alias_to_unique_same_file_record(&mut alias, self.overlays);
-                    alias
-                })
-                .collect();
-            enqueue_alias_targets(&converted_overlay_aliases, &mut names);
-            aliases.extend(converted_overlay_aliases);
-        }
-
-        let stable_targets: HashSet<_> = aliases
-            .iter()
-            .filter_map(|alias| match &alias.target {
-                TypeAliasTarget::StableRecord(identity) => Some(identity.clone()),
-                _ => None,
-            })
-            .collect();
-        for identity in stable_targets {
-            if records.iter().any(|record| record.identity == identity) {
-                continue;
-            }
-            match identity {
-                RecordCandidateIdentity::Persistent(id) => {
-                    let row = match self.handle {
-                        Some(handle) => {
-                            handle.read(|store| store.member_view().record_row_by_id(id))?
-                        }
-                        None => None,
-                    };
-                    if let Some(row) = row {
-                        if self.overlays.shadows(&row.path) {
-                            shadowed_evidence = true;
-                            if let Some(fact) = unique_overlay_replacement_for_record(
-                                self.overlays.records_for_path(&row.path),
-                                &row,
-                            ) {
-                                scanned += 1;
-                                let (external, directly_included) = self.path_evidence(
-                                    &row.path,
-                                    row.external,
-                                    row.directly_included,
-                                );
-                                let tier = resolver::scope_tier(
-                                    &row.path,
-                                    external,
-                                    directly_included,
-                                    Some(&resolve_context),
-                                );
-                                let replacement = RecordCandidate::from_overlay(
-                                    row.path.clone(),
-                                    fact.record.clone(),
-                                    tier,
-                                );
-                                remap_persistent_alias_targets(
-                                    &mut aliases,
-                                    id,
-                                    replacement.identity.clone(),
-                                );
-                                records.push(replacement);
-                            }
-                        } else {
-                            scanned += 1;
-                            let (external, directly_included) =
-                                self.path_evidence(&row.path, row.external, row.directly_included);
-                            let tier = resolver::scope_tier(
-                                &row.path,
-                                external,
-                                directly_included,
-                                Some(&resolve_context),
-                            );
-                            records.push(RecordCandidate::from_read_row(row, tier));
-                        }
-                    }
-                }
-                RecordCandidateIdentity::ParserKey { path, record_key } => {
-                    if let Some(fact) = self.overlays.record_by_parser_key(&path, &record_key) {
-                        scanned += 1;
-                        let (external, directly_included) =
-                            self.path_evidence(&path, Path::new(&path).is_absolute(), false);
-                        let tier = resolver::scope_tier(
-                            &path,
-                            external,
-                            directly_included,
-                            Some(&resolve_context),
-                        );
-                        records.push(RecordCandidate::from_overlay(
-                            path,
-                            fact.record.clone(),
-                            tier,
-                        ));
-                    }
-                }
-            }
-        }
-
-        let coverage = CandidateCoverage {
-            scanned,
-            truncated,
-            scope_open: self.current_reach.as_ref().is_some_and(|scope| scope.open),
-            incomplete_reason: if self.overlays.has_incomplete_facts() {
-                Some(crate::query::CandidateIncompleteReason::Cancelled)
-            } else {
-                truncated.then_some(crate::query::CandidateIncompleteReason::CandidateBudget)
-            },
-        };
-        let root_records = record_candidates_exact(
-            name,
-            records.clone(),
-            coverage.clone(),
-            TYPE_CANDIDATE_LIMIT,
-        );
-        let root_aliases = type_alias_candidates_exact(
-            name,
-            aliases.clone(),
-            coverage.clone(),
-            TYPE_CANDIDATE_LIMIT,
-        );
-        let alias_resolutions = root_aliases
-            .candidates
-            .iter()
-            .cloned()
-            .map(|alias| resolve_type_alias(alias, &aliases, &records, coverage.clone()))
-            .collect();
-        Ok(TypeCandidateBundle {
-            records: root_records,
-            aliases: root_aliases,
-            alias_resolutions,
-            shadowed_evidence,
-            trace_records: records,
-        })
-    }
-
-    /// Resolve terminal records while retaining whether the shared candidate
-    /// facade found authoritative root or tombstone evidence. An empty record
-    /// list with `true` means “resolved to no live terminal”, not “try a stale
-    /// generation-unaware fallback”.
-    pub fn records_for_type_name_with_evidence(&self, name: &str) -> Result<TypeRecordResolution> {
-        let bundle = self.type_candidates(name)?;
-        let authoritative = bundle.shadowed_evidence
-            || !bundle.records.candidates.is_empty()
-            || !bundle.aliases.candidates.is_empty();
-        let mut incomplete = !bundle.records.coverage.permits_uniqueness()
-            || !bundle.aliases.coverage.permits_uniqueness();
-        let mut ambiguous = false;
-        let mut records = bundle.records.candidates;
-        for resolution in bundle.alias_resolutions {
-            ambiguous |= resolution.status == AliasResolutionStatus::AmbiguousRecord;
-            incomplete |= resolution.status != AliasResolutionStatus::UniqueRecord;
-            records.extend(resolution.terminal_records);
-        }
-        records.sort_by(|left, right| {
-            right
-                .tier
-                .rank()
-                .cmp(&left.tier.rank())
-                .then_with(|| left.path.cmp(&right.path))
-                .then_with(|| left.name_range.start_byte.cmp(&right.name_range.start_byte))
-        });
-        let mut identities = HashSet::new();
-        records.retain(|record| identities.insert(record.identity.clone()));
-        if let Some(highest_rank) = records.iter().map(|record| record.tier.rank()).max() {
-            ambiguous |= records
-                .iter()
-                .filter(|record| record.tier.rank() == highest_rank)
-                .count()
-                > 1;
-        }
-        incomplete |= ambiguous;
-        Ok(TypeRecordResolution {
-            records,
-            authoritative,
-            incomplete,
-            ambiguous,
-        })
-    }
-
-    /// Fetch member evidence for request-local record identities. Persistent
-    /// IDs are read from the pinned generation; parser identities read only
-    /// the dirty overlay and therefore naturally replace stale base fields.
-    /// Fetch resolved-owner members under one scan budget shared by live
-    /// parser records and pinned durable rows. Live facts are consumed first
-    /// so a large clean record cannot crowd a dirty/current owner out of the
-    /// bounded working set.
-    pub fn members_for_records_limited(
-        &self,
-        records: &[RecordCandidate],
-        member_name: Option<&str>,
-        scan_limit: usize,
-    ) -> Result<BoundedMemberCandidates> {
-        let resolve_context = ResolveContext {
-            current_path: Some(self.current_path),
-            reach: self.current_reach.as_deref(),
-            direct_external_files: None,
-        };
-        let mut persistent_ids: Vec<_> = records
-            .iter()
-            .filter_map(|record| match record.identity {
-                RecordCandidateIdentity::Persistent(id) => Some(id),
-                RecordCandidateIdentity::ParserKey { .. } => None,
-            })
-            .collect();
-        persistent_ids.sort_unstable();
-        persistent_ids.dedup();
-        let mut tier_by_path = HashMap::new();
-        for record in records {
-            tier_by_path
-                .entry(record.path.as_str())
-                .and_modify(|tier: &mut crate::model::ScopeTier| {
-                    if record.tier.rank() > tier.rank() {
-                        *tier = record.tier;
-                    }
-                })
-                .or_insert(record.tier);
-        }
-        let mut members = Vec::new();
-        let mut scanned = 0usize;
-        let mut truncated = false;
-        let mut seen_parser_records = HashSet::new();
-        for record in records {
-            let RecordCandidateIdentity::ParserKey { path, record_key } = &record.identity else {
-                continue;
-            };
-            if !seen_parser_records.insert((path.as_str(), record_key.as_str())) {
-                continue;
-            }
-            let owner_revision_hash = self
-                .overlays
-                .source_text(path)
-                .map(|source| blake3::hash(source.as_bytes()).to_hex().to_string());
-            for member in self.overlays.members_for_parser_record(path, record_key) {
-                if scanned >= scan_limit {
-                    truncated = true;
-                    break;
-                }
-                scanned += 1;
-                if member_name.is_some_and(|name| member.name != name) {
-                    continue;
-                }
-                members.push(MemberCandidate {
-                    name: member.name.clone(),
-                    kind: member.kind,
-                    signature: member.signature.clone(),
-                    type_name: member.type_name.clone(),
-                    tier: record.tier,
-                    confidence: member.confidence,
-                    owner_path: path.clone(),
-                    owner_revision_hash: owner_revision_hash.clone(),
-                    handle: crate::model::MemberCandidateHandle::new(
-                        None, path, record_key, member,
-                    ),
-                });
-            }
-            if truncated {
-                break;
-            }
-        }
-
-        if !truncated && !persistent_ids.is_empty() {
-            let remaining = scan_limit.saturating_sub(scanned);
-            let (mut durable, durable_scanned, durable_truncated) = match self.handle {
-                Some(handle) => handle.read(|store| {
-                    store.member_view().members_for_records_limited(
-                        &persistent_ids,
-                        member_name,
-                        Some(&resolve_context),
-                        remaining,
-                    )
-                })?,
-                None => (Vec::new(), 0, false),
-            };
-            scanned = scanned.saturating_add(durable_scanned);
-            truncated |= durable_truncated;
-            durable.retain(|member| !self.overlays.shadows(&member.owner_path));
-            for member in &mut durable {
-                if let Some(tier) = tier_by_path.get(member.owner_path.as_str()) {
-                    member.tier = *tier;
-                }
-            }
-            members.extend(durable);
-        }
-        members.sort_by(|left, right| {
-            right
-                .tier
-                .rank()
-                .cmp(&left.tier.rank())
-                .then_with(|| left.owner_path.cmp(&right.owner_path))
-                .then_with(|| left.name.cmp(&right.name))
-                .then_with(|| left.kind.as_str().cmp(right.kind.as_str()))
-        });
-        members.dedup_by(|left, right| {
-            left.owner_path == right.owner_path
-                && left.name == right.name
-                && left.kind == right.kind
-                && left.signature == right.signature
-        });
-        Ok(BoundedMemberCandidates {
-            candidates: members,
-            scanned,
-            truncated,
-        })
-    }
-
-    /// Bounded global member fallback with the same all-open tombstones as
-    /// exact owner resolution. Durable rows from every dirty owner path are
-    /// removed, then current-buffer member facts are added back.
-    pub fn fallback_member_candidates(
-        &self,
-        prefix: &str,
-        limit: usize,
-    ) -> Result<(Vec<MemberCandidate>, bool)> {
-        let resolve_context = ResolveContext {
-            current_path: Some(self.current_path),
-            reach: self.current_reach.as_deref(),
-            direct_external_files: None,
-        };
-        let (mut members, mut truncated) = match self.handle {
-            Some(handle) => handle.read(|store| {
-                store.member_view().fallback_member_candidates_limited(
-                    prefix,
-                    limit,
-                    Some(&resolve_context),
-                )
-            })?,
-            None => (Vec::new(), false),
-        };
-        members.retain(|member| !self.overlays.shadows(&member.owner_path));
-
-        let (overlay_members, overlay_truncated) = self
-            .overlays
-            .fallback_members_by_prefix_limited(prefix, MEMBER_FALLBACK_OVERLAY_SCAN_LIMIT);
-        truncated |= overlay_truncated;
-        for fact in overlay_members {
-            let path = &fact.path;
-            let member = &fact.member;
-            let (external, directly_included) =
-                self.path_evidence(path, Path::new(path).is_absolute(), false);
-            let tier =
-                resolver::scope_tier(path, external, directly_included, Some(&resolve_context));
-            let owner_revision_hash = self
-                .overlays
-                .source_text(path)
-                .map(|source| blake3::hash(source.as_bytes()).to_hex().to_string());
-            members.push(MemberCandidate {
-                name: member.name.clone(),
-                kind: member.kind,
-                signature: member.signature.clone(),
-                type_name: member.type_name.clone(),
-                tier,
-                confidence: member.confidence,
-                owner_path: path.clone(),
-                owner_revision_hash,
-                handle: crate::model::MemberCandidateHandle::new(
-                    None,
-                    path,
-                    &member.record_key,
-                    member,
-                ),
-            });
-        }
-        members.sort_by(|left, right| {
-            right
-                .tier
-                .rank()
-                .cmp(&left.tier.rank())
-                .then_with(|| left.name.cmp(&right.name))
-                .then_with(|| left.owner_path.cmp(&right.owner_path))
-                .then_with(|| left.signature.cmp(&right.signature))
-        });
-        members.dedup_by(|left, right| {
-            left.owner_path == right.owner_path
-                && left.name == right.name
-                && left.kind == right.kind
-                && left.signature == right.signature
-        });
-        truncated |= members.len() > limit;
-        members.truncate(limit);
-        Ok((members, truncated))
-    }
-}
-
-fn unique_overlay_replacement_for_record<'a>(
-    facts: &'a [OverlayRecordFact],
-    row: &crate::store::views::RecordReadRow,
-) -> Option<&'a OverlayRecordFact> {
-    let mut matches = facts.iter().filter(|fact| {
-        fact.record.kind == row.kind
-            && (fact.record.display_name == row.display_name
-                || row
-                    .tag_name
-                    .as_ref()
-                    .is_some_and(|name| fact.record.tag_name.as_ref() == Some(name))
-                || row
-                    .typedef_name
-                    .as_ref()
-                    .is_some_and(|name| fact.record.typedef_name.as_ref() == Some(name)))
-    });
-    let found = matches.next()?;
-    matches.next().is_none().then_some(found)
-}
-
-/// Tree-sitter represents `typedef B Active` as an unresolved type spelling.
-/// In C++ (and in C after a prior typedef), that spelling may name a record
-/// directly. Bind it only when this same dirty file contains exactly one
-/// matching parser record; otherwise preserve the ordinary alias-chain path.
-/// This keeps a dirty typedef retarget on the same immutable overlay instead
-/// of falling back to the stale durable target record.
-fn bind_overlay_alias_to_unique_same_file_record(
-    alias: &mut TypeAliasCandidate,
-    overlays: &CandidateOverlaySnapshot,
-) {
-    let TypeAliasTarget::TypeName(target_name) = &alias.target else {
-        return;
-    };
-    let mut matching = overlays
-        .records(target_name)
-        .iter()
-        .filter(|fact| fact.path == alias.path);
-    let Some(record) = matching.next() else {
-        return;
-    };
-    if matching.next().is_some() {
-        return;
-    }
-    alias.target = TypeAliasTarget::StableRecord(RecordCandidateIdentity::ParserKey {
-        path: record.path.clone(),
-        record_key: record.record.record_key.clone(),
-    });
-}
-
-fn remap_persistent_alias_targets(
-    aliases: &mut [TypeAliasCandidate],
-    persistent_id: i64,
-    replacement: RecordCandidateIdentity,
-) {
-    for alias in aliases {
-        if alias.target
-            == TypeAliasTarget::StableRecord(RecordCandidateIdentity::Persistent(persistent_id))
-        {
-            alias.target = TypeAliasTarget::StableRecord(replacement.clone());
-        }
-    }
-}
-
-fn enqueue_alias_targets(aliases: &[TypeAliasCandidate], names: &mut Vec<String>) {
-    for alias in aliases {
-        match &alias.target {
-            TypeAliasTarget::NamedRecord { tag, .. } | TypeAliasTarget::TypeName(tag) => {
-                names.push(tag.clone());
-            }
-            TypeAliasTarget::StableRecord(_) => {}
-        }
-    }
-}
-
-fn overlay_symbol_record(fact: &OverlaySymbolFact) -> SymbolRecord {
-    SymbolRecord {
-        // Negative ids are request-local and are never sent back as durable
-        // identifiers. Range/path form the fallback identity.
-        id: -1,
-        name: fact.symbol.name.clone(),
-        kind: match fact.symbol.kind {
-            crate::semantic_model::SymbolKind::Function => "function",
-            crate::semantic_model::SymbolKind::Macro => "macro",
-            crate::semantic_model::SymbolKind::Type => "type",
-            crate::semantic_model::SymbolKind::EnumConstant => "enum_constant",
-            crate::semantic_model::SymbolKind::GlobalVariable => "global_variable",
-            crate::semantic_model::SymbolKind::Field => "field",
-        }
-        .into(),
-        role: match fact.symbol.role {
-            SymbolRole::Definition => "definition",
-            SymbolRole::Declaration => "declaration",
-            SymbolRole::TentativeDefinition => "tentative_definition",
-            SymbolRole::UnknownDeclarationOrDefinition => "unknown_declaration_or_definition",
-        }
-        .into(),
-        path: fact.path.clone(),
-        start_line: fact.symbol.start_line as u32,
-        start_col: fact.symbol.start_col as u32,
-        end_line: fact.symbol.end_line as u32,
-        end_col: fact.symbol.end_col as u32,
-        signature: fact.symbol.signature.clone(),
-        guard: fact.symbol.guard.clone(),
-        source: if Path::new(&fact.path).is_absolute() {
-            "external"
-        } else {
-            "workspace"
-        }
-        .into(),
-        directly_included: false,
-    }
-}
-
-#[cfg(test)]
-fn symbol_record_has_internal_linkage(record: &SymbolRecord) -> bool {
-    record.kind == "global_variable"
-        && record
-            .signature
-            .split(|ch: char| ch != '_' && !ch.is_ascii_alphanumeric())
-            .any(|token| token == "static")
-}
-
-fn resolved_anchor(
-    anchor: CallableAnchor,
-    source: String,
-    tier: crate::model::ScopeTier,
-    origin: CandidateOrigin,
-) -> ResolvedCallableAnchor {
-    let base_match = if anchor.role == crate::call_model::AnchorRole::Definition {
-        1_000
-    } else {
-        900
-    };
-    let (confidence, reason) = resolver::confidence_reason_for(tier, true, None);
-    let candidate = DefinitionCandidate {
-        name: anchor.name.clone(),
-        kind: anchor.kind.as_str().into(),
-        role: anchor.role.as_str().into(),
-        path: anchor.path.clone(),
-        range: CandidateRange {
-            start_line: anchor.name_range.start.line,
-            start_col: anchor.name_range.start.character,
-            end_line: anchor.name_range.end.line,
-            end_col: anchor.name_range.end.character,
-        },
-        source,
-        tier,
-        base_match,
-        confidence,
-        reason,
-    };
-    ResolvedCallableAnchor::new(anchor, candidate, origin)
-}
-
-fn resolved_lexical_function(
-    record: SymbolRecord,
-    tier: crate::model::ScopeTier,
-    origin: CandidateOrigin,
-) -> ResolvedCallableAnchor {
-    let position_range = SourceRange {
-        start: SourcePosition {
-            line: record.start_line,
-            character: record.start_col,
-        },
-        end: SourcePosition {
-            line: record.end_line,
-            character: record.end_col,
-        },
-        start_byte: 0,
-        end_byte: 0,
-    };
-    let role = if record.role == "definition" {
-        AnchorRole::Definition
-    } else {
-        AnchorRole::Declaration
-    };
-    let fingerprint = blake3::hash(
-        format!(
-            "lexical|{}|{}|{}|{}|{}|{}",
-            record.path,
-            record.name,
-            record.start_line,
-            record.start_col,
-            record.end_line,
-            record.end_col
-        )
-        .as_bytes(),
-    )
-    .to_hex()[..24]
-        .to_string();
-    let entity_key = blake3::hash(
-        format!(
-            "lexical|{}|{}|{}",
-            record.path, record.name, record.signature
-        )
-        .as_bytes(),
-    )
-    .to_hex()[..24]
-        .to_string();
-    let linkage = if record
-        .signature
-        .split(|ch: char| !(ch == '_' || ch.is_ascii_alphanumeric()))
-        .any(|token| token == "static")
-    {
-        LinkageDomain::Internal(record.path.clone())
-    } else {
-        LinkageDomain::External
-    };
-    let anchor = CallableAnchor {
-        path: record.path.clone(),
-        name: record.name.clone(),
-        qualified_name: record.name.clone(),
-        owner: None,
-        owner_kind: None,
-        kind: CallableKind::Function,
-        role,
-        linkage,
-        signature: SignatureShape {
-            normalized: record.signature.clone(),
-            min_arity: None,
-            max_arity: None,
-            variadic: false,
-        },
-        canonical_signature: String::new(),
-        presentation_signature: record.signature.clone(),
-        signature_fidelity: SignatureFidelity::LexicalFallback,
-        name_range: position_range,
-        declaration_range: position_range,
-        body_range: None,
-        guard: record.guard.clone(),
-        provenance: FactProvenance::LexicalFallback,
-        syntax_error_overlap: true,
-        entity_key,
-        anchor_fingerprint: fingerprint,
-    };
-    resolved_anchor(anchor, record.source, tier, origin)
 }
 
 #[cfg(test)]
@@ -2425,6 +1095,25 @@ mod tests {
         );
         parsed.diagnostics.fallback_used = true;
         parsed.diagnostics.ast_source = crate::parser::FactSource::LexicalFallback;
+        parsed.parse_outcome = crate::semantic_model::ParseOutcome::LexicalFallback;
+        parsed.declarations.clear();
+        parsed.fallback_completions = vec![FallbackCompletionFact {
+            name: "api".to_string(),
+            kind_hint: crate::semantic_model::CompletionKindHint::Function,
+            range: SourceRange {
+                start: SourcePosition {
+                    line: 0,
+                    character: 4,
+                },
+                end: SourcePosition {
+                    line: 0,
+                    character: 7,
+                },
+                start_byte: 4,
+                end_byte: 7,
+            },
+            detail: Some("api(int value)".to_string()),
+        }];
         parsed.callable_anchors.clear();
         parsed.call_sites.clear();
         parsed.records.clear();
@@ -2433,13 +1122,20 @@ mod tests {
         assert!(!overlay.facts_complete);
         let snapshot = CandidateOverlaySnapshot::new(1, vec![overlay]);
         assert!(snapshot.has_incomplete_facts());
+        assert_eq!(snapshot.fallback_completion_facts().len(), 1);
         let candidates = CandidateQueryService::new(None, &snapshot, "fallback.h", None, None)
             .callable_candidates("api", None)
             .expect("lexical callable fallback");
-        assert_eq!(candidates.anchors.len(), 1);
-        assert_eq!(
-            candidates.anchors[0].anchor.signature_fidelity,
-            SignatureFidelity::LexicalFallback
+        assert!(
+            candidates.anchors.is_empty(),
+            "lexical fallback must never enter semantic callable candidates"
+        );
+        assert!(
+            CandidateQueryService::new(None, &snapshot, "fallback.h", None, None)
+                .semantic_candidates("api", SemanticIntent::Neutral)
+                .expect("semantic candidates")
+                .all
+                .is_empty()
         );
         assert_eq!(
             candidates.coverage.incomplete_reason,
@@ -2690,12 +1386,14 @@ mod tests {
             crate::model::ScopeTier::Global
         );
         let removed_symbol = removed_service
-            .non_callable_symbols("EXTERNAL_FLAG")
-            .expect("removed include symbol")
+            .semantic_candidates("EXTERNAL_FLAG", SemanticIntent::Value)
+            .expect("removed include declaration")
+            .all
             .into_iter()
+            .flat_map(|group| group.candidates)
             .next()
-            .expect("removed include symbol candidate");
-        assert_eq!(removed_symbol.source, "external");
+            .expect("removed include declaration candidate");
+        assert!(removed_symbol.external);
         assert!(!removed_symbol.directly_included);
         assert_eq!(
             removed_service
@@ -2765,12 +1463,14 @@ mod tests {
         let added_service =
             CandidateQueryService::new(None, &added, "main.c", None, Some(&empty_published));
         let added_symbol = added_service
-            .non_callable_symbols("EXTERNAL_FLAG")
-            .expect("added include symbol")
+            .semantic_candidates("EXTERNAL_FLAG", SemanticIntent::Value)
+            .expect("added include declaration")
+            .all
             .into_iter()
+            .flat_map(|group| group.candidates)
             .next()
-            .expect("added include symbol candidate");
-        assert_eq!(added_symbol.source, "external");
+            .expect("added include declaration candidate");
+        assert!(added_symbol.external);
         assert!(added_symbol.directly_included);
         assert_eq!(
             added_service
@@ -2964,13 +1664,17 @@ mod tests {
             .iter()
             .any(|candidate| candidate.anchor.path == "zzz/reachable.h"));
 
-        let symbols = service
-            .non_callable_symbols("crowded_value")
-            .expect("non-callable candidates");
+        let symbols: Vec<_> = service
+            .semantic_candidates("crowded_value", SemanticIntent::Value)
+            .expect("value declaration candidates")
+            .all
+            .into_iter()
+            .flat_map(|group| group.candidates)
+            .collect();
         assert!(symbols.len() <= DEFAULT_EXACT_NAME_CANDIDATE_LIMIT);
         assert!(symbols
             .iter()
-            .any(|candidate| candidate.path == "zzz/reachable.h"));
+            .any(|candidate| candidate.fact.path == "zzz/reachable.h"));
 
         let semantic_callables = service
             .semantic_candidates("crowded", SemanticIntent::Call)
@@ -3001,10 +1705,12 @@ mod tests {
             .iter()
             .any(|candidate| candidate.anchor.path == "zzz/reachable.h"));
         assert!(current_service
-            .non_callable_symbols("crowded_value")
-            .expect("current-file non-callable candidates")
+            .semantic_candidates("crowded_value", SemanticIntent::Value)
+            .expect("current-file value candidates")
+            .all
             .iter()
-            .any(|candidate| candidate.path == "zzz/reachable.h"));
+            .flat_map(|group| &group.candidates)
+            .any(|candidate| candidate.fact.path == "zzz/reachable.h"));
 
         let dirty = parse_with_handle(
             Path::new("zzz/reachable.h"),
@@ -3033,10 +1739,12 @@ mod tests {
             .iter()
             .all(|candidate| candidate.anchor.path != "zzz/reachable.h"));
         assert!(dirty_service
-            .non_callable_symbols("crowded_value")
-            .expect("dirty non-callable candidates")
+            .semantic_candidates("crowded_value", SemanticIntent::Value)
+            .expect("dirty value candidates")
+            .all
             .iter()
-            .all(|candidate| candidate.path != "zzz/reachable.h"));
+            .flat_map(|group| &group.candidates)
+            .all(|candidate| candidate.fact.path != "zzz/reachable.h"));
     }
 
     #[test]
@@ -3160,13 +1868,78 @@ mod tests {
             .semantic_candidates("shared_value", SemanticIntent::Value)
             .expect("semantic object candidates");
 
-        let presentations = navigation_presentations(&semantic, false);
+        let presentations = navigation_presentations(&semantic, false, "main.c");
         assert_eq!(
             presentations
                 .iter()
                 .map(|candidate| candidate.path.as_str())
                 .collect::<Vec<_>>(),
             vec!["first.c", "second.c"]
+        );
+    }
+
+    #[test]
+    fn navigation_prefers_function_definitions_in_source_files() {
+        let header = parse_with_handle(
+            Path::new("api.h"),
+            "int shared_api(void) { return 1; }\n",
+            None,
+            ParseFacts::HOVER_SEMANTICS,
+        );
+        let source = parse_with_handle(
+            Path::new("api.c"),
+            "int shared_api(void) { return 2; }\n",
+            None,
+            ParseFacts::HOVER_SEMANTICS,
+        );
+        let snapshot = CandidateOverlaySnapshot::new(
+            1,
+            vec![
+                FileCandidateOverlay::from_index("api.h".into(), &header),
+                FileCandidateOverlay::from_index("api.c".into(), &source),
+            ],
+        );
+        let semantic = CandidateQueryService::new(None, &snapshot, "main.c", None, None)
+            .semantic_candidates("shared_api", SemanticIntent::Call)
+            .expect("semantic function candidates");
+
+        let presentations = navigation_presentations(&semantic, false, "main.c");
+        assert_eq!(presentations[0].path, "api.c");
+        assert!(presentations[0].base_match > presentations[1].base_match);
+    }
+
+    #[test]
+    fn navigation_uses_path_locality_after_tier_and_match_quality() {
+        let near = parse_with_handle(
+            Path::new("src/shared.c"),
+            "int shared_value = 1;\n",
+            None,
+            ParseFacts::HOVER_SEMANTICS,
+        );
+        let far = parse_with_handle(
+            Path::new("lib/shared.c"),
+            "int shared_value = 2;\n",
+            None,
+            ParseFacts::HOVER_SEMANTICS,
+        );
+        let snapshot = CandidateOverlaySnapshot::new(
+            1,
+            vec![
+                FileCandidateOverlay::from_index("lib/shared.c".into(), &far),
+                FileCandidateOverlay::from_index("src/shared.c".into(), &near),
+            ],
+        );
+        let semantic = CandidateQueryService::new(None, &snapshot, "src/main.c", None, None)
+            .semantic_candidates("shared_value", SemanticIntent::Value)
+            .expect("semantic object candidates");
+
+        let presentations = navigation_presentations(&semantic, false, "src/main.c");
+        assert_eq!(
+            presentations
+                .iter()
+                .map(|candidate| candidate.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src/shared.c", "lib/shared.c"]
         );
     }
 }

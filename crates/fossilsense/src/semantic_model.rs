@@ -9,7 +9,33 @@ use crate::call_model::SourceRange;
 /// This is deliberately independent from the SQLite schema version: changing
 /// how a fact is derived must invalidate persisted rows even when their SQL
 /// column layout happens to stay compatible.
-pub const PARSER_FACT_VERSION: i64 = 4;
+pub const PARSER_FACT_VERSION: i64 = 5;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParseOutcome {
+    Ast,
+    PartialAst,
+    LexicalFallback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionKindHint {
+    Function,
+    Macro,
+    Type,
+    Object,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FallbackCompletionFact {
+    pub name: String,
+    pub kind_hint: CompletionKindHint,
+    pub range: SourceRange,
+    pub detail: Option<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -80,8 +106,6 @@ pub enum LanguageFidelity {
 #[allow(dead_code)]
 pub enum SemanticFactProvenance {
     Ast,
-    LexicalFallback,
-    Synthetic,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -135,24 +159,8 @@ pub enum DeclarationBacking {
     CallableAnchor { fingerprint: String },
     Record { record_key: String },
     TypeAlias { fingerprint: String },
-    Symbol { start_byte: usize, end_byte: usize },
+    SourceRange { range: SourceRange },
     None,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Symbol {
-    pub name: String,
-    pub kind: SymbolKind,
-    pub role: SymbolRole,
-    pub start_byte: usize,
-    pub end_byte: usize,
-    pub start_line: usize,
-    pub start_col: usize,
-    pub end_line: usize,
-    pub end_col: usize,
-    pub signature: String,
-    pub guard: Option<String>,
-    pub container: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,17 +171,6 @@ pub enum SymbolKind {
     EnumConstant,
     GlobalVariable,
     Field,
-}
-
-pub fn kind_from_str(s: &str) -> SymbolKind {
-    match s {
-        "function" => SymbolKind::Function,
-        "macro" => SymbolKind::Macro,
-        "type" => SymbolKind::Type,
-        "enum_constant" => SymbolKind::EnumConstant,
-        "field" => SymbolKind::Field,
-        _ => SymbolKind::GlobalVariable,
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -383,9 +380,10 @@ pub struct Occurrence {
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
 pub struct PersistentFacts<'a> {
-    pub symbols: &'a [Symbol],
+    pub parse_outcome: ParseOutcome,
     pub includes: &'a [Include],
     pub declarations: &'a [DeclarationFact],
+    pub fallback_completions: &'a [FallbackCompletionFact],
     pub records: &'a [RecordDef],
     pub fields: &'a [FieldDef],
     pub members: &'a [MemberDef],

@@ -27,7 +27,7 @@ use grep_searcher::sinks::Lossy;
 use grep_searcher::SearcherBuilder;
 use rayon::prelude::*;
 
-use crate::config::WorkspaceConfig;
+use crate::config::{LanguageResolver, SourceLanguage, WorkspaceConfig};
 use crate::parser::{self, SyntacticRole};
 use crate::pathing;
 
@@ -392,6 +392,7 @@ fn search_references_inner_borrowed(
         .with_context(|| format!("failed to compile reference pattern {pattern}"))?;
 
     let (config, _config_issue) = WorkspaceConfig::load(&root);
+    let language_resolver = LanguageResolver::from_workspace_config(&root, &config);
     let discover_started = Instant::now();
     let discovered;
     let candidates = match indexed_files {
@@ -423,7 +424,12 @@ fn search_references_inner_borrowed(
                 let mut occurrence_count = 0usize;
                 if !file_hits.is_empty() {
                     let classify_started = Instant::now();
-                    occurrence_count = classify_file_hits(path, &mut file_hits, cache);
+                    occurrence_count = classify_file_hits(
+                        path,
+                        language_resolver.language_for_path(path),
+                        &mut file_hits,
+                        cache,
+                    );
                     classify_elapsed = classify_started.elapsed();
                 }
 
@@ -507,10 +513,11 @@ pub fn search_references_with_shared_files(
 /// classification failure — useful for profiling per-file occurrence cost.
 fn classify_file_hits(
     abs_path: &Path,
+    language: SourceLanguage,
     file_hits: &mut [ReferenceHit],
     cache: Option<&ReferenceRoleCache>,
 ) -> usize {
-    let Some(roles) = position_roles(abs_path, cache) else {
+    let Some(roles) = position_roles(abs_path, language, cache) else {
         return 0;
     };
     let count = roles.len();
@@ -526,10 +533,11 @@ fn classify_file_hits(
 /// when the file fingerprint is unchanged, otherwise parsed and cached.
 fn position_roles(
     abs_path: &Path,
+    language: SourceLanguage,
     cache: Option<&ReferenceRoleCache>,
 ) -> Option<Arc<HashMap<(u32, u32), SyntacticRole>>> {
     let fingerprint = file_fingerprint(abs_path)?;
-    let key = abs_path.to_string_lossy().into_owned();
+    let key = format!("{}#{language:?}", abs_path.to_string_lossy());
 
     if let Some(cache) = cache {
         if let Some(roles) = cache.get(&key, fingerprint) {
@@ -538,7 +546,13 @@ fn position_roles(
     }
 
     let source = std::fs::read_to_string(abs_path).ok()?;
-    let parsed = parser::parse_with_handle(abs_path, &source, None, parser::ParseFacts::COLOR_REF);
+    let parsed = parser::parse_with_handle_and_language(
+        abs_path,
+        &source,
+        language,
+        None,
+        parser::ParseFacts::COLOR_REF,
+    );
     let request_facts = parsed.request_facts();
     let occurrences = match parsed.fact_availability(parser::FactGroup::Occurrences) {
         parser::FactAvailability::Available => request_facts.occurrences,

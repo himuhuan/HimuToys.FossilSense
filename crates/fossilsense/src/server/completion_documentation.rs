@@ -150,19 +150,18 @@ impl Backend {
                 }
                 let roots = vec![root];
                 let client_include_roots = self.include_paths.lock().await.clone();
-                let config_roots = roots.clone();
-                let allowed_external_roots: Vec<PathBuf> = tokio::task::spawn_blocking(move || {
-                    config_roots
-                        .iter()
-                        .flat_map(|root| {
-                            super::configured_include_paths(Some(root), &client_include_roots)
-                        })
-                        .map(PathBuf::from)
-                        .filter(|path| path.is_absolute())
-                        .collect()
-                })
-                .await
-                .unwrap_or_default();
+                let configured = self
+                    .include_roots_for_workspace(
+                        roots.first().map(PathBuf::as_path),
+                        &client_include_roots,
+                    )
+                    .await;
+                let allowed_external_roots: Vec<PathBuf> = configured
+                    .into_iter()
+                    .map(PathBuf::from)
+                    .filter(|path| path.is_absolute())
+                    .collect();
+                let language_resolver = self.workspace_root_config(&roots[0]).await.language;
                 let owner = Path::new(&owner_path);
                 let owner_is_absolute = owner.is_absolute();
                 let owner_allowed = if owner.is_absolute() {
@@ -248,7 +247,18 @@ impl Backend {
                         {
                             continue;
                         }
-                        let parsed = crate::parser::parse(Path::new(&owner_path), &source);
+                        let owner_parse_path = if owner_is_absolute {
+                            PathBuf::from(&owner_path)
+                        } else {
+                            root.join(owner_path.replace('/', std::path::MAIN_SEPARATOR_STR))
+                        };
+                        let language = language_resolver.language_for_path(&owner_parse_path);
+                        let parsed = crate::parser::parse_with_language(
+                            Path::new(&owner_path),
+                            &source,
+                            language,
+                            crate::parser::ParseFacts::ALL,
+                        );
                         let member = parsed.members.iter().find(|member| {
                             crate::model::MemberCandidateHandle::new(
                                 None,

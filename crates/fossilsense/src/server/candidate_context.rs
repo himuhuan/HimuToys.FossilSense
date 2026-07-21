@@ -78,9 +78,11 @@ impl Backend {
         });
 
         let client_roots = self.include_paths.lock().await.clone();
+        let configured = self
+            .include_roots_for_workspace(Some(&root), &client_roots)
+            .await;
         let root_for_paths = root.clone();
         let prepared = tokio::task::spawn_blocking(move || {
-            let configured = super::configured_include_paths(Some(&root_for_paths), &client_roots);
             let (include_roots, _issues) = crate::config::resolve_include_roots(&configured);
             let include_root_strings: Vec<String> = include_roots
                 .iter()

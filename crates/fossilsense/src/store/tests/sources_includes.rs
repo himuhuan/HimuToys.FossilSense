@@ -20,14 +20,14 @@ fn records_source_and_absolute_path_for_external_files() {
     );
 
     let reader = IndexStore::open_readonly(&db).expect("readonly");
-    let ext = reader.symbols_by_name("size_t").expect("size_t");
+    let ext = reader.declarations_by_name("size_t").expect("size_t");
     assert_eq!(ext.len(), 1);
-    assert_eq!(ext[0].source, "external");
-    assert_eq!(ext[0].path, "C:/mingw/include/stddef.h");
+    assert!(ext[0].external);
+    assert_eq!(ext[0].fact.path, "C:/mingw/include/stddef.h");
 
-    let ws = reader.symbols_by_name("main").expect("main");
-    assert_eq!(ws[0].source, "workspace");
-    assert_eq!(ws[0].path, "src/main.c");
+    let ws = reader.declarations_by_name("main").expect("main");
+    assert!(!ws[0].external);
+    assert_eq!(ws[0].fact.path, "src/main.c");
 
     let indexed_files = reader
         .indexed_workspace_files()
@@ -50,14 +50,18 @@ fn external_symbols_color_only_when_first_layer() {
     );
 
     // Transitively-only external symbol: excluded from coloring counts.
-    let before = store.kind_counts_by_names(&["size_t"]).expect("before");
+    let before = store
+        .declaration_kind_counts_by_names(&["size_t"])
+        .expect("before");
     assert!(!before.contains_key("size_t"));
 
     // Promote to first layer; now it contributes a `type` count.
     store
         .mark_directly_included(&[ext_path.to_string()])
         .expect("mark");
-    let after = store.kind_counts_by_names(&["size_t"]).expect("after");
+    let after = store
+        .declaration_kind_counts_by_names(&["size_t"])
+        .expect("after");
     assert_eq!(
         after.get("size_t").and_then(|m| m.get("type")).copied(),
         Some(1)
@@ -65,7 +69,9 @@ fn external_symbols_color_only_when_first_layer() {
 
     // Clearing (re-derivation with no match) demotes it again.
     store.mark_directly_included(&[]).expect("clear");
-    let cleared = store.kind_counts_by_names(&["size_t"]).expect("cleared");
+    let cleared = store
+        .declaration_kind_counts_by_names(&["size_t"])
+        .expect("cleared");
     assert!(!cleared.contains_key("size_t"));
 }
 
@@ -147,7 +153,7 @@ fn directly_included_derivation_only_flags_external_exact_dsts() {
     store.apply_directly_included_derivation().expect("derive");
 
     let reader = IndexStore::open_readonly(&db).expect("readonly");
-    let defs = reader.symbols_by_name("size_t").expect("size_t");
+    let defs = reader.declarations_by_name("size_t").expect("size_t");
     assert_eq!(defs.len(), 1);
     assert!(
         defs[0].directly_included,
@@ -156,7 +162,9 @@ fn directly_included_derivation_only_flags_external_exact_dsts() {
 
     // Counts: with the derivation, the kind_counts coloring loop includes
     // directly_included externals — size_t now colors.
-    let counts = reader.kind_counts_by_names(&["size_t"]).expect("counts");
+    let counts = reader
+        .declaration_kind_counts_by_names(&["size_t"])
+        .expect("counts");
     assert_eq!(counts["size_t"].get("type").copied(), Some(1));
 
     // Removing the ExternalExact edge and re-deriving clears the flag.
@@ -177,7 +185,9 @@ fn directly_included_derivation_only_flags_external_exact_dsts() {
         .apply_directly_included_derivation()
         .expect("re-derive");
     let reader = IndexStore::open_readonly(&db).expect("readonly2");
-    let cleared = reader.kind_counts_by_names(&["size_t"]).expect("cleared");
+    let cleared = reader
+        .declaration_kind_counts_by_names(&["size_t"])
+        .expect("cleared");
     assert!(
         !cleared.contains_key("size_t"),
         "without an ExternalExact edge, the external twin is no longer first-layer"

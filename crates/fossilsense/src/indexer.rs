@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 
-use crate::config::{resolve_include_roots, WorkspaceConfig};
+use crate::config::{resolve_include_roots, LanguageResolver, WorkspaceConfig};
 use crate::pathing::{
     canonical_workspace, default_index_path, default_index_staging_path, normalize_abs_path,
     publish_default_index, relative_slash_path,
@@ -22,7 +22,7 @@ use candidates::{
     discover_external_candidates, DEFAULT_EXTERNAL_MAX_BYTES, DEFAULT_EXTERNAL_MAX_FILES,
 };
 use include_edges::{build_include_edges, sql_affected_include_edge_sources};
-use parse_pipeline::{parse_and_write_changed, parse_thread_count};
+use parse_pipeline::{parse_and_write_changed, parse_thread_count, ParsePipelineConfig};
 use progress_limiter::ProgressLimiter;
 
 #[derive(Debug, Clone, Default)]
@@ -197,7 +197,10 @@ pub fn index_workspace(
 
     parse_and_write_changed(
         changed,
-        parse_thread_count(options.parse_threads),
+        ParsePipelineConfig {
+            parse_threads: parse_thread_count(options.parse_threads),
+            language_resolver: LanguageResolver::from_workspace_config(&workspace, &config),
+        },
         build,
         &mut store,
         &workspace_display,
@@ -229,7 +232,7 @@ pub fn index_workspace(
         store.finalize_full_build_indexes()?;
         stats.secondary_index_ms = secondary_index_started.elapsed().as_millis();
     }
-    stats.symbols = store.symbol_count()?;
+    stats.declarations = store.declaration_count()?;
     let call_coverage = store.call_fact_view().coverage()?;
     stats.callable_anchors = call_coverage.callable_anchors as usize;
     stats.call_sites = call_coverage.call_sites as usize;
@@ -382,7 +385,10 @@ pub fn index_dirty_files(
 
     parse_and_write_changed(
         upserts,
-        parse_thread_count(options.parse_threads),
+        ParsePipelineConfig {
+            parse_threads: parse_thread_count(options.parse_threads),
+            language_resolver: LanguageResolver::from_workspace_config(&workspace, &config),
+        },
         build,
         &mut store,
         &workspace_display,
@@ -409,7 +415,7 @@ pub fn index_dirty_files(
     stats.semantic_generation = commit.generation;
     stats.maintenance_warning = commit.cleanup_warning;
     stats.include_edge_ms = include_edge_started.elapsed().as_millis();
-    stats.symbols = store.symbol_count()?;
+    stats.declarations = store.declaration_count()?;
     let call_coverage = store.call_fact_view().coverage()?;
     stats.callable_anchors = call_coverage.callable_anchors as usize;
     stats.call_sites = call_coverage.call_sites as usize;

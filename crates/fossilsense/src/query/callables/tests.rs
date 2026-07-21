@@ -910,9 +910,9 @@ fn counterpart_requires_external_exact_signature_and_known_reach() {
     internal.anchor.linkage = LinkageDomain::Internal("src/api.C".to_string());
     assert_unpaired(internal, header.clone(), reach(false, true));
 
-    let mut lexical = header.clone();
-    lexical.anchor.signature_fidelity = SignatureFidelity::LexicalFallback;
-    assert_unpaired(source.clone(), lexical, reach(false, true));
+    let mut malformed = header.clone();
+    malformed.anchor.signature_fidelity = SignatureFidelity::Malformed;
+    assert_unpaired(source.clone(), malformed, reach(false, true));
 
     let mut signature_mismatch = header;
     signature_mismatch.anchor.canonical_signature = "int pick(long lhs, long rhs)".to_string();

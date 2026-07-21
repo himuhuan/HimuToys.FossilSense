@@ -78,13 +78,13 @@ fn batch_delete_missing_files_anti_join() {
     let deleted = store.delete_missing_files(&seen).expect("delete");
     assert_eq!(deleted, 1, "one file should be deleted");
 
-    let names = store.load_symbol_names().expect("names");
-    assert!(names.iter().any(|(_, n, _)| n == "keep"));
-    assert!(!names.iter().any(|(_, n, _)| n == "remove"));
+    let names = store.declaration_name_rows().expect("names");
+    assert!(names.iter().any(|row| row.name == "keep"));
+    assert!(!names.iter().any(|row| row.name == "remove"));
 }
 
 #[test]
-fn batch_symbols_by_ids_preserves_order_and_omits_missing() {
+fn batch_declarations_by_ids_preserves_order_and_omits_missing() {
     let dir = tempdir().expect("tempdir");
     let db = dir.path().join("index.sqlite");
     let mut store = IndexStore::open(&db, dir.path()).expect("store");
@@ -93,13 +93,13 @@ fn batch_symbols_by_ids_preserves_order_and_omits_missing() {
     upsert_source(&mut store, "b.c", "int second(void){return 2;}\n");
     upsert_source(&mut store, "c.c", "int third(void){return 3;}\n");
 
-    let all = store.load_symbol_names().expect("names");
-    let ids: Vec<i64> = all.iter().map(|(id, _, _)| *id).collect();
-    assert!(ids.len() >= 3, "expected at least 3 symbols");
+    let all = store.declaration_name_rows().expect("names");
+    let ids: Vec<i64> = all.iter().map(|row| row.id).collect();
+    assert!(ids.len() >= 3, "expected at least 3 declarations");
 
     // Query in reverse order with a non-existent id and a duplicate mixed in.
     let query_ids = vec![ids[2], 99999, ids[0], ids[2], ids[1]];
-    let records = store.symbols_by_ids(&query_ids).expect("by ids");
+    let records = store.declarations_by_ids(&query_ids).expect("by ids");
     assert_eq!(records.len(), 4, "missing id 99999 should be omitted");
     assert_eq!(records[0].id, ids[2], "order preserved: third first");
     assert_eq!(records[1].id, ids[0], "order preserved: first second");
@@ -119,7 +119,7 @@ fn wal_checkpoint_after_full_rebuild() {
 
     // No error = WAL checkpoint succeeded. Verify store is still readable.
     let reader = IndexStore::open_readonly(&db).expect("readonly");
-    assert!(!reader.load_symbol_names().expect("names").is_empty());
+    assert!(!reader.declaration_name_rows().expect("names").is_empty());
 }
 
 #[test]

@@ -6,21 +6,9 @@ use tower_lsp::lsp_types::{
 };
 
 use crate::model;
-use crate::parser::{Symbol, SymbolKind as ParserSymbolKind};
 use crate::references::{self, ReferenceHit};
-use crate::semantic_model::SemanticDeclarationKind;
+use crate::semantic_model::{DeclarationFact, SemanticDeclarationKind};
 use crate::store::views::DeclarationReadRow;
-
-fn lsp_kind_from_parser(kind: ParserSymbolKind) -> SymbolKind {
-    match kind {
-        ParserSymbolKind::Function => SymbolKind::FUNCTION,
-        ParserSymbolKind::Macro => SymbolKind::CONSTANT,
-        ParserSymbolKind::Type => SymbolKind::STRUCT,
-        ParserSymbolKind::EnumConstant => SymbolKind::ENUM_MEMBER,
-        ParserSymbolKind::GlobalVariable => SymbolKind::VARIABLE,
-        ParserSymbolKind::Field => SymbolKind::FIELD,
-    }
-}
 
 #[allow(dead_code)]
 fn lsp_completion_kind(kind: &str) -> CompletionItemKind {
@@ -141,27 +129,43 @@ pub(super) fn declaration_to_symbol_information(
 }
 
 #[allow(deprecated)]
-pub(super) fn parsed_to_document_symbol(symbol: &Symbol) -> DocumentSymbol {
-    let start = Position {
-        line: symbol.start_line as u32,
-        character: symbol.start_col as u32,
-    };
+pub(super) fn declaration_to_document_symbol(declaration: &DeclarationFact) -> DocumentSymbol {
     let range = Range {
-        start,
+        start: Position {
+            line: declaration.declaration_range.start.line,
+            character: declaration.declaration_range.start.character,
+        },
         end: Position {
-            line: symbol.end_line as u32,
-            character: symbol.end_col as u32,
+            line: declaration.declaration_range.end.line,
+            character: declaration.declaration_range.end.character,
+        },
+    };
+    let selection_range = Range {
+        start: Position {
+            line: declaration.name_range.start.line,
+            character: declaration.name_range.start.character,
+        },
+        end: Position {
+            line: declaration.name_range.end.line,
+            character: declaration.name_range.end.character,
         },
     };
     DocumentSymbol {
-        name: symbol.name.clone(),
-        detail: Some(symbol.signature.clone()),
-        kind: lsp_kind_from_parser(symbol.kind),
+        name: declaration.name.clone(),
+        detail: declaration.canonical_signature.clone(),
+        kind: match declaration.declaration_kind {
+            SemanticDeclarationKind::Function | SemanticDeclarationKind::Method => {
+                SymbolKind::FUNCTION
+            }
+            SemanticDeclarationKind::Object => SymbolKind::VARIABLE,
+            SemanticDeclarationKind::Type | SemanticDeclarationKind::Alias => SymbolKind::STRUCT,
+            SemanticDeclarationKind::EnumConstant => SymbolKind::ENUM_MEMBER,
+            SemanticDeclarationKind::Macro => SymbolKind::CONSTANT,
+        },
         tags: None,
         deprecated: None,
         range,
-        // selection_range must be contained within range.
-        selection_range: Range { start, end: start },
+        selection_range,
         children: None,
     }
 }

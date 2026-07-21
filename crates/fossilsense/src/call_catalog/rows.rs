@@ -87,7 +87,6 @@ fn parse_owner_kind(value: Option<&str>) -> Option<OwnerKindHint> {
 fn parse_provenance(value: &str) -> FactProvenance {
     match value {
         "synthetic" => FactProvenance::Synthetic,
-        "lexical_fallback" => FactProvenance::LexicalFallback,
         _ => FactProvenance::Ast,
     }
 }

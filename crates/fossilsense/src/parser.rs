@@ -4,8 +4,30 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-use crate::config::normalized_extension;
-use crate::semantic_model::{DeclarationFact, SemanticDeclarationRole};
+use crate::config::SourceLanguage;
+use crate::semantic_model::{
+    DeclarationFact, FallbackCompletionFact, ParseOutcome, SemanticDeclarationRole,
+};
+
+/// Parser-private staging record used while converting AST nodes or hard-
+/// failure lexical hints into their final typed fact models. It is never
+/// exposed to storage or semantic consumers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RawDeclaration {
+    name: String,
+    kind: SymbolKind,
+    role: SymbolRole,
+    start_byte: usize,
+    end_byte: usize,
+    start_line: usize,
+    start_col: usize,
+    end_line: usize,
+    end_col: usize,
+    signature: String,
+    guard: Option<String>,
+    container: Option<String>,
+    incomplete: bool,
+}
 
 mod ast;
 mod callables;
@@ -16,20 +38,19 @@ use ast::collect_ast_index;
 pub use ast::infer_receiver_record;
 #[cfg(test)]
 use lexical::compact_whitespace;
-use lexical::extract_symbols_and_includes;
+use lexical::{extract_fallback_completions, scan_includes};
 
 bitflags::bitflags! {
-    /// Which AST facts to collect during `parse`. The lexical pass
-    /// (symbols + includes) is always run regardless of this mask.
+    /// Which facts to collect during `parse`. Include scanning always runs;
+    /// lexical completion extraction runs only after a hard AST failure.
     ///
     /// Each bit controls a distinct collection branch inside the post-parse
     /// AST DFS. Skipping a branch returns an empty vector for that field
     /// in `FileSemanticIndex`, keeping the data structure stable.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub struct ParseFacts: u8 {
-        /// Symbols from the lexical pass are always produced; this bit
-        /// controls whether AST-derived enum constants are also merged in.
-        const SYMBOLS       = 1 << 0;
+        /// Canonical AST declaration facts.
+        const DECLARATIONS  = 1 << 0;
         /// Include lines (lexical pass, always collected).
         const INCLUDES      = 1 << 1;
         /// Identifier occurrences with syntactic roles (AST DFS).
@@ -46,33 +67,33 @@ bitflags::bitflags! {
         const CALL_RELATIONS = 1 << 7;
 
         /// Indexing: everything except request-time facts.
-        const INDEX         = Self::SYMBOLS.bits()
+        const INDEX         = Self::DECLARATIONS.bits()
                             | Self::INCLUDES.bits()
                             | Self::RECORDS.bits()
                             | Self::FIELDS.bits()
                             | Self::ALIASES.bits()
                             | Self::CALL_RELATIONS.bits();
 
-        /// Coloring / references: occurrences + symbols + includes.
-        const COLOR_REF     = Self::SYMBOLS.bits()
+        /// Coloring / references: occurrences + canonical declarations + includes.
+        const COLOR_REF     = Self::DECLARATIONS.bits()
                             | Self::INCLUDES.bits()
                             | Self::OCCURRENCES.bits();
 
         /// Member completion: needs local declarations, receiver inference,
         /// and record/field/alias resolution.
-        const MEMBER        = Self::SYMBOLS.bits()
+        const MEMBER        = Self::DECLARATIONS.bits()
                             | Self::INCLUDES.bits()
                             | Self::LOCAL_DECLS.bits()
                             | Self::RECORDS.bits()
                             | Self::FIELDS.bits()
                             | Self::ALIASES.bits();
 
-        /// Ordinary identifier completion: lexical symbols, canonical aliases
-        /// and callables, plus local/parameter bindings. Canonical declaration
+        /// Ordinary identifier completion: canonical declarations plus local
+        /// and parameter bindings. Canonical declaration
         /// facts let the list attach an overlay identity directly without a
         /// post-recall semantic hydration query; a later resolve parse produces
         /// the same locator for functions and methods.
-        const COMPLETION    = Self::SYMBOLS.bits()
+        const COMPLETION    = Self::DECLARATIONS.bits()
                             | Self::INCLUDES.bits()
                             | Self::LOCAL_DECLS.bits()
                             | Self::ALIASES.bits()
@@ -84,7 +105,7 @@ bitflags::bitflags! {
 
         /// Hover/type semantics: the durable type and callable facts needed to
         /// build a live-document overlay. Occurrences remain a separate opt-in.
-        const HOVER_SEMANTICS = Self::SYMBOLS.bits()
+        const HOVER_SEMANTICS = Self::DECLARATIONS.bits()
                                | Self::INCLUDES.bits()
                                | Self::RECORDS.bits()
                                | Self::FIELDS.bits()
@@ -96,17 +117,16 @@ bitflags::bitflags! {
     }
 }
 
-/// The single best-effort parse product for one file. Produced by `parse` in one
-/// tree-sitter parse and one AST DFS plus one lexical pass, and consumed by the
-/// indexer, semantic coloring, reference role classification, and member-
-/// completion receiver inference. Symbols/includes are lexical; occurrences,
-/// records, fields, aliases, and local declarations are AST-derived (empty on the
-/// lexical-fallback path — see `ParseDiagnostics`).
+/// The single best-effort parse product for one file. One lightweight include
+/// scan always runs; every semantic fact is derived by one tree-sitter parse
+/// and AST DFS. Only a hard AST failure populates `fallback_completions`, while
+/// leaving every semantic vector empty.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileSemanticIndex {
-    pub symbols: Vec<Symbol>,
     pub includes: Vec<Include>,
     pub declarations: Vec<DeclarationFact>,
+    pub fallback_completions: Vec<FallbackCompletionFact>,
+    pub parse_outcome: ParseOutcome,
     /// Identifier occurrences with syntactic roles (AST-derived). Empty on the
     /// lexical-fallback path. Request-time data: the indexer does not persist it.
     pub occurrences: Vec<Occurrence>,
@@ -145,7 +165,8 @@ pub struct RequestFacts<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[allow(dead_code)]
 pub enum FactGroup {
-    Symbols,
+    Declarations,
+    FallbackCompletions,
     Includes,
     Occurrences,
     Records,
@@ -179,9 +200,9 @@ pub enum FactAvailability {
     Unavailable(FactUnavailableReason),
 }
 
-/// Where a group of facts in a `FileSemanticIndex` came from. R5 keeps symbol
-/// extraction lexical and only labels provenance; it does not move top-level
-/// symbols onto the AST.
+/// Where a group of facts in a `FileSemanticIndex` came from. Semantic facts
+/// are AST-derived; lexical extraction is reserved for include scanning and an
+/// isolated completion-only hard-failure path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FactSource {
     /// Produced from the tree-sitter AST.
@@ -200,8 +221,8 @@ pub struct ParseDiagnostics {
     /// True only when tree-sitter could not produce a usable tree, so the AST
     /// fact vectors are empty by fallback rather than genuinely empty.
     pub fallback_used: bool,
-    /// Provenance of `symbols`/`includes` (always `Lexical`).
-    pub symbols_source: FactSource,
+    /// Provenance of include and fallback-completion scanning (always lexical).
+    pub lexical_source: FactSource,
     /// Provenance of the AST fact groups: `Ast` on a usable tree, otherwise
     /// `LexicalFallback`.
     pub ast_source: FactSource,
@@ -241,10 +262,8 @@ pub struct LocalBinding {
     pub scope_end_byte: usize,
 }
 
-/// Coloring's macro/type/enum definition name sets, projected from an already
-/// parsed `FileSemanticIndex` (no extra parse). Macro/type names come from the
-/// lexical symbols; enum-constant names come from the AST enum facts that were
-/// merged into `symbols`.
+/// Coloring's macro/type/enum definition name sets, projected only from the
+/// canonical AST declarations in an already parsed `FileSemanticIndex`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ColoringDefs {
     pub macro_defs: HashSet<String>,
@@ -279,9 +298,10 @@ impl FileSemanticIndex {
     #[allow(dead_code)]
     pub fn persistent_facts(&self) -> PersistentFacts<'_> {
         PersistentFacts {
-            symbols: &self.symbols,
+            parse_outcome: self.parse_outcome,
             includes: &self.includes,
             declarations: &self.declarations,
+            fallback_completions: &self.fallback_completions,
             records: &self.records,
             fields: &self.fields,
             members: &self.members,
@@ -310,21 +330,24 @@ impl FileSemanticIndex {
         self.diagnostics.fact_availability(group)
     }
 
-    /// Project the coloring definition-name sets from this index's symbols. This
-    /// reuses the already-extracted symbols (no re-parse): definition-role macros
-    /// and types from the lexical pass, plus enum constants from the AST pass.
+    /// Project coloring definition names from canonical AST declarations.
     pub fn coloring_defs(&self) -> ColoringDefs {
         let mut defs = ColoringDefs::default();
-        for symbol in &self.symbols {
-            match symbol.kind {
-                SymbolKind::Macro if symbol.role == SymbolRole::Definition => {
-                    defs.macro_defs.insert(symbol.name.clone());
+        for declaration in &self.declarations {
+            match declaration.declaration_kind {
+                crate::semantic_model::SemanticDeclarationKind::Macro
+                    if declaration.role == SemanticDeclarationRole::Definition =>
+                {
+                    defs.macro_defs.insert(declaration.name.clone());
                 }
-                SymbolKind::Type if symbol.role == SymbolRole::Definition => {
-                    defs.type_defs.insert(symbol.name.clone());
+                crate::semantic_model::SemanticDeclarationKind::Type
+                | crate::semantic_model::SemanticDeclarationKind::Alias
+                    if declaration.role == SemanticDeclarationRole::Definition =>
+                {
+                    defs.type_defs.insert(declaration.name.clone());
                 }
-                SymbolKind::EnumConstant => {
-                    defs.enum_defs.insert(symbol.name.clone());
+                crate::semantic_model::SemanticDeclarationKind::EnumConstant => {
+                    defs.enum_defs.insert(declaration.name.clone());
                 }
                 _ => {}
             }
@@ -339,8 +362,16 @@ impl ParseDiagnostics {
     /// existing vectors or tolerant parse behavior.
     #[allow(dead_code)]
     pub fn fact_availability(&self, group: FactGroup) -> FactAvailability {
-        if matches!(group, FactGroup::Symbols | FactGroup::Includes) {
+        if matches!(group, FactGroup::Includes) {
             return FactAvailability::Available;
+        }
+
+        if group == FactGroup::FallbackCompletions {
+            return if self.fallback_used {
+                FactAvailability::Available
+            } else {
+                FactAvailability::NotRequested
+            };
         }
 
         if !self.group_requested(group) {
@@ -359,7 +390,9 @@ impl ParseDiagnostics {
     #[allow(dead_code)]
     pub fn group_requested(&self, group: FactGroup) -> bool {
         match group {
-            FactGroup::Symbols | FactGroup::Includes => true,
+            FactGroup::Includes => true,
+            FactGroup::Declarations => self.requested_facts.contains(ParseFacts::DECLARATIONS),
+            FactGroup::FallbackCompletions => self.fallback_used,
             FactGroup::Occurrences => self.requested_facts.contains(ParseFacts::OCCURRENCES),
             FactGroup::Records => self
                 .requested_facts
@@ -371,17 +404,16 @@ impl ParseDiagnostics {
             FactGroup::LocalDeclarations | FactGroup::LocalBindings => {
                 self.requested_facts.contains(ParseFacts::LOCAL_DECLS)
             }
-            FactGroup::CallableAnchors | FactGroup::CallSites => {
-                self.requested_facts.contains(ParseFacts::CALL_RELATIONS)
-            }
+            FactGroup::CallableAnchors => self.requested_facts.contains(ParseFacts::CALL_RELATIONS),
+            FactGroup::CallSites => self.requested_facts.contains(ParseFacts::CALL_RELATIONS),
         }
     }
 }
 
 pub use crate::semantic_model::{
-    kind_from_str, AliasTarget, AliasTargetFidelity, DeclaratorShape, FieldDef, Include,
-    MemberConfidence, MemberDef, MemberKind, Occurrence, RecordConfidence, RecordDef, RecordKind,
-    RecordRangeFidelity, Symbol, SymbolKind, SymbolRole, SyntacticRole, TypeAlias,
+    AliasTarget, AliasTargetFidelity, DeclaratorShape, FieldDef, Include, MemberConfidence,
+    MemberDef, MemberKind, Occurrence, RecordConfidence, RecordDef, RecordKind,
+    RecordRangeFidelity, SymbolKind, SymbolRole, SyntacticRole, TypeAlias,
 };
 
 #[allow(dead_code)]
@@ -390,11 +422,10 @@ pub const PARSER_FACT_VERSION: i64 = crate::semantic_model::PARSER_FACT_VERSION;
 /// A typedef alias mapping a new name to an underlying record tag, e.g.
 /// `typedef struct Foo FooT;` records `FooT -> Foo`. Lets member completion
 /// resolve a receiver typed with the alias back to the tag that owns the fields.
-/// Parse `source` into the single `FileSemanticIndex` product: lexical symbols
-/// and includes, plus the AST-derived occurrences, records, fields, aliases, enum
-/// constants, and record-typed local declarations — one tree-sitter parse and one
-/// AST DFS. The indexer, coloring, reference classification, and member-completion
-/// receiver inference all consume this one product.
+/// Parse `source` into the single `FileSemanticIndex` product: lexical includes
+/// plus AST-derived declarations, occurrences, records, fields, aliases, enum
+/// constants, and record-typed local declarations — one tree-sitter parse and
+/// one AST DFS. A hard AST failure returns only isolated fallback completions.
 ///
 /// Reusable tree-sitter `Parser` wrapper for the index-worker file-parse loop.
 ///
@@ -474,8 +505,23 @@ impl ParserHandle {
 /// Convenience wrapper that creates a temporary [`ParserHandle`]. For bulk
 /// parsing (e.g. the indexer's file-parse loop), use [`parse_with_handle`]
 /// to reuse a handle across files.
+#[cfg(test)]
 pub fn parse(path: &Path, source: &str) -> FileSemanticIndex {
-    parse_with_handle(path, source, None, ParseFacts::ALL)
+    parse_with_language(
+        path,
+        source,
+        SourceLanguage::default_for_path(path),
+        ParseFacts::ALL,
+    )
+}
+
+pub fn parse_with_language(
+    path: &Path,
+    source: &str,
+    language: SourceLanguage,
+    facts: ParseFacts,
+) -> FileSemanticIndex {
+    parse_with_handle_and_language(path, source, language, None, facts)
 }
 
 /// Parse `source` with an optional shared [`ParserHandle`].
@@ -486,27 +532,43 @@ pub fn parse(path: &Path, source: &str) -> FileSemanticIndex {
 ///
 /// `facts` controls which AST facts are collected during the DFS pass.
 /// Skipped facts produce empty vectors in the returned `FileSemanticIndex`.
+#[cfg(test)]
 pub fn parse_with_handle(
     path: &Path,
     source: &str,
     handle: Option<&ParserHandle>,
     facts: ParseFacts,
 ) -> FileSemanticIndex {
-    parse_with_handle_control(path, source, handle, facts, None)
+    parse_with_handle_and_language(
+        path,
+        source,
+        SourceLanguage::default_for_path(path),
+        handle,
+        facts,
+    )
+}
+
+pub fn parse_with_handle_and_language(
+    path: &Path,
+    source: &str,
+    language: SourceLanguage,
+    handle: Option<&ParserHandle>,
+    facts: ParseFacts,
+) -> FileSemanticIndex {
+    parse_with_handle_control(path, source, language, handle, facts, None)
+        .expect("non-cancelled parse always produces a parse product")
 }
 
 fn parse_with_handle_control(
     path: &Path,
     source: &str,
+    language: SourceLanguage,
     handle: Option<&ParserHandle>,
     facts: ParseFacts,
     cancel: Option<&AtomicBool>,
-) -> FileSemanticIndex {
+) -> Option<FileSemanticIndex> {
     let line_starts = line_starts(source);
-    let is_cpp = is_cpp_path(path);
-    let (symbols, includes) = extract_symbols_and_includes(source, &line_starts, is_cpp);
-
-    let language = language_for_path(path);
+    let includes = scan_includes(source);
 
     // Use the provided handle, or create a temporary one.
     let owned_handle;
@@ -519,40 +581,74 @@ fn parse_with_handle_control(
     };
 
     let parsed_tree = match cancel {
-        Some(cancel) => active_handle.parse_with_language_cancel(language, source, cancel),
-        None => active_handle.parse_with_language(language, source, None),
+        Some(cancel) => active_handle.parse_with_language_cancel(
+            language.tree_sitter_language(),
+            source,
+            cancel,
+        ),
+        None => active_handle.parse_with_language(language.tree_sitter_language(), source, None),
     };
     let tree = match parsed_tree {
         Ok(Some(tree)) => tree,
-        Ok(None) | Err(()) => return lexical_fallback_with_path(path, symbols, includes, facts),
+        Ok(None) if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) => return None,
+        Ok(None) | Err(()) => return Some(lexical_fallback(source, includes, facts, language)),
     };
 
-    let ast = collect_ast_index(tree.root_node(), path, source, &line_starts, facts);
+    if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        return None;
+    }
+    if ast_is_hard_failure(tree.root_node(), source) {
+        return Some(lexical_fallback(source, includes, facts, language));
+    }
 
-    // A usable syntax tree is authoritative for type definitions. The lexical
-    // pass remains the fallback source when tree-sitter cannot produce a tree,
-    // but its broad tag regex must not compete with exact AST name nodes.
-    let mut symbols: Vec<_> = symbols
-        .into_iter()
-        .filter(|symbol| symbol.kind != SymbolKind::Type)
-        .collect();
-    symbols.reserve(ast.type_symbols.len() + ast.enum_constants.len());
-    symbols.extend(ast.type_symbols);
-    symbols.extend(ast.enum_constants);
-    let declarations = declarations::canonical_declarations(
+    let mut ast = collect_ast_index(
+        tree.root_node(),
         path,
-        &symbols,
-        &ast.records,
-        &ast.aliases,
-        &ast.callable_anchors,
-        ast.declarations,
-        false,
+        source,
+        &line_starts,
+        facts,
+        language,
     );
+    let declarations = if facts.contains(ParseFacts::DECLARATIONS) {
+        declarations::canonical_declarations(
+            path,
+            language,
+            declarations::CanonicalDeclarationInputs {
+                source,
+                type_symbols: &ast.type_symbols,
+                enum_constants: &ast.enum_constants,
+                records: &ast.records,
+                aliases: &ast.aliases,
+                anchors: &ast.callable_anchors,
+                declarations: ast.declarations,
+            },
+        )
+    } else {
+        Vec::new()
+    };
+    // Canonical declarations use records, aliases, and callable anchors as
+    // private staging evidence. Do not leak those supporting collections into
+    // request products unless their own fact groups were requested.
+    if !facts.intersects(ParseFacts::RECORDS | ParseFacts::FIELDS) {
+        ast.records.clear();
+    }
+    if !facts.contains(ParseFacts::ALIASES) {
+        ast.aliases.clear();
+    }
+    if !facts.contains(ParseFacts::CALL_RELATIONS) {
+        ast.callable_anchors.clear();
+    }
+    let parse_outcome = if ast.parse_error_count == 0 {
+        ParseOutcome::Ast
+    } else {
+        ParseOutcome::PartialAst
+    };
 
-    FileSemanticIndex {
-        symbols,
+    Some(FileSemanticIndex {
         includes,
         declarations,
+        fallback_completions: Vec::new(),
+        parse_outcome,
         occurrences: ast.occurrences,
         records: ast.records,
         fields: ast.fields,
@@ -565,11 +661,11 @@ fn parse_with_handle_control(
         diagnostics: ParseDiagnostics {
             parse_error_count: ast.parse_error_count,
             fallback_used: false,
-            symbols_source: FactSource::Lexical,
+            lexical_source: FactSource::Lexical,
             ast_source: FactSource::Ast,
             requested_facts: facts,
         },
-    }
+    })
 }
 
 thread_local! {
@@ -587,58 +683,42 @@ thread_local! {
 /// Intended for the indexer's Rayon-parallel file-parse loop. Each Rayon worker
 /// thread lazily creates its own `ParserHandle` on first call, then reuses it
 /// for all subsequent files parsed on that thread.
-pub fn parse_thread_local_with_facts(
+pub fn parse_thread_local_with_language(
     path: &Path,
     source: &str,
+    language: SourceLanguage,
     facts: ParseFacts,
 ) -> FileSemanticIndex {
     TL_PARSER_HANDLE.with(|cell| {
         let handle = cell.borrow();
-        parse_with_handle(path, source, Some(&*handle), facts)
+        parse_with_handle_and_language(path, source, language, Some(&*handle), facts)
     })
 }
 
-pub fn parse_thread_local_with_facts_cancel(
+pub fn parse_thread_local_with_language_cancel(
     path: &Path,
     source: &str,
+    language: SourceLanguage,
     facts: ParseFacts,
     cancel: &AtomicBool,
-) -> FileSemanticIndex {
+) -> Option<FileSemanticIndex> {
     TL_PARSER_HANDLE.with(|cell| {
         let handle = cell.borrow();
-        parse_with_handle_control(path, source, Some(&*handle), facts, Some(cancel))
+        parse_with_handle_control(path, source, language, Some(&*handle), facts, Some(cancel))
     })
 }
 
-/// Product when tree-sitter cannot produce a usable tree: lexical symbols and
-/// includes only, all AST fact vectors empty, `fallback_used = true` so a
-/// consumer or test can tell AST facts are absent by fallback rather than
-/// genuinely empty.
-#[allow(dead_code)]
-fn lexical_fallback(symbols: Vec<Symbol>, includes: Vec<Include>) -> FileSemanticIndex {
-    lexical_fallback_with_facts(symbols, includes, ParseFacts::ALL)
-}
-
-fn lexical_fallback_with_facts(
-    symbols: Vec<Symbol>,
+fn lexical_fallback(
+    source: &str,
     includes: Vec<Include>,
     facts: ParseFacts,
+    language: SourceLanguage,
 ) -> FileSemanticIndex {
-    lexical_fallback_with_path(Path::new(""), symbols, includes, facts)
-}
-
-fn lexical_fallback_with_path(
-    path: &Path,
-    symbols: Vec<Symbol>,
-    includes: Vec<Include>,
-    facts: ParseFacts,
-) -> FileSemanticIndex {
-    let declarations =
-        declarations::canonical_declarations(path, &symbols, &[], &[], &[], Vec::new(), true);
     FileSemanticIndex {
-        symbols,
         includes,
-        declarations,
+        declarations: Vec::new(),
+        fallback_completions: extract_fallback_completions(source, language),
+        parse_outcome: ParseOutcome::LexicalFallback,
         occurrences: Vec::new(),
         records: Vec::new(),
         fields: Vec::new(),
@@ -651,27 +731,44 @@ fn lexical_fallback_with_path(
         diagnostics: ParseDiagnostics {
             parse_error_count: 0,
             fallback_used: true,
-            symbols_source: FactSource::Lexical,
+            lexical_source: FactSource::Lexical,
             ast_source: FactSource::LexicalFallback,
             requested_facts: facts,
         },
     }
 }
 
-fn language_for_path(path: &Path) -> tree_sitter::Language {
-    if is_cpp_path(path) {
-        tree_sitter_cpp::LANGUAGE.into()
-    } else {
-        tree_sitter_c::LANGUAGE.into()
+fn ast_is_hard_failure(root: tree_sitter::Node<'_>, source: &str) -> bool {
+    if source.trim().is_empty() {
+        return false;
     }
+    let mut cursor = root.walk();
+    let mut has_error_or_missing = false;
+    let mut has_usable_structure = false;
+    for node in root.named_children(&mut cursor) {
+        if node.is_error() || node.is_missing() {
+            has_error_or_missing = true;
+        } else if ast_node_has_usable_structure(node) {
+            // Comments prove that the input is lexically readable, but they do
+            // not make an otherwise wholly broken translation unit useful to
+            // the AST fact collectors.  A comments-only file is still a clean
+            // AST product because `has_error_or_missing` remains false.
+            has_usable_structure = true;
+        }
+    }
+    has_error_or_missing && !has_usable_structure
 }
 
-fn is_cpp_path(path: &Path) -> bool {
-    normalized_extension(path).is_some_and(|ext| {
-        ["cpp", "hpp", "cc", "hh", "cxx", "hxx", "inl"]
-            .iter()
-            .any(|candidate| ext.eq_ignore_ascii_case(candidate))
-    })
+fn ast_node_has_usable_structure(node: tree_sitter::Node<'_>) -> bool {
+    match node.kind() {
+        "comment" | "empty_statement" => false,
+        "expression_statement" => {
+            let mut cursor = node.walk();
+            let has_expression = node.named_children(&mut cursor).next().is_some();
+            has_expression
+        }
+        _ => true,
+    }
 }
 
 fn line_starts(source: &str) -> Vec<usize> {

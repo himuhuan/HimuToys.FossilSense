@@ -3,8 +3,9 @@ use std::path::Path;
 use super::{
     infer_receiver_record, parse, parse_with_handle, FactAvailability, FactGroup,
     FactUnavailableReason, FileSemanticIndex, MemberConfidence, MemberKind, Occurrence, ParseFacts,
-    ParserHandle, SymbolKind, SymbolRole, SyntacticRole,
+    ParserHandle, SymbolKind, SyntacticRole,
 };
+use crate::semantic_model::{SemanticDeclarationKind, SemanticDeclarationRole};
 
 /// Role of the (single) occurrence of `name` in a parsed buffer.
 fn role_of(path: &str, source: &str, name: &str) -> Option<SyntacticRole> {
@@ -74,9 +75,10 @@ fn role_marks_increment_target_as_write() {
 
 #[test]
 fn role_in_error_region_falls_back_to_read() {
-    // A top-level expression is invalid C, so this lands in an error region;
-    // `stray` must still be emitted as an occurrence, with role Read.
-    let src = "1 + stray;\n";
+    // The declaration keeps this a usable partial AST while the following
+    // invalid top-level expression lands in an error region. `stray` must
+    // still be emitted as an occurrence, with role Read.
+    let src = "int stable;\n1 + stray;\n";
     let index = parse(Path::new("a.c"), src);
     let occ = index
         .occurrences
@@ -247,10 +249,13 @@ fn extracts_multiline_typedef_struct_type_symbol() {
         "typedef struct {\n    int x;\n    int y;\n} Boom;\n",
     );
 
-    assert!(index.symbols.iter().any(|symbol| {
+    assert!(index.declarations.iter().any(|symbol| {
         symbol.name == "Boom"
-            && symbol.kind == SymbolKind::Type
-            && symbol.role == SymbolRole::Definition
+            && matches!(
+                symbol.declaration_kind,
+                SemanticDeclarationKind::Type | SemanticDeclarationKind::Alias
+            )
+            && symbol.role == SemanticDeclarationRole::Definition
     }));
     assert_eq!(field_containers(&index, "x"), vec!["Boom".to_string()]);
 }
@@ -262,10 +267,13 @@ fn extracts_multiline_typedef_struct_when_member_comments_contain_braces() {
         "typedef struct {\n    int x; // comment with }\n    const char *text; /* comment with { */\n} Boom;\n",
     );
 
-    assert!(index.symbols.iter().any(|symbol| {
+    assert!(index.declarations.iter().any(|symbol| {
         symbol.name == "Boom"
-            && symbol.kind == SymbolKind::Type
-            && symbol.role == SymbolRole::Definition
+            && matches!(
+                symbol.declaration_kind,
+                SemanticDeclarationKind::Type | SemanticDeclarationKind::Alias
+            )
+            && symbol.role == SemanticDeclarationRole::Definition
     }));
     assert_eq!(field_containers(&index, "x"), vec!["Boom".to_string()]);
     assert_eq!(field_containers(&index, "text"), vec!["Boom".to_string()]);
@@ -281,11 +289,16 @@ fn trailing_comments_cannot_create_type_symbols() {
 "#;
     let index = parse(Path::new("checkpoint.h"), source);
     let mut types: Vec<_> = index
-        .symbols
+        .declarations
         .iter()
-        .filter(|symbol| symbol.kind == SymbolKind::Type)
+        .filter(|symbol| {
+            matches!(
+                symbol.declaration_kind,
+                SemanticDeclarationKind::Type | SemanticDeclarationKind::Alias
+            )
+        })
         .collect();
-    types.sort_by_key(|symbol| symbol.start_byte);
+    types.sort_by_key(|symbol| symbol.name_range.start_byte);
 
     assert_eq!(
         types
@@ -295,12 +308,28 @@ fn trailing_comments_cannot_create_type_symbols() {
         vec!["AVTextWriter", "AVTextWriter"]
     );
     assert!(types.iter().all(|symbol| {
-        source.get(symbol.start_byte..symbol.end_byte) == Some(symbol.name.as_str())
+        source.get(symbol.name_range.start_byte..symbol.name_range.end_byte)
+            == Some(symbol.name.as_str())
     }));
-    assert_eq!((types[0].start_line, types[0].start_col), (0, 15));
-    assert_eq!((types[1].start_line, types[1].start_col), (4, 2));
-    assert!(!index.symbols.iter().any(|symbol| symbol.name == "const"));
-    assert!(!index.symbols.iter().any(|symbol| symbol.name == "of"));
+    assert_eq!(
+        (
+            types[0].name_range.start.line,
+            types[0].name_range.start.character
+        ),
+        (0, 15)
+    );
+    assert_eq!(
+        (
+            types[1].name_range.start.line,
+            types[1].name_range.start.character
+        ),
+        (4, 2)
+    );
+    assert!(!index
+        .declarations
+        .iter()
+        .any(|symbol| symbol.name == "const"));
+    assert!(!index.declarations.iter().any(|symbol| symbol.name == "of"));
 }
 
 #[test]
@@ -308,14 +337,17 @@ fn builtin_like_typedef_remains_a_navigable_ast_symbol() {
     let source = "typedef unsigned long size_t;\n";
     let index = parse(Path::new("stddef.h"), source);
     let symbol = index
-        .symbols
+        .declarations
         .iter()
         .find(|symbol| symbol.name == "size_t")
         .expect("size_t typedef symbol");
 
-    assert_eq!(symbol.kind, SymbolKind::Type);
+    assert!(matches!(
+        symbol.declaration_kind,
+        SemanticDeclarationKind::Type | SemanticDeclarationKind::Alias
+    ));
     assert_eq!(
-        source.get(symbol.start_byte..symbol.end_byte),
+        source.get(symbol.name_range.start_byte..symbol.name_range.end_byte),
         Some("size_t")
     );
 }
@@ -343,25 +375,38 @@ typedef struct xxxa {
     let index = parse(Path::new("macro_typedef.c"), source);
 
     let xxx_t = index
-        .symbols
+        .declarations
         .iter()
         .find(|symbol| {
             symbol.name == "xxx_t"
-                && symbol.kind == SymbolKind::Type
-                && symbol.role == SymbolRole::Definition
+                && matches!(
+                    symbol.declaration_kind,
+                    SemanticDeclarationKind::Type | SemanticDeclarationKind::Alias
+                )
+                && symbol.role == SemanticDeclarationRole::Definition
         })
         .expect("first typedef after multiline macro should be a type definition");
     assert!(
-        xxx_t.signature.starts_with("typedef struct xxx"),
+        xxx_t
+            .canonical_signature
+            .as_deref()
+            .is_some_and(|signature| signature.starts_with("typedef struct xxx")),
         "typedef signature should not include the macro body: {:?}",
-        xxx_t.signature
+        xxx_t.canonical_signature
     );
-    assert!(!xxx_t.signature.contains("while (0)"));
+    assert!(!xxx_t
+        .canonical_signature
+        .as_deref()
+        .unwrap_or_default()
+        .contains("while (0)"));
 
-    assert!(index.symbols.iter().any(|symbol| {
+    assert!(index.declarations.iter().any(|symbol| {
         symbol.name == "xxxa_t"
-            && symbol.kind == SymbolKind::Type
-            && symbol.role == SymbolRole::Definition
+            && matches!(
+                symbol.declaration_kind,
+                SemanticDeclarationKind::Type | SemanticDeclarationKind::Alias
+            )
+            && symbol.role == SemanticDeclarationRole::Definition
     }));
     assert_eq!(field_containers(&index, "value"), vec!["xxx_t".to_string()]);
     assert_eq!(
@@ -375,10 +420,13 @@ fn multiline_macro_with_trailing_space_after_backslash_does_not_swallow_typedef(
     let source = "#define WRAP(value) \\   \n    do { (value); } while (0)\n\ntypedef struct after_macro {\n    int field;\n} after_macro_t;\n";
     let index = parse(Path::new("macro_spacing.h"), source);
 
-    assert!(index.symbols.iter().any(|symbol| {
+    assert!(index.declarations.iter().any(|symbol| {
         symbol.name == "after_macro_t"
-            && symbol.kind == SymbolKind::Type
-            && symbol.role == SymbolRole::Definition
+            && matches!(
+                symbol.declaration_kind,
+                SemanticDeclarationKind::Type | SemanticDeclarationKind::Alias
+            )
+            && symbol.role == SemanticDeclarationRole::Definition
     }));
     assert_eq!(
         field_containers(&index, "field"),
@@ -398,10 +446,13 @@ fn preprocessor_directives_inside_typedef_struct_body_keep_typedef_statement() {
 "#;
     let index = parse(Path::new("guarded_typedef.h"), source);
 
-    assert!(index.symbols.iter().any(|symbol| {
+    assert!(index.declarations.iter().any(|symbol| {
         symbol.name == "guarded_t"
-            && symbol.kind == SymbolKind::Type
-            && symbol.role == SymbolRole::Definition
+            && matches!(
+                symbol.declaration_kind,
+                SemanticDeclarationKind::Type | SemanticDeclarationKind::Alias
+            )
+            && symbol.role == SemanticDeclarationRole::Definition
     }));
     assert_eq!(
         field_containers(&index, "enabled"),
@@ -424,10 +475,13 @@ fn multiline_macro_inside_typedef_struct_body_does_not_reset_pending_typedef() {
 "#;
     let index = parse(Path::new("macro_in_record.h"), source);
 
-    assert!(index.symbols.iter().any(|symbol| {
+    assert!(index.declarations.iter().any(|symbol| {
         symbol.name == "context_t"
-            && symbol.kind == SymbolKind::Type
-            && symbol.role == SymbolRole::Definition
+            && matches!(
+                symbol.declaration_kind,
+                SemanticDeclarationKind::Type | SemanticDeclarationKind::Alias
+            )
+            && symbol.role == SemanticDeclarationRole::Definition
     }));
     assert_eq!(
         field_containers(&index, "explicit_field"),
@@ -764,18 +818,15 @@ int main(void) {
         .includes
         .iter()
         .any(|include| include.target_text == "\"hello.h\""));
-    assert!(index
-        .symbols
-        .iter()
-        .any(|symbol| { symbol.name == "ANSWER" && symbol.kind == SymbolKind::Macro }));
-    assert!(index
-        .symbols
-        .iter()
-        .any(|symbol| { symbol.name == "hello_value" && symbol.role == SymbolRole::Declaration }));
-    assert!(index
-        .symbols
-        .iter()
-        .any(|symbol| { symbol.name == "main" && symbol.role == SymbolRole::Definition }));
+    assert!(index.declarations.iter().any(|symbol| {
+        symbol.name == "ANSWER" && symbol.declaration_kind == SemanticDeclarationKind::Macro
+    }));
+    assert!(index.declarations.iter().any(|symbol| {
+        symbol.name == "hello_value" && symbol.role == SemanticDeclarationRole::Declaration
+    }));
+    assert!(index.declarations.iter().any(|symbol| {
+        symbol.name == "main" && symbol.role == SemanticDeclarationRole::Definition
+    }));
 }
 
 #[test]
@@ -789,20 +840,28 @@ fn c_file_scope_objects_distinguish_declaration_tentative_and_full_definition() 
     let index = parse(Path::new("objects.c"), source);
 
     for (name, expected_role) in [
-        ("declared", SymbolRole::Declaration),
-        ("tentative", SymbolRole::TentativeDefinition),
-        ("internal_tentative", SymbolRole::TentativeDefinition),
-        ("full", SymbolRole::Definition),
-        ("extern_full", SymbolRole::Definition),
-        ("uncertain", SymbolRole::UnknownDeclarationOrDefinition),
+        ("declared", SemanticDeclarationRole::Declaration),
+        ("tentative", SemanticDeclarationRole::TentativeDefinition),
+        (
+            "internal_tentative",
+            SemanticDeclarationRole::TentativeDefinition,
+        ),
+        ("full", SemanticDeclarationRole::Definition),
+        ("extern_full", SemanticDeclarationRole::Definition),
     ] {
         let symbol = index
-            .symbols
+            .declarations
             .iter()
-            .find(|symbol| symbol.name == name && symbol.kind == SymbolKind::GlobalVariable)
+            .find(|symbol| {
+                symbol.name == name && symbol.declaration_kind == SemanticDeclarationKind::Object
+            })
             .unwrap_or_else(|| panic!("missing object symbol {name}"));
         assert_eq!(symbol.role, expected_role, "unexpected role for {name}");
     }
+    assert!(!index
+        .declarations
+        .iter()
+        .any(|fact| fact.name == "uncertain"));
 }
 
 #[test]
@@ -812,16 +871,18 @@ fn cpp_file_scope_object_without_initializer_is_a_full_definition() {
 
     let role = |name: &str| {
         index
-            .symbols
+            .declarations
             .iter()
-            .find(|symbol| symbol.name == name && symbol.kind == SymbolKind::GlobalVariable)
+            .find(|symbol| {
+                symbol.name == name && symbol.declaration_kind == SemanticDeclarationKind::Object
+            })
             .map(|symbol| symbol.role)
             .unwrap_or_else(|| panic!("missing object symbol {name}"))
     };
 
-    assert_eq!(role("declared"), SymbolRole::Declaration);
-    assert_eq!(role("full"), SymbolRole::Definition);
-    assert_eq!(role("internal_full"), SymbolRole::Definition);
+    assert_eq!(role("declared"), SemanticDeclarationRole::Declaration);
+    assert_eq!(role("full"), SemanticDeclarationRole::Definition);
+    assert_eq!(role("internal_full"), SemanticDeclarationRole::Definition);
 }
 
 #[test]
@@ -980,13 +1041,16 @@ fn leading_comments_do_not_pollute_symbol_signature_or_start_line() {
     let source = "#define VALUE 1\n/// @brief Helps the smoke test.\nvoid helper(void);\n";
     let index = parse(Path::new("defs.h"), source);
     let symbol = index
-        .symbols
+        .declarations
         .iter()
         .find(|symbol| symbol.name == "helper")
         .expect("helper symbol");
 
-    assert_eq!(symbol.start_line, 2);
-    assert_eq!(symbol.signature, "void helper(void);");
+    assert_eq!(symbol.name_range.start.line, 2);
+    assert_eq!(
+        symbol.canonical_signature.as_deref(),
+        Some("void helper(void)")
+    );
 }
 
 #[test]
@@ -1063,7 +1127,7 @@ int guarded(void);
 
     let index = parse(Path::new("guarded.h"), source);
     let symbol = index
-        .symbols
+        .declarations
         .iter()
         .find(|symbol| symbol.name == "guarded")
         .expect("guarded symbol");
@@ -1073,19 +1137,26 @@ int guarded(void);
 
 #[test]
 fn parse_reports_ast_provenance_on_clean_file() {
-    // A syntactically valid file: lexical symbols and AST facts coexist in one
-    // product, with `fallback_used = false` and AST provenance.
+    // A syntactically valid file has canonical AST declarations and no lexical
+    // completion fallback.
     let index = parse(
         Path::new("a.c"),
         "#define M 1\nstruct S { int x; };\ntypedef struct S St;\nvoid f(void) { struct S s; }\n",
     );
     let d = index.diagnostics;
     assert!(!d.fallback_used);
-    assert_eq!(d.symbols_source, super::FactSource::Lexical);
+    assert_eq!(d.lexical_source, super::FactSource::Lexical);
     assert_eq!(d.ast_source, super::FactSource::Ast);
-    // Lexical fact (macro) and AST facts (record/occurrences/alias/local decl)
-    // are all present on the single product.
-    assert!(index.symbols.iter().any(|s| s.name == "M"));
+    assert_eq!(
+        index.parse_outcome,
+        crate::semantic_model::ParseOutcome::Ast
+    );
+    assert!(index.fallback_completions.is_empty());
+    assert!(index.declarations.iter().all(|fact| {
+        fact.identity.provenance == crate::semantic_model::SemanticFactProvenance::Ast
+    }));
+    // Macro, record, alias, and local facts all come from the one AST product.
+    assert!(index.declarations.iter().any(|s| s.name == "M"));
     assert!(index.records.iter().any(|r| r.display_name == "S"));
     assert!(!index.occurrences.is_empty());
     assert!(index.aliases.iter().any(|a| a.alias == "St"));
@@ -1096,38 +1167,182 @@ fn parse_reports_ast_provenance_on_clean_file() {
 }
 
 #[test]
-fn parse_keeps_lexical_symbols_through_parse_errors() {
+fn header_and_inl_declaration_metadata_use_the_resolved_cpp_language() {
+    for path in ["api.h", "api.inl"] {
+        let index = parse(Path::new(path), "class Widget {};\nint api(int value);\n");
+        assert!(!index.declarations.is_empty(), "{path}");
+        assert!(index.declarations.iter().all(|declaration| {
+            declaration.identity.language == crate::semantic_model::SemanticLanguage::Cpp
+        }));
+    }
+
+    let overridden = super::parse_with_language(
+        Path::new("legacy.h"),
+        "int legacy_api(int value);\n",
+        crate::config::SourceLanguage::C,
+        super::ParseFacts::ALL,
+    );
+    assert!(overridden.declarations.iter().all(|declaration| {
+        declaration.identity.language == crate::semantic_model::SemanticLanguage::C
+    }));
+}
+
+#[test]
+fn cpp_using_aliases_are_canonical_ast_declarations() {
+    let source = "struct Widget {};\nusing WidgetAlias = Widget;\n";
+    let index = parse(Path::new("aliases.h"), source);
+    let declaration = index
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name == "WidgetAlias")
+        .expect("using alias declaration");
+    assert_eq!(
+        declaration.declaration_kind,
+        crate::semantic_model::SemanticDeclarationKind::Alias
+    );
+    assert_eq!(
+        declaration.identity.provenance,
+        crate::semantic_model::SemanticFactProvenance::Ast
+    );
+    assert_eq!(
+        &source[declaration.name_range.start_byte..declaration.name_range.end_byte],
+        "WidgetAlias"
+    );
+    assert!(index.aliases.iter().any(|alias| {
+        alias.alias == "WidgetAlias"
+            && alias.target
+                == crate::semantic_model::AliasTarget::UnresolvedTypeName("Widget".to_string())
+    }));
+}
+
+#[test]
+fn partial_ast_keeps_ast_declarations_without_fallback_completions() {
     // A stray token yields an error-laden but still usable tree. That is NOT
-    // the lexical-fallback path: lexical symbols are extracted, AST facts come
-    // from the error tree, and the error count is non-zero.
+    // the lexical-fallback path: declarations still come exclusively from the
+    // usable AST, and the error count is non-zero.
     let index = parse(Path::new("b.c"), "#define OK 1\n@\n");
     assert!(!index.diagnostics.fallback_used);
     assert_eq!(index.diagnostics.ast_source, super::FactSource::Ast);
     assert!(index.diagnostics.parse_error_count > 0);
-    assert!(index.symbols.iter().any(|s| s.name == "OK"));
+    assert_eq!(
+        index.parse_outcome,
+        crate::semantic_model::ParseOutcome::PartialAst
+    );
+    assert!(index.fallback_completions.is_empty());
+    assert!(index.declarations.iter().all(|fact| {
+        fact.identity.provenance == crate::semantic_model::SemanticFactProvenance::Ast
+    }));
+    assert!(index.declarations.iter().any(|s| s.name == "OK"));
 }
 
 #[test]
-fn lexical_fallback_product_has_lexical_facts_and_no_ast() {
+fn partial_ast_marks_only_the_overlapping_declaration_incomplete() {
+    let index = parse(Path::new("partial.c"), "int broken = ;\nint healthy;\n");
+    assert_eq!(
+        index.parse_outcome,
+        crate::semantic_model::ParseOutcome::PartialAst
+    );
+    assert!(index.fallback_completions.is_empty());
+    let broken = index
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name == "broken")
+        .expect("broken declaration");
+    let healthy = index
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name == "healthy")
+        .expect("healthy declaration");
+    assert_eq!(
+        broken.identity.fact_fidelity,
+        crate::semantic_model::SemanticFactFidelity::Incomplete
+    );
+    assert_eq!(
+        healthy.identity.fact_fidelity,
+        crate::semantic_model::SemanticFactFidelity::Authoritative
+    );
+}
+
+#[test]
+fn comments_do_not_mask_an_otherwise_hard_ast_failure() {
+    let index = parse(Path::new("broken.c"), "// still a valid comment\n@\n");
+    assert_eq!(
+        index.parse_outcome,
+        crate::semantic_model::ParseOutcome::LexicalFallback
+    );
+    assert!(index.declarations.is_empty());
+}
+
+#[test]
+fn comments_only_remain_a_clean_ast_product() {
+    let index = parse(Path::new("comments.c"), "// no declarations here\n");
+    assert_eq!(
+        index.parse_outcome,
+        crate::semantic_model::ParseOutcome::Ast
+    );
+    assert!(index.declarations.is_empty());
+    assert!(index.fallback_completions.is_empty());
+}
+
+#[test]
+fn wholly_invalid_translation_unit_uses_completion_only_fallback() {
+    let source = "((( guessed(value);\n";
+    let index = parse(Path::new("broken.c"), source);
+    assert_eq!(
+        index.parse_outcome,
+        crate::semantic_model::ParseOutcome::LexicalFallback
+    );
+    assert!(index.declarations.is_empty());
+    assert!(index
+        .fallback_completions
+        .iter()
+        .any(|completion| completion.name == "guessed"));
+}
+
+#[test]
+fn lexical_fallback_product_has_completion_hints_and_no_ast() {
     // The fallback product (returned when tree-sitter yields no usable tree)
-    // keeps lexical symbols/includes, empties AST facts, and is distinguishable
-    // from a clean parse by `fallback_used` / `ast_source`.
+    // keeps include facts and isolated completion hints, empties all AST facts,
+    // and is distinguishable from a clean parse by its outcome/provenance.
     let source = "#include \"x.h\"\n#define Z 9\n";
-    let ls = super::line_starts(source);
-    let (symbols, includes) = super::extract_symbols_and_includes(source, &ls, false);
-    let index = super::lexical_fallback(symbols, includes);
+    let includes = super::scan_includes(source);
+    let index = super::lexical_fallback(
+        source,
+        includes,
+        ParseFacts::ALL,
+        crate::config::SourceLanguage::C,
+    );
     assert!(index.diagnostics.fallback_used);
+    assert_eq!(
+        index.parse_outcome,
+        crate::semantic_model::ParseOutcome::LexicalFallback
+    );
     assert_eq!(
         index.diagnostics.ast_source,
         super::FactSource::LexicalFallback
     );
-    assert_eq!(index.diagnostics.symbols_source, super::FactSource::Lexical);
+    assert_eq!(index.diagnostics.lexical_source, super::FactSource::Lexical);
     assert_eq!(index.diagnostics.parse_error_count, 0);
-    assert!(index.symbols.iter().any(|s| s.name == "Z"));
+    assert!(index.fallback_completions.iter().any(|s| s.name == "Z"));
+    assert!(index.declarations.is_empty());
     assert_eq!(index.includes.len(), 1);
     assert!(index.occurrences.is_empty());
     assert!(index.records.is_empty());
     assert!(index.local_declarations.is_empty());
+}
+
+#[test]
+fn cancelled_parse_returns_none_without_synthesizing_fallback() {
+    let cancel = std::sync::atomic::AtomicBool::new(true);
+    let result = super::parse_with_handle_control(
+        Path::new("cancelled.h"),
+        "int should_not_be_cached(void);\n",
+        crate::config::SourceLanguage::Cpp,
+        None,
+        ParseFacts::ALL,
+        Some(&cancel),
+    );
+    assert!(result.is_none());
 }
 
 #[test]
@@ -1183,10 +1398,20 @@ int use(Widget *w, int count) {
 }
 
 fn has_symbol(index: &FileSemanticIndex, name: &str, kind: SymbolKind) -> bool {
-    index
-        .symbols
-        .iter()
-        .any(|symbol| symbol.name == name && symbol.kind == kind)
+    let expected = match kind {
+        SymbolKind::Function => SemanticDeclarationKind::Function,
+        SymbolKind::Macro => SemanticDeclarationKind::Macro,
+        SymbolKind::Type => SemanticDeclarationKind::Type,
+        SymbolKind::EnumConstant => SemanticDeclarationKind::EnumConstant,
+        SymbolKind::GlobalVariable => SemanticDeclarationKind::Object,
+        SymbolKind::Field => return false,
+    };
+    index.declarations.iter().any(|symbol| {
+        symbol.name == name
+            && (symbol.declaration_kind == expected
+                || (kind == SymbolKind::Type
+                    && symbol.declaration_kind == SemanticDeclarationKind::Alias))
+    })
 }
 
 #[test]
@@ -1195,7 +1420,6 @@ fn parse_fact_masks_document_current_field_contents() {
 
     let index = parse_with_handle(path, fact_mask_source(), None, ParseFacts::INDEX);
     let persistent = index.persistent_facts();
-    assert_eq!(persistent.symbols.len(), index.symbols.len());
     assert_eq!(persistent.includes.len(), index.includes.len());
     assert_eq!(persistent.declarations.len(), index.declarations.len());
     assert_eq!(persistent.records.len(), index.records.len());
@@ -1269,11 +1493,20 @@ fn parse_fact_masks_document_current_field_contents() {
     assert!(color_ref.fields.is_empty());
     assert!(color_ref.members.is_empty());
     assert!(color_ref.aliases.is_empty());
+    assert!(color_ref.callable_anchors.is_empty());
     assert!(color_ref.local_declarations.is_empty());
     assert!(color_ref.local_bindings.is_empty());
     assert_eq!(
         color_ref.fact_availability(FactGroup::Occurrences),
         FactAvailability::Available
+    );
+    assert_eq!(
+        color_ref.fact_availability(FactGroup::Aliases),
+        FactAvailability::NotRequested
+    );
+    assert_eq!(
+        color_ref.fact_availability(FactGroup::CallableAnchors),
+        FactAvailability::NotRequested
     );
     assert_eq!(
         color_ref.fact_availability(FactGroup::Records),
@@ -1698,13 +1931,15 @@ int caller(void) { return (*fp)(); }
         anchor.kind == crate::call_model::CallableKind::SyntheticGlobalInitializer
     }));
     assert!(
-        !index.declarations.iter().any(|declaration| {
-            declaration.name == "<global initialization>"
-                || declaration.identity.provenance
-                    == crate::semantic_model::SemanticFactProvenance::Synthetic
-        }),
+        !index
+            .declarations
+            .iter()
+            .any(|declaration| declaration.name == "<global initialization>"),
         "synthetic call-relation scopes are not canonical declarations"
     );
+    assert!(index.declarations.iter().all(|declaration| {
+        declaration.identity.provenance == crate::semantic_model::SemanticFactProvenance::Ast
+    }));
     assert!(index
         .call_sites
         .iter()
@@ -1946,18 +2181,16 @@ fn record_declaration_uses_exact_tag_name_range() {
 }
 
 #[test]
-fn lexical_fallback_still_emits_low_fidelity_candidate_identity() {
+fn lexical_fallback_is_completion_only_and_has_no_candidate_identity() {
     let source = "#define FALLBACK_VALUE 1\nint fallback_object;\n";
-    let line_starts = super::line_starts(source);
-    let (symbols, includes) = super::extract_symbols_and_includes(source, &line_starts, false);
-    let index = super::lexical_fallback_with_facts(symbols, includes, ParseFacts::ALL);
-    assert!(!index.declarations.is_empty());
-    assert!(index.declarations.iter().all(|declaration| {
-        declaration.identity.fact_fidelity
-            == crate::semantic_model::SemanticFactFidelity::LowFidelity
-            && declaration.identity.provenance
-                == crate::semantic_model::SemanticFactProvenance::LexicalFallback
-    }));
+    let index = super::lexical_fallback(
+        source,
+        super::scan_includes(source),
+        ParseFacts::ALL,
+        crate::config::SourceLanguage::C,
+    );
+    assert!(index.declarations.is_empty());
+    assert!(!index.fallback_completions.is_empty());
 }
 
 #[test]
@@ -1971,6 +2204,10 @@ fn call_relation_fact_mask_is_explicit() {
     );
     assert!(skipped.callable_anchors.is_empty());
     assert!(skipped.call_sites.is_empty());
+    assert_eq!(
+        skipped.fact_availability(FactGroup::CallableAnchors),
+        FactAvailability::NotRequested
+    );
     assert_eq!(
         skipped.fact_availability(FactGroup::CallSites),
         FactAvailability::NotRequested
@@ -2064,10 +2301,12 @@ fn availability_distinguishes_empty_skipped_and_fallback_ast_vectors() {
     );
 
     let fallback_source = "#include \"x.h\"\n#define ONLY_LEXICAL 1\n";
-    let line_starts = super::line_starts(fallback_source);
-    let (symbols, includes) =
-        super::extract_symbols_and_includes(fallback_source, &line_starts, false);
-    let fallback = super::lexical_fallback_with_facts(symbols, includes, ParseFacts::ALL);
+    let fallback = super::lexical_fallback(
+        fallback_source,
+        super::scan_includes(fallback_source),
+        ParseFacts::ALL,
+        crate::config::SourceLanguage::C,
+    );
     assert!(fallback.records.is_empty());
     assert!(fallback.members.is_empty());
     assert!(fallback.aliases.is_empty());
@@ -2092,9 +2331,12 @@ fn availability_distinguishes_empty_skipped_and_fallback_ast_vectors() {
         FactAvailability::Unavailable(FactUnavailableReason::LexicalFallback)
     );
 
-    let (symbols, includes) =
-        super::extract_symbols_and_includes(fallback_source, &line_starts, false);
-    let fallback_index = super::lexical_fallback_with_facts(symbols, includes, ParseFacts::INDEX);
+    let fallback_index = super::lexical_fallback(
+        fallback_source,
+        super::scan_includes(fallback_source),
+        ParseFacts::INDEX,
+        crate::config::SourceLanguage::C,
+    );
     assert_eq!(
         fallback_index.fact_availability(FactGroup::Occurrences),
         FactAvailability::NotRequested
@@ -2116,7 +2358,7 @@ fn availability_distinguishes_empty_skipped_and_fallback_ast_vectors() {
 #[test]
 fn c_callable_identity_ignores_parameter_names_extern_body_and_whitespace() {
     let declaration = parse(
-        Path::new("api.h"),
+        Path::new("api_decl.c"),
         "extern int lookup ( int key , const char * value );\n",
     );
     let definition = parse(
@@ -2167,7 +2409,7 @@ fn c_callable_identity_ignores_parameter_names_extern_body_and_whitespace() {
 
 #[test]
 fn c_callable_identity_still_rejects_incompatible_parameter_types() {
-    let int_anchor = parse(Path::new("api.h"), "extern int lookup(int value);\n")
+    let int_anchor = parse(Path::new("api_decl.c"), "extern int lookup(int value);\n")
         .callable_anchors
         .into_iter()
         .find(|anchor| anchor.name == "lookup")
@@ -2186,11 +2428,14 @@ fn c_callable_identity_still_rejects_incompatible_parameter_types() {
 
 #[test]
 fn c_callable_identity_ignores_nested_function_pointer_parameter_names() {
-    let declaration = parse(Path::new("api.h"), "int visit(int (*callback)(int));\n")
-        .callable_anchors
-        .into_iter()
-        .find(|anchor| anchor.name == "visit")
-        .expect("declaration anchor");
+    let declaration = parse(
+        Path::new("api_decl.c"),
+        "int visit(int (*callback)(int));\n",
+    )
+    .callable_anchors
+    .into_iter()
+    .find(|anchor| anchor.name == "visit")
+    .expect("declaration anchor");
     let definition = parse(
         Path::new("api.c"),
         "int visit(int (*fn)(int value)) { return fn(value); }\n",
@@ -2476,4 +2721,63 @@ fn hover_semantics_mask_collects_type_and_callable_facts_without_occurrences() {
         index.fact_availability(FactGroup::Occurrences),
         FactAvailability::NotRequested
     );
+}
+
+#[test]
+fn declaration_and_call_relation_masks_are_strictly_decoupled() {
+    let source = "struct Widget { int value; };\n\
+                  typedef struct Widget WidgetAlias;\n\
+                  int helper(void);\n\
+                  int value = helper();\n";
+
+    let declarations_only =
+        parse_with_handle(Path::new("masks.c"), source, None, ParseFacts::DECLARATIONS);
+    assert!(declarations_only
+        .declarations
+        .iter()
+        .any(|declaration| declaration.name == "helper"));
+    assert!(declarations_only.declarations.iter().any(|declaration| {
+        declaration.name == "Widget"
+            && matches!(
+                declaration.backing,
+                crate::semantic_model::DeclarationBacking::Record { .. }
+            )
+    }));
+    assert!(declarations_only.declarations.iter().any(|declaration| {
+        declaration.name == "WidgetAlias"
+            && declaration.declaration_kind == crate::semantic_model::SemanticDeclarationKind::Alias
+            && matches!(
+                declaration.backing,
+                crate::semantic_model::DeclarationBacking::TypeAlias { .. }
+            )
+    }));
+    assert!(declarations_only.call_sites.is_empty());
+    assert!(declarations_only.callable_anchors.is_empty());
+    assert_eq!(
+        declarations_only.fact_availability(FactGroup::CallableAnchors),
+        FactAvailability::NotRequested
+    );
+    assert_eq!(
+        declarations_only.fact_availability(FactGroup::CallSites),
+        FactAvailability::NotRequested
+    );
+
+    let relations_only = parse_with_handle(
+        Path::new("masks.c"),
+        source,
+        None,
+        ParseFacts::CALL_RELATIONS,
+    );
+    assert!(relations_only.declarations.is_empty());
+    assert!(!relations_only.callable_anchors.is_empty());
+    assert_eq!(relations_only.call_sites.len(), 1);
+
+    let records_only = parse_with_handle(
+        Path::new("masks.h"),
+        "struct Widget { int value; };\n",
+        None,
+        ParseFacts::RECORDS,
+    );
+    assert!(!records_only.records.is_empty());
+    assert!(records_only.declarations.is_empty());
 }

@@ -14,9 +14,9 @@ fn benchmark_large_name_table_build_and_dirty_update() {
     let mut builder = name_index_builder::NameIndexBuilder::new(None);
     let visit_started = std::time::Instant::now();
     store
-        .name_table_view()
-        .visit_symbol_rows(|row| {
-            builder.push(row);
+        .declaration_view()
+        .visit_name_rows(|row| {
+            builder.push_declaration(row);
             Ok(())
         })
         .expect("stream name rows into builder");
@@ -28,14 +28,14 @@ fn benchmark_large_name_table_build_and_dirty_update() {
     let expected_len = table.len();
 
     let changed_path = store
-        .name_table_view()
-        .largest_symbol_path()
+        .declaration_view()
+        .largest_declaration_path()
         .expect("largest symbol path")
         .map(|(path, _)| path)
         .expect("at least one symbol row");
     let fresh_rows = store
-        .name_table_view()
-        .symbol_rows_for_paths(std::slice::from_ref(&changed_path))
+        .declaration_view()
+        .name_rows_for_paths(std::slice::from_ref(&changed_path))
         .expect("load changed path rows");
 
     let paths = std::collections::HashSet::from([changed_path]);
@@ -58,7 +58,11 @@ fn benchmark_large_name_table_build_and_dirty_update() {
     };
     for _ in 0..5 {
         let update_started = std::time::Instant::now();
-        table = table.with_updated_path_rows(&paths, fresh_rows.clone());
+        table = table.with_updated_declaration_name_rows_with_project_context(
+            &paths,
+            fresh_rows.clone(),
+            None,
+        );
         dirty_us.push(update_started.elapsed().as_micros());
         assert_eq!(table.len(), expected_len);
     }
@@ -67,7 +71,11 @@ fn benchmark_large_name_table_build_and_dirty_update() {
     dirty_us.sort_unstable();
 
     while !table.needs_compaction() {
-        table = table.with_updated_path_rows(&paths, fresh_rows.clone());
+        table = table.with_updated_declaration_name_rows_with_project_context(
+            &paths,
+            fresh_rows.clone(),
+            None,
+        );
         assert_eq!(table.len(), expected_len);
     }
     let segments_before_compaction = table.delta_segment_count();
@@ -1019,7 +1027,7 @@ fn build_table_and_scope_with_options(
     crate::indexer::index_workspace(dir, options, |_| {}).expect("index");
 
     let store = crate::store::IndexStore::open_readonly(&db).expect("readonly");
-    let table = NameTable::build_from_store_view(&store.name_table_view(), None)
+    let table = NameTable::build_from_declaration_view(&store.declaration_view(), None)
         .expect("streamed name table");
 
     let edges = store.load_include_edge_paths().expect("edges");
@@ -1067,12 +1075,16 @@ fn streamed_name_index_matches_typed_row_builder_with_project_context() {
         }],
     );
 
-    let legacy = NameTable::build_from_rows_with_project_context(
-        store.name_table_view().symbol_rows().expect("typed rows"),
+    let legacy = NameTable::build_from_declaration_name_rows_with_project_context(
+        store
+            .declaration_view()
+            .all_name_rows()
+            .expect("typed rows"),
         Some(&projects),
     );
-    let streamed = NameTable::build_from_store_view(&store.name_table_view(), Some(&projects))
-        .expect("streamed rows");
+    let streamed =
+        NameTable::build_from_declaration_view(&store.declaration_view(), Some(&projects))
+            .expect("streamed rows");
 
     assert_eq!(streamed.len(), legacy.len());
     for query in ["api", "APP", "helper", "project"] {

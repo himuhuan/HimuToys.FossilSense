@@ -7,6 +7,7 @@ use std::collections::HashSet;
 
 mod basic;
 mod call_facts;
+mod fallback_facts;
 mod generations;
 mod maintenance;
 mod members;

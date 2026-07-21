@@ -180,7 +180,7 @@ async fn main() -> Result<()> {
                             return;
                         }
                         println!(
-                            "{phase} {}/{} files (indexed {}, skipped {}, symbols {})",
+                            "{phase} {}/{} files (indexed {}, skipped {}, declarations {})",
                             status.processed_files,
                             status.total_files,
                             status.indexed_files,
@@ -196,7 +196,7 @@ async fn main() -> Result<()> {
             println!("indexed: {}", stats.indexed_files);
             println!("skipped: {}", stats.skipped_files);
             println!("deleted: {}", stats.deleted_files);
-            println!("symbols: {}", stats.symbols);
+            println!("declarations: {}", stats.declarations);
             println!("callable_anchors: {}", stats.callable_anchors);
             println!("call_sites: {}", stats.call_sites);
             println!("elapsed_ms: {}", stats.elapsed_ms);
@@ -256,7 +256,7 @@ fn run_query(kind: QueryCommand) -> Result<()> {
                 .map(|row| (row.id, row))
                 .collect();
 
-            println!("symbols: {} (of {} names)", records.len(), names.len());
+            println!("declarations: {} (of {} names)", records.len(), names.len());
             for id in ids {
                 if let Some(record) = records.get(&id) {
                     print_declaration(&record.fact);
@@ -286,18 +286,24 @@ fn run_query(kind: QueryCommand) -> Result<()> {
                 return Ok(());
             }
 
-            let store = IndexStore::open_readonly(&db_path)?;
             let rel = pathing::normalize_path_string(&file);
-            let candidates = query::rank_definitions_into_candidates_with_scope(
-                store.symbol_read_view().symbols_by_name(&word)?,
+            let handle = call_service::CallReadHandle::capture(db_path)?;
+            let overlay = candidate_service::CandidateOverlaySnapshot::default();
+            let service = candidate_service::CandidateQueryService::new(
+                Some(&handle),
+                &overlay,
                 &rel,
                 None,
+                None,
             );
+            let semantic =
+                service.semantic_candidates(&word, candidate_service::SemanticIntent::Neutral)?;
+            let candidates = candidate_service::navigation_presentations(&semantic, false, &rel);
 
             println!("identifier: {word}");
             println!("candidates: {}", candidates.len());
             for candidate in &candidates {
-                print_candidate(candidate);
+                print_definition_candidate(candidate);
             }
             Ok(())
         }
@@ -455,8 +461,7 @@ fn print_declaration(record: &semantic_model::DeclarationFact) {
     );
 }
 
-/// Print a labeled goto-definition candidate with its confidence and reason.
-fn print_candidate(candidate: &model::DefinitionCandidate) {
+fn print_definition_candidate(candidate: &model::DefinitionCandidate) {
     println!(
         "{}\t{}\t{}\t{}:{}\t{}:{}",
         candidate.name,

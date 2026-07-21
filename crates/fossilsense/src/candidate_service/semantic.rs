@@ -63,11 +63,28 @@ impl ResolvedDeclarationCandidate {
                 "workspace".into()
             },
             tier: self.tier,
-            base_match: 1_000,
+            base_match: definition_base_match(&self.fact),
             confidence: self.confidence,
             reason: self.reason,
         }
     }
+}
+
+fn definition_base_match(fact: &DeclarationFact) -> i32 {
+    let mut score = match fact.role {
+        SemanticDeclarationRole::Definition => 1_000,
+        SemanticDeclarationRole::TentativeDefinition => 750,
+        SemanticDeclarationRole::Declaration => 500,
+        SemanticDeclarationRole::Unknown => 0,
+    };
+    if matches!(
+        fact.declaration_kind,
+        SemanticDeclarationKind::Function | SemanticDeclarationKind::Method
+    ) && crate::query::is_source_path(&fact.path)
+    {
+        score += 100;
+    }
+    score
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,6 +149,7 @@ pub fn focused_has_kind(
 pub fn navigation_presentations(
     set: &CandidateSet<ResolvedDeclarationCandidate>,
     declaration: bool,
+    current_path: &str,
 ) -> Vec<DefinitionCandidate> {
     let focused_groups: HashSet<_> = set.focused.iter().map(|item| item.group_index).collect();
     let mut selected = Vec::new();
@@ -173,11 +191,7 @@ pub fn navigation_presentations(
         }
     }
     selected.sort_by(|left, right| {
-        right
-            .tier
-            .cmp(&left.tier)
-            .then_with(|| left.path.cmp(&right.path))
-            .then_with(|| left.range.start_line.cmp(&right.range.start_line))
+        resolver::compare_candidates(left, right, Some(current_path))
             .then_with(|| left.range.start_col.cmp(&right.range.start_col))
     });
     selected.dedup_by(|left, right| left.path == right.path && left.range == right.range);

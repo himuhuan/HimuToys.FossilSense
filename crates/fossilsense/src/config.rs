@@ -2,10 +2,87 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+use serde_json::Value;
+
+mod matching;
+use matching::{language_override_glob_matches, path_matches_glob_entry};
 
 pub const DEFAULT_EXTENSIONS: &[&str] = &["c", "h", "cpp", "hpp", "cc", "hh", "cxx", "hxx", "inl"];
 pub const DEFAULT_EXCLUDED_DIRS: &[&str] =
     &[".git", ".vscode", "node_modules", "target", "out", "build"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceLanguage {
+    C,
+    Cpp,
+}
+
+impl SourceLanguage {
+    pub fn default_for_path(path: &Path) -> Self {
+        match normalized_extension(path)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("h" | "cpp" | "hpp" | "cc" | "hh" | "cxx" | "hxx" | "inl") => Self::Cpp,
+            _ => Self::C,
+        }
+    }
+
+    pub fn tree_sitter_language(self) -> tree_sitter::Language {
+        match self {
+            Self::C => tree_sitter_c::LANGUAGE.into(),
+            Self::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LanguageOverride {
+    pub glob: String,
+    pub language: SourceLanguage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LanguageResolver {
+    workspace_root: Option<PathBuf>,
+    overrides: Vec<LanguageOverride>,
+}
+
+impl LanguageResolver {
+    pub fn new(workspace_root: Option<&Path>, overrides: Vec<LanguageOverride>) -> Self {
+        Self {
+            workspace_root: workspace_root.map(Path::to_path_buf),
+            overrides,
+        }
+    }
+
+    pub fn from_workspace_config(workspace_root: &Path, config: &WorkspaceConfig) -> Self {
+        Self::new(Some(workspace_root), config.language_overrides.clone())
+    }
+
+    pub fn language_for_path(&self, path: &Path) -> SourceLanguage {
+        self.overridden_language_for_path(path)
+            .unwrap_or_else(|| SourceLanguage::default_for_path(path))
+    }
+
+    pub fn overridden_language_for_path(&self, path: &Path) -> Option<SourceLanguage> {
+        let target = self.match_path(path);
+        self.overrides
+            .iter()
+            .rev()
+            .find(|rule| language_override_glob_matches(&target, &rule.glob))
+            .map(|rule| rule.language)
+    }
+
+    fn match_path(&self, path: &Path) -> String {
+        if let Some(root) = &self.workspace_root {
+            if let Ok(relative) = path.strip_prefix(root) {
+                return normalize_language_match_path(relative);
+            }
+        }
+        normalize_language_match_path(path)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigIssue {
@@ -22,6 +99,7 @@ pub struct WorkspaceConfig {
     /// Distinct from `include`, which selects *workspace* subtrees. Empty by
     /// default; never affects workspace traversal.
     pub include_paths: Vec<String>,
+    pub language_overrides: Vec<LanguageOverride>,
 
     /// Precomputed lookup structures derived from include/exclude/extensions
     /// at load time. Avoids repeated lowercasing, allocation, and linear scans
@@ -163,6 +241,7 @@ impl Default for WorkspaceConfig {
                 .map(|dir| dir.to_string())
                 .collect(),
             include_paths: Vec::new(),
+            language_overrides: Vec::new(),
             matchers: PrecomputedMatchers::default(),
         }
     }
@@ -178,6 +257,14 @@ struct RawConfig {
     extensions: Option<Vec<String>>,
     #[serde(default, rename = "includePaths")]
     include_paths: Option<Vec<String>>,
+    #[serde(default, rename = "languageOverrides")]
+    language_overrides: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawLanguageOverride {
+    glob: String,
+    language: String,
 }
 
 impl WorkspaceConfig {
@@ -201,6 +288,7 @@ impl WorkspaceConfig {
         };
 
         let mut config = Self::default();
+        let mut issues = Vec::new();
 
         if let Some(include) = raw.include {
             config.include = include.into_iter().map(normalize_entry).collect();
@@ -222,13 +310,72 @@ impl WorkspaceConfig {
                 include_paths.into_iter().map(normalize_include_path_entry),
             );
             config.include_paths = deduped;
-            if let Some(issue) = duplicate_issues.into_iter().next() {
-                return (config, Some(issue));
+            issues.extend(duplicate_issues);
+        }
+
+        if let Some(overrides) = raw.language_overrides {
+            let overrides = match overrides {
+                Value::Array(overrides) => overrides,
+                _ => {
+                    issues.push(ConfigIssue {
+                        message: "languageOverrides must be an array; ignoring only that field"
+                            .to_string(),
+                    });
+                    Vec::new()
+                }
+            };
+            for raw_rule in overrides {
+                let rule: RawLanguageOverride = match serde_json::from_value(raw_rule) {
+                    Ok(rule) => rule,
+                    Err(error) => {
+                        issues.push(ConfigIssue {
+                            message: format!(
+                                "languageOverrides entry is malformed, skipping: {error}"
+                            ),
+                        });
+                        continue;
+                    }
+                };
+                let raw_glob = rule.glob;
+                let glob = normalize_language_override_glob(raw_glob.clone());
+                let language = match rule.language.trim().to_ascii_lowercase().as_str() {
+                    "c" => Some(SourceLanguage::C),
+                    "cpp" => Some(SourceLanguage::Cpp),
+                    _ => None,
+                };
+                if glob.is_empty() || !valid_language_override_glob(&glob) {
+                    issues.push(ConfigIssue {
+                        message: format!(
+                            "languageOverrides entry has an invalid glob, skipping: {}",
+                            raw_glob
+                        ),
+                    });
+                    continue;
+                }
+                let Some(language) = language else {
+                    issues.push(ConfigIssue {
+                        message: format!(
+                            "languageOverrides entry has an invalid language, skipping: {}",
+                            rule.language
+                        ),
+                    });
+                    continue;
+                };
+                config
+                    .language_overrides
+                    .push(LanguageOverride { glob, language });
             }
         }
 
         config.matchers = PrecomputedMatchers::build(&config);
-        (config, None)
+        let issue = (!issues.is_empty()).then(|| ConfigIssue {
+            message: issues
+                .into_iter()
+                .map(|issue| issue.message)
+                .collect::<Vec<_>>()
+                .join("; "),
+        });
+        (config, issue)
     }
 
     /// Cheap traversal-layer filter shared by the indexer, reference search,
@@ -442,6 +589,31 @@ fn normalize_include_path_entry(entry: String) -> String {
     s
 }
 
+fn normalize_language_override_glob(entry: String) -> String {
+    entry
+        .trim()
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .to_string()
+}
+
+fn normalize_language_match_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn valid_language_override_glob(glob: &str) -> bool {
+    let mut depth = 0usize;
+    for ch in glob.chars() {
+        match ch {
+            '[' => depth += 1,
+            ']' if depth == 0 => return false,
+            ']' => depth -= 1,
+            _ => {}
+        }
+    }
+    depth == 0
+}
+
 /// Drop blank and case-insensitively duplicate entries, preserving first-seen
 /// order.
 fn dedupe_include_paths_with_issues(
@@ -517,107 +689,6 @@ fn path_matches_entry(rel_slash_path: &str, entry: &str) -> bool {
     let path_lower = rel_slash_path.to_ascii_lowercase();
     let entry_lower = entry.to_ascii_lowercase();
     path_matches_entry_lower(&path_lower, &entry_lower)
-}
-
-fn path_matches_glob_entry(rel_slash_path: &str, entry: &str) -> bool {
-    wildcard_match(
-        rel_slash_path.to_ascii_lowercase().as_bytes(),
-        entry.to_ascii_lowercase().as_bytes(),
-    )
-}
-
-fn wildcard_match(path: &[u8], pattern: &[u8]) -> bool {
-    let mut path_idx = 0usize;
-    let mut pattern_idx = 0usize;
-    let mut star: Option<usize> = None;
-    let mut star_path_idx = 0usize;
-
-    while path_idx < path.len() {
-        if pattern_idx < pattern.len() {
-            match pattern[pattern_idx] {
-                b'?' => {
-                    path_idx += 1;
-                    pattern_idx += 1;
-                    continue;
-                }
-                b'*' => {
-                    star = Some(pattern_idx);
-                    pattern_idx += 1;
-                    star_path_idx = path_idx;
-                    continue;
-                }
-                b'[' => {
-                    if let Some(next_pattern_idx) =
-                        char_class_matches(path[path_idx], pattern, pattern_idx)
-                    {
-                        path_idx += 1;
-                        pattern_idx = next_pattern_idx;
-                        continue;
-                    }
-                }
-                literal if literal == path[path_idx] => {
-                    path_idx += 1;
-                    pattern_idx += 1;
-                    continue;
-                }
-                _ => {}
-            }
-        }
-
-        if let Some(star_idx) = star {
-            pattern_idx = star_idx + 1;
-            star_path_idx += 1;
-            path_idx = star_path_idx;
-        } else {
-            return false;
-        }
-    }
-
-    while pattern_idx < pattern.len() && pattern[pattern_idx] == b'*' {
-        pattern_idx += 1;
-    }
-    pattern_idx == pattern.len()
-}
-
-fn char_class_matches(ch: u8, pattern: &[u8], start: usize) -> Option<usize> {
-    let mut idx = start + 1;
-    if idx >= pattern.len() {
-        return None;
-    }
-
-    let negated = matches!(pattern[idx], b'!' | b'^');
-    if negated {
-        idx += 1;
-    }
-
-    let mut matched = false;
-    let mut saw_end = false;
-    while idx < pattern.len() {
-        if pattern[idx] == b']' {
-            saw_end = true;
-            break;
-        }
-
-        if idx + 2 < pattern.len() && pattern[idx + 1] == b'-' && pattern[idx + 2] != b']' {
-            let start_ch = pattern[idx];
-            let end_ch = pattern[idx + 2];
-            if start_ch <= ch && ch <= end_ch {
-                matched = true;
-            }
-            idx += 3;
-        } else {
-            if pattern[idx] == ch {
-                matched = true;
-            }
-            idx += 1;
-        }
-    }
-
-    if saw_end && matched != negated {
-        Some(idx + 1)
-    } else {
-        None
-    }
 }
 
 fn extension_from_slash_path_lower(path_lower: &str) -> Option<&str> {

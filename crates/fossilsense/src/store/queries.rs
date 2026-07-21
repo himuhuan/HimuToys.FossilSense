@@ -5,50 +5,9 @@ use anyhow::Result;
 
 use crate::model::{MemberCandidate, RecordCandidate};
 
-use super::{IndexStore, SymbolRecord};
+use super::IndexStore;
 
 impl IndexStore {
-    /// Load every symbol id + name (+ external flag) for building the in-memory
-    /// fuzzy name table.
-    ///
-    /// Compatibility wrapper: the typed contract lives in
-    /// [`crate::store::views::NameTableStoreView`].
-    #[allow(dead_code)]
-    pub fn load_symbol_names(&self) -> Result<Vec<(i64, String, bool)>> {
-        self.name_table_view().symbol_name_rows()
-    }
-
-    /// Load every symbol id + name (+ external flag, path, kind) for building
-    /// the in-memory fuzzy `NameTable` with per-symbol kind cached.
-    ///
-    /// Compatibility wrapper around the typed name-table read view.
-    #[allow(clippy::type_complexity)]
-    #[allow(dead_code)]
-    pub fn load_symbol_names_with_paths(
-        &self,
-    ) -> Result<Vec<(i64, String, bool, String, String, bool)>> {
-        self.name_table_view().symbol_rows().map(|rows| {
-            rows.into_iter()
-                .map(crate::store::views::NameTableSymbolRow::into_legacy_tuple)
-                .collect()
-        })
-    }
-
-    #[allow(clippy::type_complexity)]
-    #[allow(dead_code)]
-    pub fn load_symbol_names_for_paths(
-        &self,
-        paths: &[String],
-    ) -> Result<Vec<(i64, String, bool, String, String, bool)>> {
-        self.name_table_view()
-            .symbol_rows_for_paths(paths)
-            .map(|rows| {
-                rows.into_iter()
-                    .map(crate::store::views::NameTableSymbolRow::into_legacy_tuple)
-                    .collect()
-            })
-    }
-
     /// Degraded member-completion fallback used when receiver inference fails.
     ///
     /// Compatibility wrapper around [`crate::store::views::MemberStoreView`].
@@ -110,20 +69,13 @@ impl IndexStore {
         Ok(names)
     }
 
-    /// Fetch full records for the given symbol ids, preserving caller order.
-    /// Missing ids are silently omitted.
-    #[allow(dead_code)]
-    pub fn symbols_by_ids(&self, ids: &[i64]) -> Result<Vec<SymbolRecord>> {
-        self.symbol_read_view().symbols_by_ids(ids)
-    }
-
     /// Count, per name, how many *definitions* of each kind exist in the index.
     ///
     /// Returns `name -> (kind string -> definition count)`. Production coloring
     /// resolves kinds from the in-memory `NameTable`; this SQL form is retained
     /// only as the parity oracle for that path's tests.
     #[cfg(test)]
-    pub fn kind_counts_by_names(
+    pub fn declaration_kind_counts_by_names(
         &self,
         names: &[&str],
     ) -> Result<HashMap<String, HashMap<String, usize>>> {
@@ -135,11 +87,23 @@ impl IndexStore {
         for chunk in names.chunks(400) {
             let placeholders = vec!["?"; chunk.len()].join(",");
             let sql = format!(
-                "SELECT s.name, s.kind, COUNT(*) FROM symbols s \
-                 JOIN files f ON f.id = s.file_id \
-                 WHERE s.role = 'definition' AND s.name IN ({placeholders}) \
-                 AND (f.source = 'workspace' OR f.directly_included = 1) \
-                 GROUP BY s.name, s.kind"
+                "SELECT d.name,
+                        CASE d.declaration_kind
+                            WHEN 0 THEN 'function'
+                            WHEN 1 THEN 'function'
+                            WHEN 2 THEN 'global_variable'
+                            WHEN 3 THEN 'type'
+                            WHEN 4 THEN 'type'
+                            WHEN 5 THEN 'enum_constant'
+                            WHEN 6 THEN 'macro'
+                            ELSE 'unknown'
+                        END,
+                        COUNT(*)
+                 FROM declarations d
+                 JOIN file_entries f ON f.id = d.file_id
+                 WHERE d.role = 1 AND d.name IN ({placeholders})
+                 AND (f.source = 'workspace' OR f.directly_included = 1)
+                 GROUP BY d.name, d.declaration_kind"
             );
             let mut stmt = self.conn.prepare(&sql)?;
             let rows =
@@ -157,11 +121,5 @@ impl IndexStore {
         }
 
         Ok(counts)
-    }
-
-    /// Fetch all symbols with an exact name (definition candidate set).
-    #[allow(dead_code)]
-    pub fn symbols_by_name(&self, name: &str) -> Result<Vec<SymbolRecord>> {
-        self.symbol_read_view().symbols_by_name(name)
     }
 }

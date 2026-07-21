@@ -53,9 +53,12 @@ impl Backend {
         let Some(root) = self.root_for_uri(&uri).await else {
             return Ok(None);
         };
-        let current_rel = uri_to_path(&uri)
-            .and_then(|path| pathing::relative_slash_path(&root, &path).ok())
+        let current_abs = uri_to_path(&uri);
+        let current_rel = current_abs
+            .as_deref()
+            .and_then(|path| pathing::relative_slash_path(&root, path).ok())
             .unwrap_or_default();
+        let source_language = self.source_language_for_uri(&uri).await;
         let source_cursor_byte =
             query::byte_offset_at(&text, position.position.line, position.position.character);
 
@@ -76,6 +79,7 @@ impl Backend {
                     &label_text,
                     &label_word,
                     source_cursor_byte,
+                    source_language,
                 )
             })
             .await
@@ -107,6 +111,7 @@ impl Backend {
                     &local_text,
                     &local_word,
                     local_position,
+                    source_language,
                 )
             })
             .await
@@ -239,6 +244,7 @@ impl Backend {
                 let candidates = crate::candidate_service::navigation_presentations(
                     &semantic_set,
                     operation == NavigationOperation::Declaration,
+                    &current_rel,
                 );
                 perf.include_non_callable_candidates(semantic_count);
                 perf.query_us = query_started.elapsed().as_micros();
@@ -292,11 +298,13 @@ pub(super) fn local_binding_location(
     text: &str,
     word: &str,
     position: tower_lsp::lsp_types::Position,
+    language: crate::config::SourceLanguage,
 ) -> Option<Location> {
     let cursor_byte = query::byte_offset_at(text, position.line, position.character);
-    let parsed = parser::parse_with_handle(
+    let parsed = parser::parse_with_handle_and_language(
         Path::new(current_path),
         text,
+        language,
         None,
         parser::ParseFacts::LOCAL_DECLS,
     );
@@ -325,13 +333,19 @@ pub(super) fn label_navigation_location(
     text: &str,
     word: &str,
     cursor_byte: usize,
+    language: crate::config::SourceLanguage,
 ) -> LabelNavigation<Location> {
-    let (start_byte, end_byte) =
-        match label_navigation_byte_range(current_path, text, word, cursor_byte) {
-            LabelNavigation::NotLabelSyntax => return LabelNavigation::NotLabelSyntax,
-            LabelNavigation::MissingDefinition => return LabelNavigation::MissingDefinition,
-            LabelNavigation::Found(range) => range,
-        };
+    let (start_byte, end_byte) = match label_navigation_byte_range_with_language(
+        current_path,
+        text,
+        word,
+        cursor_byte,
+        language,
+    ) {
+        LabelNavigation::NotLabelSyntax => return LabelNavigation::NotLabelSyntax,
+        LabelNavigation::MissingDefinition => return LabelNavigation::MissingDefinition,
+        LabelNavigation::Found(range) => range,
+    };
     LabelNavigation::Found(Location {
         uri: uri.clone(),
         range: tower_lsp::lsp_types::Range {
@@ -360,11 +374,28 @@ fn label_definition_byte_range(
     }
 }
 
+#[cfg(test)]
 fn label_navigation_byte_range(
     current_path: &str,
     text: &str,
     word: &str,
     cursor_byte: usize,
+) -> LabelNavigation<(usize, usize)> {
+    label_navigation_byte_range_with_language(
+        current_path,
+        text,
+        word,
+        cursor_byte,
+        crate::config::SourceLanguage::default_for_path(Path::new(current_path)),
+    )
+}
+
+fn label_navigation_byte_range_with_language(
+    _current_path: &str,
+    text: &str,
+    word: &str,
+    cursor_byte: usize,
+    language: crate::config::SourceLanguage,
 ) -> LabelNavigation<(usize, usize)> {
     let Some((query_start, query_end)) = identifier_byte_range_at(text, cursor_byte) else {
         return LabelNavigation::NotLabelSyntax;
@@ -375,14 +406,9 @@ fn label_navigation_byte_range(
         return LabelNavigation::NotLabelSyntax;
     }
 
-    let language = if is_cpp_navigation_path(current_path) {
-        tree_sitter_cpp::LANGUAGE.into()
-    } else {
-        tree_sitter_c::LANGUAGE.into()
-    };
     let parser = parser::ParserHandle::new();
     let Some(tree) = parser
-        .parse_with_language(language, text, None)
+        .parse_with_language(language.tree_sitter_language(), text, None)
         .ok()
         .flatten()
     else {
@@ -465,18 +491,6 @@ fn identifier_byte_range_at(text: &str, cursor_byte: usize) -> Option<(usize, us
 
 fn is_ascii_identifier_byte(byte: u8) -> bool {
     byte == b'_' || byte.is_ascii_alphanumeric()
-}
-
-fn is_cpp_navigation_path(path: &str) -> bool {
-    Path::new(path)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            matches!(
-                extension.to_ascii_lowercase().as_str(),
-                "cpp" | "hpp" | "cc" | "hh" | "cxx" | "hxx"
-            )
-        })
 }
 
 fn label_context_node_at<'tree>(
