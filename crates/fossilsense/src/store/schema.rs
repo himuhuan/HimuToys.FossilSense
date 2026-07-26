@@ -1,6 +1,7 @@
-// Version 19 removes the legacy symbol fact model and isolates lexical fallback
-// names in a completion-only table.
-pub(crate) const SCHEMA_VERSION: i64 = 19;
+// Version 21 adds the built-in Go front-end language code, revision-scoped
+// package/import/build-guard facts, package linkage, and source-owned member
+// facts. Existing caches rebuild rather than mixing semantic/storage contracts.
+pub(crate) const SCHEMA_VERSION: i64 = 22;
 
 pub(crate) const DROP_DATA_TABLES_SQL: &str = "
     DROP TABLE IF EXISTS pending_file_revisions;
@@ -9,6 +10,8 @@ pub(crate) const DROP_DATA_TABLES_SQL: &str = "
     DROP TABLE IF EXISTS symbol_facts;
     DROP TABLE IF EXISTS fallback_completion_facts;
     DROP TABLE IF EXISTS declaration_facts;
+    DROP TABLE IF EXISTS import_facts;
+    DROP TABLE IF EXISTS package_facts;
     DROP TABLE IF EXISTS type_alias_facts;
     DROP TABLE IF EXISTS call_site_facts;
     DROP TABLE IF EXISTS callable_anchor_facts;
@@ -58,7 +61,8 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
         parser_version INTEGER NOT NULL,
         fact_mask INTEGER NOT NULL DEFAULT 0,
         parse_error_count INTEGER NOT NULL DEFAULT 0,
-        fallback_used INTEGER NOT NULL DEFAULT 0 CHECK(fallback_used IN (0, 1))
+        fallback_used INTEGER NOT NULL DEFAULT 0 CHECK(fallback_used IN (0, 1)),
+        build_guard TEXT
     );
 
     CREATE TABLE IF NOT EXISTS active_file_revisions (
@@ -120,9 +124,9 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
         declarator_shape_json TEXT,
         has_initializer INTEGER CHECK(has_initializer IN (0, 1)),
         owner TEXT,
-        linkage_kind INTEGER NOT NULL CHECK(linkage_kind BETWEEN 0 AND 2),
+        linkage_kind INTEGER NOT NULL CHECK(linkage_kind BETWEEN 0 AND 3),
         guard TEXT,
-        language INTEGER NOT NULL CHECK(language BETWEEN 0 AND 2),
+        language INTEGER NOT NULL CHECK(language BETWEEN 0 AND 3),
         language_fidelity INTEGER NOT NULL CHECK(language_fidelity BETWEEN 0 AND 3),
         provenance INTEGER NOT NULL CHECK(provenance = 0),
         fact_fidelity INTEGER NOT NULL CHECK(fact_fidelity BETWEEN 0 AND 2),
@@ -131,11 +135,45 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
         locator_fingerprint TEXT NOT NULL,
         logical_linkage_domain TEXT NOT NULL,
         guard_fingerprint TEXT,
+        logical_canonical_signature TEXT,
         backing_kind TEXT NOT NULL,
         backing_id INTEGER,
         backing_key TEXT,
         backing_start_byte INTEGER,
         backing_end_byte INTEGER
+    );
+
+    CREATE TABLE IF NOT EXISTS package_facts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        revision_id INTEGER NOT NULL UNIQUE REFERENCES file_revisions(id) ON DELETE CASCADE,
+        file_id INTEGER NOT NULL REFERENCES file_entries(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        name_start_byte INTEGER NOT NULL CHECK(name_start_byte >= 0),
+        name_end_byte INTEGER NOT NULL CHECK(name_end_byte >= name_start_byte),
+        name_start_line INTEGER NOT NULL,
+        name_start_col INTEGER NOT NULL,
+        name_end_line INTEGER NOT NULL,
+        name_end_col INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS import_facts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        revision_id INTEGER NOT NULL REFERENCES file_revisions(id) ON DELETE CASCADE,
+        file_id INTEGER NOT NULL REFERENCES file_entries(id) ON DELETE CASCADE,
+        import_path TEXT NOT NULL,
+        alias TEXT,
+        path_start_byte INTEGER NOT NULL CHECK(path_start_byte >= 0),
+        path_end_byte INTEGER NOT NULL CHECK(path_end_byte >= path_start_byte),
+        path_start_line INTEGER NOT NULL,
+        path_start_col INTEGER NOT NULL,
+        path_end_line INTEGER NOT NULL,
+        path_end_col INTEGER NOT NULL,
+        declaration_start_byte INTEGER NOT NULL CHECK(declaration_start_byte >= 0),
+        declaration_end_byte INTEGER NOT NULL CHECK(declaration_end_byte >= declaration_start_byte),
+        declaration_start_line INTEGER NOT NULL,
+        declaration_start_col INTEGER NOT NULL,
+        declaration_end_line INTEGER NOT NULL,
+        declaration_end_col INTEGER NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS include_facts (
@@ -160,6 +198,7 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         revision_id INTEGER NOT NULL REFERENCES file_revisions(id) ON DELETE CASCADE,
         file_id INTEGER NOT NULL REFERENCES file_entries(id) ON DELETE CASCADE,
+        record_key TEXT NOT NULL,
         display_name TEXT NOT NULL,
         tag_name TEXT,
         typedef_name TEXT,
@@ -191,7 +230,10 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
 
     CREATE TABLE IF NOT EXISTS member_facts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        record_id INTEGER NOT NULL REFERENCES record_facts(id) ON DELETE CASCADE,
+        revision_id INTEGER NOT NULL REFERENCES file_revisions(id) ON DELETE CASCADE,
+        file_id INTEGER NOT NULL REFERENCES file_entries(id) ON DELETE CASCADE,
+        record_id INTEGER REFERENCES record_facts(id) ON DELETE SET NULL,
+        record_key TEXT NOT NULL,
         name TEXT NOT NULL,
         kind TEXT NOT NULL,
         confidence TEXT NOT NULL,
@@ -251,7 +293,7 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
         owner_kind INTEGER CHECK(owner_kind IS NULL OR owner_kind IN (0, 1, 2)),
         kind INTEGER NOT NULL CHECK(kind IN (0, 1, 2, 3)),
         role INTEGER NOT NULL CHECK(role IN (0, 1, 2)),
-        linkage_kind INTEGER NOT NULL CHECK(linkage_kind IN (0, 1, 2)),
+        linkage_kind INTEGER NOT NULL CHECK(linkage_kind IN (0, 1, 2, 3)),
         linkage_file_id INTEGER REFERENCES call_strings(id),
         signature_id INTEGER NOT NULL REFERENCES call_strings(id),
         canonical_signature_id INTEGER NOT NULL REFERENCES call_strings(id),
@@ -345,6 +387,16 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
         JOIN active_file_revisions a
           ON a.file_id = f.file_id AND a.revision_id = f.revision_id;
 
+    CREATE VIEW IF NOT EXISTS packages AS
+        SELECT f.* FROM package_facts f
+        JOIN active_file_revisions a
+          ON a.file_id = f.file_id AND a.revision_id = f.revision_id;
+
+    CREATE VIEW IF NOT EXISTS imports AS
+        SELECT f.* FROM import_facts f
+        JOIN active_file_revisions a
+          ON a.file_id = f.file_id AND a.revision_id = f.revision_id;
+
     CREATE VIEW IF NOT EXISTS includes AS
         SELECT f.* FROM include_facts f
         JOIN active_file_revisions a
@@ -357,9 +409,8 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
 
     CREATE VIEW IF NOT EXISTS members AS
         SELECT m.* FROM member_facts m
-        JOIN record_facts r ON r.id = m.record_id
         JOIN active_file_revisions a
-          ON a.file_id = r.file_id AND a.revision_id = r.revision_id;
+          ON a.file_id = m.file_id AND a.revision_id = m.revision_id;
 
     CREATE VIEW IF NOT EXISTS type_aliases AS
         SELECT f.* FROM type_alias_facts f
@@ -386,6 +437,10 @@ pub(crate) const CREATE_LOOKUP_INDEXES_SQL: &str = "
     CREATE INDEX IF NOT EXISTS idx_declaration_facts_file_id ON declaration_facts(file_id);
     CREATE INDEX IF NOT EXISTS idx_declaration_facts_logical_key ON declaration_facts(logical_key_digest);
     CREATE INDEX IF NOT EXISTS idx_declaration_facts_locator ON declaration_facts(locator_fingerprint);
+    CREATE INDEX IF NOT EXISTS idx_package_facts_name ON package_facts(name);
+    CREATE INDEX IF NOT EXISTS idx_package_facts_file_id ON package_facts(file_id);
+    CREATE INDEX IF NOT EXISTS idx_import_facts_path ON import_facts(import_path);
+    CREATE INDEX IF NOT EXISTS idx_import_facts_file_id ON import_facts(file_id);
     CREATE INDEX IF NOT EXISTS idx_type_alias_facts_alias ON type_alias_facts(alias);
     CREATE INDEX IF NOT EXISTS idx_type_alias_facts_fingerprint ON type_alias_facts(fingerprint);
     CREATE INDEX IF NOT EXISTS idx_type_alias_facts_file_id ON type_alias_facts(file_id);
@@ -394,7 +449,10 @@ pub(crate) const CREATE_LOOKUP_INDEXES_SQL: &str = "
     CREATE INDEX IF NOT EXISTS idx_record_facts_tag_name ON record_facts(tag_name);
     CREATE INDEX IF NOT EXISTS idx_record_facts_typedef_name ON record_facts(typedef_name);
     CREATE INDEX IF NOT EXISTS idx_record_facts_file_id ON record_facts(file_id);
+    CREATE INDEX IF NOT EXISTS idx_record_facts_record_key ON record_facts(record_key);
     CREATE INDEX IF NOT EXISTS idx_member_facts_record_id ON member_facts(record_id);
+    CREATE INDEX IF NOT EXISTS idx_member_facts_record_key ON member_facts(record_key);
+    CREATE INDEX IF NOT EXISTS idx_member_facts_file_id ON member_facts(file_id);
     CREATE INDEX IF NOT EXISTS idx_member_facts_name ON member_facts(name);
     CREATE INDEX IF NOT EXISTS idx_member_facts_kind ON member_facts(kind);
     CREATE INDEX IF NOT EXISTS idx_include_facts_target_basename ON include_facts(target_basename);

@@ -70,8 +70,59 @@ fn source_language_defaults_make_headers_and_inl_cpp() {
         SourceLanguage::C
     );
     assert_eq!(
+        SourceLanguage::default_for_path(Path::new("src/widget.go")),
+        SourceLanguage::Go
+    );
+    assert_eq!(
         SourceLanguage::default_for_path(Path::new("generated/widget.custom")),
         SourceLanguage::C
+    );
+    assert!(WorkspaceConfig::default()
+        .extensions
+        .iter()
+        .any(|extension| extension == "go"));
+}
+
+#[test]
+fn built_in_language_registry_declares_go_as_a_separate_semantic_family() {
+    let backends = super::built_in_language_backends();
+    assert_eq!(backends.len(), 3);
+    assert_eq!(backends[0].language, SourceLanguage::C);
+    assert_eq!(backends[1].language, SourceLanguage::Cpp);
+    assert_eq!(backends[2].language, SourceLanguage::Go);
+    assert_eq!(
+        SourceLanguage::C.semantic_family(),
+        super::SemanticFamily::CFamily
+    );
+    assert_eq!(
+        SourceLanguage::Cpp.semantic_family(),
+        super::SemanticFamily::CFamily
+    );
+    assert_eq!(
+        SourceLanguage::Go.semantic_family(),
+        super::SemanticFamily::Go
+    );
+    assert_eq!(
+        SourceLanguage::from_config_name("go"),
+        Some(SourceLanguage::Go)
+    );
+    assert!(backends[2].default_extensions.contains(&"go"));
+    assert_eq!(
+        backends[2].tree_sitter_language(),
+        tree_sitter_go::LANGUAGE.into()
+    );
+    let registered_extensions: std::collections::HashSet<_> = backends
+        .iter()
+        .flat_map(|backend| backend.default_extensions.iter().copied())
+        .collect();
+    let configured_extensions: std::collections::HashSet<_> =
+        WorkspaceConfig::default().extensions.into_iter().collect();
+    assert_eq!(
+        registered_extensions,
+        configured_extensions
+            .iter()
+            .map(String::as_str)
+            .collect::<std::collections::HashSet<_>>()
     );
 }
 
@@ -85,7 +136,8 @@ fn language_overrides_use_relative_globs_and_last_match_wins() {
           "languageOverrides": [
             { "glob": "legacy-c/**/*.h", "language": "c" },
             { "glob": "legacy-c/special/*.h", "language": "cpp" },
-            { "glob": "legacy-c/special/final.h", "language": "c" }
+            { "glob": "legacy-c/special/final.h", "language": "c" },
+            { "glob": "generated/**/*.inc", "language": "go" }
           ]
         }"#,
     )
@@ -107,6 +159,10 @@ fn language_overrides_use_relative_globs_and_last_match_wins() {
         resolver.language_for_path(&root.join("legacy-c/special/final.h")),
         SourceLanguage::C,
         "the final matching rule must win"
+    );
+    assert_eq!(
+        resolver.language_for_path(&root.join("generated/runtime.inc")),
+        SourceLanguage::Go
     );
 }
 

@@ -285,7 +285,7 @@ fn current_schema_migrate_by_drop_clears_old_data() {
 }
 
 #[test]
-fn opening_schema_18_parser_fact_4_drops_old_symbol_data_for_schema_19_rebuild() {
+fn opening_old_schema_and_parser_facts_drops_old_symbol_data_for_current_rebuild() {
     let dir = tempdir().expect("tempdir");
     let db = dir.path().join("index.sqlite");
     {
@@ -331,7 +331,7 @@ fn opening_schema_18_parser_fact_4_drops_old_symbol_data_for_schema_19_rebuild()
         .expect("seed schema 18 parser-fact-4 data");
     }
 
-    let store = IndexStore::open(&db, dir.path()).expect("open schema 19");
+    let store = IndexStore::open(&db, dir.path()).expect("open current schema");
     let version: String = store
         .conn
         .query_row(
@@ -340,7 +340,7 @@ fn opening_schema_18_parser_fact_4_drops_old_symbol_data_for_schema_19_rebuild()
             |row| row.get(0),
         )
         .expect("schema version");
-    assert_eq!(version, "19");
+    assert_eq!(version, crate::store::schema::SCHEMA_VERSION.to_string());
 
     let anchor_count: i64 = store
         .conn

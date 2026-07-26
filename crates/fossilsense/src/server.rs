@@ -291,8 +291,17 @@ impl Backend {
         requested_facts: parser::ParseFacts,
     ) -> Option<Arc<FileSemanticIndex>> {
         let language = self.source_language_for_path(path).await;
+        let identity_path = if language == SourceLanguage::Go {
+            self.root_for_uri(uri)
+                .await
+                .and_then(|root| pathing::relative_slash_path(&root, path).ok())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| path.to_path_buf())
+        } else {
+            path.to_path_buf()
+        };
         if version == 0 {
-            let path_owned = path.to_path_buf();
+            let path_owned = identity_path;
             let text_owned = text.to_string();
             return tokio::task::spawn_blocking(move || {
                 Arc::new(parser::parse_thread_local_with_language(
@@ -338,7 +347,7 @@ impl Backend {
         // Cache miss: parse on the blocking thread-pool and store.
         self.perf_log(|| live_parse_cache_log(LiveParseCacheEvent::Miss).to_string())
             .await;
-        let path_owned = path.to_path_buf();
+        let path_owned = identity_path;
         let text_owned = text.to_string();
         let facts = self
             .session

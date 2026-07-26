@@ -281,13 +281,26 @@ impl<'a> MemberStoreView<'a> {
         }
         let placeholders = vec!["?"; record_ids.len()].join(",");
         let mut sql = format!(
-            "SELECT m.id, m.name, m.kind, m.signature, m.confidence, m.type_name, f.path, f.source, f.directly_included, rev.hash, m.start_byte, m.end_byte, m.start_line, m.start_col, m.end_line, m.end_col \
+            "WITH requested_records AS (
+                 SELECT id, record_key
+                 FROM record_defs
+                 WHERE id IN ({placeholders})
+             )
+             SELECT m.id, m.name, m.kind, m.signature, m.confidence, m.type_name, f.path, f.source, f.directly_included, rev.hash, m.start_byte, m.end_byte, m.start_line, m.start_col, m.end_line, m.end_col \
              FROM members m \
-             JOIN record_defs r ON r.id = m.record_id \
-             JOIN files f ON f.id = r.file_id \
-             JOIN active_file_revisions active ON active.file_id = f.id \
-             JOIN file_revisions rev ON rev.id = active.revision_id \
-             WHERE m.record_id IN ({placeholders})"
+             JOIN files f ON f.id = m.file_id \
+             JOIN file_revisions rev ON rev.id = m.revision_id \
+             WHERE (
+                 (m.record_id IS NOT NULL AND EXISTS (
+                     SELECT 1 FROM requested_records requested
+                     WHERE requested.id = m.record_id
+                 ))
+                 OR
+                 (m.record_id IS NULL AND EXISTS (
+                     SELECT 1 FROM requested_records requested
+                     WHERE requested.record_key = m.record_key
+                 ))
+             )"
         );
         let mut params: Vec<Value> = record_ids.iter().copied().map(Value::Integer).collect();
         if let Some(prefix) = prefix {
@@ -341,10 +354,8 @@ impl<'a> MemberStoreView<'a> {
         let mut stmt = self.store.conn.prepare(
             "SELECT m.id, m.name, m.kind, m.signature, m.confidence, m.type_name, f.path, f.source, f.directly_included, rev.hash, m.start_byte, m.end_byte, m.start_line, m.start_col, m.end_line, m.end_col \
              FROM members m \
-             JOIN record_defs r ON r.id = m.record_id \
-             JOIN files f ON f.id = r.file_id \
-             JOIN active_file_revisions active ON active.file_id = f.id \
-             JOIN file_revisions rev ON rev.id = active.revision_id \
+             JOIN files f ON f.id = m.file_id \
+             JOIN file_revisions rev ON rev.id = m.revision_id \
              WHERE m.name LIKE ?1 ESCAPE '\\' COLLATE NOCASE \
              ORDER BY lower(m.name), m.name, f.path, m.kind, m.signature, m.id \
              LIMIT ?2",
@@ -419,8 +430,7 @@ impl<'a> MemberStoreView<'a> {
         let mut stmt = self.store.conn.prepare(
             "SELECT m.name, f.path, f.source, f.directly_included \
              FROM members m \
-             JOIN record_defs r ON r.id = m.record_id \
-             JOIN files f ON f.id = r.file_id \
+             JOIN files f ON f.id = m.file_id \
              WHERE m.kind = 'field' AND m.name LIKE ?1 ESCAPE '\\' COLLATE NOCASE",
         )?;
         let rows = stmt.query_map([pattern], |row| {
@@ -606,6 +616,7 @@ fn record_read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RecordReadRow> {
     let kind = match kind_str.as_str() {
         "union" => crate::semantic_model::RecordKind::Union,
         "class" => crate::semantic_model::RecordKind::Class,
+        "interface" => crate::semantic_model::RecordKind::Interface,
         _ => crate::semantic_model::RecordKind::Struct,
     };
     let source_str: String = row.get(6)?;

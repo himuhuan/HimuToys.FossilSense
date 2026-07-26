@@ -20,6 +20,7 @@ const SELECT: &str = "SELECT
     d.linkage_kind, d.guard, d.language, d.language_fidelity, d.provenance,
     d.fact_fidelity, d.logical_key_digest, d.locator_fingerprint,
     d.logical_linkage_domain, d.guard_fingerprint,
+    d.logical_canonical_signature,
     d.backing_kind, d.backing_id, d.backing_key,
     d.backing_start_byte, d.backing_end_byte,
     f.path, rev.source, f.directly_included,
@@ -302,11 +303,20 @@ fn declaration_row(row: &rusqlite::Row<'_>) -> Result<DeclarationReadRow> {
         .with_context(|| format!("invalid declarator shape for declaration row {id}"))?;
     let has_initializer = row.get::<_, Option<i64>>(19)?.map(|value| value != 0);
     let owner: Option<String> = row.get(20)?;
-    let path: String = row.get(36)?;
+    let path: String = row.get(37)?;
+    let logical_linkage_domain: String = row.get(29)?;
     let linkage = match row.get::<_, i64>(21)? {
         0 => LinkageDomain::External,
         1 => LinkageDomain::Internal(path.clone()),
         2 => LinkageDomain::Unknown,
+        3 => LinkageDomain::Package(
+            logical_linkage_domain
+                .strip_prefix("package:")
+                .with_context(|| {
+                    format!("package linkage is missing its domain for declaration row {id}")
+                })?
+                .to_string(),
+        ),
         value => anyhow::bail!("invalid linkage kind {value} for declaration row {id}"),
     };
     let guard: Option<String> = row.get(22)?;
@@ -324,13 +334,13 @@ fn declaration_row(row: &rusqlite::Row<'_>) -> Result<DeclarationReadRow> {
         "invalid logical key digest for declaration row {id}"
     );
     let locator_fingerprint: String = row.get(28)?;
-    let logical_linkage_domain: String = row.get(29)?;
     let guard_fingerprint: Option<String> = row.get(30)?;
-    let backing_kind: String = row.get(31)?;
-    let backing_id: Option<i64> = row.get(32)?;
-    let backing_key: Option<String> = row.get(33)?;
-    let backing_start: Option<i64> = row.get(34)?;
-    let backing_end: Option<i64> = row.get(35)?;
+    let logical_canonical_signature: Option<String> = row.get(31)?;
+    let backing_kind: String = row.get(32)?;
+    let backing_id: Option<i64> = row.get(33)?;
+    let backing_key: Option<String> = row.get(34)?;
+    let backing_start: Option<i64> = row.get(35)?;
+    let backing_end: Option<i64> = row.get(36)?;
     let backing = declaration_backing(
         id,
         &backing_kind,
@@ -344,7 +354,7 @@ fn declaration_row(row: &rusqlite::Row<'_>) -> Result<DeclarationReadRow> {
         qualified_name: qualified_name.clone(),
         declaration_kind,
         owner: owner.clone(),
-        canonical_signature: canonical_signature.clone(),
+        canonical_signature: logical_canonical_signature,
         linkage_domain: logical_linkage_domain,
         guard_fingerprint,
     };
@@ -385,12 +395,12 @@ fn declaration_row(row: &rusqlite::Row<'_>) -> Result<DeclarationReadRow> {
         logical_key_digest,
         backing_kind,
         backing_id,
-        external: row.get::<_, String>(37)? == "external",
-        directly_included: row.get::<_, i64>(38)? != 0,
-        revision_id: row.get(39)?,
-        revision_size: row.get::<_, i64>(40)? as u64,
-        revision_mtime_ns: row.get(41)?,
-        revision_hash: row.get(42)?,
+        external: row.get::<_, String>(38)? == "external",
+        directly_included: row.get::<_, i64>(39)? != 0,
+        revision_id: row.get(40)?,
+        revision_size: row.get::<_, i64>(41)? as u64,
+        revision_mtime_ns: row.get(42)?,
+        revision_hash: row.get(43)?,
     })
 }
 
@@ -471,6 +481,7 @@ fn semantic_language(value: i64) -> Result<SemanticLanguage> {
         0 => SemanticLanguage::C,
         1 => SemanticLanguage::Cpp,
         2 => SemanticLanguage::Unknown,
+        3 => SemanticLanguage::Go,
         _ => anyhow::bail!("unknown semantic language code {value}"),
     })
 }

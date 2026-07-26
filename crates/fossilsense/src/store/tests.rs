@@ -9,6 +9,7 @@ mod basic;
 mod call_facts;
 mod fallback_facts;
 mod generations;
+mod go_facts;
 mod maintenance;
 mod members;
 mod parser_consumer_migration;

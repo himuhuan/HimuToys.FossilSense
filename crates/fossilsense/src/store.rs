@@ -631,6 +631,8 @@ impl IndexStore {
                 "type_aliases",
                 "members",
                 "record_defs",
+                "imports",
+                "packages",
                 "includes",
                 "fallback_completions",
                 "symbols",
@@ -747,6 +749,7 @@ fn record_kind_to_str(k: RecordKind) -> &'static str {
         RecordKind::Struct => "struct",
         RecordKind::Union => "union",
         RecordKind::Class => "class",
+        RecordKind::Interface => "interface",
     }
 }
 
@@ -755,6 +758,7 @@ fn record_kind_from_str(s: &str) -> Option<RecordKind> {
         "struct" => Some(RecordKind::Struct),
         "union" => Some(RecordKind::Union),
         "class" => Some(RecordKind::Class),
+        "interface" => Some(RecordKind::Interface),
         _ => None,
     }
 }

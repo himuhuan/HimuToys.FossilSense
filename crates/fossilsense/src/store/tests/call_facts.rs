@@ -43,7 +43,7 @@ fn callable_and_call_site_facts_round_trip_through_active_views() {
 }
 
 #[test]
-fn schema_19_persists_full_typed_callable_signatures() {
+fn current_schema_persists_full_typed_callable_signatures() {
     let dir = tempdir().unwrap();
     let db = dir.path().join("index.sqlite");
     let mut store = IndexStore::open(&db, dir.path()).unwrap();
@@ -61,7 +61,7 @@ fn schema_19_persists_full_typed_callable_signatures() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, "19");
+    assert_eq!(version, crate::store::schema::SCHEMA_VERSION.to_string());
 
     let anchor_columns: Vec<(String, String)> = store
         .conn

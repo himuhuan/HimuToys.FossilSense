@@ -671,6 +671,46 @@ async fn unsaved_header_overlay_uses_the_same_configured_language_as_indexing() 
 }
 
 #[tokio::test]
+async fn go_live_parse_uses_the_same_relative_package_identity_as_indexing() {
+    let (dir, service, uri, _line, _character) = indexed_backend_with_open_doc(
+        &[],
+        "src/sensor/read.go",
+        "package sensor\nfunc Read/*cursor*/() {}\n",
+    )
+    .await;
+    let path = dir.path().join("src/sensor/read.go");
+    let document = service
+        .inner()
+        .session
+        .documents
+        .snapshot(&uri)
+        .await
+        .expect("open document");
+    let parsed = service
+        .inner()
+        .get_or_parse_document(
+            &uri,
+            &path,
+            document.version,
+            &document.text,
+            crate::parser::ParseFacts::DECLARATIONS,
+        )
+        .await
+        .expect("live parse");
+    let declaration = parsed
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name == "Read")
+        .expect("Read declaration");
+
+    assert_eq!(declaration.path, "src/sensor/read.go");
+    assert_eq!(
+        declaration.linkage,
+        crate::call_model::LinkageDomain::Package("src/sensor#sensor".to_string())
+    );
+}
+
+#[tokio::test]
 async fn live_parse_language_reuses_cached_workspace_resolver_until_invalidation() {
     let service = test_backend_service();
     let dir = tempdir().expect("root");

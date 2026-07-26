@@ -217,9 +217,9 @@ pub fn resolve_callable_candidates(input: CallableQueryInput) -> CallableCandida
         crate::call_model::LinkageDomain::Internal(_) => {
             input.visible_internal_paths.contains(&anchor.anchor.path)
         }
-        crate::call_model::LinkageDomain::External | crate::call_model::LinkageDomain::Unknown => {
-            true
-        }
+        crate::call_model::LinkageDomain::External
+        | crate::call_model::LinkageDomain::Package(_)
+        | crate::call_model::LinkageDomain::Unknown => true,
     });
     // Defend the pure boundary too, even though the request facade normally
     // rejects these forms first. Otherwise a `widget.open()` name-only recall

@@ -7,7 +7,6 @@ use serde_json::Value;
 mod matching;
 use matching::{language_override_glob_matches, path_matches_glob_entry};
 
-pub const DEFAULT_EXTENSIONS: &[&str] = &["c", "h", "cpp", "hpp", "cc", "hh", "cxx", "hxx", "inl"];
 pub const DEFAULT_EXCLUDED_DIRS: &[&str] =
     &[".git", ".vscode", "node_modules", "target", "out", "build"];
 
@@ -15,24 +14,124 @@ pub const DEFAULT_EXCLUDED_DIRS: &[&str] =
 pub enum SourceLanguage {
     C,
     Cpp,
+    Go,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticFamily {
+    CFamily,
+    Go,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParserFrontend {
+    CFamily,
+    Go,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct LanguageBackend {
+    pub language: SourceLanguage,
+    pub config_name: &'static str,
+    pub default_extensions: &'static [&'static str],
+    pub semantic_family: SemanticFamily,
+    pub parser_frontend: ParserFrontend,
+    grammar: fn() -> tree_sitter::Language,
+}
+
+const BUILT_IN_LANGUAGE_BACKENDS: &[LanguageBackend] = &[
+    LanguageBackend {
+        language: SourceLanguage::C,
+        config_name: "c",
+        default_extensions: &["c"],
+        semantic_family: SemanticFamily::CFamily,
+        parser_frontend: ParserFrontend::CFamily,
+        grammar: c_grammar,
+    },
+    LanguageBackend {
+        language: SourceLanguage::Cpp,
+        config_name: "cpp",
+        default_extensions: &["h", "cpp", "hpp", "cc", "hh", "cxx", "hxx", "inl"],
+        semantic_family: SemanticFamily::CFamily,
+        parser_frontend: ParserFrontend::CFamily,
+        grammar: cpp_grammar,
+    },
+    LanguageBackend {
+        language: SourceLanguage::Go,
+        config_name: "go",
+        default_extensions: &["go"],
+        semantic_family: SemanticFamily::Go,
+        parser_frontend: ParserFrontend::Go,
+        grammar: go_grammar,
+    },
+];
+
+pub fn built_in_language_backends() -> &'static [LanguageBackend] {
+    BUILT_IN_LANGUAGE_BACKENDS
+}
+
+impl LanguageBackend {
+    pub fn tree_sitter_language(self) -> tree_sitter::Language {
+        (self.grammar)()
+    }
+}
+
+fn c_grammar() -> tree_sitter::Language {
+    tree_sitter_c::LANGUAGE.into()
+}
+
+fn cpp_grammar() -> tree_sitter::Language {
+    tree_sitter_cpp::LANGUAGE.into()
+}
+
+fn go_grammar() -> tree_sitter::Language {
+    tree_sitter_go::LANGUAGE.into()
+}
+
+fn default_extensions() -> impl Iterator<Item = &'static str> {
+    built_in_language_backends()
+        .iter()
+        .flat_map(|backend| backend.default_extensions.iter().copied())
 }
 
 impl SourceLanguage {
     pub fn default_for_path(path: &Path) -> Self {
-        match normalized_extension(path)
-            .map(str::to_ascii_lowercase)
+        let extension = normalized_extension(path).map(str::to_ascii_lowercase);
+        extension
             .as_deref()
-        {
-            Some("h" | "cpp" | "hpp" | "cc" | "hh" | "cxx" | "hxx" | "inl") => Self::Cpp,
-            _ => Self::C,
-        }
+            .and_then(|extension| {
+                built_in_language_backends()
+                    .iter()
+                    .find(|backend| backend.default_extensions.contains(&extension))
+                    .map(|backend| backend.language)
+            })
+            .unwrap_or(Self::C)
+    }
+
+    pub fn from_config_name(name: &str) -> Option<Self> {
+        built_in_language_backends()
+            .iter()
+            .find(|backend| backend.config_name == name)
+            .map(|backend| backend.language)
+    }
+
+    pub fn semantic_family(self) -> SemanticFamily {
+        self.backend().semantic_family
+    }
+
+    pub fn parser_frontend(self) -> ParserFrontend {
+        self.backend().parser_frontend
     }
 
     pub fn tree_sitter_language(self) -> tree_sitter::Language {
-        match self {
-            Self::C => tree_sitter_c::LANGUAGE.into(),
-            Self::Cpp => tree_sitter_cpp::LANGUAGE.into(),
-        }
+        self.backend().tree_sitter_language()
+    }
+
+    fn backend(self) -> &'static LanguageBackend {
+        BUILT_IN_LANGUAGE_BACKENDS
+            .iter()
+            .find(|backend| backend.language == self)
+            .expect("every SourceLanguage must have one built-in backend")
     }
 }
 
@@ -141,8 +240,7 @@ impl Default for PrecomputedMatchers {
                 .iter()
                 .map(|d| d.to_ascii_lowercase())
                 .collect(),
-            extension_set: DEFAULT_EXTENSIONS
-                .iter()
+            extension_set: default_extensions()
                 .map(|ext| format!(".{}", ext.to_ascii_lowercase()))
                 .collect(),
             include_ancestor_prefixes: Vec::new(),
@@ -232,8 +330,7 @@ impl Default for WorkspaceConfig {
         Self {
             include: Vec::new(),
             exclude: Vec::new(),
-            extensions: DEFAULT_EXTENSIONS
-                .iter()
+            extensions: default_extensions()
                 .map(|extension| extension.to_string())
                 .collect(),
             excluded_dirs: DEFAULT_EXCLUDED_DIRS
@@ -339,9 +436,7 @@ impl WorkspaceConfig {
                 let raw_glob = rule.glob;
                 let glob = normalize_language_override_glob(raw_glob.clone());
                 let language = match rule.language.trim().to_ascii_lowercase().as_str() {
-                    "c" => Some(SourceLanguage::C),
-                    "cpp" => Some(SourceLanguage::Cpp),
-                    _ => None,
+                    name => SourceLanguage::from_config_name(name),
                 };
                 if glob.is_empty() || !valid_language_override_glob(&glob) {
                     issues.push(ConfigIssue {

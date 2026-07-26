@@ -6,6 +6,7 @@ use crate::reachability::OpenReason;
 mod call_facts;
 mod declarations;
 mod member;
+mod package_imports;
 
 #[allow(unused_imports)]
 pub use call_facts::{CallCoverageRow, CallFactStoreView, CallSiteRow, CallableAnchorRow};
@@ -15,6 +16,8 @@ pub use declarations::{
 };
 #[allow(unused_imports)]
 pub use member::{MemberReadRow, MemberStoreView, RecordReadRow, TypeAliasReadRow};
+#[allow(unused_imports)]
+pub use package_imports::{ImportReadRow, PackageImportStoreView, PackageReadRow};
 
 use super::IndexStore;
 

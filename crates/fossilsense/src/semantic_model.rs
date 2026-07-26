@@ -9,7 +9,7 @@ use crate::call_model::SourceRange;
 /// This is deliberately independent from the SQLite schema version: changing
 /// how a fact is derived must invalidate persisted rows even when their SQL
 /// column layout happens to stay compatible.
-pub const PARSER_FACT_VERSION: i64 = 5;
+pub const PARSER_FACT_VERSION: i64 = 7;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -89,6 +89,7 @@ pub enum SemanticLanguage {
     C,
     Cpp,
     Unknown,
+    Go,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -178,6 +179,7 @@ pub enum RecordKind {
     Struct,
     Union,
     Class,
+    Interface,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordConfidence {
@@ -367,6 +369,25 @@ pub struct Include {
     pub target_text: String,
 }
 
+/// Go package declaration for a source file. Package membership is a
+/// language-front-end fact; module/import-path resolution remains an indexer
+/// concern so parsing never depends on a Go toolchain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageFact {
+    pub name: String,
+    pub name_range: SourceRange,
+}
+
+/// Go import declaration. The path is stored without string delimiters and the
+/// optional alias preserves named, dot, and blank imports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportFact {
+    pub path: String,
+    pub alias: Option<String>,
+    pub path_range: SourceRange,
+    pub declaration_range: SourceRange,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Occurrence {
     pub name: String,
@@ -382,6 +403,9 @@ pub struct Occurrence {
 pub struct PersistentFacts<'a> {
     pub parse_outcome: ParseOutcome,
     pub includes: &'a [Include],
+    pub package: Option<&'a PackageFact>,
+    pub imports: &'a [ImportFact],
+    pub build_guard: Option<&'a str>,
     pub declarations: &'a [DeclarationFact],
     pub fallback_completions: &'a [FallbackCompletionFact],
     pub records: &'a [RecordDef],

@@ -85,6 +85,8 @@ fn local_binding_detail(binding: &LocalBinding) -> String {
     let role = match binding.kind {
         LocalBindingKind::Parameter => "parameter",
         LocalBindingKind::LocalVariable => "local",
+        LocalBindingKind::LocalConstant => "local constant",
+        LocalBindingKind::LocalType => "local type",
     };
     match binding.type_text.as_deref() {
         Some(type_text) if !type_text.is_empty() => format!("{role}: {type_text}"),

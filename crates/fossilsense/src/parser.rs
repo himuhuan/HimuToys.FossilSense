@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-use crate::config::SourceLanguage;
+use crate::config::{ParserFrontend, SourceLanguage};
 use crate::semantic_model::{
     DeclarationFact, FallbackCompletionFact, ParseOutcome, SemanticDeclarationRole,
 };
@@ -32,6 +32,7 @@ struct RawDeclaration {
 mod ast;
 mod callables;
 mod declarations;
+mod go;
 mod lexical;
 
 use ast::collect_ast_index;
@@ -39,6 +40,92 @@ pub use ast::infer_receiver_record;
 #[cfg(test)]
 use lexical::compact_whitespace;
 use lexical::{extract_fallback_completions, scan_includes};
+
+struct BackendAstProduct {
+    ast: ast::AstIndex,
+    package: Option<crate::semantic_model::PackageFact>,
+    imports: Vec<crate::semantic_model::ImportFact>,
+    build_guard: Option<String>,
+}
+
+type CollectBackendFacts = for<'tree> fn(
+    tree_sitter::Node<'tree>,
+    &Path,
+    &str,
+    &[usize],
+    ParseFacts,
+    SourceLanguage,
+) -> BackendAstProduct;
+
+struct ParserFrontendAdapter {
+    frontend: ParserFrontend,
+    scan_includes: fn(&str) -> Vec<Include>,
+    collect: CollectBackendFacts,
+    fallback_build_guard: fn(&str) -> Option<String>,
+}
+
+const PARSER_FRONTEND_ADAPTERS: &[ParserFrontendAdapter] = &[
+    ParserFrontendAdapter {
+        frontend: ParserFrontend::CFamily,
+        scan_includes,
+        collect: collect_c_family_backend,
+        fallback_build_guard: no_build_guard,
+    },
+    ParserFrontendAdapter {
+        frontend: ParserFrontend::Go,
+        scan_includes: no_includes,
+        collect: collect_go_backend,
+        fallback_build_guard: go::extract_build_guard,
+    },
+];
+
+fn parser_frontend_adapter(frontend: ParserFrontend) -> &'static ParserFrontendAdapter {
+    PARSER_FRONTEND_ADAPTERS
+        .iter()
+        .find(|adapter| adapter.frontend == frontend)
+        .expect("every registered parser frontend must have one adapter")
+}
+
+fn collect_c_family_backend(
+    root: tree_sitter::Node<'_>,
+    path: &Path,
+    source: &str,
+    line_starts: &[usize],
+    facts: ParseFacts,
+    language: SourceLanguage,
+) -> BackendAstProduct {
+    BackendAstProduct {
+        ast: collect_ast_index(root, path, source, line_starts, facts, language),
+        package: None,
+        imports: Vec::new(),
+        build_guard: None,
+    }
+}
+
+fn collect_go_backend(
+    root: tree_sitter::Node<'_>,
+    path: &Path,
+    source: &str,
+    line_starts: &[usize],
+    facts: ParseFacts,
+    _language: SourceLanguage,
+) -> BackendAstProduct {
+    let product = go::collect_go_ast_index(root, path, source, line_starts, facts);
+    BackendAstProduct {
+        ast: product.ast,
+        package: product.package,
+        imports: product.imports,
+        build_guard: product.build_guard,
+    }
+}
+
+fn no_includes(_source: &str) -> Vec<Include> {
+    Vec::new()
+}
+
+fn no_build_guard(_source: &str) -> Option<String> {
+    None
+}
 
 bitflags::bitflags! {
     /// Which facts to collect during `parse`. Include scanning always runs;
@@ -124,6 +211,9 @@ bitflags::bitflags! {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileSemanticIndex {
     pub includes: Vec<Include>,
+    pub package: Option<crate::semantic_model::PackageFact>,
+    pub imports: Vec<crate::semantic_model::ImportFact>,
+    pub build_guard: Option<String>,
     pub declarations: Vec<DeclarationFact>,
     pub fallback_completions: Vec<FallbackCompletionFact>,
     pub parse_outcome: ParseOutcome,
@@ -246,6 +336,8 @@ pub struct LocalDeclaration {
 pub enum LocalBindingKind {
     Parameter,
     LocalVariable,
+    LocalConstant,
+    LocalType,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -256,8 +348,8 @@ pub struct LocalBinding {
     pub decl_start_byte: usize,
     pub function_start_byte: usize,
     pub function_end_byte: usize,
-    /// Lexical block in which this binding is visible. Parameters use the
-    /// function body; locals use their nearest compound statement.
+    /// Lexical scope in which this binding is visible. Parameters use the
+    /// function body; locals use their nearest block or Go statement scope.
     pub scope_start_byte: usize,
     pub scope_end_byte: usize,
 }
@@ -300,6 +392,9 @@ impl FileSemanticIndex {
         PersistentFacts {
             parse_outcome: self.parse_outcome,
             includes: &self.includes,
+            package: self.package.as_ref(),
+            imports: &self.imports,
+            build_guard: self.build_guard.as_deref(),
             declarations: &self.declarations,
             fallback_completions: &self.fallback_completions,
             records: &self.records,
@@ -568,7 +663,11 @@ fn parse_with_handle_control(
     cancel: Option<&AtomicBool>,
 ) -> Option<FileSemanticIndex> {
     let line_starts = line_starts(source);
-    let includes = scan_includes(source);
+    let frontend = parser_frontend_adapter(language.parser_frontend());
+    // The Go adapter intentionally disables C include scanning: a cgo preamble
+    // may contain textual `#include` lines inside a Go comment, but cgo
+    // cross-language binding is outside the supported fact contract.
+    let includes = (frontend.scan_includes)(source);
 
     // Use the provided handle, or create a temporary one.
     let owned_handle;
@@ -601,7 +700,12 @@ fn parse_with_handle_control(
         return Some(lexical_fallback(source, includes, facts, language));
     }
 
-    let mut ast = collect_ast_index(
+    let BackendAstProduct {
+        mut ast,
+        package,
+        imports,
+        build_guard,
+    } = (frontend.collect)(
         tree.root_node(),
         path,
         source,
@@ -646,6 +750,9 @@ fn parse_with_handle_control(
 
     Some(FileSemanticIndex {
         includes,
+        package,
+        imports,
+        build_guard,
         declarations,
         fallback_completions: Vec::new(),
         parse_outcome,
@@ -716,6 +823,11 @@ fn lexical_fallback(
 ) -> FileSemanticIndex {
     FileSemanticIndex {
         includes,
+        package: None,
+        imports: Vec::new(),
+        build_guard: (parser_frontend_adapter(language.parser_frontend()).fallback_build_guard)(
+            source,
+        ),
         declarations: Vec::new(),
         fallback_completions: extract_fallback_completions(source, language),
         parse_outcome: ParseOutcome::LexicalFallback,

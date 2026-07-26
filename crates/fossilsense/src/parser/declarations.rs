@@ -27,18 +27,20 @@ pub(super) fn canonical_declarations(
 ) -> Vec<DeclarationFact> {
     let mut declarations = inputs.declarations;
     declarations.extend(callable_declarations(path, language, inputs.anchors));
-    declarations.extend(
-        inputs
-            .records
-            .iter()
-            .filter_map(|record| record_declaration(path, language, record)),
-    );
-    declarations.extend(
-        inputs
-            .aliases
-            .iter()
-            .map(|alias| alias_declaration(path, language, inputs.source, alias)),
-    );
+    if language != SourceLanguage::Go {
+        declarations.extend(
+            inputs
+                .records
+                .iter()
+                .filter_map(|record| record_declaration(path, language, record)),
+        );
+        declarations.extend(
+            inputs
+                .aliases
+                .iter()
+                .map(|alias| alias_declaration(path, language, inputs.source, alias)),
+        );
+    }
 
     let canonical: HashSet<_> = declarations
         .iter()
@@ -103,7 +105,7 @@ fn callable_declarations(
                 SemanticFactFidelity::Authoritative
             };
             let guard_fingerprint = anchor.guard.as_ref().map(|guard| digest(guard));
-            fact(
+            let mut declaration = fact(
                 path,
                 language,
                 anchor.name.clone(),
@@ -123,7 +125,13 @@ fn callable_declarations(
                 DeclarationBacking::CallableAnchor {
                     fingerprint: anchor.anchor_fingerprint.clone(),
                 },
-            )
+            );
+            if language == SourceLanguage::Go {
+                declaration.identity.logical_key.canonical_signature =
+                    (anchor.name == "init").then(|| anchor.entity_key.clone());
+                declaration.identity.logical_key.guard_fingerprint = None;
+            }
+            declaration
         })
         .collect()
 }
@@ -306,7 +314,7 @@ fn fact(
         declaration_kind,
         owner: owner.clone(),
         canonical_signature: canonical_signature.clone(),
-        linkage_domain: linkage_key(&linkage),
+        linkage_domain: linkage_key(language, &linkage),
         guard_fingerprint,
     };
     DeclarationFact {
@@ -321,6 +329,7 @@ fn fact(
             language: match language {
                 SourceLanguage::C => SemanticLanguage::C,
                 SourceLanguage::Cpp => SemanticLanguage::Cpp,
+                SourceLanguage::Go => SemanticLanguage::Go,
             },
             language_fidelity: LanguageFidelity::Explicit,
             provenance,
@@ -379,10 +388,14 @@ fn path_text(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
-fn linkage_key(linkage: &LinkageDomain) -> String {
+fn linkage_key(language: SourceLanguage, linkage: &LinkageDomain) -> String {
     match linkage {
         LinkageDomain::External => "external".into(),
+        LinkageDomain::Internal(package) if language == SourceLanguage::Go => {
+            format!("package:{package}")
+        }
         LinkageDomain::Internal(path) => format!("internal:{path}"),
+        LinkageDomain::Package(package) => format!("package:{package}"),
         LinkageDomain::Unknown => "unknown".into(),
     }
 }

@@ -387,6 +387,8 @@ fn local_binding_hover_markdown(
     let binding_kind = match binding.kind {
         crate::parser::LocalBindingKind::Parameter => "parameter",
         crate::parser::LocalBindingKind::LocalVariable => "local variable",
+        crate::parser::LocalBindingKind::LocalConstant => "local constant",
+        crate::parser::LocalBindingKind::LocalType => "local type",
     };
     let type_note = binding
         .type_text
@@ -611,6 +613,7 @@ fn record_hover_section(
         crate::semantic_model::RecordKind::Struct => "struct",
         crate::semantic_model::RecordKind::Union => "union",
         crate::semantic_model::RecordKind::Class => "class",
+        crate::semantic_model::RecordKind::Interface => "interface",
     };
     let mut section = format!("### {kind} `{}`\n\n", record.display_name);
     if let Some(comment) = type_candidate_comment(

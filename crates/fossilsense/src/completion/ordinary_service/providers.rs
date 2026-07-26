@@ -86,6 +86,19 @@ pub(super) fn completion_items_for_local_bindings(
 ) -> Vec<OrdinaryPipelineCandidate> {
     hits.into_iter()
         .map(|hit| {
+            let (candidate_kind, presentation_kind) = match hit.kind {
+                parser::LocalBindingKind::Parameter | parser::LocalBindingKind::LocalVariable => (
+                    CompletionCandidateKind::Variable,
+                    OrdinaryCompletionKind::Variable,
+                ),
+                parser::LocalBindingKind::LocalConstant => (
+                    CompletionCandidateKind::EnumConstant,
+                    OrdinaryCompletionKind::EnumConstant,
+                ),
+                parser::LocalBindingKind::LocalType => {
+                    (CompletionCandidateKind::Type, OrdinaryCompletionKind::Type)
+                }
+            };
             let mut evidence = CandidateEvidence::new(
                 CandidateSource::LocalBinding,
                 model::ScopeTier::Current,
@@ -93,13 +106,13 @@ pub(super) fn completion_items_for_local_bindings(
                 hit.score,
             );
             evidence.match_score = hit.match_score;
-            evidence.kind = CompletionCandidateKind::Variable;
+            evidence.kind = candidate_kind;
             set_completion_history_key(&mut evidence, &hit.name);
             OrdinaryPipelineCandidate::new(
                 hit.name.clone(),
                 evidence,
                 OrdinaryCompletionPresentation {
-                    kind: OrdinaryCompletionKind::Variable,
+                    kind: presentation_kind,
                     detail: Some(hit.detail),
                     documentation: None,
                     initial_sort_text: Some(format!("{:08}", 100_000_000 - hit.score)),

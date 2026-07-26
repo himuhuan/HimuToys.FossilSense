@@ -484,6 +484,7 @@ fn linkage_label(linkage: &LinkageDomain) -> &'static str {
     match linkage {
         LinkageDomain::External => "external",
         LinkageDomain::Internal(_) => "internal",
+        LinkageDomain::Package(_) => "package",
         LinkageDomain::Unknown => "unknown",
     }
 }

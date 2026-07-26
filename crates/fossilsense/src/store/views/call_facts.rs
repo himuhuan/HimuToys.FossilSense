@@ -349,7 +349,10 @@ impl<'a> CallFactStoreView<'a> {
                          ELSE 'function' END,
                     CASE a.role WHEN 1 THEN 'definition' WHEN 2 THEN 'synthetic'
                          ELSE 'declaration' END,
-                    CASE a.linkage_kind WHEN 1 THEN 'external' WHEN 2 THEN 'internal'
+                    CASE a.linkage_kind
+                        WHEN 1 THEN 'external'
+                        WHEN 2 THEN 'internal'
+                        WHEN 3 THEN 'package'
                          ELSE 'unknown' END,
                     linkage_text.text, signature_text.text, canonical_text.text,
                     presentation_text.text, a.signature_fidelity,

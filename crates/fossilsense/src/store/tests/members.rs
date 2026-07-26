@@ -167,6 +167,55 @@ fn members_for_records_limited_uses_limit_plus_one_and_reports_scan_count() {
 }
 
 #[test]
+fn split_go_members_are_not_multiplied_by_record_build_variants() {
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+    let mut store = IndexStore::open(&db, dir.path()).expect("store");
+    upsert_source(
+        &mut store,
+        "src/sensor/b_windows.go",
+        "//go:build windows\n\npackage sensor\ntype Device struct { Windows int }\n",
+    );
+    upsert_source(
+        &mut store,
+        "src/sensor/c_linux.go",
+        "//go:build linux\n\npackage sensor\ntype Device struct { Linux int }\n",
+    );
+    upsert_source(
+        &mut store,
+        "src/sensor/a_methods.go",
+        "package sensor\nfunc (Device) Close() {}\nfunc (Device) Open() {}\n",
+    );
+
+    let reader = IndexStore::open_readonly(&db).expect("readonly");
+    let records = reader
+        .resolve_record_candidates(&["Device"], None)
+        .expect("Device variants");
+    assert_eq!(records.len(), 2);
+    let record_ids: Vec<_> = records.iter().map(|record| record.id).collect();
+    let (members, scanned, truncated) = reader
+        .member_view()
+        .members_for_records_limited(&record_ids, None, None, 2)
+        .expect("bounded split members");
+    let persistent_ids: std::collections::HashSet<_> = members
+        .iter()
+        .map(|member| member.handle.persistent_id)
+        .collect();
+
+    assert_eq!(scanned, 2);
+    assert_eq!(members.len(), 2);
+    assert_eq!(
+        persistent_ids.len(),
+        2,
+        "each member fact must consume at most one scan-budget row"
+    );
+    assert!(
+        truncated,
+        "the remaining distinct fields/members must trip LIMIT+1"
+    );
+}
+
+#[test]
 fn field_member_type_names_are_persisted_for_chain_completion() {
     let dir = tempdir().expect("tempdir");
     let db = dir.path().join("index.sqlite");

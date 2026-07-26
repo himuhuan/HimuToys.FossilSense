@@ -44,6 +44,7 @@ pub(super) fn collect_macro_declaration(
             language: match language {
                 SourceLanguage::C => SemanticLanguage::C,
                 SourceLanguage::Cpp => SemanticLanguage::Cpp,
+                SourceLanguage::Go => SemanticLanguage::Go,
             },
             language_fidelity: LanguageFidelity::Explicit,
             provenance: SemanticFactProvenance::Ast,
@@ -147,6 +148,7 @@ pub(super) fn collect_object_declarations(
         let linkage_domain = match &linkage {
             crate::call_model::LinkageDomain::External => "external".to_string(),
             crate::call_model::LinkageDomain::Internal(path) => format!("internal:{path}"),
+            crate::call_model::LinkageDomain::Package(package) => format!("package:{package}"),
             crate::call_model::LinkageDomain::Unknown => "unknown".to_string(),
         };
         let logical_key = LogicalEntityKey {

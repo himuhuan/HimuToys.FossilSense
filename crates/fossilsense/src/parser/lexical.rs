@@ -31,6 +31,9 @@ pub(super) fn extract_fallback_completions(
     source: &str,
     language: SourceLanguage,
 ) -> Vec<FallbackCompletionFact> {
+    if language == SourceLanguage::Go {
+        return super::go::fallback_completions(source);
+    }
     let starts = super::line_starts(source);
     let symbols =
         extract_fallback_declarations_raw(source, &starts, language == SourceLanguage::Cpp);

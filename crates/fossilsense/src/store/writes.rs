@@ -37,8 +37,8 @@ pub(super) fn stage_file_updates(
         let mut revision_stmt = tx.prepare(
             "INSERT INTO file_revisions (
                 file_id, extension, size, mtime_ns, hash, indexed_at, status, error, source,
-                parser_version, fact_mask, parse_error_count, fallback_used
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                parser_version, fact_mask, parse_error_count, fallback_used, build_guard
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         )?;
         let mut pending_stmt = tx.prepare(
             "INSERT INTO pending_file_revisions (build_id, file_id, revision_id)
@@ -61,20 +61,40 @@ pub(super) fn stage_file_updates(
                 canonical_signature, declarator_shape_json, has_initializer, owner,
                 linkage_kind, guard, language, language_fidelity, provenance, fact_fidelity,
                 logical_key_digest, locator_fingerprint, logical_linkage_domain,
-                guard_fingerprint, backing_kind, backing_id, backing_key,
+                guard_fingerprint, logical_canonical_signature,
+                backing_kind, backing_id, backing_key,
                 backing_start_byte, backing_end_byte
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                 ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
                 ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35,
-                ?36, ?37
+                ?36, ?37, ?38
              )",
         )?;
         let mut include_stmt = tx
             .prepare("INSERT INTO include_facts (revision_id, file_id, line, target_text, target_form, target_normalized, target_basename) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")?;
+        let mut package_stmt = tx.prepare(
+            "INSERT INTO package_facts (
+                revision_id, file_id, name, name_start_byte, name_end_byte,
+                name_start_line, name_start_col, name_end_line, name_end_col
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        )?;
+        let mut import_stmt = tx.prepare(
+            "INSERT INTO import_facts (
+                revision_id, file_id, import_path, alias,
+                path_start_byte, path_end_byte, path_start_line, path_start_col,
+                path_end_line, path_end_col,
+                declaration_start_byte, declaration_end_byte,
+                declaration_start_line, declaration_start_col,
+                declaration_end_line, declaration_end_col
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                ?13, ?14, ?15, ?16
+             )",
+        )?;
         let mut record_stmt = tx.prepare(
             "INSERT INTO record_facts (
-                    revision_id, file_id, display_name, tag_name, typedef_name, kind, start_byte, end_byte,
+                    revision_id, file_id, record_key, display_name, tag_name, typedef_name, kind, start_byte, end_byte,
                     start_line, start_col, end_line, end_col,
                     body_start_byte, body_end_byte, body_start_line, body_start_col,
                     body_end_line, body_end_col,
@@ -83,13 +103,17 @@ pub(super) fn stage_file_updates(
                     range_fidelity, signature, confidence, declaration_hash
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
                            ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23,
-                           ?24, ?25, ?26, ?27, ?28)",
+                           ?24, ?25, ?26, ?27, ?28, ?29)",
         )?;
         let mut member_stmt = tx.prepare(
             "INSERT INTO member_facts (
-                    record_id, name, kind, confidence, start_byte, end_byte,
+                    revision_id, file_id, record_id, record_key,
+                    name, kind, confidence, start_byte, end_byte,
                     start_line, start_col, end_line, end_col, signature, type_name
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                    ?11, ?12, ?13, ?14, ?15
+                 )",
         )?;
         let mut alias_stmt = tx.prepare(
             "INSERT INTO type_alias_facts (
@@ -156,17 +180,18 @@ pub(super) fn stage_file_updates(
 
         for update in updates {
             let fingerprint = update.fingerprint;
-            let (status, error, fact_mask, parse_error_count, fallback_used) = match update.payload
-            {
-                FileIndexPayload::Ok(index) => (
-                    "ok",
-                    None,
-                    index.persistence_diagnostics().fact_mask as i64,
-                    index.persistence_diagnostics().parse_error_count as i64,
-                    i64::from(index.persistence_diagnostics().fallback_used),
-                ),
-                FileIndexPayload::Error(error) => ("error", Some(error), 0, 0, 0),
-            };
+            let (status, error, fact_mask, parse_error_count, fallback_used, build_guard) =
+                match update.payload {
+                    FileIndexPayload::Ok(index) => (
+                        "ok",
+                        None,
+                        index.persistence_diagnostics().fact_mask as i64,
+                        index.persistence_diagnostics().parse_error_count as i64,
+                        i64::from(index.persistence_diagnostics().fallback_used),
+                        index.persistent_facts().build_guard,
+                    ),
+                    FileIndexPayload::Error(error) => ("error", Some(error), 0, 0, 0, None),
+                };
             file_stmt.execute(params![
                 fingerprint.path.as_str(),
                 fingerprint.extension.as_str(),
@@ -195,6 +220,7 @@ pub(super) fn stage_file_updates(
                 fact_mask,
                 parse_error_count,
                 fallback_used,
+                build_guard,
             ])?;
             let revision_id = tx.last_insert_rowid();
             pending_stmt.execute(params![build.id, file_id, revision_id])?;
@@ -221,7 +247,9 @@ pub(super) fn stage_file_updates(
                 anyhow::bail!("fallback revision attempted to persist declarations");
             }
             if fallback_used != 0
-                && (!facts.records.is_empty()
+                && (facts.package.is_some()
+                    || !facts.imports.is_empty()
+                    || !facts.records.is_empty()
                     || !facts.fields.is_empty()
                     || !facts.members.is_empty()
                     || !facts.aliases.is_empty()
@@ -267,6 +295,41 @@ pub(super) fn stage_file_updates(
                 ])?;
             }
 
+            if let Some(package) = facts.package {
+                package_stmt.execute(params![
+                    revision_id,
+                    file_id,
+                    package.name.as_str(),
+                    package.name_range.start_byte as i64,
+                    package.name_range.end_byte as i64,
+                    package.name_range.start.line as i64,
+                    package.name_range.start.character as i64,
+                    package.name_range.end.line as i64,
+                    package.name_range.end.character as i64,
+                ])?;
+            }
+
+            for import in facts.imports {
+                import_stmt.execute(params![
+                    revision_id,
+                    file_id,
+                    import.path.as_str(),
+                    import.alias.as_deref(),
+                    import.path_range.start_byte as i64,
+                    import.path_range.end_byte as i64,
+                    import.path_range.start.line as i64,
+                    import.path_range.start.character as i64,
+                    import.path_range.end.line as i64,
+                    import.path_range.end.character as i64,
+                    import.declaration_range.start_byte as i64,
+                    import.declaration_range.end_byte as i64,
+                    import.declaration_range.start.line as i64,
+                    import.declaration_range.start.character as i64,
+                    import.declaration_range.end.line as i64,
+                    import.declaration_range.end.character as i64,
+                ])?;
+            }
+
             let mut record_key_to_id = HashMap::new();
             let mut record_name_to_ids: std::collections::HashMap<String, Vec<i64>> =
                 std::collections::HashMap::new();
@@ -274,6 +337,7 @@ pub(super) fn stage_file_updates(
                 record_stmt.execute(params![
                     revision_id,
                     file_id,
+                    record.record_key.as_str(),
                     record.display_name.as_str(),
                     record.tag_name.as_deref(),
                     record.typedef_name.as_deref(),
@@ -329,22 +393,23 @@ pub(super) fn stage_file_updates(
                         let ids = record_name_to_ids.get(owner)?;
                         (ids.len() == 1).then_some(ids[0])
                     });
-                if let Some(rid) = record_id {
-                    member_stmt.execute(params![
-                        rid,
-                        member.name.as_str(),
-                        member_kind_to_str(member.kind),
-                        member_confidence_to_str(member.confidence),
-                        member.start_byte as i64,
-                        member.end_byte as i64,
-                        member.start_line as i64,
-                        member.start_col as i64,
-                        member.end_line as i64,
-                        member.end_col as i64,
-                        member.signature.as_str(),
-                        member.type_name.as_deref(),
-                    ])?;
-                }
+                member_stmt.execute(params![
+                    revision_id,
+                    file_id,
+                    record_id,
+                    member.record_key.as_str(),
+                    member.name.as_str(),
+                    member_kind_to_str(member.kind),
+                    member_confidence_to_str(member.confidence),
+                    member.start_byte as i64,
+                    member.end_byte as i64,
+                    member.start_line as i64,
+                    member.start_col as i64,
+                    member.end_line as i64,
+                    member.end_col as i64,
+                    member.signature.as_str(),
+                    member.type_name.as_deref(),
+                ])?;
             }
 
             let mut alias_fingerprint_to_id = HashMap::new();
@@ -397,6 +462,9 @@ pub(super) fn stage_file_updates(
                 let (linkage_kind, linkage_file) = match &anchor.linkage {
                     crate::call_model::LinkageDomain::External => (1i64, None),
                     crate::call_model::LinkageDomain::Internal(path) => (2, Some(path.as_str())),
+                    crate::call_model::LinkageDomain::Package(package) => {
+                        (3, Some(package.as_str()))
+                    }
                     crate::call_model::LinkageDomain::Unknown => (0, None),
                 };
                 let name_id = intern_call_string(&anchor.name)?;
@@ -517,10 +585,12 @@ pub(super) fn stage_file_updates(
                     .locator
                     .path
                     .clone_from(&fingerprint.path);
-                if matches!(
-                    declaration.linkage,
-                    crate::call_model::LinkageDomain::Internal(_)
-                ) {
+                if declaration.identity.language != SemanticLanguage::Go
+                    && matches!(
+                        declaration.linkage,
+                        crate::call_model::LinkageDomain::Internal(_)
+                    )
+                {
                     declaration.linkage =
                         crate::call_model::LinkageDomain::Internal(fingerprint.path.clone());
                     declaration.identity.logical_key.linkage_domain =
@@ -607,6 +677,11 @@ pub(super) fn stage_file_updates(
                         .logical_key
                         .guard_fingerprint
                         .as_deref(),
+                    declaration
+                        .identity
+                        .logical_key
+                        .canonical_signature
+                        .as_deref(),
                     backing_kind,
                     backing_id,
                     backing_key,
@@ -673,6 +748,7 @@ fn linkage_kind_code(linkage: &crate::call_model::LinkageDomain) -> i64 {
         crate::call_model::LinkageDomain::External => 0,
         crate::call_model::LinkageDomain::Internal(_) => 1,
         crate::call_model::LinkageDomain::Unknown => 2,
+        crate::call_model::LinkageDomain::Package(_) => 3,
     }
 }
 
@@ -681,6 +757,7 @@ fn semantic_language_code(language: SemanticLanguage) -> i64 {
         SemanticLanguage::C => 0,
         SemanticLanguage::Cpp => 1,
         SemanticLanguage::Unknown => 2,
+        SemanticLanguage::Go => 3,
     }
 }
 
