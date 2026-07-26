@@ -82,7 +82,11 @@ for (const testCase of cases) {
 
   const expected = fs.readFileSync(path.join(goldenRoot, testCase.golden), "utf8");
   assert.equal(result.status, testCase.expectedStatus, `${testCase.name} exit status\n${result.stderr}`);
-  assert.equal(result.stdout.replace(/\r\n/g, "\n"), expected, `${testCase.name} stdout`);
+  assert.equal(
+    result.stdout.replace(/\r\n/g, "\n"),
+    expected.replace(/\r\n/g, "\n"),
+    `${testCase.name} stdout`
+  );
   assert.equal(result.stderr.replace(/\r\n/g, "\n"), "", `${testCase.name} stderr`);
 }
 
