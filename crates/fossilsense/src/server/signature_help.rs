@@ -205,6 +205,7 @@ impl Backend {
                         &ranked,
                         active_argument,
                         comment.as_ref(),
+                        candidate.anchor.signature.variadic,
                         candidates.arity_mismatch_fallback,
                     ));
                 }
@@ -257,13 +258,14 @@ pub(super) fn signature_information_for(
     ranked: &query::RankedSignatureCandidate,
     active_argument: u32,
 ) -> SignatureInformation {
-    signature_information_for_with_comment(ranked, active_argument, None, false)
+    signature_information_for_with_comment(ranked, active_argument, None, false, false)
 }
 
 fn signature_information_for_with_comment(
     ranked: &query::RankedSignatureCandidate,
     active_argument: u32,
     comment: Option<&query::RenderedSymbolComment>,
+    variadic: bool,
     arity_mismatch_fallback: bool,
 ) -> SignatureInformation {
     let parts: query::SignatureParts = if ranked.candidate.name.is_empty() {
@@ -284,11 +286,14 @@ fn signature_information_for_with_comment(
             }),
         })
         .collect();
-    let active_parameter = if parameters.is_empty() || active_argument as usize >= parameters.len()
-    {
+    let active_parameter = if parameters.is_empty() {
         None
-    } else {
+    } else if (active_argument as usize) < parameters.len() {
         Some(active_argument)
+    } else if variadic {
+        Some((parameters.len() - 1) as u32)
+    } else {
+        None
     };
     SignatureInformation {
         label: parts.label,
@@ -463,6 +468,7 @@ mod tests {
             0,
             Some(&comment),
             false,
+            false,
         );
         let documentation = match info.documentation.expect("documentation") {
             Documentation::String(value) => value,
@@ -487,6 +493,21 @@ mod tests {
         let info = signature_information_for(
             &candidate("int foo(int a)", crate::model::ScopeTier::Global),
             3,
+        );
+        assert_eq!(info.active_parameter, None);
+    }
+
+    #[test]
+    fn nested_function_pointer_ellipsis_does_not_make_the_outer_function_variadic() {
+        let info = signature_information_for_with_comment(
+            &candidate(
+                "void install(void (*callback)(int, ...))",
+                crate::model::ScopeTier::Reachable,
+            ),
+            1,
+            None,
+            false,
+            false,
         );
         assert_eq!(info.active_parameter, None);
     }

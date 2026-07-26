@@ -10,7 +10,9 @@ use crate::pathing;
 use crate::progress::DegradedCapabilities;
 use crate::reachability::ReachGraph;
 use crate::server::workspace::EngineSnapshot;
-use crate::server::{CacheLedger, CachePublishReport, IncludeCompletionTable};
+use crate::server::{
+    CacheLedger, CachePublishReport, GoImportCompletionTable, IncludeCompletionTable,
+};
 use crate::store::IndexStore;
 
 mod declaration_models;
@@ -148,6 +150,25 @@ fn build_include_table_from_db(db_path: &Path) -> Result<IncludeCompletionTable>
     ))
 }
 
+pub(in crate::server) async fn rebuild_go_import_table(
+    root: PathBuf,
+) -> Result<Arc<GoImportCompletionTable>> {
+    let built = tokio::task::spawn_blocking(move || -> Result<GoImportCompletionTable> {
+        let db_path = pathing::default_index_path(&root)?;
+        let store = IndexStore::open_readonly(&db_path)?;
+        Ok(GoImportCompletionTable::build(
+            store.go_package_graph_view().importable_packages()?,
+        ))
+    })
+    .await;
+
+    match built {
+        Ok(Ok(table)) => Ok(Arc::new(table)),
+        Ok(Err(err)) => Err(err),
+        Err(err) => Err(err.into()),
+    }
+}
+
 pub(in crate::server) async fn rebuild_indexed_file_list(
     root: PathBuf,
 ) -> Result<Arc<Vec<(String, PathBuf)>>> {
@@ -266,6 +287,15 @@ impl CacheLedger {
             }
         };
         let include_count = include_table.as_ref().map_or(0, |table| table.len());
+        let mut go_import_table_error = None;
+        let go_import_table = match rebuild_go_import_table(root.clone()).await {
+            Ok(table) => Some(table),
+            Err(err) => {
+                degraded.go_import_table = true;
+                go_import_table_error = Some(format!("{err:#}"));
+                None
+            }
+        };
 
         let mut reference_file_list_error = None;
         let indexed_files = match rebuild_indexed_file_list(root.clone()).await {
@@ -294,6 +324,7 @@ impl CacheLedger {
             fallback_completion_table,
             reach_graph,
             include_table,
+            go_import_table,
             indexed_files,
             project_context,
             call_read_handle: Some(call_read_handle),
@@ -312,6 +343,7 @@ impl CacheLedger {
             degraded,
             epoch,
             include_table_error,
+            go_import_table_error,
             reference_file_list_error,
         })
     }
@@ -374,6 +406,15 @@ impl CacheLedger {
             }
         };
         let include_count = include_table.as_ref().map_or(0, |table| table.len());
+        let mut go_import_table_error = None;
+        let go_import_table = match rebuild_go_import_table(root.clone()).await {
+            Ok(table) => Some(table),
+            Err(err) => {
+                degraded.go_import_table = true;
+                go_import_table_error = Some(format!("{err:#}"));
+                None
+            }
+        };
 
         let mut reference_file_list_error = None;
         let indexed_files = match update_indexed_file_list(
@@ -410,6 +451,7 @@ impl CacheLedger {
             fallback_completion_table,
             reach_graph,
             include_table,
+            go_import_table,
             indexed_files,
             project_context,
             call_read_handle: Some(call_read_handle),
@@ -428,6 +470,7 @@ impl CacheLedger {
             degraded,
             epoch,
             include_table_error,
+            go_import_table_error,
             reference_file_list_error,
         };
         drop(_publish_guard);
@@ -511,6 +554,7 @@ impl CacheLedger {
             fallback_completion_table: current.fallback_completion_table.clone(),
             reach_graph: current.reach_graph.clone(),
             include_table: current.include_table.clone(),
+            go_import_table: current.go_import_table.clone(),
             indexed_files: current.indexed_files.clone(),
             project_context: current.project_context.clone(),
             call_read_handle: current.call_read_handle.clone(),
@@ -556,6 +600,7 @@ impl CacheLedger {
             fallback_completion_table: previous.fallback_completion_table.clone(),
             reach_graph: previous.reach_graph.clone(),
             include_table: previous.include_table.clone(),
+            go_import_table: previous.go_import_table.clone(),
             indexed_files: previous.indexed_files.clone(),
             project_context,
             call_read_handle: previous.call_read_handle.clone(),

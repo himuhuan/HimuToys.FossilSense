@@ -7,10 +7,11 @@ assert.strictEqual(
   degradedCapabilityWarning({
     reachGraph: true,
     includeTable: true,
+    goImportTable: true,
     referenceFileList: true,
     projectContext: true,
   }),
-  'reachGraph, includeTable, referenceFileList, projectContext',
+  'reachGraph, includeTable, goImportTable, referenceFileList, projectContext',
 );
 
 assert.strictEqual(

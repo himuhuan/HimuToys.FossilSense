@@ -1,6 +1,7 @@
 export interface DegradedCapabilities {
   reachGraph?: boolean;
   includeTable?: boolean;
+  goImportTable?: boolean;
   referenceFileList?: boolean;
   projectContext?: boolean;
 }
@@ -12,6 +13,9 @@ export function degradedCapabilityWarning(degraded?: DegradedCapabilities): stri
   }
   if (degraded?.includeTable) {
     labels.push('includeTable');
+  }
+  if (degraded?.goImportTable) {
+    labels.push('goImportTable');
   }
   if (degraded?.referenceFileList) {
     labels.push('referenceFileList');

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tower_lsp::lsp_types::Url;
 
+use super::super::go_import_completion::GoImportCompletionTable;
 use super::super::include_completion::IncludeCompletionTable;
 use super::super::state;
 use crate::call_model::SemanticGeneration;
@@ -61,6 +62,7 @@ pub(in crate::server) struct EngineSnapshot {
         Arc<crate::completion::ordinary_service::FallbackCompletionNameTable>,
     pub(in crate::server) reach_graph: Option<Arc<ReachGraph>>,
     pub(in crate::server) include_table: Option<Arc<IncludeCompletionTable>>,
+    pub(in crate::server) go_import_table: Option<Arc<GoImportCompletionTable>>,
     pub(in crate::server) indexed_files: Option<Arc<Vec<(String, PathBuf)>>>,
     pub(in crate::server) project_context: Option<Arc<ProjectContextIndex>>,
     pub(in crate::server) call_read_handle: Option<Arc<CallReadHandle>>,
@@ -80,6 +82,7 @@ impl EngineSnapshot {
             ),
             reach_graph: None,
             include_table: None,
+            go_import_table: None,
             indexed_files: None,
             project_context: None,
             call_read_handle: None,
@@ -149,5 +152,6 @@ pub(in crate::server) struct CachePublishReport {
     pub(in crate::server) degraded: crate::progress::DegradedCapabilities,
     pub(in crate::server) epoch: state::EngineEpoch,
     pub(in crate::server) include_table_error: Option<String>,
+    pub(in crate::server) go_import_table_error: Option<String>,
     pub(in crate::server) reference_file_list_error: Option<String>,
 }

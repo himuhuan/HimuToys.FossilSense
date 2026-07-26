@@ -218,6 +218,7 @@ impl IndexStore {
         if include_graph.clear_all_go_packages {
             tx.execute("DELETE FROM go_package_edges", [])?;
             tx.execute("DELETE FROM go_open_packages", [])?;
+            tx.execute("DELETE FROM go_importable_packages", [])?;
         }
         for (source, target, resolution) in &include_graph.go_package_edges {
             tx.execute(
@@ -232,6 +233,13 @@ impl IndexStore {
                 "INSERT OR REPLACE INTO go_open_packages (package_key, reason)
                  VALUES (?1, ?2)",
                 rusqlite::params![package_key, reason],
+            )?;
+        }
+        for (package_key, import_path) in &include_graph.go_importable_packages {
+            tx.execute(
+                "INSERT OR REPLACE INTO go_importable_packages (package_key, import_path)
+                 VALUES (?1, ?2)",
+                rusqlite::params![package_key, import_path],
             )?;
         }
         tx.execute(

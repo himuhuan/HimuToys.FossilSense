@@ -239,6 +239,7 @@ pub fn index_workspace(
     let go_package_graph = build_go_package_graph(&store, build, &workspace, &go_module_roots)?;
     include_graph.go_package_edges = go_package_graph.edges;
     include_graph.go_open_packages = go_package_graph.open_packages;
+    include_graph.go_importable_packages = go_package_graph.importable_packages;
     include_graph.clear_all_go_packages = true;
     let commit = store.commit_index_build(build, &include_graph)?;
     stats.semantic_generation = commit.generation;
@@ -440,6 +441,7 @@ pub fn index_dirty_files(
     let go_package_graph = build_go_package_graph(&store, build, &workspace, &go_module_roots)?;
     include_graph.go_package_edges = go_package_graph.edges;
     include_graph.go_open_packages = go_package_graph.open_packages;
+    include_graph.go_importable_packages = go_package_graph.importable_packages;
     include_graph.clear_all_go_packages = true;
     let commit = store.commit_index_build(build, &include_graph)?;
     stats.semantic_generation = commit.generation;

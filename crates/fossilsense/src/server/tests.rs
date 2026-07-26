@@ -11,14 +11,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex as StdMutex};
 use tempfile::tempdir;
 use tower_lsp::lsp_types::{
-    CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse,
-    DeclarationCapability, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
-    DidChangeWorkspaceFoldersParams, DidOpenTextDocumentParams, DocumentSymbolParams,
-    DocumentSymbolResponse, Documentation, ExecuteCommandParams, FileChangeType, FileEvent,
-    GotoDefinitionParams, GotoDefinitionResponse, HoverContents, HoverParams, InitializeParams,
-    OneOf, Position, SignatureHelpParams, TextDocumentContentChangeEvent, TextDocumentIdentifier,
-    TextDocumentItem, TextDocumentPositionParams, Url, VersionedTextDocumentIdentifier,
-    WorkspaceFolder, WorkspaceFoldersChangeEvent, WorkspaceSymbolParams,
+    CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams, CompletionItem,
+    CompletionItemKind, CompletionParams, CompletionResponse, DeclarationCapability,
+    DidChangeTextDocumentParams, DidChangeWatchedFilesParams, DidChangeWorkspaceFoldersParams,
+    DidOpenTextDocumentParams, DocumentSymbolParams, DocumentSymbolResponse, Documentation,
+    ExecuteCommandParams, FileChangeType, FileEvent, GotoDefinitionParams, GotoDefinitionResponse,
+    HoverContents, HoverParams, InitializeParams, OneOf, Position, ReferenceContext,
+    ReferenceParams, SemanticTokensParams, SemanticTokensResult, SignatureHelpParams,
+    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
+    TextDocumentPositionParams, Url, VersionedTextDocumentIdentifier, WorkspaceFolder,
+    WorkspaceFoldersChangeEvent, WorkspaceSymbolParams,
 };
 use tower_lsp::{LanguageServer as _, LspService};
 
@@ -95,6 +97,20 @@ fn signature_help_params(uri: Url, line: u32, character: u32) -> SignatureHelpPa
         },
         work_done_progress_params: Default::default(),
         context: None,
+    }
+}
+
+fn reference_params(uri: Url, line: u32, character: u32) -> ReferenceParams {
+    ReferenceParams {
+        text_document_position: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri },
+            position: Position::new(line, character),
+        },
+        work_done_progress_params: Default::default(),
+        partial_result_params: Default::default(),
+        context: ReferenceContext {
+            include_declaration: true,
+        },
     }
 }
 
@@ -303,6 +319,7 @@ async fn workspace_folder_removal_drops_root_and_published_snapshot() {
             fallback_completion_table: Arc::new(Default::default()),
             reach_graph: None,
             include_table: None,
+            go_import_table: None,
             indexed_files: None,
             project_context: None,
             call_read_handle: None,
@@ -383,6 +400,7 @@ async fn name_index_compaction_publishes_only_for_the_expected_engine_epoch() {
             fallback_completion_table: Arc::new(Default::default()),
             reach_graph: None,
             include_table: None,
+            go_import_table: None,
             indexed_files: None,
             project_context: None,
             call_read_handle: None,
@@ -757,6 +775,519 @@ async fn go_live_parse_uses_the_same_relative_package_identity_as_indexing() {
         declaration.linkage,
         crate::call_model::LinkageDomain::Package("src/sensor#sensor".to_string())
     );
+}
+
+#[tokio::test]
+async fn go_lsp_symbols_navigation_hover_and_possible_targets_share_persisted_facts() {
+    let api = "package device\n\
+               // Exported returns the adjusted sensor value.\n\
+               func Exported(value int) int { return value + 1 }\n";
+    let (dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[
+            ("go.mod", "module example.com/board\n\ngo 1.22\n"),
+            ("device/api.go", api),
+        ],
+        "device/use.go",
+        "package device\nfunc Use() int { return Exported/*cursor*/(1) }\n",
+    )
+    .await;
+
+    let symbols = service
+        .inner()
+        .document_symbol(DocumentSymbolParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .expect("document symbols")
+        .expect("Go document symbols");
+    let names: Vec<_> = match symbols {
+        DocumentSymbolResponse::Nested(symbols) => {
+            symbols.into_iter().map(|symbol| symbol.name).collect()
+        }
+        DocumentSymbolResponse::Flat(symbols) => {
+            symbols.into_iter().map(|symbol| symbol.name).collect()
+        }
+    };
+    assert!(names.iter().any(|name| name == "Use"), "{names:?}");
+
+    let workspace_symbols = service
+        .inner()
+        .symbol(WorkspaceSymbolParams {
+            query: "Exported".into(),
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .expect("workspace symbols")
+        .expect("Go workspace symbols");
+    assert!(
+        workspace_symbols
+            .iter()
+            .any(|symbol| symbol.name == "Exported"),
+        "{workspace_symbols:?}"
+    );
+
+    let definition = service
+        .inner()
+        .goto_definition(goto_definition_params(uri.clone(), line, character))
+        .await
+        .expect("Go definition")
+        .expect("Exported definition");
+    let definition_targets = definition_locations(definition);
+    assert_eq!(definition_targets.len(), 1);
+    assert_eq!(
+        definition_targets[0].uri,
+        Url::from_file_path(dir.path().join("device/api.go")).expect("api uri")
+    );
+    assert_eq!(definition_targets[0].range.start.line, 2);
+
+    let declaration = service
+        .inner()
+        .goto_declaration(goto_definition_params(uri.clone(), line, character))
+        .await
+        .expect("Go declaration")
+        .expect("Exported declaration");
+    assert_eq!(definition_locations(declaration).len(), 1);
+
+    let hover = service
+        .inner()
+        .hover(hover_params(uri.clone(), line, character))
+        .await
+        .expect("Go hover")
+        .expect("Exported hover");
+    let hover = hover_text(hover.contents);
+    assert!(hover.contains("func Exported(value int) int"), "{hover}");
+    assert!(
+        hover.contains("returns the adjusted sensor value"),
+        "{hover}"
+    );
+
+    let possible = service
+        .inner()
+        .possible_targets_command(&serde_json::json!({
+            "uri": uri,
+            "line": line,
+            "character": character,
+        }))
+        .await
+        .expect("Go possible targets");
+    assert_eq!(possible["name"], "Exported");
+    assert_eq!(possible["items"].as_array().map(Vec::len), Some(1));
+    assert_eq!(possible["items"][0]["linkage"], "package");
+}
+
+#[tokio::test]
+async fn go_lsp_completion_covers_indexed_local_member_import_and_resolve() {
+    let api = "package device\n\
+               // Exported reports the current device value.\n\
+               func Exported(value int) int { return value }\n\
+               type Device struct { Reading int }\n\
+               func (device Device) Reset() {}\n";
+    let (_dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[
+            ("go.mod", "module example.com/board\n\ngo 1.22\n"),
+            ("device/api.go", api),
+        ],
+        "main.go",
+        "package main\nfunc Use() { Expor/*cursor*/ }\n",
+    )
+    .await;
+
+    let response = service
+        .inner()
+        .completion(completion_params(uri.clone(), line, character))
+        .await
+        .expect("ordinary Go completion")
+        .expect("ordinary completion response");
+    let exported = completion_items(response)
+        .into_iter()
+        .find(|item| item.label == "Exported")
+        .expect("indexed Go completion");
+    assert_eq!(exported.kind, Some(CompletionItemKind::FUNCTION));
+    let resolved = service
+        .inner()
+        .completion_resolve(exported)
+        .await
+        .expect("resolve indexed Go completion");
+    let documentation = resolved
+        .documentation
+        .map(documentation_text)
+        .expect("resolved Go documentation");
+    assert!(
+        documentation.contains("reports the current device value"),
+        "{documentation}"
+    );
+
+    let (local_source, local_line, local_character) =
+        text_and_position("package main\nfunc Use() { localThing := 1; _ = localTh/*cursor*/ }\n");
+    open_test_document(&service, uri.clone(), 2, local_source).await;
+    let local = service
+        .inner()
+        .completion(completion_params(uri.clone(), local_line, local_character))
+        .await
+        .expect("local Go completion")
+        .expect("local completion response");
+    assert!(
+        completion_items(local)
+            .iter()
+            .any(|item| item.label == "localThing"),
+        "short variable should be recalled from the current Go scope"
+    );
+
+    let (member_source, member_line, member_character) = text_and_position(
+        "package main\n\
+         type Device struct { Reading int }\n\
+         func (device Device) Reset() {}\n\
+         func Use() { var device Device; _ = device.Re/*cursor*/ }\n",
+    );
+    open_test_document(&service, uri.clone(), 3, member_source).await;
+    let members = service
+        .inner()
+        .completion(completion_params(
+            uri.clone(),
+            member_line,
+            member_character,
+        ))
+        .await
+        .expect("member Go completion")
+        .expect("member completion response");
+    let member_labels: Vec<_> = completion_items(members)
+        .into_iter()
+        .map(|item| item.label)
+        .collect();
+    assert!(member_labels.iter().any(|label| label == "Reading"));
+    assert!(member_labels.iter().any(|label| label == "Reset"));
+
+    let (import_source, import_line, import_character) =
+        text_and_position("package main\nimport \"example.com/board/de/*cursor*/\"\n");
+    open_test_document(&service, uri.clone(), 4, import_source).await;
+    let imports = service
+        .inner()
+        .completion(completion_params(uri, import_line, import_character))
+        .await
+        .expect("Go import completion")
+        .expect("Go import completion response");
+    let device = completion_items(imports)
+        .into_iter()
+        .find(|item| item.label == "example.com/board/device")
+        .expect("indexed Go package import path");
+    assert_eq!(device.kind, Some(CompletionItemKind::MODULE));
+}
+
+#[tokio::test]
+async fn go_import_completion_does_not_offer_the_current_package() {
+    let source = "package device\nimport \"example.com/board/devi/*cursor*/\"\n";
+    let (_dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[
+            ("go.mod", "module example.com/board\n\ngo 1.22\n"),
+            ("device/api.go", "package device\nfunc Open() {}\n"),
+        ],
+        "device/use.go",
+        source,
+    )
+    .await;
+    #[cfg(windows)]
+    let uri = {
+        let upper_path = PathBuf::from(
+            uri.to_file_path()
+                .expect("workspace path")
+                .to_string_lossy()
+                .to_ascii_uppercase(),
+        );
+        let upper_uri = Url::from_file_path(upper_path).expect("uppercase workspace uri");
+        open_test_document(
+            &service,
+            upper_uri.clone(),
+            2,
+            source.replace("/*cursor*/", ""),
+        )
+        .await;
+        upper_uri
+    };
+    let completion = service
+        .inner()
+        .completion(completion_params(uri.clone(), line, character))
+        .await
+        .expect("self import completion")
+        .expect("self import completion response");
+    assert!(completion_items(completion)
+        .iter()
+        .all(|item| item.label != "example.com/board/device"));
+}
+
+#[tokio::test]
+async fn go_import_completion_filters_the_open_external_module_package() {
+    let dir = tempdir().expect("tempdir");
+    let workspace = dir.path().join("workspace");
+    let external = dir.path().join("external");
+    fs::create_dir_all(&workspace).expect("workspace");
+    fs::create_dir_all(external.join("pkg")).expect("external package");
+    fs::write(workspace.join("go.mod"), "module example.com/workspace\n").expect("workspace mod");
+    fs::write(workspace.join("main.go"), "package main\nfunc main() {}\n").expect("workspace main");
+    fs::write(external.join("go.mod"), "module example.com/external\n").expect("external mod");
+    let (source, line, character) =
+        text_and_position("package pkg\nimport \"example.com/external/p/*cursor*/\"\n");
+    let external_file = external.join("pkg/use.go");
+    fs::write(&external_file, &source).expect("external source");
+    fs::write(
+        workspace.join("fossilsense.json"),
+        serde_json::json!({"goModulePaths": [external.to_string_lossy()]}).to_string(),
+    )
+    .expect("workspace config");
+    crate::indexer::index_workspace(
+        &workspace,
+        crate::indexer::IndexOptions {
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("index");
+
+    let service = test_backend_service();
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(workspace.clone());
+    service
+        .inner()
+        .session
+        .cache
+        .publish_full_index(&service.inner().client, workspace)
+        .await
+        .expect("publish");
+    #[cfg(windows)]
+    let external_file = PathBuf::from(external_file.to_string_lossy().to_ascii_uppercase());
+    let uri = Url::from_file_path(external_file).expect("external uri");
+    open_test_document(&service, uri.clone(), 1, source).await;
+
+    let completion = service
+        .inner()
+        .completion(completion_params(uri, line, character))
+        .await
+        .expect("external self completion")
+        .expect("external completion response");
+    assert!(completion_items(completion)
+        .iter()
+        .all(|item| item.label != "example.com/external/pkg"));
+}
+
+#[tokio::test]
+async fn go_lsp_references_keep_roles_and_do_not_cross_the_c_family_boundary() {
+    let source = "package device\nfunc Target() {}\nfunc Use() { Target/*cursor*/() }\n";
+    let (_dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[
+            ("go.mod", "module example.com/board\n\ngo 1.22\n"),
+            (
+                "same.c",
+                "void Target(void) {}\nvoid use(void) { Target(); }\n",
+            ),
+        ],
+        "main.go",
+        source,
+    )
+    .await;
+
+    let references = service
+        .inner()
+        .references(reference_params(uri.clone(), line, character))
+        .await
+        .expect("Go references")
+        .expect("Go reference locations");
+    assert_eq!(references.len(), 2, "{references:?}");
+    assert!(
+        references
+            .iter()
+            .all(|location| location.uri.path().ends_with("/main.go")),
+        "{references:?}"
+    );
+
+    let grouped = service
+        .inner()
+        .execute_command(ExecuteCommandParams {
+            command: super::GROUPED_REFERENCES_LSP_COMMAND.into(),
+            arguments: vec![serde_json::json!({
+                "uri": uri,
+                "line": line,
+                "character": character,
+            })],
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .expect("grouped Go references")
+        .expect("grouped Go reference response");
+    let roles: Vec<_> = grouped
+        .as_array()
+        .expect("grouped reference array")
+        .iter()
+        .filter_map(|item| item["role"].as_str())
+        .collect();
+    assert_eq!(roles, vec!["definition", "call"]);
+}
+
+#[tokio::test]
+async fn references_use_one_cached_language_config_snapshot_per_request() {
+    let initial_config = r#"{"languageOverrides":[{"glob":"legacy/**/*.h","language":"go"}]}"#;
+    let source = "package legacy\nfunc Target() {}\nfunc Use() { Target/*cursor*/() }\n";
+    let (dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[
+            ("fossilsense.json", initial_config),
+            ("same.c", "void Target(void) {}\n"),
+        ],
+        "legacy/api.h",
+        source,
+    )
+    .await;
+    assert_eq!(
+        service.inner().source_language_for_uri(&uri).await,
+        crate::config::SourceLanguage::Go,
+        "prime the request-side cached resolver"
+    );
+    fs::write(
+        dir.path().join("fossilsense.json"),
+        r#"{"languageOverrides":[{"glob":"legacy/**/*.h","language":"c"}]}"#,
+    )
+    .expect("change config on disk without a watcher event");
+
+    let references = service
+        .inner()
+        .references(reference_params(uri, line, character))
+        .await
+        .expect("references")
+        .expect("reference locations");
+    assert_eq!(
+        references.len(),
+        2,
+        "one request must not mix the cached request language with a newly reloaded file resolver"
+    );
+    assert!(
+        references
+            .iter()
+            .all(|location| location.uri.path().ends_with("/legacy/api.h")),
+        "{references:?}"
+    );
+}
+
+#[tokio::test]
+async fn go_lsp_signature_help_handles_variadics_and_semantic_tokens() {
+    let api = "package device\n\
+               // Format combines a prefix and values.\n\
+               func Format(prefix string, values ...int) int { return len(values) }\n";
+    let (_dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[
+            ("go.mod", "module example.com/board\n\ngo 1.22\n"),
+            ("device/api.go", api),
+        ],
+        "device/use.go",
+        "package device\nfunc Use() { _ = Format(\"value\", 1, /*cursor*/) }\n",
+    )
+    .await;
+    let help = service
+        .inner()
+        .signature_help(signature_help_params(uri.clone(), line, character))
+        .await
+        .expect("Go signature help")
+        .expect("Go signature response");
+    assert_eq!(help.signatures.len(), 1);
+    assert!(
+        help.signatures[0].label.contains("values ...int"),
+        "{}",
+        help.signatures[0].label
+    );
+    assert_eq!(
+        help.signatures[0].active_parameter,
+        Some(1),
+        "arguments beyond the fixed prefix belong to the final variadic parameter"
+    );
+
+    let semantic_source = "package device\n\
+                           type Device struct{}\n\
+                           func Use() { var current Device; _ = current }\n";
+    open_test_document(&service, uri.clone(), 2, semantic_source.into()).await;
+    let tokens = service
+        .inner()
+        .semantic_tokens_full(SemanticTokensParams {
+            text_document: TextDocumentIdentifier { uri },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .expect("Go semantic tokens")
+        .expect("Go semantic token response");
+    let SemanticTokensResult::Tokens(tokens) = tokens else {
+        panic!("expected full semantic tokens");
+    };
+    assert!(!tokens.data.is_empty());
+}
+
+#[tokio::test]
+async fn go_lsp_call_hierarchy_keeps_direct_calls_separate_from_same_named_methods() {
+    let source = "package device\n\
+                  func Run() {}\n\
+                  type Worker struct{}\n\
+                  func (Worker) Run() {}\n\
+                  func Caller/*cursor*/() { Run() }\n";
+    let (_dir, service, uri, line, character) =
+        indexed_backend_with_open_doc(&[], "main.go", source).await;
+    let prepared = service
+        .inner()
+        .prepare_call_hierarchy(CallHierarchyPrepareParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri },
+                position: Position::new(line, character),
+            },
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .expect("prepare Go call hierarchy")
+        .expect("Go call hierarchy item");
+    assert_eq!(prepared.len(), 1);
+    assert_eq!(prepared[0].name, "Caller");
+
+    let outgoing = service
+        .inner()
+        .outgoing_calls(CallHierarchyOutgoingCallsParams {
+            item: prepared[0].clone(),
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .expect("Go outgoing calls")
+        .expect("Go outgoing call response");
+    assert_eq!(outgoing.len(), 1, "{outgoing:?}");
+    assert_eq!(outgoing[0].to.name, "Run");
+    assert_eq!(
+        outgoing[0].to.selection_range.start.line, 1,
+        "a direct Run() call must not bind to Worker.Run"
+    );
+}
+
+#[tokio::test]
+async fn go_lsp_cgo_possible_targets_expose_the_unsupported_language_boundary() {
+    let source = "package device\n\
+                  import \"C\"\n\
+                  func Target() {}\n\
+                  func Use() { Target/*cursor*/() }\n";
+    let (_dir, service, uri, line, character) =
+        indexed_backend_with_open_doc(&[], "main.go", source).await;
+    let possible = service
+        .inner()
+        .possible_targets_command(&serde_json::json!({
+            "uri": uri,
+            "line": line,
+            "character": character,
+        }))
+        .await
+        .expect("cgo possible targets");
+    assert_eq!(
+        possible["coverage"]["openReason"],
+        "unsupported_language_boundary"
+    );
+    assert_eq!(possible["coverage"]["open"], true);
 }
 
 #[tokio::test]
@@ -2742,6 +3273,7 @@ async fn project_context_commands_validate_selection_and_outside_uri_has_no_auto
             fallback_completion_table: current.fallback_completion_table.clone(),
             reach_graph: current.reach_graph.clone(),
             include_table: current.include_table.clone(),
+            go_import_table: current.go_import_table.clone(),
             indexed_files: current.indexed_files.clone(),
             project_context: None,
             call_read_handle: None,
@@ -3352,6 +3884,7 @@ async fn candidate_overlay_does_not_adopt_a_new_graph_after_request_publication(
                 vec![],
             ))),
             include_table: None,
+            go_import_table: None,
             indexed_files: None,
             project_context: None,
             call_read_handle: None,
@@ -3382,6 +3915,7 @@ async fn candidate_overlay_does_not_adopt_a_new_graph_after_request_publication(
                 vec![],
             ))),
             include_table: None,
+            go_import_table: None,
             indexed_files: None,
             project_context: None,
             call_read_handle: None,
@@ -3419,6 +3953,7 @@ async fn candidate_overlay_cache_rejects_a_late_build_after_publication() {
             fallback_completion_table: Arc::new(Default::default()),
             reach_graph: None,
             include_table: None,
+            go_import_table: None,
             indexed_files: None,
             project_context: None,
             call_read_handle: None,
@@ -3467,6 +4002,7 @@ async fn indexed_completion_resolve_rejects_cross_generation_context_before_over
             fallback_completion_table: Arc::new(Default::default()),
             reach_graph: None,
             include_table: None,
+            go_import_table: None,
             indexed_files: None,
             project_context: None,
             call_read_handle: None,
@@ -3549,6 +4085,7 @@ async fn reach_scope_uses_captured_request_context_graph() {
             fallback_completion_table: Arc::new(Default::default()),
             reach_graph: Some(captured_graph),
             include_table: None,
+            go_import_table: None,
             indexed_files: None,
             project_context: None,
             call_read_handle: None,
@@ -5897,6 +6434,7 @@ fn index_status_ready_carries_degraded_capabilities() {
         call_relations: false,
         reach_graph: true,
         include_table: false,
+        go_import_table: false,
         reference_file_list: true,
         project_context: false,
     };
@@ -5917,6 +6455,7 @@ fn ready_cache_message_names_degraded_capabilities() {
         call_relations: false,
         reach_graph: true,
         include_table: true,
+        go_import_table: false,
         reference_file_list: false,
         project_context: false,
     };

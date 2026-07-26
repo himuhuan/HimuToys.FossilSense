@@ -720,6 +720,20 @@ async fn log_cache_degradation(
             )
             .await;
     }
+    if report.degraded.go_import_table {
+        let detail = report
+            .go_import_table_error
+            .as_deref()
+            .unwrap_or("unavailable");
+        client
+            .log_message(
+                MessageType::WARNING,
+                format!(
+                    "Go import completion table {operation} failed for {display_root}: {detail}"
+                ),
+            )
+            .await;
+    }
     if report.degraded.reference_file_list {
         let detail = report
             .reference_file_list_error

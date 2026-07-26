@@ -109,6 +109,7 @@ pub struct IncludeGraphUpdate {
     pub clear_all: bool,
     pub go_package_edges: Vec<(String, String, String)>,
     pub go_open_packages: Vec<(String, String)>,
+    pub go_importable_packages: Vec<(String, String)>,
     pub clear_all_go_packages: bool,
 }
 

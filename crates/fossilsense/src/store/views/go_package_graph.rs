@@ -28,6 +28,12 @@ pub struct GoOpenPackageRow {
     pub reason: OpenReason,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoImportablePackageRow {
+    pub package_key: String,
+    pub import_path: String,
+}
+
 pub struct GoPackageGraphStoreView<'a> {
     store: &'a IndexStore,
 }
@@ -94,6 +100,22 @@ impl<'a> GoPackageGraphStoreView<'a> {
             Ok(GoOpenPackageRow {
                 package_key: row.get(0)?,
                 reason,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn importable_packages(&self) -> Result<Vec<GoImportablePackageRow>> {
+        let mut stmt = self.store.conn.prepare(
+            "SELECT package_key, import_path
+             FROM go_importable_packages
+             ORDER BY import_path, package_key",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(GoImportablePackageRow {
+                package_key: row.get(0)?,
+                import_path: row.get(1)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()

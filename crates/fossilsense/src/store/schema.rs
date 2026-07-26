@@ -1,7 +1,7 @@
-// Version 24 adds persisted package-level Go import edges and explicit open
-// package evidence. Existing caches rebuild rather than mixing file-pair C
-// include edges with the package graph contract.
-pub(crate) const SCHEMA_VERSION: i64 = 24;
+// Version 25 persists the import path of each indexed Go package. This powers
+// bounded import-string completion without reading go.mod files or opening
+// SQLite on the request hot path.
+pub(crate) const SCHEMA_VERSION: i64 = 25;
 
 pub(crate) const DROP_DATA_TABLES_SQL: &str = "
     DROP TABLE IF EXISTS pending_file_revisions;
@@ -20,6 +20,7 @@ pub(crate) const DROP_DATA_TABLES_SQL: &str = "
     DROP TABLE IF EXISTS record_facts;
     DROP TABLE IF EXISTS go_open_packages;
     DROP TABLE IF EXISTS go_package_edges;
+    DROP TABLE IF EXISTS go_importable_packages;
     DROP TABLE IF EXISTS include_edges;
     DROP TABLE IF EXISTS include_facts;
     DROP TABLE IF EXISTS file_revisions;
@@ -202,6 +203,11 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
         target_package_key TEXT NOT NULL,
         resolution TEXT NOT NULL CHECK(resolution IN ('exact', 'heuristic')),
         PRIMARY KEY (source_package_key, target_package_key)
+    ) WITHOUT ROWID;
+
+    CREATE TABLE IF NOT EXISTS go_importable_packages (
+        package_key TEXT PRIMARY KEY NOT NULL,
+        import_path TEXT NOT NULL
     ) WITHOUT ROWID;
 
     CREATE TABLE IF NOT EXISTS go_open_packages (

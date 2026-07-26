@@ -9,6 +9,7 @@ use crate::store::{IndexBuild, IndexStore};
 pub(super) struct GoPackageGraphUpdate {
     pub edges: Vec<(String, String, String)>,
     pub open_packages: Vec<(String, String)>,
+    pub importable_packages: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -57,8 +58,10 @@ pub(super) fn build_go_package_graph(
     let go_work_modules = read_go_work_module_dirs(&canonical_workspace);
     let mut module_cache: HashMap<PathBuf, Option<(PathBuf, String)>> = HashMap::new();
     let mut import_targets: HashMap<String, Vec<String>> = HashMap::new();
+    let mut importable_packages = Vec::new();
     for node in nodes_by_key.values() {
-        if node.name.ends_with("_test") && node.path.ends_with("_test.go") {
+        if node.name == "main" || (node.name.ends_with("_test") && node.path.ends_with("_test.go"))
+        {
             continue;
         }
         let Some(import_path) = package_import_path(
@@ -71,9 +74,10 @@ pub(super) fn build_go_package_graph(
             continue;
         };
         import_targets
-            .entry(import_path)
+            .entry(import_path.clone())
             .or_default()
             .push(node.key.clone());
+        importable_packages.push((node.key.clone(), import_path));
     }
     for targets in import_targets.values_mut() {
         targets.sort();
@@ -146,9 +150,12 @@ pub(super) fn build_go_package_graph(
         .map(|(package, reason)| (package, reason.to_string()))
         .collect();
     open_packages.sort();
+    importable_packages.sort();
+    importable_packages.dedup();
     Ok(GoPackageGraphUpdate {
         edges,
         open_packages,
+        importable_packages,
     })
 }
 
@@ -159,11 +166,6 @@ fn package_import_path(
     go_work_modules: Option<&HashSet<PathBuf>>,
     module_cache: &mut HashMap<PathBuf, Option<(PathBuf, String)>>,
 ) -> Option<String> {
-    if node.source == "workspace" {
-        if let Some(vendor_suffix) = vendor_import_suffix(&node.path) {
-            return Some(vendor_suffix);
-        }
-    }
     let source_path = if node.source == "workspace" {
         workspace.join(node.path.replace('/', std::path::MAIN_SEPARATOR_STR))
     } else {
@@ -179,6 +181,18 @@ fn package_import_path(
             .max_by_key(|root| root.components().count())
             .map(PathBuf::as_path)
     }?;
+    let vendor_path = if node.source == "workspace" {
+        node.path.clone()
+    } else {
+        source_path
+            .strip_prefix(boundary)
+            .ok()?
+            .to_string_lossy()
+            .replace('\\', "/")
+    };
+    if let Some(vendor_suffix) = vendor_import_suffix(&vendor_path) {
+        return Some(vendor_suffix);
+    }
     let (module_dir, module_path) = nearest_module(&directory, boundary, module_cache)?;
     if node.source == "workspace"
         && go_work_modules.is_some_and(|modules| !modules.contains(&module_dir))
@@ -199,22 +213,38 @@ fn package_import_path(
 }
 
 fn vendor_import_suffix(path: &str) -> Option<String> {
-    if let Some(suffix) = path.strip_prefix("vendor/") {
-        return Some(
-            suffix
-                .rsplit_once('/')
-                .map_or(suffix, |(directory, _)| directory)
-                .to_string(),
+    let components: Vec<_> = path.split('/').collect();
+    let directories = components.get(..components.len().checked_sub(1)?)?;
+    let boundary = directories
+        .iter()
+        .enumerate()
+        .filter_map(|(index, component)| {
+            (*component == "vendor" && index + 1 < directories.len()).then_some(index)
+        })
+        .next_back()?;
+    let package_components = directories.get(boundary + 1..)?;
+    (!package_components.is_empty()).then(|| package_components.join("/"))
+}
+
+#[cfg(test)]
+mod vendor_import_suffix_tests {
+    use super::vendor_import_suffix;
+
+    #[test]
+    fn uses_the_last_vendor_that_has_a_package_directory_after_it() {
+        assert_eq!(
+            vendor_import_suffix("vendor/outer/vendor/example.com/nested/pkg/pkg.go").as_deref(),
+            Some("example.com/nested/pkg")
+        );
+        assert_eq!(
+            vendor_import_suffix("vendor/example.com/org/vendor/vendor.go").as_deref(),
+            Some("example.com/org/vendor")
+        );
+        assert_eq!(
+            vendor_import_suffix("vendor/example.com/vendor/sensor/sensor.go").as_deref(),
+            Some("sensor")
         );
     }
-    let marker = "/vendor/";
-    let (_, suffix) = path.rsplit_once(marker)?;
-    Some(
-        suffix
-            .rsplit_once('/')
-            .map_or(suffix, |(directory, _)| directory)
-            .to_string(),
-    )
 }
 
 fn nearest_module(

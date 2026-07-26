@@ -17,8 +17,8 @@ pub use declarations::{
 };
 #[allow(unused_imports)]
 pub use go_package_graph::{
-    GoOpenPackageRow, GoPackageEdgeRow, GoPackageFileRow, GoPackageGraphStoreView,
-    GoPackageResolution,
+    GoImportablePackageRow, GoOpenPackageRow, GoPackageEdgeRow, GoPackageFileRow,
+    GoPackageGraphStoreView, GoPackageResolution,
 };
 #[allow(unused_imports)]
 pub use member::{MemberReadRow, MemberStoreView, RecordReadRow, TypeAliasReadRow};

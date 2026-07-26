@@ -146,19 +146,31 @@ impl LanguageServer for Backend {
         let search_word = word.clone();
         let role_cache = self.session.cache.reference_role_cache.clone();
         let search_cache = self.session.cache.reference_search_cache.clone();
+        let reference_cache_epoch = search_cache.epoch();
         let context = self.request_context_for_root(root.clone()).await;
         let indexed_generation = context.engine.epoch.as_u64();
         let indexed_files = context.engine.indexed_files.clone();
+        let config_snapshot = self.workspace_root_config(&root).await;
+        let semantic_family = uri_to_path(&uri)
+            .map(|path| config_snapshot.language.language_for_path(&path))
+            .unwrap_or_else(|| SourceLanguage::default_for_path(Path::new(uri.path())))
+            .semantic_family();
+        let workspace_config = config_snapshot.workspace;
+        let language_resolver = config_snapshot.language;
         let result = tokio::task::spawn_blocking(
             move || -> Result<(Vec<Location>, bool, references::ReferencesTiming)> {
                 let (mut hits, truncated, timing) =
-                    references::search_references_with_shared_files(
+                    references::search_references_with_shared_files_for_family(
                         &root,
                         &search_word,
                         &role_cache,
                         &search_cache,
                         indexed_generation,
                         indexed_files,
+                        semantic_family,
+                        reference_cache_epoch,
+                        workspace_config,
+                        language_resolver,
                     )?;
                 // Group by role for the editor: definition/declaration first, then
                 // call, write, type-use, and plain reads last; ties keep path/line
@@ -360,6 +372,37 @@ impl LanguageServer for Backend {
         let completion_overlay_epoch = document_request.overlay_epoch;
 
         let line_text = text.lines().nth(position.line as usize).unwrap_or_default();
+
+        if self.source_language_for_uri(&uri).await == SourceLanguage::Go {
+            if let Some(import_context) = go_import_completion::go_import_completion_context(
+                &text,
+                position.line,
+                position.character,
+            ) {
+                let (table, current_package_key) = match self.root_for_uri(&uri).await {
+                    Some(root) => {
+                        let current_package_key = uri_to_path(&uri).and_then(|path| {
+                            let identity_path = pathing::relative_slash_path(&root, &path)
+                                .unwrap_or_else(|_| pathing::normalize_abs_path(&path));
+                            go_import_completion::current_go_package_key(&identity_path, &text)
+                        });
+                        (
+                            self.request_context_for_root(root)
+                                .await
+                                .engine
+                                .go_import_table
+                                .clone(),
+                            current_package_key,
+                        )
+                    }
+                    None => (None, None),
+                };
+                return Ok(Some(match table {
+                    Some(table) => table.complete(&import_context, current_package_key.as_deref()),
+                    None => empty_completion_list(true),
+                }));
+            }
+        }
 
         // Inside an `#include "..."` / `<...>`: offer header paths, not symbols.
         if let Some((form, partial)) =

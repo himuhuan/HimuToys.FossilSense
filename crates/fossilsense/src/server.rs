@@ -48,6 +48,7 @@ mod call_hierarchy;
 mod candidate_context;
 mod completion_candidate_documentation;
 mod completion_documentation;
+mod go_import_completion;
 mod hover;
 mod include_completion;
 mod indexing;
@@ -64,6 +65,7 @@ mod signature_help;
 mod state;
 mod workspace;
 
+use go_import_completion::GoImportCompletionTable;
 use include_completion::{
     collect_include_candidates_with_table_and_evidence, configured_include_paths,
     location_at_file_start, resolve_include_paths, CurrentIncludeEvidence, ExternalIncludeDirCache,

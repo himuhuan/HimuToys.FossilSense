@@ -63,6 +63,19 @@ fn go_module_import_reaches_whole_target_package_without_file_pair_edges() {
         .go_package_graph_view()
         .package_edges()
         .expect("package edges");
+    let importable = store
+        .go_package_graph_view()
+        .importable_packages()
+        .expect("importable packages");
+    assert!(importable
+        .iter()
+        .any(|row| row.import_path == "example.com/acme/lib"));
+    assert!(
+        importable
+            .iter()
+            .all(|row| row.import_path != "example.com/acme/cmd/app"),
+        "package main must not be offered as an import"
+    );
     assert_eq!(
         package_edges.len(),
         1,
@@ -82,11 +95,87 @@ fn go_module_import_reaches_whole_target_package_without_file_pair_edges() {
 }
 
 #[test]
+fn dirty_go_package_publication_replaces_import_completion_rows() {
+    let dir = tempdir().expect("tempdir");
+    fs::create_dir_all(dir.path().join("old")).expect("old");
+    fs::write(dir.path().join("go.mod"), "module example.com/device\n").expect("go.mod");
+    let old_path = dir.path().join("old/old.go");
+    fs::write(&old_path, "package old\nfunc Open() {}\n").expect("old package");
+    let db = dir.path().join("index.sqlite");
+    index_workspace(
+        dir.path(),
+        IndexOptions {
+            db_path: Some(db.clone()),
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("full index");
+    {
+        let store = IndexStore::open_readonly(&db).expect("readonly");
+        let paths = store
+            .go_package_graph_view()
+            .importable_packages()
+            .expect("full import paths");
+        assert!(paths
+            .iter()
+            .any(|row| row.import_path == "example.com/device/old"));
+    }
+
+    fs::remove_file(&old_path).expect("remove old");
+    let new_path = dir.path().join("new/new.go");
+    fs::create_dir_all(new_path.parent().expect("new parent")).expect("new dir");
+    fs::write(&new_path, "package newpkg\nfunc Open() {}\n").expect("new package");
+    index_dirty_files(
+        dir.path(),
+        vec![
+            DirtyFileChange {
+                absolute_path: old_path,
+                kind: DirtyFileKind::Delete,
+            },
+            DirtyFileChange {
+                absolute_path: new_path,
+                kind: DirtyFileKind::Upsert,
+            },
+        ],
+        IndexOptions {
+            db_path: Some(db.clone()),
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("dirty index");
+
+    let store = IndexStore::open_readonly(&db).expect("readonly");
+    let paths = store
+        .go_package_graph_view()
+        .importable_packages()
+        .expect("dirty import paths");
+    assert!(
+        paths
+            .iter()
+            .all(|row| row.import_path != "example.com/device/old"),
+        "{paths:?}"
+    );
+    assert!(
+        paths
+            .iter()
+            .any(|row| row.import_path == "example.com/device/new"),
+        "{paths:?}"
+    );
+}
+
+#[test]
 fn go_vendor_import_resolves_and_cgo_is_detected_as_an_unsupported_boundary() {
     let dir = tempdir().expect("tempdir");
     fs::create_dir_all(dir.path().join("cmd/app")).expect("cmd");
     fs::create_dir_all(dir.path().join("vendor/example.com/dependency/device"))
         .expect("vendor package");
+    fs::create_dir_all(
+        dir.path()
+            .join("vendor/example.com/outer/vendor/example.com/nested/pkg"),
+    )
+    .expect("nested vendor package");
     fs::write(dir.path().join("go.mod"), "module example.com/acme\n").expect("go.mod");
     fs::write(
         dir.path().join("cmd/app/main.go"),
@@ -99,6 +188,12 @@ fn go_vendor_import_resolves_and_cgo_is_detected_as_an_unsupported_boundary() {
         "package device\nfunc Open() {}\n",
     )
     .expect("device.go");
+    fs::write(
+        dir.path()
+            .join("vendor/example.com/outer/vendor/example.com/nested/pkg/pkg.go"),
+        "package pkg\nfunc Open() {}\n",
+    )
+    .expect("nested vendor source");
     let db = dir.path().join("index.sqlite");
 
     index_workspace(
@@ -112,6 +207,16 @@ fn go_vendor_import_resolves_and_cgo_is_detected_as_an_unsupported_boundary() {
     .expect("index");
 
     let store = IndexStore::open_readonly(&db).expect("readonly");
+    let importable = store
+        .go_package_graph_view()
+        .importable_packages()
+        .expect("importable packages");
+    assert!(
+        importable
+            .iter()
+            .any(|row| row.import_path == "example.com/nested/pkg"),
+        "{importable:?}"
+    );
     let graph = graph_from_store(&store);
     let scope = graph.reachable("cmd/app/main.go");
     assert!(scope
@@ -162,6 +267,9 @@ fn explicit_external_go_module_root_is_bounded_and_resolves_without_a_go_toolcha
     let external = dir.path().join("external-device");
     fs::create_dir_all(workspace.join("cmd/app")).expect("workspace");
     fs::create_dir_all(external.join("device")).expect("external");
+    fs::create_dir_all(external.join("vendor/example.com/vendor/sensor")).expect("external vendor");
+    fs::create_dir_all(external.join("vendor/example.com/outer/vendor/example.com/nested/pkg"))
+        .expect("nested external vendor");
     fs::write(workspace.join("go.mod"), "module example.com/acme\n").expect("workspace go.mod");
     fs::write(
         workspace.join("cmd/app/main.go"),
@@ -174,6 +282,16 @@ fn explicit_external_go_module_root_is_bounded_and_resolves_without_a_go_toolcha
         "package device\nfunc Open() {}\n",
     )
     .expect("device.go");
+    fs::write(
+        external.join("vendor/example.com/vendor/sensor/sensor.go"),
+        "package sensor\nfunc Read() {}\n",
+    )
+    .expect("vendor sensor");
+    fs::write(
+        external.join("vendor/example.com/outer/vendor/example.com/nested/pkg/pkg.go"),
+        "package pkg\nfunc Read() {}\n",
+    )
+    .expect("nested vendor package");
     fs::write(
         workspace.join("fossilsense.json"),
         serde_json::json!({
@@ -199,6 +317,9 @@ fn explicit_external_go_module_root_is_bounded_and_resolves_without_a_go_toolcha
     let package_files = package_view.package_files().expect("package files");
     let package_edges = package_view.package_edges().expect("package edges");
     let open_packages = package_view.open_packages().expect("open packages");
+    let importable = package_view
+        .importable_packages()
+        .expect("importable packages");
     let scope = graph_from_store(&store).reachable("cmd/app/main.go");
     let external_file = crate::pathing::normalize_abs_path(&external.join("device/device.go"));
     assert!(
@@ -207,6 +328,22 @@ fn explicit_external_go_module_root_is_bounded_and_resolves_without_a_go_toolcha
          package_edges={package_edges:?} open_packages={open_packages:?}"
     );
     assert!(!scope.open);
+    assert!(
+        importable.iter().any(|row| row.import_path == "sensor"),
+        "{importable:?}"
+    );
+    assert!(
+        importable
+            .iter()
+            .any(|row| row.import_path == "example.com/nested/pkg"),
+        "{importable:?}"
+    );
+    assert!(
+        importable.iter().all(|row| !row
+            .import_path
+            .contains("/vendor/example.com/vendor/sensor")),
+        "{importable:?}"
+    );
 }
 
 #[test]

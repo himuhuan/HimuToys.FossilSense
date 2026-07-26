@@ -42,6 +42,7 @@ pub enum IndexState {
 pub struct DegradedCapabilities {
     pub reach_graph: bool,
     pub include_table: bool,
+    pub go_import_table: bool,
     pub reference_file_list: bool,
     pub project_context: bool,
     pub call_relations: bool,
@@ -51,6 +52,7 @@ impl DegradedCapabilities {
     pub fn any(&self) -> bool {
         self.reach_graph
             || self.include_table
+            || self.go_import_table
             || self.reference_file_list
             || self.project_context
             || self.call_relations
@@ -63,6 +65,9 @@ impl DegradedCapabilities {
         }
         if self.include_table {
             labels.push("includeTable");
+        }
+        if self.go_import_table {
+            labels.push("goImportTable");
         }
         if self.reference_file_list {
             labels.push("referenceFileList");
