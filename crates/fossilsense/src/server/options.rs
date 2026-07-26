@@ -112,13 +112,24 @@ pub(super) fn parse_initial_project_context_selection(
 /// `fossilsense.includePaths`. Non-string / non-array values are ignored
 /// (never fatal); the indexer further validates each entry against the disk.
 pub(super) fn parse_include_paths(params: &InitializeParams) -> Vec<String> {
+    parse_external_paths(params, "includePaths")
+}
+
+/// Explicit external Go module roots forwarded by the client. Invalid values
+/// are ignored here and nonexistent/overlapping roots are reported by the
+/// indexer without making initialization fatal.
+pub(super) fn parse_go_module_paths(params: &InitializeParams) -> Vec<String> {
+    parse_external_paths(params, "goModulePaths")
+}
+
+fn parse_external_paths(params: &InitializeParams, field: &str) -> Vec<String> {
     let Some(opts) = &params.initialization_options else {
         return Vec::new();
     };
     opts.as_object()
         .and_then(|o| o.get("fossilsense"))
         .and_then(|v| v.as_object())
-        .and_then(|o| o.get("includePaths"))
+        .and_then(|o| o.get(field))
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
@@ -505,6 +516,23 @@ mod tests {
         );
         // Missing / non-array -> empty, never panics.
         assert!(parse_include_paths(&InitializeParams::default()).is_empty());
+    }
+
+    #[test]
+    fn parse_go_module_paths_reads_and_normalizes() {
+        let params = InitializeParams {
+            initialization_options: Some(serde_json::json!({
+                "fossilsense": {
+                    "goModulePaths": ["C:\\deps\\device", "", "/opt/go/device", 7]
+                }
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            parse_go_module_paths(&params),
+            vec!["C:/deps/device".to_string(), "/opt/go/device".to_string()]
+        );
+        assert!(parse_go_module_paths(&InitializeParams::default()).is_empty());
     }
 
     #[test]

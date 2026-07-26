@@ -1,4 +1,4 @@
-const DEFAULT_EXTENSIONS = ['c', 'h', 'cpp', 'hpp', 'cc', 'hh', 'cxx', 'hxx', 'inl'];
+const DEFAULT_EXTENSIONS = ['c', 'h', 'cpp', 'hpp', 'cc', 'hh', 'cxx', 'hxx', 'inl', 'go'];
 
 export function extensionsFromConfigText(text: string | undefined): string[] {
   if (!text) {

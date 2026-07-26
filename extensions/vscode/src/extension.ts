@@ -11,8 +11,9 @@ import {
   completionModeFromConfig,
   completionPrefixRankingFromConfig,
   debugCandidateReasonsFromConfig,
-  detectedCppLanguageServers,
+  detectedLanguageServers,
   fossilsenseModeFromConfig,
+  goModulePathsFromConfig,
   includePathsFromConfig,
   includeScopingModeFromConfig,
   perfLogsFromConfig,
@@ -29,6 +30,11 @@ import {
   completionHistoryInitializationOptions,
 } from './completionHistory';
 import { extensionsFromConfigText, sourceWatchGlob } from './watchPlan';
+import {
+  PROJECT_CONTEXT_MARKER_PATTERNS,
+  isSupportedLocalDocument,
+  languageDocumentSelectors,
+} from './languageSupport';
 import {
   DegradedCapabilities,
   degradedCapabilityWarning,
@@ -67,22 +73,6 @@ const REBUILD_INDEX_COMMAND = 'fossilsense.rebuildIndex';
 const REBUILD_INDEX_LSP_COMMAND = 'fossilsense.lsp.rebuildIndex';
 const GROUPED_REFERENCES_COMMAND = 'fossilsense.findReferencesGrouped';
 const POSSIBLE_TARGETS_COMMAND = 'fossilsense.findAllPossibleTargets';
-const PROJECT_CONTEXT_MARKER_PATTERNS = [
-  '**/Makefile',
-  '**/GNUmakefile',
-  '**/CMakeLists.txt',
-  '**/*.pro',
-  '**/build.ninja',
-  '**/*.sln',
-  '**/*.vcxproj',
-  '**/*.vcproj',
-  '**/meson.build',
-  '**/BUILD',
-  '**/BUILD.bazel',
-  '**/WORKSPACE',
-  '**/WORKSPACE.bazel',
-];
-
 let client: LanguageClient | undefined;
 let statusBar: vscode.StatusBarItem;
 let projectContextStatusBar: vscode.StatusBarItem;
@@ -183,6 +173,7 @@ export function activate(context: vscode.ExtensionContext): void {
       if (
         client &&
         (event.affectsConfiguration('fossilsense.includePaths') ||
+          event.affectsConfiguration('fossilsense.goModulePaths') ||
           event.affectsConfiguration('fossilsense.completion.mode') ||
           event.affectsConfiguration('fossilsense.completion.prefixRanking') ||
           event.affectsConfiguration('fossilsense.completionHistory.mode') ||
@@ -287,17 +278,14 @@ async function startServer(context: vscode.ExtensionContext): Promise<void> {
     ),
   ];
 
-  const conflictingExtensions = detectedCppLanguageServers();
+  const conflictingExtensions = detectedLanguageServers();
 
   const completionMode = completionModeFromConfig();
   const completionHistoryMode = completionHistoryModeFromConfig();
   const semanticColoringMode = semanticColoringModeFromConfig();
 
   const clientOptions: LanguageClientOptions = {
-    documentSelector: [
-      { scheme: 'file', language: 'c' },
-      { scheme: 'file', language: 'cpp' },
-    ],
+    documentSelector: languageDocumentSelectors(),
     outputChannel: output,
     synchronize: {
       fileEvents,
@@ -322,6 +310,7 @@ async function startServer(context: vscode.ExtensionContext): Promise<void> {
           memoryBudgetMB: semanticIndexMemoryBudgetMBFromConfig(),
         },
         includePaths: includePathsFromConfig(),
+        goModulePaths: goModulePathsFromConfig(),
         debug: {
           candidateReasons: debugCandidateReasonsFromConfig(),
           perfLogs: perfLogsFromConfig(),
@@ -504,7 +493,10 @@ async function updateProjectContextForActiveEditor(
     return;
   }
   setProjectContextStatus(status);
-  if (!editor || !isLocalCppDocument(editor.document)) {
+  if (
+    !editor ||
+    !isSupportedLocalDocument(editor.document.uri.scheme, editor.document.languageId)
+  ) {
     return;
   }
   if (!shouldPromptForProjectContext(projectContextModeFromConfig(), status)) {
@@ -629,13 +621,6 @@ function activeEditorUriArgument(): Array<{ uri: string }> {
 
 function uriArgument(uri: string | undefined): Array<{ uri: string }> {
   return uri ? [{ uri }] : [];
-}
-
-function isLocalCppDocument(document: vscode.TextDocument): boolean {
-  return (
-    document.uri.scheme === 'file' &&
-    (document.languageId === 'c' || document.languageId === 'cpp')
-  );
 }
 
 async function showMutualExclusionWarning(conflictingExtensions: string[]): Promise<void> {

@@ -5,8 +5,7 @@ impl Backend {
         let roots = self.workspace_roots.lock().await.clone();
         let mut dirty_changes = Vec::new();
         let mut project_context_roots = Vec::new();
-        let mut config_roots = Vec::new();
-        let mut needs_full = false;
+        let mut full_roots = Vec::new();
 
         // Populate each root once, then reuse the same snapshots throughout
         // this event batch. A configuration change chooses a full rebuild and
@@ -17,32 +16,28 @@ impl Backend {
 
         for change in &params.changes {
             match watched_change_in_scope(&roots, change, &self.config_cache).await {
-                Some(WatchDecision::Full(root)) => {
-                    needs_full = true;
-                    config_roots.push(root);
-                }
+                Some(WatchDecision::Full(root)) => full_roots.push(root),
                 Some(WatchDecision::ProjectContext(root)) => project_context_roots.push(root),
                 Some(WatchDecision::Dirty(dirty)) => dirty_changes.push(dirty),
                 None => {}
             }
         }
 
-        let relevant_changes =
-            dirty_changes.len() + project_context_roots.len() + usize::from(needs_full);
+        full_roots.sort();
+        full_roots.dedup();
+        let relevant_changes = dirty_changes.len() + project_context_roots.len() + full_roots.len();
         let dirty_count = dirty_changes.len();
         if relevant_changes > 0 {
             self.session.cache.invalidate_references();
         }
-        if !config_roots.is_empty() {
-            config_roots.sort();
-            config_roots.dedup();
+        if !full_roots.is_empty() {
             self.session
                 .documents
-                .invalidate_language_config_roots(&config_roots)
+                .invalidate_language_config_roots(&full_roots)
                 .await;
             self.session
                 .cache
-                .invalidate_candidate_overlay_roots(&config_roots)
+                .invalidate_candidate_overlay_roots(&full_roots)
                 .await;
         }
         self.client
@@ -57,9 +52,8 @@ impl Backend {
             )
             .await;
 
-        if needs_full {
-            self.spawn_index_roots(None).await;
-            return;
+        if !full_roots.is_empty() {
+            self.spawn_index_root_changes(full_roots).await;
         }
         if !dirty_changes.is_empty() {
             self.spawn_dirty_files(dirty_changes).await;

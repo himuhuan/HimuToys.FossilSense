@@ -35,6 +35,7 @@ fn test_backend_service() -> LspService<super::Backend> {
         ),
         external_include_dir_cache: Arc::new(StdMutex::new(HashMap::new())),
         include_paths: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+        go_module_paths: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         completion_enabled: AtomicBool::new(true),
         strict_prefix_ranking: AtomicBool::new(true),
         semantic_coloring_enabled: AtomicBool::new(true),
@@ -2985,6 +2986,62 @@ async fn marker_watcher_classifies_supported_and_ignores_excluded_or_fragment_fi
         renamed_away,
         Some(super::WatchDecision::ProjectContext(_))
     ));
+
+    for go_metadata in ["go.mod", "go.work"] {
+        let decision = super::watched_change_in_scope(
+            &roots,
+            &event(
+                &root.path().join("app").join(go_metadata),
+                FileChangeType::CHANGED,
+            ),
+            &cache,
+        )
+        .await;
+        assert!(
+            matches!(decision, Some(super::WatchDecision::Full(_))),
+            "{go_metadata} changes must rebuild package/import evidence"
+        );
+    }
+}
+
+#[tokio::test]
+async fn watcher_scopes_go_metadata_rebuild_to_the_matching_workspace_root() {
+    let first = tempdir().expect("first root");
+    let second = tempdir().expect("second root");
+    fs::create_dir_all(second.path().join("src")).expect("second source tree");
+    let first_root = first.path().to_path_buf();
+    let second_root = second.path().to_path_buf();
+    let service = test_backend_service();
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .extend([first_root.clone(), second_root.clone()]);
+
+    service
+        .inner()
+        .did_change_watched_files(DidChangeWatchedFilesParams {
+            changes: vec![
+                FileEvent {
+                    uri: Url::from_file_path(first.path().join("go.mod")).expect("go.mod uri"),
+                    typ: FileChangeType::CHANGED,
+                },
+                FileEvent {
+                    uri: Url::from_file_path(second.path().join("src/main.go"))
+                        .expect("source uri"),
+                    typ: FileChangeType::CHANGED,
+                },
+            ],
+        })
+        .await;
+
+    let state = service.inner().index_schedule.lock().await;
+    assert!(state.pending_full);
+    assert!(!state.pending_all_roots);
+    assert_eq!(state.pending_full_roots, vec![first_root]);
+    assert_eq!(state.pending_changes.len(), 1);
+    assert_eq!(state.pending_changes[0].root, second_root);
 }
 
 #[tokio::test]
@@ -3526,6 +3583,28 @@ async fn initialize_defaults_to_strict_prefix_ranking_and_accepts_scope_first() 
     assert_eq!(
         scope_first.inner().request_settings().prefix_ranking,
         crate::completion::CompletionPrefixRanking::ScopeFirst
+    );
+}
+
+#[tokio::test]
+async fn initialize_captures_client_go_module_paths() {
+    let service = test_backend_service();
+    service
+        .inner()
+        .initialize(InitializeParams {
+            initialization_options: Some(serde_json::json!({
+                "fossilsense": {
+                    "goModulePaths": ["C:\\deps\\device", "/opt/go/device"]
+                }
+            })),
+            ..Default::default()
+        })
+        .await
+        .expect("initialize");
+
+    assert_eq!(
+        *service.inner().go_module_paths.lock().await,
+        vec!["C:/deps/device".to_string(), "/opt/go/device".to_string()]
     );
 }
 
@@ -6265,7 +6344,7 @@ async fn local_binding_completion_is_not_hydrated_from_same_name_global() {
 
 // --- R7: watcher/debounce IndexScheduleState machine tests ---------------
 
-use super::IndexScheduleState;
+use super::{IndexScheduleState, ScheduledIndex};
 
 fn dirty_change(root: &str, rel: &str) -> super::RootDirtyChange {
     super::RootDirtyChange {
@@ -6305,6 +6384,55 @@ fn index_schedule_full_overrides_dirty() {
     assert!(state.pending_full);
     assert!(state.pending_force);
     assert!(state.pending_changes.is_empty());
+}
+
+#[test]
+fn index_schedule_scoped_full_preserves_dirty_work_for_other_roots() {
+    let root_a = PathBuf::from("/workspace/a");
+    let root_b = PathBuf::from("/workspace/b");
+    let mut state = IndexScheduleState::default();
+    state.request_dirty_changes(vec![
+        dirty_change("/workspace/a", "src/a.go"),
+        dirty_change("/workspace/b", "src/b.go"),
+    ]);
+    state.request_full_roots(vec![root_a.clone()]);
+
+    match state.take_scheduled_index() {
+        ScheduledIndex::Full {
+            roots: Some(roots),
+            force,
+            changes,
+        } => {
+            assert_eq!(roots, vec![root_a]);
+            assert!(!force);
+            assert_eq!(changes.len(), 1);
+            assert_eq!(changes[0].root, root_b);
+            assert_eq!(changes[0].rel_path, "src/b.go");
+        }
+        _ => panic!("expected a root-scoped full index"),
+    }
+}
+
+#[test]
+fn index_schedule_scoped_full_merges_roots_without_becoming_global() {
+    let root_a = PathBuf::from("/workspace/a");
+    let root_b = PathBuf::from("/workspace/b");
+    let mut state = IndexScheduleState::default();
+    state.request_full_roots(vec![root_a.clone()]);
+    state.request_full_roots(vec![root_b.clone(), root_a.clone()]);
+
+    match state.take_scheduled_index() {
+        ScheduledIndex::Full {
+            roots: Some(roots),
+            force,
+            changes,
+        } => {
+            assert_eq!(roots, vec![root_a, root_b]);
+            assert!(!force);
+            assert!(changes.is_empty());
+        }
+        _ => panic!("expected a root-scoped full index"),
+    }
 }
 
 #[test]

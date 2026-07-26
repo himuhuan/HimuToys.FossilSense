@@ -37,6 +37,9 @@ pub struct IndexOptions {
     /// External include reference directories forwarded from the LSP client,
     /// merged with `fossilsense.json`'s `includePaths`.
     pub include_paths: Vec<String>,
+    /// Explicit external Go module roots forwarded from the LSP client,
+    /// merged with `fossilsense.json`'s `goModulePaths`.
+    pub go_module_paths: Vec<String>,
     /// Override the per-root external file-count cap (defaults to ~20k).
     pub external_max_files: Option<usize>,
     /// Override the per-root external byte cap (defaults to ~512 MB).
@@ -120,7 +123,9 @@ pub fn index_workspace(
     let mut include_entries = config.include_paths.clone();
     include_entries.extend(options.include_paths.iter().cloned());
     let (include_roots, include_issues) = resolve_include_roots(&include_entries);
-    let (go_module_roots, mut go_module_issues) = resolve_go_module_roots(&config.go_module_paths);
+    let mut go_module_entries = config.go_module_paths.clone();
+    go_module_entries.extend(options.go_module_paths.iter().cloned());
+    let (go_module_roots, mut go_module_issues) = resolve_go_module_roots(&go_module_entries);
     let (go_module_roots, overlap_issues) = external_go_module_roots(&workspace, go_module_roots);
     go_module_issues.extend(overlap_issues);
 
@@ -344,7 +349,9 @@ pub fn index_dirty_files(
     let mut include_entries = config.include_paths.clone();
     include_entries.extend(options.include_paths.iter().cloned());
     let (include_roots, include_issues) = resolve_include_roots(&include_entries);
-    let (go_module_roots, mut go_module_issues) = resolve_go_module_roots(&config.go_module_paths);
+    let mut go_module_entries = config.go_module_paths.clone();
+    go_module_entries.extend(options.go_module_paths.iter().cloned());
+    let (go_module_roots, mut go_module_issues) = resolve_go_module_roots(&go_module_entries);
     let (go_module_roots, overlap_issues) = external_go_module_roots(&workspace, go_module_roots);
     go_module_issues.extend(overlap_issues);
     for issue in include_issues.into_iter().chain(go_module_issues) {

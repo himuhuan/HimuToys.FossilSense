@@ -1,5 +1,6 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
+import { isSupportedLocalDocument } from './languageSupport';
 import { ExecuteCommandRequest, LanguageClient } from 'vscode-languageclient/node';
 import {
   CallRelation,
@@ -181,8 +182,13 @@ export class CallRelationsController {
   async show(direction: RelationDirection, refreshPosition = true): Promise<void> {
     const active = vscode.window.activeTextEditor;
     if (refreshPosition) {
-      if (!active || !['c', 'cpp'].includes(active.document.languageId)) {
-        void vscode.window.showInformationMessage('Place the cursor on a C/C++ function first.');
+      if (
+        !active ||
+        !isSupportedLocalDocument(active.document.uri.scheme, active.document.languageId)
+      ) {
+        void vscode.window.showInformationMessage(
+          'Place the cursor on a C/C++ or Go function first.',
+        );
         return;
       }
       this.lastLocation = {

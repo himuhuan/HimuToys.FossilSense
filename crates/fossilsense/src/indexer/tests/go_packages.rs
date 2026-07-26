@@ -347,6 +347,49 @@ fn explicit_external_go_module_root_is_bounded_and_resolves_without_a_go_toolcha
 }
 
 #[test]
+fn client_forwarded_go_module_root_is_indexed_without_workspace_config() {
+    let dir = tempdir().expect("tempdir");
+    let workspace = dir.path().join("workspace");
+    let external = dir.path().join("external");
+    fs::create_dir_all(&workspace).expect("workspace");
+    fs::create_dir_all(external.join("device")).expect("external package");
+    fs::write(workspace.join("go.mod"), "module example.com/workspace\n").expect("workspace mod");
+    fs::write(
+        workspace.join("main.go"),
+        "package main\nimport \"example.com/external/device\"\nfunc main() { device.Open() }\n",
+    )
+    .expect("workspace source");
+    fs::write(external.join("go.mod"), "module example.com/external\n").expect("external mod");
+    fs::write(
+        external.join("device/device.go"),
+        "package device\nfunc Open() {}\n",
+    )
+    .expect("external source");
+    let db = workspace.join("index.sqlite");
+
+    index_workspace(
+        &workspace,
+        IndexOptions {
+            db_path: Some(db.clone()),
+            go_module_paths: vec![external.to_string_lossy().into_owned()],
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("index");
+
+    let store = IndexStore::open_readonly(&db).expect("readonly");
+    let external_file = crate::pathing::normalize_abs_path(&external.join("device/device.go"));
+    assert!(
+        graph_from_store(&store)
+            .reachable("main.go")
+            .files
+            .contains(&external_file),
+        "client-forwarded Go module root must contribute package reachability"
+    );
+}
+
+#[test]
 fn external_go_module_root_over_cap_contributes_no_declarations_and_reports_it() {
     let dir = tempdir().expect("tempdir");
     let workspace = dir.path().join("workspace");

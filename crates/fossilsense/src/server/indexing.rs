@@ -32,6 +32,8 @@ pub(super) struct IndexScheduleState {
     pub(super) scheduled: bool,
     pub(super) pending_requested: bool,
     pub(super) pending_full: bool,
+    pub(super) pending_all_roots: bool,
+    pub(super) pending_full_roots: Vec<PathBuf>,
     pub(super) pending_force: bool,
     pub(super) pending_changes: Vec<RootDirtyChange>,
 }
@@ -49,9 +51,71 @@ pub(super) enum WatchDecision {
     Dirty(RootDirtyChange),
 }
 
-enum ScheduledIndex {
-    Full { force: bool },
+pub(super) enum ScheduledIndex {
+    Full {
+        roots: Option<Vec<PathBuf>>,
+        force: bool,
+        changes: Vec<RootDirtyChange>,
+    },
     Dirty(Vec<RootDirtyChange>),
+}
+
+impl IndexScheduleState {
+    pub(super) fn request_dirty_changes(&mut self, changes: Vec<RootDirtyChange>) {
+        self.pending_requested = true;
+        self.pending_changes.extend(changes);
+    }
+
+    pub(super) fn request_all_roots(&mut self, force: bool) {
+        self.pending_requested = true;
+        self.pending_full = true;
+        self.pending_all_roots = true;
+        self.pending_full_roots.clear();
+        self.pending_force |= force;
+        self.pending_changes.clear();
+    }
+
+    pub(super) fn request_full_roots(&mut self, roots: Vec<PathBuf>) {
+        if roots.is_empty() {
+            return;
+        }
+        self.pending_requested = true;
+        self.pending_full = true;
+        if self.pending_all_roots {
+            return;
+        }
+        self.pending_full_roots.extend(roots);
+        self.pending_full_roots.sort();
+        self.pending_full_roots.dedup();
+        self.pending_changes
+            .retain(|change| !self.pending_full_roots.contains(&change.root));
+    }
+
+    pub(super) fn take_scheduled_index(&mut self) -> ScheduledIndex {
+        self.pending_requested = false;
+        if !self.pending_full {
+            return ScheduledIndex::Dirty(std::mem::take(&mut self.pending_changes));
+        }
+
+        self.pending_full = false;
+        let force = std::mem::take(&mut self.pending_force);
+        let roots = if std::mem::take(&mut self.pending_all_roots) {
+            self.pending_full_roots.clear();
+            self.pending_changes.clear();
+            None
+        } else {
+            let roots = std::mem::take(&mut self.pending_full_roots);
+            self.pending_changes
+                .retain(|change| !roots.contains(&change.root));
+            Some(roots)
+        };
+        let changes = std::mem::take(&mut self.pending_changes);
+        ScheduledIndex::Full {
+            roots,
+            force,
+            changes,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -134,6 +198,7 @@ impl Backend {
             roots: self.workspace_roots.clone(),
         };
         let include_paths = self.include_paths.lock().await.clone();
+        let go_module_paths = self.go_module_paths.lock().await.clone();
         let client = self.client.clone();
         let index_schedule = self.index_schedule.clone();
         let cache = self.session.cache.clone();
@@ -142,8 +207,7 @@ impl Backend {
             .load(std::sync::atomic::Ordering::Relaxed);
 
         let mut state = index_schedule.lock().await;
-        state.pending_requested = true;
-        state.pending_changes.extend(changes);
+        state.request_dirty_changes(changes);
         if state.running || state.scheduled {
             return;
         }
@@ -155,6 +219,7 @@ impl Backend {
                 client,
                 workspace_state,
                 include_paths,
+                go_module_paths,
                 cache,
                 index_schedule,
                 perf_logging_enabled,
@@ -164,26 +229,39 @@ impl Backend {
     }
 
     pub(super) async fn spawn_index_roots(&self, force: Option<bool>) {
+        self.spawn_index_roots_with_scope(None, force.unwrap_or(false))
+            .await;
+    }
+
+    pub(super) async fn spawn_index_root_changes(&self, roots: Vec<PathBuf>) {
+        self.spawn_index_roots_with_scope(Some(roots), false).await;
+    }
+
+    async fn spawn_index_roots_with_scope(&self, roots: Option<Vec<PathBuf>>, force: bool) {
         self.session.cache.invalidate_after_index_change().await;
         let workspace_state = IndexWorkspaceState {
             documents: self.session.documents.clone(),
             roots: self.workspace_roots.clone(),
         };
         let include_paths = self.include_paths.lock().await.clone();
+        let go_module_paths = self.go_module_paths.lock().await.clone();
         let client = self.client.clone();
         let index_schedule = self.index_schedule.clone();
         let cache = self.session.cache.clone();
-        let force = force.unwrap_or(false);
         let perf_logging_enabled = self
             .perf_logging_enabled
             .load(std::sync::atomic::Ordering::Relaxed);
 
         let mut state = index_schedule.lock().await;
-        state.pending_requested = true;
-        state.pending_full = true;
-        state.pending_force |= force;
-        state.pending_changes.clear();
+        if let Some(roots) = roots {
+            state.request_full_roots(roots);
+        } else {
+            state.request_all_roots(force);
+        }
         if state.running || state.scheduled {
+            return;
+        }
+        if !state.pending_requested {
             return;
         }
         state.scheduled = true;
@@ -194,6 +272,7 @@ impl Backend {
                 client,
                 workspace_state,
                 include_paths,
+                go_module_paths,
                 cache,
                 index_schedule,
                 perf_logging_enabled,
@@ -207,6 +286,7 @@ async fn run_scheduled_indexes(
     client: Client,
     workspace_state: IndexWorkspaceState,
     include_paths: Vec<String>,
+    go_module_paths: Vec<String>,
     cache: CacheLedger,
     index_schedule: IndexSchedule,
     perf_logging_enabled: bool,
@@ -218,37 +298,52 @@ async fn run_scheduled_indexes(
             let mut state = index_schedule.lock().await;
             state.scheduled = false;
             state.running = true;
-            state.pending_requested = false;
-            if state.pending_full {
-                state.pending_full = false;
-                state.pending_changes.clear();
-                let force = state.pending_force;
-                state.pending_force = false;
-                ScheduledIndex::Full { force }
-            } else {
-                let changes = std::mem::take(&mut state.pending_changes);
-                ScheduledIndex::Dirty(changes)
-            }
+            state.take_scheduled_index()
         };
 
         match scheduled {
-            ScheduledIndex::Full { force } => {
-                let roots = workspace_state.roots.lock().await.clone();
+            ScheduledIndex::Full {
+                roots,
+                force,
+                changes,
+            } => {
+                let current_roots = workspace_state.roots.lock().await.clone();
+                let roots = roots.map_or_else(
+                    || current_roots.clone(),
+                    |mut scoped| {
+                        scoped.retain(|root| current_roots.contains(root));
+                        scoped
+                    },
+                );
                 index_roots(
                     client.clone(),
-                    roots.clone(),
+                    roots,
                     include_paths.clone(),
+                    go_module_paths.clone(),
                     cache.clone(),
                     workspace_state.clone(),
                     force,
                     perf_logging_enabled,
                 )
                 .await;
+                if !changes.is_empty() {
+                    index_dirty_roots(
+                        client.clone(),
+                        include_paths.clone(),
+                        go_module_paths.clone(),
+                        cache.clone(),
+                        workspace_state.clone(),
+                        changes,
+                        perf_logging_enabled,
+                    )
+                    .await;
+                }
             }
             ScheduledIndex::Dirty(changes) if !changes.is_empty() => {
                 index_dirty_roots(
                     client.clone(),
                     include_paths.clone(),
+                    go_module_paths.clone(),
                     cache.clone(),
                     workspace_state.clone(),
                     changes,
@@ -280,6 +375,7 @@ async fn index_roots(
     client: Client,
     roots: Vec<PathBuf>,
     include_paths: Vec<String>,
+    go_module_paths: Vec<String>,
     cache: CacheLedger,
     workspace_state: IndexWorkspaceState,
     force: bool,
@@ -304,6 +400,7 @@ async fn index_roots(
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let index_root = root.clone();
         let include_paths_for_index = include_paths.clone();
+        let go_module_paths_for_index = go_module_paths.clone();
         let result = tokio::task::spawn_blocking(move || {
             indexer::index_workspace(
                 index_root,
@@ -311,6 +408,7 @@ async fn index_roots(
                     db_path: None,
                     force,
                     include_paths: include_paths_for_index,
+                    go_module_paths: go_module_paths_for_index,
                     ..Default::default()
                 },
                 |status| {
@@ -483,6 +581,7 @@ async fn index_roots(
 async fn index_dirty_roots(
     client: Client,
     include_paths: Vec<String>,
+    go_module_paths: Vec<String>,
     cache: CacheLedger,
     workspace_state: IndexWorkspaceState,
     changes: Vec<RootDirtyChange>,
@@ -521,6 +620,7 @@ async fn index_dirty_roots(
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let index_root = root.clone();
         let include_paths_for_index = include_paths.clone();
+        let go_module_paths_for_index = go_module_paths.clone();
         let dirty_changes: Vec<indexer::DirtyFileChange> =
             changes.into_iter().map(|change| change.change).collect();
         let result = tokio::task::spawn_blocking(move || {
@@ -531,6 +631,7 @@ async fn index_dirty_roots(
                     db_path: None,
                     force: false,
                     include_paths: include_paths_for_index,
+                    go_module_paths: go_module_paths_for_index,
                     ..Default::default()
                 },
                 |status| {

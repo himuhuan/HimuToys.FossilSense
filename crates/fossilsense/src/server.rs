@@ -74,6 +74,7 @@ use include_completion::{
 #[cfg(test)]
 use indexing::{
     ready_cache_message, rebuild_include_table, rebuild_indexed_file_list, RootDirtyChange,
+    ScheduledIndex,
 };
 use indexing::{watched_change_in_scope, IndexScheduleState, WatchDecision};
 use lsp_adapters::{
@@ -85,8 +86,9 @@ use options::{
     candidate_reason_log_lines, completion_trigger_characters, empty_completion_list,
     member_completion_is_incomplete, parse_completion_history_mode, parse_completion_mode,
     parse_completion_prefix_ranking, parse_debug_candidate_reasons, parse_debug_perf_logs,
-    parse_include_paths, parse_include_scoping_enabled, parse_initial_project_context_selection,
-    parse_semantic_coloring_mode, parse_semantic_index_memory_budget_mb, signature_help_options,
+    parse_go_module_paths, parse_include_paths, parse_include_scoping_enabled,
+    parse_initial_project_context_selection, parse_semantic_coloring_mode,
+    parse_semantic_index_memory_budget_mb, signature_help_options,
 };
 use workspace::{
     CacheLedger, CachePublishReport, DocumentRequestSnapshot, DocumentStore, RequestContext,
@@ -136,6 +138,7 @@ pub async fn run_stdio() -> Result<()> {
         session: WorkspaceSession::new(DocumentStore::default(), CacheLedger::default()),
         external_include_dir_cache: Arc::new(StdMutex::new(HashMap::new())),
         include_paths: Arc::new(Mutex::new(Vec::new())),
+        go_module_paths: Arc::new(Mutex::new(Vec::new())),
         completion_enabled: AtomicBool::new(true),
         strict_prefix_ranking: AtomicBool::new(true),
         semantic_coloring_enabled: AtomicBool::new(true),
@@ -166,6 +169,9 @@ struct Backend {
     /// External include reference directories (normalized) forwarded from the
     /// client; used for indexing, include-path completion, and jump-to-header.
     include_paths: Arc<Mutex<Vec<String>>>,
+    /// Explicit external Go module roots forwarded from the client. Each root
+    /// remains subject to the indexer's independent file/byte caps.
+    go_module_paths: Arc<Mutex<Vec<String>>>,
     /// Whether completion is enabled (based on initializationOptions).
     completion_enabled: AtomicBool,
     /// Whether ordinary identifier completion guards exact/literal-prefix
