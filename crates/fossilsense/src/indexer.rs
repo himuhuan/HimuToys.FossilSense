@@ -4,7 +4,9 @@ use std::time::Instant;
 
 use anyhow::Result;
 
-use crate::config::{resolve_include_roots, LanguageResolver, WorkspaceConfig};
+use crate::config::{
+    resolve_go_module_roots, resolve_include_roots, ConfigIssue, LanguageResolver, WorkspaceConfig,
+};
 use crate::pathing::{
     canonical_workspace, default_index_path, default_index_staging_path, normalize_abs_path,
     publish_default_index, relative_slash_path,
@@ -13,14 +15,17 @@ use crate::progress::{IndexStats, IndexStatus};
 use crate::store::IndexStore;
 
 mod candidates;
+mod go_packages;
 mod include_edges;
 mod parse_pipeline;
 mod progress_limiter;
 
 use candidates::{
     candidate_for_path, canonicalize_existing_prefix, discover_candidates,
-    discover_external_candidates, DEFAULT_EXTERNAL_MAX_BYTES, DEFAULT_EXTERNAL_MAX_FILES,
+    discover_external_candidates, discover_external_go_candidates, DEFAULT_EXTERNAL_MAX_BYTES,
+    DEFAULT_EXTERNAL_MAX_FILES,
 };
+use go_packages::build_go_package_graph;
 use include_edges::{build_include_edges, sql_affected_include_edge_sources};
 use parse_pipeline::{parse_and_write_changed, parse_thread_count, ParsePipelineConfig};
 use progress_limiter::ProgressLimiter;
@@ -115,6 +120,9 @@ pub fn index_workspace(
     let mut include_entries = config.include_paths.clone();
     include_entries.extend(options.include_paths.iter().cloned());
     let (include_roots, include_issues) = resolve_include_roots(&include_entries);
+    let (go_module_roots, mut go_module_issues) = resolve_go_module_roots(&config.go_module_paths);
+    let (go_module_roots, overlap_issues) = external_go_module_roots(&workspace, go_module_roots);
+    go_module_issues.extend(overlap_issues);
 
     let max_files = options
         .external_max_files
@@ -128,10 +136,20 @@ pub fn index_workspace(
     let (external_candidates, external_issues) =
         discover_external_candidates(&include_roots, &config, max_files, max_bytes);
     candidates.extend(external_candidates);
+    let (external_go_candidates, external_go_issues) =
+        discover_external_go_candidates(&go_module_roots, &config, max_files, max_bytes);
+    candidates.extend(external_go_candidates);
+    candidates.sort_by(|left, right| left.fingerprint.path.cmp(&right.fingerprint.path));
+    candidates.dedup_by(|left, right| left.fingerprint.path == right.fingerprint.path);
     stats.discover_ms = discover_started.elapsed().as_millis();
     stats.total_files = candidates.len();
 
-    for issue in include_issues.into_iter().chain(external_issues) {
+    for issue in include_issues
+        .into_iter()
+        .chain(go_module_issues)
+        .chain(external_issues)
+        .chain(external_go_issues)
+    {
         progress(IndexStatus::indexing_with_message(
             workspace_display.clone(),
             &stats,
@@ -217,7 +235,11 @@ pub fn index_workspace(
     // Rebuild the full include graph that backs reachability scoping, and
     // derive the first-layer `directly_included` flag in the same pass.
     let include_edge_started = Instant::now();
-    let include_graph = build_include_edges(&store, build, &include_roots, None)?;
+    let mut include_graph = build_include_edges(&store, build, &include_roots, None)?;
+    let go_package_graph = build_go_package_graph(&store, build, &workspace, &go_module_roots)?;
+    include_graph.go_package_edges = go_package_graph.edges;
+    include_graph.go_open_packages = go_package_graph.open_packages;
+    include_graph.clear_all_go_packages = true;
     let commit = store.commit_index_build(build, &include_graph)?;
     stats.semantic_generation = commit.generation;
     stats.maintenance_warning = commit.cleanup_warning;
@@ -321,7 +343,10 @@ pub fn index_dirty_files(
     let mut include_entries = config.include_paths.clone();
     include_entries.extend(options.include_paths.iter().cloned());
     let (include_roots, include_issues) = resolve_include_roots(&include_entries);
-    for issue in include_issues {
+    let (go_module_roots, mut go_module_issues) = resolve_go_module_roots(&config.go_module_paths);
+    let (go_module_roots, overlap_issues) = external_go_module_roots(&workspace, go_module_roots);
+    go_module_issues.extend(overlap_issues);
+    for issue in include_issues.into_iter().chain(go_module_issues) {
         progress(IndexStatus::indexing_with_message(
             workspace_display.clone(),
             &stats,
@@ -410,7 +435,12 @@ pub fn index_dirty_files(
     let affected_rels =
         sql_affected_include_edge_sources(&store, &roots_slash, &upsert_rels, &changed_rels)?;
     stats.include_edge_sources_rebuilt = affected_rels.clone();
-    let include_graph = build_include_edges(&store, build, &include_roots, Some(&affected_rels))?;
+    let mut include_graph =
+        build_include_edges(&store, build, &include_roots, Some(&affected_rels))?;
+    let go_package_graph = build_go_package_graph(&store, build, &workspace, &go_module_roots)?;
+    include_graph.go_package_edges = go_package_graph.edges;
+    include_graph.go_open_packages = go_package_graph.open_packages;
+    include_graph.clear_all_go_packages = true;
     let commit = store.commit_index_build(build, &include_graph)?;
     stats.semantic_generation = commit.generation;
     stats.maintenance_warning = commit.cleanup_warning;
@@ -422,6 +452,44 @@ pub fn index_dirty_files(
     stats.elapsed_ms = started.elapsed().as_millis();
     progress(IndexStatus::ready(workspace_display, &stats));
     Ok(stats)
+}
+
+fn external_go_module_roots(
+    workspace: &Path,
+    roots: Vec<PathBuf>,
+) -> (Vec<PathBuf>, Vec<ConfigIssue>) {
+    let mut external = Vec::new();
+    let mut issues = Vec::new();
+    let mut seen = HashSet::new();
+    for root in roots {
+        let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+        if canonical.starts_with(workspace) || workspace.starts_with(&canonical) {
+            issues.push(ConfigIssue {
+                message: format!(
+                    "goModulePaths root overlaps the workspace and would index workspace files \
+                     twice; skipping external duplicate: {}",
+                    canonical.display()
+                ),
+            });
+            continue;
+        }
+        let identity = normalize_abs_path(&canonical).to_ascii_lowercase();
+        if !seen.insert(identity) {
+            issues.push(ConfigIssue {
+                message: format!(
+                    "goModulePaths roots resolve to the same directory, skipping duplicate: {}",
+                    canonical.display()
+                ),
+            });
+            continue;
+        }
+        // Canonical paths are comparison identities only. On Windows,
+        // `canonicalize` may add a verbatim `\\?\` prefix; feeding that back
+        // into discovery would change the persisted absolute path spelling
+        // and break equality with other normalized external-root consumers.
+        external.push(root);
+    }
+    (external, issues)
 }
 
 #[cfg(test)]

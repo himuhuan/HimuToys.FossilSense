@@ -5,7 +5,7 @@ use tower_lsp::lsp_types::Url;
 
 use super::completion_documentation::{completion_popup_markdown, current_document_for_root};
 use super::Backend;
-use crate::candidate_service::CandidateHandle;
+use crate::candidate_service::{CandidateHandle, CandidateHandleLocator};
 use crate::query;
 
 impl Backend {
@@ -29,6 +29,10 @@ impl Backend {
             return None;
         }
         let request_uri = Url::parse(&uri).ok();
+        let semantic_family = match request_uri.as_ref() {
+            Some(uri) => self.source_language_for_uri(uri).await.semantic_family(),
+            None => return None,
+        };
         let documents = self
             .session
             .documents
@@ -69,14 +73,16 @@ impl Backend {
         let cache_before = declaration_index.payload_cache_stats();
         let query_started = std::time::Instant::now();
         let result = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
-            let service = crate::candidate_service::CandidateQueryService::new_with_declarations(
-                call_read_handle.as_deref(),
-                Some(&query_index),
-                &overlay,
-                &current_rel,
-                reach_scope.as_deref(),
-                reach_graph.as_deref(),
-            );
+            let service =
+                crate::candidate_service::CandidateQueryService::new_with_declarations_for_family(
+                    call_read_handle.as_deref(),
+                    Some(&query_index),
+                    &overlay,
+                    &current_rel,
+                    reach_scope.as_deref(),
+                    reach_graph.as_deref(),
+                    semantic_family,
+                );
             let semantic = service.semantic_candidates(
                 &declaration_name,
                 crate::candidate_service::SemanticIntent::Neutral,
@@ -145,12 +151,15 @@ impl Backend {
         if !self.is_workspace_root(&root).await && !standalone_root {
             return None;
         }
+        let semantic_family = handle.semantic_family;
+        let overlay_handle = matches!(handle.locator, CandidateHandleLocator::Overlay { .. });
         let documents = self
             .session
             .documents
             .capture_request_snapshot(request_uri.as_ref())
             .await;
         if documents.overlay_epoch < overlay_epoch
+            || (overlay_handle && documents.overlay_epoch != overlay_epoch)
             || documents
                 .current
                 .as_ref()
@@ -182,14 +191,16 @@ impl Backend {
             )
             .await;
         let result = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
-            let service = crate::candidate_service::CandidateQueryService::new_with_declarations(
-                call_read_handle.as_deref(),
-                declaration_index.as_deref(),
-                &overlay,
-                &current_rel,
-                reach_scope.as_deref(),
-                reach_graph.as_deref(),
-            );
+            let service =
+                crate::candidate_service::CandidateQueryService::new_with_declarations_for_family(
+                    call_read_handle.as_deref(),
+                    declaration_index.as_deref(),
+                    &overlay,
+                    &current_rel,
+                    reach_scope.as_deref(),
+                    reach_graph.as_deref(),
+                    semantic_family,
+                );
             let Some(candidate) = service.resolve_candidate_handle(&handle)? else {
                 return Ok(None);
             };

@@ -174,9 +174,11 @@ fn counterpart_scan_cap() -> Result<BenchmarkMetrics> {
     )?;
     let handle = CallReadHandle::capture(database)?;
     let (bounded_rows, bounded_truncated) = handle.read(|store| {
-        store
-            .call_fact_view()
-            .anchors_by_name_limited("counterpart", DEFAULT_EXACT_NAME_CANDIDATE_LIMIT)
+        store.call_fact_view().anchors_by_name_family_limited(
+            "counterpart",
+            crate::semantic_model::SemanticFamily::CFamily,
+            DEFAULT_EXACT_NAME_CANDIDATE_LIMIT,
+        )
     })?;
     if !bounded_truncated || bounded_rows.len() != DEFAULT_EXACT_NAME_CANDIDATE_LIMIT {
         anyhow::bail!("durable exact-name candidate query did not stop at its configured cap");

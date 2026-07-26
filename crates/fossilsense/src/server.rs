@@ -319,7 +319,7 @@ impl Backend {
         if let Some(cached) = self
             .session
             .documents
-            .cached_live_parse(uri, version, requested_facts)
+            .cached_live_parse(uri, version, language, requested_facts)
             .await
         {
             self.perf_log(|| live_parse_cache_log(LiveParseCacheEvent::Hit).to_string())
@@ -336,7 +336,7 @@ impl Backend {
         if let Some(cached) = self
             .session
             .documents
-            .cached_live_parse(uri, version, requested_facts)
+            .cached_live_parse(uri, version, language, requested_facts)
             .await
         {
             self.perf_log(|| live_parse_cache_log(LiveParseCacheEvent::Coalesced).to_string())
@@ -352,7 +352,7 @@ impl Backend {
         let facts = self
             .session
             .documents
-            .cached_live_parse_facts(uri, version)
+            .cached_live_parse_facts(uri, version, language)
             .await
             | requested_facts;
         let cancellation = self
@@ -379,7 +379,7 @@ impl Backend {
 
         self.session
             .documents
-            .store_live_parse(uri.clone(), version, facts, index.clone())
+            .store_live_parse(uri.clone(), version, language, facts, index.clone())
             .await;
         Some(index)
     }

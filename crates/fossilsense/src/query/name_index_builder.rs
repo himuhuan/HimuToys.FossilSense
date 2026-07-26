@@ -64,6 +64,7 @@ impl<'a> NameIndexBuilder<'a> {
             project_id,
             kind: super::parser_kind_from_declaration_kind(row.declaration_kind),
             role: super::symbol_role_from_declaration_role(row.role),
+            semantic_family: row.semantic_family,
             external: row.external,
             directly_included: row.directly_included,
         });
@@ -82,6 +83,7 @@ impl<'a> NameIndexBuilder<'a> {
             project_id,
             kind: entry.kind,
             role: entry.role,
+            semantic_family: entry.semantic_family,
             external: entry.external,
             directly_included: entry.directly_included,
         });
@@ -101,6 +103,7 @@ impl<'a> NameIndexBuilder<'a> {
             project_id,
             kind: entry.kind,
             role: entry.role,
+            semantic_family: entry.semantic_family,
             external: entry.external,
             directly_included: entry.directly_included,
         });
@@ -128,6 +131,7 @@ impl<'a> NameIndexBuilder<'a> {
             project_id,
             kind: entry.kind,
             role: entry.role,
+            semantic_family: entry.semantic_family,
             external: entry.external,
             directly_included: entry.directly_included,
         });

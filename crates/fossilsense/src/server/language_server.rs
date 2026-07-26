@@ -485,24 +485,30 @@ impl LanguageServer for Backend {
                             entry.path.clone(),
                             entry.kind.clone(),
                             entry.directly_included,
+                            entry.semantic_family,
                         )
                     })
                     .collect();
                 let effective_table = table
-                    .with_updated_paths(overlay.shadowed_paths(), rows)
+                    .with_updated_family_paths(overlay.shadowed_paths(), rows)
                     .with_direct_include_overrides(overlay.direct_include_overrides());
                 let overlay_fallbacks = overlay.fallback_completion_facts().iter().map(|entry| {
-                    crate::completion::ordinary_service::FallbackCompletionName {
-                        name: entry.fact.name.clone(),
-                        kind_hint: entry.fact.kind_hint,
-                        detail: entry.fact.detail.clone(),
-                        path: entry.path.clone(),
-                    }
+                    (
+                        crate::completion::ordinary_service::FallbackCompletionName {
+                            name: entry.fact.name.clone(),
+                            kind_hint: entry.fact.kind_hint,
+                            detail: entry.fact.detail.clone(),
+                            path: entry.path.clone(),
+                        },
+                        overlay
+                            .semantic_family_for_path(&entry.path)
+                            .unwrap_or(crate::semantic_model::SemanticFamily::CFamily),
+                    )
                 });
                 let effective_fallback_table = context
                     .engine
                     .fallback_completion_table
-                    .with_updated_paths(overlay.shadowed_paths(), overlay_fallbacks);
+                    .with_updated_family_paths(overlay.shadowed_paths(), overlay_fallbacks);
                 table_generations.push((context.engine.root.clone(), context.engine.epoch));
                 table_roots.push(context.engine.root.clone());
                 table_semantic_generations.push(context.engine.semantic_generation);

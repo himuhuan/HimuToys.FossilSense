@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::call_service::CallReadHandle;
 use crate::project_context::ProjectContextIndex;
-use crate::query::{CompletionScope, NameTable, RankedNameHit};
+use crate::query::NameTable;
 use crate::store::views::{DeclarationNameRow, DeclarationReadRow};
 use anyhow::Result;
 
@@ -215,13 +215,15 @@ impl SemanticDeclarationIndex {
         self.payloads.stats()
     }
 
-    pub fn exact_name_hits_scoped(
+    pub fn exact_name_hits_scoped_for_family(
         &self,
         name: &str,
         limit: usize,
-        scope: Option<&CompletionScope>,
-    ) -> Vec<RankedNameHit> {
-        self.names.exact_name_hits_scoped(name, limit, scope)
+        scope: Option<&crate::query::CompletionScope>,
+        semantic_family: crate::semantic_model::SemanticFamily,
+    ) -> Vec<crate::query::RankedNameHit> {
+        self.names
+            .exact_name_hits_scoped_for_family(name, limit, scope, semantic_family)
     }
 
     pub fn with_updated_paths(
@@ -293,6 +295,7 @@ mod tests {
             name: name.into(),
             declaration_kind: SemanticDeclarationKind::Function,
             role: SemanticDeclarationRole::Declaration,
+            semantic_family: crate::config::SemanticFamily::CFamily,
             path: path.into(),
             external: false,
             directly_included: false,

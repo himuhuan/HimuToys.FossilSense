@@ -12,13 +12,13 @@ use std::sync::{Arc, Mutex as StdMutex};
 use tempfile::tempdir;
 use tower_lsp::lsp_types::{
     CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse,
-    DeclarationCapability, DidChangeTextDocumentParams, DidChangeWorkspaceFoldersParams,
-    DidOpenTextDocumentParams, DocumentSymbolParams, DocumentSymbolResponse, Documentation,
-    ExecuteCommandParams, FileChangeType, FileEvent, GotoDefinitionParams, GotoDefinitionResponse,
-    HoverContents, HoverParams, InitializeParams, OneOf, Position, SignatureHelpParams,
-    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
-    TextDocumentPositionParams, Url, VersionedTextDocumentIdentifier, WorkspaceFolder,
-    WorkspaceFoldersChangeEvent, WorkspaceSymbolParams,
+    DeclarationCapability, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
+    DidChangeWorkspaceFoldersParams, DidOpenTextDocumentParams, DocumentSymbolParams,
+    DocumentSymbolResponse, Documentation, ExecuteCommandParams, FileChangeType, FileEvent,
+    GotoDefinitionParams, GotoDefinitionResponse, HoverContents, HoverParams, InitializeParams,
+    OneOf, Position, SignatureHelpParams, TextDocumentContentChangeEvent, TextDocumentIdentifier,
+    TextDocumentItem, TextDocumentPositionParams, Url, VersionedTextDocumentIdentifier,
+    WorkspaceFolder, WorkspaceFoldersChangeEvent, WorkspaceSymbolParams,
 };
 use tower_lsp::{LanguageServer as _, LspService};
 
@@ -671,6 +671,55 @@ async fn unsaved_header_overlay_uses_the_same_configured_language_as_indexing() 
 }
 
 #[tokio::test]
+async fn clean_indexed_language_override_keeps_its_family_for_semantic_queries() {
+    let config = r#"{
+      "languageOverrides": [
+        { "glob": "legacy/**/*.h", "language": "go" }
+      ]
+    }"#;
+    let source =
+        "package legacy\nfunc Open() int { return 1 }\nfunc Use() { _ = Open/*cursor*/() }\n";
+    let (dir, service, uri, line, character) =
+        indexed_backend_with_open_doc(&[("fossilsense.json", config)], "legacy/api.h", source)
+            .await;
+    let generation = service
+        .inner()
+        .request_context_for_root(dir.path().to_path_buf())
+        .await
+        .engine
+        .semantic_generation;
+    service
+        .inner()
+        .session
+        .documents
+        .reconcile_published_files(
+            dir.path().to_path_buf(),
+            Some(vec!["legacy/api.h".into()]),
+            generation,
+        )
+        .await;
+    let clean = service
+        .inner()
+        .session
+        .documents
+        .snapshot(&uri)
+        .await
+        .expect("clean document");
+    assert!(!clean.needs_relation_overlay(generation));
+
+    let definition = service
+        .inner()
+        .goto_definition(goto_definition_params(uri.clone(), line, character))
+        .await
+        .expect("definition request")
+        .expect("Go declaration from overridden .h");
+    let locations = definition_locations(definition);
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0].uri, uri);
+    assert_eq!(locations[0].range.start.line, 1);
+}
+
+#[tokio::test]
 async fn go_live_parse_uses_the_same_relative_package_identity_as_indexing() {
     let (dir, service, uri, _line, _character) = indexed_backend_with_open_doc(
         &[],
@@ -1183,7 +1232,12 @@ async fn hover_agrees_with_navigation_on_local_bindings() {
         .inner()
         .session
         .documents
-        .cached_live_parse(&uri, 1, crate::parser::ParseFacts::LOCAL_DECLS)
+        .cached_live_parse(
+            &uri,
+            1,
+            crate::config::SourceLanguage::C,
+            crate::parser::ParseFacts::LOCAL_DECLS,
+        )
         .await
         .expect("local hover must populate the versioned live-parse cache");
     service
@@ -1196,7 +1250,12 @@ async fn hover_agrees_with_navigation_on_local_bindings() {
         .inner()
         .session
         .documents
-        .cached_live_parse(&uri, 1, crate::parser::ParseFacts::LOCAL_DECLS)
+        .cached_live_parse(
+            &uri,
+            1,
+            crate::config::SourceLanguage::C,
+            crate::parser::ParseFacts::LOCAL_DECLS,
+        )
         .await
         .expect("cached local parse");
     assert!(
@@ -1960,7 +2019,12 @@ async fn stale_document_work_cannot_overwrite_latest_revision_caches() {
         .await;
     assert!(Arc::ptr_eq(
         &documents
-            .cached_live_parse(&uri, 2, crate::parser::ParseFacts::ALL)
+            .cached_live_parse(
+                &uri,
+                2,
+                crate::config::SourceLanguage::C,
+                crate::parser::ParseFacts::ALL,
+            )
             .await
             .expect("current parse"),
         &current_parse
@@ -2439,10 +2503,94 @@ async fn watcher_routes_nested_workspace_changes_to_the_most_specific_root() {
         &cache,
     )
     .await;
-    assert!(matches!(config, Some(super::WatchDecision::Full)));
+    assert!(matches!(
+        config,
+        Some(super::WatchDecision::Full(root)) if root == inner
+    ));
     let cached = cache.lock().await;
     assert!(cached.contains_key(&outer_root));
     assert!(!cached.contains_key(&inner));
+}
+
+#[tokio::test]
+async fn language_override_watch_reparses_unchanged_open_document_and_overlay() {
+    let service = test_backend_service();
+    let dir = tempdir().expect("workspace");
+    let root = dir.path().to_path_buf();
+    fs::create_dir_all(root.join("legacy")).expect("legacy");
+    let path = root.join("legacy/api.h");
+    let uri = Url::from_file_path(&path).expect("uri");
+    *service.inner().workspace_roots.lock().await = vec![root.clone()];
+    open_test_document(
+        &service,
+        uri.clone(),
+        1,
+        "package legacy\nfunc Open() {}\n".into(),
+    )
+    .await;
+
+    let first = service
+        .inner()
+        .get_or_parse_document(
+            &uri,
+            &path,
+            1,
+            "package legacy\nfunc Open() {}\n",
+            crate::parser::ParseFacts::HOVER_SEMANTICS,
+        )
+        .await
+        .expect("first parse");
+    assert_eq!(
+        first.language,
+        crate::semantic_model::SemanticLanguage::Cpp,
+        ".h starts in the C/C++ family"
+    );
+    let first_overlay = service
+        .inner()
+        .candidate_overlay_snapshot(&root, crate::call_model::SemanticGeneration(0), None, None)
+        .await;
+
+    fs::write(
+        root.join("fossilsense.json"),
+        r#"{
+          "languageOverrides": [
+            { "glob": "legacy/**/*.h", "language": "go" }
+          ]
+        }"#,
+    )
+    .expect("config");
+    service
+        .inner()
+        .did_change_watched_files(DidChangeWatchedFilesParams {
+            changes: vec![FileEvent {
+                uri: Url::from_file_path(root.join("fossilsense.json")).expect("config uri"),
+                typ: FileChangeType::CHANGED,
+            }],
+        })
+        .await;
+
+    let second = service
+        .inner()
+        .get_or_parse_document(
+            &uri,
+            &path,
+            1,
+            "package legacy\nfunc Open() {}\n",
+            crate::parser::ParseFacts::HOVER_SEMANTICS,
+        )
+        .await
+        .expect("reparsed Go document");
+    assert_eq!(second.language, crate::semantic_model::SemanticLanguage::Go);
+    assert!(!Arc::ptr_eq(&first, &second));
+    let second_overlay = service
+        .inner()
+        .candidate_overlay_snapshot(&root, crate::call_model::SemanticGeneration(0), None, None)
+        .await;
+    assert!(!Arc::ptr_eq(&first_overlay, &second_overlay));
+    assert_eq!(
+        second_overlay.semantic_family_for_path("legacy/api.h"),
+        Some(crate::semantic_model::SemanticFamily::Go)
+    );
 }
 
 #[tokio::test]
@@ -3345,6 +3493,7 @@ async fn indexed_completion_resolve_rejects_cross_generation_context_before_over
                         guard_fingerprint: None,
                     },
                     locator_fingerprint: "stale".into(),
+                    semantic_family: crate::config::SemanticFamily::CFamily,
                 },
                 semantic_generation: 11,
                 overlay_epoch: service
@@ -5354,6 +5503,62 @@ async fn indexed_completion_resolve_rejects_changed_overlay_revision() {
         .unwrap_or_default();
     assert!(!documentation.contains("Replacement indexed docs"));
     assert!(!documentation.contains("Original indexed docs"));
+}
+
+#[tokio::test]
+async fn overlay_completion_resolve_rejects_a_newer_overlay_epoch() {
+    let (dir, service, uri, line, character) =
+        indexed_backend_with_open_doc(&[], "main.c", "void f(void) { Over/*cursor*/ }\n").await;
+    let header_uri = Url::from_file_path(dir.path().join("api.h")).expect("header uri");
+    open_test_document(
+        &service,
+        header_uri.clone(),
+        1,
+        "/// Original dirty docs.\nint OverlayFunction(void);\n".into(),
+    )
+    .await;
+    let response = service
+        .inner()
+        .completion(completion_params(uri, line, character))
+        .await
+        .expect("completion request")
+        .expect("completion response");
+    let item = completion_items(response)
+        .into_iter()
+        .find(|item| item.label == "OverlayFunction")
+        .expect("dirty overlay completion");
+    assert_eq!(
+        item.data
+            .as_ref()
+            .and_then(|data| data.get("handle"))
+            .and_then(|handle| handle.get("locator"))
+            .and_then(|locator| locator.get("origin"))
+            .and_then(serde_json::Value::as_str),
+        Some("overlay")
+    );
+
+    service
+        .inner()
+        .session
+        .change_document(
+            header_uri,
+            2,
+            "/// Replacement dirty docs must not hydrate the old item.\nint OverlayFunction(void);\n"
+                .into(),
+        )
+        .await;
+
+    let resolved = service
+        .inner()
+        .completion_resolve(item)
+        .await
+        .expect("resolve stale overlay item");
+    let documentation = resolved
+        .documentation
+        .map(documentation_text)
+        .unwrap_or_default();
+    assert!(!documentation.contains("Replacement dirty docs"));
+    assert!(!documentation.contains("Original dirty docs"));
 }
 
 #[tokio::test]

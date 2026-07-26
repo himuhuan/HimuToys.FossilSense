@@ -44,7 +44,7 @@ pub(super) struct RootDirtyChange {
 }
 
 pub(super) enum WatchDecision {
-    Full,
+    Full(PathBuf),
     ProjectContext(PathBuf),
     Dirty(RootDirtyChange),
 }

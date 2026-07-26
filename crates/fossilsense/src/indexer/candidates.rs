@@ -193,6 +193,24 @@ pub(super) fn discover_external_candidates(
     (out, issues)
 }
 
+pub(super) fn discover_external_go_candidates(
+    roots: &[PathBuf],
+    config: &WorkspaceConfig,
+    max_files: usize,
+    max_bytes: u64,
+) -> (Vec<FileCandidate>, Vec<ConfigIssue>) {
+    let mut go_only = config.clone();
+    go_only.extensions = vec!["go".to_string()];
+    let (candidates, mut issues) =
+        discover_external_candidates(roots, &go_only, max_files, max_bytes);
+    for issue in &mut issues {
+        issue.message = issue
+            .message
+            .replacen("includePaths root", "goModulePaths root", 1);
+    }
+    (candidates, issues)
+}
+
 /// Build an external candidate without reading file contents: the fingerprint
 /// hash is derived from size+mtime so the unchanged check is cheap. The actual
 /// content is only read for files that need (re)parsing.

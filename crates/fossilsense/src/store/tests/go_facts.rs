@@ -89,6 +89,57 @@ fn go_import_reads_are_bounded_with_limit_plus_one() {
 }
 
 #[test]
+fn compact_name_and_fallback_rows_keep_their_semantic_family() {
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+    let mut store = IndexStore::open(&db, dir.path()).expect("store");
+    upsert_source(
+        &mut store,
+        "src/shared.c",
+        "int SharedOpen(void) { return 1; }\n",
+    );
+    upsert_source(
+        &mut store,
+        "src/shared.go",
+        "package shared\nfunc SharedOpen() int { return 1 }\n",
+    );
+    upsert_source(
+        &mut store,
+        "src/broken.go",
+        "package broken\nfunc Broken(value int {\n",
+    );
+
+    let reader = IndexStore::open_readonly(&db).expect("readonly");
+    let rows = reader.declaration_name_rows().expect("name rows");
+    assert!(rows.iter().any(|row| {
+        row.path == "src/shared.c" && row.semantic_family == crate::config::SemanticFamily::CFamily
+    }));
+    assert!(rows.iter().any(|row| {
+        row.path == "src/shared.go" && row.semantic_family == crate::config::SemanticFamily::Go
+    }));
+    let (go_rows, go_truncated) = reader
+        .declaration_view()
+        .by_name_family_limited("SharedOpen", crate::config::SemanticFamily::Go, 1)
+        .expect("bounded Go declarations");
+    assert_eq!(go_rows.len(), 1);
+    assert_eq!(go_rows[0].fact.identity.language, SemanticLanguage::Go);
+    assert!(!go_truncated);
+    let (c_rows, c_truncated) = reader
+        .declaration_view()
+        .by_name_family_limited("SharedOpen", crate::config::SemanticFamily::CFamily, 1)
+        .expect("bounded C-family declarations");
+    assert_eq!(c_rows.len(), 1);
+    assert_eq!(c_rows[0].fact.identity.language, SemanticLanguage::C);
+    assert!(!c_truncated);
+    assert!(reader
+        .fallback_completion_view()
+        .all()
+        .expect("fallback rows")
+        .iter()
+        .all(|row| row.semantic_family == crate::config::SemanticFamily::Go));
+}
+
+#[test]
 fn staged_go_package_facts_are_invisible_until_generation_commit() {
     let dir = tempdir().expect("tempdir");
     let db = dir.path().join("index.sqlite");

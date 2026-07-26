@@ -1098,6 +1098,49 @@ fn streamed_name_index_matches_typed_row_builder_with_project_context() {
 }
 
 #[test]
+fn compact_name_recall_filters_c_family_and_go_before_spending_budget() {
+    use crate::config::SemanticFamily;
+    use crate::semantic_model::{SemanticDeclarationKind, SemanticDeclarationRole};
+    use crate::store::views::DeclarationNameRow;
+
+    let table = NameTable::build_from_declaration_name_rows_with_project_context(
+        vec![
+            DeclarationNameRow {
+                id: 1,
+                name: "SharedOpen".to_string(),
+                declaration_kind: SemanticDeclarationKind::Function,
+                role: SemanticDeclarationRole::Definition,
+                path: "src/open.c".to_string(),
+                external: false,
+                directly_included: false,
+                semantic_family: SemanticFamily::CFamily,
+            },
+            DeclarationNameRow {
+                id: 2,
+                name: "SharedOpen".to_string(),
+                declaration_kind: SemanticDeclarationKind::Function,
+                role: SemanticDeclarationRole::Definition,
+                path: "src/open.go".to_string(),
+                external: false,
+                directly_included: false,
+                semantic_family: SemanticFamily::Go,
+            },
+        ],
+        None,
+    );
+
+    let c_hits =
+        table.exact_name_hits_scoped_for_family("SharedOpen", 1, None, SemanticFamily::CFamily);
+    let go_hits =
+        table.exact_name_hits_scoped_for_family("SharedOpen", 1, None, SemanticFamily::Go);
+    assert_eq!(c_hits.iter().map(|hit| hit.id).collect::<Vec<_>>(), vec![1]);
+    assert_eq!(
+        go_hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+        vec![2]
+    );
+}
+
+#[test]
 fn completion_reachable_outranks_unreachable_from_real_index() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (table, graph) = build_table_and_scope(

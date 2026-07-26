@@ -57,6 +57,7 @@ impl Backend {
         let completion_overlay_epoch = documents.overlay_epoch;
         let roots = self.workspace_roots.lock().await.clone();
         let primary_root = self.root_for_uri(uri).await;
+        let semantic_family = self.source_language_for_uri(uri).await.semantic_family();
         let mut member_root_contexts: HashMap<PathBuf, MemberRootQueryContext> = HashMap::new();
         let mut primary_context = None;
         for root in &roots {
@@ -87,6 +88,7 @@ impl Backend {
                     current_path,
                     reach_graph: context.engine.reach_graph.clone(),
                     semantic_generation: context.engine.semantic_generation,
+                    semantic_family,
                 },
             );
         }
@@ -503,17 +505,19 @@ struct MemberRootQueryContext {
     current_path: String,
     reach_graph: Option<Arc<crate::reachability::ReachGraph>>,
     semantic_generation: crate::call_model::SemanticGeneration,
+    semantic_family: crate::semantic_model::SemanticFamily,
 }
 
 impl MemberRootQueryContext {
     fn service(&self) -> CandidateQueryService<'_> {
-        CandidateQueryService::new_with_declarations(
+        CandidateQueryService::new_with_declarations_for_family(
             self.handle.as_deref(),
             self.declaration_index.as_deref(),
             self.overlay.as_ref(),
             &self.current_path,
             None,
             self.reach_graph.as_deref(),
+            self.semantic_family,
         )
     }
 }

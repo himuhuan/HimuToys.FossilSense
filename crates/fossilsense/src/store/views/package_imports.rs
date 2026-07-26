@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), allow(dead_code))]
+
 use anyhow::Result;
 use rusqlite::OptionalExtension;
 
@@ -49,6 +51,7 @@ impl<'a> PackageImportStoreView<'a> {
         Ok(rows.next()?.map(package_row).transpose()?)
     }
 
+    #[allow(dead_code)] // Reserved for bounded package-name selector evidence.
     pub fn packages_named(&self, name: &str, limit: usize) -> Result<(Vec<PackageReadRow>, bool)> {
         if limit == 0 {
             return Ok((Vec::new(), false));

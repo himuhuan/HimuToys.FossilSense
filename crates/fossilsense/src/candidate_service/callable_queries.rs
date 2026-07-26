@@ -10,16 +10,42 @@ pub struct CandidateQueryService<'a> {
     pub(super) current_path: &'a str,
     pub(super) current_reach: Option<Arc<ReachScope>>,
     pub(super) reach_graph: Option<&'a ReachGraph>,
+    pub(super) semantic_family: crate::semantic_model::SemanticFamily,
     pub(super) exact_name_limit: usize,
 }
 
 impl<'a> CandidateQueryService<'a> {
+    #[cfg(test)]
     pub fn new(
         handle: Option<&'a CallReadHandle>,
         overlays: &'a CandidateOverlaySnapshot,
         current_path: &'a str,
         current_reach: Option<&'a ReachScope>,
         reach_graph: Option<&'a ReachGraph>,
+    ) -> Self {
+        let semantic_family = overlays
+            .semantic_family_for_path(current_path)
+            .unwrap_or_else(|| {
+                crate::config::SourceLanguage::default_for_path(Path::new(current_path))
+                    .semantic_family()
+            });
+        Self::new_for_family(
+            handle,
+            overlays,
+            current_path,
+            current_reach,
+            reach_graph,
+            semantic_family,
+        )
+    }
+
+    pub fn new_for_family(
+        handle: Option<&'a CallReadHandle>,
+        overlays: &'a CandidateOverlaySnapshot,
+        current_path: &'a str,
+        current_reach: Option<&'a ReachScope>,
+        reach_graph: Option<&'a ReachGraph>,
+        semantic_family: crate::semantic_model::SemanticFamily,
     ) -> Self {
         let reach_graph = overlays.effective_reach_graph(reach_graph);
         let current_reach = reach_graph
@@ -32,10 +58,12 @@ impl<'a> CandidateQueryService<'a> {
             current_path,
             current_reach,
             reach_graph,
+            semantic_family,
             exact_name_limit: DEFAULT_EXACT_NAME_CANDIDATE_LIMIT,
         }
     }
 
+    #[cfg(test)]
     pub fn new_with_declarations(
         handle: Option<&'a CallReadHandle>,
         declaration_index: Option<&'a crate::declaration_index::SemanticDeclarationIndex>,
@@ -45,6 +73,27 @@ impl<'a> CandidateQueryService<'a> {
         reach_graph: Option<&'a ReachGraph>,
     ) -> Self {
         let mut service = Self::new(handle, overlays, current_path, current_reach, reach_graph);
+        service.declaration_index = declaration_index;
+        service
+    }
+
+    pub fn new_with_declarations_for_family(
+        handle: Option<&'a CallReadHandle>,
+        declaration_index: Option<&'a crate::declaration_index::SemanticDeclarationIndex>,
+        overlays: &'a CandidateOverlaySnapshot,
+        current_path: &'a str,
+        current_reach: Option<&'a ReachScope>,
+        reach_graph: Option<&'a ReachGraph>,
+        semantic_family: crate::semantic_model::SemanticFamily,
+    ) -> Self {
+        let mut service = Self::new_for_family(
+            handle,
+            overlays,
+            current_path,
+            current_reach,
+            reach_graph,
+            semantic_family,
+        );
         service.declaration_index = declaration_index;
         service
     }
@@ -96,14 +145,22 @@ impl<'a> CandidateQueryService<'a> {
         let (base_rows, mut truncated) = match self.handle {
             Some(handle) => handle.read(|store| {
                 let call_view = store.call_fact_view();
-                let (global_anchors, mut anchor_truncated) =
-                    call_view.anchors_by_name_limited(name, self.exact_name_limit)?;
+                let (global_anchors, mut anchor_truncated) = call_view
+                    .anchors_by_name_family_limited(
+                        name,
+                        self.semantic_family,
+                        self.exact_name_limit,
+                    )?;
                 let mut anchors = Vec::new();
                 if anchor_truncated {
                     for paths in [&current_paths, &reachable_paths] {
                         let remaining = self.exact_name_limit.saturating_sub(anchors.len());
-                        let (rows, limited) =
-                            call_view.anchors_by_name_in_paths_limited(name, paths, remaining)?;
+                        let (rows, limited) = call_view.anchors_by_name_family_in_paths_limited(
+                            name,
+                            self.semantic_family,
+                            paths,
+                            remaining,
+                        )?;
                         anchors.extend(rows);
                         anchor_truncated |= limited;
                     }
@@ -118,7 +175,10 @@ impl<'a> CandidateQueryService<'a> {
             })?,
             None => (Vec::new(), false),
         };
-        let scanned = base_rows.len() + self.overlays.callable_anchors(name).len();
+        let overlay_anchors_for_family = self
+            .overlays
+            .callable_anchors_for_family(name, self.semantic_family);
+        let scanned = base_rows.len() + overlay_anchors_for_family.len();
         let resolve_context = ResolveContext {
             current_path: Some(self.current_path),
             reach: self.current_reach.as_deref(),
@@ -141,10 +201,8 @@ impl<'a> CandidateQueryService<'a> {
                 resolved_anchor(anchor, source, tier, CandidateOrigin::Base)
             })
             .collect();
-        let overlay_anchors = self
-            .overlays
-            .callable_anchors(name)
-            .iter()
+        let overlay_anchors = overlay_anchors_for_family
+            .into_iter()
             .cloned()
             .map(|anchor| {
                 let (external, directly_included) =
@@ -366,11 +424,18 @@ fn resolved_anchor(
     tier: crate::model::ScopeTier,
     origin: CandidateOrigin,
 ) -> ResolvedCallableAnchor {
-    let base_match = if anchor.role == crate::call_model::AnchorRole::Definition {
+    let mut base_match = if anchor.role == crate::call_model::AnchorRole::Definition {
         1_000
     } else {
         900
     };
+    if anchor
+        .guard
+        .as_deref()
+        .is_some_and(|guard| !guard.trim().is_empty())
+    {
+        base_match -= 1;
+    }
     let (confidence, reason) = resolver::confidence_reason_for(tier, true, None);
     let candidate = DefinitionCandidate {
         name: anchor.name.clone(),

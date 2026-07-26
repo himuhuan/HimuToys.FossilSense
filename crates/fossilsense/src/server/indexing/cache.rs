@@ -38,10 +38,14 @@ async fn load_reach_graph(root: PathBuf) -> Result<Arc<ReachGraph>> {
 fn build_reach_graph_from_db(db_path: &Path) -> Result<ReachGraph> {
     let store = IndexStore::open_readonly(db_path)?;
     let reach_view = store.reach_graph_view();
-    Ok(ReachGraph::from_rows(
+    let package_view = store.go_package_graph_view();
+    Ok(ReachGraph::from_rows_with_packages(
         reach_view.include_edges()?,
         reach_view.unresolved_includes()?,
         reach_view.ambiguous_includes()?,
+        package_view.package_files()?,
+        package_view.package_edges()?,
+        package_view.open_packages()?,
     ))
 }
 
@@ -73,6 +77,9 @@ async fn refresh_reach_graph_incremental(
             Some(graph) => Some(graph),
             None => rebuild_reach_graph(client, root).await,
         };
+    }
+    if source_paths.iter().any(|path| path.ends_with(".go")) {
+        return rebuild_reach_graph(client, root).await;
     }
 
     let Some(previous) = previous else {

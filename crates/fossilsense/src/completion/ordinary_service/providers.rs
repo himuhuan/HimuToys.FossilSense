@@ -208,6 +208,7 @@ pub(super) fn completion_items_for_current_file_overlay(
                                     .locator
                                     .fingerprint
                                     .clone(),
+                                semantic_family: declaration.identity.language.semantic_family(),
                             },
                         }
                     });
@@ -299,10 +300,11 @@ pub(super) fn exact_indexed_completion_candidates_for_local_word(
     local_score: i32,
     scope: Option<&query::CompletionScope>,
     limit: usize,
+    semantic_family: crate::semantic_model::SemanticFamily,
     context: IndexedCompletionContext<'_>,
 ) -> Vec<OrdinaryPipelineCandidate> {
     table
-        .exact_name_hits_scoped(word, limit, scope)
+        .exact_name_hits_scoped_for_family(word, limit, scope, semantic_family)
         .into_iter()
         .map(|hit| {
             let (confidence, reason) =

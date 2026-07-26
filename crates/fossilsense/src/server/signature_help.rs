@@ -41,6 +41,7 @@ impl Backend {
         let current_rel = uri_to_path(&uri)
             .and_then(|path| pathing::relative_slash_path(&root, &path).ok())
             .unwrap_or_default();
+        let semantic_family = self.source_language_for_uri(&uri).await.semantic_family();
         let total_started = std::time::Instant::now();
         let context = self.request_context_for_root(root.clone()).await;
         let reach_started = std::time::Instant::now();
@@ -129,13 +130,14 @@ impl Backend {
         let result = tokio::task::spawn_blocking(
             move || -> Result<(Vec<SignatureInformation>, usize, SemanticRequestPerf)> {
                 let query_started = std::time::Instant::now();
-                let service = CandidateQueryService::new_with_declarations(
+                let service = CandidateQueryService::new_with_declarations_for_family(
                     call_read_handle.as_deref(),
                     declaration_index.as_deref(),
                     &overlay,
                     &current_rel,
                     reach_scope.as_deref(),
                     reach_graph.as_deref(),
+                    semantic_family,
                 );
                 let semantic_set = service.semantic_candidates(
                     &call_name,

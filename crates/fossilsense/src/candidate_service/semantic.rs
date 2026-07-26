@@ -84,6 +84,13 @@ fn definition_base_match(fact: &DeclarationFact) -> i32 {
     {
         score += 100;
     }
+    if fact
+        .guard
+        .as_deref()
+        .is_some_and(|guard| !guard.trim().is_empty())
+    {
+        score -= 1;
+    }
     score
 }
 
@@ -93,6 +100,7 @@ pub struct CandidateHandle {
     pub locator: CandidateHandleLocator,
     pub logical_key: LogicalEntityKey,
     pub locator_fingerprint: String,
+    pub semantic_family: crate::semantic_model::SemanticFamily,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -228,10 +236,11 @@ impl CandidateQueryService<'_> {
                                 })
                                 .unwrap_or_default(),
                         });
-                let hits = index.exact_name_hits_scoped(
+                let hits = index.exact_name_hits_scoped_for_family(
                     name,
                     self.exact_name_limit.saturating_add(1),
                     scope.as_ref(),
+                    self.semantic_family,
                 );
                 let limited = hits.len() > self.exact_name_limit;
                 let ids: Vec<_> = hits
@@ -244,8 +253,11 @@ impl CandidateQueryService<'_> {
                 let (current_paths, reachable_paths) = self.durable_priority_path_groups();
                 let (rows, limited) = handle.read(|store| {
                     let view = store.declaration_view();
-                    let (global, mut limited) =
-                        view.by_name_limited(name, self.exact_name_limit)?;
+                    let (global, mut limited) = view.by_name_family_limited(
+                        name,
+                        self.semantic_family,
+                        self.exact_name_limit,
+                    )?;
                     if !limited {
                         return Ok((global, false));
                     }
@@ -253,8 +265,12 @@ impl CandidateQueryService<'_> {
                     let mut rows = Vec::new();
                     for paths in [&current_paths, &reachable_paths] {
                         let remaining = self.exact_name_limit.saturating_sub(rows.len());
-                        let (priority, priority_limited) =
-                            view.by_name_in_paths_limited(name, paths, remaining)?;
+                        let (priority, priority_limited) = view.by_name_family_in_paths_limited(
+                            name,
+                            self.semantic_family,
+                            paths,
+                            remaining,
+                        )?;
                         rows.extend(priority);
                         limited |= priority_limited;
                     }
@@ -307,9 +323,11 @@ impl CandidateQueryService<'_> {
             }));
         }
 
-        let overlay = self.overlays.declarations(name);
+        let overlay = self
+            .overlays
+            .declarations_for_family(name, self.semantic_family);
         scanned += overlay.len();
-        candidates.extend(overlay.iter().cloned().map(|entry| {
+        candidates.extend(overlay.into_iter().cloned().map(|entry| {
             let external = std::path::Path::new(&entry.path).is_absolute();
             let (external, directly_included) = self.path_evidence(&entry.path, external, false);
             let tier = resolver::scope_tier(
@@ -360,6 +378,9 @@ impl CandidateQueryService<'_> {
         &self,
         candidate: &CandidateHandle,
     ) -> Result<Option<ResolvedDeclarationCandidate>> {
+        if candidate.semantic_family != self.semantic_family {
+            return Ok(None);
+        }
         match &candidate.locator {
             CandidateHandleLocator::Persistent { declaration_id } => {
                 let Some(handle) = self.handle else {
@@ -406,9 +427,11 @@ impl CandidateQueryService<'_> {
                         return Ok(None);
                     };
                     let (rows, _) = read_handle.read(|store| {
-                        store
-                            .declaration_view()
-                            .by_logical_key_limited(&candidate.logical_key, self.exact_name_limit)
+                        store.declaration_view().by_logical_key_family_limited(
+                            &candidate.logical_key,
+                            self.semantic_family,
+                            self.exact_name_limit,
+                        )
                     })?;
                     let Some(name) = rows
                         .into_iter()
@@ -596,6 +619,7 @@ fn candidate_order(
         .cmp(&left.tier)
         .then_with(|| fidelity_rank(right).cmp(&fidelity_rank(left)))
         .then_with(|| role_rank(right.fact.role).cmp(&role_rank(left.fact.role)))
+        .then_with(|| guard_rank(right).cmp(&guard_rank(left)))
         .then_with(|| {
             candidate_origin_priority(right.origin).cmp(&candidate_origin_priority(left.origin))
         })
@@ -606,6 +630,16 @@ fn candidate_order(
                 .start_byte
                 .cmp(&right.fact.name_range.start_byte)
         })
+}
+
+fn guard_rank(candidate: &ResolvedDeclarationCandidate) -> u8 {
+    u8::from(
+        candidate
+            .fact
+            .guard
+            .as_deref()
+            .is_none_or(|guard| guard.trim().is_empty()),
+    )
 }
 
 fn intent_accepts(intent: SemanticIntent, kind: SemanticDeclarationKind) -> bool {

@@ -51,6 +51,7 @@ impl Backend {
             .and_then(|path| pathing::relative_slash_path(&root, path).ok())
             .unwrap_or_default();
         let source_language = self.source_language_for_uri(&uri).await;
+        let semantic_family = source_language.semantic_family();
         let cursor_byte =
             query::byte_offset_at(&text, position.position.line, position.position.character);
 
@@ -164,13 +165,14 @@ impl Backend {
         let result = tokio::task::spawn_blocking(
             move || -> Result<(Option<String>, SemanticRequestPerf)> {
                 let query_started = std::time::Instant::now();
-                let service = CandidateQueryService::new_with_declarations(
+                let service = CandidateQueryService::new_with_declarations_for_family(
                     call_read_handle.as_deref(),
                     declaration_index.as_deref(),
                     &overlay,
                     &current_rel,
                     reach_scope.as_deref(),
                     reach_graph.as_deref(),
+                    semantic_family,
                 );
                 let call_context = service.complete_call_context_at(source_position)?;
                 let is_call_site = call_context.is_some();

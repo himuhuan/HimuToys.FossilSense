@@ -31,7 +31,7 @@ const SELECT: &str = "SELECT
 
 const SELECT_NAME: &str = "SELECT
     d.id, d.name, d.declaration_kind, d.role,
-    f.path, rev.source, f.directly_included
+    d.language, f.path, rev.source, f.directly_included
     FROM declarations d
     JOIN file_entries f ON f.id = d.file_id
     JOIN file_revisions rev ON rev.id = d.revision_id";
@@ -59,6 +59,7 @@ pub struct DeclarationNameRow {
     pub name: String,
     pub declaration_kind: SemanticDeclarationKind,
     pub role: SemanticDeclarationRole,
+    pub semantic_family: crate::semantic_model::SemanticFamily,
     pub path: String,
     pub external: bool,
     pub directly_included: bool,
@@ -74,6 +75,7 @@ pub struct DeclarationNameRef<'a> {
     pub name: &'a str,
     pub declaration_kind: SemanticDeclarationKind,
     pub role: SemanticDeclarationRole,
+    pub semantic_family: crate::semantic_model::SemanticFamily,
     pub path: &'a str,
     pub external: bool,
     pub directly_included: bool,
@@ -105,8 +107,8 @@ impl<'a> DeclarationStoreView<'a> {
         while let Some(row) = rows.next()? {
             let id = row.get(0)?;
             let name = row.get_ref(1)?.as_str()?;
-            let path = row.get_ref(4)?.as_str()?;
-            let source = row.get_ref(5)?.as_str()?;
+            let path = row.get_ref(5)?.as_str()?;
+            let source = row.get_ref(6)?.as_str()?;
             visitor(DeclarationNameRef {
                 id,
                 name,
@@ -114,9 +116,10 @@ impl<'a> DeclarationStoreView<'a> {
                     .with_context(|| format!("invalid declaration kind for row {id}"))?,
                 role: declaration_role(row.get(3)?)
                     .with_context(|| format!("invalid declaration role for row {id}"))?,
+                semantic_family: semantic_language(row.get(4)?)?.semantic_family(),
                 path,
                 external: source == "external",
-                directly_included: row.get::<_, i64>(6)? != 0,
+                directly_included: row.get::<_, i64>(7)? != 0,
             })?;
             count += 1;
         }
@@ -174,12 +177,25 @@ impl<'a> DeclarationStoreView<'a> {
         Ok(output)
     }
 
+    #[cfg(test)]
     pub fn by_name_limited(
         &self,
         name: &str,
         limit: usize,
     ) -> Result<(Vec<DeclarationReadRow>, bool)> {
         let sql = format!("{SELECT} WHERE d.name = ?1 ORDER BY d.id LIMIT ?2");
+        let rows = self.read(&sql, params![name, limit.saturating_add(1) as i64])?;
+        Ok(truncate(rows, limit))
+    }
+
+    pub fn by_name_family_limited(
+        &self,
+        name: &str,
+        semantic_family: crate::semantic_model::SemanticFamily,
+        limit: usize,
+    ) -> Result<(Vec<DeclarationReadRow>, bool)> {
+        let language = semantic_family_sql_predicate(semantic_family, "d.language");
+        let sql = format!("{SELECT} WHERE d.name = ?1 AND {language} ORDER BY d.id LIMIT ?2");
         let rows = self.read(&sql, params![name, limit.saturating_add(1) as i64])?;
         Ok(truncate(rows, limit))
     }
@@ -194,6 +210,7 @@ impl<'a> DeclarationStoreView<'a> {
     /// only after the ordinary workspace-wide read proves that its cap hid
     /// rows, so current and reachable declarations cannot be starved by
     /// earlier unrelated declarations with the same spelling.
+    #[cfg(test)]
     pub fn by_name_in_paths_limited(
         &self,
         name: &str,
@@ -206,6 +223,36 @@ impl<'a> DeclarationStoreView<'a> {
             let placeholders = vec!["?"; chunk.len()].join(",");
             let sql = format!(
                 "{SELECT} WHERE d.name = ? AND f.path IN ({placeholders}) \
+                 ORDER BY d.id LIMIT {probe_limit}"
+            );
+            let mut values = Vec::with_capacity(chunk.len() + 1);
+            values.push(name);
+            values.extend(chunk.iter().map(String::as_str));
+            output.extend(self.read(&sql, rusqlite::params_from_iter(values))?);
+            if output.len() > limit {
+                break;
+            }
+        }
+        Ok(truncate(output, limit))
+    }
+
+    pub fn by_name_family_in_paths_limited(
+        &self,
+        name: &str,
+        semantic_family: crate::semantic_model::SemanticFamily,
+        paths: &[String],
+        limit: usize,
+    ) -> Result<(Vec<DeclarationReadRow>, bool)> {
+        let mut output = Vec::new();
+        let language = semantic_family_sql_predicate(semantic_family, "d.language");
+        for chunk in paths.chunks(399) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let probe_limit = limit.saturating_sub(output.len()).saturating_add(1);
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "{SELECT} WHERE d.name = ? AND {language} AND f.path IN ({placeholders}) \
                  ORDER BY d.id LIMIT {probe_limit}"
             );
             let mut values = Vec::with_capacity(chunk.len() + 1);
@@ -234,6 +281,7 @@ impl<'a> DeclarationStoreView<'a> {
         Ok(ids.iter().filter_map(|id| by_id.get(id).cloned()).collect())
     }
 
+    #[cfg(test)]
     pub fn by_logical_key_limited(
         &self,
         key: &LogicalEntityKey,
@@ -247,6 +295,31 @@ impl<'a> DeclarationStoreView<'a> {
             .unwrap_or(key.qualified_name.as_str());
         let sql = format!(
             "{SELECT} WHERE d.name = ?1 AND d.logical_key_digest = ?2 ORDER BY d.id LIMIT ?3"
+        );
+        let rows = self.read(&sql, params![name, digest, limit.saturating_add(1) as i64])?;
+        let rows = rows
+            .into_iter()
+            .filter(|row| &row.fact.identity.logical_key == key)
+            .collect();
+        Ok(truncate(rows, limit))
+    }
+
+    pub fn by_logical_key_family_limited(
+        &self,
+        key: &LogicalEntityKey,
+        semantic_family: crate::semantic_model::SemanticFamily,
+        limit: usize,
+    ) -> Result<(Vec<DeclarationReadRow>, bool)> {
+        let digest = logical_key_digest(key)?;
+        let name = key
+            .qualified_name
+            .rsplit("::")
+            .next()
+            .unwrap_or(key.qualified_name.as_str());
+        let language = semantic_family_sql_predicate(semantic_family, "d.language");
+        let sql = format!(
+            "{SELECT} WHERE d.name = ?1 AND d.logical_key_digest = ?2 AND {language} \
+             ORDER BY d.id LIMIT ?3"
         );
         let rows = self.read(&sql, params![name, digest, limit.saturating_add(1) as i64])?;
         let rows = rows
@@ -279,9 +352,10 @@ fn declaration_name_row(row: &rusqlite::Row<'_>) -> Result<DeclarationNameRow> {
             .with_context(|| format!("invalid declaration kind for row {id}"))?,
         role: declaration_role(row.get(3)?)
             .with_context(|| format!("invalid declaration role for row {id}"))?,
-        path: row.get(4)?,
-        external: row.get::<_, String>(5)? == "external",
-        directly_included: row.get::<_, i64>(6)? != 0,
+        semantic_family: semantic_language(row.get(4)?)?.semantic_family(),
+        path: row.get(5)?,
+        external: row.get::<_, String>(6)? == "external",
+        directly_included: row.get::<_, i64>(7)? != 0,
     })
 }
 
@@ -484,6 +558,16 @@ fn semantic_language(value: i64) -> Result<SemanticLanguage> {
         3 => SemanticLanguage::Go,
         _ => anyhow::bail!("unknown semantic language code {value}"),
     })
+}
+
+fn semantic_family_sql_predicate(
+    semantic_family: crate::semantic_model::SemanticFamily,
+    column: &str,
+) -> String {
+    match semantic_family {
+        crate::semantic_model::SemanticFamily::CFamily => format!("{column} <> 3"),
+        crate::semantic_model::SemanticFamily::Go => format!("{column} = 3"),
+    }
 }
 
 fn language_fidelity(value: i64) -> Result<LanguageFidelity> {

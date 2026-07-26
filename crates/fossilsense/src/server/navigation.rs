@@ -127,6 +127,7 @@ impl Backend {
         // `None` when scoping is disabled or no graph exists yet — non-current
         // workspace files then fall back to `Global`.
         let total_started = std::time::Instant::now();
+        let semantic_family = self.source_language_for_uri(&uri).await.semantic_family();
         let context = self.request_context_for_root(root.clone()).await;
         let reach_started = std::time::Instant::now();
         let reach_scope: Option<Arc<reachability::ReachScope>> = self
@@ -164,14 +165,16 @@ impl Backend {
         let result = tokio::task::spawn_blocking(
             move || -> Result<(Vec<Location>, Vec<String>, SemanticRequestPerf)> {
                 let query_started = std::time::Instant::now();
-                let service = crate::candidate_service::CandidateQueryService::new_with_declarations(
-                    call_read_handle.as_deref(),
-                    declaration_index.as_deref(),
-                    &overlay,
-                    &current_rel,
-                    reach_scope.as_deref(),
-                    reach_graph.as_deref(),
-                );
+                let service =
+                    crate::candidate_service::CandidateQueryService::new_with_declarations_for_family(
+                        call_read_handle.as_deref(),
+                        declaration_index.as_deref(),
+                        &overlay,
+                        &current_rel,
+                        reach_scope.as_deref(),
+                        reach_graph.as_deref(),
+                        semantic_family,
+                    );
                 let call_context = service.complete_call_context_at(source_position)?;
                 let semantic_set = service.semantic_candidates(
                     &word,

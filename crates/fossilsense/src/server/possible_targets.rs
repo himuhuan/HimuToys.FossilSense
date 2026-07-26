@@ -98,6 +98,7 @@ impl Backend {
             .unwrap_or_default();
         let context = self.request_context_for_root(root.clone()).await;
         let source_language = self.source_language_for_uri(&uri).await;
+        let semantic_family = source_language.semantic_family();
         let semantic_generation = context.engine.semantic_generation.0;
         let cursor = crate::call_model::SourcePosition { line, character };
         let lsp_cursor = tower_lsp::lsp_types::Position { line, character };
@@ -188,13 +189,14 @@ impl Backend {
             .await;
 
         let result = tokio::task::spawn_blocking(move || -> Result<PossibleTargetsResponse> {
-            let service = CandidateQueryService::new_with_declarations(
+            let service = CandidateQueryService::new_with_declarations_for_family(
                 call_read_handle.as_deref(),
                 declaration_index.as_deref(),
                 &overlay,
                 &current_path,
                 reach_scope.as_deref(),
                 reach_graph.as_deref(),
+                semantic_family,
             );
             let call_context = service.complete_call_context_at(cursor)?;
             let semantic_set = service.semantic_candidates(
@@ -550,6 +552,8 @@ fn open_reason_label(reason: OpenReason) -> String {
     match reason {
         OpenReason::UnresolvedInclude => "unresolved_include",
         OpenReason::AmbiguousInclude => "ambiguous_include",
+        OpenReason::UnsupportedLanguageBoundary => "unsupported_language_boundary",
+        OpenReason::BuildConstraintUnknown => "build_constraint_unknown",
         OpenReason::DepthLimit => "depth_limit",
         OpenReason::NodeLimit => "node_limit",
     }

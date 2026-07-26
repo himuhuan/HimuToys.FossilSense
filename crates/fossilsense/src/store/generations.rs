@@ -215,6 +215,25 @@ impl IndexStore {
                 rusqlite::params![src, count],
             )?;
         }
+        if include_graph.clear_all_go_packages {
+            tx.execute("DELETE FROM go_package_edges", [])?;
+            tx.execute("DELETE FROM go_open_packages", [])?;
+        }
+        for (source, target, resolution) in &include_graph.go_package_edges {
+            tx.execute(
+                "INSERT OR REPLACE INTO go_package_edges (
+                    source_package_key, target_package_key, resolution
+                 ) VALUES (?1, ?2, ?3)",
+                rusqlite::params![source, target, resolution],
+            )?;
+        }
+        for (package_key, reason) in &include_graph.go_open_packages {
+            tx.execute(
+                "INSERT OR REPLACE INTO go_open_packages (package_key, reason)
+                 VALUES (?1, ?2)",
+                rusqlite::params![package_key, reason],
+            )?;
+        }
         tx.execute(
             "UPDATE file_entries SET directly_included = 0 WHERE source = 'external'",
             [],

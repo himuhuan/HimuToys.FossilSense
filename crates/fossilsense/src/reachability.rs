@@ -12,20 +12,28 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crate::includes::ResolutionKind;
-use crate::store::views::{IncludeEdgeRow, OpenIncludeRow};
+use crate::store::views::{
+    GoOpenPackageRow, GoPackageEdgeRow, GoPackageFileRow, GoPackageResolution, IncludeEdgeRow,
+    OpenIncludeRow,
+};
 
 /// Maximum include depth followed before a reachable set is declared "open".
 pub const MAX_REACH_DEPTH: usize = 32;
 /// Maximum number of files in a reachable set before it is declared "open".
 pub const MAX_REACH_NODES: usize = 4096;
+/// Maximum Go package nodes visited by one request.
+pub const MAX_REACH_PACKAGES: usize = 4096;
+/// Maximum Go package dependency edges scanned by one request.
+pub const MAX_REACH_PACKAGE_EDGES: usize = 16_384;
 
 /// Why a reachable set is "open" (uncertain). Records the first cause detected
 /// during the fixed-order BFS in [`ReachGraph::compute`]; a determinate (closed)
 /// scope carries no reason. The reason explains the scope, never claims a
 /// semantic binding. The fixed-cause precedence — applied when more than one
-/// applies to the same node — is `UnresolvedInclude` before `AmbiguousInclude`,
-/// both before the traversal caps (`DepthLimit` / `NodeLimit`), the latter two
-/// detected during the BFS so they can only ever follow the include causes.
+/// applies to the same node — is `UnsupportedLanguageBoundary`, then
+/// `UnresolvedInclude`, `AmbiguousInclude`, and `BuildConstraintUnknown`, all
+/// before the traversal caps (`DepthLimit` / `NodeLimit`). The latter two are
+/// detected during the BFS so they can only ever follow graph evidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenReason {
     /// A file in the reachable set has at least one unresolved `#include`.
@@ -33,6 +41,13 @@ pub enum OpenReason {
     /// A file in the reachable set has an `#include` resolving to two or more
     /// candidate files with no exact-tier winner.
     AmbiguousInclude,
+    /// A Go package imports the cgo pseudo-package `C`. FossilSense records the
+    /// boundary but deliberately does not infer C declarations from Go.
+    UnsupportedLanguageBoundary,
+    /// A Go package contains files guarded by build expressions or filename
+    /// target suffixes, and no active target evidence proves which variants
+    /// participate. All variants remain candidates.
+    BuildConstraintUnknown,
     /// Traversal reached `MAX_REACH_DEPTH` before exhausting the graph.
     DepthLimit,
     /// Traversal reached `MAX_REACH_NODES` before exhausting the graph.
@@ -63,6 +78,12 @@ pub struct ReachScope {
 struct ReachEdge {
     target: String,
     resolution: ResolutionKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PackageReachEdge {
+    target: String,
+    heuristic: bool,
 }
 
 fn is_strong_resolution(resolution: ResolutionKind) -> bool {
@@ -97,6 +118,10 @@ pub struct ReachGraph {
     /// determinate closure). A node that is both unresolved and ambiguous is
     /// stored once, under `UnresolvedInclude`, per the documented precedence.
     open: HashMap<String, OpenReason>,
+    package_by_file: HashMap<String, String>,
+    files_by_package: HashMap<String, Vec<String>>,
+    package_edges: HashMap<String, Vec<PackageReachEdge>>,
+    open_packages: HashMap<String, OpenReason>,
     cache: Mutex<HashMap<String, Arc<ReachScope>>>,
 }
 
@@ -151,6 +176,10 @@ impl ReachGraph {
         Self {
             edges,
             open,
+            package_by_file: HashMap::new(),
+            files_by_package: HashMap::new(),
+            package_edges: HashMap::new(),
+            open_packages: HashMap::new(),
             cache: Mutex::new(HashMap::new()),
         }
     }
@@ -173,6 +202,54 @@ impl ReachGraph {
             .map(|row| row.source_path)
             .collect();
         Self::new_with_kinds(edges, unresolved_files, ambiguous_files)
+    }
+
+    pub fn from_rows_with_packages(
+        edge_rows: Vec<IncludeEdgeRow>,
+        unresolved_rows: Vec<OpenIncludeRow>,
+        ambiguous_rows: Vec<OpenIncludeRow>,
+        package_files: Vec<GoPackageFileRow>,
+        package_edges: Vec<GoPackageEdgeRow>,
+        open_packages: Vec<GoOpenPackageRow>,
+    ) -> Self {
+        let mut graph = Self::from_rows(edge_rows, unresolved_rows, ambiguous_rows);
+        for row in package_files {
+            graph
+                .package_by_file
+                .insert(row.path.clone(), row.package_key.clone());
+            graph
+                .files_by_package
+                .entry(row.package_key)
+                .or_default()
+                .push(row.path);
+        }
+        for files in graph.files_by_package.values_mut() {
+            files.sort();
+            files.dedup();
+        }
+        for row in package_edges {
+            graph
+                .package_edges
+                .entry(row.source_package_key)
+                .or_default()
+                .push(PackageReachEdge {
+                    target: row.target_package_key,
+                    heuristic: row.resolution == GoPackageResolution::Heuristic,
+                });
+        }
+        for edges in graph.package_edges.values_mut() {
+            edges.sort_by(|left, right| {
+                left.target
+                    .cmp(&right.target)
+                    .then_with(|| left.heuristic.cmp(&right.heuristic))
+            });
+            edges.dedup();
+        }
+        graph.open_packages = open_packages
+            .into_iter()
+            .map(|row| (row.package_key, row.reason))
+            .collect();
+        graph
     }
 
     /// Replace the out-edges and open flags for the given source paths, clearing
@@ -278,6 +355,10 @@ impl ReachGraph {
         let mut next = Self {
             edges: self.edges.clone(),
             open: self.open.clone(),
+            package_by_file: self.package_by_file.clone(),
+            files_by_package: self.files_by_package.clone(),
+            package_edges: self.package_edges.clone(),
+            open_packages: self.open_packages.clone(),
             cache: Mutex::new(HashMap::new()),
         };
         next.refresh_sources_from_rows(sources, edges, open);
@@ -294,9 +375,64 @@ impl ReachGraph {
         let mut next = Self {
             edges: self.edges.clone(),
             open: self.open.clone(),
+            package_by_file: self.package_by_file.clone(),
+            files_by_package: self.files_by_package.clone(),
+            package_edges: self.package_edges.clone(),
+            open_packages: self.open_packages.clone(),
             cache: Mutex::new(HashMap::new()),
         };
         next.refresh_sources_with_kinds(sources, edges, open);
+        next
+    }
+
+    pub(crate) fn with_refreshed_go_overlays(
+        &self,
+        overlays: Vec<(String, Option<(String, OpenReason)>)>,
+    ) -> Self {
+        let mut next = Self {
+            edges: self.edges.clone(),
+            open: self.open.clone(),
+            package_by_file: self.package_by_file.clone(),
+            files_by_package: self.files_by_package.clone(),
+            package_edges: self.package_edges.clone(),
+            open_packages: self.open_packages.clone(),
+            cache: Mutex::new(HashMap::new()),
+        };
+        let mut affected_packages = HashSet::new();
+        for (path, package) in overlays {
+            if let Some(old_package) = next.package_by_file.remove(&path) {
+                affected_packages.insert(old_package.clone());
+                if let Some(files) = next.files_by_package.get_mut(&old_package) {
+                    files.retain(|file| file != &path);
+                }
+            }
+            next.open.remove(&path);
+            match package {
+                Some((package_key, reason)) => {
+                    affected_packages.insert(package_key.clone());
+                    next.package_by_file
+                        .insert(path.clone(), package_key.clone());
+                    let files = next
+                        .files_by_package
+                        .entry(package_key.clone())
+                        .or_default();
+                    if !files.contains(&path) {
+                        files.push(path);
+                        files.sort();
+                    }
+                    next.open_packages.insert(package_key, reason);
+                }
+                None => {
+                    next.open.insert(path, OpenReason::UnresolvedInclude);
+                }
+            }
+        }
+        for package in affected_packages {
+            next.package_edges.remove(&package);
+            next.open_packages
+                .entry(package)
+                .or_insert(OpenReason::UnresolvedInclude);
+        }
         next
     }
 
@@ -373,6 +509,9 @@ impl ReachGraph {
     }
 
     fn compute(&self, start: &str) -> ReachScope {
+        if let Some(package_key) = self.package_by_file.get(start) {
+            return self.compute_package(start, package_key);
+        }
         let mut files = HashSet::new();
         files.insert(start.to_string());
         let mut heuristic_files = HashSet::new();
@@ -439,6 +578,81 @@ impl ReachGraph {
             reason,
         }
     }
+
+    fn compute_package(&self, start: &str, start_package: &str) -> ReachScope {
+        let mut files = HashSet::new();
+        let mut heuristic_files = HashSet::new();
+        let mut open = false;
+        let mut reason = self.open_packages.get(start_package).copied();
+        open |= reason.is_some();
+        let mark_open = |open: &mut bool, cause: OpenReason, reason: &mut Option<OpenReason>| {
+            *open = true;
+            if reason.is_none() {
+                *reason = Some(cause);
+            }
+        };
+        let mut seen_packages = HashSet::new();
+        let mut queue = VecDeque::from([(start_package.to_string(), 0usize, false)]);
+        seen_packages.insert(start_package.to_string());
+        let mut scanned_package_edges = 0usize;
+
+        'packages: while let Some((package, depth, path_is_heuristic)) = queue.pop_front() {
+            if let Some(cause) = self.open_packages.get(&package) {
+                mark_open(&mut open, *cause, &mut reason);
+            }
+            for path in self.files_by_package.get(&package).into_iter().flatten() {
+                if files.len() + heuristic_files.len() >= MAX_REACH_NODES {
+                    mark_open(&mut open, OpenReason::NodeLimit, &mut reason);
+                    break;
+                }
+                if path_is_heuristic {
+                    if !files.contains(path) {
+                        heuristic_files.insert(path.clone());
+                    }
+                } else {
+                    files.insert(path.clone());
+                    heuristic_files.remove(path);
+                }
+            }
+            if depth >= MAX_REACH_DEPTH {
+                mark_open(&mut open, OpenReason::DepthLimit, &mut reason);
+                continue;
+            }
+            let outgoing = self.package_edges.get(&package);
+            if files.len() + heuristic_files.len() >= MAX_REACH_NODES
+                && outgoing.is_some_and(|edges| !edges.is_empty())
+            {
+                mark_open(&mut open, OpenReason::NodeLimit, &mut reason);
+                break;
+            }
+            for edge in outgoing.into_iter().flatten() {
+                if scanned_package_edges >= MAX_REACH_PACKAGE_EDGES {
+                    mark_open(&mut open, OpenReason::NodeLimit, &mut reason);
+                    break 'packages;
+                }
+                scanned_package_edges += 1;
+                let next_is_heuristic = path_is_heuristic || edge.heuristic;
+                if !seen_packages.contains(&edge.target)
+                    && seen_packages.len() >= MAX_REACH_PACKAGES
+                {
+                    mark_open(&mut open, OpenReason::NodeLimit, &mut reason);
+                    break 'packages;
+                }
+                if seen_packages.insert(edge.target.clone()) {
+                    queue.push_back((edge.target.clone(), depth + 1, next_is_heuristic));
+                }
+            }
+        }
+        if !files.contains(start) && !heuristic_files.contains(start) {
+            files.insert(start.to_string());
+        }
+        ReachScope {
+            files,
+            heuristic_files,
+            open,
+            reason,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -493,6 +707,68 @@ mod tests {
         assert!(graph
             .directly_included_external_paths_from("other.c")
             .is_empty());
+    }
+
+    #[test]
+    fn go_package_reach_stops_expanding_edges_when_the_file_node_cap_is_full() {
+        let package_files = (0..MAX_REACH_NODES)
+            .map(|index| GoPackageFileRow {
+                package_key: "pkg0#pkg".into(),
+                path: format!("pkg/file{index}.go"),
+            })
+            .collect();
+        let package_edges = (0..(MAX_REACH_DEPTH + 8))
+            .map(|index| GoPackageEdgeRow {
+                source_package_key: format!("pkg{index}#pkg"),
+                target_package_key: format!("pkg{}#pkg", index + 1),
+                resolution: GoPackageResolution::Exact,
+            })
+            .collect();
+        let graph = ReachGraph::from_rows_with_packages(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            package_files,
+            package_edges,
+            Vec::new(),
+        );
+
+        let scope = graph.reachable("pkg/file0.go");
+        assert_eq!(scope.files.len(), MAX_REACH_NODES);
+        assert!(scope.open);
+        assert_eq!(scope.reason, Some(OpenReason::NodeLimit));
+    }
+
+    #[test]
+    fn go_package_depth_cap_keeps_the_boundary_package_files() {
+        let package_files = (0..=MAX_REACH_DEPTH)
+            .map(|index| GoPackageFileRow {
+                package_key: format!("pkg{index}#pkg"),
+                path: format!("pkg{index}/file.go"),
+            })
+            .collect();
+        let package_edges = (0..MAX_REACH_DEPTH)
+            .map(|index| GoPackageEdgeRow {
+                source_package_key: format!("pkg{index}#pkg"),
+                target_package_key: format!("pkg{}#pkg", index + 1),
+                resolution: GoPackageResolution::Exact,
+            })
+            .collect();
+        let graph = ReachGraph::from_rows_with_packages(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            package_files,
+            package_edges,
+            Vec::new(),
+        );
+
+        let scope = graph.reachable("pkg0/file.go");
+        assert!(scope
+            .files
+            .contains(&format!("pkg{MAX_REACH_DEPTH}/file.go")));
+        assert!(scope.open);
+        assert_eq!(scope.reason, Some(OpenReason::DepthLimit));
     }
 
     #[test]

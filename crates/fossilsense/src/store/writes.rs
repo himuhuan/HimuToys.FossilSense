@@ -37,8 +37,8 @@ pub(super) fn stage_file_updates(
         let mut revision_stmt = tx.prepare(
             "INSERT INTO file_revisions (
                 file_id, extension, size, mtime_ns, hash, indexed_at, status, error, source,
-                parser_version, fact_mask, parse_error_count, fallback_used, build_guard
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                parser_version, language, fact_mask, parse_error_count, fallback_used, build_guard
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         )?;
         let mut pending_stmt = tx.prepare(
             "INSERT INTO pending_file_revisions (build_id, file_id, revision_id)
@@ -180,17 +180,18 @@ pub(super) fn stage_file_updates(
 
         for update in updates {
             let fingerprint = update.fingerprint;
-            let (status, error, fact_mask, parse_error_count, fallback_used, build_guard) =
+            let (status, error, language, fact_mask, parse_error_count, fallback_used, build_guard) =
                 match update.payload {
                     FileIndexPayload::Ok(index) => (
                         "ok",
                         None,
+                        semantic_language_code(index.persistent_facts().language),
                         index.persistence_diagnostics().fact_mask as i64,
                         index.persistence_diagnostics().parse_error_count as i64,
                         i64::from(index.persistence_diagnostics().fallback_used),
                         index.persistent_facts().build_guard,
                     ),
-                    FileIndexPayload::Error(error) => ("error", Some(error), 0, 0, 0, None),
+                    FileIndexPayload::Error(error) => ("error", Some(error), 2, 0, 0, 0, None),
                 };
             file_stmt.execute(params![
                 fingerprint.path.as_str(),
@@ -217,6 +218,7 @@ pub(super) fn stage_file_updates(
                 error,
                 update.source.as_str(),
                 PARSER_FACT_VERSION,
+                language,
                 fact_mask,
                 parse_error_count,
                 fallback_used,

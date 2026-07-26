@@ -44,7 +44,7 @@ pub(super) fn collect_go_ast_index(
     facts: ParseFacts,
 ) -> GoAstProduct {
     let path_text = normalized_path(path);
-    let build_guard = extract_build_guard(source);
+    let build_guard = combine_build_guards(extract_build_guard(source), filename_build_guard(path));
     let package = collect_package(root, source, line_starts);
     let package_name = package
         .as_ref()
@@ -1044,7 +1044,13 @@ fn call_site(
         let mut cursor = arguments.walk();
         arguments.named_children(&mut cursor).count() as u32
     });
-    let qualified_name = text(function, source).map(str::to_string);
+    // Go selector receivers need package/type binding before they can be
+    // compared with a declaration's canonical qualified name. Retaining the
+    // source spelling here (including plain direct names) would make the
+    // generic call resolver reject every package-qualified anchor as unequal.
+    // Keep the call form as evidence, but leave qualification unresolved so
+    // call hierarchy conservatively returns same-name candidates.
+    let qualified_name = None;
     Some(CallSiteFact {
         path: path.to_string(),
         caller_entity_key: caller_entity_key.to_string(),
@@ -1338,6 +1344,87 @@ pub(super) fn extract_build_guard(source: &str) -> Option<String> {
             expressions.join(" | ")
         )),
     }
+}
+
+pub(super) fn combine_build_guards(
+    source_guard: Option<String>,
+    filename_guard: Option<String>,
+) -> Option<String> {
+    match (source_guard, filename_guard) {
+        (Some(source), Some(filename)) => Some(format!("({source}) && ({filename})")),
+        (Some(source), None) => Some(source),
+        (None, Some(filename)) => Some(filename),
+        (None, None) => None,
+    }
+}
+
+pub(super) fn filename_build_guard(path: &Path) -> Option<String> {
+    const KNOWN_OS: &[&str] = &[
+        "aix",
+        "android",
+        "darwin",
+        "dragonfly",
+        "freebsd",
+        "hurd",
+        "illumos",
+        "ios",
+        "js",
+        "linux",
+        "nacl",
+        "netbsd",
+        "openbsd",
+        "plan9",
+        "solaris",
+        "wasip1",
+        "windows",
+        "zos",
+    ];
+    const KNOWN_ARCH: &[&str] = &[
+        "386",
+        "amd64",
+        "amd64p32",
+        "arm",
+        "armbe",
+        "arm64",
+        "arm64be",
+        "loong64",
+        "mips",
+        "mipsle",
+        "mips64",
+        "mips64le",
+        "mips64p32",
+        "mips64p32le",
+        "ppc",
+        "ppc64",
+        "ppc64le",
+        "riscv",
+        "riscv64",
+        "s390",
+        "s390x",
+        "sparc",
+        "sparc64",
+        "wasm",
+    ];
+
+    let stem = path.file_stem()?.to_str()?;
+    let stem = stem.strip_suffix("_test").unwrap_or(stem);
+    let (base, last) = stem.rsplit_once('_')?;
+    if base.is_empty() {
+        return None;
+    }
+    let is_os = |value: &str| KNOWN_OS.contains(&value);
+    let is_arch = |value: &str| KNOWN_ARCH.contains(&value);
+    let expression = if is_arch(last) {
+        base.rsplit_once('_')
+            .filter(|(basename, os)| !basename.is_empty() && is_os(os))
+            .map(|(_, os)| os)
+            .map_or_else(|| last.to_string(), |os| format!("{os} && {last}"))
+    } else if is_os(last) {
+        last.to_string()
+    } else {
+        return None;
+    };
+    Some(format!("filename: {expression}"))
 }
 
 pub(super) fn fallback_completions(source: &str) -> Vec<FallbackCompletionFact> {

@@ -104,6 +104,7 @@ pub struct RankedNameHit {
     pub name: String,
     pub kind: ParserKind,
     pub role: SymbolRole,
+    pub semantic_family: crate::semantic_model::SemanticFamily,
     /// Best-effort build-marker ownership for ordinary completion only.
     pub project_key: Option<ProjectKey>,
 }
@@ -125,6 +126,7 @@ struct NameEntry {
     path: Arc<str>,
     kind: ParserKind,
     role: SymbolRole,
+    semantic_family: crate::semantic_model::SemanticFamily,
     project_key: Option<ProjectKey>,
 }
 
@@ -138,6 +140,7 @@ struct CompactNameEntry {
     project_id: u32,
     kind: ParserKind,
     role: SymbolRole,
+    semantic_family: crate::semantic_model::SemanticFamily,
     external: bool,
     directly_included: bool,
 }
@@ -158,6 +161,7 @@ struct NameEntryRef<'a> {
     path: &'a str,
     kind: ParserKind,
     role: SymbolRole,
+    semantic_family: crate::semantic_model::SemanticFamily,
     project_key: Option<&'a ProjectKey>,
 }
 
@@ -547,6 +551,7 @@ impl NameSegment {
             path: &self.paths[entry.path_id as usize],
             kind: entry.kind,
             role: entry.role,
+            semantic_family: entry.semantic_family,
             project_key: (entry.project_id != NO_PROJECT_ID)
                 .then(|| &self.projects[entry.project_id as usize]),
         }

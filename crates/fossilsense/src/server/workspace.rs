@@ -11,6 +11,7 @@ use super::LocalWordCache;
 use crate::call_model::SemanticGeneration;
 use crate::candidate_service::CandidateOverlaySnapshot;
 use crate::completion_words;
+use crate::config::SourceLanguage;
 use crate::parser::{FileSemanticIndex, ParseFacts};
 use crate::pathing;
 #[cfg(test)]
@@ -28,7 +29,8 @@ pub(super) use models::{
 };
 pub(super) use session::WorkspaceSession;
 
-type LiveParseCache = Arc<RwLock<HashMap<Url, (i32, ParseFacts, Arc<FileSemanticIndex>)>>>;
+type LiveParseCache =
+    Arc<RwLock<HashMap<Url, (i32, SourceLanguage, ParseFacts, Arc<FileSemanticIndex>)>>>;
 type LiveParseGates = Arc<Mutex<HashMap<Url, Arc<Mutex<()>>>>>;
 type LiveParseCancellations = Arc<Mutex<HashMap<Url, (i32, Arc<AtomicBool>)>>>;
 
@@ -280,6 +282,37 @@ impl DocumentStore {
         }
     }
 
+    pub(super) async fn invalidate_language_config_roots(&self, roots: &[PathBuf]) {
+        let affected = {
+            let mut documents = self.open_docs.lock().await;
+            let mut affected = Vec::new();
+            for (uri, document) in documents.iter_mut() {
+                let Some(path) = uri.to_file_path().ok() else {
+                    continue;
+                };
+                if !roots
+                    .iter()
+                    .any(|root| pathing::path_is_within(root, &path))
+                {
+                    continue;
+                }
+                if matches!(document.relation_overlay, RelationOverlayState::Clean) {
+                    document.relation_overlay = RelationOverlayState::SavedAwaitingContentHash(
+                        blake3::hash(document.text.as_bytes()).to_hex().to_string(),
+                    );
+                }
+                affected.push(uri.clone());
+            }
+            if !affected.is_empty() {
+                self.bump_overlay_epoch();
+            }
+            affected
+        };
+        for uri in affected {
+            self.clear_live_state(&uri).await;
+        }
+    }
+
     pub(super) async fn snapshot(&self, uri: &Url) -> Option<DocumentSnapshot> {
         self.open_docs
             .lock()
@@ -328,23 +361,34 @@ impl DocumentStore {
         &self,
         uri: &Url,
         version: i32,
+        language: SourceLanguage,
         facts: ParseFacts,
     ) -> Option<Arc<FileSemanticIndex>> {
         let cache = self.live_parse_cache.read().await;
         cache
             .get(uri)
-            .and_then(|(cached_version, cached_facts, parsed)| {
-                (*cached_version == version && cached_facts.contains(facts)).then(|| parsed.clone())
+            .and_then(|(cached_version, cached_language, cached_facts, parsed)| {
+                (*cached_version == version
+                    && *cached_language == language
+                    && cached_facts.contains(facts))
+                .then(|| parsed.clone())
             })
     }
 
-    pub(super) async fn cached_live_parse_facts(&self, uri: &Url, version: i32) -> ParseFacts {
+    pub(super) async fn cached_live_parse_facts(
+        &self,
+        uri: &Url,
+        version: i32,
+        language: SourceLanguage,
+    ) -> ParseFacts {
         self.live_parse_cache
             .read()
             .await
             .get(uri)
-            .filter(|(cached_version, _, _)| *cached_version == version)
-            .map_or(ParseFacts::empty(), |(_, facts, _)| *facts)
+            .filter(|(cached_version, cached_language, _, _)| {
+                *cached_version == version && *cached_language == language
+            })
+            .map_or(ParseFacts::empty(), |(_, _, facts, _)| *facts)
     }
 
     pub(super) async fn live_parse_gate(&self, uri: &Url) -> Arc<Mutex<()>> {
@@ -373,6 +417,7 @@ impl DocumentStore {
         &self,
         uri: Url,
         version: i32,
+        language: SourceLanguage,
         facts: ParseFacts,
         parsed: Arc<FileSemanticIndex>,
     ) {
@@ -388,7 +433,7 @@ impl DocumentStore {
             self.live_parse_cache
                 .write()
                 .await
-                .insert(uri, (version, facts, parsed));
+                .insert(uri, (version, language, facts, parsed));
         }
     }
 
@@ -444,7 +489,12 @@ impl DocumentStore {
         version: i32,
         parsed: Arc<FileSemanticIndex>,
     ) {
-        self.store_live_parse(uri, version, ParseFacts::ALL, parsed)
+        let language = uri
+            .to_file_path()
+            .ok()
+            .map(|path| SourceLanguage::default_for_path(&path))
+            .unwrap_or(SourceLanguage::C);
+        self.store_live_parse(uri, version, language, ParseFacts::ALL, parsed)
             .await;
     }
 
@@ -454,7 +504,7 @@ impl DocumentStore {
             .read()
             .await
             .get(uri)
-            .map(|(_, _, parsed)| parsed.clone())
+            .map(|(_, _, _, parsed)| parsed.clone())
     }
 
     #[cfg(test)]
@@ -513,6 +563,15 @@ impl CacheLedger {
         drop(overlays);
         self.clear_all_completion_memos().await;
         self.invalidate_references();
+    }
+
+    pub(super) async fn invalidate_candidate_overlay_roots(&self, roots: &[PathBuf]) {
+        let mut overlays = self.candidate_overlays.lock().await;
+        for root in roots {
+            invalidate_candidate_overlay_root(&mut overlays, root);
+        }
+        drop(overlays);
+        self.clear_all_completion_memos().await;
     }
 
     pub(in crate::server) fn allocate_engine_epoch(&self) -> state::EngineEpoch {

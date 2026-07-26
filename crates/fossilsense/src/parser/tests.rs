@@ -115,6 +115,43 @@ func Use() {
 }
 
 #[test]
+fn go_filename_constraints_join_source_guards_in_ast_and_fallback_products() {
+    let ast = parse(
+        Path::new("device_linux_arm64.go"),
+        "//go:build tinygo\n\npackage device\nfunc Open() {}\n",
+    );
+    assert_eq!(
+        ast.build_guard.as_deref(),
+        Some("(tinygo) && (filename: linux && arm64)")
+    );
+    assert!(ast.declarations.iter().all(|declaration| {
+        declaration.guard.as_deref() == Some("(tinygo) && (filename: linux && arm64)")
+    }));
+
+    let fallback_source = "//go:build tinygo\npackage device\nfunc (((\n";
+    let fallback = super::lexical_fallback(
+        Path::new("device_windows.go"),
+        fallback_source,
+        Vec::new(),
+        ParseFacts::ALL,
+        crate::config::SourceLanguage::Go,
+    );
+    assert!(fallback.diagnostics.fallback_used);
+    assert_eq!(
+        fallback.build_guard.as_deref(),
+        Some("(tinygo) && (filename: windows)")
+    );
+
+    for ordinary_name in ["linux.go", "amd64.go", "linux_test.go"] {
+        let ordinary = parse(Path::new(ordinary_name), "package device\nvar Value = 1\n");
+        assert_eq!(
+            ordinary.build_guard, None,
+            "{ordinary_name} has no basename_target separator"
+        );
+    }
+}
+
+#[test]
 fn malformed_go_remains_a_bounded_partial_or_fallback_product() {
     let index = parse(
         Path::new("broken.go"),
@@ -130,6 +167,7 @@ fn malformed_go_remains_a_bounded_partial_or_fallback_product() {
         .iter()
         .all(|declaration| declaration.identity.language == SemanticLanguage::Go));
     assert!(index.call_sites.len() <= 16);
+    assert_eq!(index.language, crate::semantic_model::SemanticLanguage::Go);
 }
 
 #[test]
@@ -1743,6 +1781,7 @@ fn lexical_fallback_product_has_completion_hints_and_no_ast() {
     let source = "#include \"x.h\"\n#define Z 9\n";
     let includes = super::scan_includes(source);
     let index = super::lexical_fallback(
+        Path::new("fallback.c"),
         source,
         includes,
         ParseFacts::ALL,
@@ -2620,6 +2659,7 @@ fn record_declaration_uses_exact_tag_name_range() {
 fn lexical_fallback_is_completion_only_and_has_no_candidate_identity() {
     let source = "#define FALLBACK_VALUE 1\nint fallback_object;\n";
     let index = super::lexical_fallback(
+        Path::new("fallback.c"),
         source,
         super::scan_includes(source),
         ParseFacts::ALL,
@@ -2738,6 +2778,7 @@ fn availability_distinguishes_empty_skipped_and_fallback_ast_vectors() {
 
     let fallback_source = "#include \"x.h\"\n#define ONLY_LEXICAL 1\n";
     let fallback = super::lexical_fallback(
+        Path::new("fallback.c"),
         fallback_source,
         super::scan_includes(fallback_source),
         ParseFacts::ALL,
@@ -2768,6 +2809,7 @@ fn availability_distinguishes_empty_skipped_and_fallback_ast_vectors() {
     );
 
     let fallback_index = super::lexical_fallback(
+        Path::new("fallback.c"),
         fallback_source,
         super::scan_includes(fallback_source),
         ParseFacts::INDEX,

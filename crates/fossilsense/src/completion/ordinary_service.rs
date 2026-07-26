@@ -7,7 +7,7 @@ use crate::parser::{FactAvailability, FactGroup, FileSemanticIndex};
 use crate::project_context::ProjectKey;
 use crate::query::{self, NameTable};
 use crate::resolver;
-use crate::semantic_model::CompletionKindHint;
+use crate::semantic_model::{CompletionKindHint, SemanticFamily};
 use crate::store::views::FallbackCompletionRow;
 
 use super::{
@@ -81,6 +81,7 @@ pub(crate) struct FallbackCompletionName {
 struct IndexedFallbackCompletionName {
     value: FallbackCompletionName,
     lower: String,
+    semantic_family: SemanticFamily,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -103,22 +104,37 @@ impl FallbackCompletionNameTable {
                     3 => CompletionKindHint::Object,
                     _ => return None,
                 };
-                Some(FallbackCompletionName {
-                    name: row.name,
-                    kind_hint,
-                    detail: row.detail,
-                    path: row.path,
-                })
+                Some((
+                    FallbackCompletionName {
+                        name: row.name,
+                        kind_hint,
+                        detail: row.detail,
+                        path: row.path,
+                    },
+                    row.semantic_family,
+                ))
             })
             .collect();
-        Self::from_entries(entries)
+        Self::from_family_entries(entries)
     }
 
+    #[cfg(test)]
     fn from_entries(mut entries: Vec<FallbackCompletionName>) -> Self {
         sort_and_dedup_fallback_entries(&mut entries);
+        Self::from_family_entries(
+            entries
+                .into_iter()
+                .map(|entry| (entry, SemanticFamily::CFamily))
+                .collect(),
+        )
+    }
+
+    fn from_family_entries(mut entries: Vec<(FallbackCompletionName, SemanticFamily)>) -> Self {
+        entries.sort_by(|left, right| fallback_entry_order(&left.0, &right.0));
+        entries.dedup();
         let entries: Vec<_> = entries
             .into_iter()
-            .map(IndexedFallbackCompletionName::new)
+            .map(|(entry, family)| IndexedFallbackCompletionName::new(entry, family))
             .collect();
         let match_index = fallback_match_index(&entries);
         Self {
@@ -129,7 +145,17 @@ impl FallbackCompletionNameTable {
         }
     }
 
+    #[cfg(test)]
     fn matching(&self, prefix: &str, limit: usize) -> Vec<ScoredFallbackCompletionName> {
+        self.matching_for_family(prefix, limit, SemanticFamily::CFamily)
+    }
+
+    fn matching_for_family(
+        &self,
+        prefix: &str,
+        limit: usize,
+        semantic_family: SemanticFamily,
+    ) -> Vec<ScoredFallbackCompletionName> {
         if limit == 0 {
             return Vec::new();
         }
@@ -144,13 +170,15 @@ impl FallbackCompletionNameTable {
             .flatten()
             .filter_map(|&index| {
                 let entry = &self.entries[index];
-                (!self.shadowed_paths.contains(&entry.value.path))
-                    .then(|| score_indexed_fallback(&needle, entry))
-                    .flatten()
+                (entry.semantic_family == semantic_family
+                    && !self.shadowed_paths.contains(&entry.value.path))
+                .then(|| score_indexed_fallback(&needle, entry))
+                .flatten()
             })
             .chain(
                 self.overlay_entries
                     .iter()
+                    .filter(|entry| entry.semantic_family == semantic_family)
                     .filter_map(|entry| score_indexed_fallback(&needle, entry)),
             )
             .collect();
@@ -159,20 +187,35 @@ impl FallbackCompletionNameTable {
         scored
     }
 
+    #[cfg(test)]
     pub(crate) fn with_updated_paths(
         &self,
         shadowed_paths: &HashSet<String>,
         overlay_entries: impl IntoIterator<Item = FallbackCompletionName>,
     ) -> Self {
+        self.with_updated_family_paths(
+            shadowed_paths,
+            overlay_entries
+                .into_iter()
+                .map(|entry| (entry, SemanticFamily::CFamily)),
+        )
+    }
+
+    pub(crate) fn with_updated_family_paths(
+        &self,
+        shadowed_paths: &HashSet<String>,
+        overlay_entries: impl IntoIterator<Item = (FallbackCompletionName, SemanticFamily)>,
+    ) -> Self {
         let mut overlay_entries: Vec<_> = overlay_entries.into_iter().collect();
-        sort_and_dedup_fallback_entries(&mut overlay_entries);
+        overlay_entries.sort_by(|left, right| fallback_entry_order(&left.0, &right.0));
+        overlay_entries.dedup();
         Self {
             entries: self.entries.clone(),
             match_index: self.match_index.clone(),
             shadowed_paths: Arc::new(shadowed_paths.clone()),
             overlay_entries: overlay_entries
                 .into_iter()
-                .map(IndexedFallbackCompletionName::new)
+                .map(|(entry, family)| IndexedFallbackCompletionName::new(entry, family))
                 .collect::<Vec<_>>()
                 .into(),
         }
@@ -180,9 +223,13 @@ impl FallbackCompletionNameTable {
 }
 
 impl IndexedFallbackCompletionName {
-    fn new(value: FallbackCompletionName) -> Self {
+    fn new(value: FallbackCompletionName, semantic_family: SemanticFamily) -> Self {
         let lower = value.name.to_ascii_lowercase();
-        Self { value, lower }
+        Self {
+            value,
+            lower,
+            semantic_family,
+        }
     }
 }
 
@@ -234,19 +281,25 @@ fn sort_scored_fallbacks(entries: &mut [ScoredFallbackCompletionName]) {
     });
 }
 
+#[cfg(test)]
 fn sort_and_dedup_fallback_entries(entries: &mut Vec<FallbackCompletionName>) {
-    entries.sort_by(|left, right| {
-        left.name
-            .to_ascii_lowercase()
-            .cmp(&right.name.to_ascii_lowercase())
-            .then_with(|| left.name.cmp(&right.name))
-            .then_with(|| left.path.cmp(&right.path))
-            .then_with(|| {
-                completion_hint_rank(left.kind_hint).cmp(&completion_hint_rank(right.kind_hint))
-            })
-            .then_with(|| left.detail.cmp(&right.detail))
-    });
+    entries.sort_by(fallback_entry_order);
     entries.dedup();
+}
+
+fn fallback_entry_order(
+    left: &FallbackCompletionName,
+    right: &FallbackCompletionName,
+) -> std::cmp::Ordering {
+    left.name
+        .to_ascii_lowercase()
+        .cmp(&right.name.to_ascii_lowercase())
+        .then_with(|| left.name.cmp(&right.name))
+        .then_with(|| left.path.cmp(&right.path))
+        .then_with(|| {
+            completion_hint_rank(left.kind_hint).cmp(&completion_hint_rank(right.kind_hint))
+        })
+        .then_with(|| left.detail.cmp(&right.detail))
 }
 
 fn completion_hint_rank(kind: CompletionKindHint) -> u8 {
@@ -380,6 +433,19 @@ pub(crate) fn complete_ordinary_identifier(
     let mut candidates: Vec<OrdinaryPipelineCandidate> = Vec::new();
     let mut new_pools: Vec<Vec<usize>> = Vec::with_capacity(input.tables.len());
     let mut recall_channels = query::CompletionRecallMetrics::default();
+    let semantic_family = input
+        .parsed_document
+        .as_ref()
+        .map(|index| index.language.semantic_family())
+        .or_else(|| {
+            input.scope.as_ref().and_then(|scope| {
+                scope.current_path.as_deref().map(|path| {
+                    crate::config::SourceLanguage::default_for_path(std::path::Path::new(path))
+                        .semantic_family()
+                })
+            })
+        })
+        .unwrap_or(SemanticFamily::CFamily);
 
     for (idx, table) in input.tables.iter().enumerate() {
         // A manual/automatic key belongs to exactly one workspace root. Only
@@ -396,13 +462,16 @@ pub(crate) fn complete_ordinary_identifier(
             query::CompletionRecallQuotas::default_for_completion_limit(input.limit)
         };
         let prior = input.prior_pools.get(idx).and_then(|pool| pool.as_deref());
-        let (mut hits, pool, metrics) = table.table.search_completion_recall_pooled_with_project(
-            &input.prefix,
-            quotas,
-            input.scope.as_ref(),
-            table_project_context,
-            prior,
-        );
+        let (mut hits, pool, metrics) = table
+            .table
+            .search_completion_recall_pooled_with_project_for_family(
+                &input.prefix,
+                quotas,
+                input.scope.as_ref(),
+                table_project_context,
+                prior,
+                semantic_family,
+            );
         if input.parsed_document.is_some() {
             // The parsed current-document overlay below is source-order aware.
             // Suppress the positionless durable `Current` projection so a
@@ -481,7 +550,11 @@ pub(crate) fn complete_ordinary_identifier(
 
     let mut fallback_names = Vec::new();
     for table in &input.tables {
-        fallback_names.extend(table.fallback_table.matching(&input.prefix, input.limit));
+        fallback_names.extend(table.fallback_table.matching_for_family(
+            &input.prefix,
+            input.limit,
+            semantic_family,
+        ));
     }
     if let Some(parsed) = input.parsed_document.as_ref() {
         let current: Vec<_> = parsed
@@ -544,6 +617,7 @@ pub(crate) fn complete_ordinary_identifier(
                 word_score,
                 input.scope.as_ref(),
                 input.limit,
+                semantic_family,
                 IndexedCompletionContext {
                     table_index,
                     overlay_handles: &table.overlay_handles,
@@ -759,6 +833,7 @@ mod tests {
             path: "include/shared.h".to_string(),
             declaration_kind: SemanticDeclarationKind::Function,
             role: SemanticDeclarationRole::Declaration,
+            semantic_family: crate::config::SemanticFamily::CFamily,
             directly_included: false,
         };
         let source = DeclarationNameRow {
@@ -768,6 +843,7 @@ mod tests {
             path: "src/shared.c".to_string(),
             declaration_kind: SemanticDeclarationKind::Function,
             role: SemanticDeclarationRole::Definition,
+            semantic_family: crate::config::SemanticFamily::CFamily,
             directly_included: false,
         };
 
@@ -780,6 +856,106 @@ mod tests {
                 (11, parser::SymbolRole::Declaration)
             );
         }
+    }
+
+    #[test]
+    fn go_completion_recall_excludes_c_family_before_ranking() {
+        let (text, line, character) =
+            text_and_position("package main\nfunc main() {\n    SharedO/*cursor*/\n}\n");
+        let parsed = Arc::new(parser::parse(&PathBuf::from("src/main.go"), &text));
+        let rows = vec![
+            DeclarationNameRow {
+                id: 11,
+                name: "SharedOpen".to_string(),
+                external: false,
+                path: "src/shared.c".to_string(),
+                declaration_kind: SemanticDeclarationKind::Function,
+                role: SemanticDeclarationRole::Definition,
+                semantic_family: crate::config::SemanticFamily::CFamily,
+                directly_included: false,
+            },
+            DeclarationNameRow {
+                id: 22,
+                name: "SharedOpen".to_string(),
+                external: false,
+                path: "src/shared.go".to_string(),
+                declaration_kind: SemanticDeclarationKind::Function,
+                role: SemanticDeclarationRole::Definition,
+                semantic_family: crate::config::SemanticFamily::Go,
+                directly_included: false,
+            },
+        ];
+        let output = complete_ordinary_identifier(OrdinaryCompletionInput {
+            prefix: "SharedO".to_string(),
+            text: Arc::from(text),
+            line,
+            character,
+            parsed_document: Some(parsed),
+            local_words: Arc::new(HashSet::new()),
+            tables: vec![OrdinaryCompletionNameTable {
+                table: Arc::new(
+                    NameTable::build_from_declaration_name_rows_with_project_context(rows, None),
+                ),
+                overlay_handles: HashMap::new(),
+                fallback_table: Arc::new(FallbackCompletionNameTable::default()),
+            }],
+            scope: None,
+            active_project_context: None,
+            prior_pools: vec![None],
+            intent: CompletionIntent::default(),
+            history_enabled: false,
+            history: CompletionHistorySnapshot::default(),
+            prefix_bucket: "sharedo".to_string(),
+            prefix_ranking: CompletionPrefixRanking::Strict,
+            limit: 10,
+            locality_bonus: COMPLETION_LOCALITY_BONUS,
+        });
+
+        let indexed = output
+            .items
+            .iter()
+            .find(|item| item.label == "SharedOpen")
+            .expect("Go indexed completion");
+        assert!(matches!(
+            indexed.documentation_target,
+            Some(OrdinaryCompletionDocumentationTarget::Declaration {
+                declaration_id: 22,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn fallback_completion_table_filters_semantic_family_before_limit() {
+        let table = FallbackCompletionNameTable::from_family_entries(vec![
+            (
+                FallbackCompletionName {
+                    name: "SharedC".to_string(),
+                    kind_hint: crate::semantic_model::CompletionKindHint::Function,
+                    detail: None,
+                    path: "broken.c".to_string(),
+                },
+                crate::config::SemanticFamily::CFamily,
+            ),
+            (
+                FallbackCompletionName {
+                    name: "SharedGo".to_string(),
+                    kind_hint: crate::semantic_model::CompletionKindHint::Function,
+                    detail: None,
+                    path: "broken.go".to_string(),
+                },
+                crate::config::SemanticFamily::Go,
+            ),
+        ]);
+
+        assert_eq!(
+            table
+                .matching_for_family("Shared", 1, crate::config::SemanticFamily::Go)
+                .into_iter()
+                .map(|entry| entry.value.name)
+                .collect::<Vec<_>>(),
+            vec!["SharedGo"]
+        );
     }
 
     #[test]

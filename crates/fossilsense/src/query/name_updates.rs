@@ -68,6 +68,29 @@ impl NameTable {
         self.with_updated_entries(paths, fresh_entries)
     }
 
+    pub(crate) fn with_updated_family_paths(
+        &self,
+        paths: &HashSet<String>,
+        names: Vec<(
+            i64,
+            String,
+            bool,
+            String,
+            String,
+            bool,
+            crate::semantic_model::SemanticFamily,
+        )>,
+    ) -> Self {
+        let fresh_entries = names.into_iter().map(
+            |(id, name, external, path, kind, directly_included, semantic_family)| {
+                let mut entry = name_entry((id, name, external, path, kind, directly_included));
+                entry.semantic_family = semantic_family;
+                entry
+            },
+        );
+        self.with_updated_entries(paths, fresh_entries)
+    }
+
     pub(crate) fn with_updated_declaration_name_rows_with_project_context(
         &self,
         paths: &HashSet<String>,
@@ -225,6 +248,7 @@ pub(super) fn name_entry(
         path,
         kind,
         SymbolRole::Definition,
+        crate::semantic_model::SemanticFamily::CFamily,
         directly_included,
         None,
     )
@@ -256,6 +280,7 @@ pub(super) fn declaration_name_entries(
                 path: Arc::from(row.path),
                 kind: parser_kind_from_declaration_kind(row.declaration_kind),
                 role: symbol_role_from_declaration_role(row.role),
+                semantic_family: row.semantic_family,
                 project_key,
             }
         })
@@ -299,6 +324,7 @@ fn name_entry_parts(
     path: String,
     kind: String,
     role: SymbolRole,
+    semantic_family: crate::semantic_model::SemanticFamily,
     directly_included: bool,
     project_key: Option<ProjectKey>,
 ) -> NameEntry {
@@ -312,6 +338,7 @@ fn name_entry_parts(
         path: Arc::from(path),
         kind: parser_kind_from_str(&kind),
         role,
+        semantic_family,
         project_key,
     }
 }

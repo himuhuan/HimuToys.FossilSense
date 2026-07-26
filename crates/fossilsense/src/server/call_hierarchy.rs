@@ -38,6 +38,7 @@ pub(super) struct RelationRequestState {
     overlays: Arc<Vec<FileCallOverlay>>,
     pub(super) revision: RelationRevision,
     reach_graph: Option<std::sync::Arc<ReachGraph>>,
+    semantic_family: crate::semantic_model::SemanticFamily,
 }
 
 impl RelationRequestState {
@@ -53,17 +54,23 @@ impl RelationRequestState {
         let handle = self.handle.clone();
         let overlays = self.overlays.clone();
         let reach_graph = self.reach_graph.clone();
+        let semantic_family = self.semantic_family;
         let path = path.to_string();
         let (catalog, key, mut page) = tokio::task::spawn_blocking(move || {
-            CallRelationService::for_request_with_reach(&handle, &overlays, reach_graph.as_deref())
-                .query_at(
-                    &path,
-                    position,
-                    direction,
-                    cursor,
-                    relation_limit,
-                    call_site_limit,
-                )
+            CallRelationService::for_request_with_reach_and_family(
+                &handle,
+                &overlays,
+                reach_graph.as_deref(),
+                semantic_family,
+            )
+            .query_at(
+                &path,
+                position,
+                direction,
+                cursor,
+                relation_limit,
+                call_site_limit,
+            )
         })
         .await??;
         self.with_reachability(&mut page.relations);
@@ -81,10 +88,16 @@ impl RelationRequestState {
         let handle = self.handle.clone();
         let overlays = self.overlays.clone();
         let reach_graph = self.reach_graph.clone();
+        let semantic_family = self.semantic_family;
         let key = key.to_string();
         let (catalog, key, mut page) = tokio::task::spawn_blocking(move || {
-            CallRelationService::for_request_with_reach(&handle, &overlays, reach_graph.as_deref())
-                .query_key(&key, direction, cursor, relation_limit, call_site_limit)
+            CallRelationService::for_request_with_reach_and_family(
+                &handle,
+                &overlays,
+                reach_graph.as_deref(),
+                semantic_family,
+            )
+            .query_key(&key, direction, cursor, relation_limit, call_site_limit)
         })
         .await??;
         self.with_reachability(&mut page.relations);
@@ -102,10 +115,22 @@ impl RelationRequestState {
         let handle = self.handle.clone();
         let overlays = self.overlays.clone();
         let reach_graph = self.reach_graph.clone();
+        let semantic_family = self.semantic_family;
         let locator = locator.clone();
         let (catalog, key, mut page) = tokio::task::spawn_blocking(move || {
-            CallRelationService::for_request_with_reach(&handle, &overlays, reach_graph.as_deref())
-                .query_locator(&locator, direction, cursor, relation_limit, call_site_limit)
+            CallRelationService::for_request_with_reach_and_family(
+                &handle,
+                &overlays,
+                reach_graph.as_deref(),
+                semantic_family,
+            )
+            .query_locator(
+                &locator,
+                direction,
+                cursor,
+                relation_limit,
+                call_site_limit,
+            )
         })
         .await??;
         self.with_reachability(&mut page.relations);
@@ -221,6 +246,7 @@ impl Backend {
         let overlay_epoch = overlay.epoch;
         let reach_graph = overlay.effective_reach_graph_arc(context.engine.reach_graph.clone());
         let overlays = overlay.call_relation_overlays();
+        let semantic_family = self.source_language_for_uri(uri).await.semantic_family();
         Some(RelationRequestState {
             root,
             handle,
@@ -232,6 +258,7 @@ impl Backend {
                 resolver_version: CALLABLE_CANDIDATE_RESOLVER_VERSION,
             },
             reach_graph,
+            semantic_family,
         })
     }
 
@@ -246,14 +273,20 @@ impl Backend {
         let handle = state.handle.clone();
         let overlays = state.overlays.clone();
         let reach_graph = state.reach_graph.clone();
+        let semantic_family = state.semantic_family;
         let prepare_position = SourcePosition {
             line: position.line,
             character: position.character,
         };
         let prepare_rel = rel.clone();
         let catalog = tokio::task::spawn_blocking(move || {
-            CallRelationService::for_request_with_reach(&handle, &overlays, reach_graph.as_deref())
-                .prepare_at(&prepare_rel, prepare_position)
+            CallRelationService::for_request_with_reach_and_family(
+                &handle,
+                &overlays,
+                reach_graph.as_deref(),
+                semantic_family,
+            )
+            .prepare_at(&prepare_rel, prepare_position)
         })
         .await
         .ok()?

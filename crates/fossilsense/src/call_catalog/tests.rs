@@ -37,6 +37,7 @@ fn anchor(key: &str, name: &str, path: &str, role: AnchorRole, arity: u32) -> Ca
     CallableAnchorRow {
         id: 0,
         path: path.into(),
+        semantic_family: crate::semantic_model::SemanticFamily::CFamily,
         source: "workspace".into(),
         directly_included: false,
         entity_key: key.into(),

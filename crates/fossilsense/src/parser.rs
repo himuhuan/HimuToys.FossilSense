@@ -7,6 +7,7 @@ use std::sync::Mutex;
 use crate::config::{ParserFrontend, SourceLanguage};
 use crate::semantic_model::{
     DeclarationFact, FallbackCompletionFact, ParseOutcome, SemanticDeclarationRole,
+    SemanticLanguage,
 };
 
 /// Parser-private staging record used while converting AST nodes or hard-
@@ -210,6 +211,7 @@ bitflags::bitflags! {
 /// leaving every semantic vector empty.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileSemanticIndex {
+    pub language: SemanticLanguage,
     pub includes: Vec<Include>,
     pub package: Option<crate::semantic_model::PackageFact>,
     pub imports: Vec<crate::semantic_model::ImportFact>,
@@ -390,6 +392,7 @@ impl FileSemanticIndex {
     #[allow(dead_code)]
     pub fn persistent_facts(&self) -> PersistentFacts<'_> {
         PersistentFacts {
+            language: self.language,
             parse_outcome: self.parse_outcome,
             includes: &self.includes,
             package: self.package.as_ref(),
@@ -690,14 +693,16 @@ fn parse_with_handle_control(
     let tree = match parsed_tree {
         Ok(Some(tree)) => tree,
         Ok(None) if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) => return None,
-        Ok(None) | Err(()) => return Some(lexical_fallback(source, includes, facts, language)),
+        Ok(None) | Err(()) => {
+            return Some(lexical_fallback(path, source, includes, facts, language));
+        }
     };
 
     if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
         return None;
     }
     if ast_is_hard_failure(tree.root_node(), source) {
-        return Some(lexical_fallback(source, includes, facts, language));
+        return Some(lexical_fallback(path, source, includes, facts, language));
     }
 
     let BackendAstProduct {
@@ -749,6 +754,7 @@ fn parse_with_handle_control(
     };
 
     Some(FileSemanticIndex {
+        language: language.semantic_language(),
         includes,
         package,
         imports,
@@ -816,18 +822,25 @@ pub fn parse_thread_local_with_language_cancel(
 }
 
 fn lexical_fallback(
+    path: &Path,
     source: &str,
     includes: Vec<Include>,
     facts: ParseFacts,
     language: SourceLanguage,
 ) -> FileSemanticIndex {
+    let source_guard =
+        (parser_frontend_adapter(language.parser_frontend()).fallback_build_guard)(source);
+    let build_guard = if language == SourceLanguage::Go {
+        go::combine_build_guards(source_guard, go::filename_build_guard(path))
+    } else {
+        source_guard
+    };
     FileSemanticIndex {
+        language: language.semantic_language(),
         includes,
         package: None,
         imports: Vec::new(),
-        build_guard: (parser_frontend_adapter(language.parser_frontend()).fallback_build_guard)(
-            source,
-        ),
+        build_guard,
         declarations: Vec::new(),
         fallback_completions: extract_fallback_completions(source, language),
         parse_outcome: ParseOutcome::LexicalFallback,

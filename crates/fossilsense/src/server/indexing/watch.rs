@@ -20,7 +20,7 @@ pub(in crate::server) async fn watched_change_in_scope(
         // event re-reads the config. Nested files with this basename are not
         // workspace configuration unless their directory is itself a root.
         config_cache.lock().await.remove(root);
-        return Some(WatchDecision::Full);
+        return Some(WatchDecision::Full(root.clone()));
     }
 
     // Use cached config to avoid re-reading fossilsense.json on every event.

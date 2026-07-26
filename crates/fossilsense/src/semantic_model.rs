@@ -13,6 +13,14 @@ pub const PARSER_FACT_VERSION: i64 = 7;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum SemanticFamily {
+    CFamily,
+    Go,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ParseOutcome {
     Ast,
     PartialAst,
@@ -90,6 +98,15 @@ pub enum SemanticLanguage {
     Cpp,
     Unknown,
     Go,
+}
+
+impl SemanticLanguage {
+    pub fn semantic_family(self) -> SemanticFamily {
+        match self {
+            Self::Go => SemanticFamily::Go,
+            Self::C | Self::Cpp | Self::Unknown => SemanticFamily::CFamily,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -401,6 +418,7 @@ pub struct Occurrence {
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
 pub struct PersistentFacts<'a> {
+    pub language: SemanticLanguage,
     pub parse_outcome: ParseOutcome,
     pub includes: &'a [Include],
     pub package: Option<&'a PackageFact>,

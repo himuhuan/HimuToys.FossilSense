@@ -64,6 +64,7 @@ impl Backend {
             .await;
         let index: Option<Arc<FileSemanticIndex>> = cached;
         let index = index?;
+        let semantic_family = index.language.semantic_family();
 
         let result = tokio::task::spawn_blocking(move || -> Result<Vec<coloring::ColoredToken>> {
             let defs = index.coloring_defs();
@@ -99,7 +100,11 @@ impl Backend {
                 Some(table) => {
                     let wanted_set: std::collections::HashSet<&str> =
                         wanted.iter().copied().collect();
-                    table.colorable_kind_counts(&wanted_set, color_scope.as_ref())
+                    table.colorable_kind_counts_for_family(
+                        &wanted_set,
+                        color_scope.as_ref(),
+                        semantic_family,
+                    )
                 }
                 None => HashMap::new(),
             };

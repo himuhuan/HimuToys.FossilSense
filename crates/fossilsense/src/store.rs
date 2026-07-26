@@ -11,6 +11,7 @@ use crate::semantic_model::{
 };
 
 mod generations;
+mod go_package_graph;
 mod includes;
 mod queries;
 mod schema;
@@ -106,6 +107,9 @@ pub struct IncludeGraphUpdate {
     pub unresolved: Vec<(i64, i64)>,
     pub ambiguous: Vec<(i64, i64)>,
     pub clear_all: bool,
+    pub go_package_edges: Vec<(String, String, String)>,
+    pub go_open_packages: Vec<(String, String)>,
+    pub clear_all_go_packages: bool,
 }
 
 pub struct SemanticReadGuard<'a> {
