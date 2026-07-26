@@ -1,6 +1,6 @@
 # FossilSense for VS Code
 
-FossilSense gives large, difficult-to-build C and C++ workspaces useful navigation without requiring a complete compiler setup. The `1.4.4` VSIX is self-contained: open a workspace and let the bundled native engine build its local index.
+FossilSense gives large, difficult-to-build C and C++ workspaces useful navigation without requiring a complete compiler setup. The `1.4.5` VSIX is self-contained: open a workspace and let the bundled native engine build its local index.
 
 It is designed for firmware, embedded systems, drivers, kernels, legacy code, vendored SDKs, and repositories where `compile_commands.json` is missing or unreliable.
 
@@ -17,7 +17,9 @@ It is designed for firmware, embedded systems, drivers, kernels, legacy code, ve
 - Limited semantic coloring for macros, types, enum constants, parameters, and local variables.
 - Unsaved open-document declarations included in candidate results.
 
-FossilSense ranks evidence from the current file, reachable includes, direct external headers, and global fallback. Version 1.4.4 preserves how include edges were resolved: exact edges provide strong reachability; unique suffix matches and every possible target of an ambiguous include remain heuristic; and direct-external evidence is evaluated from the current query origin. Limited semantic coloring lets those bounded heuristic include targets contribute macro, type, and enum-kind evidence, while unrelated whole-workspace definitions remain excluded when the include scope is open; conflicting kind evidence stays uncolored. If an exact-name global window reaches its cap, Current and strongly reachable paths are recalled first. Indexed object candidates also distinguish declarations, C tentative definitions, full definitions, and unknown declaration/definition roles. When parsing or include information is incomplete, results degrade conservatively and expose ambiguity, confidence, or coverage instead of claiming compiler-level precision.
+FossilSense ranks evidence from the current file, reachable includes, direct external headers, and global fallback, and preserves how include edges were resolved: exact edges provide strong reachability; unique suffix matches and every possible target of an ambiguous include remain heuristic; and direct-external evidence is evaluated from the current query origin. Limited semantic coloring lets those bounded heuristic include targets contribute macro, type, and enum-kind evidence, while unrelated whole-workspace definitions remain excluded when the include scope is open; conflicting kind evidence stays uncolored. If an exact-name global window reaches its cap, Current and strongly reachable paths are recalled first. Indexed object candidates also distinguish declarations, C tentative definitions, full definitions, and unknown declaration/definition roles. When parsing or include information is incomplete, results degrade conservatively and expose ambiguity, confidence, or coverage instead of claiming compiler-level precision.
+
+Version 1.4.5 makes Hover agree with navigation on lexically proven identifiers: function parameters, local variables, and `goto` labels resolve by C scope rules in Hover as well, instead of falling back to same-name workspace candidates. When default navigation or Hover focuses better-matching candidates and omits other same-name candidates, the Hover footer states how many candidates are outside the focused result and gives the set-level match verdict (exact / preferred / ambiguous / fallback); the Find All QuickPick lists those candidates marked `outside focused result`, and its coverage carries the same verdict and count. A candidate can be outside the focus because of query intent or scope tier, so the label does not misstate every omission as scope ranking.
 
 ## Where symbols come from
 
@@ -29,7 +31,7 @@ C++ record methods intentionally participate in ordinary identifier recall as fu
 
 ## Install and start
 
-Install `fossilsense-vscode-1.4.4_BUILD*.vsix` with:
+Install `fossilsense-vscode-1.4.5_BUILD*.vsix` with:
 
 ```text
 Extensions -> ... -> Install from VSIX

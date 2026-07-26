@@ -15,7 +15,7 @@ FossilSense 的实现事实只来自**当前源码、测试、清单和脚本**�
 
 ## 项目定位
 
-FossilSense `1.4.4` 是一个面向大型 Windows C/C++ 工作区的 VS Code 代码导航与分析工具。它把“缺少可靠编译环境”视为正常场景：用户不需要先准备 `compile_commands.json`、clangd、ctags 或完整构建链。
+FossilSense `1.4.5` 是一个面向大型 Windows C/C++ 工作区的 VS Code 代码导航与分析工具。它把“缺少可靠编译环境”视为正常场景：用户不需要先准备 `compile_commands.json`、clangd、ctags 或完整构建链。
 
 核心原则：
 

@@ -22,6 +22,8 @@ export interface PossibleTargetItem {
   arityCompatibility?: string | null;
   pairingEvidence?: string | null;
   origin: string;
+  /** `false` marks a candidate outside the default navigation/hover focus. */
+  focused?: boolean;
 }
 
 export interface PossibleTargetsCoverage {
@@ -32,6 +34,10 @@ export interface PossibleTargetsCoverage {
   open: boolean;
   openReason?: string | null;
   incompleteReason?: string | null;
+  /** Set-level uncertainty verdict: exact / preferred / ambiguous / fallback. */
+  disposition?: string;
+  /** Same-name candidates outside the focused presentation; listed here with focused=false. */
+  alternativeCount?: number;
   semanticGeneration: number;
   overlayEpoch: number;
   resolverVersion: number;
@@ -109,6 +115,7 @@ export function possibleTargetPickRows(
     const qualifiers = [
       `${humanize(item.scopeTier)} scope`,
       `${humanize(item.linkage)} linkage`,
+      item.focused === false ? 'outside focused result' : undefined,
       item.guard ? `guard: ${item.guard}` : undefined,
       evidence || undefined,
     ].filter((part): part is string => Boolean(part));
@@ -127,6 +134,12 @@ export function possibleTargetsCoverageSummary(
   coverage: PossibleTargetsCoverage,
 ): string {
   const notes: string[] = [];
+  if (coverage.disposition) {
+    notes.push(`matches: ${humanize(coverage.disposition)}`);
+  }
+  if (coverage.alternativeCount) {
+    notes.push(`${coverage.alternativeCount} outside focused result`);
+  }
   if (coverage.bounded) {
     notes.push(`bounded recall (limit ${coverage.limit})`);
   }

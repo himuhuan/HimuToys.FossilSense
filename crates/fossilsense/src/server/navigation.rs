@@ -231,6 +231,9 @@ impl Backend {
                                 .to_string(),
                         );
                     }
+                    if debug_reasons {
+                        debug_lines.insert(0, candidate_set_debug_line(&semantic_set));
+                    }
                     let locations: Vec<Location> = candidates
                         .iter()
                         .filter_map(|candidate| candidate_to_location(&root, candidate))
@@ -248,7 +251,10 @@ impl Backend {
                 );
                 perf.include_non_callable_candidates(semantic_count);
                 perf.query_us = query_started.elapsed().as_micros();
-                let debug_lines = candidate_reason_log_lines(&candidates, debug_reasons);
+                let mut debug_lines = candidate_reason_log_lines(&candidates, debug_reasons);
+                if debug_reasons {
+                    debug_lines.insert(0, candidate_set_debug_line(&semantic_set));
+                }
                 let locations: Vec<Location> = candidates
                     .iter()
                     .filter_map(|candidate| candidate_to_location(&root, candidate))
@@ -292,14 +298,31 @@ impl Backend {
     }
 }
 
-pub(super) fn local_binding_location(
-    uri: &Url,
+/// Set-level uncertainty evidence for the debug-gated candidate-reason log:
+/// how confidently the shared candidate set proved its focused answer and how
+/// many recalled same-name candidates were suppressed from presentation.
+fn candidate_set_debug_line(
+    set: &crate::model::CandidateSet<crate::candidate_service::ResolvedDeclarationCandidate>,
+) -> String {
+    format!(
+        "candidate_set: disposition={} suppressed={} truncated={} scope_open={}",
+        set.disposition.as_str(),
+        set.alternative_count,
+        set.coverage.truncated,
+        set.coverage.scope_open,
+    )
+}
+
+/// Prove the nearest visible parameter/local binding for `word` at the cursor,
+/// using only the request document. Shared by navigation, hover, and possible
+/// targets so every feature answers a lexically bound identifier identically.
+pub(super) fn visible_local_binding_at(
     current_path: &str,
     text: &str,
     word: &str,
     position: tower_lsp::lsp_types::Position,
     language: crate::config::SourceLanguage,
-) -> Option<Location> {
+) -> Option<crate::parser::LocalBinding> {
     let cursor_byte = query::byte_offset_at(text, position.line, position.character);
     let parsed = parser::parse_with_handle_and_language(
         Path::new(current_path),
@@ -308,7 +331,18 @@ pub(super) fn local_binding_location(
         None,
         parser::ParseFacts::LOCAL_DECLS,
     );
-    let binding = query::visible_local_binding(&parsed.local_bindings, word, cursor_byte)?;
+    query::visible_local_binding(&parsed.local_bindings, word, cursor_byte).cloned()
+}
+
+pub(super) fn local_binding_location(
+    uri: &Url,
+    current_path: &str,
+    text: &str,
+    word: &str,
+    position: tower_lsp::lsp_types::Position,
+    language: crate::config::SourceLanguage,
+) -> Option<Location> {
+    let binding = visible_local_binding_at(current_path, text, word, position, language)?;
     let start = source_position_for_byte(text, binding.decl_start_byte);
     let end = tower_lsp::lsp_types::Position {
         line: start.line,

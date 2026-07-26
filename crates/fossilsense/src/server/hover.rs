@@ -23,6 +23,7 @@ pub(super) const HOVER_SOURCE_FILE_BYTE_LIMIT: u64 = 256 * 1024;
 
 impl Backend {
     pub(super) async fn provide_hover(&self, params: HoverParams) -> LspResult<Option<Hover>> {
+        let total_started = std::time::Instant::now();
         let position = params.text_document_position_params;
         let uri = position.text_document.uri;
         let documents = self
@@ -30,7 +31,7 @@ impl Backend {
             .documents
             .capture_request_snapshot(Some(&uri))
             .await;
-        let Some((_version, text)) = self.document_snapshot_from_request(&uri, &documents).await
+        let Some((version, text)) = self.document_snapshot_from_request(&uri, &documents).await
         else {
             return Ok(None);
         };
@@ -44,10 +45,94 @@ impl Backend {
         let Some(root) = self.root_for_uri(&uri).await else {
             return Ok(None);
         };
-        let current_rel = uri_to_path(&uri)
-            .and_then(|path| pathing::relative_slash_path(&root, &path).ok())
+        let current_abs = uri_to_path(&uri);
+        let current_rel = current_abs
+            .as_deref()
+            .and_then(|path| pathing::relative_slash_path(&root, path).ok())
             .unwrap_or_default();
-        let total_started = std::time::Instant::now();
+        let source_language = self.source_language_for_uri(&uri).await;
+        let cursor_byte =
+            query::byte_offset_at(&text, position.position.line, position.position.character);
+
+        // C and C++ labels inhabit a function-local namespace. Hover shares
+        // navigation's label proof instead of describing workspace symbols
+        // that merely share the spelling.
+        if super::navigation::label_navigation_syntax_hint(&text, &word, cursor_byte) {
+            let label_path = current_rel.clone();
+            let label_text = text.clone();
+            let label_word = word.clone();
+            let label_uri = uri.clone();
+            match tokio::task::spawn_blocking(move || {
+                super::navigation::label_navigation_location(
+                    &label_uri,
+                    &label_path,
+                    &label_text,
+                    &label_word,
+                    cursor_byte,
+                    source_language,
+                )
+            })
+            .await
+            {
+                Ok(super::navigation::LabelNavigation::Found(location)) => {
+                    let total_us = total_started.elapsed().as_micros();
+                    self.perf_log(|| SemanticRequestPerf::default().log_line("hover", total_us))
+                        .await;
+                    return Ok(Some(markdown_hover(label_hover_markdown(
+                        &current_rel,
+                        &text,
+                        &location,
+                    ))));
+                }
+                // A proven `goto name` resolves only in the enclosing
+                // function's label namespace; a missing label must not surface
+                // unrelated workspace candidates named `name`.
+                Ok(super::navigation::LabelNavigation::MissingDefinition) => {
+                    let total_us = total_started.elapsed().as_micros();
+                    self.perf_log(|| SemanticRequestPerf::default().log_line("hover", total_us))
+                        .await;
+                    return Ok(None);
+                }
+                Ok(super::navigation::LabelNavigation::NotLabelSyntax) | Err(_) => {}
+            }
+        }
+
+        // Lexical bindings are proven by C scope rules and dominate every
+        // workspace same-name candidate, exactly as in navigation and possible
+        // targets.
+        if super::navigation::ordinary_identifier_navigation_context(
+            line_text,
+            position.position.character,
+        ) {
+            if let Some(current_abs) = current_abs.as_deref() {
+                if let Some(parsed) = self
+                    .get_or_parse_document(
+                        &uri,
+                        current_abs,
+                        version,
+                        &text,
+                        crate::parser::ParseFacts::LOCAL_DECLS,
+                    )
+                    .await
+                {
+                    if let Some(binding) =
+                        query::visible_local_binding(&parsed.local_bindings, &word, cursor_byte)
+                    {
+                        let total_us = total_started.elapsed().as_micros();
+                        self.perf_log(|| {
+                            SemanticRequestPerf::default().log_line("hover", total_us)
+                        })
+                        .await;
+                        return Ok(Some(markdown_hover(local_binding_hover_markdown(
+                            &current_rel,
+                            &text,
+                            binding,
+                        ))));
+                    }
+                }
+            }
+        }
+
         let context = self.request_context_for_root(root.clone()).await;
         let reach_started = std::time::Instant::now();
         let reach_scope = self
@@ -144,7 +229,7 @@ impl Backend {
                     perf.hydration_us = hydration_started.elapsed().as_micros();
                     perf.hydration_count = hydration.count;
                     perf.hydration_bytes = hydration.bytes;
-                    return Ok((markdown, perf));
+                    return Ok((with_candidate_set_evidence(markdown, &semantic_set), perf));
                 }
 
                 let type_candidates =
@@ -182,7 +267,7 @@ impl Backend {
                         perf.hydration_us = hydration_started.elapsed().as_micros();
                         perf.hydration_count = hydration.count;
                         perf.hydration_bytes = hydration.bytes;
-                        return Ok((markdown, perf));
+                        return Ok((with_candidate_set_evidence(markdown, &semantic_set), perf));
                     }
                 }
                 if let Some(callable_set) =
@@ -212,7 +297,7 @@ impl Backend {
                     perf.hydration_us = hydration_started.elapsed().as_micros();
                     perf.hydration_count = hydration.count;
                     perf.hydration_bytes = hydration.bytes;
-                    return Ok((markdown, perf));
+                    return Ok((with_candidate_set_evidence(markdown, &semantic_set), perf));
                 }
 
                 let documentation_ranked: Vec<_> =
@@ -255,7 +340,7 @@ impl Backend {
                 perf.hydration_us = hydration_started.elapsed().as_micros();
                 perf.hydration_count = hydration.count;
                 perf.hydration_bytes = hydration.bytes;
-                Ok((markdown, perf))
+                Ok((with_candidate_set_evidence(markdown, &semantic_set), perf))
             },
         )
         .await;
@@ -279,6 +364,107 @@ impl Backend {
             _ => Ok(None),
         }
     }
+}
+
+fn markdown_hover(value: String) -> Hover {
+    Hover {
+        contents: HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value,
+        }),
+        range: None,
+    }
+}
+
+/// Hover for a lexically proven parameter/local: the binding's own declaration
+/// line, never a workspace candidate that merely shares the spelling.
+fn local_binding_hover_markdown(
+    current_rel: &str,
+    text: &str,
+    binding: &crate::parser::LocalBinding,
+) -> String {
+    let declaration = source_line_at_byte(text, binding.decl_start_byte);
+    let binding_kind = match binding.kind {
+        crate::parser::LocalBindingKind::Parameter => "parameter",
+        crate::parser::LocalBindingKind::LocalVariable => "local variable",
+    };
+    let type_note = binding
+        .type_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|type_text| !type_text.is_empty())
+        .map(|type_text| format!(" | type: {}", escape_html_text(type_text)))
+        .unwrap_or_default();
+    let mut out = String::new();
+    out.push_str("```c\n");
+    out.push_str(&format!("// In {current_rel}\n"));
+    out.push_str(&declaration.replace("```", "'''"));
+    out.push_str("\n```\n\n");
+    out.push_str(&format!(
+        "<small><span style=\"color: var(--vscode-descriptionForeground);\"><em>{binding_kind}{type_note} | tier: current | confidence: exact | reason: lexical_binding</em></span></small>"
+    ));
+    out
+}
+
+/// Hover for a proven label definition/use inside the enclosing function.
+fn label_hover_markdown(
+    current_rel: &str,
+    text: &str,
+    location: &tower_lsp::lsp_types::Location,
+) -> String {
+    let declaration = text
+        .lines()
+        .nth(location.range.start.line as usize)
+        .unwrap_or_default()
+        .trim();
+    let mut out = String::new();
+    out.push_str("```c\n");
+    out.push_str(&format!("// In {current_rel}\n"));
+    out.push_str(&declaration.replace("```", "'''"));
+    out.push_str("\n```\n\n");
+    out.push_str(
+        "<small><span style=\"color: var(--vscode-descriptionForeground);\"><em>label | tier: current | confidence: exact | reason: label_namespace</em></span></small>",
+    );
+    out
+}
+
+fn source_line_at_byte(text: &str, byte: usize) -> &str {
+    let byte = byte.min(text.len());
+    let start = text[..byte].rfind('\n').map_or(0, |index| index + 1);
+    let end = text[byte..]
+        .find('\n')
+        .map_or(text.len(), |offset| byte + offset);
+    text[start..end].trim()
+}
+
+/// Append set-level uncertainty evidence to a hover produced from the shared
+/// semantic candidate set. Scope-tier focus may suppress recalled same-name
+/// candidates from presentation; that suppression must stay visible instead of
+/// silently narrowing the answer, and truncated bounded recall must never read
+/// as a complete match list.
+fn with_candidate_set_evidence(
+    markdown: Option<String>,
+    set: &crate::model::CandidateSet<crate::candidate_service::ResolvedDeclarationCandidate>,
+) -> Option<String> {
+    let markdown = markdown?;
+    let mut notes = Vec::new();
+    if set.alternative_count > 0 {
+        notes.push(format!(
+            "{} same-name candidate(s) outside the focused result — run \"FossilSense: Find All Possible Definitions / Declarations\" to inspect them",
+            set.alternative_count
+        ));
+    }
+    if set.coverage.truncated {
+        notes.push("bounded exact-name recall was truncated; matches may be incomplete".into());
+    }
+    if notes.is_empty() {
+        return Some(markdown);
+    }
+    Some(format!(
+        "{markdown}\n\n<small><span style=\"color: var(--vscode-descriptionForeground);\"><em>matches: {} | {}</em></span></small>",
+        set.disposition.as_str(),
+        notes.join(" | ")
+    ))
 }
 
 fn hover_markdown_for_type_candidates(
@@ -605,6 +791,13 @@ fn sanitize_inline(value: &str) -> String {
     value.replace('`', "\\`")
 }
 
+fn escape_html_text(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 #[allow(clippy::too_many_arguments)] // Keeps revision/overlay evidence explicit at hydration boundary.
 fn hover_markdown_for_callable_presentations(
     root: &Path,
@@ -804,6 +997,37 @@ mod tests {
                 reason,
             },
         }
+    }
+
+    #[test]
+    fn local_binding_hover_escapes_type_text_inside_html_metadata() {
+        let source = "void run(void) {\n    std::vector<int> &values = input;\n}\n";
+        let declaration_byte = source.find("values").expect("binding");
+        let binding = crate::parser::LocalBinding {
+            name: "values".into(),
+            kind: crate::parser::LocalBindingKind::LocalVariable,
+            type_text: Some("std::vector<int> &".into()),
+            decl_start_byte: declaration_byte,
+            function_start_byte: 0,
+            function_end_byte: source.len(),
+            scope_start_byte: source.find('{').expect("scope"),
+            scope_end_byte: source.rfind('}').expect("scope"),
+        };
+
+        let markdown = local_binding_hover_markdown("main.cpp", source, &binding);
+
+        assert!(
+            markdown.contains("std::vector<int> &values = input;"),
+            "source excerpts stay verbatim inside their fenced code block: {markdown}"
+        );
+        assert!(
+            markdown.contains("type: std::vector&lt;int&gt; &amp;"),
+            "metadata embedded in raw HTML must be escaped as text: {markdown}"
+        );
+        assert!(
+            !markdown.contains("type: std::vector<int> & |"),
+            "raw source-controlled type text must not become HTML: {markdown}"
+        );
     }
 
     #[test]

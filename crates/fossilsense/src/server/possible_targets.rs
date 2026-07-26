@@ -37,6 +37,10 @@ struct PossibleTargetItem {
     arity_compatibility: Option<String>,
     pairing_evidence: Option<String>,
     origin: String,
+    /// `false` marks a candidate whose group is outside the default
+    /// navigation/hover focus; this command is the escape hatch that keeps such
+    /// candidates inspectable.
+    focused: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -51,6 +55,12 @@ struct PossibleTargetsCoverage {
     open: bool,
     open_reason: Option<String>,
     incomplete_reason: Option<String>,
+    /// Set-level uncertainty verdict of the shared candidate set
+    /// (`exact` / `preferred` / `ambiguous` / `fallback`).
+    disposition: String,
+    /// Recalled same-name candidates outside the default focused presentation;
+    /// they stay listed here with `focused: false`.
+    alternative_count: usize,
     semantic_generation: u64,
     overlay_epoch: u64,
     resolver_version: u32,
@@ -198,13 +208,24 @@ impl Backend {
             let allowed = crate::candidate_service::focused_callable_fingerprints(&semantic_set);
             if !allowed.is_empty() {
                 let callable_set = service.callable_candidates(&word, call_context)?;
-                let items = callable_items(
+                let mut items = callable_items(
                     &root,
                     &callable_set.groups,
                     &allowed,
                     &current_path,
                     cursor_byte,
                 );
+                // The focused callable entity is rendered through its variant
+                // groups above; other groups (static same-name symbols in other
+                // units, same-name non-functions) stay inspectable through the
+                // semantic listing.
+                items.extend(semantic_items(
+                    &root,
+                    &semantic_set,
+                    &current_path,
+                    cursor,
+                    SemanticItemSelection::SuppressedOnly,
+                ));
                 let coverage = semantic_coverage(
                     &semantic_set,
                     service.effective_current_reach(),
@@ -225,7 +246,13 @@ impl Backend {
                 semantic_generation,
                 overlay_epoch,
             );
-            let items = semantic_items(&root, &semantic_set, &current_path, cursor);
+            let items = semantic_items(
+                &root,
+                &semantic_set,
+                &current_path,
+                cursor,
+                SemanticItemSelection::All,
+            );
             Ok(PossibleTargetsResponse {
                 protocol_version: POSSIBLE_TARGETS_PROTOCOL_VERSION,
                 name: word,
@@ -278,6 +305,7 @@ fn proven_local_response(
             arity_compatibility: None,
             pairing_evidence: None,
             origin: "current_document".into(),
+            focused: true,
         }],
         coverage: PossibleTargetsCoverage {
             bounded: false,
@@ -287,6 +315,8 @@ fn proven_local_response(
             open: false,
             open_reason: None,
             incomplete_reason: None,
+            disposition: crate::model::CandidateDisposition::Exact.as_str().into(),
+            alternative_count: 0,
             semantic_generation,
             overlay_epoch,
             resolver_version: query::CALLABLE_CANDIDATE_RESOLVER_VERSION,
@@ -339,10 +369,20 @@ fn callable_items(
                         query::CandidateOrigin::Overlay => "overlay",
                     }
                     .into(),
+                    focused: true,
                 })
             })
         })
         .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SemanticItemSelection {
+    /// Every bounded group, focused and suppressed alike.
+    All,
+    /// Only groups outside the focused set (used when the focused entity is
+    /// already rendered through callable variant groups).
+    SuppressedOnly,
 }
 
 fn semantic_items(
@@ -350,10 +390,27 @@ fn semantic_items(
     set: &crate::model::CandidateSet<crate::candidate_service::ResolvedDeclarationCandidate>,
     current_path: &str,
     cursor: crate::call_model::SourcePosition,
+    selection: SemanticItemSelection,
 ) -> Vec<PossibleTargetItem> {
-    crate::candidate_service::focused_candidates(set)
-        .into_iter()
-        .filter_map(|candidate| {
+    let focused_groups: std::collections::HashSet<usize> = set
+        .focused
+        .iter()
+        .map(|candidate_ref| candidate_ref.group_index)
+        .collect();
+    set.all
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| {
+            selection == SemanticItemSelection::All || !focused_groups.contains(index)
+        })
+        .flat_map(|(index, group)| {
+            let focused = focused_groups.contains(&index);
+            group
+                .candidates
+                .iter()
+                .map(move |candidate| (focused, candidate))
+        })
+        .filter_map(|(focused, candidate)| {
             let presentation = candidate.as_definition_candidate();
             let location = candidate_to_location(root, &presentation)?;
             Some(PossibleTargetItem {
@@ -390,6 +447,7 @@ fn semantic_items(
                     query::CandidateOrigin::Overlay => "overlay",
                 }
                 .into(),
+                focused,
             })
         })
         .collect()
@@ -414,6 +472,8 @@ fn semantic_coverage(
             .coverage
             .facts_incomplete
             .then(|| "facts_unavailable".into()),
+        disposition: set.disposition.as_str().into(),
+        alternative_count: set.alternative_count,
         semantic_generation,
         overlay_epoch,
         resolver_version: query::CALLABLE_CANDIDATE_RESOLVER_VERSION,
@@ -537,6 +597,8 @@ mod tests {
         assert!(coverage.bounded);
         assert!(coverage.truncated);
         assert_eq!(coverage.limit, DEFAULT_EXACT_NAME_CANDIDATE_LIMIT);
+        assert_eq!(coverage.disposition, "fallback");
+        assert_eq!(coverage.alternative_count, 0);
     }
 
     #[test]

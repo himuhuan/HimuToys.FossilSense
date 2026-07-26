@@ -2,7 +2,7 @@
 
 FossilSense 是一款面向大型、难以构建的 C/C++ 仓库的 VS Code 代码导航工具。它不要求 `compile_commands.json`，也不需要额外安装 clangd、ctags 或 Rust 工具链。安装一个自包含 VSIX，打开工作区后即可建立索引。
 
-当前版本：`1.4.4`。
+当前版本：`1.4.5`。
 
 ## 什么时候适合使用
 
@@ -16,7 +16,7 @@ FossilSense 主要解决一种很实际的问题：代码就在眼前，但完�
 
 1. 在 VS Code 中打开 `Extensions`。
 2. 选择右上角 `... -> Install from VSIX`。
-3. 选择 `fossilsense-vscode-1.4.4_BUILD*.vsix`。
+3. 选择 `fossilsense-vscode-1.4.5_BUILD*.vsix`。
 4. 打开 C/C++ 工作区，等待状态栏进入 `ready`。
 
 默认无需配置。FossilSense 会扫描常见 C/C++ 文件，并把索引保存在用户缓存目录，不会在源码仓库中生成数据库。
@@ -34,7 +34,9 @@ FossilSense 主要解决一种很实际的问题：代码就在眼前，但完�
 - **未保存编辑感知**：当前工作区打开但尚未保存的结构化声明可以参与候选结果。
 - **有限语义着色**：重点区分宏、类型、枚举量、参数和局部变量，避免大面积误着色。
 
-FossilSense 会优先展示当前文件、include 可达文件和直接外部头中的候选，再使用全局 fallback。`1.4.4` 会保留 include 解析方式的证据强度：精确解析的边可提供强可达性；唯一后缀匹配和 ambiguous include 的所有可能目标只作为启发式证据；外部头证据也按当前查询来源判断，避免把其他文件的关系借给本次跳转或补全。有限语义着色允许这些有界启发式 include 目标参与宏、类型和枚举量的种类判定，但不会因为 include scope 处于 open 状态而放开无关的全库定义；种类证据冲突时仍不着色。exact-name 全局窗口触顶时会先抢救 Current 和强可达候选。遇到 include 缺失、语法不完整或结果被截断时，界面会保留降级、歧义或 coverage 信息，而不是假装结果完全精确。
+FossilSense 会优先展示当前文件、include 可达文件和直接外部头中的候选，再使用全局 fallback。include 解析方式的证据强度会被保留：精确解析的边可提供强可达性；唯一后缀匹配和 ambiguous include 的所有可能目标只作为启发式证据；外部头证据也按当前查询来源判断，避免把其他文件的关系借给本次跳转或补全。有限语义着色允许这些有界启发式 include 目标参与宏、类型和枚举量的种类判定，但不会因为 include scope 处于 open 状态而放开无关的全库定义；种类证据冲突时仍不着色。exact-name 全局窗口触顶时会先抢救 Current 和强可达候选。遇到 include 缺失、语法不完整或结果被截断时，界面会保留降级、歧义或 coverage 信息，而不是假装结果完全精确。
+
+`1.4.5` 让 Hover 与跳转对同一符号给出一致答案：函数参数、局部变量和 `goto` label 在 Hover 中同样按 C 作用域规则短路，不再回落到工作区同名候选。当默认跳转或 Hover 聚焦更匹配的候选、没有展示其他同名候选时，Hover 页脚会标注 focused result 之外的候选数量与整体匹配置信度（exact / preferred / ambiguous / fallback）；`Find All Possible Definitions / Declarations` 会把这些候选一并列出并标记 `outside focused result`，其 coverage 同时携带该置信度与数量。候选可能因查询意图或作用域层级不在 focused result 中，该标记不把原因一概归结为作用域排序。
 
 ## 符号从哪里来，为什么补全分两段
 

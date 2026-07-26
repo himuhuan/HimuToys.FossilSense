@@ -2,7 +2,7 @@
   "name": "fossilsense-vscode",
   "displayName": "FossilSense",
   "description": "FossilSense C/C++ best-effort semantics: stable Definition/Declaration navigation, C callable normalization, role-aware candidates, reachability evidence, full record hover, and call relations.",
-  "version": "1.4.4",
+  "version": "1.4.5",
   "private": true,
   "license": "UNLICENSED",
   "publisher": "himutoys",

@@ -105,6 +105,38 @@ assert.strictEqual(
   'bounded recall (limit 256) · results truncated · coverage open: ambiguous include · incomplete: facts unavailable',
 );
 
+assert.strictEqual(
+  possibleTargetsCoverageSummary({
+    bounded: true,
+    limit: 256,
+    scanned: 6,
+    truncated: false,
+    open: false,
+    disposition: 'preferred',
+    alternativeCount: 5,
+    semanticGeneration: 7,
+    overlayEpoch: 3,
+    resolverVersion: 5,
+  }),
+  'matches: preferred · 5 outside focused result · bounded recall (limit 256)',
+);
+
+const suppressedRows = possibleTargetPickRows(
+  [
+    {
+      ...item('definition', 'workspace_fallback', 'file:///workspace/vendor/foo.c', 4),
+      focused: false,
+    },
+  ],
+  (uri) => uri.replace('file:///workspace/', ''),
+);
+const suppressedRow = suppressedRows.find((row) => row.kind === 'item');
+assert.ok(
+  suppressedRow?.kind === 'item' &&
+    suppressedRow.detail.includes('outside focused result'),
+  'suppressed candidates must stay visibly marked in the escape hatch',
+);
+
 const packageJson = JSON.parse(
   fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8'),
 );

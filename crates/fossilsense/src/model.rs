@@ -218,8 +218,13 @@ pub struct DefinitionCandidate {
     pub reason: ResolutionReason,
 }
 
+/// How confidently a shared candidate set proved its focused answer: `Exact`
+/// (unique authoritative target under complete coverage), `Preferred` (unique
+/// but coverage was open/truncated/incomplete, so uniqueness is a preference,
+/// not a proof), `Ambiguous` (several strongest targets survive), `Fallback`
+/// (no authoritative evidence). Surfaced as uncertainty evidence (hover
+/// footer, possible-targets coverage, debug logs); never used as a filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[allow(dead_code)]
 pub enum CandidateDisposition {
     Exact,
     Preferred,
@@ -228,7 +233,6 @@ pub enum CandidateDisposition {
 }
 
 impl CandidateDisposition {
-    #[allow(dead_code)]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Exact => "exact",
@@ -240,7 +244,6 @@ impl CandidateDisposition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-#[allow(dead_code)]
 pub struct SharedCandidateCoverage {
     pub scanned: usize,
     pub truncated: bool,
@@ -264,14 +267,12 @@ impl SharedCandidateCoverage {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[allow(dead_code)]
 pub struct CandidateRef {
     pub group_index: usize,
     pub candidate_index: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct CandidateGroup<T> {
     pub logical_key: Option<crate::semantic_model::LogicalEntityKey>,
     pub declaration_kind: crate::semantic_model::SemanticDeclarationKind,
@@ -282,34 +283,42 @@ pub struct CandidateGroup<T> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct CandidateSet<T> {
     pub all: Vec<CandidateGroup<T>>,
     pub focused: Vec<CandidateRef>,
     pub coverage: SharedCandidateCoverage,
     pub disposition: CandidateDisposition,
+    /// Recalled candidates living in groups outside `focused`, i.e. omitted
+    /// from the default presentation by intent and/or tier focus. Alternatives
+    /// inside a focused group (e.g. a declaration behind its focused
+    /// definition) are presentation views of the same entity and are not
+    /// counted.
     pub alternative_count: usize,
 }
 
 impl<T> CandidateSet<T> {
-    #[allow(dead_code)]
     pub fn new(
         all: Vec<CandidateGroup<T>>,
         focused: Vec<CandidateRef>,
         coverage: SharedCandidateCoverage,
     ) -> Self {
         let disposition = classify_candidate_disposition(&all, &focused, &coverage);
-        let focused_count = focused.len();
-        let total_count = all
+        let focused_groups: std::collections::HashSet<usize> = focused
             .iter()
-            .map(|group| group.candidates.len())
-            .sum::<usize>();
+            .map(|candidate_ref| candidate_ref.group_index)
+            .collect();
+        let alternative_count = all
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !focused_groups.contains(index))
+            .map(|(_, group)| group.candidates.len())
+            .sum();
         Self {
             all,
             focused,
             coverage,
             disposition,
-            alternative_count: total_count.saturating_sub(focused_count),
+            alternative_count,
         }
     }
 }
@@ -864,5 +873,38 @@ mod tests {
         let actual: Vec<_> = set.all.iter().map(|group| group.declaration_kind).collect();
         assert_eq!(actual, kinds);
         assert_eq!(set.alternative_count, kinds.len());
+    }
+
+    #[test]
+    fn alternative_count_counts_suppressed_groups_not_same_entity_views() {
+        // Group 0 (focused): one entity presented through two physical rows
+        // (definition + declaration). Group 1 (suppressed lower tier): three
+        // same-name rows. Only the suppressed group's rows are alternatives.
+        let set = CandidateSet::new(
+            vec![
+                candidate_group(
+                    crate::semantic_model::SemanticDeclarationKind::Object,
+                    ScopeTier::Reachable,
+                    true,
+                    false,
+                    vec!["definition", "declaration"],
+                ),
+                candidate_group(
+                    crate::semantic_model::SemanticDeclarationKind::Object,
+                    ScopeTier::Global,
+                    true,
+                    false,
+                    vec!["distant_a", "distant_b", "distant_c"],
+                ),
+            ],
+            vec![CandidateRef {
+                group_index: 0,
+                candidate_index: 0,
+            }],
+            SharedCandidateCoverage::complete(5),
+        );
+
+        assert_eq!(set.alternative_count, 3);
+        assert_eq!(set.disposition, CandidateDisposition::Exact);
     }
 }

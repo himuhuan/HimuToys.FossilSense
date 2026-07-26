@@ -1111,6 +1111,273 @@ async fn local_binding_navigation_dominates_workspace_same_name_candidates() {
 }
 
 #[tokio::test]
+async fn hover_agrees_with_navigation_on_local_bindings() {
+    let (_dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[("other.c", "int value(void) { return 1; }\n")],
+        "main.c",
+        "int run(void) {\n    int value = 2;\n    return value/*cursor*/;\n}\n",
+    )
+    .await;
+
+    let hover = service
+        .inner()
+        .hover(hover_params(uri.clone(), line, character))
+        .await
+        .expect("hover request")
+        .expect("local binding hover");
+    let hover = hover_text(hover.contents);
+    assert!(
+        hover.contains("// In main.c"),
+        "hover must describe the request document: {hover}"
+    );
+    assert!(
+        hover.contains("int value = 2;"),
+        "hover must show the proven local declaration line: {hover}"
+    );
+    assert!(hover.contains("reason: lexical_binding"), "{hover}");
+    assert!(
+        !hover.contains("other.c"),
+        "workspace same-name candidate must not leak into a lexically bound hover: {hover}"
+    );
+    let first_parse = service
+        .inner()
+        .session
+        .documents
+        .cached_live_parse(&uri, 1, crate::parser::ParseFacts::LOCAL_DECLS)
+        .await
+        .expect("local hover must populate the versioned live-parse cache");
+    service
+        .inner()
+        .hover(hover_params(uri.clone(), line, character))
+        .await
+        .expect("cached hover request")
+        .expect("cached local binding hover");
+    let reused_parse = service
+        .inner()
+        .session
+        .documents
+        .cached_live_parse(&uri, 1, crate::parser::ParseFacts::LOCAL_DECLS)
+        .await
+        .expect("cached local parse");
+    assert!(
+        Arc::ptr_eq(&first_parse, &reused_parse),
+        "repeated hover on the same document version must reuse its parsed local facts"
+    );
+
+    let definition = service
+        .inner()
+        .goto_definition(goto_definition_params(uri.clone(), line, character))
+        .await
+        .expect("definition request")
+        .expect("local definition response");
+    let locations = definition_locations(definition);
+    assert_eq!(locations.len(), 1);
+    assert_eq!(locations[0].uri, uri);
+    assert_eq!(locations[0].range.start.line, 1);
+}
+
+#[tokio::test]
+async fn hover_agrees_with_navigation_on_labels() {
+    let (_dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[("other.c", "int same(void) { return 1; }\n")],
+        "main.c",
+        "void run(void) {\n    goto sa/*cursor*/me;\nsame:\n    return;\n}\n",
+    )
+    .await;
+
+    let hover = service
+        .inner()
+        .hover(hover_params(uri, line, character))
+        .await
+        .expect("hover request")
+        .expect("label hover");
+    let hover = hover_text(hover.contents);
+    assert!(hover.contains("same:"), "{hover}");
+    assert!(hover.contains("reason: label_namespace"), "{hover}");
+    assert!(
+        !hover.contains("other.c"),
+        "workspace same-name candidate must not leak into a label hover: {hover}"
+    );
+
+    let (_dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[("other.c", "int missing(void) { return 1; }\n")],
+        "main.c",
+        "void run(void) {\n    goto mis/*cursor*/sing;\n}\n",
+    )
+    .await;
+    assert!(
+        service
+            .inner()
+            .hover(hover_params(uri, line, character))
+            .await
+            .expect("missing label hover request")
+            .is_none(),
+        "a missing label must not surface workspace same-name hover candidates"
+    );
+}
+
+#[tokio::test]
+async fn hover_and_definition_hydrate_the_same_declaration() {
+    let (dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[("dep.h", "int shared_table[4];\n")],
+        "main.c",
+        "#include \"dep.h\"\nint use(void) { return shared_table/*cursor*/[0]; }\n",
+    )
+    .await;
+
+    let definition = service
+        .inner()
+        .goto_definition(goto_definition_params(uri.clone(), line, character))
+        .await
+        .expect("definition request")
+        .expect("definition response");
+    let locations = definition_locations(definition);
+    assert_eq!(locations.len(), 1);
+    let dep_uri = Url::from_file_path(dir.path().join("dep.h")).expect("dep uri");
+    assert_eq!(locations[0].uri, dep_uri);
+
+    let hover = service
+        .inner()
+        .hover(hover_params(uri, line, character))
+        .await
+        .expect("hover request")
+        .expect("hover response");
+    let hover = hover_text(hover.contents);
+    assert!(
+        hover.contains("// In dep.h"),
+        "hover and definition must hydrate the same declaration: {hover}"
+    );
+    assert!(hover.contains("shared_table"), "{hover}");
+    assert!(
+        !hover.contains("suppressed"),
+        "a unique entity must not report suppressed alternatives: {hover}"
+    );
+}
+
+#[tokio::test]
+async fn suppressed_same_name_candidates_stay_visible_as_evidence_and_escape_hatch() {
+    let (dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[
+            ("dep.h", "int limit = 10;\n"),
+            ("distant_a.c", "static int limit = 1;\n"),
+            ("distant_b.c", "static int limit = 2;\n"),
+        ],
+        "main.c",
+        "#include \"dep.h\"\nint use(void) { return limit/*cursor*/; }\n",
+    )
+    .await;
+
+    let definition = service
+        .inner()
+        .goto_definition(goto_definition_params(uri.clone(), line, character))
+        .await
+        .expect("definition request")
+        .expect("definition response");
+    let locations = definition_locations(definition);
+    let dep_uri = Url::from_file_path(dir.path().join("dep.h")).expect("dep uri");
+    assert_eq!(
+        locations.len(),
+        1,
+        "lower-tier same-name groups are suppressed"
+    );
+    assert_eq!(locations[0].uri, dep_uri);
+
+    let hover = service
+        .inner()
+        .hover(hover_params(uri.clone(), line, character))
+        .await
+        .expect("hover request")
+        .expect("hover response");
+    let hover = hover_text(hover.contents);
+    assert!(hover.contains("// In dep.h"), "{hover}");
+    assert!(
+        hover.contains("2 same-name candidate(s) outside the focused result"),
+        "suppression must stay visible as hover evidence: {hover}"
+    );
+    assert!(hover.contains("matches: exact"), "{hover}");
+    assert!(!hover.contains("distant_a.c"), "{hover}");
+
+    let response = service
+        .inner()
+        .execute_command(ExecuteCommandParams {
+            command: super::POSSIBLE_TARGETS_LSP_COMMAND.to_string(),
+            arguments: vec![serde_json::json!({
+                "uri": uri,
+                "line": line,
+                "character": character,
+            })],
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .expect("possible targets command")
+        .expect("possible targets response");
+    assert_eq!(response["coverage"]["disposition"], "exact");
+    assert_eq!(response["coverage"]["alternativeCount"], 2);
+    let items = response["items"].as_array().expect("items");
+    let suppressed: Vec<_> = items
+        .iter()
+        .filter(|item| item["focused"] == false)
+        .filter_map(|item| item["location"]["uri"].as_str())
+        .collect();
+    assert_eq!(
+        suppressed.len(),
+        2,
+        "the escape hatch must list every suppressed candidate: {items:?}"
+    );
+    assert!(suppressed.iter().any(|uri| uri.contains("distant_a.c")));
+    assert!(suppressed.iter().any(|uri| uri.contains("distant_b.c")));
+    assert!(items.iter().any(|item| item["focused"] == true
+        && item["location"]["uri"]
+            .as_str()
+            .is_some_and(|uri| uri.contains("dep.h"))));
+}
+
+#[tokio::test]
+async fn possible_targets_lists_semantic_groups_suppressed_behind_the_focused_callable() {
+    let (_dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[
+            ("api.h", "int helper(int value);\n"),
+            (
+                "api.c",
+                "#include \"api.h\"\nint helper(int value) { return value; }\n",
+            ),
+            ("distant.c", "static int helper(int value) { return 0; }\n"),
+        ],
+        "main.c",
+        "#include \"api.h\"\nint run(void) { return helper/*cursor*/(1); }\n",
+    )
+    .await;
+
+    let response = service
+        .inner()
+        .execute_command(ExecuteCommandParams {
+            command: super::POSSIBLE_TARGETS_LSP_COMMAND.to_string(),
+            arguments: vec![serde_json::json!({
+                "uri": uri,
+                "line": line,
+                "character": character,
+            })],
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .expect("possible targets command")
+        .expect("possible targets response");
+    assert_eq!(response["coverage"]["alternativeCount"], 1);
+    let items = response["items"].as_array().expect("items");
+    assert!(
+        items.iter().any(|item| item["focused"] == false
+            && item["location"]["uri"]
+                .as_str()
+                .is_some_and(|uri| uri.contains("distant.c"))),
+        "an internal-linkage same-name group suppressed by tier focus must stay inspectable: {items:?}"
+    );
+    assert!(items.iter().any(|item| item["focused"] == true
+        && item["location"]["uri"]
+            .as_str()
+            .is_some_and(|uri| uri.contains("api.c"))));
+}
+
+#[tokio::test]
 async fn label_navigation_is_scoped_to_the_enclosing_function() {
     let (_dir, service, uri, line, character) = indexed_backend_with_open_doc(
         &[("other.c", "int same(void) { return 1; }\n")],
