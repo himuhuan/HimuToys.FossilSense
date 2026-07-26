@@ -268,12 +268,9 @@ fn partial_call_target_before(bytes: &[u8], open_paren: usize) -> Option<Partial
     let mut qualified_start = start;
     let mut cursor = start;
     let mut has_qualifier = false;
-    loop {
-        let Some(second_colon) =
-            previous_non_ws_index(bytes, cursor).filter(|index| bytes[*index] == b':')
-        else {
-            break;
-        };
+    while let Some(second_colon) =
+        previous_non_ws_index(bytes, cursor).filter(|index| bytes[*index] == b':')
+    {
         let Some(first_colon) =
             previous_non_ws_index(bytes, second_colon).filter(|index| bytes[*index] == b':')
         else {

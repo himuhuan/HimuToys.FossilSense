@@ -196,7 +196,7 @@ impl CompletionHistoryStore {
         self.data.entries.push(event);
         self.data
             .entries
-            .sort_by(|left, right| right.accepted_at.cmp(&left.accepted_at));
+            .sort_by_key(|entry| std::cmp::Reverse(entry.accepted_at));
         self.data.entries.truncate(MAX_HISTORY_ENTRIES);
         self.prepare_persist()
     }

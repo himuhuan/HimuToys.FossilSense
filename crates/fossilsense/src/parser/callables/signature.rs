@@ -368,7 +368,7 @@ pub(super) fn parameter_shape_without_names(
         }
         stack.extend(named_children(node));
     }
-    removals.sort_unstable_by(|left, right| right.0.cmp(&left.0));
+    removals.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
     removals.dedup();
     for (start, end) in removals {
         if start <= end && end <= value.len() {
