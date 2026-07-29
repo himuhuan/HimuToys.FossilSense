@@ -52,9 +52,423 @@ fn test_backend_service() -> LspService<super::Backend> {
         debug_candidate_reasons: AtomicBool::new(false),
         perf_logging_enabled: AtomicBool::new(false),
         config_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        workspace_semantics_bootstrap: Arc::new(tokio::sync::Mutex::new(Default::default())),
+        external_source_roots_cache: Arc::new(tokio::sync::Mutex::new(Default::default())),
         resource_monitor_shutdown: Arc::new(tokio::sync::Notify::new()),
     });
     service
+}
+
+fn empty_workspace_semantics(
+    root: &std::path::Path,
+) -> Arc<super::workspace_config::PublishedWorkspaceSemantics> {
+    Arc::new(super::workspace_config::PublishedWorkspaceSemantics::empty(
+        root,
+    ))
+}
+
+async fn current_test_workspace_semantics(
+    service: &LspService<super::Backend>,
+    root: &std::path::Path,
+) -> Arc<super::workspace_config::PublishedWorkspaceSemantics> {
+    let include_paths = service.inner().include_paths.lock().await.clone();
+    let go_module_paths = service.inner().go_module_paths.lock().await.clone();
+    Arc::new(
+        super::workspace_config::PublishedWorkspaceSemantics::load_current(
+            root,
+            &include_paths,
+            &go_module_paths,
+        ),
+    )
+}
+
+#[tokio::test]
+async fn first_request_bootstraps_workspace_configuration_before_index_publication() {
+    let service = test_backend_service();
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().join("workspace");
+    let include_root = dir.path().join("sdk");
+    std::fs::create_dir_all(root.join("legacy")).expect("workspace");
+    std::fs::create_dir_all(&include_root).expect("include root");
+    std::fs::write(
+        root.join("fossilsense.json"),
+        serde_json::json!({
+            "includePaths": [crate::pathing::normalize_abs_path(&include_root)],
+            "languageOverrides": [{
+                "glob": "legacy/**/*.h",
+                "language": "go"
+            }]
+        })
+        .to_string(),
+    )
+    .expect("config");
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(root.clone());
+
+    let context = service.inner().request_context_for_root(root.clone()).await;
+
+    assert_eq!(
+        context
+            .engine
+            .workspace_semantics
+            .language_for_path(&root.join("legacy/api.h")),
+        crate::config::SourceLanguage::Go
+    );
+    assert!(context
+        .engine
+        .workspace_semantics
+        .external_roots
+        .normalized_include_roots()
+        .contains(&crate::pathing::normalize_abs_path(&include_root)));
+    assert_eq!(
+        context.engine.semantic_generation,
+        crate::call_model::SemanticGeneration::MISSING
+    );
+    assert!(context.engine.name_table.is_none());
+}
+
+#[tokio::test]
+async fn concurrent_first_requests_share_workspace_configuration_bootstrap() {
+    let service = test_backend_service();
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().join("workspace");
+    std::fs::create_dir_all(&root).expect("workspace");
+    std::fs::write(
+        root.join("fossilsense.json"),
+        r#"{"languageOverrides":[{"glob":"legacy/**/*.h","language":"go"}]}"#,
+    )
+    .expect("config");
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(root.clone());
+
+    let started = Arc::new(tokio::sync::Barrier::new(2));
+    let resume = Arc::new(tokio::sync::Barrier::new(2));
+    service
+        .inner()
+        .set_workspace_semantics_bootstrap_barriers_for_test(&root, started.clone(), resume.clone())
+        .await;
+
+    let first_root = root.clone();
+    let second_root = root.clone();
+    let release_bootstrap = async move {
+        started.wait().await;
+        tokio::task::yield_now().await;
+        resume.wait().await;
+    };
+    let (first, second, ()) = tokio::join!(
+        service.inner().request_context_for_root(first_root),
+        service.inner().request_context_for_root(second_root),
+        release_bootstrap,
+    );
+
+    assert!(
+        Arc::ptr_eq(&first.engine, &second.engine),
+        "concurrent first requests must share the same configuration-only snapshot"
+    );
+    assert_eq!(
+        service
+            .inner()
+            .workspace_semantics_bootstrap_preparation_count_for_test(&root)
+            .await,
+        1,
+        "concurrent first requests must prepare workspace configuration only once"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_first_requests_share_failed_workspace_configuration_bootstrap() {
+    let service = test_backend_service();
+    let dir = tempdir().expect("tempdir");
+    let missing_root = dir.path().join("missing-workspace");
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(missing_root.clone());
+
+    let started = Arc::new(tokio::sync::Barrier::new(2));
+    let resume = Arc::new(tokio::sync::Barrier::new(2));
+    service
+        .inner()
+        .set_workspace_semantics_bootstrap_barriers_for_test(
+            &missing_root,
+            started.clone(),
+            resume.clone(),
+        )
+        .await;
+
+    let first_root = missing_root.clone();
+    let second_root = missing_root.clone();
+    let release_bootstrap = async move {
+        started.wait().await;
+        tokio::task::yield_now().await;
+        resume.wait().await;
+    };
+    let (_, _, ()) = tokio::join!(
+        service.inner().request_context_for_root(first_root),
+        service.inner().request_context_for_root(second_root),
+        release_bootstrap,
+    );
+
+    assert_eq!(
+        service
+            .inner()
+            .workspace_semantics_bootstrap_preparation_count_for_test(&missing_root)
+            .await,
+        1,
+        "concurrent waiters must share a failed bootstrap attempt instead of retrying serially"
+    );
+
+    std::fs::create_dir_all(missing_root.join("legacy")).expect("recovered workspace");
+    std::fs::write(
+        missing_root.join("fossilsense.json"),
+        r#"{"languageOverrides":[{"glob":"legacy/**/*.h","language":"go"}]}"#,
+    )
+    .expect("recovered config");
+    let recovered = service
+        .inner()
+        .request_context_for_root(missing_root.clone())
+        .await;
+    assert_eq!(
+        service
+            .inner()
+            .workspace_semantics_bootstrap_preparation_count_for_test(&missing_root)
+            .await,
+        2,
+        "a later request must retry after the shared failed attempt"
+    );
+    assert_eq!(
+        recovered
+            .engine
+            .workspace_semantics
+            .language_for_path(&missing_root.join("legacy/api.h")),
+        crate::config::SourceLanguage::Go
+    );
+}
+
+#[tokio::test]
+async fn cancelling_first_request_does_not_abandon_workspace_configuration_bootstrap() {
+    let service = test_backend_service();
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().join("workspace");
+    std::fs::create_dir_all(root.join("legacy")).expect("workspace");
+    std::fs::write(
+        root.join("fossilsense.json"),
+        r#"{"languageOverrides":[{"glob":"legacy/**/*.h","language":"go"}]}"#,
+    )
+    .expect("config");
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(root.clone());
+
+    let started = Arc::new(tokio::sync::Barrier::new(2));
+    let resume = Arc::new(tokio::sync::Barrier::new(2));
+    service
+        .inner()
+        .set_workspace_semantics_bootstrap_barriers_for_test(&root, started.clone(), resume.clone())
+        .await;
+
+    let mut first = Box::pin(service.inner().request_context_for_root(root.clone()));
+    tokio::select! {
+        _ = started.wait() => {}
+        _ = &mut first => panic!("bootstrap unexpectedly completed before cancellation"),
+    }
+    drop(first);
+
+    let release = tokio::time::timeout(std::time::Duration::from_secs(2), resume.wait());
+    let second = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        service.inner().request_context_for_root(root.clone()),
+    );
+    let (released, second) = tokio::join!(release, second);
+    assert!(
+        released.is_ok(),
+        "bootstrap owner must survive cancellation of the first request"
+    );
+    let second = second.expect("second request must observe bootstrap completion");
+    assert_eq!(
+        second
+            .engine
+            .workspace_semantics
+            .language_for_path(&root.join("legacy/api.h")),
+        crate::config::SourceLanguage::Go
+    );
+}
+
+#[tokio::test]
+async fn workspace_remove_readd_cannot_publish_a_stale_configuration_bootstrap() {
+    let service = test_backend_service();
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().join("workspace");
+    std::fs::create_dir_all(root.join("legacy")).expect("workspace");
+    std::fs::write(
+        root.join("fossilsense.json"),
+        r#"{"languageOverrides":[{"glob":"legacy/**/*.h","language":"go"}]}"#,
+    )
+    .expect("config");
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(root.clone());
+
+    let finalize_started = Arc::new(tokio::sync::Barrier::new(2));
+    let finalize_resume = Arc::new(tokio::sync::Barrier::new(2));
+    service
+        .inner()
+        .set_workspace_semantics_bootstrap_finalize_barriers_for_test(
+            &root,
+            finalize_started.clone(),
+            finalize_resume.clone(),
+        )
+        .await;
+
+    let mut first = Box::pin(service.inner().request_context_for_root(root.clone()));
+    tokio::select! {
+        _ = finalize_started.wait() => {}
+        _ = &mut first => panic!("bootstrap unexpectedly published before finalization barrier"),
+    }
+
+    let uri = Url::from_directory_path(&root).expect("workspace uri");
+    let folder = WorkspaceFolder {
+        uri,
+        name: "workspace".into(),
+    };
+    let update = service
+        .inner()
+        .did_change_workspace_folders(DidChangeWorkspaceFoldersParams {
+            event: WorkspaceFoldersChangeEvent {
+                added: vec![folder.clone()],
+                removed: vec![folder],
+            },
+        });
+    let release = async move {
+        tokio::task::yield_now().await;
+        finalize_resume.wait().await;
+    };
+    let ((), ()) = tokio::join!(update, release);
+    tokio::time::timeout(std::time::Duration::from_secs(2), &mut first)
+        .await
+        .expect("stale bootstrap waiter must be released");
+
+    assert!(
+        service
+            .inner()
+            .session
+            .cache
+            .current_engine_snapshot(&root)
+            .await
+            .is_none(),
+        "root cleanup must remove a snapshot published by an older bootstrap attempt"
+    );
+}
+
+#[tokio::test]
+async fn workspace_remove_readd_blocks_new_bootstrap_until_engine_cleanup_finishes() {
+    let service = test_backend_service();
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().join("workspace");
+    std::fs::create_dir_all(root.join("legacy")).expect("workspace");
+    std::fs::write(
+        root.join("fossilsense.json"),
+        r#"{"languageOverrides":[{"glob":"legacy/**/*.h","language":"go"}]}"#,
+    )
+    .expect("config");
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(root.clone());
+
+    let removal_started = Arc::new(tokio::sync::Notify::new());
+    let removal_resume = Arc::new(tokio::sync::Notify::new());
+    let next_attempt_started = Arc::new(tokio::sync::Notify::new());
+    service
+        .inner()
+        .set_workspace_semantics_removal_barriers_for_test(
+            &root,
+            removal_started.clone(),
+            removal_resume.clone(),
+        )
+        .await;
+    service
+        .inner()
+        .set_workspace_semantics_bootstrap_attempt_started_for_test(
+            &root,
+            next_attempt_started.clone(),
+        )
+        .await;
+
+    let uri = Url::from_directory_path(&root).expect("workspace uri");
+    let folder = WorkspaceFolder {
+        uri,
+        name: "workspace".into(),
+    };
+    let mut update = Box::pin(service.inner().did_change_workspace_folders(
+        DidChangeWorkspaceFoldersParams {
+            event: WorkspaceFoldersChangeEvent {
+                added: vec![folder.clone()],
+                removed: vec![folder],
+            },
+        },
+    ));
+    tokio::select! {
+        _ = removal_started.notified() => {}
+        _ = &mut update => panic!("workspace cleanup unexpectedly skipped its test barrier"),
+    }
+
+    let mut request = Box::pin(service.inner().request_context_for_root(root.clone()));
+    let entered_during_cleanup =
+        tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            tokio::select! {
+                _ = next_attempt_started.notified() => {}
+                _ = &mut request => panic!("request unexpectedly completed during root cleanup"),
+            }
+        })
+        .await;
+    assert!(
+        entered_during_cleanup.is_err(),
+        "a new bootstrap attempt must not enter between invalidation and engine cleanup"
+    );
+
+    removal_resume.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(2), &mut update)
+        .await
+        .expect("workspace cleanup");
+    let context = tokio::time::timeout(std::time::Duration::from_secs(2), &mut request)
+        .await
+        .expect("request must retry after cleanup");
+    assert_eq!(
+        context
+            .engine
+            .workspace_semantics
+            .language_for_path(&root.join("legacy/api.h")),
+        crate::config::SourceLanguage::Go
+    );
+    assert!(
+        service
+            .inner()
+            .session
+            .cache
+            .current_engine_snapshot(&root)
+            .await
+            .is_some(),
+        "the post-cleanup attempt must retain its published snapshot"
+    );
 }
 
 fn completion_params(uri: Url, line: u32, character: u32) -> CompletionParams {
@@ -324,6 +738,7 @@ async fn workspace_folder_removal_drops_root_and_published_snapshot() {
             indexed_files: None,
             project_context: None,
             call_read_handle: None,
+            workspace_semantics: empty_workspace_semantics(&root),
             degraded: Default::default(),
         })
         .await;
@@ -405,6 +820,7 @@ async fn name_index_compaction_publishes_only_for_the_expected_engine_epoch() {
             indexed_files: None,
             project_context: None,
             call_read_handle: None,
+            workspace_semantics: empty_workspace_semantics(&root),
             degraded: Default::default(),
         })
         .await;
@@ -726,6 +1142,23 @@ async fn clean_indexed_language_override_keeps_its_family_for_semantic_queries()
         .expect("clean document");
     assert!(!clean.needs_relation_overlay(generation));
 
+    // Configuration N+1 may be loaded while generation N is still serving.
+    // Semantic requests must keep using N's published language resolver until
+    // the replacement index is successfully published.
+    std::fs::write(dir.path().join("fossilsense.json"), "{}").expect("generation N+1 config");
+    service.inner().config_cache.lock().await.remove(dir.path());
+    let still_published = service
+        .inner()
+        .request_context_for_root(dir.path().to_path_buf())
+        .await;
+    assert_eq!(
+        still_published
+            .engine
+            .workspace_semantics
+            .language_for_uri(&uri),
+        crate::config::SourceLanguage::Go
+    );
+
     let definition = service
         .inner()
         .goto_definition(goto_definition_params(uri.clone(), line, character))
@@ -736,6 +1169,146 @@ async fn clean_indexed_language_override_keeps_its_family_for_semantic_queries()
     assert_eq!(locations.len(), 1);
     assert_eq!(locations[0].uri, uri);
     assert_eq!(locations[0].range.start.line, 1);
+}
+
+#[tokio::test]
+async fn published_language_snapshot_controls_tokens_and_symbols_during_config_rebuild() {
+    let config = r#"{
+      "languageOverrides": [
+        { "glob": "legacy/**/*.h", "language": "go" }
+      ]
+    }"#;
+    let source = "package legacy\ntype Device/*cursor*/ struct { Value int }\n";
+    let (dir, service, uri, _line, _character) =
+        indexed_backend_with_open_doc(&[("fossilsense.json", config)], "legacy/api.h", source)
+            .await;
+    std::fs::write(dir.path().join("fossilsense.json"), "{}").expect("generation N+1 config");
+    service.inner().config_cache.lock().await.remove(dir.path());
+    service
+        .inner()
+        .session
+        .documents
+        .clear_live_state(&uri)
+        .await;
+
+    service
+        .inner()
+        .compute_semantic_tokens(&uri, None)
+        .await
+        .expect("semantic tokens");
+    assert!(service
+        .inner()
+        .session
+        .documents
+        .cached_live_parse(
+            &uri,
+            1,
+            crate::config::SourceLanguage::Go,
+            crate::parser::ParseFacts::COLOR_LIVE,
+        )
+        .await
+        .is_some());
+
+    service
+        .inner()
+        .session
+        .documents
+        .clear_live_state(&uri)
+        .await;
+    let symbols = service
+        .inner()
+        .document_symbol(DocumentSymbolParams {
+            text_document: TextDocumentIdentifier { uri },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .expect("document symbols")
+        .expect("published-language symbols");
+    let names = match symbols {
+        DocumentSymbolResponse::Nested(symbols) => symbols
+            .into_iter()
+            .map(|symbol| symbol.name)
+            .collect::<Vec<_>>(),
+        DocumentSymbolResponse::Flat(symbols) => symbols
+            .into_iter()
+            .map(|symbol| symbol.name)
+            .collect::<Vec<_>>(),
+    };
+    assert!(names.iter().any(|name| name == "Device"), "{names:?}");
+}
+
+#[tokio::test]
+async fn include_navigation_uses_published_roots_during_config_rebuild() {
+    let dir = tempdir().expect("root");
+    let root = dir.path().join("workspace");
+    let old_include = dir.path().join("old-include");
+    let new_include = dir.path().join("new-include");
+    for path in [&root, &old_include, &new_include] {
+        fs::create_dir_all(path).expect("directory");
+    }
+    fs::write(old_include.join("api.h"), "int old_api;\n").expect("old header");
+    fs::write(new_include.join("api.h"), "int new_api;\n").expect("new header");
+    fs::write(root.join("main.c"), "#include \"api.h\"\n").expect("source");
+    fs::write(
+        root.join("fossilsense.json"),
+        serde_json::json!({
+            "includePaths": [crate::pathing::normalize_abs_path(&old_include)]
+        })
+        .to_string(),
+    )
+    .expect("generation N config");
+    crate::indexer::index_workspace(
+        &root,
+        crate::indexer::IndexOptions {
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("index");
+    let service = test_backend_service();
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(root.clone());
+    service
+        .inner()
+        .session
+        .cache
+        .publish_full_index(&service.inner().client, root.clone())
+        .await
+        .expect("publish");
+    fs::write(
+        root.join("fossilsense.json"),
+        serde_json::json!({
+            "includePaths": [crate::pathing::normalize_abs_path(&new_include)]
+        })
+        .to_string(),
+    )
+    .expect("generation N+1 config");
+    service.inner().config_cache.lock().await.remove(&root);
+    fs::remove_file(crate::pathing::default_index_path(&root).expect("db path"))
+        .expect("remove database");
+
+    let result = service
+        .inner()
+        .goto_include(
+            &Url::from_file_path(root.join("main.c")).expect("source uri"),
+            crate::includes::IncludeForm::Quote,
+            "api.h".into(),
+        )
+        .await
+        .expect("include navigation")
+        .expect("published include root");
+    let locations = definition_locations(result);
+    assert_eq!(locations.len(), 1);
+    assert_eq!(
+        locations[0].uri,
+        Url::from_file_path(old_include.join("api.h")).expect("old header uri")
+    );
 }
 
 #[tokio::test]
@@ -1330,6 +1903,71 @@ async fn live_parse_language_reuses_cached_workspace_resolver_until_invalidation
         service.inner().source_language_for_path(&header).await,
         crate::config::SourceLanguage::Cpp,
         "explicit invalidation must reload the derived resolver"
+    );
+}
+
+#[tokio::test]
+async fn explicit_rebuild_refreshes_external_root_authorization_without_watcher() {
+    let service = test_backend_service();
+    let dir = tempdir().expect("root");
+    let root = dir.path().join("workspace");
+    let old_module = dir.path().join("old-module");
+    let new_module = dir.path().join("new-module");
+    for path in [&root, &old_module, &new_module] {
+        fs::create_dir_all(path).expect("directory");
+    }
+    let old_source = old_module.join("old.go");
+    let new_source = new_module.join("new.go");
+    fs::write(&old_source, "package old\n").expect("old source");
+    fs::write(&new_source, "package new\n").expect("new source");
+    fs::write(
+        root.join("fossilsense.json"),
+        serde_json::json!({
+            "goModulePaths": [crate::pathing::normalize_abs_path(&old_module)]
+        })
+        .to_string(),
+    )
+    .expect("old config");
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(root.clone());
+
+    let old_roots = service
+        .inner()
+        .authorized_external_source_roots(&root)
+        .await;
+    assert!(old_roots
+        .authorized_path(&old_source, crate::semantic_model::SemanticFamily::Go)
+        .is_some());
+
+    fs::write(
+        root.join("fossilsense.json"),
+        serde_json::json!({
+            "goModulePaths": [crate::pathing::normalize_abs_path(&new_module)]
+        })
+        .to_string(),
+    )
+    .expect("new config");
+    service.inner().spawn_index_roots(Some(true)).await;
+
+    let refreshed = service
+        .inner()
+        .authorized_external_source_roots(&root)
+        .await;
+    assert!(
+        refreshed
+            .authorized_path(&new_source, crate::semantic_model::SemanticFamily::Go)
+            .is_some(),
+        "explicit rebuild must reload external roots from disk"
+    );
+    assert!(
+        refreshed
+            .authorized_path(&old_source, crate::semantic_model::SemanticFamily::Go)
+            .is_none(),
+        "a removed root must not remain authorized after explicit rebuild"
     );
 }
 
@@ -2734,6 +3372,272 @@ async fn cache_ledger_publishes_full_and_dirty_read_models_with_generations() {
 }
 
 #[tokio::test]
+async fn dirty_scheduler_keeps_published_configuration_until_full_rebuild() {
+    let root = tempdir().expect("root");
+    let root_path = root.path().to_path_buf();
+    write_workspace_file(
+        root.path(),
+        "fossilsense.json",
+        r#"{"languageOverrides":[{"glob":"legacy/**/*.h","language":"go"}]}"#,
+    );
+    write_workspace_file(
+        root.path(),
+        "legacy/api.h",
+        "package legacy\nfunc PublishedGo() {}\n",
+    );
+    write_workspace_file(root.path(), "other.c", "int old_dirty_name;\n");
+    crate::indexer::index_workspace(
+        root.path(),
+        crate::indexer::IndexOptions {
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("initial index");
+
+    let service = test_backend_service();
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(root_path.clone());
+    service
+        .inner()
+        .session
+        .cache
+        .publish_full_index(&service.inner().client, root_path.clone())
+        .await
+        .expect("publish generation N");
+
+    write_workspace_file(root.path(), "fossilsense.json", "{}");
+    write_workspace_file(root.path(), "other.c", "int new_dirty_name;\n");
+    service
+        .inner()
+        .run_dirty_index_for_test(vec![super::RootDirtyChange {
+            root: root_path.clone(),
+            rel_path: "other.c".into(),
+            change: crate::indexer::DirtyFileChange {
+                absolute_path: root.path().join("other.c"),
+                kind: crate::indexer::DirtyFileKind::Upsert,
+            },
+        }])
+        .await;
+
+    let context = service
+        .inner()
+        .request_context_for_root(root_path.clone())
+        .await;
+    assert_eq!(context.engine.semantic_generation.0, 2);
+    assert_eq!(
+        context
+            .engine
+            .workspace_semantics
+            .language_for_path(&root.path().join("legacy/api.h")),
+        crate::config::SourceLanguage::Go,
+        "a dirty source event must not adopt a newer unindexed configuration"
+    );
+    assert!(context
+        .engine
+        .name_table
+        .as_ref()
+        .expect("name table")
+        .search_ranked("new_dirty_name", 8)
+        .iter()
+        .any(|hit| hit.name == "new_dirty_name"));
+}
+
+#[tokio::test]
+async fn dirty_cache_publication_fully_hydrates_across_a_generation_gap() {
+    let root = tempdir().expect("root");
+    let root_path = root.path().to_path_buf();
+    write_workspace_file(root.path(), "a.c", "int alpha_old;\n");
+    write_workspace_file(root.path(), "b.c", "int beta_old;\n");
+    write_workspace_file(root.path(), "new.h", "int from_new_header;\n");
+    crate::indexer::index_workspace(
+        root.path(),
+        crate::indexer::IndexOptions {
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("generation 1 index");
+
+    let service = test_backend_service();
+    let semantics = current_test_workspace_semantics(&service, root.path()).await;
+    service
+        .inner()
+        .session
+        .cache
+        .publish_full_index_with_semantics(
+            &service.inner().client,
+            root_path.clone(),
+            semantics.clone(),
+        )
+        .await
+        .expect("publish generation 1");
+
+    write_workspace_file(
+        root.path(),
+        "b.c",
+        "#include \"new.h\"\nint beta_from_generation_2;\n",
+    );
+    write_workspace_file(root.path(), "c.c", "int gamma_from_generation_2;\n");
+    crate::indexer::index_dirty_files(
+        root.path(),
+        vec![
+            crate::indexer::DirtyFileChange {
+                absolute_path: root.path().join("b.c"),
+                kind: crate::indexer::DirtyFileKind::Upsert,
+            },
+            crate::indexer::DirtyFileChange {
+                absolute_path: root.path().join("c.c"),
+                kind: crate::indexer::DirtyFileKind::Upsert,
+            },
+        ],
+        crate::indexer::IndexOptions::default(),
+        |_| {},
+    )
+    .expect("commit generation 2 without cache publication");
+
+    write_workspace_file(root.path(), "a.c", "int alpha_from_generation_3;\n");
+    crate::indexer::index_dirty_files(
+        root.path(),
+        vec![crate::indexer::DirtyFileChange {
+            absolute_path: root.path().join("a.c"),
+            kind: crate::indexer::DirtyFileKind::Upsert,
+        }],
+        crate::indexer::IndexOptions::default(),
+        |_| {},
+    )
+    .expect("commit generation 3");
+
+    let report = service
+        .inner()
+        .session
+        .cache
+        .publish_dirty_index_with_semantics(
+            &service.inner().client,
+            root_path.clone(),
+            &["a.c".into()],
+            &["a.c".into()],
+            semantics,
+        )
+        .await
+        .expect("gap publication");
+    assert_eq!(report.semantic_generation.0, 3);
+
+    let context = service.inner().request_context_for_root(root_path).await;
+    let names = context.engine.name_table.as_ref().expect("name table");
+    for expected in [
+        "alpha_from_generation_3",
+        "beta_from_generation_2",
+        "gamma_from_generation_2",
+    ] {
+        assert!(
+            names
+                .search_ranked(expected, 8)
+                .iter()
+                .any(|hit| hit.name == expected),
+            "full hydration after a gap must include {expected}"
+        );
+    }
+    assert_eq!(
+        context
+            .engine
+            .indexed_files
+            .as_ref()
+            .expect("indexed files")
+            .len(),
+        4
+    );
+    assert!(context
+        .engine
+        .reach_graph
+        .as_ref()
+        .expect("reach graph")
+        .reachable("b.c")
+        .files
+        .contains("new.h"));
+}
+
+#[tokio::test]
+async fn dirty_scheduler_promotes_a_generation_gap_to_full_rebuild() {
+    let root = tempdir().expect("root");
+    let root_path = root.path().to_path_buf();
+    write_workspace_file(root.path(), "a.c", "int alpha_old;\n");
+    write_workspace_file(root.path(), "b.c", "int beta_old;\n");
+    crate::indexer::index_workspace(
+        root.path(),
+        crate::indexer::IndexOptions {
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("generation 1 index");
+
+    let service = test_backend_service();
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(root_path.clone());
+    service
+        .inner()
+        .session
+        .cache
+        .publish_full_index(&service.inner().client, root_path.clone())
+        .await
+        .expect("publish generation 1");
+
+    write_workspace_file(
+        root.path(),
+        "b.c",
+        "int beta_from_unpublished_generation;\n",
+    );
+    crate::indexer::index_dirty_files(
+        root.path(),
+        vec![crate::indexer::DirtyFileChange {
+            absolute_path: root.path().join("b.c"),
+            kind: crate::indexer::DirtyFileKind::Upsert,
+        }],
+        crate::indexer::IndexOptions::default(),
+        |_| {},
+    )
+    .expect("commit generation 2 without publishing");
+    write_workspace_file(root.path(), "a.c", "int alpha_after_gap;\n");
+
+    service
+        .inner()
+        .run_dirty_index_for_test(vec![super::RootDirtyChange {
+            root: root_path.clone(),
+            rel_path: "a.c".into(),
+            change: crate::indexer::DirtyFileChange {
+                absolute_path: root.path().join("a.c"),
+                kind: crate::indexer::DirtyFileKind::Upsert,
+            },
+        }])
+        .await;
+
+    let context = service.inner().request_context_for_root(root_path).await;
+    assert_eq!(context.engine.semantic_generation.0, 3);
+    let names = context.engine.name_table.as_ref().expect("name table");
+    for expected in ["alpha_after_gap", "beta_from_unpublished_generation"] {
+        assert!(
+            names
+                .search_ranked(expected, 8)
+                .iter()
+                .any(|hit| hit.name == expected),
+            "full rebuild after a generation gap must include {expected}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn marker_only_refresh_retags_names_publishes_epoch_and_clears_memos() {
     let root = tempdir().expect("root");
     let root_path = root.path().to_path_buf();
@@ -2855,6 +3759,75 @@ async fn marker_only_refresh_retags_names_publishes_epoch_and_clears_memos() {
         .expect("available")
         .projects()
         .is_empty());
+}
+
+#[tokio::test]
+async fn marker_refresh_uses_published_workspace_config_not_newer_disk_config() {
+    let root = tempdir().expect("root");
+    let root_path = root.path().to_path_buf();
+    write_workspace_file(root.path(), "fossilsense.json", r#"{"exclude":["app"]}"#);
+    write_workspace_file(root.path(), "app/Makefile", "all:\n");
+    crate::indexer::index_workspace(
+        root.path(),
+        crate::indexer::IndexOptions {
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("index");
+    let service = test_backend_service();
+    service
+        .inner()
+        .session
+        .cache
+        .publish_full_index(&service.inner().client, root_path.clone())
+        .await
+        .expect("publish");
+    let published = service
+        .inner()
+        .session
+        .request_context_for_root(root_path.clone())
+        .await;
+    assert!(published
+        .engine
+        .project_context
+        .as_ref()
+        .expect("project context")
+        .projects()
+        .is_empty());
+
+    write_workspace_file(root.path(), "fossilsense.json", "{}");
+    let count = service
+        .inner()
+        .session
+        .cache
+        .refresh_project_context(&service.inner().client, root_path.clone())
+        .await
+        .expect("marker refresh");
+    assert_eq!(
+        count, 0,
+        "marker refresh must retain generation N's exclusion until N+1 publishes"
+    );
+    let refreshed = service
+        .inner()
+        .session
+        .request_context_for_root(root_path)
+        .await;
+    assert!(refreshed
+        .engine
+        .project_context
+        .as_ref()
+        .expect("project context")
+        .projects()
+        .is_empty());
+    assert!(refreshed
+        .engine
+        .workspace_semantics
+        .workspace
+        .exclude
+        .iter()
+        .any(|entry| entry == "app"));
 }
 
 #[tokio::test]
@@ -3334,6 +4307,7 @@ async fn project_context_commands_validate_selection_and_outside_uri_has_no_auto
             indexed_files: current.indexed_files.clone(),
             project_context: None,
             call_read_handle: None,
+            workspace_semantics: current.workspace_semantics.clone(),
             degraded,
         })
         .await;
@@ -3887,6 +4861,12 @@ async fn candidate_overlay_cache_includes_dirty_external_header_with_normalized_
         .inner()
         .candidate_overlay_snapshot(&root, generation, None, None)
         .await;
+    let first_root_mapping = service
+        .inner()
+        .authorized_external_source_roots(&root)
+        .await;
+    let first_authorization_misses = first_root_mapping.authorization_miss_count_for_test();
+    assert_eq!(first_authorization_misses, 1);
     let external_path = crate::pathing::normalize_abs_path(&header);
     assert!(first.shadows(&external_path));
     assert_eq!(
@@ -3912,13 +4892,26 @@ async fn candidate_overlay_cache_includes_dirty_external_header_with_normalized_
     service
         .inner()
         .session
-        .change_document(uri, 2, "int newer_vendor(void);\n".into())
+        .change_document(uri.clone(), 2, "int newer_vendor(void);\n".into())
         .await;
     let newer = service
         .inner()
         .candidate_overlay_snapshot(&root, generation, None, None)
         .await;
+    let newer_root_mapping = service
+        .inner()
+        .authorized_external_source_roots(&root)
+        .await;
     assert!(!Arc::ptr_eq(&first, &newer));
+    assert!(
+        Arc::ptr_eq(&first_root_mapping, &newer_root_mapping),
+        "a new overlay epoch must reuse validated external-root mappings"
+    );
+    assert_eq!(
+        newer_root_mapping.authorization_miss_count_for_test(),
+        first_authorization_misses,
+        "didChange must not repeat filesystem authorization for the same external URI"
+    );
     assert_eq!(
         newer.source_text(&external_path),
         Some("int newer_vendor(void);\n")
@@ -3931,6 +4924,829 @@ async fn candidate_overlay_cache_includes_dirty_external_header_with_normalized_
             .candidate_overlay_cache_len_for_test()
             .await,
         1
+    );
+
+    service
+        .inner()
+        .did_close(tower_lsp::lsp_types::DidCloseTextDocumentParams {
+            text_document: TextDocumentIdentifier { uri },
+        })
+        .await;
+    assert_eq!(
+        newer_root_mapping.authorization_cache_len_for_test(),
+        0,
+        "closing an external URI must discard its generation-bound authorization"
+    );
+}
+
+#[tokio::test]
+async fn did_close_prevents_a_late_external_authorization_cache_write() {
+    let service = test_backend_service();
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().join("workspace");
+    let include_root = dir.path().join("sdk");
+    std::fs::create_dir_all(&root).expect("workspace");
+    std::fs::create_dir_all(&include_root).expect("include root");
+    let header = include_root.join("vendor.h");
+    std::fs::write(&header, "int vendor(void);\n").expect("header");
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(root.clone());
+    *service.inner().include_paths.lock().await =
+        vec![crate::pathing::normalize_abs_path(&include_root)];
+    let semantics = current_test_workspace_semantics(&service, &root).await;
+    let started = Arc::new(std::sync::Barrier::new(2));
+    let resume = Arc::new(std::sync::Barrier::new(2));
+    semantics
+        .external_roots
+        .set_authorization_publish_barriers_for_test(started.clone(), resume.clone());
+    service
+        .inner()
+        .session
+        .cache
+        .publish_engine_snapshot(super::workspace::EngineSnapshot {
+            root: root.clone(),
+            epoch: super::state::EngineEpoch::published(1),
+            semantic_generation: crate::call_model::SemanticGeneration::MISSING,
+            declaration_index: None,
+            name_table: None,
+            fallback_completion_table: Arc::new(Default::default()),
+            reach_graph: None,
+            include_table: None,
+            go_import_table: None,
+            indexed_files: None,
+            project_context: None,
+            call_read_handle: None,
+            workspace_semantics: semantics.clone(),
+            degraded: Default::default(),
+        })
+        .await;
+    let uri = Url::from_file_path(&header).expect("header uri");
+    service
+        .inner()
+        .session
+        .open_document(uri.clone(), 1, "int dirty_vendor(void);\n".into())
+        .await;
+
+    let roots = semantics.external_roots.clone();
+    let authorize_header = header.clone();
+    let authorization = tokio::task::spawn_blocking(move || roots.mapped_path(&authorize_header));
+    tokio::task::spawn_blocking(move || started.wait())
+        .await
+        .expect("wait for miss");
+
+    service
+        .inner()
+        .did_close(tower_lsp::lsp_types::DidCloseTextDocumentParams {
+            text_document: TextDocumentIdentifier { uri },
+        })
+        .await;
+    tokio::task::spawn_blocking(move || resume.wait())
+        .await
+        .expect("release miss");
+    assert!(authorization.await.expect("authorization worker").is_some());
+    assert_eq!(
+        semantics.external_roots.authorization_cache_len_for_test(),
+        0,
+        "a miss computed before didClose must not publish after invalidation"
+    );
+}
+
+#[tokio::test]
+async fn candidate_overlay_includes_configured_go_module_roots_but_rejects_siblings() {
+    let service = test_backend_service();
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().join("workspace");
+    let config_module = dir.path().join("configured-module");
+    let config_identity_root = dir
+        .path()
+        .join("identity-parent")
+        .join("..")
+        .join("configured-module");
+    let client_module = dir.path().join("client-module");
+    let sibling = dir.path().join("not-configured");
+    for path in [
+        &root,
+        &config_module,
+        &client_module,
+        &sibling,
+        &dir.path().join("identity-parent"),
+    ] {
+        std::fs::create_dir_all(path).expect("external root");
+    }
+    std::fs::write(
+        root.join("fossilsense.json"),
+        serde_json::json!({
+            "goModulePaths": [crate::pathing::normalize_abs_path(&config_identity_root)]
+        })
+        .to_string(),
+    )
+    .expect("workspace config");
+    let configured_go = config_module.join("configured.go");
+    let client_go = client_module.join("client.go");
+    let sibling_go = sibling.join("sibling.go");
+    for path in [&configured_go, &client_go, &sibling_go] {
+        std::fs::write(path, "package external\n").expect("saved Go source");
+    }
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(root.clone());
+    *service.inner().go_module_paths.lock().await =
+        vec![crate::pathing::normalize_abs_path(&client_module)];
+    for (path, declaration) in [
+        (&configured_go, "ConfiguredDirty"),
+        (&client_go, "ClientDirty"),
+        (&sibling_go, "SiblingDirty"),
+    ] {
+        service
+            .inner()
+            .session
+            .open_document(
+                Url::from_file_path(path).expect("Go uri"),
+                1,
+                format!("package external\nfunc {declaration}() {{}}\n"),
+            )
+            .await;
+    }
+
+    let overlay = service
+        .inner()
+        .candidate_overlay_snapshot(
+            &root,
+            crate::call_model::SemanticGeneration::MISSING,
+            None,
+            None,
+        )
+        .await;
+    for path in [
+        crate::pathing::normalize_abs_path(&config_identity_root.join("configured.go")),
+        crate::pathing::normalize_abs_path(&client_go),
+    ] {
+        assert!(
+            overlay.shadows(&path),
+            "configured Go root must shadow {path}"
+        );
+        assert_eq!(
+            overlay.semantic_family_for_path(&path),
+            Some(crate::semantic_model::SemanticFamily::Go)
+        );
+    }
+    assert!(
+        !overlay.shadows(&crate::pathing::normalize_abs_path(&sibling_go)),
+        "an adjacent unconfigured external file must remain unauthorized"
+    );
+}
+
+#[tokio::test]
+async fn candidate_overlay_shadows_every_persisted_include_alias_identity() {
+    let dir = tempdir().expect("tempdir");
+    let workspace = dir.path().join("workspace");
+    let external = dir.path().join("external");
+    let alias_a = dir.path().join("alias-a").join("..").join("external");
+    let alias_b = dir.path().join("alias-b").join("..").join("external");
+    for path in [
+        &workspace,
+        &external,
+        &dir.path().join("alias-a"),
+        &dir.path().join("alias-b"),
+    ] {
+        std::fs::create_dir_all(path).expect("directory");
+    }
+    std::fs::write(workspace.join("main.cpp"), "void use(void) {}\n").expect("workspace source");
+    let external_source = external.join("api.h");
+    std::fs::write(&external_source, "int saved_external(void);\n").expect("saved external source");
+    std::fs::write(
+        workspace.join("fossilsense.json"),
+        serde_json::json!({
+            "includePaths": [
+                crate::pathing::normalize_abs_path(&alias_a),
+                crate::pathing::normalize_abs_path(&alias_b)
+            ]
+        })
+        .to_string(),
+    )
+    .expect("workspace config");
+    crate::indexer::index_workspace(
+        &workspace,
+        crate::indexer::IndexOptions {
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("index");
+
+    let service = test_backend_service();
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(workspace.clone());
+    service
+        .inner()
+        .session
+        .cache
+        .publish_full_index(&service.inner().client, workspace.clone())
+        .await
+        .expect("publish");
+    open_test_document(
+        &service,
+        Url::from_file_path(&external_source).expect("external uri"),
+        1,
+        "int dirty_external(void);\n".into(),
+    )
+    .await;
+
+    let context = service
+        .inner()
+        .request_context_for_root(workspace.clone())
+        .await;
+    let overlay = service
+        .inner()
+        .candidate_overlay_snapshot(
+            &workspace,
+            context.engine.semantic_generation,
+            context.engine.reach_graph.as_deref(),
+            context.engine.indexed_files.as_deref().map(Vec::as_slice),
+        )
+        .await;
+    for identity in [
+        crate::pathing::normalize_abs_path(&alias_a.join("api.h")),
+        crate::pathing::normalize_abs_path(&alias_b.join("api.h")),
+    ] {
+        assert!(
+            overlay.shadows(&identity),
+            "dirty canonical file must shadow persisted alias {identity}"
+        );
+    }
+    let query = crate::candidate_service::CandidateQueryService::new_with_declarations_for_family(
+        context.engine.call_read_handle.as_deref(),
+        context.engine.declaration_index.as_deref(),
+        &overlay,
+        "main.cpp",
+        None,
+        context.engine.reach_graph.as_deref(),
+        crate::semantic_model::SemanticFamily::CFamily,
+    );
+    let stale = query
+        .semantic_candidates(
+            "saved_external",
+            crate::candidate_service::SemanticIntent::Call,
+        )
+        .expect("stale query");
+    assert!(
+        stale.all.iter().all(|group| group.candidates.is_empty()),
+        "no persisted include alias may leak stale facts"
+    );
+    let dirty = query
+        .semantic_candidates(
+            "dirty_external",
+            crate::candidate_service::SemanticIntent::Call,
+        )
+        .expect("dirty query");
+    assert!(dirty.all.iter().any(|group| !group.candidates.is_empty()));
+}
+
+#[tokio::test]
+async fn candidate_overlay_bounds_alias_parses_but_tombstones_every_identity() {
+    let service = test_backend_service();
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().join("workspace");
+    let external = dir.path().join("external");
+    std::fs::create_dir_all(&root).expect("workspace");
+    std::fs::create_dir_all(&external).expect("external");
+    let source = external.join("api.h");
+    std::fs::write(&source, "package external\nfunc SavedAlias() {}\n").expect("saved source");
+    let mut include_paths = Vec::new();
+    let mut identities = Vec::new();
+    for index in 0..12 {
+        let marker = dir.path().join(format!("alias-{index}"));
+        std::fs::create_dir_all(&marker).expect("alias marker");
+        let identity_root = marker.join("..").join("external");
+        include_paths.push(crate::pathing::normalize_abs_path(&identity_root));
+        identities.push(crate::pathing::normalize_abs_path(
+            &identity_root.join("api.h"),
+        ));
+    }
+    std::fs::write(
+        root.join("fossilsense.json"),
+        serde_json::json!({
+            "includePaths": include_paths,
+            "languageOverrides": [{"glob": "**/api.h", "language": "go"}]
+        })
+        .to_string(),
+    )
+    .expect("workspace config");
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(root.clone());
+    open_test_document(
+        &service,
+        Url::from_file_path(&source).expect("external uri"),
+        1,
+        "package external\nfunc dirty_alias() {}\n".into(),
+    )
+    .await;
+
+    let overlay = service
+        .inner()
+        .candidate_overlay_snapshot(
+            &root,
+            crate::call_model::SemanticGeneration::MISSING,
+            None,
+            None,
+        )
+        .await;
+    assert!(
+        identities.iter().all(|identity| overlay.shadows(identity)),
+        "every persisted identity must be tombstoned even beyond the parse budget"
+    );
+    assert!(
+        overlay.declarations("dirty_alias").len()
+            <= super::candidate_context::MAX_EXTERNAL_OVERLAY_PARSED_IDENTITIES,
+        "dirty parsing must have a fixed per-document identity bound"
+    );
+    assert!(
+        overlay.has_incomplete_facts(),
+        "unparsed aliases must make coverage explicitly incomplete"
+    );
+    assert_eq!(
+        overlay
+            .semantic_family_for_path(identities.last().expect("identity beyond the parse budget")),
+        Some(crate::semantic_model::SemanticFamily::Go),
+        "a tombstone must retain the published override family"
+    );
+}
+
+#[tokio::test]
+async fn candidate_overlay_reuses_external_parse_across_workspace_roots() {
+    let service = test_backend_service();
+    let dir = tempdir().expect("tempdir");
+    let root_a = dir.path().join("workspace-a");
+    let root_b = dir.path().join("workspace-b");
+    let external = dir.path().join("external");
+    for path in [&root_a, &root_b, &external] {
+        std::fs::create_dir_all(path).expect("directory");
+    }
+    let source = external.join("device.go");
+    std::fs::write(&source, "package device\nfunc Saved(void) {}\n").expect("saved source");
+    let config = serde_json::json!({
+        "goModulePaths": [crate::pathing::normalize_abs_path(&external)]
+    })
+    .to_string();
+    for root in [&root_a, &root_b] {
+        std::fs::write(root.join("fossilsense.json"), &config).expect("workspace config");
+    }
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .extend([root_a.clone(), root_b.clone()]);
+    open_test_document(
+        &service,
+        Url::from_file_path(&source).expect("external uri"),
+        1,
+        "package device\nfunc Dirty() {}\n".into(),
+    )
+    .await;
+
+    for root in [&root_a, &root_b] {
+        service
+            .inner()
+            .candidate_overlay_snapshot(
+                root,
+                crate::call_model::SemanticGeneration::MISSING,
+                None,
+                None,
+            )
+            .await;
+    }
+
+    assert_eq!(
+        service
+            .inner()
+            .session
+            .documents
+            .external_overlay_parse_cache_len_for_test()
+            .await,
+        1,
+        "the same URI, version, language, and identity must share one external parse"
+    );
+}
+
+#[tokio::test]
+async fn candidate_overlay_uses_alias_identity_for_language_override() {
+    let service = test_backend_service();
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().join("workspace");
+    let external = dir.path().join("external");
+    let identity_root = dir
+        .path()
+        .join("identity-parent")
+        .join("..")
+        .join("external");
+    for path in [&root, &external, &dir.path().join("identity-parent")] {
+        std::fs::create_dir_all(path).expect("directory");
+    }
+    let source = external.join("device.h");
+    std::fs::write(&source, "package device\nfunc SavedGo() {}\n").expect("saved source");
+    let identity = crate::pathing::normalize_abs_path(&identity_root.join("device.h"));
+    std::fs::write(
+        root.join("fossilsense.json"),
+        serde_json::json!({
+            "includePaths": [crate::pathing::normalize_abs_path(&identity_root)],
+            "languageOverrides": [{"glob": identity, "language": "go"}]
+        })
+        .to_string(),
+    )
+    .expect("workspace config");
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(root.clone());
+    open_test_document(
+        &service,
+        Url::from_file_path(&source).expect("external uri"),
+        1,
+        "package device\nfunc DirtyGo() {}\n".into(),
+    )
+    .await;
+
+    let overlay = service
+        .inner()
+        .candidate_overlay_snapshot(
+            &root,
+            crate::call_model::SemanticGeneration::MISSING,
+            None,
+            None,
+        )
+        .await;
+    let identity = crate::pathing::normalize_abs_path(&identity_root.join("device.h"));
+    assert!(overlay.shadows(&identity));
+    assert_eq!(
+        overlay.semantic_family_for_path(&identity),
+        Some(crate::semantic_model::SemanticFamily::Go)
+    );
+    assert!(
+        !overlay.declarations("DirtyGo").is_empty(),
+        "identity-specific Go override must select the Go parser"
+    );
+}
+
+#[tokio::test]
+async fn candidate_overlay_tombstones_external_go_file_after_its_parent_is_removed() {
+    let service = test_backend_service();
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().join("workspace");
+    let go_module = dir.path().join("device-module");
+    let package = go_module.join("device");
+    let source = package.join("device.go");
+    std::fs::create_dir_all(&root).expect("workspace");
+    std::fs::create_dir_all(&package).expect("external package");
+    std::fs::write(&source, "package device\nfunc Saved() {}\n").expect("saved Go source");
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(root.clone());
+    *service.inner().go_module_paths.lock().await =
+        vec![crate::pathing::normalize_abs_path(&go_module)];
+    service
+        .inner()
+        .session
+        .open_document(
+            Url::from_file_path(&source).expect("Go uri"),
+            1,
+            "package device\nfunc Dirty() {}\n".into(),
+        )
+        .await;
+    std::fs::remove_dir_all(&package).expect("remove package directory");
+
+    let overlay = service
+        .inner()
+        .candidate_overlay_snapshot(
+            &root,
+            crate::call_model::SemanticGeneration::MISSING,
+            None,
+            None,
+        )
+        .await;
+    let identity = crate::pathing::normalize_abs_path(&source);
+    assert!(
+        overlay.shadows(&identity),
+        "an open external buffer must tombstone its persisted identity after its parent disappears"
+    );
+    assert_eq!(
+        overlay.source_text(&identity),
+        Some("package device\nfunc Dirty() {}\n")
+    );
+}
+
+#[tokio::test]
+async fn dirty_external_go_alias_shadows_persisted_declarations() {
+    let dir = tempdir().expect("tempdir");
+    let workspace = dir.path().join("workspace");
+    let external = dir.path().join("external");
+    let identity_root = dir
+        .path()
+        .join("identity-parent")
+        .join("..")
+        .join("external");
+    let package = external.join("device");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    std::fs::create_dir_all(dir.path().join("identity-parent")).expect("identity parent");
+    std::fs::create_dir_all(&package).expect("external package");
+    std::fs::write(
+        workspace.join("go.mod"),
+        "module example.com/workspace\n\ngo 1.22\n",
+    )
+    .expect("workspace go.mod");
+    std::fs::write(
+        external.join("go.mod"),
+        "module example.com/external\n\ngo 1.22\n",
+    )
+    .expect("external go.mod");
+    let (main_source, line, character) = text_and_position(
+        "package main\n\
+         import device \"example.com/external/device\"\n\
+         func use() { device./*cursor*/ }\n",
+    );
+    std::fs::write(workspace.join("main.go"), &main_source).expect("workspace source");
+    let external_source = package.join("device.go");
+    std::fs::write(
+        &external_source,
+        "package device\nfunc SavedExternal() {}\n",
+    )
+    .expect("saved external source");
+    std::fs::write(
+        workspace.join("fossilsense.json"),
+        serde_json::json!({
+            "goModulePaths": [crate::pathing::normalize_abs_path(&identity_root)]
+        })
+        .to_string(),
+    )
+    .expect("workspace config");
+    crate::indexer::index_workspace(
+        &workspace,
+        crate::indexer::IndexOptions {
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("index");
+
+    let service = test_backend_service();
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(workspace.clone());
+    service
+        .inner()
+        .session
+        .cache
+        .publish_full_index(&service.inner().client, workspace.clone())
+        .await
+        .expect("publish");
+    let main_uri = Url::from_file_path(workspace.join("main.go")).expect("main uri");
+    open_test_document(&service, main_uri.clone(), 1, main_source).await;
+    let external_uri = Url::from_file_path(&external_source).expect("external uri");
+    open_test_document(
+        &service,
+        external_uri.clone(),
+        1,
+        "package device\nfunc DirtyExternal() {}\n".into(),
+    )
+    .await;
+
+    let completion = service
+        .inner()
+        .completion(completion_params(main_uri, line, character))
+        .await
+        .expect("Go completion")
+        .expect("Go completion response");
+    let labels = completion_items(completion)
+        .into_iter()
+        .map(|item| item.label)
+        .collect::<Vec<_>>();
+    assert!(
+        labels.iter().all(|label| label != "SavedExternal"),
+        "persisted declaration leaked through alias identity: {labels:?}"
+    );
+    let context = service
+        .inner()
+        .request_context_for_root(workspace.clone())
+        .await;
+    let overlay = service
+        .inner()
+        .candidate_overlay_snapshot(
+            &workspace,
+            context.engine.semantic_generation,
+            context.engine.reach_graph.as_deref(),
+            context.engine.indexed_files.as_deref().map(Vec::as_slice),
+        )
+        .await;
+    let query = crate::candidate_service::CandidateQueryService::new_with_declarations_for_family(
+        context.engine.call_read_handle.as_deref(),
+        context.engine.declaration_index.as_deref(),
+        &overlay,
+        "main.go",
+        None,
+        context.engine.reach_graph.as_deref(),
+        crate::semantic_model::SemanticFamily::Go,
+    );
+    let stale = query
+        .semantic_candidates(
+            "SavedExternal",
+            crate::candidate_service::SemanticIntent::Call,
+        )
+        .expect("stale candidate query");
+    assert!(
+        stale.all.iter().all(|group| group.candidates.is_empty()),
+        "the dirty alias must tombstone persisted candidates"
+    );
+    let dirty = query
+        .semantic_candidates(
+            "DirtyExternal",
+            crate::candidate_service::SemanticIntent::Call,
+        )
+        .expect("dirty candidate query");
+    assert!(
+        dirty.all.iter().any(|group| !group.candidates.is_empty()),
+        "the mapped overlay must expose dirty candidates"
+    );
+}
+
+#[tokio::test]
+async fn candidate_overlay_keeps_published_external_semantics_until_next_generation() {
+    let dir = tempdir().expect("tempdir");
+    let workspace = dir.path().join("workspace");
+    let external = dir.path().join("external");
+    let package = external.join("device");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    std::fs::create_dir_all(&package).expect("external package");
+    std::fs::write(
+        workspace.join("go.mod"),
+        "module example.com/workspace\n\ngo 1.22\n",
+    )
+    .expect("workspace go.mod");
+    std::fs::write(
+        external.join("go.mod"),
+        "module example.com/external\n\ngo 1.22\n",
+    )
+    .expect("external go.mod");
+    std::fs::write(workspace.join("main.go"), "package main\n").expect("workspace source");
+    let external_source = package.join("device.go");
+    std::fs::write(
+        &external_source,
+        "package device\nfunc SavedExternal() {}\n",
+    )
+    .expect("saved source");
+    std::fs::write(
+        workspace.join("fossilsense.json"),
+        serde_json::json!({
+            "goModulePaths": [crate::pathing::normalize_abs_path(&external)]
+        })
+        .to_string(),
+    )
+    .expect("generation N config");
+    crate::indexer::index_workspace(
+        &workspace,
+        crate::indexer::IndexOptions {
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("index generation N");
+
+    let service = test_backend_service();
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(workspace.clone());
+    service
+        .inner()
+        .session
+        .cache
+        .publish_full_index(&service.inner().client, workspace.clone())
+        .await
+        .expect("publish generation N");
+    let external_uri = Url::from_file_path(&external_source).expect("external uri");
+    open_test_document(
+        &service,
+        external_uri.clone(),
+        1,
+        "package device\nfunc DirtyExternal() {}\n".into(),
+    )
+    .await;
+    let context = service
+        .inner()
+        .request_context_for_root(workspace.clone())
+        .await;
+
+    std::fs::write(workspace.join("fossilsense.json"), "{}").expect("generation N+1 config");
+    service.inner().config_cache.lock().await.remove(&workspace);
+    service
+        .inner()
+        .invalidate_external_source_root_cache(std::slice::from_ref(&workspace))
+        .await;
+    service
+        .inner()
+        .session
+        .cache
+        .invalidate_candidate_overlay_roots(std::slice::from_ref(&workspace))
+        .await;
+
+    let overlay = service
+        .inner()
+        .candidate_overlay_snapshot(
+            &workspace,
+            context.engine.semantic_generation,
+            context.engine.reach_graph.as_deref(),
+            context.engine.indexed_files.as_deref().map(Vec::as_slice),
+        )
+        .await;
+    let identity = crate::pathing::normalize_abs_path(&external_source);
+    assert!(
+        overlay.shadows(&identity),
+        "generation N dirty file must keep shadowing N facts while N+1 is only scheduled"
+    );
+    let query = crate::candidate_service::CandidateQueryService::new_with_declarations_for_family(
+        context.engine.call_read_handle.as_deref(),
+        context.engine.declaration_index.as_deref(),
+        &overlay,
+        "main.go",
+        None,
+        context.engine.reach_graph.as_deref(),
+        crate::semantic_model::SemanticFamily::Go,
+    );
+    let stale = query
+        .semantic_candidates(
+            "SavedExternal",
+            crate::candidate_service::SemanticIntent::Call,
+        )
+        .expect("stale query");
+    assert!(stale.all.iter().all(|group| group.candidates.is_empty()));
+    let dirty = query
+        .semantic_candidates(
+            "DirtyExternal",
+            crate::candidate_service::SemanticIntent::Call,
+        )
+        .expect("dirty query");
+    assert!(dirty.all.iter().any(|group| !group.candidates.is_empty()));
+
+    let documents = service
+        .inner()
+        .session
+        .documents
+        .capture_request_snapshot(Some(&external_uri))
+        .await;
+    crate::indexer::index_workspace(
+        &workspace,
+        crate::indexer::IndexOptions {
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("index generation N+1");
+    service
+        .inner()
+        .session
+        .cache
+        .publish_full_index(&service.inner().client, workspace.clone())
+        .await
+        .expect("publish generation N+1");
+    let relation_state = service
+        .inner()
+        .relation_state_from_context(&external_uri, workspace, context, documents)
+        .await
+        .expect("generation N relation state");
+    assert!(
+        relation_state
+            .overlays
+            .iter()
+            .any(|overlay| overlay.path == identity),
+        "call hierarchy must retain N's dirty external tombstone after N+1 publishes"
     );
 }
 
@@ -3967,6 +5783,7 @@ async fn candidate_overlay_does_not_adopt_a_new_graph_after_request_publication(
             indexed_files: None,
             project_context: None,
             call_read_handle: None,
+            workspace_semantics: empty_workspace_semantics(&root),
             degraded: Default::default(),
         })
         .await;
@@ -3998,6 +5815,7 @@ async fn candidate_overlay_does_not_adopt_a_new_graph_after_request_publication(
             indexed_files: None,
             project_context: None,
             call_read_handle: None,
+            workspace_semantics: old.workspace_semantics.clone(),
             degraded: Default::default(),
         })
         .await;
@@ -4036,6 +5854,7 @@ async fn candidate_overlay_cache_rejects_a_late_build_after_publication() {
             indexed_files: None,
             project_context: None,
             call_read_handle: None,
+            workspace_semantics: empty_workspace_semantics(&root),
             degraded: Default::default(),
         })
         .await;
@@ -4085,6 +5904,7 @@ async fn indexed_completion_resolve_rejects_cross_generation_context_before_over
             indexed_files: None,
             project_context: None,
             call_read_handle: None,
+            workspace_semantics: empty_workspace_semantics(&root),
             degraded: Default::default(),
         })
         .await;
@@ -4168,6 +5988,7 @@ async fn reach_scope_uses_captured_request_context_graph() {
             indexed_files: None,
             project_context: None,
             call_read_handle: None,
+            workspace_semantics: empty_workspace_semantics(&root),
             degraded: crate::progress::DegradedCapabilities::default(),
         }),
         settings: super::RequestSettings {
@@ -4317,6 +6138,338 @@ async fn member_completion_returns_fields_and_methods_for_resolved_receiver() {
         Documentation::MarkupContent(markup) => markup.value,
     };
     assert!(documentation.contains("Resizes the widget."));
+}
+
+#[tokio::test]
+async fn member_completion_uses_primary_published_family_across_workspace_roots() {
+    let dir = tempdir().expect("root");
+    let go_root = dir.path().join("go-root");
+    let c_root = dir.path().join("c-root");
+    fs::create_dir_all(go_root.join("legacy")).expect("Go tree");
+    fs::create_dir_all(&c_root).expect("C tree");
+    fs::write(
+        go_root.join("fossilsense.json"),
+        r#"{"languageOverrides":[{"glob":"legacy/**/*.h","language":"go"}]}"#,
+    )
+    .expect("Go override");
+    let (go_text, line, character) =
+        text_and_position("package legacy\nfunc Use() { mystery.fie/*cursor*/ }\n");
+    let go_path = go_root.join("legacy/api.h");
+    fs::write(&go_path, &go_text).expect("Go source");
+    fs::write(
+        c_root.join("record.h"),
+        "struct Other { int fieldFromC; };\n",
+    )
+    .expect("C source");
+    for root in [&go_root, &c_root] {
+        crate::indexer::index_workspace(
+            root,
+            crate::indexer::IndexOptions {
+                force: true,
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .expect("index root");
+    }
+
+    let service = test_backend_service();
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .extend([go_root.clone(), c_root.clone()]);
+    for root in [&go_root, &c_root] {
+        service
+            .inner()
+            .session
+            .cache
+            .publish_full_index(&service.inner().client, root.clone())
+            .await
+            .expect("publish root");
+    }
+    let uri = Url::from_file_path(go_path).expect("Go URI");
+    open_test_document(&service, uri.clone(), 1, go_text).await;
+
+    let response = service
+        .inner()
+        .completion(completion_params(uri, line, character))
+        .await
+        .expect("completion")
+        .expect("member completion");
+    let labels = completion_items(response)
+        .into_iter()
+        .map(|item| item.label)
+        .collect::<Vec<_>>();
+    assert!(
+        labels.iter().all(|label| label != "fieldFromC"),
+        "C-family fallback leaked into a Go request: {labels:?}"
+    );
+}
+
+#[tokio::test]
+async fn member_completion_resolve_allows_go_module_owner_and_rejects_sibling() {
+    let service = test_backend_service();
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().join("workspace");
+    let go_module = dir.path().join("device-module");
+    let configured_go_module = dir
+        .path()
+        .join("identity-parent")
+        .join("..")
+        .join("device-module");
+    let sibling = dir.path().join("not-configured");
+    std::fs::create_dir_all(&root).expect("workspace");
+    std::fs::create_dir_all(&go_module).expect("Go module");
+    std::fs::create_dir_all(dir.path().join("identity-parent")).expect("identity parent");
+    std::fs::create_dir_all(&sibling).expect("sibling");
+    let request_uri = Url::from_file_path(root.join("main.go")).expect("request uri");
+    let saved_source = "package device\n\
+                        type Device struct{}\n\
+                        // Reset has saved documentation.\n\
+                        func (Device) Reset() {}\n";
+    let source = "package device\n\
+                  type Device struct{}\n\
+                  // Reset uses unsaved external documentation.\n\
+                  func (Device) Reset() {}\n";
+    let allowed_owner = configured_go_module.join("device.go");
+    let rejected_owner = go_module
+        .join("..")
+        .join(sibling.file_name().expect("sibling name"))
+        .join("device.go");
+    std::fs::write(go_module.join("device.go"), saved_source).expect("allowed owner");
+    std::fs::write(&rejected_owner, source).expect("rejected owner");
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(root.clone());
+    *service.inner().go_module_paths.lock().await =
+        vec![crate::pathing::normalize_abs_path(&configured_go_module)];
+    open_test_document(&service, request_uri.clone(), 1, "package main\n".into()).await;
+    service
+        .inner()
+        .session
+        .open_document(
+            Url::from_file_path(go_module.join("device.go")).expect("external Go uri"),
+            1,
+            source.into(),
+        )
+        .await;
+    let generation = crate::call_model::SemanticGeneration(21);
+    let workspace_semantics = current_test_workspace_semantics(&service, &root).await;
+    service
+        .inner()
+        .session
+        .cache
+        .publish_engine_snapshot(super::workspace::EngineSnapshot {
+            root: root.clone(),
+            epoch: super::state::EngineEpoch::published(21),
+            semantic_generation: generation,
+            declaration_index: None,
+            name_table: None,
+            fallback_completion_table: Arc::new(Default::default()),
+            reach_graph: None,
+            include_table: None,
+            go_import_table: None,
+            indexed_files: None,
+            project_context: None,
+            call_read_handle: None,
+            workspace_semantics,
+            degraded: Default::default(),
+        })
+        .await;
+    let overlay_epoch = service
+        .inner()
+        .session
+        .documents
+        .capture_request_snapshot(Some(&request_uri))
+        .await
+        .overlay_epoch;
+    let completion_item = |owner: &std::path::Path| {
+        let owner_path = crate::pathing::normalize_abs_path(owner);
+        let parsed = crate::parser::parse_with_language(
+            owner,
+            source,
+            crate::config::SourceLanguage::Go,
+            crate::parser::ParseFacts::ALL,
+        );
+        let member = parsed
+            .members
+            .iter()
+            .find(|member| member.name == "Reset")
+            .expect("Reset member");
+        CompletionItem {
+            label: "Reset".into(),
+            data: Some(
+                serde_json::to_value(super::CompletionDocumentationData::Member {
+                    version: 5,
+                    root: root.to_string_lossy().into_owned(),
+                    uri: request_uri.to_string(),
+                    owner_path: owner_path.clone(),
+                    handle: crate::model::MemberCandidateHandle::new(
+                        None,
+                        &owner_path,
+                        &member.record_key,
+                        member,
+                    ),
+                    semantic_family: crate::semantic_model::SemanticFamily::Go,
+                    semantic_generation: generation.0,
+                    owner_revision_hash: blake3::hash(source.as_bytes()).to_hex().to_string(),
+                    overlay_epoch,
+                    document_version: 1,
+                })
+                .expect("member completion data"),
+            ),
+            ..Default::default()
+        }
+    };
+
+    let resolved = service
+        .inner()
+        .completion_resolve(completion_item(&allowed_owner))
+        .await
+        .expect("allowed resolve");
+    let documentation =
+        documentation_text(resolved.documentation.expect("external Go documentation"));
+    assert!(documentation.contains("uses unsaved external documentation"));
+
+    let rejected = service
+        .inner()
+        .completion_resolve(completion_item(&rejected_owner))
+        .await
+        .expect("rejected resolve");
+    assert!(
+        rejected.documentation.is_none(),
+        "an adjacent unconfigured owner path must not be read"
+    );
+}
+
+#[tokio::test]
+async fn member_completion_resolve_uses_alias_identity_language_override() {
+    let service = test_backend_service();
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().join("workspace");
+    let external = dir.path().join("external");
+    let identity_root = dir
+        .path()
+        .join("identity-parent")
+        .join("..")
+        .join("external");
+    for path in [&root, &external, &dir.path().join("identity-parent")] {
+        std::fs::create_dir_all(path).expect("directory");
+    }
+    let owner = identity_root.join("device.h");
+    let canonical_owner = external.join("device.h");
+    let owner_path = crate::pathing::normalize_abs_path(&owner);
+    let source = "package device\n\
+                  type Device struct{}\n\
+                  // Reset uses identity-selected Go documentation.\n\
+                  func (Device) Reset() {}\n";
+    std::fs::write(&canonical_owner, source).expect("external source");
+    std::fs::write(
+        root.join("fossilsense.json"),
+        serde_json::json!({
+            "includePaths": [crate::pathing::normalize_abs_path(&identity_root)],
+            "languageOverrides": [{"glob": owner_path, "language": "go"}]
+        })
+        .to_string(),
+    )
+    .expect("workspace config");
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(root.clone());
+    let request_uri = Url::from_file_path(root.join("main.go")).expect("request uri");
+    open_test_document(&service, request_uri.clone(), 1, "package main\n".into()).await;
+    open_test_document(
+        &service,
+        Url::from_file_path(&canonical_owner).expect("external uri"),
+        1,
+        source.into(),
+    )
+    .await;
+    let generation = crate::call_model::SemanticGeneration(22);
+    let workspace_semantics = current_test_workspace_semantics(&service, &root).await;
+    service
+        .inner()
+        .session
+        .cache
+        .publish_engine_snapshot(super::workspace::EngineSnapshot {
+            root: root.clone(),
+            epoch: super::state::EngineEpoch::published(22),
+            semantic_generation: generation,
+            declaration_index: None,
+            name_table: None,
+            fallback_completion_table: Arc::new(Default::default()),
+            reach_graph: None,
+            include_table: None,
+            go_import_table: None,
+            indexed_files: None,
+            project_context: None,
+            call_read_handle: None,
+            workspace_semantics,
+            degraded: Default::default(),
+        })
+        .await;
+    let overlay_epoch = service
+        .inner()
+        .session
+        .documents
+        .capture_request_snapshot(Some(&request_uri))
+        .await
+        .overlay_epoch;
+    let parsed = crate::parser::parse_with_language(
+        &owner,
+        source,
+        crate::config::SourceLanguage::Go,
+        crate::parser::ParseFacts::ALL,
+    );
+    let member = parsed
+        .members
+        .iter()
+        .find(|member| member.name == "Reset")
+        .expect("Reset member");
+    let item = CompletionItem {
+        label: "Reset".into(),
+        data: Some(
+            serde_json::to_value(super::CompletionDocumentationData::Member {
+                version: 5,
+                root: root.to_string_lossy().into_owned(),
+                uri: request_uri.to_string(),
+                owner_path: owner_path.clone(),
+                handle: crate::model::MemberCandidateHandle::new(
+                    None,
+                    &owner_path,
+                    &member.record_key,
+                    member,
+                ),
+                semantic_family: crate::semantic_model::SemanticFamily::Go,
+                semantic_generation: generation.0,
+                owner_revision_hash: blake3::hash(source.as_bytes()).to_hex().to_string(),
+                overlay_epoch,
+                document_version: 1,
+            })
+            .expect("member completion data"),
+        ),
+        ..Default::default()
+    };
+
+    let resolved = service
+        .inner()
+        .completion_resolve(item)
+        .await
+        .expect("resolve");
+    let documentation = documentation_text(
+        resolved
+            .documentation
+            .expect("identity-selected Go documentation"),
+    );
+    assert!(documentation.contains("identity-selected Go documentation"));
 }
 
 #[tokio::test]

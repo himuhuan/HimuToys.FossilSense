@@ -8,21 +8,25 @@ impl Backend {
         rel: String,
     ) -> LspResult<Option<GotoDefinitionResponse>> {
         let current_dir = uri_to_path(uri).and_then(|p| p.parent().map(|d| d.to_path_buf()));
-        let client_include_roots = self.include_paths.lock().await.clone();
         let workspace_root = self.root_for_uri(uri).await;
-        let semantic_generation = match &workspace_root {
-            Some(root) => Some(
-                self.request_context_for_root(root.clone())
-                    .await
-                    .engine
-                    .semantic_generation
-                    .0,
-            ),
+        let request_context = match &workspace_root {
+            Some(root) => Some(self.request_context_for_root(root.clone()).await),
             None => None,
         };
-        let include_roots = self
-            .include_roots_for_workspace(workspace_root.as_deref(), &client_include_roots)
-            .await;
+        let semantic_generation = request_context
+            .as_ref()
+            .map(|context| context.engine.semantic_generation.0);
+        let include_roots = match request_context.as_ref() {
+            Some(context) => context
+                .engine
+                .workspace_semantics
+                .external_roots
+                .normalized_include_roots(),
+            None => {
+                let client_include_roots = self.include_paths.lock().await.clone();
+                configured_include_paths(&[], &client_include_roots)
+            }
+        };
         let db_path = workspace_root
             .as_ref()
             .and_then(|root| pathing::default_index_path(root).ok());
@@ -61,7 +65,6 @@ impl Backend {
     ) -> LspResult<Option<CompletionResponse>> {
         let (dir_part, seg) = includes::split_partial(&partial);
         let current_dir = uri_to_path(uri).and_then(|p| p.parent().map(|d| d.to_path_buf()));
-        let client_include_roots = self.include_paths.lock().await.clone();
         let workspace_root = self.root_for_uri(uri).await;
         let current_rel_path = workspace_root.as_ref().and_then(|root| {
             uri_to_path(uri).and_then(|path| pathing::relative_slash_path(root, &path).ok())
@@ -79,9 +82,17 @@ impl Backend {
         let semantic_generation = request_context
             .as_ref()
             .map(|context| context.engine.semantic_generation.0);
-        let include_roots = self
-            .include_roots_for_workspace(workspace_root.as_deref(), &client_include_roots)
-            .await;
+        let include_roots = match request_context.as_ref() {
+            Some(context) => context
+                .engine
+                .workspace_semantics
+                .external_roots
+                .normalized_include_roots(),
+            None => {
+                let client_include_roots = self.include_paths.lock().await.clone();
+                configured_include_paths(&[], &client_include_roots)
+            }
+        };
         let db_path = workspace_root
             .as_ref()
             .and_then(|root| pathing::default_index_path(root).ok());

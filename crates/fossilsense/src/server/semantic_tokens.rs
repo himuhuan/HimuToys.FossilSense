@@ -59,8 +59,19 @@ impl Backend {
                 reach: (*reach).clone(),
             });
 
+        let source_language = context
+            .as_ref()
+            .map(|context| context.engine.workspace_semantics.language_for_uri(uri))
+            .unwrap_or_else(|| crate::config::SourceLanguage::default_for_path(&path));
         let cached = self
-            .get_or_parse_document(uri, &path, version, &text, ParseFacts::COLOR_LIVE)
+            .get_or_parse_document_with_language(
+                uri,
+                &path,
+                version,
+                &text,
+                ParseFacts::COLOR_LIVE,
+                source_language,
+            )
             .await;
         let index: Option<Arc<FileSemanticIndex>> = cached;
         let index = index?;

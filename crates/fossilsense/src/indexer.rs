@@ -46,6 +46,50 @@ pub struct IndexOptions {
     pub external_max_bytes: Option<u64>,
     /// Override parser worker count. Defaults to a small bounded pool.
     pub parse_threads: Option<usize>,
+    /// Configuration and resolved external roots captured by the caller for
+    /// this exact index run. The LSP uses this to publish request semantics
+    /// with the same generation; CLI callers normally leave it unset.
+    pub prepared_configuration: Option<IndexConfigurationSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexConfigurationSnapshot {
+    pub workspace: PathBuf,
+    pub config: WorkspaceConfig,
+    pub language_resolver: LanguageResolver,
+    pub include_roots: Vec<PathBuf>,
+    pub go_module_roots: Vec<PathBuf>,
+    pub issues: Vec<ConfigIssue>,
+}
+
+pub fn prepare_index_configuration(
+    workspace: impl AsRef<Path>,
+    client_include_paths: &[String],
+    client_go_module_paths: &[String],
+) -> Result<IndexConfigurationSnapshot> {
+    let workspace = canonical_workspace(workspace)?;
+    let (config, config_issue) = WorkspaceConfig::load(&workspace);
+    let mut include_entries = config.include_paths.clone();
+    include_entries.extend(client_include_paths.iter().cloned());
+    let (include_roots, include_issues) = resolve_include_roots(&include_entries);
+    let mut go_module_entries = config.go_module_paths.clone();
+    go_module_entries.extend(client_go_module_paths.iter().cloned());
+    let (go_module_roots, mut go_module_issues) = resolve_go_module_roots(&go_module_entries);
+    let (go_module_roots, overlap_issues) = external_go_module_roots(&workspace, go_module_roots);
+    go_module_issues.extend(overlap_issues);
+    let mut issues = Vec::new();
+    issues.extend(config_issue);
+    issues.extend(include_issues);
+    issues.extend(go_module_issues);
+    let language_resolver = LanguageResolver::from_workspace_config(&workspace, &config);
+    Ok(IndexConfigurationSnapshot {
+        workspace,
+        config,
+        language_resolver,
+        include_roots,
+        go_module_roots,
+        issues,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,26 +152,26 @@ pub fn index_workspace(
         "discovering",
     ));
 
-    let (config, config_issue) = WorkspaceConfig::load(&workspace);
-    if let Some(issue) = &config_issue {
-        progress(IndexStatus::indexing_with_message(
-            workspace_display.clone(),
-            &stats,
-            issue.message.clone(),
-        ));
-    }
-
-    // External include reference directories: merge config + client-forwarded
-    // entries, then validate against the filesystem. Invalid entries are skipped
-    // with a note; never fatal.
-    let mut include_entries = config.include_paths.clone();
-    include_entries.extend(options.include_paths.iter().cloned());
-    let (include_roots, include_issues) = resolve_include_roots(&include_entries);
-    let mut go_module_entries = config.go_module_paths.clone();
-    go_module_entries.extend(options.go_module_paths.iter().cloned());
-    let (go_module_roots, mut go_module_issues) = resolve_go_module_roots(&go_module_entries);
-    let (go_module_roots, overlap_issues) = external_go_module_roots(&workspace, go_module_roots);
-    go_module_issues.extend(overlap_issues);
+    let prepared = match options.prepared_configuration.clone() {
+        Some(prepared) => prepared,
+        None => prepare_index_configuration(
+            &workspace,
+            &options.include_paths,
+            &options.go_module_paths,
+        )?,
+    };
+    anyhow::ensure!(
+        prepared.workspace == workspace,
+        "prepared index configuration belongs to a different workspace"
+    );
+    let IndexConfigurationSnapshot {
+        config,
+        language_resolver,
+        include_roots,
+        go_module_roots,
+        issues: configuration_issues,
+        ..
+    } = prepared;
 
     let max_files = options
         .external_max_files
@@ -149,9 +193,8 @@ pub fn index_workspace(
     stats.discover_ms = discover_started.elapsed().as_millis();
     stats.total_files = candidates.len();
 
-    for issue in include_issues
+    for issue in configuration_issues
         .into_iter()
-        .chain(go_module_issues)
         .chain(external_issues)
         .chain(external_go_issues)
     {
@@ -202,9 +245,14 @@ pub fn index_workspace(
         let unchanged = stored_files
             .get(&candidate.fingerprint.path)
             .is_some_and(|stored| {
+                let expected_language = language_resolver
+                    .language_for_path(&candidate.absolute_path)
+                    .semantic_language();
                 candidate.fingerprint.mtime_ns != 0
                     && stored.size == candidate.fingerprint.size
                     && stored.mtime_ns == candidate.fingerprint.mtime_ns
+                    && stored.language_code
+                        == crate::store::semantic_language_storage_code(expected_language)
             });
 
         if unchanged && !options.force {
@@ -222,7 +270,7 @@ pub fn index_workspace(
         changed,
         ParsePipelineConfig {
             parse_threads: parse_thread_count(options.parse_threads),
-            language_resolver: LanguageResolver::from_workspace_config(&workspace, &config),
+            language_resolver,
         },
         build,
         &mut store,
@@ -337,24 +385,27 @@ pub fn index_dirty_files(
         "updating",
     ));
 
-    let (config, config_issue) = WorkspaceConfig::load(&workspace);
-    if let Some(issue) = &config_issue {
-        progress(IndexStatus::indexing_with_message(
-            workspace_display.clone(),
-            &stats,
-            issue.message.clone(),
-        ));
-    }
-
-    let mut include_entries = config.include_paths.clone();
-    include_entries.extend(options.include_paths.iter().cloned());
-    let (include_roots, include_issues) = resolve_include_roots(&include_entries);
-    let mut go_module_entries = config.go_module_paths.clone();
-    go_module_entries.extend(options.go_module_paths.iter().cloned());
-    let (go_module_roots, mut go_module_issues) = resolve_go_module_roots(&go_module_entries);
-    let (go_module_roots, overlap_issues) = external_go_module_roots(&workspace, go_module_roots);
-    go_module_issues.extend(overlap_issues);
-    for issue in include_issues.into_iter().chain(go_module_issues) {
+    let prepared = match options.prepared_configuration.clone() {
+        Some(prepared) => prepared,
+        None => prepare_index_configuration(
+            &workspace,
+            &options.include_paths,
+            &options.go_module_paths,
+        )?,
+    };
+    anyhow::ensure!(
+        prepared.workspace == workspace,
+        "prepared index configuration belongs to a different workspace"
+    );
+    let IndexConfigurationSnapshot {
+        config,
+        language_resolver,
+        include_roots,
+        go_module_roots,
+        issues: configuration_issues,
+        ..
+    } = prepared;
+    for issue in configuration_issues {
         progress(IndexStatus::indexing_with_message(
             workspace_display.clone(),
             &stats,
@@ -420,7 +471,7 @@ pub fn index_dirty_files(
         upserts,
         ParsePipelineConfig {
             parse_threads: parse_thread_count(options.parse_threads),
-            language_resolver: LanguageResolver::from_workspace_config(&workspace, &config),
+            language_resolver,
         },
         build,
         &mut store,

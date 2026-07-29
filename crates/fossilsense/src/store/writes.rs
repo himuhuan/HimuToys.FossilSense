@@ -754,7 +754,7 @@ fn linkage_kind_code(linkage: &crate::call_model::LinkageDomain) -> i64 {
     }
 }
 
-fn semantic_language_code(language: SemanticLanguage) -> i64 {
+pub(super) fn semantic_language_code(language: SemanticLanguage) -> i64 {
     match language {
         SemanticLanguage::C => 0,
         SemanticLanguage::Cpp => 1,

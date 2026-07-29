@@ -21,7 +21,7 @@ FossilSense 主要解决一种很实际的问题：代码就在眼前，但完�
 
 默认无需配置。FossilSense 会扫描常见 C/C++ 与 `.go` 文件，并把索引保存在用户缓存目录，不会在源码仓库中生成数据库。
 
-如果工作区同时启用了 clangd、Microsoft C/C++、ccls 或 Go/gopls，FossilSense 会提示选择主要语言服务。每种语言建议只保留一个主要 provider。
+如果已激活的 clangd、Microsoft C/C++、ccls 或 Go 扩展与当前工作区已打开文件的语言匹配，FossilSense 会提示它可能启动重叠的语言服务。每种语言建议只保留一个主要 provider。
 
 ## 你会获得什么
 

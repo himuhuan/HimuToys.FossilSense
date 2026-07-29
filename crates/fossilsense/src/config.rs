@@ -13,7 +13,7 @@ use matching::{language_override_glob_matches, path_matches_glob_entry};
 pub const DEFAULT_EXCLUDED_DIRS: &[&str] =
     &[".git", ".vscode", "node_modules", "target", "out", "build"];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SourceLanguage {
     C,
     Cpp,
@@ -457,9 +457,8 @@ impl WorkspaceConfig {
                 };
                 let raw_glob = rule.glob;
                 let glob = normalize_language_override_glob(raw_glob.clone());
-                let language = match rule.language.trim().to_ascii_lowercase().as_str() {
-                    name => SourceLanguage::from_config_name(name),
-                };
+                let normalized_language = rule.language.trim().to_ascii_lowercase();
+                let language = SourceLanguage::from_config_name(&normalized_language);
                 if glob.is_empty() || !valid_language_override_glob(&glob) {
                     issues.push(ConfigIssue {
                         message: format!(

@@ -45,12 +45,13 @@ impl Backend {
         let Some(root) = self.root_for_uri(&uri).await else {
             return Ok(None);
         };
+        let context = self.request_context_for_root(root.clone()).await;
         let current_abs = uri_to_path(&uri);
         let current_rel = current_abs
             .as_deref()
             .and_then(|path| pathing::relative_slash_path(&root, path).ok())
             .unwrap_or_default();
-        let source_language = self.source_language_for_uri(&uri).await;
+        let source_language = context.engine.workspace_semantics.language_for_uri(&uri);
         let semantic_family = source_language.semantic_family();
         let cursor_byte =
             query::byte_offset_at(&text, position.position.line, position.position.character);
@@ -107,12 +108,13 @@ impl Backend {
         ) {
             if let Some(current_abs) = current_abs.as_deref() {
                 if let Some(parsed) = self
-                    .get_or_parse_document(
+                    .get_or_parse_document_with_language(
                         &uri,
                         current_abs,
                         version,
                         &text,
                         crate::parser::ParseFacts::LOCAL_DECLS,
+                        source_language,
                     )
                     .await
                 {
@@ -134,7 +136,6 @@ impl Backend {
             }
         }
 
-        let context = self.request_context_for_root(root.clone()).await;
         let reach_started = std::time::Instant::now();
         let reach_scope = self
             .reach_scope_from_context(&uri, &context)
@@ -152,6 +153,7 @@ impl Backend {
                 semantic_generation,
                 reach_graph.as_deref(),
                 context.engine.indexed_files.as_deref().map(Vec::as_slice),
+                context.engine.workspace_semantics.clone(),
                 documents,
             )
             .await;

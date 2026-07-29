@@ -529,6 +529,7 @@ fn collect_type_spec(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_fact(
     declaration: tree_sitter::Node<'_>,
     type_node: tree_sitter::Node<'_>,

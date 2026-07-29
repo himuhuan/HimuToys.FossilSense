@@ -31,6 +31,9 @@ impl Backend {
             self.session.cache.invalidate_references();
         }
         if !full_roots.is_empty() {
+            #[cfg(test)]
+            self.invalidate_external_source_root_cache(&full_roots)
+                .await;
             self.session
                 .documents
                 .invalidate_language_config_roots(&full_roots)

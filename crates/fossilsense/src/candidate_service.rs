@@ -155,6 +155,16 @@ impl FileCandidateOverlay {
         overlay.facts_complete = false;
         overlay
     }
+
+    pub fn tombstone_for_family(
+        path: String,
+        text: Arc<str>,
+        semantic_family: SemanticFamily,
+    ) -> Self {
+        let mut overlay = Self::tombstone(path, text);
+        overlay.semantic_family = semantic_family;
+        overlay
+    }
 }
 
 #[derive(Debug, Clone)]

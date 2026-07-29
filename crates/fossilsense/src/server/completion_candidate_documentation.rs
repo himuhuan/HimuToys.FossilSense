@@ -29,14 +29,11 @@ impl Backend {
             return None;
         }
         let request_uri = Url::parse(&uri).ok();
-        let semantic_family = match request_uri.as_ref() {
-            Some(uri) => self.source_language_for_uri(uri).await.semantic_family(),
-            None => return None,
-        };
+        let request_uri = request_uri.as_ref()?;
         let documents = self
             .session
             .documents
-            .capture_request_snapshot(request_uri.as_ref())
+            .capture_request_snapshot(Some(request_uri))
             .await;
         if documents.overlay_epoch < overlay_epoch
             || documents
@@ -50,14 +47,18 @@ impl Backend {
         if context.engine.semantic_generation.0 != semantic_generation {
             return None;
         }
+        let semantic_family = context
+            .engine
+            .workspace_semantics
+            .language_for_uri(request_uri)
+            .semantic_family();
         let declaration_index = context.engine.declaration_index.clone()?;
         let generation = context.engine.semantic_generation;
         let (current_rel, current_text) =
-            current_document_for_root(request_uri.as_ref(), &root, documents.current.as_ref());
-        let reach_scope = request_uri.as_ref().and_then(|uri| {
-            self.reach_scope_from_context(uri, &context)
-                .map(|(_, reach)| reach)
-        });
+            current_document_for_root(Some(request_uri), &root, documents.current.as_ref());
+        let reach_scope = self
+            .reach_scope_from_context(request_uri, &context)
+            .map(|(_, reach)| reach);
         let reach_graph = context.engine.reach_graph.clone();
         let call_read_handle = context.engine.call_read_handle.clone();
         let query_index = declaration_index.clone();
@@ -67,6 +68,7 @@ impl Backend {
                 generation,
                 reach_graph.as_deref(),
                 context.engine.indexed_files.as_deref().map(Vec::as_slice),
+                context.engine.workspace_semantics.clone(),
                 documents,
             )
             .await;
@@ -187,6 +189,7 @@ impl Backend {
                 generation,
                 reach_graph.as_deref(),
                 context.engine.indexed_files.as_deref().map(Vec::as_slice),
+                context.engine.workspace_semantics.clone(),
                 documents,
             )
             .await;

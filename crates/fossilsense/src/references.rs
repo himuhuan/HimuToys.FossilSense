@@ -521,6 +521,7 @@ fn search_references_inner_borrowed(
 /// Server reference search constrained to the requesting document's semantic
 /// family. The family is part of the complete-result cache identity, so a
 /// same-name C request cannot reuse Go hits (or vice versa).
+#[allow(clippy::too_many_arguments)]
 pub fn search_references_with_shared_files_for_family(
     root: impl AsRef<Path>,
     identifier: &str,
@@ -547,6 +548,7 @@ pub fn search_references_with_shared_files_for_family(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn search_references_with_shared_files_filtered(
     root: impl AsRef<Path>,
     identifier: &str,

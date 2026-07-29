@@ -41,7 +41,7 @@ use crate::store::IndexStore;
 #[derive(Debug, Parser)]
 #[command(name = "fossilsense")]
 #[command(version)]
-#[command(about = "FossilSense best-effort C/C++ navigation and analysis")]
+#[command(about = "FossilSense best-effort C/C++ and Go navigation and analysis")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -52,7 +52,7 @@ mod cli_tests {
     use std::fs;
     use std::path::Path;
 
-    use clap::{error::ErrorKind, Parser};
+    use clap::{error::ErrorKind, CommandFactory, Parser};
     use tempfile::tempdir;
 
     use super::{query_semantic_family, Cli};
@@ -64,6 +64,14 @@ mod cli_tests {
 
         assert_eq!(error.kind(), ErrorKind::DisplayVersion);
         assert!(error.to_string().contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn cli_help_describes_c_cpp_and_go_support() {
+        let help = Cli::command().render_long_help().to_string();
+
+        assert!(help.contains("C/C++ and Go"));
+        assert!(help.contains("supported C/C++ and Go files"));
     }
 
     #[test]
@@ -106,7 +114,7 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Scan a workspace and report C/C++ files that would enter the index.
+    /// Scan a workspace and report supported C/C++ and Go files that would enter the index.
     Scan {
         /// Workspace root to scan.
         workspace: PathBuf,

@@ -226,27 +226,6 @@ fn vendor_import_suffix(path: &str) -> Option<String> {
     (!package_components.is_empty()).then(|| package_components.join("/"))
 }
 
-#[cfg(test)]
-mod vendor_import_suffix_tests {
-    use super::vendor_import_suffix;
-
-    #[test]
-    fn uses_the_last_vendor_that_has_a_package_directory_after_it() {
-        assert_eq!(
-            vendor_import_suffix("vendor/outer/vendor/example.com/nested/pkg/pkg.go").as_deref(),
-            Some("example.com/nested/pkg")
-        );
-        assert_eq!(
-            vendor_import_suffix("vendor/example.com/org/vendor/vendor.go").as_deref(),
-            Some("example.com/org/vendor")
-        );
-        assert_eq!(
-            vendor_import_suffix("vendor/example.com/vendor/sensor/sensor.go").as_deref(),
-            Some("sensor")
-        );
-    }
-}
-
 fn nearest_module(
     directory: &Path,
     boundary: &Path,
@@ -372,5 +351,26 @@ fn retain_open_reason(
         _ => {
             open.insert(package, reason);
         }
+    }
+}
+
+#[cfg(test)]
+mod vendor_import_suffix_tests {
+    use super::vendor_import_suffix;
+
+    #[test]
+    fn uses_the_last_vendor_that_has_a_package_directory_after_it() {
+        assert_eq!(
+            vendor_import_suffix("vendor/outer/vendor/example.com/nested/pkg/pkg.go").as_deref(),
+            Some("example.com/nested/pkg")
+        );
+        assert_eq!(
+            vendor_import_suffix("vendor/example.com/org/vendor/vendor.go").as_deref(),
+            Some("example.com/org/vendor")
+        );
+        assert_eq!(
+            vendor_import_suffix("vendor/example.com/vendor/sensor/sensor.go").as_deref(),
+            Some("sensor")
+        );
     }
 }

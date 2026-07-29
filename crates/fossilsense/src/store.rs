@@ -50,6 +50,7 @@ pub struct StoredFile {
     pub size: u64,
     pub mtime_ns: i64,
     pub hash: String,
+    pub language_code: i64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -445,7 +446,7 @@ impl IndexStore {
     pub fn stored_file(&self, path: &str) -> Result<Option<StoredFile>> {
         self.conn
             .query_row(
-                "SELECT f.id, r.size, r.mtime_ns, r.hash FROM files f
+                "SELECT f.id, r.size, r.mtime_ns, r.hash, r.language FROM files f
                  JOIN active_file_revisions a ON a.file_id = f.id
                  JOIN file_revisions r ON r.id = a.revision_id
                  WHERE f.path = ?1",
@@ -456,6 +457,7 @@ impl IndexStore {
                         size: row.get::<_, i64>(1)? as u64,
                         mtime_ns: row.get(2)?,
                         hash: row.get(3)?,
+                        language_code: row.get(4)?,
                     })
                 },
             )
@@ -472,7 +474,7 @@ impl IndexStore {
         for chunk in paths.chunks(400) {
             let placeholders = vec!["?"; chunk.len()].join(",");
             let sql = format!(
-                "SELECT f.path, f.id, r.size, r.mtime_ns, r.hash FROM files f
+                "SELECT f.path, f.id, r.size, r.mtime_ns, r.hash, r.language FROM files f
                  JOIN active_file_revisions a ON a.file_id = f.id
                  JOIN file_revisions r ON r.id = a.revision_id
                  WHERE f.path IN ({placeholders})"
@@ -488,6 +490,7 @@ impl IndexStore {
                             size: row.get::<_, i64>(2)? as u64,
                             mtime_ns: row.get(3)?,
                             hash: row.get(4)?,
+                            language_code: row.get(5)?,
                         },
                     ))
                 },
@@ -719,6 +722,12 @@ impl IndexStore {
     pub fn call_fact_view(&self) -> views::CallFactStoreView<'_> {
         views::CallFactStoreView::new(self)
     }
+}
+
+pub(crate) fn semantic_language_storage_code(
+    language: crate::semantic_model::SemanticLanguage,
+) -> i64 {
+    writes::semantic_language_code(language)
 }
 
 /// A schema can stay structurally current while the parser fact contract moves

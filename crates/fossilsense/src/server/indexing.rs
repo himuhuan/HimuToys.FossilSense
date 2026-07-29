@@ -239,6 +239,19 @@ impl Backend {
 
     async fn spawn_index_roots_with_scope(&self, roots: Option<Vec<PathBuf>>, force: bool) {
         self.session.cache.invalidate_after_index_change().await;
+        let root_scope = match roots.as_ref() {
+            Some(roots) => roots.clone(),
+            None => self.workspace_roots.lock().await.clone(),
+        };
+        // A user-triggered refresh/rebuild must observe fossilsense.json even
+        // when no file-watcher event arrived.
+        self.config_cache
+            .lock()
+            .await
+            .retain(|root, _| !root_scope.contains(root));
+        #[cfg(test)]
+        self.invalidate_external_source_root_cache(&root_scope)
+            .await;
         let workspace_state = IndexWorkspaceState {
             documents: self.session.documents.clone(),
             roots: self.workspace_roots.clone(),
@@ -371,6 +384,7 @@ async fn run_scheduled_indexes(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn index_roots(
     client: Client,
     roots: Vec<PathBuf>,
@@ -402,19 +416,32 @@ async fn index_roots(
         let include_paths_for_index = include_paths.clone();
         let go_module_paths_for_index = go_module_paths.clone();
         let result = tokio::task::spawn_blocking(move || {
-            indexer::index_workspace(
-                index_root,
+            let prepared = indexer::prepare_index_configuration(
+                &index_root,
+                &include_paths_for_index,
+                &go_module_paths_for_index,
+            )?;
+            let stats = indexer::index_workspace(
+                &index_root,
                 IndexOptions {
                     db_path: None,
                     force,
                     include_paths: include_paths_for_index,
                     go_module_paths: go_module_paths_for_index,
+                    prepared_configuration: Some(prepared.clone()),
                     ..Default::default()
                 },
                 |status| {
                     let _ = sender.send(status);
                 },
-            )
+            )?;
+            let workspace_semantics = Arc::new(
+                super::workspace_config::PublishedWorkspaceSemantics::from_index_configuration(
+                    &index_root,
+                    &prepared,
+                ),
+            );
+            Ok::<_, anyhow::Error>((stats, workspace_semantics))
         });
 
         while let Some(status) = receiver.recv().await {
@@ -437,7 +464,7 @@ async fn index_roots(
         }
 
         match result.await {
-            Ok(Ok(mut stats)) => {
+            Ok(Ok((mut stats, workspace_semantics))) => {
                 if let Some(warning) = &stats.maintenance_warning {
                     client
                         .log_message(MessageType::WARNING, warning.clone())
@@ -462,7 +489,10 @@ async fn index_roots(
                         ),
                     )
                     .await;
-                match cache.publish_full_index(&client, root.clone()).await {
+                match cache
+                    .publish_full_index_with_semantics(&client, root.clone(), workspace_semantics)
+                    .await
+                {
                     Ok(report) => {
                         if !workspace_state.roots.lock().await.contains(&root) {
                             cache
@@ -601,6 +631,41 @@ async fn index_dirty_roots(
         if !workspace_state.roots.lock().await.contains(&root) {
             continue;
         }
+        let published = cache.current_engine_snapshot(&root).await;
+        let store_generation = cache::load_store_semantic_generation(root.clone()).await;
+        let may_increment = published.as_ref().is_some_and(|snapshot| {
+            snapshot.semantic_generation != crate::call_model::SemanticGeneration::MISSING
+                && store_generation
+                    .as_ref()
+                    .is_ok_and(|generation| *generation == snapshot.semantic_generation)
+        });
+        if !may_increment {
+            client
+                .log_message(
+                    MessageType::WARNING,
+                    format!(
+                        "dirty update for {} has no direct published base; rebuilding the full workspace",
+                        root.display()
+                    ),
+                )
+                .await;
+            index_roots(
+                client.clone(),
+                vec![root],
+                include_paths.clone(),
+                go_module_paths.clone(),
+                cache.clone(),
+                workspace_state.clone(),
+                false,
+                perf_logging_enabled,
+            )
+            .await;
+            continue;
+        }
+        let workspace_semantics = published
+            .expect("incremental eligibility requires a published snapshot")
+            .workspace_semantics
+            .clone();
         let display_root = root.display().to_string();
         let rel_paths: Vec<String> = changes
             .iter()
@@ -621,23 +686,27 @@ async fn index_dirty_roots(
         let index_root = root.clone();
         let include_paths_for_index = include_paths.clone();
         let go_module_paths_for_index = go_module_paths.clone();
+        let workspace_semantics_for_index = workspace_semantics.clone();
         let dirty_changes: Vec<indexer::DirtyFileChange> =
             changes.into_iter().map(|change| change.change).collect();
         let result = tokio::task::spawn_blocking(move || {
-            indexer::index_dirty_files(
-                index_root,
+            let prepared = workspace_semantics_for_index.index_configuration_snapshot();
+            let stats = indexer::index_dirty_files(
+                &index_root,
                 dirty_changes,
                 IndexOptions {
                     db_path: None,
                     force: false,
                     include_paths: include_paths_for_index,
                     go_module_paths: go_module_paths_for_index,
+                    prepared_configuration: Some(prepared.clone()),
                     ..Default::default()
                 },
                 |status| {
                     let _ = sender.send(status);
                 },
-            )
+            )?;
+            Ok::<_, anyhow::Error>((stats, workspace_semantics_for_index))
         });
 
         while let Some(status) = receiver.recv().await {
@@ -657,7 +726,7 @@ async fn index_dirty_roots(
         }
 
         match result.await {
-            Ok(Ok(mut stats)) => {
+            Ok(Ok((mut stats, workspace_semantics))) => {
                 if let Some(warning) = &stats.maintenance_warning {
                     client
                         .log_message(MessageType::WARNING, warning.clone())
@@ -682,11 +751,12 @@ async fn index_dirty_roots(
                     )
                     .await;
                 match cache
-                    .publish_dirty_index(
+                    .publish_dirty_index_with_semantics(
                         &client,
                         root.clone(),
                         &rel_paths,
                         &stats.include_edge_sources_rebuilt,
+                        workspace_semantics,
                     )
                     .await
                 {
@@ -800,6 +870,25 @@ async fn index_dirty_roots(
                     .await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+impl Backend {
+    pub(super) async fn run_dirty_index_for_test(&self, changes: Vec<RootDirtyChange>) {
+        index_dirty_roots(
+            self.client.clone(),
+            self.include_paths.lock().await.clone(),
+            self.go_module_paths.lock().await.clone(),
+            self.session.cache.clone(),
+            IndexWorkspaceState {
+                documents: self.session.documents.clone(),
+                roots: self.workspace_roots.clone(),
+            },
+            changes,
+            false,
+        )
+        .await;
     }
 }
 

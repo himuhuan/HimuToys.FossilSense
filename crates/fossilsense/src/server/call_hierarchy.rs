@@ -35,7 +35,7 @@ struct ItemData {
 pub(super) struct RelationRequestState {
     pub(super) root: PathBuf,
     pub(super) handle: Arc<CallReadHandle>,
-    overlays: Arc<Vec<FileCallOverlay>>,
+    pub(super) overlays: Arc<Vec<FileCallOverlay>>,
     pub(super) revision: RelationRevision,
     reach_graph: Option<std::sync::Arc<ReachGraph>>,
     semantic_family: crate::semantic_model::SemanticFamily,
@@ -232,21 +232,43 @@ impl Backend {
     }
 
     pub(super) async fn relation_state_for_uri(&self, uri: &Url) -> Option<RelationRequestState> {
+        let documents = self
+            .session
+            .documents
+            .capture_request_snapshot(Some(uri))
+            .await;
         let root = self.root_for_uri(uri).await?;
         let context = self.request_context_for_root(root.clone()).await;
+        self.relation_state_from_context(uri, root, context, documents)
+            .await
+    }
+
+    pub(super) async fn relation_state_from_context(
+        &self,
+        uri: &Url,
+        root: PathBuf,
+        context: super::RequestContext,
+        documents: super::workspace::DocumentRequestSnapshot,
+    ) -> Option<RelationRequestState> {
         let handle = context.engine.call_read_handle.clone()?;
         let overlay = self
-            .candidate_overlay_snapshot(
+            .candidate_overlay_snapshot_from_documents(
                 &root,
                 context.engine.semantic_generation,
                 context.engine.reach_graph.as_deref(),
                 context.engine.indexed_files.as_deref().map(Vec::as_slice),
+                context.engine.workspace_semantics.clone(),
+                documents,
             )
             .await;
         let overlay_epoch = overlay.epoch;
         let reach_graph = overlay.effective_reach_graph_arc(context.engine.reach_graph.clone());
         let overlays = overlay.call_relation_overlays();
-        let semantic_family = self.source_language_for_uri(uri).await.semantic_family();
+        let semantic_family = context
+            .engine
+            .workspace_semantics
+            .language_for_uri(uri)
+            .semantic_family();
         Some(RelationRequestState {
             root,
             handle,

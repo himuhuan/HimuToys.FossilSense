@@ -66,11 +66,15 @@ pub(in crate::server) struct EngineSnapshot {
     pub(in crate::server) indexed_files: Option<Arc<Vec<(String, PathBuf)>>>,
     pub(in crate::server) project_context: Option<Arc<ProjectContextIndex>>,
     pub(in crate::server) call_read_handle: Option<Arc<CallReadHandle>>,
+    pub(in crate::server) workspace_semantics:
+        Arc<super::super::workspace_config::PublishedWorkspaceSemantics>,
     pub(in crate::server) degraded: crate::progress::DegradedCapabilities,
 }
 
 impl EngineSnapshot {
     pub(super) fn empty(root: PathBuf) -> Self {
+        let workspace_semantics =
+            Arc::new(super::super::workspace_config::PublishedWorkspaceSemantics::empty(&root));
         Self {
             root,
             epoch: state::EngineEpoch::missing(),
@@ -86,6 +90,7 @@ impl EngineSnapshot {
             indexed_files: None,
             project_context: None,
             call_read_handle: None,
+            workspace_semantics,
             degraded: crate::progress::DegradedCapabilities::default(),
         }
     }

@@ -8,10 +8,13 @@ use crate::{parser, pathing};
 use super::workspace::DocumentRequestSnapshot;
 use super::{uri_to_path, Backend};
 
+pub(super) const MAX_EXTERNAL_OVERLAY_PARSED_IDENTITIES: usize = 8;
+
 impl Backend {
     /// Capture every divergent open document in this workspace under one
     /// monotonic overlay epoch. The returned Arc is immutable and cached by
     /// `(root, semantic generation, overlay epoch)`.
+    #[cfg(test)]
     pub(super) async fn candidate_overlay_snapshot(
         &self,
         root: &Path,
@@ -20,11 +23,33 @@ impl Backend {
         indexed_workspace_files: Option<&[(String, PathBuf)]>,
     ) -> Arc<CandidateOverlaySnapshot> {
         let documents = self.session.documents.capture_request_snapshot(None).await;
+        let workspace_semantics = match self
+            .session
+            .cache
+            .current_engine_snapshot(&root.to_path_buf())
+            .await
+            .filter(|snapshot| snapshot.semantic_generation == generation)
+        {
+            Some(snapshot) => snapshot.workspace_semantics.clone(),
+            None => {
+                let include_paths = self.include_paths.lock().await.clone();
+                let go_module_paths = self.go_module_paths.lock().await.clone();
+                let mut semantics =
+                    super::workspace_config::PublishedWorkspaceSemantics::load_current(
+                        root,
+                        &include_paths,
+                        &go_module_paths,
+                    );
+                semantics.external_roots = self.authorized_external_source_roots(root).await;
+                Arc::new(semantics)
+            }
+        };
         self.candidate_overlay_snapshot_from_documents(
             root,
             generation,
             base_reach_graph,
             indexed_workspace_files,
+            workspace_semantics,
             documents,
         )
         .await
@@ -39,6 +64,7 @@ impl Backend {
         generation: SemanticGeneration,
         base_reach_graph: Option<&crate::reachability::ReachGraph>,
         indexed_workspace_files: Option<&[(String, PathBuf)]>,
+        workspace_semantics: Arc<super::workspace_config::PublishedWorkspaceSemantics>,
         documents: DocumentRequestSnapshot,
     ) -> Arc<CandidateOverlaySnapshot> {
         let root = root.to_path_buf();
@@ -77,17 +103,11 @@ impl Backend {
                 })
         });
 
-        let client_roots = self.include_paths.lock().await.clone();
-        let configured = self
-            .include_roots_for_workspace(Some(&root), &client_roots)
-            .await;
+        let external_roots = workspace_semantics.external_roots.clone();
+        let language_resolver = workspace_semantics.language.clone();
         let root_for_paths = root.clone();
         let prepared = tokio::task::spawn_blocking(move || {
-            let (include_roots, _issues) = crate::config::resolve_include_roots(&configured);
-            let include_root_strings: Vec<String> = include_roots
-                .iter()
-                .map(|path| pathing::normalize_abs_path(path))
-                .collect();
+            let include_root_strings = external_roots.normalized_include_roots();
             let mut prepared = Vec::new();
             for (uri, snapshot) in documents.all {
                 if !snapshot.needs_relation_overlay(generation) {
@@ -96,24 +116,33 @@ impl Backend {
                 let Some(path) = uri_to_path(&uri) else {
                     continue;
                 };
-                let overlay_path = if pathing::path_is_within(&root_for_paths, &path) {
-                    pathing::relative_slash_path(&root_for_paths, &path).ok()
+                let is_external = !pathing::path_is_within(&root_for_paths, &path);
+                let overlay_targets = if !is_external {
+                    let language = language_resolver.language_for_path(&path);
+                    pathing::relative_slash_path(&root_for_paths, &path)
+                        .ok()
+                        .map(|path| vec![(path, Some(language))])
                 } else {
-                    include_roots.iter().find_map(|include_root| {
-                        if !pathing::path_is_within(include_root, &path) {
-                            return None;
-                        }
-                        let relative = pathing::relative_slash_path(include_root, &path).ok()?;
-                        let base = pathing::normalize_abs_path(include_root);
-                        Some(if relative.is_empty() {
-                            base
-                        } else {
-                            format!("{}/{}", base.trim_end_matches('/'), relative)
+                    external_roots
+                        .mapped_path(&path)
+                        .map(|authorized| {
+                            authorized
+                                .identities
+                                .into_iter()
+                                .filter_map(|identity| {
+                                    let language = language_resolver
+                                        .language_for_path(Path::new(&identity.identity_path));
+                                    (!identity.go_only
+                                        || language.semantic_family()
+                                            == crate::semantic_model::SemanticFamily::Go)
+                                        .then_some((identity.identity_path, Some(language)))
+                                })
+                                .collect::<Vec<_>>()
                         })
-                    })
+                        .filter(|targets| !targets.is_empty())
                 };
-                if let Some(overlay_path) = overlay_path {
-                    prepared.push((uri, path, overlay_path, snapshot));
+                if let Some(overlay_targets) = overlay_targets {
+                    prepared.push((uri, path, overlay_targets, is_external, snapshot));
                 }
             }
             (include_root_strings, prepared)
@@ -123,33 +152,73 @@ impl Backend {
 
         let (include_roots, prepared_documents) = prepared;
         let mut parsed_documents = Vec::with_capacity(prepared_documents.len());
-        for (uri, path, overlay_path, snapshot) in prepared_documents {
-            let parsed = self
-                .get_or_parse_document(
-                    &uri,
-                    &path,
-                    snapshot.version,
-                    &snapshot.text,
-                    parser::ParseFacts::HOVER_SEMANTICS,
-                )
-                .await;
-            parsed_documents.push((overlay_path, parsed, snapshot.text));
+        for (uri, path, overlay_targets, is_external, snapshot) in prepared_documents {
+            if !is_external {
+                let Some((overlay_path, language)) = overlay_targets.into_iter().next() else {
+                    continue;
+                };
+                let language = language.expect("workspace overlay language");
+                let parsed = self
+                    .get_or_parse_document_with_language(
+                        &uri,
+                        &path,
+                        snapshot.version,
+                        &snapshot.text,
+                        parser::ParseFacts::HOVER_SEMANTICS,
+                        language,
+                    )
+                    .await;
+                parsed_documents.push((
+                    overlay_path,
+                    parsed,
+                    snapshot.text,
+                    language.semantic_family(),
+                ));
+                continue;
+            }
+
+            for (identity_index, (overlay_path, language)) in
+                overlay_targets.into_iter().enumerate()
+            {
+                let language = language.expect("external overlay language");
+                let parsed = if snapshot.text.len() as u64
+                    > super::hover::HOVER_SOURCE_FILE_BYTE_LIMIT
+                    || identity_index >= MAX_EXTERNAL_OVERLAY_PARSED_IDENTITIES
+                {
+                    None
+                } else {
+                    self.get_or_parse_external_overlay_document(
+                        &uri,
+                        &overlay_path,
+                        snapshot.version,
+                        &snapshot.text,
+                        language,
+                    )
+                    .await
+                };
+                parsed_documents.push((
+                    overlay_path,
+                    parsed,
+                    snapshot.text.clone(),
+                    language.semantic_family(),
+                ));
+            }
         }
 
         let fallback_documents = parsed_documents
             .iter()
-            .map(|(path, _, text)| (path.clone(), text.clone()))
+            .map(|(path, _, text, family)| (path.clone(), text.clone(), *family))
             .collect::<Vec<_>>();
         let built = tokio::task::spawn_blocking(move || {
             let files = parsed_documents
                 .into_iter()
-                .map(|(path, parsed, text)| match parsed {
+                .map(|(path, parsed, text, family)| match parsed {
                     Some(parsed) => FileCandidateOverlay::from_index_with_text(path, &parsed, text),
                     None => {
                         // A newer didChange may cancel this captured version's
                         // parse. Keep a tombstone so stale durable facts cannot
                         // leak through the dirty path.
-                        FileCandidateOverlay::tombstone(path, text)
+                        FileCandidateOverlay::tombstone_for_family(path, text, family)
                     }
                 })
                 .collect();
@@ -173,7 +242,9 @@ impl Backend {
                 epoch,
                 fallback_documents
                     .into_iter()
-                    .map(|(path, text)| FileCandidateOverlay::tombstone(path, text))
+                    .map(|(path, text, family)| {
+                        FileCandidateOverlay::tombstone_for_family(path, text, family)
+                    })
                     .collect(),
             ))
         });

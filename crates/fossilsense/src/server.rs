@@ -151,6 +151,9 @@ pub async fn run_stdio() -> Result<()> {
         debug_candidate_reasons: AtomicBool::new(false),
         perf_logging_enabled: AtomicBool::new(false),
         config_cache: Arc::new(Mutex::new(HashMap::new())),
+        workspace_semantics_bootstrap: Arc::new(Mutex::new(Default::default())),
+        #[cfg(test)]
+        external_source_roots_cache: Arc::new(Mutex::new(Default::default())),
         resource_monitor_shutdown: Arc::new(tokio::sync::Notify::new()),
     });
 
@@ -208,6 +211,14 @@ struct Backend {
     /// Request hot paths never read or parse `fossilsense.json`; the entry is
     /// invalidated when that file changes or its workspace root is removed.
     config_cache: Arc<Mutex<HashMap<PathBuf, WorkspaceRootConfig>>>,
+    /// Per-root single-flight gates for the first immutable configuration
+    /// snapshot. The map is pruned when workspace roots are removed.
+    workspace_semantics_bootstrap: Arc<Mutex<workspace_config::WorkspaceSemanticsBootstrap>>,
+    #[cfg(test)]
+    /// Test-only current-configuration mapping used by isolated overlay/cache
+    /// regressions. Production requests use the immutable mapping owned by
+    /// `EngineSnapshot.workspace_semantics`.
+    external_source_roots_cache: Arc<Mutex<workspace_config::ExternalSourceRootsCache>>,
     /// Cancels the `fossilsense/resourceUsage` background reporter when the
     /// server shuts down. The reporter is spawned in `initialized` and stopped
     /// in `shutdown`.
@@ -217,24 +228,29 @@ struct Backend {
 #[derive(Clone)]
 struct WorkspaceRootConfig {
     workspace: WorkspaceConfig,
+    #[cfg(test)]
     language: LanguageResolver,
 }
 
 impl WorkspaceRootConfig {
     fn load(root: &Path) -> Self {
         let workspace = WorkspaceConfig::load(root).0;
+        #[cfg(test)]
         let language = LanguageResolver::from_workspace_config(root, &workspace);
         Self {
             workspace,
+            #[cfg(test)]
             language,
         }
     }
 
-    fn fallback(root: &Path) -> Self {
+    fn fallback(_root: &Path) -> Self {
         let workspace = WorkspaceConfig::default();
-        let language = LanguageResolver::from_workspace_config(root, &workspace);
+        #[cfg(test)]
+        let language = LanguageResolver::from_workspace_config(_root, &workspace);
         Self {
             workspace,
+            #[cfg(test)]
             language,
         }
     }
@@ -290,6 +306,7 @@ impl Backend {
     /// (all-facts) parse result so that multiple request types (semantic
     /// tokens, member completion, document symbols) for the same version
     /// share a single parse. Parsing is spawned on the blocking thread-pool.
+    #[cfg(test)]
     async fn get_or_parse_document(
         &self,
         uri: &Url,
@@ -299,6 +316,26 @@ impl Backend {
         requested_facts: parser::ParseFacts,
     ) -> Option<Arc<FileSemanticIndex>> {
         let language = self.source_language_for_path(path).await;
+        self.get_or_parse_document_with_language(
+            uri,
+            path,
+            version,
+            text,
+            requested_facts,
+            language,
+        )
+        .await
+    }
+
+    async fn get_or_parse_document_with_language(
+        &self,
+        uri: &Url,
+        path: &Path,
+        version: i32,
+        text: &str,
+        requested_facts: parser::ParseFacts,
+        language: SourceLanguage,
+    ) -> Option<Arc<FileSemanticIndex>> {
         let identity_path = if language == SourceLanguage::Go {
             self.root_for_uri(uri)
                 .await
@@ -392,6 +429,79 @@ impl Backend {
         Some(index)
     }
 
+    /// Parse one authorized external-document identity. The identity is part
+    /// of the cache key because parser output stores declaration paths, while
+    /// the URI/version pair lets independent workspace roots share the same
+    /// result when they publish the same identity and language.
+    async fn get_or_parse_external_overlay_document(
+        &self,
+        uri: &Url,
+        identity_path: &str,
+        version: i32,
+        text: &str,
+        language: SourceLanguage,
+    ) -> Option<Arc<FileSemanticIndex>> {
+        if let Some(cached) = self
+            .session
+            .documents
+            .cached_external_overlay_parse(uri, version, language, identity_path)
+            .await
+        {
+            return Some(cached);
+        }
+
+        // The gate is URI-scoped so concurrent requests from different roots
+        // cannot duplicate the same external parse. Distinct identities still
+        // serialize, and candidate overlay construction applies a hard count
+        // bound before calling this method.
+        let parse_gate = self.session.documents.live_parse_gate(uri).await;
+        let _parse_guard = parse_gate.lock().await;
+        if let Some(cached) = self
+            .session
+            .documents
+            .cached_external_overlay_parse(uri, version, language, identity_path)
+            .await
+        {
+            return Some(cached);
+        }
+
+        let cancellation = self
+            .session
+            .documents
+            .live_parse_cancellation(uri, version)
+            .await;
+        let parse_cancellation = cancellation.clone();
+        let path_owned = PathBuf::from(identity_path);
+        let text_owned = text.to_string();
+        let parsed = tokio::task::spawn_blocking(move || {
+            parser::parse_thread_local_with_language_cancel(
+                &path_owned,
+                &text_owned,
+                language,
+                parser::ParseFacts::HOVER_SEMANTICS,
+                &parse_cancellation,
+            )
+            .map(Arc::new)
+        })
+        .await
+        .ok()??;
+        if cancellation.load(Ordering::Relaxed) {
+            return None;
+        }
+
+        self.session
+            .documents
+            .store_external_overlay_parse(
+                uri.clone(),
+                version,
+                language,
+                identity_path.to_string(),
+                parsed.clone(),
+            )
+            .await;
+        Some(parsed)
+    }
+
     fn reach_scope_from_context(
         &self,
         uri: &Url,
@@ -422,6 +532,7 @@ impl Backend {
     }
 
     async fn request_context_for_root(&self, root: PathBuf) -> RequestContext {
+        self.ensure_workspace_semantics(&root).await;
         self.session
             .request_context_for_root_with_settings(root, self.request_settings())
             .await

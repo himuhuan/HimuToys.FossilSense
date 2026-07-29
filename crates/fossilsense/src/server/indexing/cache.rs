@@ -37,6 +37,12 @@ async fn load_reach_graph(root: PathBuf) -> Result<Arc<ReachGraph>> {
     }
 }
 
+pub(super) async fn load_store_semantic_generation(
+    root: PathBuf,
+) -> Result<crate::call_model::SemanticGeneration> {
+    load_semantic_generation(root).await
+}
+
 fn build_reach_graph_from_db(db_path: &Path) -> Result<ReachGraph> {
     let store = IndexStore::open_readonly(db_path)?;
     let reach_view = store.reach_graph_view();
@@ -232,19 +238,49 @@ async fn update_indexed_file_list(
 }
 
 impl CacheLedger {
+    #[cfg(test)]
     pub(in crate::server) async fn publish_full_index(
         &self,
         client: &Client,
         root: PathBuf,
     ) -> Result<CachePublishReport> {
+        let workspace_semantics = Arc::new(
+            super::super::workspace_config::PublishedWorkspaceSemantics::load_current(
+                &root,
+                &[],
+                &[],
+            ),
+        );
+        self.publish_full_index_with_semantics(client, root, workspace_semantics)
+            .await
+    }
+
+    pub(in crate::server) async fn publish_full_index_with_semantics(
+        &self,
+        client: &Client,
+        root: PathBuf,
+        workspace_semantics: Arc<super::super::workspace_config::PublishedWorkspaceSemantics>,
+    ) -> Result<CachePublishReport> {
         // SQLite has one writer and the runtime has one snapshot publisher. The
         // previous engine snapshot stays visible while every next component is
         // built off to the side.
         let _publish_guard = self.publish_gate.lock().await;
+        self.publish_full_index_under_gate(client, root, workspace_semantics)
+            .await
+    }
+
+    async fn publish_full_index_under_gate(
+        &self,
+        client: &Client,
+        root: PathBuf,
+        workspace_semantics: Arc<super::super::workspace_config::PublishedWorkspaceSemantics>,
+    ) -> Result<CachePublishReport> {
         let semantic_generation = load_semantic_generation(root.clone()).await?;
 
         let nt_started = tokio::time::Instant::now();
-        let project_context = rebuild_project_context(client, root.clone()).await;
+        let project_context =
+            rebuild_project_context(client, root.clone(), workspace_semantics.workspace.clone())
+                .await;
         let declaration_index = rebuild_declaration_index(
             root.clone(),
             project_context.clone(),
@@ -328,6 +364,7 @@ impl CacheLedger {
             indexed_files,
             project_context,
             call_read_handle: Some(call_read_handle),
+            workspace_semantics,
             degraded: degraded.clone(),
         })
         .await;
@@ -348,6 +385,7 @@ impl CacheLedger {
         })
     }
 
+    #[cfg(test)]
     pub(in crate::server) async fn publish_dirty_index(
         &self,
         client: &Client,
@@ -355,9 +393,56 @@ impl CacheLedger {
         rel_paths: &[String],
         include_edge_sources_rebuilt: &[String],
     ) -> Result<CachePublishReport> {
+        let workspace_semantics = self
+            .current_engine_snapshot(&root)
+            .await
+            .map(|snapshot| snapshot.workspace_semantics.clone())
+            .unwrap_or_else(|| {
+                Arc::new(
+                    super::super::workspace_config::PublishedWorkspaceSemantics::load_current(
+                        &root,
+                        &[],
+                        &[],
+                    ),
+                )
+            });
+        self.publish_dirty_index_with_semantics(
+            client,
+            root,
+            rel_paths,
+            include_edge_sources_rebuilt,
+            workspace_semantics,
+        )
+        .await
+    }
+
+    pub(in crate::server) async fn publish_dirty_index_with_semantics(
+        &self,
+        client: &Client,
+        root: PathBuf,
+        rel_paths: &[String],
+        include_edge_sources_rebuilt: &[String],
+        workspace_semantics: Arc<super::super::workspace_config::PublishedWorkspaceSemantics>,
+    ) -> Result<CachePublishReport> {
         let _publish_guard = self.publish_gate.lock().await;
         let semantic_generation = load_semantic_generation(root.clone()).await?;
         let previous = self.current_engine_snapshot(&root).await;
+        let direct_base = previous.as_ref().is_some_and(|snapshot| {
+            snapshot.semantic_generation != crate::call_model::SemanticGeneration::MISSING
+                && snapshot.semantic_generation.0.checked_add(1) == Some(semantic_generation.0)
+        });
+        if !direct_base {
+            return self
+                .publish_full_index_under_gate(client, root, workspace_semantics)
+                .await;
+        }
+        anyhow::ensure!(
+            previous.as_ref().is_some_and(|snapshot| Arc::ptr_eq(
+                &snapshot.workspace_semantics,
+                &workspace_semantics
+            )),
+            "dirty index configuration differs from its published base; full index required"
+        );
         let project_context = previous
             .as_ref()
             .and_then(|snapshot| snapshot.project_context.clone());
@@ -455,6 +540,7 @@ impl CacheLedger {
             indexed_files,
             project_context,
             call_read_handle: Some(call_read_handle),
+            workspace_semantics,
             degraded: degraded.clone(),
         })
         .await;
@@ -558,6 +644,7 @@ impl CacheLedger {
             indexed_files: current.indexed_files.clone(),
             project_context: current.project_context.clone(),
             call_read_handle: current.call_read_handle.clone(),
+            workspace_semantics: current.workspace_semantics.clone(),
             degraded: current.degraded.clone(),
         })
         .await;
@@ -578,7 +665,12 @@ impl CacheLedger {
             .current_engine_snapshot(&root)
             .await
             .context("project context refresh requires a published engine snapshot")?;
-        let project_context = rebuild_project_context(client, root.clone()).await;
+        let project_context = rebuild_project_context(
+            client,
+            root.clone(),
+            previous.workspace_semantics.workspace.clone(),
+        )
+        .await;
         let project_count = project_context
             .as_ref()
             .map_or(0, |index| index.projects().len());
@@ -604,6 +696,7 @@ impl CacheLedger {
             indexed_files: previous.indexed_files.clone(),
             project_context,
             call_read_handle: previous.call_read_handle.clone(),
+            workspace_semantics: previous.workspace_semantics.clone(),
             degraded,
         })
         .await;

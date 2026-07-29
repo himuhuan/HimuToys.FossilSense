@@ -41,9 +41,13 @@ impl Backend {
         let current_rel = uri_to_path(&uri)
             .and_then(|path| pathing::relative_slash_path(&root, &path).ok())
             .unwrap_or_default();
-        let semantic_family = self.source_language_for_uri(&uri).await.semantic_family();
         let total_started = std::time::Instant::now();
         let context = self.request_context_for_root(root.clone()).await;
+        let semantic_family = context
+            .engine
+            .workspace_semantics
+            .language_for_uri(&uri)
+            .semantic_family();
         let reach_started = std::time::Instant::now();
         let reach_scope = self
             .reach_scope_from_context(&uri, &context)
@@ -60,6 +64,7 @@ impl Backend {
                 semantic_generation,
                 reach_graph.as_deref(),
                 context.engine.indexed_files.as_deref().map(Vec::as_slice),
+                context.engine.workspace_semantics.clone(),
                 documents,
             )
             .await;

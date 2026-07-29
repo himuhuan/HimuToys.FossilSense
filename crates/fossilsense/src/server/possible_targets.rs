@@ -97,7 +97,7 @@ impl Backend {
             .and_then(|path| pathing::relative_slash_path(&root, path).ok())
             .unwrap_or_default();
         let context = self.request_context_for_root(root.clone()).await;
-        let source_language = self.source_language_for_uri(&uri).await;
+        let source_language = context.engine.workspace_semantics.language_for_uri(&uri);
         let semantic_family = source_language.semantic_family();
         let semantic_generation = context.engine.semantic_generation.0;
         let cursor = crate::call_model::SourcePosition { line, character };
@@ -184,6 +184,7 @@ impl Backend {
                 semantic_epoch,
                 reach_graph.as_deref(),
                 indexed_files.as_deref().map(Vec::as_slice),
+                context.engine.workspace_semantics.clone(),
                 documents,
             )
             .await;

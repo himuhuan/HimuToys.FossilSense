@@ -138,7 +138,7 @@ fn semantic_family_from_language_code(
     value: i64,
 ) -> rusqlite::Result<crate::semantic_model::SemanticFamily> {
     match value {
-        0 | 1 | 2 => Ok(crate::semantic_model::SemanticFamily::CFamily),
+        0..=2 => Ok(crate::semantic_model::SemanticFamily::CFamily),
         3 => Ok(crate::semantic_model::SemanticFamily::Go),
         _ => Err(rusqlite::Error::IntegralValueOutOfRange(11, value)),
     }

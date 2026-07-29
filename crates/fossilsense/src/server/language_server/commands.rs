@@ -59,13 +59,13 @@ impl Backend {
             let context = self.request_context_for_root(root.clone()).await;
             let indexed_generation = context.engine.epoch.as_u64();
             let indexed_files = context.engine.indexed_files.clone();
-            let config_snapshot = self.workspace_root_config(&root).await;
-            let semantic_family = uri_to_path(&uri)
-                .map(|path| config_snapshot.language.language_for_path(&path))
-                .unwrap_or_else(|| SourceLanguage::default_for_path(Path::new(uri.path())))
+            let semantic_family = context
+                .engine
+                .workspace_semantics
+                .language_for_uri(&uri)
                 .semantic_family();
-            let workspace_config = config_snapshot.workspace;
-            let language_resolver = config_snapshot.language;
+            let workspace_config = context.engine.workspace_semantics.workspace.clone();
+            let language_resolver = context.engine.workspace_semantics.language.clone();
             let result = tokio::task::spawn_blocking(
                 move || -> Result<(Vec<GroupedReferenceItem>, bool, references::ReferencesTiming)> {
                     let (mut hits, truncated, timing) =

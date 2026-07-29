@@ -57,6 +57,10 @@ impl LanguageServer for Backend {
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let uri = params.text_document.uri.clone();
+        if let Some(path) = uri_to_path(&uri) {
+            self.invalidate_external_source_path_authorization(&path)
+                .await;
+        }
         self.session
             .open_document(
                 uri.clone(),
@@ -104,7 +108,13 @@ impl LanguageServer for Backend {
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
-        self.session.close_document(&params.text_document.uri).await;
+        let uri = params.text_document.uri;
+        let path = uri_to_path(&uri);
+        self.session.close_document(&uri).await;
+        if let Some(path) = path {
+            self.invalidate_external_source_path_authorization(&path)
+                .await;
+        }
     }
 
     async fn goto_definition(
@@ -150,13 +160,13 @@ impl LanguageServer for Backend {
         let context = self.request_context_for_root(root.clone()).await;
         let indexed_generation = context.engine.epoch.as_u64();
         let indexed_files = context.engine.indexed_files.clone();
-        let config_snapshot = self.workspace_root_config(&root).await;
-        let semantic_family = uri_to_path(&uri)
-            .map(|path| config_snapshot.language.language_for_path(&path))
-            .unwrap_or_else(|| SourceLanguage::default_for_path(Path::new(uri.path())))
+        let semantic_family = context
+            .engine
+            .workspace_semantics
+            .language_for_uri(&uri)
             .semantic_family();
-        let workspace_config = config_snapshot.workspace;
-        let language_resolver = config_snapshot.language;
+        let workspace_config = context.engine.workspace_semantics.workspace.clone();
+        let language_resolver = context.engine.workspace_semantics.language.clone();
         let result = tokio::task::spawn_blocking(
             move || -> Result<(Vec<Location>, bool, references::ReferencesTiming)> {
                 let (mut hits, truncated, timing) =
@@ -311,17 +321,23 @@ impl LanguageServer for Backend {
         let Some(path) = uri_to_path(&uri) else {
             return Ok(None);
         };
+        let source_language = self
+            .request_context_for_uri(&uri)
+            .await
+            .map(|context| context.engine.workspace_semantics.language_for_uri(&uri))
+            .unwrap_or_else(|| SourceLanguage::default_for_path(&path));
 
         let started = tokio::time::Instant::now();
         // Live parse served from the in-memory cache (one parse per document
         // version, shared across semantic tokens, completion, and symbols).
         let index = self
-            .get_or_parse_document(
+            .get_or_parse_document_with_language(
                 &uri,
                 &path,
                 version,
                 &text,
                 parser::ParseFacts::DECLARATIONS | parser::ParseFacts::INCLUDES,
+                source_language,
             )
             .await;
         let Some(index) = index else {
@@ -373,42 +389,46 @@ impl LanguageServer for Backend {
 
         let line_text = text.lines().nth(position.line as usize).unwrap_or_default();
 
-        if self.source_language_for_uri(&uri).await == SourceLanguage::Go {
-            if let Some(import_context) = go_import_completion::go_import_completion_context(
-                &text,
-                position.line,
-                position.character,
-            ) {
-                let (table, current_package_key) = match self.root_for_uri(&uri).await {
-                    Some(root) => {
-                        let current_package_key = uri_to_path(&uri).and_then(|path| {
-                            let identity_path = pathing::relative_slash_path(&root, &path)
-                                .unwrap_or_else(|_| pathing::normalize_abs_path(&path));
-                            go_import_completion::current_go_package_key(&identity_path, &text)
-                        });
-                        (
-                            self.request_context_for_root(root)
-                                .await
-                                .engine
-                                .go_import_table
-                                .clone(),
-                            current_package_key,
-                        )
-                    }
-                    None => (None, None),
-                };
-                return Ok(Some(match table {
-                    Some(table) => table.complete(&import_context, current_package_key.as_deref()),
-                    None => empty_completion_list(true),
-                }));
-            }
-        }
-
         // Inside an `#include "..."` / `<...>`: offer header paths, not symbols.
         if let Some((form, partial)) =
             includes::include_completion_context(line_text, position.character)
         {
             return self.complete_include(&uri, form, partial, &text).await;
+        }
+
+        let current_root = self.root_for_uri(&uri).await;
+        let primary_context = match current_root.as_ref() {
+            Some(root) => Some(self.request_context_for_root(root.clone()).await),
+            None => None,
+        };
+        let source_language = primary_context
+            .as_ref()
+            .map(|context| context.engine.workspace_semantics.language_for_uri(&uri))
+            .unwrap_or_else(|| SourceLanguage::default_for_path(Path::new(uri.path())));
+
+        if source_language == SourceLanguage::Go {
+            if let Some(import_context) = go_import_completion::go_import_completion_context(
+                &text,
+                position.line,
+                position.character,
+            ) {
+                let (table, current_package_key) =
+                    match (current_root.as_ref(), primary_context.as_ref()) {
+                        (Some(root), Some(context)) => {
+                            let current_package_key = uri_to_path(&uri).and_then(|path| {
+                                let identity_path = pathing::relative_slash_path(root, &path)
+                                    .unwrap_or_else(|_| pathing::normalize_abs_path(&path));
+                                go_import_completion::current_go_package_key(&identity_path, &text)
+                            });
+                            (context.engine.go_import_table.clone(), current_package_key)
+                        }
+                        _ => (None, None),
+                    };
+                return Ok(Some(match table {
+                    Some(table) => table.complete(&import_context, current_package_key.as_deref()),
+                    None => empty_completion_list(true),
+                }));
+            }
         }
 
         if query::is_member_completion_context(line_text, position.character) {
@@ -425,7 +445,7 @@ impl LanguageServer for Backend {
             crate::completion::classify_completion_intent(line_text, position.character, &prefix);
         let history_enabled = self.completion_history_mode.lock().await.is_enabled();
         let history_root = if history_enabled {
-            self.root_for_uri(&uri).await
+            current_root.clone()
         } else {
             None
         };
@@ -447,12 +467,13 @@ impl LanguageServer for Backend {
 
         let parsed_document = match uri_to_path(&uri) {
             Some(path) => {
-                self.get_or_parse_document(
+                self.get_or_parse_document_with_language(
                     &uri,
                     &path,
                     version,
                     &text,
                     parser::ParseFacts::COMPLETION,
+                    source_language,
                 )
                 .await
             }
@@ -460,11 +481,16 @@ impl LanguageServer for Backend {
         };
         let local_words = self.local_words_for(&uri, version, &text).await;
 
-        let current_root = self.root_for_uri(&uri).await;
         let mut contexts = {
             let roots = self.workspace_roots.lock().await.clone();
             let mut contexts = Vec::with_capacity(roots.len());
             for root in roots {
+                if current_root.as_ref() == Some(&root) {
+                    if let Some(context) = primary_context.as_ref() {
+                        contexts.push(context.clone());
+                        continue;
+                    }
+                }
                 contexts.push(self.request_context_for_root(root).await);
             }
             contexts
@@ -484,6 +510,7 @@ impl LanguageServer for Backend {
                         context.engine.semantic_generation,
                         context.engine.reach_graph.as_deref(),
                         context.engine.indexed_files.as_deref().map(Vec::as_slice),
+                        context.engine.workspace_semantics.clone(),
                         document_request.clone(),
                     )
                     .await;
@@ -784,11 +811,13 @@ impl LanguageServer for Backend {
             roots.dedup();
         }
         if !removed.is_empty() {
-            self.session.cache.remove_workspace_roots(&removed).await;
+            self.remove_workspace_runtime_roots(&removed).await;
             self.config_cache
                 .lock()
                 .await
                 .retain(|root, _| !removed.contains(root));
+            #[cfg(test)]
+            self.invalidate_external_source_root_cache(&removed).await;
             let removed_history_paths: Vec<PathBuf> = removed
                 .iter()
                 .filter_map(|root| pathing::default_completion_history_path(root).ok())
