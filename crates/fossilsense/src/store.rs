@@ -1,9 +1,10 @@
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension};
 
 use crate::semantic_model::{
     MemberConfidence, MemberKind, PersistentFacts, RecordConfidence, RecordKind,
@@ -80,6 +81,61 @@ pub struct IndexStore {
     conn: Connection,
     legacy_full_build: Option<IndexBuild>,
     bulk_call_string_ids: Option<HashMap<String, i64>>,
+}
+
+/// Cross-process writer lock for one explicit index destination.
+///
+/// Every FossilSense writer that receives an explicit `--db` path holds an
+/// exclusive transaction on a small, stable sibling lock database. SQLite
+/// releases that transaction after normal exit or process death, avoiding a
+/// stale PID-file protocol. The lock database itself intentionally remains so
+/// no close/delete/open race can split cooperating writers across two inodes.
+pub struct ExplicitIndexLock {
+    _connection: Connection,
+    destination: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplicitIndexSnapshot {
+    destination: PathBuf,
+    generation: u64,
+    state: ExplicitTargetState,
+    files: SqliteFamilyIdentity,
+}
+
+impl ExplicitIndexSnapshot {
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExplicitTargetState {
+    Missing,
+    Database,
+    ReplaceableCorrupt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SqliteFamilyIdentity {
+    main: Option<FileIdentity>,
+    wal: Option<FileIdentity>,
+    shm: Option<FileIdentity>,
+    journal: Option<FileIdentity>,
+}
+
+impl SqliteFamilyIdentity {
+    fn has_sidecars(&self) -> bool {
+        self.wal.is_some() || self.shm.is_some() || self.journal.is_some()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileIdentity {
+    len: u64,
+    modified: Option<SystemTime>,
+    volume_or_device: u64,
+    file_index_or_inode: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,6 +218,116 @@ fn include_normalized_metadata(target_text: &str) -> (&'static str, String, Stri
         .unwrap_or(&normalized)
         .to_string();
     (form_str, normalized, basename)
+}
+
+impl ExplicitIndexLock {
+    pub fn acquire(destination: &Path) -> Result<Self> {
+        let destination = normalized_explicit_destination(destination)?;
+        let lock_path = explicit_lock_path(&destination);
+        let connection = Connection::open(&lock_path).with_context(|| {
+            format!(
+                "failed to open explicit index writer lock {}",
+                lock_path.display()
+            )
+        })?;
+        connection.busy_timeout(Duration::from_millis(250))?;
+        let journal_mode: String =
+            connection.query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))?;
+        anyhow::ensure!(
+            journal_mode.eq_ignore_ascii_case("delete"),
+            "explicit index writer lock kept unexpected journal mode {journal_mode}"
+        );
+        connection.pragma_update(None, "synchronous", "FULL")?;
+        connection
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS writer_lock (
+                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1)
+             );
+             BEGIN EXCLUSIVE;",
+            )
+            .with_context(|| {
+                format!(
+                    "explicit index destination {} is locked by another FossilSense writer",
+                    destination.display()
+                )
+            })?;
+        Ok(Self {
+            _connection: connection,
+            destination,
+        })
+    }
+
+    pub fn destination_path(&self) -> &Path {
+        &self.destination
+    }
+
+    pub fn capture_replacement_snapshot(&self) -> Result<ExplicitIndexSnapshot> {
+        // Opening a clean WAL database can remove an empty leftover sidecar
+        // when the connection closes. Retry once so that benign normalization
+        // can settle, while continuous changes still fail closed.
+        for attempt in 0..2 {
+            let before = sqlite_family_identity(&self.destination)?;
+            let (state, generation) = read_explicit_target_state(&self.destination, &before)?;
+            let after = sqlite_family_identity(&self.destination)?;
+            if before == after {
+                return Ok(ExplicitIndexSnapshot {
+                    destination: self.destination.clone(),
+                    generation,
+                    state,
+                    files: after,
+                });
+            }
+            if attempt == 1 {
+                anyhow::bail!(
+                    "explicit index target changed while its publication snapshot was captured: {}",
+                    self.destination.display()
+                );
+            }
+        }
+        unreachable!("bounded snapshot retry returns or errors")
+    }
+
+    pub fn prepare_for_atomic_replacement(&self, snapshot: &ExplicitIndexSnapshot) -> Result<()> {
+        anyhow::ensure!(
+            snapshot.destination == self.destination,
+            "explicit index snapshot belongs to a different destination"
+        );
+        let before = sqlite_family_identity(&self.destination)?;
+        anyhow::ensure!(
+            before == snapshot.files,
+            "explicit index target changed during side-by-side build: {}",
+            self.destination.display()
+        );
+        let (state, generation) = read_explicit_target_state(&self.destination, &before)?;
+        let after_read = sqlite_family_identity(&self.destination)?;
+        anyhow::ensure!(
+            after_read == before,
+            "explicit index target changed while publication was revalidated: {}",
+            self.destination.display()
+        );
+        anyhow::ensure!(
+            state == snapshot.state && generation == snapshot.generation,
+            "explicit index target generation changed during side-by-side build: expected {}, observed {}",
+            snapshot.generation,
+            generation
+        );
+
+        match state {
+            ExplicitTargetState::Missing => {}
+            ExplicitTargetState::ReplaceableCorrupt => {
+                anyhow::ensure!(
+                    !before.has_sidecars(),
+                    "refusing to replace a corrupt SQLite target with sidecars: {}",
+                    self.destination.display()
+                );
+            }
+            ExplicitTargetState::Database => {
+                drain_sqlite_wal(&self.destination)?;
+            }
+        }
+        ensure_sqlite_sidecars_absent(&self.destination)?;
+        Ok(())
+    }
 }
 
 impl IndexStore {
@@ -722,6 +888,255 @@ impl IndexStore {
     pub fn call_fact_view(&self) -> views::CallFactStoreView<'_> {
         views::CallFactStoreView::new(self)
     }
+}
+
+fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut sidecar = path.as_os_str().to_os_string();
+    sidecar.push(suffix);
+    sidecar.into()
+}
+
+fn normalized_explicit_destination(destination: &Path) -> Result<PathBuf> {
+    let file_name = destination
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("explicit index destination has no file name"))?;
+    let directory = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(directory).with_context(|| {
+        format!(
+            "failed to create explicit index directory {}",
+            directory.display()
+        )
+    })?;
+    let directory = directory.canonicalize().with_context(|| {
+        format!(
+            "failed to canonicalize explicit index directory {}",
+            directory.display()
+        )
+    })?;
+    let candidate = directory.join(file_name);
+    match fs::symlink_metadata(&candidate) {
+        Ok(_) => candidate.canonicalize().with_context(|| {
+            format!(
+                "failed to resolve explicit index destination {}",
+                candidate.display()
+            )
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(candidate),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to inspect explicit index destination {}",
+                candidate.display()
+            )
+        }),
+    }
+}
+
+fn explicit_lock_path(destination: &Path) -> PathBuf {
+    let mut hasher = blake3::Hasher::new();
+    #[cfg(windows)]
+    {
+        hasher.update(
+            destination
+                .as_os_str()
+                .to_string_lossy()
+                .to_lowercase()
+                .as_bytes(),
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        hasher.update(destination.as_os_str().as_bytes());
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        hasher.update(destination.as_os_str().to_string_lossy().as_bytes());
+    }
+    let digest = hasher.finalize().to_hex();
+    destination
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!(".fossilsense-index-{}.lock", &digest[..24]))
+}
+
+fn sqlite_family_identity(path: &Path) -> Result<SqliteFamilyIdentity> {
+    let identity = SqliteFamilyIdentity {
+        main: optional_file_identity(path, true)?,
+        wal: optional_file_identity(&sqlite_sidecar_path(path, "-wal"), true)?,
+        // Reader slots and locks mutate shared-memory contents without changing
+        // committed database state. Track the SHM inode and size, not its mtime.
+        shm: optional_file_identity(&sqlite_sidecar_path(path, "-shm"), false)?,
+        journal: optional_file_identity(&sqlite_sidecar_path(path, "-journal"), true)?,
+    };
+    anyhow::ensure!(
+        identity.main.is_some() || !identity.has_sidecars(),
+        "SQLite sidecar exists without its main database: {}",
+        path.display()
+    );
+    Ok(identity)
+}
+
+fn optional_file_identity(path: &Path, track_modified: bool) -> Result<Option<FileIdentity>> {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect SQLite file {}", path.display()));
+        }
+    };
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect SQLite file {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "SQLite path is not a regular file: {}",
+        path.display()
+    );
+    let (volume_or_device, file_index_or_inode) = platform_file_identity(&file, &metadata)?;
+    Ok(Some(FileIdentity {
+        len: metadata.len(),
+        modified: track_modified.then(|| metadata.modified().ok()).flatten(),
+        volume_or_device,
+        file_index_or_inode,
+    }))
+}
+
+#[cfg(windows)]
+fn platform_file_identity(file: &fs::File, _metadata: &fs::Metadata) -> Result<(u64, u64)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    let succeeded = unsafe {
+        GetFileInformationByHandle(file.as_raw_handle() as _, &mut information as *mut _)
+    };
+    if succeeded == 0 {
+        return Err(std::io::Error::last_os_error()).context("failed to read SQLite file identity");
+    }
+    let file_index =
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+    Ok((u64::from(information.dwVolumeSerialNumber), file_index))
+}
+
+#[cfg(unix)]
+fn platform_file_identity(_file: &fs::File, metadata: &fs::Metadata) -> Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(any(windows, unix)))]
+fn platform_file_identity(_file: &fs::File, _metadata: &fs::Metadata) -> Result<(u64, u64)> {
+    Ok((0, 0))
+}
+
+fn read_explicit_target_state(
+    path: &Path,
+    identity: &SqliteFamilyIdentity,
+) -> Result<(ExplicitTargetState, u64)> {
+    if identity.main.is_none() {
+        return Ok((ExplicitTargetState::Missing, 0));
+    }
+    let generation = (|| -> rusqlite::Result<Option<String>> {
+        let connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let has_meta: bool = connection.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'meta'
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_meta {
+            return Ok(None);
+        }
+        connection
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'semantic_generation'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+    })();
+    match generation {
+        Ok(value) => {
+            let generation = value
+                .map(|value| {
+                    value.parse::<u64>().with_context(|| {
+                        format!(
+                            "invalid semantic generation in explicit index {}",
+                            path.display()
+                        )
+                    })
+                })
+                .transpose()?
+                .unwrap_or(0);
+            Ok((ExplicitTargetState::Database, generation))
+        }
+        Err(rusqlite::Error::SqliteFailure(failure, _))
+            if matches!(
+                failure.code,
+                ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase
+            ) && !identity.has_sidecars() =>
+        {
+            Ok((ExplicitTargetState::ReplaceableCorrupt, 0))
+        }
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to read semantic generation from explicit index {}",
+                path.display()
+            )
+        }),
+    }
+}
+
+fn drain_sqlite_wal(path: &Path) -> Result<()> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| {
+        format!(
+            "failed to open explicit SQLite database {} for replacement",
+            path.display()
+        )
+    })?;
+    connection.busy_timeout(Duration::from_secs(5))?;
+    let journal_mode: String =
+        connection.query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))?;
+    anyhow::ensure!(
+        journal_mode.eq_ignore_ascii_case("delete"),
+        "failed to leave WAL mode before replacing {}: SQLite kept journal mode {journal_mode}",
+        path.display()
+    );
+    drop(connection);
+    ensure_sqlite_sidecars_absent(path)
+}
+
+fn ensure_sqlite_sidecars_absent(path: &Path) -> Result<()> {
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let sidecar = sqlite_sidecar_path(path, suffix);
+        match sidecar.try_exists() {
+            Ok(false) => {}
+            Ok(true) => anyhow::bail!(
+                "refusing to replace SQLite database while sidecar exists: {}",
+                sidecar.display()
+            ),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to inspect SQLite sidecar {}", sidecar.display())
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn semantic_language_storage_code(

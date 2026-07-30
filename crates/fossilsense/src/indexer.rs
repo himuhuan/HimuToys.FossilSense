@@ -9,10 +9,10 @@ use crate::config::{
 };
 use crate::pathing::{
     canonical_workspace, default_index_path, default_index_staging_path, normalize_abs_path,
-    publish_default_index, relative_slash_path,
+    publish_default_index, relative_slash_path, ExplicitIndexPublication,
 };
 use crate::progress::{IndexStats, IndexStatus};
-use crate::store::IndexStore;
+use crate::store::{ExplicitIndexLock, IndexStore};
 
 mod candidates;
 mod go_packages;
@@ -112,10 +112,42 @@ pub fn index_workspace(
     let started = Instant::now();
     let workspace = canonical_workspace(workspace)?;
     let workspace_display = workspace.display().to_string();
-    let explicit_db_path = options.db_path.clone();
-    let (db_path, side_by_side_publication, previous_generation) =
+    let requested_explicit_db_path = options.db_path.clone();
+    let explicit_lock = requested_explicit_db_path
+        .as_deref()
+        .map(ExplicitIndexLock::acquire)
+        .transpose()?;
+    let explicit_db_path = explicit_lock
+        .as_ref()
+        .map(|lock| lock.destination_path().to_path_buf());
+    let explicit_snapshot = if options.force {
+        explicit_lock
+            .as_ref()
+            .map(ExplicitIndexLock::capture_replacement_snapshot)
+            .transpose()?
+    } else {
+        None
+    };
+    let mut explicit_publication = explicit_db_path
+        .as_ref()
+        .filter(|_| options.force)
+        .map(|path| ExplicitIndexPublication::new(path.clone()))
+        .transpose()?;
+    let (db_path, default_side_by_side_publication, previous_generation) =
         if let Some(path) = explicit_db_path.as_ref() {
-            (path.clone(), false, 0)
+            if let Some(publication) = explicit_publication.as_ref() {
+                let previous_generation = explicit_snapshot
+                    .as_ref()
+                    .expect("force publication snapshot")
+                    .generation();
+                (
+                    publication.staging_path().to_path_buf(),
+                    false,
+                    previous_generation,
+                )
+            } else {
+                (path.clone(), false, 0)
+            }
         } else {
             let active = match default_index_path(&workspace) {
                 Ok(path) => path,
@@ -144,6 +176,8 @@ pub fn index_workspace(
                 (active, false, 0)
             }
         };
+    let side_by_side_publication =
+        default_side_by_side_publication || explicit_publication.is_some();
     let database_existed = db_path.exists();
     let mut stats = IndexStats::default();
     progress(IndexStatus::indexing_phase(
@@ -316,12 +350,31 @@ pub fn index_workspace(
         progress(IndexStatus::indexing_phase(
             workspace_display.clone(),
             &stats,
-            "publishing database generation",
+            if default_side_by_side_publication {
+                "publishing database generation"
+            } else {
+                "publishing explicit database"
+            },
         ));
         let publication_started = Instant::now();
         store.prepare_full_build_publication()?;
         drop(store);
-        publish_default_index(&workspace, &db_path, stats.semantic_generation)?;
+        if default_side_by_side_publication {
+            publish_default_index(&workspace, &db_path, stats.semantic_generation)?;
+        } else {
+            let publication = explicit_publication
+                .take()
+                .expect("explicit side-by-side publication");
+            explicit_lock
+                .as_ref()
+                .expect("explicit publication writer lock")
+                .prepare_for_atomic_replacement(
+                    explicit_snapshot
+                        .as_ref()
+                        .expect("explicit publication snapshot"),
+                )?;
+            publication.publish()?;
+        }
         stats.publication_ms = publication_started.elapsed().as_millis();
     } else if defer_call_indexes {
         progress(IndexStatus::indexing_phase(
@@ -370,10 +423,15 @@ pub fn index_dirty_files(
     let started = Instant::now();
     let workspace = canonical_workspace(workspace)?;
     let workspace_display = workspace.display().to_string();
-    let db_path = match options.db_path {
-        Some(path) => path,
-        None => default_index_path(&workspace)?,
-    };
+    let requested_explicit_db_path = options.db_path.clone();
+    let explicit_lock = requested_explicit_db_path
+        .as_deref()
+        .map(ExplicitIndexLock::acquire)
+        .transpose()?;
+    let db_path = explicit_lock
+        .as_ref()
+        .map(|lock| lock.destination_path().to_path_buf())
+        .map_or_else(|| default_index_path(&workspace), Ok)?;
     let mut stats = IndexStats {
         total_files: changes.len(),
         ..Default::default()

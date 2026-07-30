@@ -2,7 +2,7 @@ use tempfile::tempdir;
 
 use crate::parser::parse;
 
-use super::{FileFingerprint, FileSource, IndexStore};
+use super::{drain_sqlite_wal, ExplicitIndexLock, FileFingerprint, FileSource, IndexStore};
 use std::collections::HashSet;
 
 mod basic;

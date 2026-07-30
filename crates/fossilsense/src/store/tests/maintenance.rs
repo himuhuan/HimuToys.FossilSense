@@ -256,3 +256,125 @@ fn existing_explicit_full_build_keeps_online_call_string_uniqueness() {
         .expect("duplicate strings");
     assert_eq!(duplicates, 0);
 }
+
+#[test]
+fn explicit_index_lock_serializes_writers_and_rejects_target_advancement() {
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+    {
+        let mut store = IndexStore::open(&db, dir.path()).expect("initial store");
+        upsert_source(&mut store, "main.c", "int first(void) { return 1; }\n");
+    }
+
+    let lock = ExplicitIndexLock::acquire(&db).expect("first writer lock");
+    let snapshot = lock
+        .capture_replacement_snapshot()
+        .expect("replacement snapshot");
+    assert_eq!(snapshot.generation(), 1);
+    let competing_error = ExplicitIndexLock::acquire(&db)
+        .err()
+        .expect("a second writer must not share the lock");
+    assert!(
+        competing_error.to_string().contains("locked"),
+        "unexpected competing writer error: {competing_error:#}"
+    );
+
+    // Simulate a non-cooperating external writer. FossilSense writers cannot
+    // reach this state because they all hold the sibling lock, but publication
+    // still revalidates the target and fails closed.
+    let connection = rusqlite::Connection::open(&db).expect("external connection");
+    connection
+        .execute(
+            "UPDATE meta SET value = '2' WHERE key = 'semantic_generation'",
+            [],
+        )
+        .expect("advance target generation");
+    drop(connection);
+    let changed_error = lock
+        .prepare_for_atomic_replacement(&snapshot)
+        .expect_err("changed target must not be replaced");
+    assert!(
+        changed_error.to_string().contains("changed"),
+        "unexpected target-change error: {changed_error:#}"
+    );
+    drop(lock);
+
+    ExplicitIndexLock::acquire(&db).expect("process exit releases writer lock");
+}
+
+#[test]
+fn explicit_replacement_snapshot_rejects_an_invalid_generation() {
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+    {
+        let store = IndexStore::open(&db, dir.path()).expect("store");
+        store
+            .conn
+            .execute(
+                "UPDATE meta SET value = 'not-a-generation'
+                 WHERE key = 'semantic_generation'",
+                [],
+            )
+            .expect("corrupt generation");
+    }
+
+    let lock = ExplicitIndexLock::acquire(&db).expect("writer lock");
+    let error = lock
+        .capture_replacement_snapshot()
+        .expect_err("invalid generation must not silently become zero");
+    assert!(
+        error.to_string().contains("invalid semantic generation"),
+        "unexpected invalid-generation error: {error:#}"
+    );
+}
+
+#[test]
+fn explicit_replacement_drains_a_real_persistent_wal() {
+    use std::ffi::{c_void, CString};
+
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+    {
+        let mut store = IndexStore::open(&db, dir.path()).expect("store");
+        upsert_source(&mut store, "main.c", "int first(void) { return 1; }\n");
+    }
+    let connection = rusqlite::Connection::open(&db).expect("WAL writer");
+    connection
+        .pragma_update(None, "journal_mode", "WAL")
+        .expect("WAL mode");
+    connection
+        .pragma_update(None, "wal_autocheckpoint", 0)
+        .expect("disable auto-checkpoint");
+    let database_name = CString::new("main").expect("database name");
+    let mut persist = 1_i32;
+    let result = unsafe {
+        rusqlite::ffi::sqlite3_file_control(
+            connection.handle(),
+            database_name.as_ptr(),
+            rusqlite::ffi::SQLITE_FCNTL_PERSIST_WAL,
+            (&mut persist as *mut i32).cast::<c_void>(),
+        )
+    };
+    assert_eq!(result, rusqlite::ffi::SQLITE_OK);
+    connection
+        .execute_batch(
+            "CREATE TABLE wal_probe (value INTEGER NOT NULL);
+             INSERT INTO wal_probe VALUES (1);",
+        )
+        .expect("write persistent WAL");
+    drop(connection);
+
+    let wal = db.with_file_name("index.sqlite-wal");
+    assert!(wal.try_exists().expect("inspect persistent WAL"));
+    drain_sqlite_wal(&db).expect("drain WAL");
+    assert!(!wal.try_exists().expect("inspect drained WAL"));
+    assert!(!db
+        .with_file_name("index.sqlite-shm")
+        .try_exists()
+        .expect("inspect drained SHM"));
+    let connection = rusqlite::Connection::open(&db).expect("drained database");
+    let probe: i64 = connection
+        .query_row("SELECT value FROM wal_probe", [], |row| row.get(0))
+        .expect("checkpointed WAL row");
+    assert_eq!(probe, 1);
+}

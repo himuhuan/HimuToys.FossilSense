@@ -1,4 +1,5 @@
 use super::*;
+use rusqlite::Connection;
 
 #[test]
 fn indexes_mini_workspace_and_skips_unchanged_files() {
@@ -281,6 +282,163 @@ fn default_full_rebuild_publishes_side_by_side_and_preserves_old_reader() {
     drop(new_reader);
     drop(old_reader);
     fs::remove_dir_all(cache_dir).expect("clean unique test cache");
+}
+
+#[test]
+fn explicit_force_rebuild_publishes_a_fresh_database_without_old_cleanup_debt() {
+    let workspace = tempdir().expect("workspace");
+    let source = workspace.path().join("main.c");
+    let db = workspace.path().join("explicit.sqlite");
+    fs::write(&source, "int first_generation(void) { return 1; }\n").expect("first source");
+
+    let first = index_workspace(
+        workspace.path(),
+        IndexOptions {
+            db_path: Some(db.clone()),
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("first explicit build");
+    assert_eq!(first.semantic_generation, 1);
+
+    let connection = Connection::open(&db).expect("open explicit database");
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_old_revision_cleanup
+             BEFORE DELETE ON file_revisions
+             BEGIN
+                 SELECT RAISE(ABORT, 'old database cleanup must not run');
+             END;",
+        )
+        .expect("install old-database cleanup guard");
+    drop(connection);
+
+    fs::write(&source, "int second_generation(void) { return 2; }\n").expect("second source");
+    let second = index_workspace(
+        workspace.path(),
+        IndexOptions {
+            db_path: Some(db.clone()),
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("second explicit build");
+
+    assert_eq!(second.semantic_generation, 2);
+    assert_eq!(
+        second.maintenance_warning, None,
+        "a fresh explicit build must not inherit old cleanup failures"
+    );
+    let store = IndexStore::open_readonly(&db).expect("new explicit database");
+    assert!(store
+        .declarations_by_name("first_generation")
+        .expect("old declaration")
+        .is_empty());
+    assert_eq!(
+        store
+            .declarations_by_name("second_generation")
+            .expect("new declaration")
+            .len(),
+        1
+    );
+    drop(store);
+
+    let connection = Connection::open(&db).expect("inspect replaced database");
+    let trigger_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*)
+             FROM sqlite_schema
+             WHERE type = 'trigger' AND name = 'reject_old_revision_cleanup'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count inherited triggers");
+    let revision_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM file_revisions", [], |row| row.get(0))
+        .expect("count revisions");
+    assert_eq!(trigger_count, 0, "the old schema must not be copied");
+    assert_eq!(
+        revision_count, 1,
+        "the replacement must contain only the published generation"
+    );
+}
+
+#[test]
+fn explicit_force_rebuild_preserves_old_database_when_wal_cannot_be_drained() {
+    let workspace = tempdir().expect("workspace");
+    let source = workspace.path().join("main.c");
+    let db = workspace.path().join("explicit.sqlite");
+    fs::write(&source, "int first_generation(void) { return 1; }\n").expect("first source");
+    index_workspace(
+        workspace.path(),
+        IndexOptions {
+            db_path: Some(db.clone()),
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("first explicit build");
+
+    let blocker = Connection::open(&db).expect("blocking connection");
+    blocker
+        .pragma_update(None, "journal_mode", "WAL")
+        .expect("WAL mode");
+    blocker
+        .execute_batch(
+            "BEGIN IMMEDIATE;
+             CREATE TABLE unpublished_external_write (value INTEGER);",
+        )
+        .expect("hold external WAL writer");
+    fs::write(&source, "int second_generation(void) { return 2; }\n").expect("second source");
+
+    let error = index_workspace(
+        workspace.path(),
+        IndexOptions {
+            db_path: Some(db.clone()),
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect_err("a live external WAL writer must block replacement");
+    assert!(
+        error.to_string().contains("locked") || error.to_string().contains("journal"),
+        "unexpected WAL drain error: {error:#}"
+    );
+    blocker
+        .execute_batch("ROLLBACK")
+        .expect("release external writer");
+    drop(blocker);
+
+    let store = IndexStore::open_readonly(&db).expect("preserved old database");
+    assert_eq!(store.semantic_generation().expect("old generation"), 1);
+    assert_eq!(
+        store
+            .declarations_by_name("first_generation")
+            .expect("old declaration")
+            .len(),
+        1
+    );
+    assert!(store
+        .declarations_by_name("second_generation")
+        .expect("unpublished declaration")
+        .is_empty());
+    drop(store);
+    let staging_count = fs::read_dir(workspace.path())
+        .expect("workspace entries")
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".fossilsense-index-build-")
+        })
+        .count();
+    assert_eq!(staging_count, 0, "failed staging must be reclaimed");
 }
 
 #[test]

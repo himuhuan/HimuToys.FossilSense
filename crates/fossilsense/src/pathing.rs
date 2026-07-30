@@ -1,6 +1,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -9,6 +10,7 @@ use directories::ProjectDirs;
 
 static INDEX_DB_LEASES: OnceLock<Mutex<std::collections::HashMap<PathBuf, Weak<()>>>> =
     OnceLock::new();
+static EXPLICIT_INDEX_BUILD_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub struct IndexDbLease {
@@ -116,6 +118,94 @@ pub fn default_index_staging_path(workspace: &Path) -> Result<PathBuf> {
         .unwrap_or_default()
         .as_nanos();
     Ok(directory.join(format!("index-build-{}-{nanos}.sqlite", std::process::id())))
+}
+
+/// Owns a fresh sibling database used to replace an explicit `--db` target.
+///
+/// Keeping the staging file in the destination directory gives publication a
+/// single-filesystem atomic rename. If indexing or validation fails, dropping
+/// this guard removes only the uniquely named staging database and its SQLite
+/// sidecars; the previously published destination remains untouched.
+#[derive(Debug)]
+pub struct ExplicitIndexPublication {
+    destination: PathBuf,
+    staging: PathBuf,
+    published: bool,
+}
+
+impl ExplicitIndexPublication {
+    pub fn new(destination: impl Into<PathBuf>) -> Result<Self> {
+        let destination = destination.into();
+        destination
+            .file_name()
+            .ok_or_else(|| anyhow!("explicit index destination has no file name"))?;
+        let directory = destination
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(directory).with_context(|| {
+            format!(
+                "failed to create explicit index directory {}",
+                directory.display()
+            )
+        })?;
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let sequence = EXPLICIT_INDEX_BUILD_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let staging = directory.join(format!(
+            ".fossilsense-index-build-{}-{nanos}-{sequence}.sqlite",
+            std::process::id()
+        ));
+        let staging_exists = staging.try_exists().with_context(|| {
+            format!(
+                "failed to inspect explicit index staging path {}",
+                staging.display()
+            )
+        })?;
+        anyhow::ensure!(
+            staging != destination && !staging_exists,
+            "explicit index staging path already exists: {}",
+            staging.display()
+        );
+        Ok(Self {
+            destination,
+            staging,
+            published: false,
+        })
+    }
+
+    pub fn staging_path(&self) -> &Path {
+        &self.staging
+    }
+
+    pub fn publish(mut self) -> Result<()> {
+        let staging_metadata = fs::metadata(&self.staging).with_context(|| {
+            format!(
+                "failed to inspect explicit index staging database {}",
+                self.staging.display()
+            )
+        })?;
+        anyhow::ensure!(
+            staging_metadata.is_file(),
+            "explicit index staging database is not a regular file: {}",
+            self.staging.display()
+        );
+        ensure_sqlite_sidecars_absent(&self.staging)?;
+        ensure_sqlite_sidecars_absent(&self.destination)?;
+        atomic_replace(&self.staging, &self.destination)?;
+        self.published = true;
+        Ok(())
+    }
+}
+
+impl Drop for ExplicitIndexPublication {
+    fn drop(&mut self) {
+        if !self.published {
+            remove_sqlite_file_family(&self.staging);
+        }
+    }
 }
 
 /// Publish a completed, closed staging database through the workspace's active
@@ -258,6 +348,38 @@ fn cleanup_index_directory_locked(
     Ok(removed)
 }
 
+fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut sidecar = path.as_os_str().to_os_string();
+    sidecar.push(suffix);
+    sidecar.into()
+}
+
+fn ensure_sqlite_sidecars_absent(path: &Path) -> Result<()> {
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let sidecar = sqlite_sidecar_path(path, suffix);
+        match sidecar.try_exists() {
+            Ok(false) => {}
+            Ok(true) => anyhow::bail!(
+                "refusing to replace SQLite database while sidecar exists: {}",
+                sidecar.display()
+            ),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to inspect SQLite sidecar {}", sidecar.display())
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn remove_sqlite_file_family(path: &Path) {
+    let _ = fs::remove_file(path);
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let _ = fs::remove_file(sqlite_sidecar_path(path, suffix));
+    }
+}
+
 #[cfg(windows)]
 fn atomic_replace(source: &Path, destination: &Path) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
@@ -280,24 +402,16 @@ fn atomic_replace(source: &Path, destination: &Path) -> Result<()> {
         )
     };
     if moved == 0 {
-        return Err(std::io::Error::last_os_error()).with_context(|| {
-            format!(
-                "failed to atomically replace index manifest {}",
-                destination_display
-            )
-        });
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed to atomically replace {}", destination_display));
     }
     Ok(())
 }
 
 #[cfg(not(windows))]
 fn atomic_replace(source: &Path, destination: &Path) -> Result<()> {
-    fs::rename(source, destination).with_context(|| {
-        format!(
-            "failed to atomically replace index manifest {}",
-            destination.display()
-        )
-    })
+    fs::rename(source, destination)
+        .with_context(|| format!("failed to atomically replace {}", destination.display()))
 }
 
 pub fn default_completion_history_path(workspace: &Path) -> Result<PathBuf> {
@@ -393,7 +507,7 @@ mod tests {
 
     use super::{
         cleanup_index_directory, default_index_path, path_is_within, publish_index_in_directory,
-        relative_slash_path, resolve_active_index, IndexDbLease,
+        relative_slash_path, resolve_active_index, ExplicitIndexPublication, IndexDbLease,
     };
 
     #[test]
@@ -439,6 +553,60 @@ mod tests {
         drop(first_lease);
         assert!(!first.exists(), "released old generation is cleaned");
         assert_eq!(fs::read(&second).unwrap(), b"second");
+    }
+
+    #[test]
+    fn explicit_publication_replaces_only_the_destination_database() {
+        let dir = tempdir().expect("tempdir");
+        let destination = dir.path().join("explicit.sqlite");
+        fs::write(&destination, b"old").expect("old destination");
+        let publication = ExplicitIndexPublication::new(destination.clone()).expect("publication");
+        fs::write(publication.staging_path(), b"new").expect("new staging");
+        publication.publish().expect("publish");
+
+        assert_eq!(
+            fs::read(destination).expect("published destination"),
+            b"new"
+        );
+    }
+
+    #[test]
+    fn explicit_publication_refuses_old_wal_and_discards_only_staging() {
+        let dir = tempdir().expect("tempdir");
+        let destination = dir.path().join("explicit.sqlite");
+        let wal = dir.path().join("explicit.sqlite-wal");
+        fs::write(&destination, b"old").expect("old destination");
+        fs::write(&wal, b"pending").expect("old WAL");
+        let publication = ExplicitIndexPublication::new(destination.clone()).expect("publication");
+        let staging = publication.staging_path().to_path_buf();
+        fs::write(&staging, b"new").expect("new staging");
+        let error = publication.publish().expect_err("WAL must block publish");
+
+        assert!(error.to_string().contains("sidecar exists"));
+        assert_eq!(
+            fs::read(destination).expect("preserved destination"),
+            b"old"
+        );
+        assert_eq!(fs::read(wal).expect("preserved WAL"), b"pending");
+        assert!(!staging.exists(), "failed staging is owned by the guard");
+    }
+
+    #[test]
+    fn explicit_publication_staging_name_has_a_fixed_component_budget() {
+        let dir = tempdir().expect("tempdir");
+        let long_name = format!("{}.sqlite", "x".repeat(220));
+        let destination = dir.path().join(long_name);
+        let publication = ExplicitIndexPublication::new(destination).expect("publication");
+        let staging_name = publication
+            .staging_path()
+            .file_name()
+            .expect("staging file name")
+            .to_string_lossy();
+
+        assert!(
+            staging_name.len() <= 96,
+            "staging component unexpectedly copied the destination name: {staging_name}"
+        );
     }
 
     #[test]

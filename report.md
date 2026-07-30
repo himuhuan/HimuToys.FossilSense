@@ -652,3 +652,42 @@ U-Boot 分段为 discover 1,123 ms、parse 6,478、write 19,616、check 9、incl
 Kubernetes 最终放行库是 `target/validation-1.5.0/kubernetes-stage4f-schema28-fresh.sqlite`。full-index engine 47,732 ms，分段为 discover 1,511、parse 9,963、write 21,589、check 13、include edge 3,557、secondary index 4,563、publication 5,677；随后 no-change 17,861 个文件全部 skipped，engine 4,072 ms，parse/write/publication 均为 0。事实计数保持 339,903 declarations、226,316 anchors、1,182,317 calls；最终 DB 为 479,776,768 bytes、117,133 pages、freelist 0，`declaration_facts` 为 132,800,512 bytes。相对 schema 27 表只增加 16,384 bytes（0.012%），整库增加 249,856（0.052%，含 fresh rebuild 页布局波动）；338,554 NULL、14 个 `x'00'`、1,335 个 `x'01'` 全部合法，schema/parser=28/8，`quick_check=ok`、foreign-key violations=0。
 
 补证过程中还暴露了一个与本阶段编码无关、但必须后续处理的既存风险：在已有的 479,768,576-byte Kubernetes 显式 DB 上再次执行 `index --force`，新一代在约 50 秒内已经发布，但进程随后停在 finalizing 超过 5 分钟并持续占用 CPU，远超 60 秒口径。中止后的只读现场 `target/validation-1.5.0/kubernetes-stage4f-schema28.sqlite` 显示 active manifest 仍正确指向 17,861 个文件、pending=0，但旧代尚未清理：file revisions 35,722、declaration rows 679,806，恰为双代，文件膨胀到 769,638,400 bytes。该现场不作为有效放行库；阶段 4G 将单独追踪发布后 obsolete-revision cleanup 的复杂度、崩溃恢复和空间回收，避免与已验证的 tagged encoding 混成一个提交。
+
+### 阶段 4G：显式 `--force` 全量索引旁路发布（已完成）
+
+状态：实现、TDD、完整 Rust 门禁、U-Boot fresh/full-force 双路径、engine hydration、SQLite 完整性复核与修复后独立 reviewer 均已通过。
+
+现场只读审计确认，阶段 4F 暴露的超时发生在语义代次已经提交之后，而不是 parser、writer、二级索引或完整性校验。原实现对已有显式 `--db` 执行 `--force` 时直接在同一个 SQLite 文件内写入新 revision；`commit_index_build` 先原子切换 active generation 并提交，再在事务外用 `DELETE FROM file_revisions ...` 回收旧 revision。17,861 个旧 revision 通过外键级联关联约 496 万条旧事实，而 full-build 又临时移除了 call revision 索引；父表逐行级联因而反复扫描大表。进程被中止时新代仍正确可读，但旧事实和空间债务留在同一文件，且下一次启动没有专门的自动重试入口。
+
+本阶段没有给每个大型事实表永久增加 revision 索引，也没有削弱提交后的旧快照可读性。显式 `--db PATH --force` 现在与默认工作区的 side-by-side 原则一致，但仍直接原子替换用户指定的 `PATH`，不引入 manifest：
+
+1. 所有显式数据库写路径——full index、普通 incremental 和 dirty-file incremental——先对规范化目标获取稳定 sibling lock DB 的 SQLite `BEGIN EXCLUSIVE`。锁文件使用目标路径 hash 的固定短名称并永久保留 8 KiB 主文件；事务在正常返回或进程死亡时由 SQLite 自动释放，不使用会遗留错误 owner 状态的 PID 文件。
+2. `--force` 在锁内严格捕获旧目标状态、semantic generation 以及主库/WAL/SHM/journal 的文件身份；读取、权限或 generation 格式错误不再静默降为 generation 0。staging 使用与目标 basename 无关的固定长度唯一名称，新库从空 schema 开始并继承代次编号。
+3. parser、fact 写入、include/Go graph、call indexes、`quick_check(1)`、`foreign_key_check` 和 checkpoint 全部在未发布 staging 上完成。新库没有 inactive revision，因此不会进入旧代级联回收。
+4. 发布前仍在同一 writer lock 内重新比较目标文件身份并重读 generation；变化即拒绝覆盖。随后旧目标通过 SQLite `journal_mode=DELETE` 排空 WAL，目标或 staging 的 `-wal`、`-shm`、`-journal` 检查使用可传播元数据错误的 fail-closed 路径。
+5. Windows 使用 `MoveFileExW(REPLACE_EXISTING | WRITE_THROUGH)`，其他平台使用同目录 rename。发布前任一步失败时旧目标保持原位，RAII guard 只删除本次唯一 staging 及其 sidecars；损坏但没有 sidecar 的旧目标仍允许由 `--force` 恢复。
+
+TDD 首先加入 `explicit_force_rebuild_publishes_a_fresh_database_without_old_cleanup_debt`。测试在第一代显式库安装一个拒绝删除 `file_revisions` 的触发器；修改前第二次 `--force` 稳定返回 `maintenance_warning=post-publication cleanup failed` 并留下旧 schema/旧 revision，修改后第二代在全新库中发布，generation 从 1 连续到 2、旧触发器不存在、旧 symbol 消失且只有一个 active revision。首轮 reviewer 随后发现旧 WAL 排空与 rename 间存在 cooperating-writer TOCTOU、generation 读取错误会被吞成 0、长 basename 会放大 staging 组件，以及 WAL/失败回滚测试不足；这两项 P1 与两项 P2 均先补测试再修复。最终覆盖相同目标第二 writer 被拒绝、非合作外部推进触发文件身份/generation 复核失败、非法 generation 不降级、真实 persistent WAL 被 checkpoint/drain、活跃 WAL writer 阻止发布时旧 generation/旧 symbol 仍可读且 staging 被回收、固定 staging 组件长度、人工 sidecar fail-closed，以及默认 manifest 和非 force incremental 不回归。修复后 reviewer 逐项确认 2 P1/2 P2 全部关闭，没有新 finding。
+
+独立 test-executor 的门禁结果：
+
+| 命令/门禁 | 结果 |
+|---|---|
+| `cargo fmt --all -- --check` | PASS，约 3.60 s |
+| `cargo test -p fossilsense` | PASS，unit 1013 passed / 6 ignored，CLI 1 passed，LSP 2 passed；0 failed |
+| `cargo clippy -p fossilsense --all-targets -- -D warnings` | PASS，约 19.78 s |
+| `cargo build --release -p fossilsense` | PASS |
+| `cargo test --release -p fossilsense --bin fossilsense --no-run` | PASS |
+
+大型门禁使用 U-Boot commit `6741b0dfb41dc82a284ab1cff4c58af6ef2f3f9c`；样本有两处既存空白差异，因此准确标记为 dirty。机器为 Acer Nitro AN515-58、Intel Core i5-12500H（12 cores / 16 logical processors）、约 24 GiB RAM、Windows 11 Pro Insider build 26220。标准脚本先删除目标，验证 fresh 显式 full-index；随后不删除同一数据库，直接再次执行完全相同的 release `index ... --db ... --force`，专门覆盖原超时路径：
+
+| 路径 | wrapper / engine | write | publication | peak Working Set / Private | 结果 |
+|---|---:|---:|---:|---:|---|
+| fresh explicit full-index | 37,266.403 / 36,225 ms | 19,692 ms | 4,218 ms | 163,053,568 / 153,350,144 bytes | PASS |
+| existing explicit DB 再次 `--force` | 36,482.081 / 36,296 ms | 19,897 ms | 4,300 ms | 171,094,016 / 160,079,872 bytes | PASS |
+
+两轮都保持 13,244 files、654,890 declarations、91,919 callable anchors、582,522 call sites，远低于 60,000 ms 硬线。标准 fresh 原始报告为 `target/benchmark/large-workspace-20260731_055014.json` 与同名 Markdown。existing-DB 轮使用同一脚本的 20 ms process sampling 逻辑直接执行，最终数据库 generation=2，但只含 13,244 个 active/file revisions、pending=0、一个 committed build、654,890 declaration rows；文件 345,067,520 bytes、84,245 pages、freelist=0，`quick_check=ok`、foreign-key violations=0，目录中只有预期的 8,192-byte writer-lock 主文件，没有 staging/WAL/SHM/journal 残留。与旧实现的 35,722 revisions、679,806 declarations、769,638,400-byte 双代中止现场相比，新路径不再产生发布后清理工作。
+
+本阶段改变了 full-build publication 架构，因此额外执行 U-Boot engine hydration。结果为 654,890 declarations / 13,244 files，compact recall 93,747,480 bytes，单代 Private 183,939,072 bytes、旧快照存活时双代峰值 348,995,584 bytes，首/次构建 3,906/3,790 ms；分别低于 384/512 MiB 门禁。原始报告为 `target/benchmark/large-workspace-20260731_055202.json` 与同名 Markdown。
+
+边界保持明确：旁路构建在发布前同时保留旧库与新 staging，要求足够的临时磁盘空间；进程被强杀时旧目标仍安全，但唯一 staging 可能成为可人工识别的孤儿文件，不能像正常错误返回那样依赖 Drop 回收。同一目标的 FossilSense writer 遵守 sibling lock，因此不会进入 WAL drain/rename 竞态；直接绕过协议写 SQLite 的外部程序明确不受支持，最终身份复核后到 rename 仍存在极小窗口，但已有 drain 后与 rename 前两次 sidecar 检查，Windows 打开句柄还会使 `MoveFileExW` 保守失败。残余测试缺口是尚未单独故障注入 Windows 打开句柄导致的 `MoveFileExW` 失败。阶段 4F 的中止现场只读保留用于证据，没有就地修理；下一阶段 4H 单独为既存 cleanup debt 和普通增量发布设计有界批量回收与恢复测试，而未来显式 `--force` 已不再制造这种债务。
