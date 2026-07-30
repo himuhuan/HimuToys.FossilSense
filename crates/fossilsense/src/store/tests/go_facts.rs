@@ -1,6 +1,6 @@
 use super::*;
 use crate::call_model::LinkageDomain;
-use crate::semantic_model::SemanticLanguage;
+use crate::semantic_model::{DeclarationBacking, SemanticLanguage};
 
 #[test]
 fn go_package_import_guard_and_language_round_trip_through_active_views() {
@@ -59,6 +59,34 @@ func Read() {
         "package:src/sensor#sensor"
     );
     assert_eq!(declaration.fact.guard.as_deref(), Some("tinygo && arm"));
+}
+
+#[test]
+fn go_defined_type_source_range_backing_round_trips_the_name_range() {
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+    let mut store = IndexStore::open(&db, dir.path()).expect("store");
+    upsert_source(
+        &mut store,
+        "src/model/types.go",
+        "package model\n\ntype UserID string\n",
+    );
+
+    let reader = IndexStore::open_readonly(&db).expect("readonly");
+    let declaration = reader
+        .declarations_by_name("UserID")
+        .expect("UserID declarations")
+        .into_iter()
+        .next()
+        .expect("UserID declaration");
+    assert_ne!(
+        declaration.fact.name_range, declaration.fact.declaration_range,
+        "the fixture must distinguish the name from the whole declaration"
+    );
+    let DeclarationBacking::SourceRange { range } = declaration.fact.backing else {
+        panic!("defined Go types use source-range backing");
+    };
+    assert_eq!(range, declaration.fact.name_range);
 }
 
 #[test]

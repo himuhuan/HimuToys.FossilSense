@@ -1,7 +1,7 @@
-// Version 26 removes the unused locator-fingerprint lookup index while keeping
-// the fingerprint in each declaration fact. The version bump forces schema 25
-// databases to rebuild so the obsolete index pages are reclaimed.
-pub(crate) const SCHEMA_VERSION: i64 = 26;
+// Version 27 compacts fixed-width declaration fingerprints and backing kinds
+// without changing their typed read-view representation. The version bump
+// invalidates schema 26 TEXT payloads before they can reach the BLOB decoder.
+pub(crate) const SCHEMA_VERSION: i64 = 27;
 
 pub(crate) const DROP_DATA_TABLES_SQL: &str = "
     DROP TABLE IF EXISTS pending_file_revisions;
@@ -136,11 +136,15 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
         fact_fidelity INTEGER NOT NULL CHECK(fact_fidelity BETWEEN 0 AND 2),
         logical_key_digest BLOB NOT NULL
             CHECK(typeof(logical_key_digest) = 'blob' AND length(logical_key_digest) = 12),
-        locator_fingerprint TEXT NOT NULL,
+        locator_fingerprint BLOB NOT NULL
+            CHECK(typeof(locator_fingerprint) = 'blob' AND length(locator_fingerprint) = 12),
         logical_linkage_domain TEXT NOT NULL,
-        guard_fingerprint TEXT,
+        guard_fingerprint BLOB
+            CHECK(guard_fingerprint IS NULL OR
+                  (typeof(guard_fingerprint) = 'blob' AND length(guard_fingerprint) = 12)),
         logical_canonical_signature TEXT,
-        backing_kind TEXT NOT NULL,
+        backing_kind INTEGER NOT NULL
+            CHECK(typeof(backing_kind) = 'integer' AND backing_kind BETWEEN 0 AND 4),
         backing_id INTEGER,
         backing_key TEXT,
         backing_start_byte INTEGER,

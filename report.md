@@ -3,7 +3,7 @@
 > 状态：原始测试已完成；发布判定 **NO-GO**；整改持续执行中
 > 开始时间：2026-07-30 22:59:29 +08:00
 > 完成时间：2026-07-31 00:02:07 +08:00（总耗时约 1 小时 03 分）
-> 最新整改更新：2026-07-31 02:46:32 +08:00
+> 最新整改更新：2026-07-31 03:53:46 +08:00
 > 测试对象：`release/v1.5.0`，source commit `fff8f89c045fee1be428472a4d823ee16b223059`
 
 ## 1. 范围与判定口径
@@ -571,3 +571,40 @@ cache 实验开始前，对当时的 `target/benchmark/index-u-boot-rebuild.sqli
 核心风险不是当前样本的低毫秒绝对值，而是 SQL `LIMIT 257` 只限制满足完整 digest/name/language 的输出，不能限制前缀索引在完整 digest 过滤前访问的候选；缺失或稀疏匹配会扫描整个前缀桶。8-byte/10-byte 前缀的随机碰撞概率很低，但随机概率不能替代请求扫描上界，也不能证明对任意大型工作区的最坏情况。为此引入扫描预算又必须向上暴露 truncation/coverage，并扩大 resolver 协议与语义范围。
 
 结论：最激进的 4-byte 方案只减少 live allocated pages 1.68% 且已出现不同 digest 碰撞；风险较低的 8-byte/10-byte 仅减少 1.01%/0.68%。收益不足以交换更宽的碰撞桶、缺失键退化和新的不确定性协议，因此保持完整 12-byte digest 等值索引。阶段 4C reviewer 提出的保守候选已经实测关闭，不进入 TDD 或大型门禁。
+
+### 阶段 4E：压缩 declaration 固定宽度标量（已完成）
+
+状态：实现、reviewer findings 的 TDD 修复、全部最终门禁和修复后独立复核均已通过。
+
+列级审计确认当前 producer 生成的 locator/guard fingerprint 都是 BLAKE3 截断后的 24 个小写十六进制字符；上层 semantic model、CandidateHandle 和 LSP completion data 仍以 String 暴露，但 SQLite 不需要用 24-byte TEXT 保存等价的 12-byte 值。`backing_kind` 同样只表示 `callable_anchor`、`record`、`type_alias`、`source_range`、`none` 五种稳定形态，当前 U-Boot/Kubernetes 实际只出现前四种，却在每行重复保存 6–15 个字符。三列都不参与 SQL filter、join 或排序，因此可以只改变持久化编码，不改变查询拓扑。
+
+U-Boot 654,890 行中 locator payload 为 15,717,360 bytes，guard fingerprint 非空 38,532 行、payload 924,768 bytes，backing-kind TEXT payload 8,005,683 bytes；Kubernetes 339,903 行的 locator 全部满足 24-char hex、guard 全部为空，backing kind 同样只有四个值。`target/benchmark/stage4e-scalar-lab/` 的隔离 shadow-table 实验保留所有非目标列并抽查首/中/尾行的严格 hex 往返、NULL 与 kind mapping：
+
+| 样本 | 原 declaration table | compact shadow | 页级减少 |
+|---|---:|---:|---:|
+| U-Boot | 193,830,912 bytes / 47,322 pages | 176,832,512 / 43,172 | 16,998,400 bytes（8.77%） |
+| Kubernetes | 141,946,880 bytes / 34,655 pages | 132,763,648 / 32,413 | 9,183,232 bytes（6.47%） |
+
+实现先新增 `declaration_storage_compacts_fingerprints_and_backing_kind_without_changing_views`。修改前定向测试因 `backing_kind` 仍是 SQLite TEXT 稳定失败，另一个 schema 26→27 测试实际得到 version 26、期望 27。随后 schema 27 把 locator 与 nullable guard fingerprint 改为带 12-byte CHECK 的 BLOB，把 backing kind 改为 0–4 CHECK INTEGER；write path 复用严格 hex decoder，read view 恢复原小写 24-char String 和原 backing-kind 字符串。定向测试现已验证 guarded/null guard、locator/guard 精确往返、四种实际 backing 的 raw code 与 typed enum 一致，以及 schema 25/26 都会失效重建。当前没有修改 locator/guard 算法、CandidateHandle JSON、overlay 比较、logical-key lookup 或最终候选语义。
+
+完整门禁中，第一轮 Clippy 唯一发现 `backing_kind` 已是 `&str` 却再次借用的 `needless_borrow`；机械修正后由主代理和独立 test-executor 分别复跑通过。最终结果：
+
+| 命令/门禁 | 结果 |
+|---|---|
+| `cargo fmt --all -- --check` | PASS |
+| `cargo test -p fossilsense` | PASS，单元与集成合计 1005 passed / 6 ignored |
+| `cargo clippy -p fossilsense --all-targets -- -D warnings` | PASS |
+| `cargo build --release -p fossilsense` | PASS |
+| `cargo test --release -p fossilsense --bin fossilsense --no-run` | PASS |
+| U-Boot full-index | PASS，wrapper 37,598.159 ms；engine 36,528 ms，均低于 60,000 ms |
+| U-Boot engine hydration | PASS，654,890 declarations / 13,244 files；单代 183,693,312 bytes，双代 348,549,120 bytes |
+
+U-Boot 事实计数保持 13,244 files、654,890 declarations、91,919 callable anchors、582,522 call sites。parser fact 8 最终 full-index 分段为 discover 1,150 ms、parse 6,242、write 20,021、check 10、include edge 1,992、secondary index 2,120、publication 4,286；峰值 Working Set 171,794,432 bytes、Private Bytes 163,610,624 bytes。hydration recall 仍为 93,747,480 bytes，首/次代构建 3,872/3,884 ms；单代约 175.2 MiB、双代约 332.4 MiB，分别低于 384/512 MiB 硬线。最终原始报告为 `target/benchmark/large-workspace-20260731_034326.json` 与同名 Markdown。
+
+最终 parser fact 8 / schema 27 U-Boot 数据库为 378,793,984 bytes、92,479 pages、freelist 0。与阶段 4B 同机 schema 26 的 395,644,928 bytes 相比，物理文件净减 16,850,944 bytes（4.26%）；`declaration_facts` 从 193,830,912 降到 176,820,224 bytes，净减 17,010,688（8.78%），与 shadow-table 预测一致。全部 654,890 行 locator 都是 12-byte BLOB，38,532 个非空 guard 都是 12-byte BLOB，其余 guard 保持 NULL，backing code 全是 0–4 的 SQLite INTEGER；全部 file revision 都是 parser fact 8，`quick_check(1)=ok`、foreign-key violations=0。schema 26 单次对照的 wrapper/engine 更快约 0.72 秒，但一次运行的 parse、机器与缓存波动无法归因；本阶段只把页级体积视为强收益，未宣称时间或进程峰值改善。
+
+为交叉验证 Go，最终 release binary 还对同一 Kubernetes 工作树新建 `target/validation-1.5.0/kubernetes-stage4e-parser8.sqlite`：17,861 files、339,903 declarations、226,316 anchors、1,182,317 call sites，engine 49,905 ms，分段为 discover 1,700、parse 11,802、write 21,610、check 12、include edge 3,456、secondary index 4,647、publication 5,926 ms；schema 27 DB 为 479,526,912 bytes、117,072 pages、freelist 0，`declaration_facts` 为 132,784,128 bytes。全部 file revision 都是 parser fact 8，339,903 行 locator、nullable guard 和 backing encoding 都满足 BLOB/INTEGER 约束，`quick_check=ok`、foreign-key violations=0。它相对原始 schema 25 run-1 的 501,284,864 bytes 减少 21,757,952（4.34%），该差额合并了阶段 4B 去 locator 索引与阶段 4E 标量压缩，不能全部归因于本阶段。随后 no-change 增量 17,861 files 全部 skipped，事实计数不变，engine 4,087 ms、parse/write/publication 均为 0，证明新库可直接复用而非意外重建。
+
+独立 reviewer 随 backing 契约审计发现一项既存 P2 与两项阶段边界 P3。P2 是 Go `type UserID string` 等 defined type 把整个 declaration range 放进 `SourceRange` backing，而 store 一直要求该 backing 等于 name range：debug index 会 panic，release 水合会把完整 byte end 与名字的 line/character end 拼成不一致 range；初轮 Kubernetes 库已有 4,557 行受影响。新增 store roundtrip 测试先稳定触发 debug assertion，现 Go parser 统一写入 name range，并把 `PARSER_FACT_VERSION` 从 7 提升到 8，确保任何结构仍为 schema 27 的旧 parser rows 也会失效。另两个失败测试分别证明 `u8::from_str_radix` 会接受 `+f` 前导符号、SQLite `BETWEEN 0 AND 4` 会放行 REAL 0.5；hex decoder 现先显式验证每个 byte 都是 ASCII hex，backing CHECK 现同时要求 `typeof='integer'`。uppercase 仍被接受并在 read view 规范化为原小写协议。
+
+上述三项定向测试均已转绿。parser fact 8 最终 U-Boot/Kubernetes 重建确认旧事实会按预期失效；Kubernetes 中 `SourceRange` backing 与 name byte range 不一致的 Go declaration 已从初轮的 4,557 行降到 0。独立 test-executor 随后复跑完整 Rust suite、Clippy、release build/no-run 和 U-Boot full-index/hydration，全部通过；修复后独立 reviewer 复核确认三项 finding 完整关闭且产品代码没有新回归，仅纠正了报告中的单次耗时差。初轮 parser fact 7 数据仅保留为发现问题的证据，不再作为放行结果。

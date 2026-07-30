@@ -184,7 +184,7 @@ fn opening_schema_25_rebuilds_without_locator_lookup_index() {
             |row| row.get(0),
         )
         .expect("schema version");
-    assert_eq!(version, "26");
+    assert_eq!(version, crate::store::schema::SCHEMA_VERSION.to_string());
 
     let declaration_count: i64 = store
         .conn
@@ -223,6 +223,61 @@ fn opening_schema_25_rebuilds_without_locator_lookup_index() {
         locator_index_count, 0,
         "schema 26 must not recreate the unused locator lookup index"
     );
+}
+
+#[test]
+fn opening_schema_26_rebuilds_with_compact_declaration_scalars() {
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+    {
+        let mut store = IndexStore::open(&db, dir.path()).expect("store");
+        upsert_source(
+            &mut store,
+            "src/legacy.c",
+            "int legacy_scalars(void) { return 1; }\n",
+        );
+        store
+            .conn
+            .execute(
+                "UPDATE meta SET value = '26' WHERE key = 'schema_version'",
+                [],
+            )
+            .expect("mark schema 26");
+    }
+
+    let store = IndexStore::open(&db, dir.path()).expect("migrate schema 26");
+    let version: String = store
+        .conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("schema version");
+    assert_eq!(version, "27");
+
+    let declaration_count: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM declaration_facts", [], |row| {
+            row.get(0)
+        })
+        .expect("declaration count after migration");
+    assert_eq!(
+        declaration_count, 0,
+        "schema migration must invalidate schema 26 declaration facts"
+    );
+
+    let columns: Vec<(String, String)> = store
+        .conn
+        .prepare("PRAGMA table_info(declaration_facts)")
+        .expect("declaration columns")
+        .query_map([], |row| Ok((row.get(1)?, row.get(2)?)))
+        .expect("query declaration columns")
+        .collect::<rusqlite::Result<_>>()
+        .expect("collect declaration columns");
+    assert!(columns.contains(&("locator_fingerprint".into(), "BLOB".into())));
+    assert!(columns.contains(&("guard_fingerprint".into(), "BLOB".into())));
+    assert!(columns.contains(&("backing_kind".into(), "INTEGER".into())));
 }
 
 #[test]

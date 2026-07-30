@@ -601,21 +601,21 @@ pub(super) fn stage_file_updates(
                 let (backing_kind, backing_id, backing_key, backing_start, backing_end) =
                     match &declaration.backing {
                         DeclarationBacking::CallableAnchor { fingerprint } => (
-                            "callable_anchor",
+                            0,
                             callable_id_by_fingerprint.get(fingerprint).copied(),
                             Some(fingerprint.clone()),
                             None,
                             None,
                         ),
                         DeclarationBacking::Record { record_key } => (
-                            "record",
+                            1,
                             record_key_to_id.get(record_key).copied(),
                             Some(record_key.clone()),
                             None,
                             None,
                         ),
                         DeclarationBacking::TypeAlias { fingerprint } => (
-                            "type_alias",
+                            2,
                             alias_fingerprint_to_id.get(fingerprint).copied(),
                             Some(fingerprint.clone()),
                             None,
@@ -627,20 +627,28 @@ pub(super) fn stage_file_updates(
                                 "source-range declaration backing must round-trip through the stored name range"
                             );
                             (
-                                "source_range",
+                                3,
                                 None,
                                 None,
                                 Some(range.start_byte as i64),
                                 Some(range.end_byte as i64),
                             )
                         }
-                        DeclarationBacking::None => ("none", None, None, None, None),
+                        DeclarationBacking::None => (4, None, None, None, None),
                     };
                 let logical_key = serde_json::to_vec(&declaration.identity.logical_key)?;
                 let declarator_shape_json = declaration
                     .declarator_shape
                     .as_ref()
                     .map(serde_json::to_string)
+                    .transpose()?;
+                let locator_fingerprint = digest_bytes(&declaration.identity.locator.fingerprint)?;
+                let guard_fingerprint = declaration
+                    .identity
+                    .logical_key
+                    .guard_fingerprint
+                    .as_deref()
+                    .map(digest_bytes)
                     .transpose()?;
                 declaration_stmt.execute(params![
                     revision_id,
@@ -672,13 +680,9 @@ pub(super) fn stage_file_updates(
                     semantic_provenance_code(declaration.identity.provenance),
                     semantic_fidelity_code(declaration.identity.fact_fidelity),
                     digest_value(&logical_key),
-                    declaration.identity.locator.fingerprint.as_str(),
+                    locator_fingerprint,
                     declaration.identity.logical_key.linkage_domain.as_str(),
-                    declaration
-                        .identity
-                        .logical_key
-                        .guard_fingerprint
-                        .as_deref(),
+                    guard_fingerprint,
                     declaration
                         .identity
                         .logical_key
@@ -701,12 +705,15 @@ fn digest_bytes(value: &str) -> Result<Vec<u8>> {
     if value.len() != 24 {
         anyhow::bail!("fact digest must contain exactly 24 hexadecimal characters");
     }
+    if !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        anyhow::bail!("fact digest contains a non-hexadecimal byte");
+    }
     value
         .as_bytes()
         .chunks_exact(2)
         .map(|pair| {
-            let text = std::str::from_utf8(pair).context("call digest is not UTF-8")?;
-            u8::from_str_radix(text, 16).context("call digest contains a non-hexadecimal byte")
+            let text = std::str::from_utf8(pair).context("fact digest is not UTF-8")?;
+            u8::from_str_radix(text, 16).context("fact digest contains a non-hexadecimal byte")
         })
         .collect()
 }
@@ -854,4 +861,23 @@ fn fact_flags(provenance: crate::call_model::FactProvenance, syntax_error: bool)
         crate::call_model::FactProvenance::Synthetic => 2,
     };
     provenance | (i64::from(syntax_error) << 8)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::digest_bytes;
+
+    #[test]
+    fn digest_bytes_rejects_signs_and_non_hex_but_accepts_uppercase() {
+        assert!(digest_bytes("+f0000000000000000000000").is_err());
+        assert!(digest_bytes("gg0000000000000000000000").is_err());
+        assert!(digest_bytes("00").is_err());
+
+        let mut expected = vec![0; 12];
+        expected[0] = 0x0f;
+        assert_eq!(
+            digest_bytes("0F0000000000000000000000").expect("uppercase digest"),
+            expected
+        );
+    }
 }

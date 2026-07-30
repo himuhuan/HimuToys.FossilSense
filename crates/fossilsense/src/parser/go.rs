@@ -494,9 +494,7 @@ fn collect_type_spec(
         });
         DeclarationBacking::TypeAlias { fingerprint }
     } else {
-        DeclarationBacking::SourceRange {
-            range: declaration_range,
-        }
+        DeclarationBacking::SourceRange { range: name_range }
     };
 
     if facts.contains(ParseFacts::DECLARATIONS) {

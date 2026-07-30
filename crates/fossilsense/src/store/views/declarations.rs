@@ -407,17 +407,21 @@ fn declaration_row(row: &rusqlite::Row<'_>) -> Result<DeclarationReadRow> {
         logical_key_digest.len() == 12,
         "invalid logical key digest for declaration row {id}"
     );
-    let locator_fingerprint: String = row.get(28)?;
-    let guard_fingerprint: Option<String> = row.get(30)?;
+    let locator_fingerprint = stored_digest_hex(row.get(28)?, "locator fingerprint", id)?;
+    let guard_fingerprint = row
+        .get::<_, Option<Vec<u8>>>(30)?
+        .map(|value| stored_digest_hex(value, "guard fingerprint", id))
+        .transpose()?;
     let logical_canonical_signature: Option<String> = row.get(31)?;
-    let backing_kind: String = row.get(32)?;
+    let backing_kind = declaration_backing_kind(row.get(32)?)
+        .with_context(|| format!("invalid backing kind for declaration row {id}"))?;
     let backing_id: Option<i64> = row.get(33)?;
     let backing_key: Option<String> = row.get(34)?;
     let backing_start: Option<i64> = row.get(35)?;
     let backing_end: Option<i64> = row.get(36)?;
     let backing = declaration_backing(
         id,
-        &backing_kind,
+        backing_kind,
         backing_key,
         backing_start,
         backing_end,
@@ -467,7 +471,7 @@ fn declaration_row(row: &rusqlite::Row<'_>) -> Result<DeclarationReadRow> {
         id,
         fact,
         logical_key_digest,
-        backing_kind,
+        backing_kind: backing_kind.to_string(),
         backing_id,
         external: row.get::<_, String>(38)? == "external",
         directly_included: row.get::<_, i64>(39)? != 0,
@@ -525,6 +529,32 @@ fn declaration_backing(
         "none" => DeclarationBacking::None,
         value => anyhow::bail!("invalid backing kind {value:?} for declaration row {id}"),
     })
+}
+
+fn declaration_backing_kind(value: i64) -> Result<&'static str> {
+    Ok(match value {
+        0 => "callable_anchor",
+        1 => "record",
+        2 => "type_alias",
+        3 => "source_range",
+        4 => "none",
+        _ => anyhow::bail!("unknown declaration backing kind code {value}"),
+    })
+}
+
+fn stored_digest_hex(value: Vec<u8>, field: &str, row_id: i64) -> Result<String> {
+    anyhow::ensure!(
+        value.len() == 12,
+        "invalid {field} length {} for declaration row {row_id}",
+        value.len()
+    );
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(24);
+    for byte in value {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    Ok(output)
 }
 
 fn declaration_kind(value: i64) -> Result<SemanticDeclarationKind> {
