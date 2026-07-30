@@ -3,7 +3,7 @@
 > 状态：原始测试已完成；发布判定 **NO-GO**；整改持续执行中
 > 开始时间：2026-07-30 22:59:29 +08:00
 > 完成时间：2026-07-31 00:02:07 +08:00（总耗时约 1 小时 03 分）
-> 最新整改更新：2026-07-31 01:22:12 +08:00
+> 最新整改更新：2026-07-31 01:29:35 +08:00
 > 测试对象：`release/v1.5.0`，source commit `fff8f89c045fee1be428472a4d823ee16b223059`
 
 ## 1. 范围与判定口径
@@ -370,7 +370,7 @@ U-Boot dirty diff 仅有三处空白行变化：一处空白行改为含制表�
 
 功能侧总体结果较好：mini C/Go、LSP smoke、扩展测试、架构可执行门禁、U-Boot hydration、Kubernetes 两次全量索引与无变化增量索引均完成且没有崩溃。Kubernetes 17,861-file 实际工作集两次全量索引中位 50.543 s，事实计数完全一致，所有 revision 均为 `ok`，复杂 build constraints、CGO 边界和 unresolved imports 均以显式证据降级；真实 definition/references/call 查询保持有界并暴露 coverage/truncation。确认的功能缺陷只有 F-01：CLI incoming calls 展示 callee 而非 caller，底层 relation 与 LSP 路径不受影响。
 
-第 1–6 节记录的原始全面测试轮次按当时要求没有修复任何产品源码、测试或发布配置；长期整改实现从第 7 节开始。测试开始前已有的 `CLAUDE.md` 删除和未跟踪 `AGENTS.md` 在阶段 1、2 中保持原状。
+第 1–6 节记录的原始全面测试轮次按当时要求没有修复任何产品源码、测试或发布配置；长期整改实现从第 7 节开始。测试开始前已有的 `CLAUDE.md` 删除和未跟踪 `AGENTS.md` 在阶段 1、2 中保持原状；阶段 3 恢复前者，后者继续保留且不纳入提交。
 
 ## 7. 1.5.0 长期整改进度
 
@@ -438,4 +438,22 @@ U-Boot dirty diff 仅有三处空白行变化：一处空白行改为含制表�
 
 本阶段是 stdout presentation 修复，没有改变索引、存储、查询复杂度或常驻读模型，因此不重复运行大型工作区性能门禁。
 
-下一阶段处理 R-02：恢复仓库和发布脚本明确要求的根 `CLAUDE.md`，同时保留用户现有 `AGENTS.md`；随后运行发布 hardening、扩展测试和打包验证，再进入 R-03 性能/存储优化。
+### 阶段 3：恢复发布文档与完整仓库门禁
+
+状态：R-02 已修复，仓库完整验证通过；干净提交上的 VSIX 打包与制品 hardening 待执行。
+
+`scripts/test_release_hardening.ps1` 在阶段开始时再次稳定失败，首个错误为根 `CLAUDE.md` 缺失。进一步核对 `verify_release_hardening.ps1` 的 `Require-DocumentPatterns` 后确认，仅恢复提交树旧版仍会因为旧文档写 `1.4.5` 而缺少当前 release version `1.5.0`。因此恢复完整的跟踪文档，并只把项目版本事实从 `1.4.5` 同步到 `1.5.0`；没有放宽 hardening，也没有用未跟踪的 `AGENTS.md` 替代长期文档。
+
+验证结果：
+
+| 命令/门禁 | 结果 |
+|---|---|
+| `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test_release_hardening.ps1`（恢复前） | FAIL：required document `CLAUDE.md` missing |
+| 同一命令（恢复并同步版本后） | PASS |
+| `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify.ps1 -SkipInstall` | PASS |
+| Rust tests | unit 997 passed / 6 ignored；CLI integration 1/1；LSP smoke 2/2 |
+| architecture fitness | golden 8/8；0 fail / 14 large-file warn |
+| benchmark entry-point tests | PASS |
+| extension `pnpm test` | PASS，TypeScript compile 与扩展测试通过 |
+
+完整验证期间没有修改产品源码。下一步先提交恢复后的文档与本节记录，再从该干净提交创建隔离 worktree 打包，避免主工作树中用户保留的未跟踪 `AGENTS.md` 被写入 `release-build.json.worktreeDirty`。打包和最终制品 hardening 通过后再进入 R-03 性能/存储优化。
