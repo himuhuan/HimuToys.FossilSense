@@ -132,6 +132,54 @@ struct NameEntry {
 
 const NO_PROJECT_ID: u32 = u32::MAX;
 
+/// Packed per-declaration evidence for the resident name-recall index.
+///
+/// `directly_included` is meaningful only for external entries, so the
+/// constructor normalizes that bit away for workspace declarations.
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+struct CompactNameFlags(u8);
+
+impl CompactNameFlags {
+    const EXTERNAL: u8 = 1 << 0;
+    const DIRECTLY_INCLUDED: u8 = 1 << 1;
+    const GO_FAMILY: u8 = 1 << 2;
+
+    fn new(
+        semantic_family: crate::semantic_model::SemanticFamily,
+        external: bool,
+        directly_included: bool,
+    ) -> Self {
+        let mut bits = match semantic_family {
+            crate::semantic_model::SemanticFamily::CFamily => 0,
+            crate::semantic_model::SemanticFamily::Go => Self::GO_FAMILY,
+        };
+        if external {
+            bits |= Self::EXTERNAL;
+        }
+        if external && directly_included {
+            bits |= Self::DIRECTLY_INCLUDED;
+        }
+        Self(bits)
+    }
+
+    fn semantic_family(self) -> crate::semantic_model::SemanticFamily {
+        if self.0 & Self::GO_FAMILY == 0 {
+            crate::semantic_model::SemanticFamily::CFamily
+        } else {
+            crate::semantic_model::SemanticFamily::Go
+        }
+    }
+
+    fn external(self) -> bool {
+        self.0 & Self::EXTERNAL != 0
+    }
+
+    fn directly_included(self) -> bool {
+        self.0 & Self::DIRECTLY_INCLUDED != 0
+    }
+}
+
 #[derive(Clone, Copy)]
 struct CompactNameEntry {
     id: i64,
@@ -140,9 +188,7 @@ struct CompactNameEntry {
     project_id: u32,
     kind: ParserKind,
     role: SymbolRole,
-    semantic_family: crate::semantic_model::SemanticFamily,
-    external: bool,
-    directly_included: bool,
+    flags: CompactNameFlags,
 }
 
 #[derive(Clone)]
@@ -546,12 +592,12 @@ impl NameSegment {
             id: entry.id,
             name: &name.original,
             lower: &name.lower,
-            external: entry.external,
-            directly_included: entry.directly_included,
+            external: entry.flags.external(),
+            directly_included: entry.flags.directly_included(),
             path: &self.paths[entry.path_id as usize],
             kind: entry.kind,
             role: entry.role,
-            semantic_family: entry.semantic_family,
+            semantic_family: entry.flags.semantic_family(),
             project_key: (entry.project_id != NO_PROJECT_ID)
                 .then(|| &self.projects[entry.project_id as usize]),
         }

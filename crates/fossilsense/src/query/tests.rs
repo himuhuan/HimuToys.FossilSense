@@ -1,6 +1,7 @@
 use super::*;
 use crate::reachability::ReachScope;
 use crate::resource::current_process_memory_bytes;
+use crate::semantic_model::SemanticFamily;
 
 #[test]
 #[ignore = "diagnostic large-workspace NameTable benchmark; set FOSSILSENSE_BENCH_DB"]
@@ -155,6 +156,32 @@ fn compact_name_entry_stays_within_three_ids_and_flags_layout() {
         std::mem::size_of::<CompactNameEntry>() <= 24,
         "compact entries must not regain per-symbol pointers"
     );
+}
+
+#[test]
+fn compact_name_flags_round_trip_family_and_scope_evidence() {
+    let cases = [
+        (SemanticFamily::CFamily, false, false, false),
+        (SemanticFamily::CFamily, false, true, false),
+        (SemanticFamily::CFamily, true, false, false),
+        (SemanticFamily::CFamily, true, true, true),
+        (SemanticFamily::Go, false, false, false),
+        (SemanticFamily::Go, false, true, false),
+        (SemanticFamily::Go, true, false, false),
+        (SemanticFamily::Go, true, true, true),
+    ];
+
+    assert_eq!(std::mem::size_of::<CompactNameFlags>(), 1);
+    for (semantic_family, external, directly_included, expected_directly_included) in cases {
+        let flags = CompactNameFlags::new(semantic_family, external, directly_included);
+        assert_eq!(flags.semantic_family(), semantic_family);
+        assert_eq!(flags.external(), external);
+        assert_eq!(
+            flags.directly_included(),
+            expected_directly_included,
+            "workspace entries cannot carry direct-external evidence"
+        );
+    }
 }
 
 #[test]
