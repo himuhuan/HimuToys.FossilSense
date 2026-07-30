@@ -3,7 +3,7 @@
 > 状态：原始测试已完成；发布判定 **NO-GO**；整改持续执行中
 > 开始时间：2026-07-30 22:59:29 +08:00
 > 完成时间：2026-07-31 00:02:07 +08:00（总耗时约 1 小时 03 分）
-> 最新整改更新：2026-07-31 01:57:35 +08:00
+> 最新整改更新：2026-07-31 02:17:54 +08:00
 > 测试对象：`release/v1.5.0`，source commit `fff8f89c045fee1be428472a4d823ee16b223059`
 
 ## 1. 范围与判定口径
@@ -478,7 +478,7 @@ U-Boot dirty diff 仅有三处空白行变化：一处空白行改为含制表�
 
 状态：实验完成并回退；没有产品源码或测试改动进入提交，仅保留可复现证据。
 
-只读 `dbstat` 复核当前 `target/benchmark/index-u-boot-rebuild.sqlite`：文件 419,995,648 bytes，4 KiB page、102,538 pages、freelist 0。`declaration_facts` 为 193,822,720 bytes；`idx_declaration_facts_name` 23,212,032、`idx_declaration_facts_file_id` 8,224,768、`idx_declaration_facts_logical_key` 15,290,368、`idx_declaration_facts_locator` 24,080,384，五项合计 264,630,272 bytes。CLI explicit full-index 不构建 server `SemanticDeclarationIndex`；可直接影响进程峰值的局部参数包括 MEMORY rollback journal、`temp_store=MEMORY`、32 MiB page cache、解析线程/批次缓冲和 full-build call-string map。
+cache 实验开始前，对当时的 `target/benchmark/index-u-boot-rebuild.sqlite` 做只读 `dbstat`：文件 419,995,648 bytes，4 KiB page、102,538 pages、freelist 0。`declaration_facts` 为 193,822,720 bytes；`idx_declaration_facts_name` 23,212,032、`idx_declaration_facts_file_id` 8,224,768、`idx_declaration_facts_logical_key` 15,290,368、`idx_declaration_facts_locator` 24,080,384，五项合计 264,630,272 bytes。该工作数据库随后按 benchmark 入口的既定行为被后续运行覆盖，因此这组数字是实时记录的历史快照，不作为阶段 4B 的精确 A/B 基线；后续严格对比使用与 32 MiB JSON 同次保留的 SQLite。CLI explicit full-index 不构建 server `SemanticDeclarationIndex`；可直接影响进程峰值的局部参数包括 MEMORY rollback journal、`temp_store=MEMORY`、32 MiB page cache、解析线程/批次缓冲和 full-build call-string map。
 
 首先按 TDD 给 `full_build_defers_call_indexes_until_facts_are_complete` 增加 cache-size 断言，然后依次试验 8、16、24 MiB，始终保留 MEMORY journal、exclusive locking、`synchronous=OFF`、deferred indexes、`quick_check(1)`、`foreign_key_check` 和 checkpoint。8 MiB 的正确性测试通过，但 U-Boot full-index 被 60 秒硬门禁终止，因此立即否决。16/24 MiB 的事实计数均保持 13,244 files、654,890 declarations、91,919 callable anchors、582,522 call sites。
 
@@ -494,8 +494,35 @@ U-Boot dirty diff 仅有三处空白行变化：一处空白行改为含制表�
 
 - `target/benchmark/large-workspace-20260731_015014.json`（16 MiB）
 - `target/benchmark/large-workspace-20260731_015311.json`、`large-workspace-20260731_015459.json`（24 MiB）
-- `target/benchmark/stage4a-cache-ab/cache32-run1/large-workspace-20260731_015645.json`（阶段 3 干净 VSIX 内 32 MiB 基线二进制）
+- `target/benchmark/stage4a-cache-ab/cache32-run1/large-workspace-20260731_015645.json` 与同目录 `index-u-boot-rebuild.sqlite`（阶段 3 干净 VSIX 内 32 MiB 基线二进制及同次数据库）
 
 结论：缩小 cache 可在部分运行中降低采样峰值，但 24 MiB 的两次 peak Private 相差约 10 MiB，同机 32 MiB 相邻运行又与其第一次几乎相同，无法把变化可靠归因于 cache；反之 write/engine 变慢 3.5–4.0 秒可重复，8 MiB 还直接违反 60 秒门禁。因此该参数调整风险收益不成立，`store.rs` 与维护测试已完整回退到阶段前状态。
 
-下一阶段转向可确定计量且有望同时减少 DB、写放大和索引构建时间的方案：先通过 schema/query-plan 测试证明 `idx_declaration_facts_locator` 没有 SQL 消费者，再把它作为独立 schema 26 变更移除；name/logical-key 复合索引另行评估，不与 locator 改动混在同一阶段。
+下一阶段转向可确定计量且有望同时减少 DB、写放大和索引构建时间的方案：先通过 SQL 消费者审计与 schema 回归测试确认 `idx_declaration_facts_locator` 没有 SQL 消费者，再把它作为独立 schema 26 变更移除；name/logical-key 复合索引另行评估，不与 locator 改动混在同一阶段。
+
+### 阶段 4B：移除未消费的 declaration locator 索引
+
+状态：阶段完成；实现、TDD、完整 Rust 门禁、U-Boot full-index 和独立 reviewer 均已通过。
+
+源码查询链复核只发现 `locator_fingerprint` 被写入 declaration fact、从 typed read view 水合并在候选合并时进行内存比较；没有 SQL `WHERE`、`JOIN` 或 `ORDER BY` 消费该字段。这个结论只支持删除查找索引，不支持删除字段：locator 仍是声明稳定身份和 overlay 合并契约的一部分。
+
+先新增 `opening_schema_25_rebuilds_without_locator_lookup_index` 回归测试。修改前该测试稳定失败，实际 schema version 为 `25`、期望为 `26`；随后把 schema 提升到 26，并从 `CREATE_LOOKUP_INDEXES_SQL` 删除 `idx_declaration_facts_locator`。修改后的定向测试通过，同时验证旧 schema 25 声明事实会被迁移机制安全失效、`locator_fingerprint` 列仍保留、旧 locator 索引不会被重新创建。当前改动没有更改 locator payload、typed read model、查询排序或候选语义。
+
+独立 test-executor 顺序执行的门禁全部通过：
+
+| 命令/门禁 | 结果 |
+|---|---|
+| `cargo fmt --all -- --check` | PASS，1.914 s |
+| `cargo test -p fossilsense` | PASS，48.673 s |
+| `cargo clippy -p fossilsense --all-targets -- -D warnings` | PASS，9.551 s |
+| `cargo build --release -p fossilsense` | PASS，55.839 s |
+| `cargo test --release -p fossilsense --bin fossilsense --no-run` | PASS，101.527 s |
+| U-Boot release full-index | PASS，wrapper 36,882.710 ms；engine 35,804 ms，均低于 60,000 ms |
+
+本轮 U-Boot 仍为 13,244 files、654,890 declarations、91,919 callable anchors、582,522 call sites，未发生事实数量退化；分段耗时为 discover 1,043 ms、parse 6,203 ms、write 19,573 ms、include edge 1,941 ms、secondary index 2,112 ms、publication 4,170 ms。峰值 Working Set 163,180,544 bytes，Private Bytes 157,540,352 bytes。原始结果为 `target/benchmark/large-workspace-20260731_020735.json` 与同名 Markdown。
+
+页级结果与修改目标一致：schema 为 26、page size 4,096、page count 96,593、freelist 0，`idx_declaration_facts_locator` 对象数为 0。严格使用阶段 4A 保留的同次 32 MiB schema 25 数据库对比：page count 102,440、数据库 419,594,240 bytes、旧 locator 索引 24,076,288 bytes；阶段 4B 数据库为 395,644,928 bytes，净减 23,949,312 bytes（5.71%）。主要降幅可直接归因于移除 locator 索引，其余 declaration 对象保持同一数量级：fact table 193,830,912 bytes、name index 23,195,648、file-id index 8,224,768、logical-key index 15,142,912。
+
+与阶段 4A 的 32 MiB 同机 schema 25 样本相比，本轮观察到 wrapper 从 43,162.560 降至 36,882.710 ms、engine 从 42,862 降至 35,804 ms、write 从 26,157 降至 19,573 ms、Private Bytes 从 172,347,392 降至 157,540,352。单次进程采样和机器状态仍可能影响时间/内存，因此这里只把数据库页减少视为强归因结果，不把全部耗时和峰值改善宣称为 locator 索引的确定收益。
+
+独立 reviewer 未发现产品代码、schema 兼容性或 locator 语义问题；其唯一 P3 finding 是初稿混用了阶段 4A 历史工作库与保留的 32 MiB A/B 工件，上述页数、字节和百分比已统一按保留工件修正。残余风险是底层 `IndexStore::migrate` 本身没有显式事务：默认工作区索引通过 side-by-side staging、完整性检查和 manifest 切换保护旧读者，但显式 `--db` 诊断路径若在 DDL 中途进程崩溃，仍可能留下需要再次重建的部分数据库。这是既有迁移架构风险，不由本阶段引入，后续应以故障注入和 crash-atomic 边界为独立阶段评估。

@@ -1,7 +1,7 @@
-// Version 25 persists the import path of each indexed Go package. This powers
-// bounded import-string completion without reading go.mod files or opening
-// SQLite on the request hot path.
-pub(crate) const SCHEMA_VERSION: i64 = 25;
+// Version 26 removes the unused locator-fingerprint lookup index while keeping
+// the fingerprint in each declaration fact. The version bump forces schema 25
+// databases to rebuild so the obsolete index pages are reclaimed.
+pub(crate) const SCHEMA_VERSION: i64 = 26;
 
 pub(crate) const DROP_DATA_TABLES_SQL: &str = "
     DROP TABLE IF EXISTS pending_file_revisions;
@@ -462,7 +462,6 @@ pub(crate) const CREATE_LOOKUP_INDEXES_SQL: &str = "
     CREATE INDEX IF NOT EXISTS idx_declaration_facts_name ON declaration_facts(name);
     CREATE INDEX IF NOT EXISTS idx_declaration_facts_file_id ON declaration_facts(file_id);
     CREATE INDEX IF NOT EXISTS idx_declaration_facts_logical_key ON declaration_facts(logical_key_digest);
-    CREATE INDEX IF NOT EXISTS idx_declaration_facts_locator ON declaration_facts(locator_fingerprint);
     CREATE INDEX IF NOT EXISTS idx_package_facts_name ON package_facts(name);
     CREATE INDEX IF NOT EXISTS idx_package_facts_file_id ON package_facts(file_id);
     CREATE INDEX IF NOT EXISTS idx_import_facts_path ON import_facts(import_path);

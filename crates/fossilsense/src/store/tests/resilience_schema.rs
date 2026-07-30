@@ -140,6 +140,92 @@ fn current_schema_has_members_table_and_version_9_or_newer() {
 }
 
 #[test]
+fn opening_schema_25_rebuilds_without_locator_lookup_index() {
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+    {
+        let mut store = IndexStore::open(&db, dir.path()).expect("store");
+        upsert_source(
+            &mut store,
+            "src/legacy.c",
+            "int legacy_locator(void) { return 1; }\n",
+        );
+        let declaration_count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM declaration_facts", [], |row| {
+                row.get(0)
+            })
+            .expect("legacy declaration count");
+        assert!(declaration_count > 0, "fixture must persist a declaration");
+
+        store
+            .conn
+            .execute(
+                "UPDATE meta SET value = '25' WHERE key = 'schema_version'",
+                [],
+            )
+            .expect("mark schema 25");
+        store
+            .conn
+            .execute(
+                "CREATE INDEX IF NOT EXISTS idx_declaration_facts_locator
+                 ON declaration_facts(locator_fingerprint)",
+                [],
+            )
+            .expect("seed schema 25 locator index");
+    }
+
+    let store = IndexStore::open(&db, dir.path()).expect("migrate schema 25");
+    let version: String = store
+        .conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("schema version");
+    assert_eq!(version, "26");
+
+    let declaration_count: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM declaration_facts", [], |row| {
+            row.get(0)
+        })
+        .expect("declaration count after migration");
+    assert_eq!(
+        declaration_count, 0,
+        "schema migration must invalidate schema 25 declaration facts"
+    );
+
+    let columns: Vec<String> = store
+        .conn
+        .prepare("PRAGMA table_info(declaration_facts)")
+        .expect("declaration columns")
+        .query_map([], |row| row.get(1))
+        .expect("query declaration columns")
+        .collect::<rusqlite::Result<_>>()
+        .expect("collect declaration columns");
+    assert!(
+        columns.contains(&"locator_fingerprint".to_string()),
+        "the locator identity remains part of the persisted semantic fact"
+    );
+
+    let locator_index_count: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'index' AND name = 'idx_declaration_facts_locator'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("locator index count");
+    assert_eq!(
+        locator_index_count, 0,
+        "schema 26 must not recreate the unused locator lookup index"
+    );
+}
+
+#[test]
 fn opening_v8_schema_drops_old_field_rows_for_full_rebuild() {
     let dir = tempdir().expect("tempdir");
     let db = dir.path().join("index.sqlite");
