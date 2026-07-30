@@ -412,7 +412,8 @@ fn declaration_row(row: &rusqlite::Row<'_>) -> Result<DeclarationReadRow> {
         .get::<_, Option<Vec<u8>>>(30)?
         .map(|value| stored_digest_hex(value, "guard fingerprint", id))
         .transpose()?;
-    let logical_canonical_signature: Option<String> = row.get(31)?;
+    let logical_canonical_signature =
+        stored_logical_signature(row.get(31)?, canonical_signature.as_deref(), id)?;
     let backing_kind = declaration_backing_kind(row.get(32)?)
         .with_context(|| format!("invalid backing kind for declaration row {id}"))?;
     let backing_id: Option<i64> = row.get(33)?;
@@ -555,6 +556,34 @@ fn stored_digest_hex(value: Vec<u8>, field: &str, row_id: i64) -> Result<String>
         output.push(HEX[(byte & 0x0f) as usize] as char);
     }
     Ok(output)
+}
+
+fn stored_logical_signature(
+    value: Option<Vec<u8>>,
+    canonical_signature: Option<&str>,
+    row_id: i64,
+) -> Result<Option<String>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let Some((&tag, payload)) = value.split_first() else {
+        anyhow::bail!("empty logical signature tag for declaration row {row_id}");
+    };
+    match tag {
+        0 if payload.is_empty() => canonical_signature
+            .map(str::to_string)
+            .with_context(|| {
+                format!("logical signature references an absent display value for row {row_id}")
+            })
+            .map(Some),
+        0 => {
+            anyhow::bail!("same-value logical signature has a payload for declaration row {row_id}")
+        }
+        1 => String::from_utf8(payload.to_vec())
+            .with_context(|| format!("logical signature is not UTF-8 for declaration row {row_id}"))
+            .map(Some),
+        _ => anyhow::bail!("unknown logical signature tag {tag} for declaration row {row_id}"),
+    }
 }
 
 fn declaration_kind(value: i64) -> Result<SemanticDeclarationKind> {

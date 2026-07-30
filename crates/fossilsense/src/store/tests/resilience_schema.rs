@@ -254,7 +254,7 @@ fn opening_schema_26_rebuilds_with_compact_declaration_scalars() {
             |row| row.get(0),
         )
         .expect("schema version");
-    assert_eq!(version, "27");
+    assert_eq!(version, crate::store::schema::SCHEMA_VERSION.to_string());
 
     let declaration_count: i64 = store
         .conn
@@ -278,6 +278,60 @@ fn opening_schema_26_rebuilds_with_compact_declaration_scalars() {
     assert!(columns.contains(&("locator_fingerprint".into(), "BLOB".into())));
     assert!(columns.contains(&("guard_fingerprint".into(), "BLOB".into())));
     assert!(columns.contains(&("backing_kind".into(), "INTEGER".into())));
+}
+
+#[test]
+fn opening_schema_27_rebuilds_with_tagged_logical_signatures() {
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+    {
+        let mut store = IndexStore::open(&db, dir.path()).expect("store");
+        upsert_source(
+            &mut store,
+            "src/legacy.c",
+            "int legacy_signature(void) { return 1; }\n",
+        );
+        store
+            .conn
+            .execute(
+                "UPDATE meta SET value = '27' WHERE key = 'schema_version'",
+                [],
+            )
+            .expect("mark schema 27");
+    }
+
+    let store = IndexStore::open(&db, dir.path()).expect("migrate schema 27");
+    let version: String = store
+        .conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("schema version");
+    assert_eq!(version, "28");
+
+    let declaration_count: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM declaration_facts", [], |row| {
+            row.get(0)
+        })
+        .expect("declaration count after migration");
+    assert_eq!(
+        declaration_count, 0,
+        "schema migration must invalidate schema 27 declaration facts"
+    );
+
+    let logical_signature_type: String = store
+        .conn
+        .query_row(
+            "SELECT type FROM pragma_table_info('declaration_facts')
+             WHERE name = 'logical_canonical_signature'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("logical signature column type");
+    assert_eq!(logical_signature_type, "BLOB");
 }
 
 #[test]

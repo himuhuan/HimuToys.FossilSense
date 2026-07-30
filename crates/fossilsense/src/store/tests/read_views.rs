@@ -204,6 +204,194 @@ fn declaration_storage_compacts_fingerprints_and_backing_kind_without_changing_v
 }
 
 #[test]
+fn declaration_storage_tags_logical_signature_relations_without_changing_views() {
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+    let mut store = IndexStore::open(&db, dir.path()).expect("store");
+    upsert_source(
+        &mut store,
+        "same.c",
+        "int same_signature(void) { return 0; }\n",
+    );
+    upsert_source(
+        &mut store,
+        "pkg/init.go",
+        "package pkg\n\nfunc Ordinary() {}\nfunc init() {}\n",
+    );
+
+    let stored_relation = |name: &str| -> (String, Option<String>) {
+        store
+            .conn
+            .query_row(
+                "SELECT typeof(logical_canonical_signature),
+                        CASE WHEN logical_canonical_signature IS NULL
+                             THEN NULL
+                             ELSE hex(logical_canonical_signature)
+                        END
+                 FROM declaration_facts
+                 WHERE name = ?1
+                 ORDER BY id
+                 LIMIT 1",
+                [name],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap_or_else(|error| panic!("stored logical signature for {name}: {error}"))
+    };
+    assert_eq!(
+        stored_relation("same_signature"),
+        ("blob".into(), Some("00".into())),
+        "equal display/logical signatures use the one-byte same-value tag"
+    );
+    assert_eq!(
+        stored_relation("Ordinary"),
+        ("null".into(), None),
+        "an absent logical signature remains SQLite NULL"
+    );
+    let (init_type, init_tagged_hex) = stored_relation("init");
+    assert_eq!(init_type, "blob");
+    let init_tagged_hex = init_tagged_hex.expect("custom init signature");
+    assert_eq!(init_tagged_hex.len(), 50);
+    assert!(
+        init_tagged_hex.starts_with("01"),
+        "a custom logical signature uses the explicit-value tag"
+    );
+
+    let reader = IndexStore::open_readonly(&db).expect("readonly");
+    let same = reader
+        .declaration_view()
+        .by_name_limited("same_signature", 1)
+        .expect("same signature")
+        .0
+        .pop()
+        .expect("same declaration");
+    assert_eq!(
+        same.fact.canonical_signature,
+        same.fact.identity.logical_key.canonical_signature
+    );
+
+    let ordinary = reader
+        .declaration_view()
+        .by_name_limited("Ordinary", 1)
+        .expect("ordinary Go declaration")
+        .0
+        .pop()
+        .expect("Ordinary declaration");
+    assert_eq!(
+        ordinary.fact.canonical_signature.as_deref(),
+        Some("func Ordinary()")
+    );
+    assert!(
+        ordinary
+            .fact
+            .identity
+            .logical_key
+            .canonical_signature
+            .is_none(),
+        "ordinary Go entities do not use a signature in their logical key"
+    );
+
+    let init = reader
+        .declaration_view()
+        .by_name_limited("init", 1)
+        .expect("Go init declaration")
+        .0
+        .pop()
+        .expect("init declaration");
+    assert_eq!(
+        init.fact.canonical_signature.as_deref(),
+        Some("func init()")
+    );
+    let init_logical = init
+        .fact
+        .identity
+        .logical_key
+        .canonical_signature
+        .as_deref()
+        .expect("init logical entity key");
+    assert_eq!(init_logical.len(), 24);
+    assert_ne!(Some(init_logical), init.fact.canonical_signature.as_deref());
+    drop(reader);
+
+    for (value, reason) in [
+        ("x''", "empty BLOB"),
+        ("x'0061'", "same-value tag with a payload"),
+        ("x'02'", "unknown tag"),
+        ("'text'", "TEXT value"),
+        ("1", "INTEGER value"),
+    ] {
+        let sql = format!(
+            "UPDATE declaration_facts
+             SET logical_canonical_signature = {value}
+             WHERE name = 'Ordinary'"
+        );
+        assert!(
+            store.conn.execute(&sql, []).is_err(),
+            "schema must reject {reason}"
+        );
+    }
+    assert!(
+        store
+            .conn
+            .execute(
+                "UPDATE declaration_facts
+                 SET canonical_signature = NULL,
+                     logical_canonical_signature = x'00'
+                 WHERE name = 'Ordinary'",
+                [],
+            )
+            .is_err(),
+        "the same-value tag requires a display signature"
+    );
+
+    store
+        .conn
+        .execute(
+            "UPDATE declaration_facts
+             SET logical_canonical_signature = x'01'
+             WHERE name = 'Ordinary'",
+            [],
+        )
+        .expect("persist explicit empty logical signature");
+    let reader = IndexStore::open_readonly(&db).expect("readonly empty override");
+    let ordinary = reader
+        .declaration_view()
+        .by_name_limited("Ordinary", 1)
+        .expect("read explicit empty override")
+        .0
+        .pop()
+        .expect("Ordinary declaration");
+    assert_eq!(
+        ordinary
+            .fact
+            .identity
+            .logical_key
+            .canonical_signature
+            .as_deref(),
+        Some("")
+    );
+    drop(reader);
+
+    store
+        .conn
+        .execute(
+            "UPDATE declaration_facts
+             SET logical_canonical_signature = x'01ff'
+             WHERE name = 'Ordinary'",
+            [],
+        )
+        .expect("tag shape permits an opaque custom payload");
+    let reader = IndexStore::open_readonly(&db).expect("readonly invalid UTF-8");
+    let error = reader
+        .declaration_view()
+        .by_name_limited("Ordinary", 1)
+        .expect_err("typed view must reject an invalid UTF-8 override");
+    assert!(
+        error.to_string().contains("not UTF-8"),
+        "unexpected typed read error: {error:#}"
+    );
+}
+
+#[test]
 fn declaration_name_view_exposes_typed_rows_and_streaming_parity() {
     let dir = tempdir().expect("tempdir");
     let db = dir.path().join("index.sqlite");

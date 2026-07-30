@@ -1,7 +1,7 @@
-// Version 27 compacts fixed-width declaration fingerprints and backing kinds
-// without changing their typed read-view representation. The version bump
-// invalidates schema 26 TEXT payloads before they can reach the BLOB decoder.
-pub(crate) const SCHEMA_VERSION: i64 = 27;
+// Version 28 stores the logical canonical signature as a tagged relation to
+// the display signature: NULL means absent, 0x00 means equal, and 0x01 prefixes
+// an explicit UTF-8 override. Typed read views still expose the original value.
+pub(crate) const SCHEMA_VERSION: i64 = 28;
 
 pub(crate) const DROP_DATA_TABLES_SQL: &str = "
     DROP TABLE IF EXISTS pending_file_revisions;
@@ -142,7 +142,12 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
         guard_fingerprint BLOB
             CHECK(guard_fingerprint IS NULL OR
                   (typeof(guard_fingerprint) = 'blob' AND length(guard_fingerprint) = 12)),
-        logical_canonical_signature TEXT,
+        logical_canonical_signature BLOB
+            CHECK(logical_canonical_signature IS NULL OR
+                  (typeof(logical_canonical_signature) = 'blob' AND
+                   ((logical_canonical_signature = x'00' AND canonical_signature IS NOT NULL) OR
+                    (length(logical_canonical_signature) >= 1 AND
+                     substr(logical_canonical_signature, 1, 1) = x'01')))),
         backing_kind INTEGER NOT NULL
             CHECK(typeof(backing_kind) = 'integer' AND backing_kind BETWEEN 0 AND 4),
         backing_id INTEGER,

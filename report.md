@@ -3,7 +3,7 @@
 > 状态：原始测试已完成；发布判定 **NO-GO**；整改持续执行中
 > 开始时间：2026-07-30 22:59:29 +08:00
 > 完成时间：2026-07-31 00:02:07 +08:00（总耗时约 1 小时 03 分）
-> 最新整改更新：2026-07-31 03:53:46 +08:00
+> 最新整改更新：2026-07-31 04:51:43 +08:00
 > 测试对象：`release/v1.5.0`，source commit `fff8f89c045fee1be428472a4d823ee16b223059`
 
 ## 1. 范围与判定口径
@@ -608,3 +608,47 @@ U-Boot 事实计数保持 13,244 files、654,890 declarations、91,919 callable 
 独立 reviewer 随 backing 契约审计发现一项既存 P2 与两项阶段边界 P3。P2 是 Go `type UserID string` 等 defined type 把整个 declaration range 放进 `SourceRange` backing，而 store 一直要求该 backing 等于 name range：debug index 会 panic，release 水合会把完整 byte end 与名字的 line/character end 拼成不一致 range；初轮 Kubernetes 库已有 4,557 行受影响。新增 store roundtrip 测试先稳定触发 debug assertion，现 Go parser 统一写入 name range，并把 `PARSER_FACT_VERSION` 从 7 提升到 8，确保任何结构仍为 schema 27 的旧 parser rows 也会失效。另两个失败测试分别证明 `u8::from_str_radix` 会接受 `+f` 前导符号、SQLite `BETWEEN 0 AND 4` 会放行 REAL 0.5；hex decoder 现先显式验证每个 byte 都是 ASCII hex，backing CHECK 现同时要求 `typeof='integer'`。uppercase 仍被接受并在 read view 规范化为原小写协议。
 
 上述三项定向测试均已转绿。parser fact 8 最终 U-Boot/Kubernetes 重建确认旧事实会按预期失效；Kubernetes 中 `SourceRange` backing 与 name byte range 不一致的 Go declaration 已从初轮的 4,557 行降到 0。独立 test-executor 随后复跑完整 Rust suite、Clippy、release build/no-run 和 U-Boot full-index/hydration，全部通过；修复后独立 reviewer 复核确认三项 finding 完整关闭且产品代码没有新回归，仅纠正了报告中的单次耗时差。初轮 parser fact 7 数据仅保留为发现问题的证据，不再作为放行结果。
+
+### 阶段 4F：关系编码去除重复 logical signature（已完成）
+
+状态：实现、完整 Rust 门禁、U-Boot full-index/hydration、Kubernetes full/no-change 与修复后独立复核均已通过。
+
+最初候选是合并 `canonical_signature` 与 `logical_canonical_signature`。源码审计证明直接合并不成立：普通 C/C++ declaration 的两值通常相同，但前者是 Hover、补全详情、LSP 展示与 overlay 使用的 presentation fact，后者属于 `LogicalEntityKey` 并参与 digest 后的精确身份匹配。Go 普通 declaration 的展示签名非空而 logical signature 为 NULL；名为 `init` 的 Go callable 则把逻辑值改为稳定 entity key，以区分多个物理初始化入口。真实 Kubernetes 中这包括 1,291 个顶层 `init` function 与 44 个名为 `init` 的 method。任意删除一列、按语言猜测或把 NULL 当作“与展示值相同”都会破坏至少一种现有语义。
+
+两库的 schema 27 / parser fact 8 列级审计为：
+
+| 样本 | declarations | display signature payload | logical signature 分布与 payload |
+|---|---:|---:|---:|
+| U-Boot | 654,890 | 31,682,279 UTF-8 bytes | 654,890 个值全部与 display 相同；31,682,279 UTF-8 bytes |
+| Kubernetes | 339,903 | 45,073,634 UTF-8 bytes | 338,554 NULL、14 个相同值、1,335 个自定义值；33,001 UTF-8 bytes |
+
+因此实现没有合并语义字段，而只压缩两者之间的持久化关系。schema 28 把 logical 列改为 nullable tagged BLOB：NULL 精确表示 logical `None`；单字节 `x'00'` 表示与非空 display 值相同；`x'01'` 后跟完整 UTF-8 bytes 表示显式 override，连显式空字符串也不会与 `x'00'` 混淆。write path 仍先序列化完整 `LogicalEntityKey` 并计算原 digest，再选择存储 tag；typed read view 严格验证 tag/UTF-8 并恢复原 `Option<String>`。SQLite CHECK 拒绝未知 tag、带 payload 的 same tag、非 BLOB 以及引用空 display 的 same tag；没有根据 language、name 或 declaration kind 推导值。
+
+`target/benchmark/stage4f-signature-lab/` 先后验证了删除列、额外 state 列与单列 tag。早期 `CREATE TABLE AS SELECT` shadow 因丢失 `id INTEGER PRIMARY KEY` 的 rowid alias，给每行重复保存 ID，使 Kubernetes 结果虚增约 1 MiB；该数字已废弃。最终实验使用与生产完全相同的显式 declaration DDL，只替换目标列，`PRAGMA table_info` 确认主键仍为 INTEGER PK，且两库关系重建 mismatch 都为 0：
+
+| 样本 | schema 27 declaration table | tagged-BLOB shadow | 页级变化 |
+|---|---:|---:|---:|
+| U-Boot | 176,820,224 bytes / 43,169 pages | 143,060,992 / 34,927 | -33,759,232 bytes（-19.09%） |
+| Kubernetes | 132,784,128 bytes / 32,418 pages | 132,788,224 / 32,419 | +4,096 bytes（+0.003%） |
+
+TDD 先加入 `declaration_storage_tags_logical_signature_relations_without_changing_views` 与 schema 27→28 重建用例。修改前前者实际读到 SQLite TEXT 和完整重复签名、期望 BLOB `00`，后者实际 version 27、期望 28，均稳定失败。转绿测试覆盖 C same、Go NULL、Go `init` override、typed logical-key 查询和 schema 失效；reviewer 复核后又把持久化边界扩到显式空 override 的 SQLite→typed round-trip、可通过 tag CHECK 但必须由 typed view 拒绝的非法 UTF-8，以及 schema 对空 BLOB、same tag 带 payload、未知 tag、TEXT、INTEGER 和 same→NULL display 的拒绝。schema 版本升级会让旧 TEXT rows 在进入 BLOB decoder 前完整重建，不需要修改 parser fact 8。
+
+独立 reviewer 最终确认 tagged relation 的 SQLite CHECK、任意 display/logical `Option<String>` 组合、完整 logical-key 序列化与 digest 输入、typed decoder、SELECT 列索引与 schema 27 失效均无剩余 finding；两项 P3 仅涉及报告把字符数误称为 bytes，以及恶意 payload/空 override 覆盖不足，修正后窄范围复核已关闭。修正测试后完整 Rust suite、格式与 Clippy 再次通过。
+
+独立 test-executor 的最终门禁：
+
+| 命令/门禁 | 结果 |
+|---|---|
+| `cargo fmt --all -- --check` | PASS |
+| `cargo test -p fossilsense` | PASS，unit 1005 + CLI 1 + LSP 2 = 1008 passed / 6 ignored |
+| `cargo clippy -p fossilsense --all-targets -- -D warnings` | PASS |
+| `cargo build --release -p fossilsense` | PASS |
+| `cargo test --release -p fossilsense --bin fossilsense --no-run` | PASS |
+| U-Boot full-index | PASS，wrapper 37,150.273 ms；engine 36,084 ms，均低于 60,000 ms |
+| U-Boot engine hydration | PASS，单代 183,697,408 bytes；双代 348,962,816 bytes |
+
+U-Boot 分段为 discover 1,123 ms、parse 6,478、write 19,616、check 9、include edge 1,960、secondary index 2,094、publication 4,155；峰值 Working Set 169,414,656 bytes、Private Bytes 158,949,376。hydration recall 为 93,747,480 bytes，首/次代 3,844/3,853 ms。原始报告是 `target/benchmark/large-workspace-20260731_041545.json` 与同名 Markdown。最终 schema 28 DB 为 345,210,880 bytes、84,280 pages、freelist 0，相对同事实 schema 27 的 378,793,984 bytes 减少 33,583,104（8.87%）；`declaration_facts` 为 143,114,240 bytes，相对 176,820,224 减少 33,705,984（19.06%）。654,890 行全部为合法单字节 `x'00'`，事实计数不变，schema/parser 分别为 28/8，完整性检查通过。
+
+Kubernetes 最终放行库是 `target/validation-1.5.0/kubernetes-stage4f-schema28-fresh.sqlite`。full-index engine 47,732 ms，分段为 discover 1,511、parse 9,963、write 21,589、check 13、include edge 3,557、secondary index 4,563、publication 5,677；随后 no-change 17,861 个文件全部 skipped，engine 4,072 ms，parse/write/publication 均为 0。事实计数保持 339,903 declarations、226,316 anchors、1,182,317 calls；最终 DB 为 479,776,768 bytes、117,133 pages、freelist 0，`declaration_facts` 为 132,800,512 bytes。相对 schema 27 表只增加 16,384 bytes（0.012%），整库增加 249,856（0.052%，含 fresh rebuild 页布局波动）；338,554 NULL、14 个 `x'00'`、1,335 个 `x'01'` 全部合法，schema/parser=28/8，`quick_check=ok`、foreign-key violations=0。
+
+补证过程中还暴露了一个与本阶段编码无关、但必须后续处理的既存风险：在已有的 479,768,576-byte Kubernetes 显式 DB 上再次执行 `index --force`，新一代在约 50 秒内已经发布，但进程随后停在 finalizing 超过 5 分钟并持续占用 CPU，远超 60 秒口径。中止后的只读现场 `target/validation-1.5.0/kubernetes-stage4f-schema28.sqlite` 显示 active manifest 仍正确指向 17,861 个文件、pending=0，但旧代尚未清理：file revisions 35,722、declaration rows 679,806，恰为双代，文件膨胀到 769,638,400 bytes。该现场不作为有效放行库；阶段 4G 将单独追踪发布后 obsolete-revision cleanup 的复杂度、崩溃恢复和空间回收，避免与已验证的 tagged encoding 混成一个提交。

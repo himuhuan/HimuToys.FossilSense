@@ -650,6 +650,14 @@ pub(super) fn stage_file_updates(
                     .as_deref()
                     .map(digest_bytes)
                     .transpose()?;
+                let logical_canonical_signature = tagged_logical_signature(
+                    declaration.canonical_signature.as_deref(),
+                    declaration
+                        .identity
+                        .logical_key
+                        .canonical_signature
+                        .as_deref(),
+                );
                 declaration_stmt.execute(params![
                     revision_id,
                     file_id,
@@ -683,11 +691,7 @@ pub(super) fn stage_file_updates(
                     locator_fingerprint,
                     declaration.identity.logical_key.linkage_domain.as_str(),
                     guard_fingerprint,
-                    declaration
-                        .identity
-                        .logical_key
-                        .canonical_signature
-                        .as_deref(),
+                    logical_canonical_signature,
                     backing_kind,
                     backing_id,
                     backing_key,
@@ -716,6 +720,20 @@ fn digest_bytes(value: &str) -> Result<Vec<u8>> {
             u8::from_str_radix(text, 16).context("fact digest contains a non-hexadecimal byte")
         })
         .collect()
+}
+
+fn tagged_logical_signature(
+    canonical_signature: Option<&str>,
+    logical_canonical_signature: Option<&str>,
+) -> Option<Vec<u8>> {
+    let logical_canonical_signature = logical_canonical_signature?;
+    if canonical_signature == Some(logical_canonical_signature) {
+        return Some(vec![0]);
+    }
+    let mut tagged = Vec::with_capacity(logical_canonical_signature.len().saturating_add(1));
+    tagged.push(1);
+    tagged.extend_from_slice(logical_canonical_signature.as_bytes());
+    Some(tagged)
 }
 
 fn digest_value(value: &[u8]) -> Vec<u8> {
@@ -865,7 +883,7 @@ fn fact_flags(provenance: crate::call_model::FactProvenance, syntax_error: bool)
 
 #[cfg(test)]
 mod tests {
-    use super::digest_bytes;
+    use super::{digest_bytes, tagged_logical_signature};
 
     #[test]
     fn digest_bytes_rejects_signs_and_non_hex_but_accepts_uppercase() {
@@ -878,6 +896,24 @@ mod tests {
         assert_eq!(
             digest_bytes("0F0000000000000000000000").expect("uppercase digest"),
             expected
+        );
+    }
+
+    #[test]
+    fn tagged_logical_signature_preserves_all_three_relation_states() {
+        assert_eq!(tagged_logical_signature(Some("same"), None), None);
+        assert_eq!(
+            tagged_logical_signature(Some("same"), Some("same")),
+            Some(vec![0])
+        );
+        assert_eq!(
+            tagged_logical_signature(Some("display"), Some("")),
+            Some(vec![1]),
+            "an explicit empty override must not collide with the same-value tag"
+        );
+        assert_eq!(
+            tagged_logical_signature(None, Some("custom")),
+            Some(b"\x01custom".to_vec())
         );
     }
 }
