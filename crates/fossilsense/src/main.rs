@@ -462,13 +462,18 @@ fn run_query(kind: QueryCommand) -> Result<()> {
                 serde_json::to_string(query_index.coverage())?
             );
             for relation in relations {
-                let target = relation
-                    .callee
-                    .as_ref()
-                    .map_or("<unresolved>", |callee| callee.qualified_name.as_str());
+                let counterpart = match relation.direction {
+                    call_model::RelationDirection::Incoming => {
+                        relation.caller.qualified_name.as_str()
+                    }
+                    call_model::RelationDirection::Outgoing => relation
+                        .callee
+                        .as_ref()
+                        .map_or("<unresolved>", |callee| callee.qualified_name.as_str()),
+                };
                 println!(
                     "{}\t{:?}\t{} sites\t{:?}",
-                    target,
+                    counterpart,
                     relation.confidence,
                     relation.call_sites.len(),
                     relation.evidence

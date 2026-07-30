@@ -3,7 +3,7 @@
 > 状态：原始测试已完成；发布判定 **NO-GO**；整改持续执行中
 > 开始时间：2026-07-30 22:59:29 +08:00
 > 完成时间：2026-07-31 00:02:07 +08:00（总耗时约 1 小时 03 分）
-> 最新整改更新：2026-07-31 01:17:45 +08:00
+> 最新整改更新：2026-07-31 01:22:12 +08:00
 > 测试对象：`release/v1.5.0`，source commit `fff8f89c045fee1be428472a4d823ee16b223059`
 
 ## 1. 范围与判定口径
@@ -370,6 +370,8 @@ U-Boot dirty diff 仅有三处空白行变化：一处空白行改为含制表�
 
 功能侧总体结果较好：mini C/Go、LSP smoke、扩展测试、架构可执行门禁、U-Boot hydration、Kubernetes 两次全量索引与无变化增量索引均完成且没有崩溃。Kubernetes 17,861-file 实际工作集两次全量索引中位 50.543 s，事实计数完全一致，所有 revision 均为 `ok`，复杂 build constraints、CGO 边界和 unresolved imports 均以显式证据降级；真实 definition/references/call 查询保持有界并暴露 coverage/truncation。确认的功能缺陷只有 F-01：CLI incoming calls 展示 callee 而非 caller，底层 relation 与 LSP 路径不受影响。
 
+第 1–6 节记录的原始全面测试轮次按当时要求没有修复任何产品源码、测试或发布配置；长期整改实现从第 7 节开始。测试开始前已有的 `CLAUDE.md` 删除和未跟踪 `AGENTS.md` 在阶段 1、2 中保持原状。
+
 ## 7. 1.5.0 长期整改进度
 
 ### 阶段 1：恢复 Rust 门禁并压缩常驻召回布局
@@ -416,6 +418,24 @@ U-Boot dirty diff 仅有三处空白行变化：一处空白行改为含制表�
 
 阶段 1 的确定性收益是 compact vector 容量对应的常驻 recall 减少 8 MiB，双代并存绝对峰值减少约 16.05 MiB；U-Boot 的 654,890 declarations、13,244 files 规模门禁以及 60 秒、384 MiB、512 MiB 硬门禁全部通过。full-index 进程峰值和数据库没有随该内存布局修复下降，说明 R-03 的主要存储/进程峰值来源仍在 canonical declaration facts、索引、发布校验及其他运行时结构中，继续保持开放，不用阶段 1 的局部收益替代后续归因。
 
-下一阶段处理 F-01：为 CLI `query calls --incoming` 先增加失败输出测试，再按 direction 选择 caller/callee；完成独立验证、审查和提交后继续处理 R-02 与 R-03。
+### 阶段 2：修复 CLI incoming call relation 展示
 
-第 1–6 节记录的原始全面测试轮次按当时要求没有修复任何产品源码、测试或发布配置；长期整改实现从第 7 节开始。测试开始前已有的 `CLAUDE.md` 删除和未跟踪 `AGENTS.md` 在阶段 1 中保持原状。
+状态：阶段完成；F-01 已由真实二进制集成测试复现、修复并完成阶段验证，本节随阶段提交记录。
+
+新增 `crates/fossilsense/tests/cli_calls.rs`，在临时 C 工作区创建 `target` 与调用它的 `caller`，通过实际 `fossilsense index` 建库后分别执行 incoming/outgoing CLI 查询。修复前测试稳定失败：incoming 的 `root` 和关系行都打印 `target`，尽管 relation 数量、call site 和底层 caller 数据正确。测试只匹配制表符分隔的关系行，避免被 `root`、coverage 或统计输出误判。
+
+`main.rs` 的 presentation 现按每条 `CallRelation.direction` 选择 counterpart：incoming 使用必有的 `relation.caller`，outgoing 继续使用可选的 `relation.callee`，未解析 outgoing 仍显示 `<unresolved>`。该修改不触及 call catalog、candidate ranking、confidence/evidence、分页、LSP call hierarchy 或扩展模型。
+
+验证结果：
+
+| 命令/门禁 | 结果 |
+|---|---|
+| `cargo test -p fossilsense --test cli_calls -- --nocapture`（修复前） | FAIL，incoming 关系行错误打印 `target` |
+| 同一命令（修复后） | PASS，1/1；incoming=`caller`、outgoing=`target` |
+| `cargo test -p fossilsense` | PASS：unit 997 passed / 6 ignored；CLI integration 1/1；LSP smoke 2/2 |
+| `cargo fmt --all -- --check` | PASS |
+| `cargo clippy -p fossilsense --all-targets -- -D warnings` | PASS |
+
+本阶段是 stdout presentation 修复，没有改变索引、存储、查询复杂度或常驻读模型，因此不重复运行大型工作区性能门禁。
+
+下一阶段处理 R-02：恢复仓库和发布脚本明确要求的根 `CLAUDE.md`，同时保留用户现有 `AGENTS.md`；随后运行发布 hardening、扩展测试和打包验证，再进入 R-03 性能/存储优化。
