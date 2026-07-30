@@ -3,7 +3,7 @@
 > 状态：原始测试已完成；发布判定 **NO-GO**；整改持续执行中
 > 开始时间：2026-07-30 22:59:29 +08:00
 > 完成时间：2026-07-31 00:02:07 +08:00（总耗时约 1 小时 03 分）
-> 最新整改更新：2026-07-31 01:34:52 +08:00
+> 最新整改更新：2026-07-31 01:57:35 +08:00
 > 测试对象：`release/v1.5.0`，source commit `fff8f89c045fee1be428472a4d823ee16b223059`
 
 ## 1. 范围与判定口径
@@ -473,3 +473,29 @@ U-Boot dirty diff 仅有三处空白行变化：一处空白行改为含制表�
 该 VSIX 证明 1.5.0 自包含打包链路和 R-02 修复有效，但不是最终发布制品：后续任何 Rust、扩展或 release-input 改动都会使它按仓库规则作废，必须在 R-03 与最终门禁结束后重新生成。
 
 下一阶段进入 R-03：以现有 A/B 数据为基线，先把数据库增长、full-build writer 峰值、publication 校验和 parser 提取拆成可独立度量的成本，再选择不削弱原子发布/完整性契约的优化点。
+
+### 阶段 4A：full-build SQLite cache 参数实验（拒绝）
+
+状态：实验完成并回退；没有产品源码或测试改动进入提交，仅保留可复现证据。
+
+只读 `dbstat` 复核当前 `target/benchmark/index-u-boot-rebuild.sqlite`：文件 419,995,648 bytes，4 KiB page、102,538 pages、freelist 0。`declaration_facts` 为 193,822,720 bytes；`idx_declaration_facts_name` 23,212,032、`idx_declaration_facts_file_id` 8,224,768、`idx_declaration_facts_logical_key` 15,290,368、`idx_declaration_facts_locator` 24,080,384，五项合计 264,630,272 bytes。CLI explicit full-index 不构建 server `SemanticDeclarationIndex`；可直接影响进程峰值的局部参数包括 MEMORY rollback journal、`temp_store=MEMORY`、32 MiB page cache、解析线程/批次缓冲和 full-build call-string map。
+
+首先按 TDD 给 `full_build_defers_call_indexes_until_facts_are_complete` 增加 cache-size 断言，然后依次试验 8、16、24 MiB，始终保留 MEMORY journal、exclusive locking、`synchronous=OFF`、deferred indexes、`quick_check(1)`、`foreign_key_check` 和 checkpoint。8 MiB 的正确性测试通过，但 U-Boot full-index 被 60 秒硬门禁终止，因此立即否决。16/24 MiB 的事实计数均保持 13,244 files、654,890 declarations、91,919 callable anchors、582,522 call sites。
+
+| page cache | engine / wrapper | write | peak Private | 判定 |
+|---:|---:|---:|---:|---|
+| 8 MiB | 超过 60 秒，脚本终止 | 未形成报告 | 未形成报告 | 硬失败 |
+| 16 MiB | 51,352 / 51,631.852 ms | 34,688 ms | 162,394,112 bytes | 通过绝对门禁，但写入代价过高 |
+| 24 MiB 第一次 | 46,337 / 46,659.794 ms | 29,717 ms | 172,326,912 bytes | 通过 |
+| 24 MiB 第二次 | 46,818 / 47,062.708 ms | 30,270 ms | 162,361,344 bytes | 通过，但峰值与第一次相差约 9.5 MiB |
+| 32 MiB 同机基线 | 42,862 / 43,162.560 ms | 26,157 ms | 172,347,392 bytes | 更快，且相邻峰值与 24 MiB 第一次等价 |
+
+原始结果：
+
+- `target/benchmark/large-workspace-20260731_015014.json`（16 MiB）
+- `target/benchmark/large-workspace-20260731_015311.json`、`large-workspace-20260731_015459.json`（24 MiB）
+- `target/benchmark/stage4a-cache-ab/cache32-run1/large-workspace-20260731_015645.json`（阶段 3 干净 VSIX 内 32 MiB 基线二进制）
+
+结论：缩小 cache 可在部分运行中降低采样峰值，但 24 MiB 的两次 peak Private 相差约 10 MiB，同机 32 MiB 相邻运行又与其第一次几乎相同，无法把变化可靠归因于 cache；反之 write/engine 变慢 3.5–4.0 秒可重复，8 MiB 还直接违反 60 秒门禁。因此该参数调整风险收益不成立，`store.rs` 与维护测试已完整回退到阶段前状态。
+
+下一阶段转向可确定计量且有望同时减少 DB、写放大和索引构建时间的方案：先通过 schema/query-plan 测试证明 `idx_declaration_facts_locator` 没有 SQL 消费者，再把它作为独立 schema 26 变更移除；name/logical-key 复合索引另行评估，不与 locator 改动混在同一阶段。
