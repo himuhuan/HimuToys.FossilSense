@@ -3,7 +3,7 @@
 > 状态：原始测试已完成；发布判定 **NO-GO**；整改持续执行中
 > 开始时间：2026-07-30 22:59:29 +08:00
 > 完成时间：2026-07-31 00:02:07 +08:00（总耗时约 1 小时 03 分）
-> 最新整改更新：2026-07-31 01:29:35 +08:00
+> 最新整改更新：2026-07-31 01:34:52 +08:00
 > 测试对象：`release/v1.5.0`，source commit `fff8f89c045fee1be428472a4d823ee16b223059`
 
 ## 1. 范围与判定口径
@@ -440,7 +440,7 @@ U-Boot dirty diff 仅有三处空白行变化：一处空白行改为含制表�
 
 ### 阶段 3：恢复发布文档与完整仓库门禁
 
-状态：R-02 已修复，仓库完整验证通过；干净提交上的 VSIX 打包与制品 hardening 待执行。
+状态：阶段完成；R-02、仓库完整验证、干净提交打包与制品 hardening 均已通过。
 
 `scripts/test_release_hardening.ps1` 在阶段开始时再次稳定失败，首个错误为根 `CLAUDE.md` 缺失。进一步核对 `verify_release_hardening.ps1` 的 `Require-DocumentPatterns` 后确认，仅恢复提交树旧版仍会因为旧文档写 `1.4.5` 而缺少当前 release version `1.5.0`。因此恢复完整的跟踪文档，并只把项目版本事实从 `1.4.5` 同步到 `1.5.0`；没有放宽 hardening，也没有用未跟踪的 `AGENTS.md` 替代长期文档。
 
@@ -456,4 +456,20 @@ U-Boot dirty diff 仅有三处空白行变化：一处空白行改为含制表�
 | benchmark entry-point tests | PASS |
 | extension `pnpm test` | PASS，TypeScript compile 与扩展测试通过 |
 
-完整验证期间没有修改产品源码。下一步先提交恢复后的文档与本节记录，再从该干净提交创建隔离 worktree 打包，避免主工作树中用户保留的未跟踪 `AGENTS.md` 被写入 `release-build.json.worktreeDirty`。打包和最终制品 hardening 通过后再进入 R-03 性能/存储优化。
+完整验证期间没有修改产品源码。恢复后的文档与首轮记录提交为 `ce2858fe08e0d4fa3ea21d1232048456b27e40d2`；随后从该提交创建隔离的干净 worktree 打包，避免主工作树中用户保留的未跟踪 `AGENTS.md` 被写入 `release-build.json.worktreeDirty`。
+
+阶段制品：
+
+| 项目 | 值 |
+|---|---|
+| VSIX | `dist/fossilsense-vscode-1.5.0_BUILD20260731_013155.vsix` |
+| VSIX SHA-256 | `6bc403605b21500d6926d88c3e12d1ad07f9f961390952ccedd7523fbcefdcd5` |
+| source commit | `ce2858fe08e0d4fa3ea21d1232048456b27e40d2` |
+| `worktreeDirty` | `false` |
+| release-input SHA-256 / file count | `d6598a50949ed32ac2518daec6b304f30f9fb8752dce5d36e912d2a1e7d734c1` / 205 |
+| artifact-payload SHA-256 | `44569a08002460e5f0211eee0a0a0e73af48c98c66e332aa357c4cef0089776b` |
+| `verify_release_hardening.ps1 -Version 1.5.0` | PASS |
+
+该 VSIX 证明 1.5.0 自包含打包链路和 R-02 修复有效，但不是最终发布制品：后续任何 Rust、扩展或 release-input 改动都会使它按仓库规则作废，必须在 R-03 与最终门禁结束后重新生成。
+
+下一阶段进入 R-03：以现有 A/B 数据为基线，先把数据库增长、full-build writer 峰值、publication 校验和 parser 提取拆成可独立度量的成本，再选择不削弱原子发布/完整性契约的优化点。
