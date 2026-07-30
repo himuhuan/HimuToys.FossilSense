@@ -3,7 +3,7 @@
 > 状态：原始测试已完成；发布判定 **NO-GO**；整改持续执行中
 > 开始时间：2026-07-30 22:59:29 +08:00
 > 完成时间：2026-07-31 00:02:07 +08:00（总耗时约 1 小时 03 分）
-> 最新整改更新：2026-07-31 02:17:54 +08:00
+> 最新整改更新：2026-07-31 02:32:05 +08:00
 > 测试对象：`release/v1.5.0`，source commit `fff8f89c045fee1be428472a4d823ee16b223059`
 
 ## 1. 范围与判定口径
@@ -526,3 +526,25 @@ cache 实验开始前，对当时的 `target/benchmark/index-u-boot-rebuild.sqli
 与阶段 4A 的 32 MiB 同机 schema 25 样本相比，本轮观察到 wrapper 从 43,162.560 降至 36,882.710 ms、engine 从 42,862 降至 35,804 ms、write 从 26,157 降至 19,573 ms、Private Bytes 从 172,347,392 降至 157,540,352。单次进程采样和机器状态仍可能影响时间/内存，因此这里只把数据库页减少视为强归因结果，不把全部耗时和峰值改善宣称为 locator 索引的确定收益。
 
 独立 reviewer 未发现产品代码、schema 兼容性或 locator 语义问题；其唯一 P3 finding 是初稿混用了阶段 4A 历史工作库与保留的 32 MiB A/B 工件，上述页数、字节和百分比已统一按保留工件修正。残余风险是底层 `IndexStore::migrate` 本身没有显式事务：默认工作区索引通过 side-by-side staging、完整性检查和 manifest 切换保护旧读者，但显式 `--db` 诊断路径若在 DDL 中途进程崩溃，仍可能留下需要再次重建的部分数据库。这是既有迁移架构风险，不由本阶段引入，后续应以故障注入和 crash-atomic 边界为独立阶段评估。
+
+### 阶段 4C：declaration name/logical-key 索引拓扑实验（拒绝）
+
+状态：阶段完成；保持 schema 26 现有两个索引，不修改产品源码。
+
+源码审计确认，生产 logical-key 查询只有 `by_logical_key_family_limited`：SQL 同时约束 `name`、`logical_key_digest` 和 language，并按 declaration `id` 排序、最多读取 `exact_name_limit + 1`，当前默认 limit 为 256。普通精确名称查询同样按 `id` 排序并限量。SQLite 二级索引隐含 rowid，因此单列 name 索引可以在 `name = ?` 时直接按 `id` 有界返回；单列 logical-key 索引也可以在 digest 等值时直接按 `id` 返回。全仓没有只按 logical-key digest 查询的 SQL，但这不等于可以无代价删除该索引：删除后，limit 只能限制输出行，不能限制为找到 digest 而访问的全部同名行。
+
+当前 U-Boot schema 26 数据库包含 654,890 declarations、481,059 个 distinct names、584,103 个 distinct logical digests，distinct `(name, digest)` 组合也是 584,103。最高碰撞名称为 `MBEDTLS_PRIVATE`（753 行），其后为 `LOG_CATEGORY` 416、`__packed` 415、`CFG_SYS_SDRAM_BASE` 406；当前 name 索引为 23,195,648 bytes，logical-key 索引为 15,142,912 bytes。
+
+在 `target/benchmark/stage4c-index-lab/` 的隔离副本中比较三种拓扑，canonical benchmark DB 与 U-Boot 样本均未改动：
+
+| 方案 | 空间结果 | 查询计划/实测 | 判定 |
+|---|---:|---|---|
+| 保持 name + logical 单列索引 | 38,338,560 bytes | name-only 与 exact logical 均直接按对应索引和 rowid 返回 | 保留 |
+| 保留 name、删除 logical | 节省 15,142,912 bytes | `MBEDTLS_PRIVATE` 的 name+logical 热查询从 0.0356 ms 增至 0.2761 ms，约 7.8 倍；最坏访问量随同名总数增长 | 拒绝 |
+| 用 `(name, logical_key_digest)` 复合索引替换两者 | 复合索引 28,766,208 bytes，净省 9,572,352 bytes | logical 查询更精确，但 name-only `ORDER BY id` 出现 `USE TEMP B-TREE FOR ORDER BY` | 拒绝 |
+
+复合索引方案的 name-only 实测也确认排序代价：`MBEDTLS_PRIVATE` 在 LIMIT 101 时热查询由 0.0740 增至 0.2064 ms，LIMIT 501 时由 0.2435 增至 0.4918 ms；不存在名称的热查询由 0.0340 增至 0.0393 ms。虽然当前样本的绝对延迟仍小，但大型工作区查询必须有界，不能用一次 U-Boot 的低毫秒结果放行随同名行数增长的扫描或排序。保留 name 与复合索引又会比当前两个单列索引多占约 13.6 MB，因此也没有空间收益。
+
+这些微测只选择底表 declaration `id`，没有包含 active-revision/file joins、language predicate 和完整 row hydration；它们用于确认 planner、访问量与相对退化方向，不用于宣称 completion resolve 的端到端延迟。
+
+结论：阶段 4B 已移除真正没有 SQL 消费者的 locator 索引；name 单列索引保护常规 exact-name 请求热路径，logical-key 单列索引保护低频但仍须有界的 stale-overlay resolve fallback。继续删除或直接合并会用最坏情况查询复杂度换取 9–15 MB 空间，不符合“大仓库优先”和候选查询必须有界的架构约束。当前 digest 已是固定 12-byte BLOB；若后续仍要压缩这 15 MB，更保守的未测方向是保留完整字段和最终相等校验，只对确定长度的 digest 前缀建立表达式索引，并让 SQL 同时约束前缀与完整 digest。该方案不改变 persisted fact payload，但前缀碰撞桶、planner 稳定性、`ORDER BY id`、实际页节省和端到端 fallback 都必须作为独立阶段验证，不能从本阶段结果直接放行。
