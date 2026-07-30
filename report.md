@@ -691,3 +691,41 @@ TDD 首先加入 `explicit_force_rebuild_publishes_a_fresh_database_without_old_
 本阶段改变了 full-build publication 架构，因此额外执行 U-Boot engine hydration。结果为 654,890 declarations / 13,244 files，compact recall 93,747,480 bytes，单代 Private 183,939,072 bytes、旧快照存活时双代峰值 348,995,584 bytes，首/次构建 3,906/3,790 ms；分别低于 384/512 MiB 门禁。原始报告为 `target/benchmark/large-workspace-20260731_055202.json` 与同名 Markdown。
 
 边界保持明确：旁路构建在发布前同时保留旧库与新 staging，要求足够的临时磁盘空间；进程被强杀时旧目标仍安全，但唯一 staging 可能成为可人工识别的孤儿文件，不能像正常错误返回那样依赖 Drop 回收。同一目标的 FossilSense writer 遵守 sibling lock，因此不会进入 WAL drain/rename 竞态；直接绕过协议写 SQLite 的外部程序明确不受支持，最终身份复核后到 rename 仍存在极小窗口，但已有 drain 后与 rename 前两次 sidecar 检查，Windows 打开句柄还会使 `MoveFileExW` 保守失败。残余测试缺口是尚未单独故障注入 Windows 打开句柄导致的 `MoveFileExW` 失败。阶段 4F 的中止现场只读保留用于证据，没有就地修理；下一阶段 4H 单独为既存 cleanup debt 和普通增量发布设计有界批量回收与恢复测试，而未来显式 `--force` 已不再制造这种债务。
+
+### 阶段 4H：inactive revision 持久化恢复与增量有界清理（已完成）
+
+状态：实现、TDD、真实 Kubernetes 历史债务恢复、普通增量性能复核、完整 Rust 门禁、U-Boot full-index/hydration 硬门禁和修复后独立 reviewer 均已通过。
+
+阶段 4G 已让未来显式 `--force` 不再在目标库中制造双代事实，但普通增量发布仍沿用旧清理协议，阶段 4F 保留的中止现场也证明既存数据库需要可恢复入口。原实现先提交 active generation，再在事务外从父表逐行删除旧 `file_revisions`，依赖 SQLite 外键级联清理约 10 张事实表；部分 revision 外键没有索引时，复杂度会退化为“旧 revision 数 × 大事实表扫描”。清理失败只返回当次 maintenance warning，没有 durable 状态；重启后若没有新的同类变更，也不会保证重试。直接从父表开始删除还把行为正确性隐含委托给逐条 cascade，无法在关闭外键以做集合清理时保持 caller anchor、record target 和跨文件 orphan 的等价语义。
+
+本阶段把发布与回收改为显式的两阶段生命周期：
+
+1. schema metadata 增加 durable `cleanup_required` 标记。新库初始为 `0`；旧 schema 首次打开或发现 abandoned staging build 时原子写入 `1`。active manifest、build committed、pending rows 删除和标记 `1` 在同一提交事务完成，因此进程可在任意后续位置终止而不会丢失恢复责任。
+2. `begin_index_build` 在接受新 staging 前检查标记。需要恢复时执行一次 workspace 范围集合清理；成功与完整性验证在同一 cleanup 事务内把标记清为 `0`，任一步失败则整个 cleanup 回滚并保留 `1`，下一次 begin 自动重试。
+3. 正常增量提交捕获本次 changed/deleted file ID 作为 cleanup scope。旧 revision 和 orphan file 只从这个小集合通过索引召回，不再扫描全库 revision/file；空 scope 不触发清理验证。full/recovery/call-string GC 保留全库模式，因为这些路径本来就是低频维护边界。
+4. cleanup 在事务外确认当前连接外键已开启，再临时关闭外键，以一个 `BEGIN IMMEDIATE` 事务建立 scoped file、obsolete revision、orphan file、record ID 和 callable-anchor ID 临时集合。十类直接事实按“obsolete revision 或 orphan file”集合删除；call sites 额外按已删除 caller anchor 清理，member/type-alias 对已删除 record target 精确执行 `SET NULL`，include edge 同时覆盖 src/dst file，最后才删除 anchor、record、revision 和 file parent，行为与 schema 的 CASCADE/SET NULL 等价。
+5. recovery/full/call-string 路径仍运行完整 `PRAGMA foreign_key_check`。普通增量使用有界 parent-set validation，逐类验证本次会影响的 revision/file、active/pending、include src/dst、caller anchor、member record 和 alias target，不把每次文件保存变成全库外键扫描。事务后若无法恢复 `foreign_keys=ON`，store 会进入 `maintenance_blocked` fail-closed 状态并保留 durable 标记；同一连接不再允许继续写入。
+
+TDD 首先加入四个必失败场景：abandoned build 的 revision 必须被回收、事实必须先于 revision parent 删除、cleanup 中途失败必须整体回滚且留下标记并在下次 begin 重试、当前 schema 缺失标记必须只审计一次。随后补齐十类事实、跨文件 orphan declaration/record/anchor、caller-anchor cascade、member/alias `SET NULL` 和 include 双向关系。首轮 reviewer 据此发现 orphan-only 且没有 obsolete revision 时会跳过事实清理、普通增量仍可能全库扫描 revision/file 和完整 FK check，以及恢复外键失败后同一连接仍可写三项问题；每项均先补回归测试再修复。最终 reviewer 逐一核对当前 schema 的全部 parent/child FK、普通 scoped SQL 和索引契约，确认原有 2 项 P2、1 项 P3 全部关闭，没有新的 P0–P3 finding。
+
+为保证集合删除和 manual validation 的查询上界，deferred lookup indexes 在既有 call indexes 之外补齐 12 个清理相关索引：七张事实表的 revision、type-alias target record、pending file/revision、call-site file 和 include-edge destination。普通打开会补建缺失索引；full build 仍先删除并在事实写完后统一创建，避免把二级索引维护放进 bulk insert 热路径。U-Boot 同事实数据库最终为 363,204,608 bytes，相对阶段 4G 的 345,067,520-byte 数据库增加 18,137,088 bytes（约 5.26%）；两个 pending 索引在提交后为空，主要增量来自十个有内容的永久维护索引。这是用约 18.1 MB 可计量空间换取普通增量和历史恢复的确定查询路径，不隐藏为零成本优化。
+
+真实恢复验证直接复制阶段 4F 保留的 769,638,400-byte Kubernetes schema 28 中止现场；原件保持只读不变。现场含 35,722 个 revisions、17,861 个 active revisions、679,806 declarations、2,364,634 call sites，约 496 万条事实属于旧代。从进程启动、迁移/索引补齐到自动恢复完成并进入 `checking 0/17861` 的上界为 14,725.550 ms；恢复后 revisions 精确等于 17,861 active rows，`cleanup_required=0`、`quick_check=ok`、foreign-key violations=0。补齐维护索引后的首次 no-change 为 wrapper 6.245 s / engine 5.967 s；随后单文件增量为 wrapper 4.323 s / engine 4.043 s，其中 discover 1,499 ms、check 114、parse 3、write 4、include-edge 1,302，说明正常发布没有退化成历史债务的 workspace 级回收。
+
+该恢复事务只做逻辑回收，不在在线路径运行 `VACUUM`。Kubernetes 修复副本因建索引和 free pages 最终保持 895,877,120 bytes；删除的旧事实成为可复用 freelist，物理文件不会立即缩小。需要压缩物理文件时应使用阶段 4G 已验证的显式 side-by-side `--force`，而不是在普通增量发布后阻塞读者做 in-place compaction。
+
+独立 test-executor 的最终门禁：
+
+| 命令/门禁 | 结果 |
+|---|---|
+| `cargo fmt --all -- --check` | PASS，约 3.58 s |
+| `cargo test -p fossilsense` | PASS，unit 1020 passed / 6 ignored，CLI 1 passed，LSP 2 passed；0 failed |
+| `cargo clippy -p fossilsense --all-targets -- -D warnings` | PASS，约 14.89 s |
+| `cargo build --release -p fossilsense` | PASS |
+| `cargo test --release -p fossilsense --bin fossilsense --no-run` | PASS |
+| U-Boot full-index | PASS，wrapper 39,313.536 ms；engine 38,193 ms，均低于 60,000 ms |
+| U-Boot engine hydration | PASS，单代 184,025,088 bytes；双代 348,672,000 bytes |
+
+最终 U-Boot full-index 保持 13,244 files、654,890 declarations、91,919 callable anchors 和 582,522 call sites。分段为 discover 977 ms、parse 6,136、write 19,550、check 8、include edge 3,181、secondary index 3,296、publication 4,403；峰值 Working Set 170,319,872 bytes、Private Bytes 158,736,384。数据库为 363,204,608 bytes、88,673 pages、freelist 0，`quick_check=ok`、foreign-key violations=0。hydration compact recall 为 93,747,480 bytes，首/次构建 3,759/3,821 ms；单代远低于 384 MiB、旧快照存活时双代远低于 512 MiB。原始报告为 `target/benchmark/large-workspace-20260731_071517.json` 与同名 Markdown。
+
+边界保持明确：首次打开缺少 marker/index 的大型旧库会承担一次迁移与 recovery 成本；recovery 是 workspace 规模的单个原子写事务，写者在其间被阻塞，但 WAL 中已有读快照可以继续服务。普通增量则只按本次 file scope 回收。full/recovery/call-string GC 的完整 FK check 仍与库规模相关，故不应进入每次请求路径。在线清理只保证逻辑一致和空间可复用，不承诺立即缩小 SQLite 文件。

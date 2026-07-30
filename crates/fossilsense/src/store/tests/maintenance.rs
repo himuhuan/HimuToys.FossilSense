@@ -123,7 +123,7 @@ fn wal_checkpoint_after_full_rebuild() {
 }
 
 #[test]
-fn full_build_defers_call_indexes_until_facts_are_complete() {
+fn full_build_defers_secondary_indexes_until_facts_are_complete() {
     let dir = tempdir().expect("tempdir");
     let db = dir.path().join("index.sqlite");
     let mut store = IndexStore::open_for_full_rebuild(&db, dir.path()).expect("bulk store");
@@ -159,7 +159,32 @@ fn full_build_defers_call_indexes_until_facts_are_complete() {
             )
             .expect("call index count")
     };
+    let cleanup_index_count = |store: &IndexStore| -> i64 {
+        store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name IN (
+                    'idx_fallback_completion_revision',
+                    'idx_declaration_facts_revision',
+                    'idx_import_facts_revision',
+                    'idx_include_facts_revision',
+                    'idx_record_facts_revision',
+                    'idx_member_facts_revision',
+                    'idx_type_alias_facts_revision',
+                    'idx_type_alias_facts_target_record',
+                    'idx_call_site_file_id',
+                    'idx_include_edges_dst',
+                    'idx_pending_file_revisions_file_id',
+                    'idx_pending_file_revisions_revision_id'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .expect("cleanup index count")
+    };
     assert_eq!(call_index_count(&store), 0);
+    assert_eq!(cleanup_index_count(&store), 0);
 
     store.begin_full_rebuild_load().expect("begin");
     upsert_source(
@@ -169,12 +194,14 @@ fn full_build_defers_call_indexes_until_facts_are_complete() {
     );
     store.finish_full_rebuild_load().expect("finish facts");
     assert_eq!(call_index_count(&store), 0);
+    assert_eq!(cleanup_index_count(&store), 0);
     assert_eq!(test_call_sites_by_callee(&store, "helper").len(), 1);
 
     store
         .finalize_full_build_indexes()
         .expect("build call indexes");
     assert_eq!(call_index_count(&store), 8);
+    assert_eq!(cleanup_index_count(&store), 12);
     let (strings, distinct_strings): (i64, i64) = store
         .conn
         .query_row(

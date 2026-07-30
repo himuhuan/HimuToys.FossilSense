@@ -81,6 +81,7 @@ pub struct IndexStore {
     conn: Connection,
     legacy_full_build: Option<IndexBuild>,
     bulk_call_string_ids: Option<HashMap<String, i64>>,
+    maintenance_blocked: bool,
 }
 
 /// Cross-process writer lock for one explicit index destination.
@@ -332,15 +333,16 @@ impl ExplicitIndexLock {
 
 impl IndexStore {
     pub fn open(path: &Path, workspace_root: &Path) -> Result<Self> {
-        Self::open_with_call_indexes(path, workspace_root, true)
+        Self::open_with_deferred_indexes(path, workspace_root, true)
     }
 
-    /// Open a full-build destination without maintaining the large call-fact
-    /// secondary indexes while facts are inserted. The destination must not be
-    /// visible to request readers until [`finalize_full_build_indexes`] returns.
+    /// Open a full-build destination without maintaining the large call and
+    /// cleanup secondary indexes while facts are inserted. The destination
+    /// must not be visible to request readers until
+    /// [`finalize_full_build_indexes`] returns.
     pub fn open_for_full_rebuild(path: &Path, workspace_root: &Path) -> Result<Self> {
         let new_database = !path.exists();
-        let mut store = Self::open_with_call_indexes(path, workspace_root, false)?;
+        let mut store = Self::open_with_deferred_indexes(path, workspace_root, false)?;
         // A full rebuild writes an unpublished database from start to finish.
         // Replaying the growing WAL into the main file every ~1,000 pages makes
         // bulk insertion highly sensitive to storage latency. Use an in-memory
@@ -365,10 +367,10 @@ impl IndexStore {
         Ok(store)
     }
 
-    fn open_with_call_indexes(
+    fn open_with_deferred_indexes(
         path: &Path,
         workspace_root: &Path,
-        create_call_indexes: bool,
+        create_deferred_indexes: bool,
     ) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).with_context(|| {
@@ -386,12 +388,13 @@ impl IndexStore {
             conn,
             legacy_full_build: None,
             bulk_call_string_ids: None,
+            maintenance_blocked: false,
         };
-        store.migrate(workspace_root, create_call_indexes)?;
-        if !create_call_indexes {
+        store.migrate(workspace_root, create_deferred_indexes)?;
+        if !create_deferred_indexes {
             store
                 .conn
-                .execute_batch(schema::DROP_CALL_LOOKUP_INDEXES_SQL)?;
+                .execute_batch(schema::DROP_DEFERRED_LOOKUP_INDEXES_SQL)?;
         }
         Ok(store)
     }
@@ -399,7 +402,7 @@ impl IndexStore {
     pub fn finalize_full_build_indexes(&mut self) -> Result<()> {
         self.bulk_call_string_ids.take();
         self.conn
-            .execute_batch(schema::CREATE_CALL_LOOKUP_INDEXES_SQL)?;
+            .execute_batch(schema::CREATE_DEFERRED_LOOKUP_INDEXES_SQL)?;
         self.conn.execute_batch(
             "ANALYZE callable_anchor_facts;
              ANALYZE call_site_facts;
@@ -456,6 +459,7 @@ impl IndexStore {
             conn,
             legacy_full_build: None,
             bulk_call_string_ids: None,
+            maintenance_blocked: false,
         })
     }
 
@@ -774,7 +778,7 @@ impl IndexStore {
         self.declaration_view().all_name_rows()
     }
 
-    fn migrate(&self, workspace_root: &Path, create_call_indexes: bool) -> Result<()> {
+    fn migrate(&self, workspace_root: &Path, create_deferred_indexes: bool) -> Result<()> {
         // Ensure the meta table exists, then drop the data tables when the stored
         // schema version differs so the next index pass repopulates with the new
         // shape (e.g. the `container` column / `type_aliases` table).
@@ -833,8 +837,8 @@ impl IndexStore {
 
         self.conn.execute_batch(schema::CREATE_SCHEMA_SQL)?;
         self.create_lookup_indexes()?;
-        if create_call_indexes {
-            self.create_call_lookup_indexes()?;
+        if create_deferred_indexes {
+            self.create_deferred_lookup_indexes()?;
         }
 
         self.conn.execute(
@@ -851,6 +855,25 @@ impl IndexStore {
             "INSERT OR IGNORE INTO meta (key, value) VALUES ('semantic_generation', '0')",
             [],
         )?;
+        if stored_version == Some(schema::SCHEMA_VERSION) && !schema_mismatch && !parser_mismatch {
+            // Current-schema databases created before cleanup debt became durable
+            // receive one conservative audit. INSERT OR IGNORE preserves the
+            // state written by newer commits and failed cleanup attempts.
+            self.conn.execute(
+                "INSERT OR IGNORE INTO meta (key, value)
+                 VALUES ('cleanup_required', '1')",
+                [],
+            )?;
+        } else {
+            // A new or schema-reset database cannot contain inactive revisions.
+            // Overwrite a stale marker left in meta when migration dropped all
+            // generation-owned data.
+            self.conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('cleanup_required', '0')
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [],
+            )?;
+        }
         Ok(())
     }
 
@@ -859,9 +882,9 @@ impl IndexStore {
         Ok(())
     }
 
-    fn create_call_lookup_indexes(&self) -> Result<()> {
+    fn create_deferred_lookup_indexes(&self) -> Result<()> {
         self.conn
-            .execute_batch(schema::CREATE_CALL_LOOKUP_INDEXES_SQL)?;
+            .execute_batch(schema::CREATE_DEFERRED_LOOKUP_INDEXES_SQL)?;
         Ok(())
     }
 
