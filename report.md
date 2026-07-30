@@ -3,7 +3,7 @@
 > 状态：原始测试已完成；发布判定 **NO-GO**；整改持续执行中
 > 开始时间：2026-07-30 22:59:29 +08:00
 > 完成时间：2026-07-31 00:02:07 +08:00（总耗时约 1 小时 03 分）
-> 最新整改更新：2026-07-31 02:32:05 +08:00
+> 最新整改更新：2026-07-31 02:46:32 +08:00
 > 测试对象：`release/v1.5.0`，source commit `fff8f89c045fee1be428472a4d823ee16b223059`
 
 ## 1. 范围与判定口径
@@ -548,3 +548,26 @@ cache 实验开始前，对当时的 `target/benchmark/index-u-boot-rebuild.sqli
 这些微测只选择底表 declaration `id`，没有包含 active-revision/file joins、language predicate 和完整 row hydration；它们用于确认 planner、访问量与相对退化方向，不用于宣称 completion resolve 的端到端延迟。
 
 结论：阶段 4B 已移除真正没有 SQL 消费者的 locator 索引；name 单列索引保护常规 exact-name 请求热路径，logical-key 单列索引保护低频但仍须有界的 stale-overlay resolve fallback。继续删除或直接合并会用最坏情况查询复杂度换取 9–15 MB 空间，不符合“大仓库优先”和候选查询必须有界的架构约束。当前 digest 已是固定 12-byte BLOB；若后续仍要压缩这 15 MB，更保守的未测方向是保留完整字段和最终相等校验，只对确定长度的 digest 前缀建立表达式索引，并让 SQL 同时约束前缀与完整 digest。该方案不改变 persisted fact payload，但前缀碰撞桶、planner 稳定性、`ORDER BY id`、实际页节省和端到端 fallback 都必须作为独立阶段验证，不能从本阶段结果直接放行。
+
+### 阶段 4D：logical digest 前缀表达式索引实验（拒绝）
+
+状态：阶段完成；没有修改产品源码、schema 或测试。
+
+当前 `logical_key_digest` 是 `serde_json(LogicalEntityKey)` 的 BLAKE3 前 12 bytes，schema 强制为固定 12-byte BLOB；SQL 用完整 digest 等值查找后，Rust 仍以完整 `LogicalEntityKey` 做最终碰撞复核。阶段 4D 在 `target/benchmark/stage4d-prefix-lab/` 的隔离副本中保留完整字段和最终校验，只把 12-byte lookup index 替换为 `substr(logical_key_digest, 1, N)` 表达式索引，并让 SQL 同时约束前缀、完整 digest、name 与 language。SQLite 3.41.2 对四种确定性 `substr` 表达式索引都能稳定选择，`ORDER BY id` 未出现临时 B-tree，因此实验没有被兼容性或 planner 偶然失配提前否决。
+
+基线为 654,890 declarations、完整 digest 索引 15,142,912 bytes、数据库文件与 `dbstat` live pages 均为 395,644,928 bytes：
+
+| 前缀长度 | 前缀索引 | 相对完整索引节省 | `dbstat` live bytes | live-page 降幅 | distinct prefix / full digest |
+|---:|---:|---:|---:|---:|---:|
+| 4 bytes | 8,527,872 | 6,615,040 | 389,005,312 | 1.68% | 584,071 / 584,103 |
+| 6 bytes | 9,842,688 | 5,300,224 | 390,320,128 | 1.35% | 584,103 / 584,103 |
+| 8 bytes | 11,157,504 | 3,985,408 | 391,634,944 | 1.01% | 584,103 / 584,103 |
+| 10 bytes | 12,492,800 | 2,650,112 | 392,970,240 | 0.68% | 584,103 / 584,103 |
+
+隔离副本通过 drop/create 索引形成，没有执行 `VACUUM`：四个文件的物理长度仍为 395,644,928 bytes，差额分别成为 1,621、1,300、979、653 个 freelist pages。上表只量化 live allocated pages；fresh full rebuild 能否形成同样的最终文件长度没有实测，因此不据此宣称物理文件已经缩小。
+
+4-byte 前缀在当前样本出现 32 个双-digest 前缀碰撞桶，共涉及 64 个不同 full digests，使 distinct prefix 比 distinct full digest 少 32；6/8/10-byte 在当前 U-Boot 没有不同 digest 的前缀碰撞，但相同 digest 的重复声明仍使最大行桶达到 321。该样本事实不能证明其他大型或对抗性工作区不会出现不同 digest 的同前缀桶。完整 digest 不存在但共享现有高密度前缀时，底表 `id` 微测的热中位数从完整索引的 0.0227 ms 增至前缀索引的 0.1572–0.2347 ms；8-byte 方案为 0.1615 ms。普通存在键几乎不变，而最高重复 digest 的 8-byte 方案由 0.2107 增至 0.3171 ms。微测只用于访问方向判断，不代表带 joins、language filter 和 typed row hydration 的端到端 resolve 延迟。
+
+核心风险不是当前样本的低毫秒绝对值，而是 SQL `LIMIT 257` 只限制满足完整 digest/name/language 的输出，不能限制前缀索引在完整 digest 过滤前访问的候选；缺失或稀疏匹配会扫描整个前缀桶。8-byte/10-byte 前缀的随机碰撞概率很低，但随机概率不能替代请求扫描上界，也不能证明对任意大型工作区的最坏情况。为此引入扫描预算又必须向上暴露 truncation/coverage，并扩大 resolver 协议与语义范围。
+
+结论：最激进的 4-byte 方案只减少 live allocated pages 1.68% 且已出现不同 digest 碰撞；风险较低的 8-byte/10-byte 仅减少 1.01%/0.68%。收益不足以交换更宽的碰撞桶、缺失键退化和新的不确定性协议，因此保持完整 12-byte digest 等值索引。阶段 4C reviewer 提出的保守候选已经实测关闭，不进入 TDD 或大型门禁。
