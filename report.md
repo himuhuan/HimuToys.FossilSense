@@ -729,3 +729,42 @@ TDD 首先加入四个必失败场景：abandoned build 的 revision 必须被�
 最终 U-Boot full-index 保持 13,244 files、654,890 declarations、91,919 callable anchors 和 582,522 call sites。分段为 discover 977 ms、parse 6,136、write 19,550、check 8、include edge 3,181、secondary index 3,296、publication 4,403；峰值 Working Set 170,319,872 bytes、Private Bytes 158,736,384。数据库为 363,204,608 bytes、88,673 pages、freelist 0，`quick_check=ok`、foreign-key violations=0。hydration compact recall 为 93,747,480 bytes，首/次构建 3,759/3,821 ms；单代远低于 384 MiB、旧快照存活时双代远低于 512 MiB。原始报告为 `target/benchmark/large-workspace-20260731_071517.json` 与同名 Markdown。
 
 边界保持明确：首次打开缺少 marker/index 的大型旧库会承担一次迁移与 recovery 成本；recovery 是 workspace 规模的单个原子写事务，写者在其间被阻塞，但 WAL 中已有读快照可以继续服务。普通增量则只按本次 file scope 回收。full/recovery/call-string GC 的完整 FK check 仍与库规模相关，故不应进入每次请求路径。在线清理只保证逻辑一致和空间可复用，不承诺立即缩小 SQLite 文件。
+
+### 阶段 4I：schema migration 错误与进程崩溃原子性（已完成）
+
+状态：实现、TDD、同步故障回滚、真实子进程 `abort` / WAL 恢复、历史 schema 回归、完整 Rust 门禁、U-Boot full-index/no-change 性能验证和三轮修复后独立 reviewer 均已通过。
+
+阶段 4B 留下的 migration 风险经当前源码重新确认仍真实存在。`IndexStore::open` 在已有显式 `--db` 的非 force 路径会原地打开目标；旧 `migrate` 依次创建/读取 meta、删除 legacy views/tables、执行 23 项 data-table drop、创建当前 schema/views/indexes，最后更新 schema/workspace/generation/cleanup metadata，但这些步骤分散在多个 autocommit 语句。默认工作区 rebuild 和显式 `--force` 已有 side-by-side staging 保护，普通已有显式 DB 则可能在中途 SQL 错误或进程终止后留下“旧数据已删、新 schema 只建一半、schema_version 仍旧”的目标文件。原实现还用 `parse().ok()` 读取 schema version，非数字值会被误当成没有版本的新数据库，并可能被覆盖成当前版本。
+
+本阶段把 migration 定义为一个明确的 SQLite 原子发布边界：
+
+1. `migrate` 改为持有可变连接并使用 `TransactionBehavior::Immediate`。从 `CREATE TABLE IF NOT EXISTS meta`、版本读取、parser-fact 探测、legacy/current data drop、schema/view/trigger 创建、普通与 deferred index 处理，到最终四类 metadata 写入和 commit，全部使用同一个 transaction，没有通过裸 `self.conn` 绕过。
+2. stored schema version 现在区分“键不存在”和“值损坏”。缺失键仍表示新库；存在但不能解析为整数时在任何 destructive DDL 前返回带上下文错误，transaction drop 回滚 meta 建表等先行操作，不再把损坏数据库重新分类为新库。
+3. `create_deferred_indexes=false` 的 full-build 打开也在同一 migration transaction 内删除 deferred lookup indexes。旧实现是在 migration commit 后用裸 `execute_batch` 删除，错误可能留下部分索引已删而 metadata 已成功的状态；现在 SQL 错误会回滚整个 schema/index/meta 变化。
+4. `BEGIN IMMEDIATE` 会串行化 migration writer，但 WAL 旧读快照仍可继续读取。current-schema 打开原本就会执行 metadata upsert；本阶段把这些写操作的锁范围显式化，没有在请求读路径引入 migration，`open_readonly` 仍不修改 schema。
+
+TDD 使用独立 `migration_atomicity.rs`，没有继续膨胀原 625 行 resilience 文件。第一条 RED 在 schema 27 库保留旧 `files` 行，并创建与当前 lookup index 同名的合法旧表，使 migration 在新 schema 已创建后确定失败；修改前失败现场丢失旧表/行并残留大部分新 schema，修改后完整 `sqlite_master`、旧行和 schema/workspace/generation metadata 逐项相同，移除阻断对象后可成功重试。第二条 RED 证明 `not-a-version` 会被旧实现静默升级为 28；修改后 open fail-closed，旧 payload 和 metadata 不变，当前 schema 对象为 0。
+
+首轮 reviewer 随后指出 `create_deferred_indexes=false` 的事务外删除仍是 P2，并要求真实 crash 证据。测试使用 `cfg(test)`、线程局部、命中即清空的一次性 failpoint：deferred indexes 全部删除后注入同步错误。故障点在事务外时 schema 快照稳定缺失维护索引；移入 transaction 后错误返回且快照完全恢复，正常重试会按 full-build 契约继续 defer。故障注入 enum、thread-local、setter 和调用点均不进入 production build，也不会在并行测试线程间共享状态。
+
+进程崩溃测试以 WAL 模式 schema 27 临时库启动当前 Rust test executable 的精确 helper。子进程在 `DROP_DATA_TABLES_SQL` 完成、当前 schema 尚未创建时命中 failpoint，随后直接 `std::process::abort()`，不进行 Rust unwinding。父进程重开库后确认完整 schema snapshot、旧 `files` 行、schema version 27、semantic generation 11、旧 workspace root 和 `quick_check=ok`，再正常重试至 schema 28。第二轮 reviewer 发现仅检查“非 91 异常退出”可能把 failpoint 前普通 panic 当成目标 abort；修复后 abort 点先在测试独占 tempdir 写入精确 `destructive-drop-complete\n` marker、执行 `sync_all()`、关闭文件并紧邻调用 abort。父进程必须同时验证 marker 存在且逐字节完整、子进程异常退出且不是 helper 兜底 91、旧 WAL 状态恢复和后续迁移成功。最终 reviewer 确认该 P2 关闭，原有 migration P2/P3 全部关闭，没有新的 P0–P3 finding。
+
+独立 test-executor 的最终门禁：
+
+| 命令/门禁 | 结果 |
+|---|---|
+| `cargo fmt --all -- --check` | PASS，约 2.00 s |
+| `cargo test -p fossilsense` | PASS，unit 1025 passed / 6 ignored，CLI 1 passed，LSP 2 passed；0 failed |
+| `cargo clippy -p fossilsense --all-targets -- -D warnings` | PASS，约 8.83 s |
+| `cargo build --release -p fossilsense` | PASS |
+| `cargo test --release -p fossilsense --bin fossilsense --no-run` | PASS |
+| U-Boot full-index | PASS，wrapper 39,438.100 ms；engine 38,351 ms，均低于 60,000 ms |
+| U-Boot existing explicit DB no-change | PASS，wrapper 4,664.912 ms；engine 4,420 ms |
+
+最终 U-Boot full-index 保持 13,244 files、654,890 declarations、91,919 callable anchors 和 582,522 call sites。分段为 discover 998 ms、parse 7,050、write 18,694、check 8、include edge 3,136、secondary index 3,246、publication 4,537；峰值 Working Set 167,923,712 bytes、Private Bytes 160,256,000。fresh DB 为 362,872,832 bytes、88,592 pages、freelist 0，schema 28、`cleanup_required=0`、`quick_check=ok`、foreign-key violations=0。原始报告为 `target/benchmark/large-workspace-20260731_091507.json` 与同名 Markdown。
+
+同一已有显式数据库随后不带 `--force` 打开，13,244 个文件全部 skipped；engine 4,420 ms，其中 discover 808、check 50、include edge 2,994，parse/write/secondary-index/publication 都为 0。关闭后数据库为 363,126,784 bytes、88,654 pages、freelist 0，file revisions 与 active revisions 均为 13,244，`cleanup_required=0`、`quick_check=ok`、foreign-key violations=0。该路径直接覆盖本阶段要保护的原地 current-schema migration，并证明事务化没有把正常重开退化为 full rebuild。
+
+按用户要求，本阶段中途清除了已完成阶段的本地生成物：`target/benchmark` 与 `target/validation-1.5.0` 当时合计 14,866,136,504 bytes（约 13.85 GiB），包括阶段 4C–4H SQLite 实验副本和旧原始 benchmark/validation 文件；历史数值已保留在本报告，但此前章节引用的本地原始路径不再存在。Stage 4I 的 benchmark 随后重新创建当前 `target/benchmark`，只保留本阶段 JSON/Markdown、当前 U-Boot DB 和预期的 8 KiB writer lock。
+
+边界保持明确：该事务保证 SQLite schema migration 在 SQL 错误、Rust error return 和被验证的进程 `abort` 下不会暴露半迁移状态；它不扩张为对介质永久损坏、文件系统违反持久化承诺或已提交数据库被外部程序篡改的恢复保证。full-build migration 成功后的 disposable runtime PRAGMA/专用 call-string setup 属于未发布 build target 初始化，不在原地 schema migration 的发布边界内。schema 仍为 28，因为持久化形状没有变化。

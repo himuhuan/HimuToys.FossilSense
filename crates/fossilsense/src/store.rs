@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension};
+use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, TransactionBehavior};
 
 use crate::semantic_model::{
     MemberConfidence, MemberKind, PersistentFacts, RecordConfidence, RecordKind,
@@ -82,6 +82,31 @@ pub struct IndexStore {
     legacy_full_build: Option<IndexBuild>,
     bulk_call_string_ids: Option<HashMap<String, i64>>,
     maintenance_blocked: bool,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MigrationFailpoint {
+    AfterDeferredIndexDrop,
+    AbortAfterDestructiveDrop,
+}
+
+#[cfg(test)]
+thread_local! {
+    static MIGRATION_FAILPOINT: std::cell::Cell<Option<MigrationFailpoint>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn take_migration_failpoint(expected: MigrationFailpoint) -> bool {
+    MIGRATION_FAILPOINT.with(|slot| {
+        if slot.get() == Some(expected) {
+            slot.set(None);
+            true
+        } else {
+            false
+        }
+    })
 }
 
 /// Cross-process writer lock for one explicit index destination.
@@ -384,19 +409,24 @@ impl IndexStore {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
 
-        let store = Self {
+        let mut store = Self {
             conn,
             legacy_full_build: None,
             bulk_call_string_ids: None,
             maintenance_blocked: false,
         };
         store.migrate(workspace_root, create_deferred_indexes)?;
-        if !create_deferred_indexes {
-            store
-                .conn
-                .execute_batch(schema::DROP_DEFERRED_LOOKUP_INDEXES_SQL)?;
-        }
         Ok(store)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_migration_failpoint_for_test(failpoint: MigrationFailpoint) {
+        MIGRATION_FAILPOINT.with(|slot| {
+            assert!(
+                slot.replace(Some(failpoint)).is_none(),
+                "migration failpoint already installed on this test thread"
+            );
+        });
     }
 
     pub fn finalize_full_build_indexes(&mut self) -> Result<()> {
@@ -778,30 +808,44 @@ impl IndexStore {
         self.declaration_view().all_name_rows()
     }
 
-    fn migrate(&self, workspace_root: &Path, create_deferred_indexes: bool) -> Result<()> {
+    fn migrate(&mut self, workspace_root: &Path, create_deferred_indexes: bool) -> Result<()> {
         // Ensure the meta table exists, then drop the data tables when the stored
         // schema version differs so the next index pass repopulates with the new
         // shape (e.g. the `container` column / `type_aliases` table).
-        self.conn.execute(
+        //
+        // SQLite DDL is transactional. Keep the stored version, every destructive
+        // drop, the replacement schema and the published metadata in one write
+        // transaction so an error or process exit cannot expose a half-migrated
+        // explicit database.
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
             "CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY NOT NULL,
                 value TEXT NOT NULL
             )",
             [],
         )?;
-        let stored_version: Option<i64> = self
-            .conn
+        let stored_version_text: Option<String> = transaction
             .query_row(
                 "SELECT value FROM meta WHERE key = 'schema_version'",
                 [],
                 |row| row.get::<_, String>(0),
             )
-            .optional()?
-            .and_then(|value| value.parse().ok());
+            .optional()?;
+        let stored_version = stored_version_text
+            .as_deref()
+            .map(|value| {
+                value
+                    .parse::<i64>()
+                    .with_context(|| format!("invalid stored schema version {value:?}"))
+            })
+            .transpose()?;
         let schema_mismatch =
             stored_version.is_some_and(|version| version != schema::SCHEMA_VERSION);
         let parser_mismatch = stored_version == Some(schema::SCHEMA_VERSION)
-            && !parser_facts_are_current(&self.conn)?;
+            && !parser_facts_are_current(&transaction)?;
         if schema_mismatch || parser_mismatch {
             for name in [
                 "call_sites",
@@ -816,8 +860,7 @@ impl IndexStore {
                 "symbols",
                 "files",
             ] {
-                let object_type: Option<String> = self
-                    .conn
+                let object_type: Option<String> = transaction
                     .query_row(
                         "SELECT type FROM sqlite_master WHERE name = ?1",
                         [name],
@@ -829,29 +872,47 @@ impl IndexStore {
                         "view" => format!("DROP VIEW IF EXISTS {name}"),
                         _ => format!("DROP TABLE IF EXISTS {name}"),
                     };
-                    self.conn.execute_batch(&statement)?;
+                    transaction.execute_batch(&statement)?;
                 }
             }
-            self.conn.execute_batch(schema::DROP_DATA_TABLES_SQL)?;
+            transaction.execute_batch(schema::DROP_DATA_TABLES_SQL)?;
+            #[cfg(test)]
+            if take_migration_failpoint(MigrationFailpoint::AbortAfterDestructiveDrop) {
+                let marker_path = std::env::var_os("FOSSILSENSE_TEST_MIGRATION_CRASH_MARKER")
+                    .expect("migration crash marker path");
+                let mut marker =
+                    std::fs::File::create(marker_path).expect("create migration crash marker");
+                std::io::Write::write_all(&mut marker, b"destructive-drop-complete\n")
+                    .expect("write migration crash marker");
+                marker.sync_all().expect("flush migration crash marker");
+                drop(marker);
+                std::process::abort();
+            }
         }
 
-        self.conn.execute_batch(schema::CREATE_SCHEMA_SQL)?;
-        self.create_lookup_indexes()?;
+        transaction.execute_batch(schema::CREATE_SCHEMA_SQL)?;
+        transaction.execute_batch(schema::CREATE_LOOKUP_INDEXES_SQL)?;
         if create_deferred_indexes {
-            self.create_deferred_lookup_indexes()?;
+            transaction.execute_batch(schema::CREATE_DEFERRED_LOOKUP_INDEXES_SQL)?;
+        } else {
+            transaction.execute_batch(schema::DROP_DEFERRED_LOOKUP_INDEXES_SQL)?;
+            #[cfg(test)]
+            if take_migration_failpoint(MigrationFailpoint::AfterDeferredIndexDrop) {
+                anyhow::bail!("injected failure after deferred index drop");
+            }
         }
 
-        self.conn.execute(
+        transaction.execute(
             "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [schema::SCHEMA_VERSION.to_string()],
         )?;
-        self.conn.execute(
+        transaction.execute(
             "INSERT INTO meta (key, value) VALUES ('workspace_root', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [workspace_root.display().to_string()],
         )?;
-        self.conn.execute(
+        transaction.execute(
             "INSERT OR IGNORE INTO meta (key, value) VALUES ('semantic_generation', '0')",
             [],
         )?;
@@ -859,7 +920,7 @@ impl IndexStore {
             // Current-schema databases created before cleanup debt became durable
             // receive one conservative audit. INSERT OR IGNORE preserves the
             // state written by newer commits and failed cleanup attempts.
-            self.conn.execute(
+            transaction.execute(
                 "INSERT OR IGNORE INTO meta (key, value)
                  VALUES ('cleanup_required', '1')",
                 [],
@@ -868,23 +929,13 @@ impl IndexStore {
             // A new or schema-reset database cannot contain inactive revisions.
             // Overwrite a stale marker left in meta when migration dropped all
             // generation-owned data.
-            self.conn.execute(
+            transaction.execute(
                 "INSERT INTO meta (key, value) VALUES ('cleanup_required', '0')
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 [],
             )?;
         }
-        Ok(())
-    }
-
-    fn create_lookup_indexes(&self) -> Result<()> {
-        self.conn.execute_batch(schema::CREATE_LOOKUP_INDEXES_SQL)?;
-        Ok(())
-    }
-
-    fn create_deferred_lookup_indexes(&self) -> Result<()> {
-        self.conn
-            .execute_batch(schema::CREATE_DEFERRED_LOOKUP_INDEXES_SQL)?;
+        transaction.commit()?;
         Ok(())
     }
 
