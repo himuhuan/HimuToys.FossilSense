@@ -1,6 +1,8 @@
 # FossilSense for VS Code
 
-FossilSense gives large, difficult-to-build C, C++, and Go workspaces useful navigation without requiring a complete compiler setup. The `1.5.0` VSIX is self-contained: open a workspace and let the bundled native engine build its local index. Go support is experimental and does not require the Go toolchain or gopls.
+FossilSense gives large, difficult-to-build C, C++, and Go workspaces useful navigation without requiring a complete compiler setup. The `1.5.1` VSIX is self-contained: open a workspace and let the bundled native engine build its local index. Go support is experimental and does not require the Go toolchain or gopls.
+
+Version 1.5.1 begins interactive-completion latency hardening with latest-request-wins admission: a newer document revision supersedes queued ordinary-completion work, and an in-progress compact-name recall cooperatively stops instead of publishing a stale partial list or memo pool.
 
 It is designed for firmware, embedded systems, drivers, kernels, legacy code, vendored SDKs, and repositories where `compile_commands.json` is missing or unreliable.
 
@@ -33,7 +35,7 @@ C++ record methods intentionally participate in ordinary identifier recall as fu
 
 ## Install and start
 
-Install `fossilsense-vscode-1.5.0_BUILD*.vsix` with:
+Install `fossilsense-vscode-1.5.1_BUILD*.vsix` with:
 
 ```text
 Extensions -> ... -> Install from VSIX

@@ -660,6 +660,8 @@ mod tests {
         let timings = CompletionStageTimings {
             total_ms: 9,
             context_ms: 1,
+            admission_wait_ms: 1,
+            worker_ms: 6,
             recall_ms: 2,
             merge_rank_ms: 3,
             render_ms: 1,
@@ -672,6 +674,9 @@ mod tests {
         assert!(line.contains("returned_current_file_overlay=1"));
         assert!(line.contains("returned_language_builtin=1"));
         assert!(line.contains("guarded_low_trust=2"));
+        assert!(line.contains("admission_wait=1ms"));
+        assert!(line.contains("worker=6ms"));
+        assert!(line.contains("recall_entries_inspected=0"));
         assert!(!line.contains("Widget\""));
         assert!(!line.contains("reachable_api"));
         assert!(!line.contains("new_local_type"));
@@ -825,6 +830,8 @@ mod tests {
         let timings = CompletionStageTimings {
             total_ms: 9,
             context_ms: 1,
+            admission_wait_ms: 1,
+            worker_ms: 6,
             recall_ms: 2,
             merge_rank_ms: 3,
             render_ms: 1,
@@ -838,6 +845,7 @@ mod tests {
         assert!(line.contains("indexed=1"));
         assert!(line.contains("local_binding=1"));
         assert!(line.contains("shadow_moved=2"));
+        assert!(line.contains("recall_cancel_checks=0"));
         assert!(!line.contains("alpha"));
         assert!(!line.contains("beta"));
         assert!(!line.contains("foo\""));

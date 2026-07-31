@@ -48,6 +48,7 @@ mod call_hierarchy;
 mod candidate_context;
 mod completion_candidate_documentation;
 mod completion_documentation;
+mod completion_runtime;
 mod go_import_completion;
 mod hover;
 mod include_completion;
@@ -146,6 +147,7 @@ pub async fn run_stdio() -> Result<()> {
         completion_history_mode: Arc::new(Mutex::new(CompletionHistoryMode::Auto)),
         completion_history: Arc::new(Mutex::new(HashMap::new())),
         completion_history_write_gate: Arc::new(Mutex::new(())),
+        completion_runtime: completion_runtime::CompletionRuntime::default(),
         project_context_selection: Arc::new(Mutex::new(ProjectContextSelection::Auto)),
         project_context_selection_epoch: AtomicU64::new(1),
         debug_candidate_reasons: AtomicBool::new(false),
@@ -194,6 +196,9 @@ struct Backend {
     completion_history: Arc<Mutex<HashMap<PathBuf, CompletionHistoryStore>>>,
     /// Serializes atomic history-file replacements without holding the store map.
     completion_history_write_gate: Arc<Mutex<()>>,
+    /// Latest-request-wins admission and cooperative cancellation for ordinary
+    /// completion CPU work.
+    completion_runtime: completion_runtime::CompletionRuntime,
     /// User-selected completion project policy. The extension persists the
     /// choice; the server validates it against current immutable snapshots.
     project_context_selection: Arc<Mutex<ProjectContextSelection>>,

@@ -2,7 +2,7 @@
 
 FossilSense 是一款面向大型、难以构建的 C/C++ 与 Go 仓库的 VS Code 代码导航工具。它不要求 `compile_commands.json`，也不需要额外安装 clangd、gopls、ctags、Go 或 Rust 工具链。安装一个自包含 VSIX，打开工作区后即可建立索引。
 
-当前版本：`1.5.0`。Go 后端在该版本中以实验能力提供，并遵守与 C/C++ 相同的候选式语义、容错与有界查询原则。
+当前版本：`1.5.1`。Go 后端继续以实验能力提供，并遵守与 C/C++ 相同的候选式语义、容错与有界查询原则。普通补全的交互路径开始采用 latest-request-wins：文档出现新 revision 时，旧的排队请求会被淘汰，正在进行的紧凑名称召回会协作停止，避免 stale 工作继续挤占前台 CPU。
 
 ## 什么时候适合使用
 
@@ -16,7 +16,7 @@ FossilSense 主要解决一种很实际的问题：代码就在眼前，但完�
 
 1. 在 VS Code 中打开 `Extensions`。
 2. 选择右上角 `... -> Install from VSIX`。
-3. 选择 `fossilsense-vscode-1.5.0_BUILD*.vsix`。
+3. 选择 `fossilsense-vscode-1.5.1_BUILD*.vsix`。
 4. 打开 C/C++ 或 Go 工作区，等待状态栏进入 `ready`。
 
 默认无需配置。FossilSense 会扫描常见 C/C++ 与 `.go` 文件，并把索引保存在用户缓存目录，不会在源码仓库中生成数据库。

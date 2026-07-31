@@ -378,6 +378,12 @@ pub(crate) struct OrdinaryCompletionOutput {
     pub merge_rank_ms: u128,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CancelledOrdinaryCompletion {
+    pub recall_metrics: query::CompletionRecallMetrics,
+    pub recall_ms: u128,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct OrdinaryCompletionItem {
     pub label: String,
@@ -425,14 +431,33 @@ pub(crate) enum OrdinaryCompletionKind {
     EnumConstant,
 }
 
+#[cfg(test)]
 pub(crate) fn complete_ordinary_identifier(
     input: OrdinaryCompletionInput,
 ) -> OrdinaryCompletionOutput {
+    complete_ordinary_identifier_inner(input, None)
+        .expect("an uncontrolled completion cannot be cancelled")
+}
+
+pub(crate) fn complete_ordinary_identifier_controlled(
+    input: OrdinaryCompletionInput,
+    cancellation: &dyn query::CompletionQueryCancellation,
+) -> std::result::Result<OrdinaryCompletionOutput, CancelledOrdinaryCompletion> {
+    complete_ordinary_identifier_inner(input, Some(cancellation))
+}
+
+fn complete_ordinary_identifier_inner(
+    input: OrdinaryCompletionInput,
+    cancellation: Option<&dyn query::CompletionQueryCancellation>,
+) -> std::result::Result<OrdinaryCompletionOutput, CancelledOrdinaryCompletion> {
     let recall_started = std::time::Instant::now();
     let open_reason = input.scope.as_ref().and_then(|scope| scope.reach.reason);
     let mut candidates: Vec<OrdinaryPipelineCandidate> = Vec::new();
     let mut new_pools: Vec<Vec<usize>> = Vec::with_capacity(input.tables.len());
     let mut recall_channels = query::CompletionRecallMetrics::default();
+    if cancellation.is_some_and(query::CompletionQueryCancellation::is_cancelled) {
+        return Err(cancelled_completion(recall_started, recall_channels));
+    }
     let semantic_family = input
         .parsed_document
         .as_ref()
@@ -462,23 +487,39 @@ pub(crate) fn complete_ordinary_identifier(
             query::CompletionRecallQuotas::default_for_completion_limit(input.limit)
         };
         let prior = input.prior_pools.get(idx).and_then(|pool| pool.as_deref());
-        let (mut hits, pool, metrics) = table
-            .table
-            .search_completion_recall_pooled_with_project_for_family(
-                &input.prefix,
-                quotas,
-                input.scope.as_ref(),
-                table_project_context,
-                prior,
-                semantic_family,
-            );
+        let (mut hits, pool, metrics) = match cancellation {
+            Some(cancellation) => table.table.search_completion_recall_pooled_controlled(
+                query::CompletionRecallQuery {
+                    query: &input.prefix,
+                    quotas,
+                    scope: input.scope.as_ref(),
+                    active_project: table_project_context,
+                    prior_pool: prior,
+                    semantic_family: Some(semantic_family),
+                    cancellation: Some(cancellation),
+                },
+            ),
+            None => table
+                .table
+                .search_completion_recall_pooled_with_project_for_family(
+                    &input.prefix,
+                    quotas,
+                    input.scope.as_ref(),
+                    table_project_context,
+                    prior,
+                    semantic_family,
+                ),
+        };
+        recall_channels.merge_from(metrics);
+        if recall_channels.cancelled {
+            return Err(cancelled_completion(recall_started, recall_channels));
+        }
         if input.parsed_document.is_some() {
             // The parsed current-document overlay below is source-order aware.
             // Suppress the positionless durable `Current` projection so a
             // declaration after the cursor cannot regain the strongest tier.
             hits.retain(|hit| hit.tier != model::ScopeTier::Current);
         }
-        recall_channels.merge_from(metrics);
         new_pools.push(pool);
         candidates.extend(completion_items_for_indexed_hits(
             hits,
@@ -489,6 +530,11 @@ pub(crate) fn complete_ordinary_identifier(
                 open_reason,
             },
         ));
+    }
+
+    if cancellation.is_some_and(query::CompletionQueryCancellation::is_cancelled) {
+        recall_channels.cancelled = true;
+        return Err(cancelled_completion(recall_started, recall_channels));
     }
 
     let local_binding_hits = input
@@ -550,6 +596,10 @@ pub(crate) fn complete_ordinary_identifier(
 
     let mut fallback_names = Vec::new();
     for table in &input.tables {
+        if cancellation.is_some_and(query::CompletionQueryCancellation::is_cancelled) {
+            recall_channels.cancelled = true;
+            return Err(cancelled_completion(recall_started, recall_channels));
+        }
         fallback_names.extend(table.fallback_table.matching_for_family(
             &input.prefix,
             input.limit,
@@ -597,7 +647,13 @@ pub(crate) fn complete_ordinary_identifier(
         ));
     }
 
-    for word in input.local_words.iter() {
+    for (word_index, word) in input.local_words.iter().enumerate() {
+        if word_index % query::COMPLETION_CANCELLATION_CHECK_INTERVAL == 0
+            && cancellation.is_some_and(query::CompletionQueryCancellation::is_cancelled)
+        {
+            recall_channels.cancelled = true;
+            return Err(cancelled_completion(recall_started, recall_channels));
+        }
         if word == &input.prefix {
             continue;
         }
@@ -650,6 +706,10 @@ pub(crate) fn complete_ordinary_identifier(
         ));
     }
 
+    if cancellation.is_some_and(query::CompletionQueryCancellation::is_cancelled) {
+        recall_channels.cancelled = true;
+        return Err(cancelled_completion(recall_started, recall_channels));
+    }
     suppress_rescue_when_primary_is_sufficient(&mut candidates, input.scope.as_ref(), input.limit);
 
     let recall_ms = recall_started.elapsed().as_millis();
@@ -685,12 +745,22 @@ pub(crate) fn complete_ordinary_identifier(
         })
         .collect();
 
-    OrdinaryCompletionOutput {
+    Ok(OrdinaryCompletionOutput {
         items,
         new_pools,
         metrics: output.metrics,
         recall_ms,
         merge_rank_ms,
+    })
+}
+
+fn cancelled_completion(
+    recall_started: std::time::Instant,
+    recall_metrics: query::CompletionRecallMetrics,
+) -> CancelledOrdinaryCompletion {
+    CancelledOrdinaryCompletion {
+        recall_metrics,
+        recall_ms: recall_started.elapsed().as_millis(),
     }
 }
 

@@ -183,8 +183,44 @@ fn full_build_defers_secondary_indexes_until_facts_are_complete() {
             )
             .expect("cleanup index count")
     };
+    let bulk_lookup_index_count = |store: &IndexStore| -> i64 {
+        store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name IN (
+                    'idx_declaration_facts_name',
+                    'idx_declaration_facts_logical_key',
+                    'idx_record_facts_record_key',
+                    'idx_member_facts_name',
+                    'idx_type_alias_facts_alias',
+                    'idx_include_facts_target_normalized'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .expect("bulk lookup index count")
+    };
     assert_eq!(call_index_count(&store), 0);
     assert_eq!(cleanup_index_count(&store), 0);
+    let revision_maintenance_index_count: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'index' AND name = 'idx_file_revisions_file_id'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("revision maintenance index count");
+    assert_eq!(
+        revision_maintenance_index_count, 1,
+        "commit-time cleanup needs its narrow revision index during a full build"
+    );
+    assert_eq!(
+        bulk_lookup_index_count(&store),
+        0,
+        "disposable full builds must not maintain lookup B-trees per inserted fact"
+    );
 
     store.begin_full_rebuild_load().expect("begin");
     upsert_source(
@@ -195,6 +231,7 @@ fn full_build_defers_secondary_indexes_until_facts_are_complete() {
     store.finish_full_rebuild_load().expect("finish facts");
     assert_eq!(call_index_count(&store), 0);
     assert_eq!(cleanup_index_count(&store), 0);
+    assert_eq!(bulk_lookup_index_count(&store), 0);
     assert_eq!(test_call_sites_by_callee(&store, "helper").len(), 1);
 
     store
@@ -202,6 +239,7 @@ fn full_build_defers_secondary_indexes_until_facts_are_complete() {
         .expect("build call indexes");
     assert_eq!(call_index_count(&store), 8);
     assert_eq!(cleanup_index_count(&store), 12);
+    assert_eq!(bulk_lookup_index_count(&store), 6);
     let (strings, distinct_strings): (i64, i64) = store
         .conn
         .query_row(

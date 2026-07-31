@@ -35,9 +35,11 @@ pub(crate) fn completion_perf_summary(
 ) -> String {
     let shadow = metrics.shadow.unwrap_or_default();
     format!(
-        "[perf] completion total={}ms context={}ms recall={}ms merge_rank={}ms render={}ms document_version={} engine_generation={} prefix_len={} hit={} intent={} intent_confidence={} history_enabled={} history_boosted={} history_max_boost={} project_boosted={} project_max_boost={} candidates_in={} after_dedup={} returned={} indexed={} local_binding={} current_file_overlay={} language_builtin={} local_word={} returned_indexed={} returned_local_binding={} returned_current_file_overlay={} returned_language_builtin={} returned_local_word={} recall_reachable={} recall_external={} recall_unknown={} recall_global={} recall_same_project={} recall_pool={} guarded_low_trust={} shadow_moved={} shadow_max_delta={}",
+        "[perf] completion total={}ms context={}ms admission_wait={}ms worker={}ms recall={}ms merge_rank={}ms render={}ms document_version={} engine_generation={} prefix_len={} hit={} intent={} intent_confidence={} history_enabled={} history_boosted={} history_max_boost={} project_boosted={} project_max_boost={} candidates_in={} after_dedup={} returned={} indexed={} local_binding={} current_file_overlay={} language_builtin={} local_word={} returned_indexed={} returned_local_binding={} returned_current_file_overlay={} returned_language_builtin={} returned_local_word={} recall_reachable={} recall_external={} recall_unknown={} recall_global={} recall_same_project={} recall_pool={} recall_entries_inspected={} recall_selection_entries={} recall_cancel_checks={} guarded_low_trust={} shadow_moved={} shadow_max_delta={}",
         timings.total_ms,
         timings.context_ms,
+        timings.admission_wait_ms,
+        timings.worker_ms,
         timings.recall_ms,
         timings.merge_rank_ms,
         timings.render_ms,
@@ -71,6 +73,9 @@ pub(crate) fn completion_perf_summary(
         metrics.recall_channels.global,
         metrics.recall_channels.same_project,
         metrics.recall_channels.pool_total,
+        metrics.recall_channels.entries_inspected,
+        metrics.recall_channels.selection_entries_inspected,
+        metrics.recall_channels.cancellation_checks,
         metrics.final_rank.guarded_low_trust,
         shadow.moved,
         shadow.max_delta,

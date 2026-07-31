@@ -364,8 +364,8 @@ impl IndexStore {
         Self::open_with_deferred_indexes(path, workspace_root, true)
     }
 
-    /// Open a full-build destination without maintaining the large call and
-    /// cleanup secondary indexes while facts are inserted. The destination
+    /// Open a full-build destination without maintaining fact lookup indexes
+    /// while rows are inserted. The destination
     /// must not be visible to request readers until
     /// [`finalize_full_build_indexes`] returns.
     pub fn open_for_full_rebuild(path: &Path, workspace_root: &Path) -> Result<Self> {
@@ -434,6 +434,7 @@ impl IndexStore {
 
     pub fn finalize_full_build_indexes(&mut self) -> Result<()> {
         self.bulk_call_string_ids.take();
+        self.conn.execute_batch(schema::CREATE_LOOKUP_INDEXES_SQL)?;
         self.conn
             .execute_batch(schema::CREATE_DEFERRED_LOOKUP_INDEXES_SQL)?;
         self.conn.execute_batch(
@@ -894,11 +895,13 @@ impl IndexStore {
         }
 
         transaction.execute_batch(schema::CREATE_SCHEMA_SQL)?;
-        transaction.execute_batch(schema::CREATE_LOOKUP_INDEXES_SQL)?;
         if create_deferred_indexes {
+            transaction.execute_batch(schema::CREATE_LOOKUP_INDEXES_SQL)?;
             transaction.execute_batch(schema::CREATE_DEFERRED_LOOKUP_INDEXES_SQL)?;
         } else {
+            transaction.execute_batch(schema::DROP_LOOKUP_INDEXES_SQL)?;
             transaction.execute_batch(schema::DROP_DEFERRED_LOOKUP_INDEXES_SQL)?;
+            transaction.execute_batch(schema::CREATE_FULL_BUILD_MAINTENANCE_INDEXES_SQL)?;
             #[cfg(test)]
             if take_migration_failpoint(MigrationFailpoint::AfterDeferredIndexDrop) {
                 anyhow::bail!("injected failure after deferred index drop");

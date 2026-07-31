@@ -68,6 +68,28 @@ pub use text::{
 };
 pub use type_resolution::*;
 
+/// Maximum number of compact recall entries processed between cooperative
+/// cancellation checks. The check is deliberately block-based so the hot loop
+/// does not perform an atomic load for every declaration.
+pub(crate) const COMPLETION_CANCELLATION_CHECK_INTERVAL: usize = 256;
+
+/// Request-owned cancellation observed by long-running completion recall.
+/// Implementations must be cheap and thread-safe because checks run inside the
+/// foreground blocking worker.
+pub(crate) trait CompletionQueryCancellation: Send + Sync {
+    fn is_cancelled(&self) -> bool;
+}
+
+pub(crate) struct CompletionRecallQuery<'a> {
+    pub query: &'a str,
+    pub quotas: CompletionRecallQuotas,
+    pub scope: Option<&'a CompletionScope>,
+    pub active_project: Option<&'a ProjectKey>,
+    pub prior_pool: Option<&'a [usize]>,
+    pub semantic_family: Option<crate::semantic_model::SemanticFamily>,
+    pub cancellation: Option<&'a dyn CompletionQueryCancellation>,
+}
+
 #[cfg(test)]
 use name_search::{sort_scored, top_scored};
 #[cfg(test)]
@@ -259,6 +281,10 @@ pub struct CompletionRecallMetrics {
     pub same_project: usize,
     pub pool_total: usize,
     pub indexed_returned: usize,
+    pub entries_inspected: usize,
+    pub selection_entries_inspected: usize,
+    pub cancellation_checks: usize,
+    pub cancelled: bool,
 }
 
 impl CompletionRecallMetrics {
@@ -270,6 +296,10 @@ impl CompletionRecallMetrics {
         self.same_project += other.same_project;
         self.pool_total += other.pool_total;
         self.indexed_returned += other.indexed_returned;
+        self.entries_inspected += other.entries_inspected;
+        self.selection_entries_inspected += other.selection_entries_inspected;
+        self.cancellation_checks += other.cancellation_checks;
+        self.cancelled |= other.cancelled;
     }
 }
 

@@ -383,4 +383,57 @@ mod tests {
         println!("completion_hot_p95_us: {p95}");
         println!("completion_hot_sql_reads: {}", stats.sql_reads);
     }
+
+    #[test]
+    #[ignore = "diagnostic production pooled-recall component benchmark; set FOSSILSENSE_BENCH_DB"]
+    fn benchmark_large_declaration_index_production_pooled_recall_component() {
+        let db = std::env::var_os("FOSSILSENSE_BENCH_DB")
+            .map(std::path::PathBuf::from)
+            .expect("set FOSSILSENSE_BENCH_DB to a current schema benchmark database");
+        let store = crate::store::IndexStore::open_readonly(&db).expect("benchmark database");
+        let names =
+            crate::query::NameTable::build_from_declaration_view(&store.declaration_view(), None)
+                .expect("stream declaration names");
+        let index = SemanticDeclarationIndex::build(names, 0);
+        let quotas = crate::query::CompletionRecallQuotas::default_for_completion_limit(100);
+
+        let mut samples = Vec::new();
+        let mut inspected = Vec::new();
+        for prefix in ["i", "in", "init", "d", "de", "dev", "c", "cmd"] {
+            for _ in 0..5 {
+                let started = std::time::Instant::now();
+                let (hits, pool, metrics) = index
+                    .name_table()
+                    .search_completion_recall_pooled_with_project_for_family(
+                        prefix,
+                        quotas,
+                        None,
+                        None,
+                        None,
+                        crate::semantic_model::SemanticFamily::CFamily,
+                    );
+                samples.push(started.elapsed().as_micros());
+                inspected.push(metrics.entries_inspected);
+                assert!(!metrics.cancelled);
+                std::hint::black_box((hits, pool));
+            }
+        }
+        samples.sort_unstable();
+        inspected.sort_unstable();
+        let p50 = samples[samples.len() / 2];
+        let p95 = samples[samples.len() * 95 / 100];
+        let inspected_p50 = inspected[inspected.len() / 2];
+        let inspected_max = inspected[inspected.len() - 1];
+        let stats = index.payload_cache_stats();
+        assert_eq!(
+            stats.sql_reads, 0,
+            "production pooled recall must not hydrate SQLite payloads"
+        );
+        println!("declarations: {}", index.len());
+        println!("completion_production_cold_p50_us: {p50}");
+        println!("completion_production_cold_p95_us: {p95}");
+        println!("completion_production_entries_inspected_p50: {inspected_p50}");
+        println!("completion_production_entries_inspected_max: {inspected_max}");
+        println!("completion_production_sql_reads: {}", stats.sql_reads);
+    }
 }

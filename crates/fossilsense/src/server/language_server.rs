@@ -57,6 +57,7 @@ impl LanguageServer for Backend {
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let uri = params.text_document.uri.clone();
+        self.completion_runtime.supersede(&uri);
         if let Some(path) = uri_to_path(&uri) {
             self.invalidate_external_source_path_authorization(&path)
                 .await;
@@ -68,6 +69,9 @@ impl LanguageServer for Backend {
                 params.text_document.text,
             )
             .await;
+        // Also cancel requests that began while the mutation awaited document
+        // or cache locks; such requests may have captured the previous state.
+        self.completion_runtime.supersede(&uri);
         if let Some(root) = self.root_for_uri(&uri).await {
             let generation = self
                 .request_context_for_root(root.clone())
@@ -93,11 +97,13 @@ impl LanguageServer for Backend {
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri;
-        if !self
+        self.completion_runtime.supersede(&uri);
+        let applied = self
             .session
             .apply_document_changes(&uri, params.text_document.version, params.content_changes)
-            .await
-        {
+            .await;
+        self.completion_runtime.supersede(&uri);
+        if !applied {
             self.client
                 .log_message(
                     MessageType::WARNING,
@@ -109,8 +115,13 @@ impl LanguageServer for Backend {
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
+        self.completion_runtime.supersede(&uri);
         let path = uri_to_path(&uri);
         self.session.close_document(&uri).await;
+        self.completion_runtime.supersede(&uri);
+        // A request that began during close may have waited behind the first
+        // memo clear. Clear once more after cancelling that race window.
+        self.session.cache.clear_completion_memo(&uri).await;
         if let Some(path) = path {
             self.invalidate_external_source_path_authorization(&path)
                 .await;
@@ -362,14 +373,16 @@ impl LanguageServer for Backend {
     }
 
     async fn completion(&self, params: CompletionParams) -> LspResult<Option<CompletionResponse>> {
+        let ordinary_started = tokio::time::Instant::now();
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        // Request-order linearization point. This must precede the first await
+        // so older snapshot preparation can never register after newer work.
+        let mut completion_request = self.completion_runtime.begin(uri.clone());
         let request_settings = self.request_settings();
         if !request_settings.completion_enabled {
             return Ok(None);
         }
-
-        let ordinary_started = tokio::time::Instant::now();
-        let uri = params.text_document_position.text_document.uri;
-        let position = params.text_document_position.position;
 
         // Current-buffer text and every divergent open-document overlay must
         // come from one lock-consistent capture. Member completion consumes
@@ -393,7 +406,12 @@ impl LanguageServer for Backend {
         if let Some((form, partial)) =
             includes::include_completion_context(line_text, position.character)
         {
-            return self.complete_include(&uri, form, partial, &text).await;
+            let response = self.complete_include(&uri, form, partial, &text).await?;
+            return if completion_request.finish() {
+                Ok(response)
+            } else {
+                Ok(Some(empty_completion_list(true)))
+            };
         }
 
         let current_root = self.root_for_uri(&uri).await;
@@ -424,23 +442,41 @@ impl LanguageServer for Backend {
                         }
                         _ => (None, None),
                     };
-                return Ok(Some(match table {
+                let response = match table {
                     Some(table) => table.complete(&import_context, current_package_key.as_deref()),
                     None => empty_completion_list(true),
-                }));
+                };
+                return if completion_request.finish() {
+                    Ok(Some(response))
+                } else {
+                    Ok(Some(empty_completion_list(true)))
+                };
             }
         }
 
         if query::is_member_completion_context(line_text, position.character) {
-            return self
+            let response = self
                 .complete_members(&uri, version, &text, line_text, position, document_request)
-                .await;
+                .await?;
+            return if completion_request.finish() {
+                Ok(response)
+            } else {
+                Ok(Some(empty_completion_list(true)))
+            };
         }
 
         let prefix = query::completion_prefix_at(line_text, position.character).unwrap_or_default();
         if prefix.len() < query::MIN_PREFIX_LEN {
             return Ok(Some(empty_completion_list(true)));
         }
+        let admission_started = tokio::time::Instant::now();
+        let Some(foreground_permit) = completion_request.acquire().await else {
+            let runtime_metrics = self.completion_runtime.metrics();
+            self.perf_log(|| runtime_metrics.perf_summary("admission", version, 0, 0))
+                .await;
+            return Ok(Some(empty_completion_list(true)));
+        };
+        let admission_wait_ms = admission_started.elapsed().as_millis();
         let intent =
             crate::completion::classify_completion_intent(line_text, position.character, &prefix);
         let history_enabled = self.completion_history_mode.lock().await.is_enabled();
@@ -479,7 +515,13 @@ impl LanguageServer for Backend {
             }
             None => None,
         };
+        if completion_request.stop_before_worker() {
+            return Ok(Some(empty_completion_list(true)));
+        }
         let local_words = self.local_words_for(&uri, version, &text).await;
+        if completion_request.stop_before_worker() {
+            return Ok(Some(empty_completion_list(true)));
+        }
 
         let mut contexts = {
             let roots = self.workspace_roots.lock().await.clone();
@@ -503,6 +545,9 @@ impl LanguageServer for Backend {
         let mut table_generations = Vec::new();
         let mut effective_completion_scope = None;
         for context in &contexts {
+            if completion_request.stop_before_worker() {
+                return Ok(Some(empty_completion_list(true)));
+            }
             if let Some(table) = context.engine.name_table.clone() {
                 let overlay = self
                     .candidate_overlay_snapshot_from_documents(
@@ -514,6 +559,9 @@ impl LanguageServer for Backend {
                         document_request.clone(),
                     )
                     .await;
+                if completion_request.stop_before_worker() {
+                    return Ok(Some(empty_completion_list(true)));
+                }
                 if current_root.as_deref() == Some(context.engine.root.as_path())
                     && context.settings.scoping_enabled
                 {
@@ -626,7 +674,6 @@ impl LanguageServer for Backend {
             active_project_context.as_ref(),
             completion_overlay_epoch,
         );
-        let completion_started = tokio::time::Instant::now();
         let memo_lookup = self
             .session
             .cache
@@ -635,7 +682,12 @@ impl LanguageServer for Backend {
         let prior_pools = memo_lookup.prior_pools;
         let hit_kind = memo_lookup.hit_kind;
         let memo_prefix = prefix.clone();
-        let context_ms = ordinary_started.elapsed().as_millis();
+        // Context and admission are reported as disjoint stages. Everything
+        // before the worker other than semaphore wait belongs to context.
+        let context_ms = ordinary_started
+            .elapsed()
+            .as_millis()
+            .saturating_sub(admission_wait_ms);
 
         let service_input = OrdinaryCompletionInput {
             prefix: prefix.clone(),
@@ -657,10 +709,24 @@ impl LanguageServer for Backend {
             locality_bonus,
         };
 
+        let cancellation = completion_request.cancellation();
+        let worker = completion_request.worker(foreground_permit);
+        let worker_started = tokio::time::Instant::now();
         let result = tokio::task::spawn_blocking(move || -> Result<_> {
-            Ok(crate::completion::ordinary_service::complete_ordinary_identifier(service_input))
+            let outcome =
+                crate::completion::ordinary_service::complete_ordinary_identifier_controlled(
+                    service_input,
+                    &cancellation,
+                );
+            let (cancelled, entries_inspected) = match &outcome {
+                Ok(output) => (false, output.metrics.recall_channels.entries_inspected),
+                Err(cancelled) => (true, cancelled.recall_metrics.entries_inspected),
+            };
+            worker.finish(cancelled, entries_inspected);
+            Ok(outcome)
         })
         .await;
+        let worker_ms = worker_started.elapsed().as_millis();
 
         // The list is always incomplete: results are truncated to
         // `COMPLETION_LIMIT` and the recall threshold widens with prefix
@@ -669,7 +735,7 @@ impl LanguageServer for Backend {
         // truncation window as the user keeps typing, and prevents an empty
         // first batch from sticking as a "complete" no-match list.
         match self.unwrap_query("completion", result).await {
-            Some(output) => {
+            Some(Ok(output)) if !completion_request.is_cancelled() => {
                 let render_started = std::time::Instant::now();
                 let mut items: Vec<CompletionItem> = output
                     .items
@@ -701,8 +767,10 @@ impl LanguageServer for Backend {
                 apply_final_completion_sort_text(&mut items);
                 let render_ms = render_started.elapsed().as_millis();
                 let timings = crate::completion::CompletionStageTimings {
-                    total_ms: completion_started.elapsed().as_millis(),
+                    total_ms: ordinary_started.elapsed().as_millis(),
                     context_ms,
+                    admission_wait_ms,
+                    worker_ms,
                     recall_ms: output.recall_ms,
                     merge_rank_ms: output.merge_rank_ms,
                     render_ms,
@@ -720,15 +788,22 @@ impl LanguageServer for Backend {
                 })
                 .await;
                 // Record this prefix's pools for the next (extending) keystroke.
-                self.session
+                let memo_committed = self
+                    .session
                     .cache
-                    .record_completion_memo(
+                    .record_completion_memo_if_current(
+                        &completion_request,
                         uri,
                         memo_prefix,
                         completion_generation,
                         output.new_pools,
                     )
                     .await;
+                // No await may follow this check: it is the response
+                // linearization point relative to edits, close, and newer RPCs.
+                if !memo_committed || !completion_request.finish() {
+                    return Ok(Some(empty_completion_list(true)));
+                }
                 if items.is_empty() {
                     Ok(Some(empty_completion_list(true)))
                 } else {
@@ -737,6 +812,25 @@ impl LanguageServer for Backend {
                         items,
                     })))
                 }
+            }
+            Some(Err(cancelled)) => {
+                let runtime_metrics = self.completion_runtime.metrics();
+                self.perf_log(|| {
+                    runtime_metrics.perf_summary(
+                        "worker",
+                        version,
+                        cancelled.recall_ms,
+                        cancelled.recall_metrics.entries_inspected,
+                    )
+                })
+                .await;
+                Ok(Some(empty_completion_list(true)))
+            }
+            Some(Ok(_)) => {
+                let runtime_metrics = self.completion_runtime.metrics();
+                self.perf_log(|| runtime_metrics.perf_summary("publish", version, 0, 0))
+                    .await;
+                Ok(Some(empty_completion_list(true)))
             }
             _ => Ok(Some(empty_completion_list(true))),
         }
@@ -846,6 +940,7 @@ impl LanguageServer for Backend {
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
         let uri = params.text_document.uri;
+        self.completion_runtime.supersede(&uri);
         if let Some(root) = self.root_for_uri(&uri).await {
             let context = self.request_context_for_root(root).await;
             self.session
@@ -854,6 +949,7 @@ impl LanguageServer for Backend {
         } else {
             self.session.cache.invalidate_references();
         }
+        self.completion_runtime.supersede(&uri);
         self.client
             .log_message(
                 MessageType::LOG,

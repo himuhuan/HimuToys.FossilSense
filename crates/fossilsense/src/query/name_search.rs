@@ -1,3 +1,5 @@
+use std::collections::BinaryHeap;
+
 use super::*;
 
 impl NameTable {
@@ -320,14 +322,15 @@ impl NameTable {
         active_project: Option<&ProjectKey>,
         prior_pool: Option<&[usize]>,
     ) -> (Vec<RankedNameHit>, Vec<usize>, CompletionRecallMetrics) {
-        self.search_completion_recall_pooled_with_project_filtered(
+        self.search_completion_recall_pooled_with_project_filtered(super::CompletionRecallQuery {
             query,
             quotas,
             scope,
             active_project,
             prior_pool,
-            None,
-        )
+            semantic_family: None,
+            cancellation: None,
+        })
     }
 
     pub fn search_completion_recall_pooled_with_project_for_family(
@@ -339,94 +342,128 @@ impl NameTable {
         prior_pool: Option<&[usize]>,
         semantic_family: crate::semantic_model::SemanticFamily,
     ) -> (Vec<RankedNameHit>, Vec<usize>, CompletionRecallMetrics) {
-        self.search_completion_recall_pooled_with_project_filtered(
+        self.search_completion_recall_pooled_with_project_filtered(super::CompletionRecallQuery {
             query,
             quotas,
             scope,
             active_project,
             prior_pool,
-            Some(semantic_family),
-        )
+            semantic_family: Some(semantic_family),
+            cancellation: None,
+        })
+    }
+
+    pub(crate) fn search_completion_recall_pooled_controlled(
+        &self,
+        query: super::CompletionRecallQuery<'_>,
+    ) -> (Vec<RankedNameHit>, Vec<usize>, CompletionRecallMetrics) {
+        debug_assert!(query.cancellation.is_some());
+        self.search_completion_recall_pooled_with_project_filtered(query)
     }
 
     fn search_completion_recall_pooled_with_project_filtered(
         &self,
-        query: &str,
-        quotas: CompletionRecallQuotas,
-        scope: Option<&CompletionScope>,
-        active_project: Option<&ProjectKey>,
-        prior_pool: Option<&[usize]>,
-        semantic_family: Option<crate::semantic_model::SemanticFamily>,
+        query: super::CompletionRecallQuery<'_>,
     ) -> (Vec<RankedNameHit>, Vec<usize>, CompletionRecallMetrics) {
-        let total_limit = quotas.total_indexed;
-        let (mut scored, mut pool) = self.scored_pool_for_query(query, scope, prior_pool);
-        if let Some(semantic_family) = semantic_family {
+        let total_limit = query.quotas.total_indexed;
+        let (mut scored, mut pool, mut scan_metrics) = self.scored_pool_for_query(
+            query.query,
+            query.scope,
+            query.prior_pool,
+            query.cancellation,
+        );
+        if scan_metrics.cancelled {
+            return cancelled_recall(scan_metrics);
+        }
+        if scan_metrics.check(query.cancellation) {
+            return cancelled_recall(scan_metrics);
+        }
+        if let Some(semantic_family) = query.semantic_family {
             scored
                 .retain(|candidate| self.entry(candidate.index).semantic_family == semantic_family);
             pool.retain(|index| self.entry(*index).semantic_family == semantic_family);
         }
-        let reserved = quotas
+        if scan_metrics.check(query.cancellation) {
+            return cancelled_recall(scan_metrics);
+        }
+        let reserved = query
+            .quotas
             .reachable
-            .saturating_add(quotas.external)
-            .saturating_add(quotas.unknown)
-            .saturating_add(quotas.global)
-            .saturating_add(quotas.same_project);
-        let global_top = top_scored(scored.clone(), total_limit.saturating_add(reserved), self);
+            .saturating_add(query.quotas.external)
+            .saturating_add(query.quotas.unknown)
+            .saturating_add(query.quotas.global)
+            .saturating_add(query.quotas.same_project);
+        let Some(global_top) = top_scored_controlled(
+            scored.iter().copied(),
+            |_| true,
+            total_limit.saturating_add(reserved),
+            self,
+            query.cancellation,
+            &mut scan_metrics,
+        ) else {
+            return cancelled_recall(scan_metrics);
+        };
 
         let mut selected_indices = HashSet::new();
         let mut selected = Vec::new();
-        let reachable = top_scored(
-            scored
-                .iter()
-                .copied()
-                .filter(|candidate| channel_for_tier(candidate.tier) == ScopeChannel::Reachable)
-                .collect(),
-            quotas.reachable,
+        let Some(reachable) = top_scored_controlled(
+            scored.iter().copied(),
+            |candidate| channel_for_tier(candidate.tier) == ScopeChannel::Reachable,
+            query.quotas.reachable,
             self,
-        );
+            query.cancellation,
+            &mut scan_metrics,
+        ) else {
+            return cancelled_recall(scan_metrics);
+        };
         take_channel(
             &reachable,
             ScopeChannel::Reachable,
-            quotas.reachable,
+            query.quotas.reachable,
             &mut selected_indices,
             &mut selected,
         );
-        let same_project = active_project
+        let same_project = if let Some(indices) = query
+            .active_project
             .and_then(|key| self.project_indices(key))
-            .map(|indices| {
-                top_scored(
-                    scored
-                        .iter()
-                        .copied()
-                        .filter(|candidate| indices.binary_search(&candidate.index).is_ok())
-                        .collect(),
-                    quotas.same_project,
-                    self,
-                )
-            })
-            .unwrap_or_default();
+        {
+            let Some(top) = top_scored_controlled(
+                scored.iter().copied(),
+                |candidate| indices.binary_search(&candidate.index).is_ok(),
+                query.quotas.same_project,
+                self,
+                query.cancellation,
+                &mut scan_metrics,
+            ) else {
+                return cancelled_recall(scan_metrics);
+            };
+            top
+        } else {
+            Vec::new()
+        };
         take_same_project(
             self,
             &same_project,
-            active_project,
-            quotas.same_project,
+            query.active_project,
+            query.quotas.same_project,
             &mut selected_indices,
             &mut selected,
         );
         for (channel, quota) in [
-            (ScopeChannel::External, quotas.external),
-            (ScopeChannel::Unknown, quotas.unknown),
-            (ScopeChannel::Global, quotas.global),
+            (ScopeChannel::External, query.quotas.external),
+            (ScopeChannel::Unknown, query.quotas.unknown),
+            (ScopeChannel::Global, query.quotas.global),
         ] {
-            let channel_top = top_scored(
-                scored
-                    .iter()
-                    .copied()
-                    .filter(|candidate| channel_for_tier(candidate.tier) == channel)
-                    .collect(),
+            let Some(channel_top) = top_scored_controlled(
+                scored.iter().copied(),
+                |candidate| channel_for_tier(candidate.tier) == channel,
                 quota,
                 self,
-            );
+                query.cancellation,
+                &mut scan_metrics,
+            ) else {
+                return cancelled_recall(scan_metrics);
+            };
             take_channel(
                 &channel_top,
                 channel,
@@ -445,10 +482,16 @@ impl NameTable {
             }
         }
 
+        if scan_metrics.check(query.cancellation) {
+            return cancelled_recall(scan_metrics);
+        }
         sort_scored(&mut selected, self);
         selected.truncate(total_limit);
         let hits = self.scored_to_hits(selected);
-        let metrics = recall_metrics(&hits, pool.len(), active_project);
+        let mut metrics = recall_metrics(&hits, pool.len(), query.active_project);
+        metrics.entries_inspected = scan_metrics.entries_inspected;
+        metrics.selection_entries_inspected = scan_metrics.selection_entries_inspected;
+        metrics.cancellation_checks = scan_metrics.cancellation_checks;
         (hits, pool, metrics)
     }
 
@@ -530,33 +573,40 @@ impl NameTable {
         query: &str,
         scope: Option<&CompletionScope>,
         prior_pool: Option<&[usize]>,
-    ) -> (Vec<ScoredCandidate>, Vec<usize>) {
+        cancellation: Option<&dyn super::CompletionQueryCancellation>,
+    ) -> (Vec<ScoredCandidate>, Vec<usize>, RecallScanMetrics) {
         let ctx_owned: Option<ResolveContext<'_>> = scope.map(|s| s.resolve_context());
         let ctx_ref = ctx_owned.as_ref();
         let query = query.trim();
         if query.is_empty() {
-            let mut scored: Vec<ScoredCandidate> = self
-                .active_indices()
-                .map(|index| {
-                    let entry = self.entry(index);
-                    let tier = resolver::scope_tier(
-                        entry.path,
-                        entry.external,
-                        self.directly_included_for(entry),
-                        ctx_ref,
-                    );
-                    let loc = resolver::locality(entry.path, ctx_ref.and_then(|c| c.current_path));
-                    ScoredCandidate {
-                        score: resolver::pack_score(tier, 0, loc),
-                        name_len: entry.name.len(),
-                        index,
-                        tier,
-                        base_match: 0,
-                    }
-                })
-                .collect();
+            let mut scored = Vec::new();
+            let mut scan_metrics = RecallScanMetrics::default();
+            for index in self.active_indices() {
+                if scan_metrics.should_cancel(cancellation) {
+                    return (Vec::new(), Vec::new(), scan_metrics);
+                }
+                let entry = self.entry(index);
+                let tier = resolver::scope_tier(
+                    entry.path,
+                    entry.external,
+                    self.directly_included_for(entry),
+                    ctx_ref,
+                );
+                let loc = resolver::locality(entry.path, ctx_ref.and_then(|c| c.current_path));
+                scored.push(ScoredCandidate {
+                    score: resolver::pack_score(tier, 0, loc),
+                    name_len: entry.name.len(),
+                    index,
+                    tier,
+                    base_match: 0,
+                });
+                scan_metrics.entries_inspected += 1;
+            }
+            if scan_metrics.cancel_after_scan(cancellation) {
+                return (Vec::new(), Vec::new(), scan_metrics);
+            }
             sort_scored(&mut scored, self);
-            return (scored, Vec::new());
+            return (scored, Vec::new(), scan_metrics);
         }
 
         let needle = query.to_ascii_lowercase();
@@ -567,19 +617,31 @@ impl NameTable {
         };
         let mut scored = Vec::new();
         let mut pool = Vec::new();
+        let mut scan_metrics = RecallScanMetrics::default();
         match prior_pool {
             Some(indices) => {
                 for &i in indices {
+                    if scan_metrics.should_cancel(cancellation) {
+                        return (Vec::new(), Vec::new(), scan_metrics);
+                    }
                     self.consider(i, &needle, min_score, ctx_ref, &mut scored, &mut pool);
+                    scan_metrics.entries_inspected += 1;
                 }
             }
             None => {
                 for i in self.active_indices() {
+                    if scan_metrics.should_cancel(cancellation) {
+                        return (Vec::new(), Vec::new(), scan_metrics);
+                    }
                     self.consider(i, &needle, min_score, ctx_ref, &mut scored, &mut pool);
+                    scan_metrics.entries_inspected += 1;
                 }
             }
         }
-        (scored, pool)
+        if scan_metrics.cancel_after_scan(cancellation) {
+            return (Vec::new(), Vec::new(), scan_metrics);
+        }
+        (scored, pool, scan_metrics)
     }
 
     fn scored_to_hits(&self, scored: Vec<ScoredCandidate>) -> Vec<RankedNameHit> {
@@ -601,6 +663,61 @@ impl NameTable {
                 }
             })
             .collect()
+    }
+}
+
+fn cancelled_recall(
+    scan_metrics: RecallScanMetrics,
+) -> (Vec<RankedNameHit>, Vec<usize>, CompletionRecallMetrics) {
+    (
+        Vec::new(),
+        Vec::new(),
+        CompletionRecallMetrics {
+            entries_inspected: scan_metrics.entries_inspected,
+            selection_entries_inspected: scan_metrics.selection_entries_inspected,
+            cancellation_checks: scan_metrics.cancellation_checks,
+            cancelled: true,
+            ..CompletionRecallMetrics::default()
+        },
+    )
+}
+
+#[derive(Default)]
+struct RecallScanMetrics {
+    entries_inspected: usize,
+    selection_entries_inspected: usize,
+    cancellation_checks: usize,
+    cancelled: bool,
+}
+
+impl RecallScanMetrics {
+    fn should_cancel(
+        &mut self,
+        cancellation: Option<&dyn super::CompletionQueryCancellation>,
+    ) -> bool {
+        if !self
+            .entries_inspected
+            .is_multiple_of(super::COMPLETION_CANCELLATION_CHECK_INTERVAL)
+        {
+            return false;
+        }
+        self.check(cancellation)
+    }
+
+    fn cancel_after_scan(
+        &mut self,
+        cancellation: Option<&dyn super::CompletionQueryCancellation>,
+    ) -> bool {
+        self.check(cancellation)
+    }
+
+    fn check(&mut self, cancellation: Option<&dyn super::CompletionQueryCancellation>) -> bool {
+        let Some(cancellation) = cancellation else {
+            return false;
+        };
+        self.cancellation_checks += 1;
+        self.cancelled = cancellation.is_cancelled();
+        self.cancelled
     }
 }
 
@@ -705,6 +822,86 @@ fn completion_role_recall_priority(role: SymbolRole) -> u8 {
         SymbolRole::TentativeDefinition => 3,
         SymbolRole::Definition => 2,
         SymbolRole::UnknownDeclarationOrDefinition => 1,
+    }
+}
+
+fn top_scored_controlled<I, F>(
+    scored: I,
+    mut include: F,
+    limit: usize,
+    table: &NameTable,
+    cancellation: Option<&dyn super::CompletionQueryCancellation>,
+    scan_metrics: &mut RecallScanMetrics,
+) -> Option<Vec<ScoredCandidate>>
+where
+    I: IntoIterator<Item = ScoredCandidate>,
+    F: FnMut(&ScoredCandidate) -> bool,
+{
+    if limit == 0 {
+        return Some(Vec::new());
+    }
+    if scan_metrics.check(cancellation) {
+        return None;
+    }
+
+    let mut retained = BinaryHeap::with_capacity(limit);
+    let mut block_len = 0usize;
+    for candidate in scored {
+        if include(&candidate) {
+            let candidate = WorstScoredCandidate { candidate, table };
+            if retained.len() < limit {
+                retained.push(candidate);
+            } else if retained
+                .peek()
+                .is_some_and(|worst| candidate.cmp(worst).is_lt())
+            {
+                retained.pop();
+                retained.push(candidate);
+            }
+        }
+        block_len += 1;
+        scan_metrics.selection_entries_inspected =
+            scan_metrics.selection_entries_inspected.saturating_add(1);
+        if block_len == super::COMPLETION_CANCELLATION_CHECK_INTERVAL {
+            block_len = 0;
+            if scan_metrics.check(cancellation) {
+                return None;
+            }
+        }
+    }
+    if block_len != 0 && scan_metrics.check(cancellation) {
+        return None;
+    }
+    let mut retained: Vec<_> = retained
+        .into_iter()
+        .map(|candidate| candidate.candidate)
+        .collect();
+    sort_scored(&mut retained, table);
+    Some(retained)
+}
+
+struct WorstScoredCandidate<'a> {
+    candidate: ScoredCandidate,
+    table: &'a NameTable,
+}
+
+impl PartialEq for WorstScoredCandidate<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for WorstScoredCandidate<'_> {}
+
+impl PartialOrd for WorstScoredCandidate<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for WorstScoredCandidate<'_> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        scored_order(&self.candidate, &other.candidate, self.table)
     }
 }
 

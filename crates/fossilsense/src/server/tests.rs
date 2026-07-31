@@ -45,6 +45,7 @@ fn test_backend_service() -> LspService<super::Backend> {
         )),
         completion_history: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         completion_history_write_gate: Arc::new(tokio::sync::Mutex::new(())),
+        completion_runtime: super::completion_runtime::CompletionRuntime::default(),
         project_context_selection: Arc::new(tokio::sync::Mutex::new(
             crate::project_context::ProjectContextSelection::Auto,
         )),
@@ -7910,6 +7911,114 @@ fn completion_memo_invalid_when_prior_prefix_empty() {
     // Even extending an empty prefix is invalid — the prior scan was
     // the empty-prefix full pass which doesn't provide a focused pool.
     assert!(!super::state::completion_memo_is_valid(1, 1, "", "foo"));
+}
+
+#[tokio::test]
+async fn completion_runtime_supersedes_queued_request_before_cpu_admission() {
+    let runtime = super::completion_runtime::CompletionRuntime::with_permits_for_test(1);
+    let blocker_uri = Url::parse("file:///workspace/blocker.c").expect("blocker uri");
+    let target_uri = Url::parse("file:///workspace/target.c").expect("target uri");
+
+    let blocker = runtime.begin(blocker_uri);
+    let blocker_permit = blocker
+        .acquire()
+        .await
+        .expect("first request owns the only foreground permit");
+
+    let queued = runtime.begin(target_uri.clone());
+    let queued_wait = tokio::spawn(async move { queued.acquire().await.is_some() });
+    tokio::task::yield_now().await;
+
+    let latest = runtime.begin(target_uri);
+    assert!(
+        !queued_wait.await.expect("queued request task"),
+        "a superseded request must leave the admission queue"
+    );
+
+    drop(blocker_permit);
+    let latest_permit = latest
+        .acquire()
+        .await
+        .expect("latest request receives the released permit");
+    drop(latest_permit);
+
+    let metrics = runtime.metrics_for_test();
+    assert_eq!(metrics.superseded, 1);
+    assert_eq!(metrics.cancelled_before_admission, 1);
+}
+
+#[test]
+fn document_change_supersedes_active_completion_token() {
+    let runtime = super::completion_runtime::CompletionRuntime::with_permits_for_test(1);
+    let uri = Url::parse("file:///workspace/target.c").expect("target uri");
+    let request = runtime.begin(uri.clone());
+
+    runtime.supersede(&uri);
+
+    assert!(request.is_cancelled());
+    assert!(request.stop_before_worker());
+    let metrics = runtime.metrics_for_test();
+    assert_eq!(metrics.superseded, 1);
+    assert_eq!(metrics.cancelled_before_worker, 1);
+}
+
+#[test]
+fn completion_runtime_never_allows_older_work_to_replace_a_post_change_request() {
+    let runtime = super::completion_runtime::CompletionRuntime::with_permits_for_test(1);
+    let uri = Url::parse("file:///workspace/target.c").expect("target uri");
+    let mut older = runtime.begin(uri.clone());
+
+    runtime.supersede(&uri);
+    let mut latest = runtime.begin(uri);
+
+    assert!(older.is_cancelled());
+    assert!(!older.is_current());
+    assert!(latest.is_current());
+    assert!(!older.finish(), "old work must not become publishable");
+    assert!(latest.finish(), "the post-change request remains current");
+}
+
+#[tokio::test]
+async fn cancelled_request_cannot_repopulate_a_memo_after_waiting_for_its_lock() {
+    let runtime = super::completion_runtime::CompletionRuntime::with_permits_for_test(1);
+    let cache = super::CacheLedger::default();
+    let uri = Url::parse("file:///workspace/target.c").expect("target uri");
+    let request = runtime.begin(uri.clone());
+    let memo_guard = cache.completion_memo.clone().lock_owned().await;
+
+    let waiting_cache = cache.clone();
+    let waiting_uri = uri.clone();
+    let commit = tokio::spawn(async move {
+        let mut request = request;
+        let committed = waiting_cache
+            .record_completion_memo_if_current(
+                &request,
+                waiting_uri,
+                "tar".to_string(),
+                7,
+                vec![vec![1, 2, 3]],
+            )
+            .await;
+        let publishable = request.finish();
+        (committed, publishable)
+    });
+    tokio::task::yield_now().await;
+
+    runtime.supersede(&uri);
+    let mut latest = runtime.begin(uri.clone());
+    drop(memo_guard);
+
+    let (committed, publishable) = commit.await.expect("memo commit task");
+    assert!(
+        !committed,
+        "a stale request must not write its candidate pool"
+    );
+    assert!(!publishable, "a stale request must not return its result");
+    assert!(
+        cache.completion_memo_for_test(&uri).await.is_none(),
+        "didChange/didClose must not be followed by stale memo resurrection"
+    );
+    assert!(latest.finish());
 }
 
 #[test]

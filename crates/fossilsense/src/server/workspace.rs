@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tower_lsp::lsp_types::{Position, TextDocumentContentChangeEvent, Url};
 
+use super::completion_runtime::CompletionRequest;
 use super::state;
 use super::LocalWordCache;
 use crate::call_model::SemanticGeneration;
@@ -779,6 +780,7 @@ impl CacheLedger {
         self.completion_memo.lock().await.clear();
     }
 
+    #[cfg(test)]
     pub(super) async fn record_completion_memo(
         &self,
         uri: Url,
@@ -794,6 +796,29 @@ impl CacheLedger {
                 pools,
             },
         );
+    }
+
+    pub(super) async fn record_completion_memo_if_current(
+        &self,
+        request: &CompletionRequest,
+        uri: Url,
+        prefix: String,
+        generation: u64,
+        pools: Vec<Vec<usize>>,
+    ) -> bool {
+        let mut memo = self.completion_memo.lock().await;
+        request
+            .run_if_current(|| {
+                memo.insert(
+                    uri,
+                    state::CompletionMemo {
+                        prefix,
+                        generation,
+                        pools,
+                    },
+                );
+            })
+            .is_some()
     }
 
     pub(super) async fn completion_memo_pools(

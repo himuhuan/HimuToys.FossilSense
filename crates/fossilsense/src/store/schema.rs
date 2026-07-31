@@ -494,6 +494,45 @@ pub(crate) const CREATE_LOOKUP_INDEXES_SQL: &str = "
     CREATE INDEX IF NOT EXISTS idx_include_facts_file_id ON include_facts(file_id);
 ";
 
+pub(crate) const DROP_LOOKUP_INDEXES_SQL: &str = "
+    DROP INDEX IF EXISTS idx_files_source;
+    DROP INDEX IF EXISTS idx_file_revisions_file_id;
+    DROP INDEX IF EXISTS idx_fallback_completion_name;
+    DROP INDEX IF EXISTS idx_fallback_completion_file_id;
+    DROP INDEX IF EXISTS idx_declaration_facts_name;
+    DROP INDEX IF EXISTS idx_declaration_facts_file_id;
+    DROP INDEX IF EXISTS idx_declaration_facts_logical_key;
+    DROP INDEX IF EXISTS idx_package_facts_name;
+    DROP INDEX IF EXISTS idx_package_facts_file_id;
+    DROP INDEX IF EXISTS idx_import_facts_path;
+    DROP INDEX IF EXISTS idx_import_facts_file_id;
+    DROP INDEX IF EXISTS idx_type_alias_facts_alias;
+    DROP INDEX IF EXISTS idx_type_alias_facts_fingerprint;
+    DROP INDEX IF EXISTS idx_type_alias_facts_file_id;
+    DROP INDEX IF EXISTS idx_include_edges_src;
+    DROP INDEX IF EXISTS idx_record_facts_display_name;
+    DROP INDEX IF EXISTS idx_record_facts_tag_name;
+    DROP INDEX IF EXISTS idx_record_facts_typedef_name;
+    DROP INDEX IF EXISTS idx_record_facts_file_id;
+    DROP INDEX IF EXISTS idx_record_facts_record_key;
+    DROP INDEX IF EXISTS idx_member_facts_record_id;
+    DROP INDEX IF EXISTS idx_member_facts_record_key;
+    DROP INDEX IF EXISTS idx_member_facts_file_id;
+    DROP INDEX IF EXISTS idx_member_facts_name;
+    DROP INDEX IF EXISTS idx_member_facts_kind;
+    DROP INDEX IF EXISTS idx_include_facts_target_basename;
+    DROP INDEX IF EXISTS idx_include_facts_target_normalized;
+    DROP INDEX IF EXISTS idx_include_facts_file_id;
+";
+
+// Full builds defer query-facing B-trees, but generation publication still
+// performs scoped stale-revision cleanup. Keep the one narrow index explicitly
+// required by that maintenance query so publishing a freshly built database
+// cannot turn a successful build into cleanup debt.
+pub(crate) const CREATE_FULL_BUILD_MAINTENANCE_INDEXES_SQL: &str = "
+    CREATE INDEX IF NOT EXISTS idx_file_revisions_file_id ON file_revisions(file_id);
+";
+
 pub(crate) const CREATE_DEFERRED_LOOKUP_INDEXES_SQL: &str = "
     CREATE INDEX IF NOT EXISTS idx_fallback_completion_revision ON fallback_completion_facts(revision_id);
     CREATE INDEX IF NOT EXISTS idx_declaration_facts_revision ON declaration_facts(revision_id);

@@ -2,6 +2,7 @@ use super::*;
 use crate::reachability::ReachScope;
 use crate::resource::current_process_memory_bytes;
 use crate::semantic_model::SemanticFamily;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[test]
 #[ignore = "diagnostic large-workspace NameTable benchmark; set FOSSILSENSE_BENCH_DB"]
@@ -599,6 +600,165 @@ fn channel_recall_narrowing_matches_cold_scan() {
         .0;
 
     assert_eq!(narrowed, cold);
+}
+
+#[derive(Default)]
+struct CancelAfterFirstRecallBlock {
+    checks: AtomicUsize,
+}
+
+struct CancelOnRecallCheck {
+    checks: AtomicUsize,
+    cancel_on: usize,
+}
+
+impl CompletionQueryCancellation for CancelOnRecallCheck {
+    fn is_cancelled(&self) -> bool {
+        self.checks.fetch_add(1, Ordering::Relaxed) + 1 >= self.cancel_on
+    }
+}
+
+impl CompletionQueryCancellation for CancelAfterFirstRecallBlock {
+    fn is_cancelled(&self) -> bool {
+        self.checks.fetch_add(1, Ordering::Relaxed) > 0
+    }
+}
+
+#[test]
+fn production_completion_recall_reports_work_and_observes_cooperative_cancellation() {
+    let table = NameTable::build(
+        (0..10_000)
+            .map(|index| {
+                (
+                    i64::from(index),
+                    format!("completion_candidate_{index:05}"),
+                    false,
+                )
+            })
+            .collect(),
+    );
+    let quotas = CompletionRecallQuotas::default_for_completion_limit(100);
+
+    let (_, _, cold_metrics) =
+        table.search_completion_recall_pooled("completion", quotas, None, None);
+    assert_eq!(cold_metrics.entries_inspected, table.len());
+    assert!(!cold_metrics.cancelled);
+
+    let cancellation = CancelAfterFirstRecallBlock::default();
+    let (hits, pool, cancelled_metrics) =
+        table.search_completion_recall_pooled_controlled(CompletionRecallQuery {
+            query: "completion",
+            quotas,
+            scope: None,
+            active_project: None,
+            prior_pool: None,
+            semantic_family: None,
+            cancellation: Some(&cancellation),
+        });
+    assert!(cancelled_metrics.cancelled);
+    assert!(
+        cancelled_metrics.entries_inspected <= COMPLETION_CANCELLATION_CHECK_INTERVAL,
+        "cooperative cancellation must bound stale scan work"
+    );
+    assert!(hits.is_empty(), "partial stale results must not escape");
+    assert!(
+        pool.is_empty(),
+        "partial stale pools must not enter the memo"
+    );
+}
+
+#[test]
+fn production_completion_recall_checks_cancellation_during_post_scan_selection() {
+    let table = NameTable::build(
+        (0..10_000)
+            .map(|index| {
+                (
+                    i64::from(index),
+                    format!("completion_candidate_{index:05}"),
+                    false,
+                )
+            })
+            .collect(),
+    );
+    let quotas = CompletionRecallQuotas::default_for_completion_limit(100);
+    let scan_checks = table.len().div_ceil(COMPLETION_CANCELLATION_CHECK_INTERVAL) + 1;
+    let cancellation = CancelOnRecallCheck {
+        checks: AtomicUsize::new(0),
+        // Two outer phase checks and the controlled selector's entry check
+        // follow the scan. Flip after its first 256-entry selection block.
+        cancel_on: scan_checks + 4,
+    };
+
+    let (hits, pool, metrics) =
+        table.search_completion_recall_pooled_controlled(CompletionRecallQuery {
+            query: "completion",
+            quotas,
+            scope: None,
+            active_project: None,
+            prior_pool: None,
+            semantic_family: None,
+            cancellation: Some(&cancellation),
+        });
+
+    assert!(metrics.cancelled, "selection must observe stale requests");
+    assert!(hits.is_empty(), "post-scan cancellation must discard hits");
+    assert!(
+        pool.is_empty(),
+        "post-scan cancellation must discard memo pools"
+    );
+    assert!(
+        (1..=COMPLETION_CANCELLATION_CHECK_INTERVAL).contains(&metrics.selection_entries_inspected),
+        "stale selection work must be bounded to one cooperative block, got {}",
+        metrics.selection_entries_inspected
+    );
+    assert!(
+        metrics.cancellation_checks > scan_checks,
+        "selection phases need checkpoints after the final scan check"
+    );
+}
+
+#[test]
+fn production_completion_recall_counts_and_cancels_sparse_channel_filtering() {
+    let table = NameTable::build(
+        (0..10_000)
+            .map(|index| {
+                (
+                    i64::from(index),
+                    format!("completion_candidate_{index:05}"),
+                    false,
+                )
+            })
+            .collect(),
+    );
+    let quotas = CompletionRecallQuotas::default_for_completion_limit(100);
+    let scan_checks = table.len().div_ceil(COMPLETION_CANCELLATION_CHECK_INTERVAL) + 1;
+    let global_selection_checks = 1 + table.len().div_ceil(COMPLETION_CANCELLATION_CHECK_INTERVAL);
+    let cancellation = CancelOnRecallCheck {
+        checks: AtomicUsize::new(0),
+        // After scan, two outer checks, and the complete global reducer,
+        // cancel after the first source block of the empty Reachable channel.
+        cancel_on: scan_checks + 2 + global_selection_checks + 2,
+    };
+
+    let (hits, pool, metrics) =
+        table.search_completion_recall_pooled_controlled(CompletionRecallQuery {
+            query: "completion",
+            quotas,
+            scope: None,
+            active_project: None,
+            prior_pool: None,
+            semantic_family: None,
+            cancellation: Some(&cancellation),
+        });
+
+    assert!(metrics.cancelled);
+    assert!(hits.is_empty());
+    assert!(pool.is_empty());
+    assert_eq!(
+        metrics.selection_entries_inspected,
+        table.len() + COMPLETION_CANCELLATION_CHECK_INTERVAL,
+        "filtered-out source entries must still consume the cancellation budget"
+    );
 }
 
 #[test]
