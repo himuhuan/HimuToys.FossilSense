@@ -805,3 +805,29 @@ full-index 保持 13,244 files、654,890 declarations、91,919 callable anchors 
 同一已有显式数据库随后不带 `--force` 打开，13,244 个文件全部 skipped；engine 4,162 ms，其中 discover 787、check 52、include edge 2,767，parse/write/secondary-index/publication 都为 0。关闭后数据库为 363,302,912 bytes、88,697 pages、freelist 0，schema 28、semantic generation 2、13,244 file revisions 与 13,244 active revisions、pending revisions 0、staging builds 0、654,890 declarations、`cleanup_required=0`、`quick_check=ok`、foreign-key violations=0。这同时证明大型真实目标在 full-index 结束后已释放 sibling lock，普通重开没有退化为 full rebuild。
 
 边界保持明确：跨进程锁只约束遵守 FossilSense 协议的 writer，不能阻止直接绕过 sibling lock 修改 SQLite/manifest 的外部程序；Windows 文件系统拒绝删除失败产物时，Drop 回收仍只能 best-effort，但旧发布状态保持安全。显式 `--db --force` 在进程被强杀时仍可能留下唯一命名的 `.fossilsense-index-build-*` staging；自动删除任意用户指定目录中的此类文件缺少可证明的 durable ownership，当前不以文件名猜测所有权。该残余风险是磁盘累积而非半发布或旧库损坏，后续若处理应先引入严格 claim/owner 协议，不能直接扩大启动清理范围。
+
+### 阶段 4K：恢复 indexer 测试的 SQLite 架构边界（已完成）
+
+状态：架构 RED、最小测试重构、完整 Rust 门禁、architecture fitness/golden 门禁和独立 reviewer 均已通过；production 源码与二进制行为未改变。
+
+Stage 4J 提交后的附加架构扫描发现当前 HEAD 有一项历史失败：`indexer/tests/basic.rs` 从阶段 4G 的显式 side-by-side 发布测试开始直接导入 `rusqlite::Connection`。三处 SQL 分别安装拒绝旧 revision cleanup 的 trigger、检查替换库没有继承 trigger 且只含一代 revision，以及以 `BEGIN IMMEDIATE` 持有未提交 WAL writer。场景本身是有效的 indexer 端到端故障注入，但连接、SQL schema 知识和事务操纵越过了 store/persistence 边界。`scripts/verify_architecture_fitness.ps1` 因此稳定报告 `sqlite-boundary` ERROR、`fail=1 / warn=14`；该失败从提交 `0737008` 起存在，不是 Stage 4J 产品实现引入。
+
+现有 architecture golden 的 `forbidden_dependency` fixture 已证明非 store 模块出现 `rusqlite` 必须失败，因此该真实仓库门禁就是本阶段的 RED，不增加 allowlist或削弱规则。修复保留两个 indexer 端到端测试及其全部产品断言，只新增严格 `#[cfg(test)] pub(crate) store::test_support`：
+
+- `install_old_revision_cleanup_guard(path)` 封装固定 trigger 安装，函数返回时关闭连接；
+- `inspect_explicit_replacement(path)` 只返回精确 trigger count 与 revision count，不暴露 query 或连接；
+- `hold_external_wal_writer(path)` 返回不透明 `ExternalWalWriter`，内部仍按原测试启用 WAL、执行 `BEGIN IMMEDIATE` 并创建未提交表；`release(self)` 只允许固定 `ROLLBACK`，提前 panic 时连接 Drop 同样回滚。
+
+接口不接受任意 SQL、不返回 `rusqlite` 类型、不暴露 execute/query 方法；`test_support.rs` 只由 `#[cfg(test)]` 模块声明引用，非测试构建不会解析或编译其中的连接、SQL 和 helper。架构规则、golden fixture 与 allowlist 均未修改，因此 PASS 来自依赖真正回到 persistence 边界，而不是文本规避。独立 reviewer 逐项核对 trigger SQL、参数化精确名称检查、WAL writer 生命周期和原端到端断言，未发现 finding。
+
+独立 test-executor 的最终结果：
+
+| 命令/门禁 | 结果 |
+|---|---|
+| `cargo fmt --all -- --check` | PASS，2.088 s |
+| `cargo test -p fossilsense` | PASS，unit 1032 passed / 6 ignored，CLI 1 passed，LSP 2 passed；0 failed |
+| `cargo clippy -p fossilsense --all-targets -- -D warnings` | PASS，1.238 s |
+| `scripts/verify_architecture_fitness.ps1` | PASS，fail 0 / warn 14 / allowlisted 0 |
+| `node scripts/test_architecture_fitness.js` | PASS，golden 8/8 |
+
+14 项 warning 全部是既有超过 800 行的 production source 提示；本阶段新增的 `store/test_support.rs` 只有场景化测试 helper，没有新增大文件或 warning。因为当前提交对 production build 的有效 token stream 为零变化，没有重复运行 U-Boot full-index/hydration；Stage 4J 的 release 二进制与 `large-workspace-20260731_100103` 数据仍精确对应当前 production 源码。后续最终全仓门禁必须继续保持 architecture fail=0，不能把这次修复降格为 allowlist。

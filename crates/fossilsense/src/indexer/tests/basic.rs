@@ -1,5 +1,7 @@
 use super::*;
-use rusqlite::Connection;
+use crate::store::test_support::{
+    hold_external_wal_writer, inspect_explicit_replacement, install_old_revision_cleanup_guard,
+};
 
 #[test]
 fn indexes_mini_workspace_and_skips_unchanged_files() {
@@ -303,17 +305,7 @@ fn explicit_force_rebuild_publishes_a_fresh_database_without_old_cleanup_debt() 
     .expect("first explicit build");
     assert_eq!(first.semantic_generation, 1);
 
-    let connection = Connection::open(&db).expect("open explicit database");
-    connection
-        .execute_batch(
-            "CREATE TRIGGER reject_old_revision_cleanup
-             BEFORE DELETE ON file_revisions
-             BEGIN
-                 SELECT RAISE(ABORT, 'old database cleanup must not run');
-             END;",
-        )
-        .expect("install old-database cleanup guard");
-    drop(connection);
+    install_old_revision_cleanup_guard(&db).expect("install old-database cleanup guard");
 
     fs::write(&source, "int second_generation(void) { return 2; }\n").expect("second source");
     let second = index_workspace(
@@ -346,22 +338,13 @@ fn explicit_force_rebuild_publishes_a_fresh_database_without_old_cleanup_debt() 
     );
     drop(store);
 
-    let connection = Connection::open(&db).expect("inspect replaced database");
-    let trigger_count: i64 = connection
-        .query_row(
-            "SELECT COUNT(*)
-             FROM sqlite_schema
-             WHERE type = 'trigger' AND name = 'reject_old_revision_cleanup'",
-            [],
-            |row| row.get(0),
-        )
-        .expect("count inherited triggers");
-    let revision_count: i64 = connection
-        .query_row("SELECT COUNT(*) FROM file_revisions", [], |row| row.get(0))
-        .expect("count revisions");
-    assert_eq!(trigger_count, 0, "the old schema must not be copied");
+    let replacement = inspect_explicit_replacement(&db).expect("inspect replaced database");
     assert_eq!(
-        revision_count, 1,
+        replacement.trigger_count, 0,
+        "the old schema must not be copied"
+    );
+    assert_eq!(
+        replacement.revision_count, 1,
         "the replacement must contain only the published generation"
     );
 }
@@ -383,16 +366,7 @@ fn explicit_force_rebuild_preserves_old_database_when_wal_cannot_be_drained() {
     )
     .expect("first explicit build");
 
-    let blocker = Connection::open(&db).expect("blocking connection");
-    blocker
-        .pragma_update(None, "journal_mode", "WAL")
-        .expect("WAL mode");
-    blocker
-        .execute_batch(
-            "BEGIN IMMEDIATE;
-             CREATE TABLE unpublished_external_write (value INTEGER);",
-        )
-        .expect("hold external WAL writer");
+    let blocker = hold_external_wal_writer(&db).expect("hold external WAL writer");
     fs::write(&source, "int second_generation(void) { return 2; }\n").expect("second source");
 
     let error = index_workspace(
@@ -409,10 +383,7 @@ fn explicit_force_rebuild_preserves_old_database_when_wal_cannot_be_drained() {
         error.to_string().contains("locked") || error.to_string().contains("journal"),
         "unexpected WAL drain error: {error:#}"
     );
-    blocker
-        .execute_batch("ROLLBACK")
-        .expect("release external writer");
-    drop(blocker);
+    blocker.release().expect("release external writer");
 
     let store = IndexStore::open_readonly(&db).expect("preserved old database");
     assert_eq!(store.semantic_generation().expect("old generation"), 1);
