@@ -30,6 +30,7 @@ use rayon::prelude::*;
 use crate::config::{LanguageResolver, SourceLanguage, WorkspaceConfig};
 use crate::parser::{self, SyntacticRole};
 use crate::pathing;
+use crate::semantic_model::SemanticFamily;
 
 /// Per-phase timing for a references search.
 #[derive(Debug, Clone, Default)]
@@ -186,7 +187,8 @@ impl ReferenceRoleCache {
     }
 }
 
-/// Cache for complete text-search results keyed by `(root, identifier)`.
+/// Cache for complete text-search results keyed by workspace generation,
+/// identifier, and optional semantic-family boundary.
 ///
 /// This is separate from [`ReferenceRoleCache`]: the role cache prevents
 /// re-parsing matched files, while this result cache prevents a repeated
@@ -200,6 +202,7 @@ pub struct ReferenceSearchCache {
 struct SearchCacheInner {
     entries: HashMap<SearchCacheKey, SearchCacheEntry>,
     order: VecDeque<SearchCacheKey>,
+    epoch: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -207,6 +210,8 @@ struct SearchCacheKey {
     root: String,
     identifier: String,
     generation: u64,
+    semantic_family: Option<SemanticFamily>,
+    cache_epoch: u64,
 }
 
 #[derive(Clone)]
@@ -226,6 +231,14 @@ impl ReferenceSearchCache {
         };
         inner.entries.clear();
         inner.order.clear();
+        inner.epoch = inner.epoch.wrapping_add(1);
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.inner
+            .lock()
+            .map(|inner| inner.epoch)
+            .unwrap_or_default()
     }
 
     #[cfg(test)]
@@ -238,14 +251,18 @@ impl ReferenceSearchCache {
 
     #[cfg(test)]
     pub fn put_empty_for_test(&self, root: &str, identifier: &str, generation: u64) {
-        self.put(
+        let epoch = self.epoch();
+        let _ = self.put_if_epoch(
             SearchCacheKey {
                 root: root.to_string(),
                 identifier: identifier.to_string(),
                 generation,
+                semantic_family: None,
+                cache_epoch: epoch,
             },
             Vec::new(),
             false,
+            epoch,
         );
     }
 
@@ -257,10 +274,19 @@ impl ReferenceSearchCache {
             .map(|entry| ((*entry.hits).clone(), entry.truncated))
     }
 
-    fn put(&self, key: SearchCacheKey, hits: Vec<ReferenceHit>, truncated: bool) {
+    fn put_if_epoch(
+        &self,
+        key: SearchCacheKey,
+        hits: Vec<ReferenceHit>,
+        truncated: bool,
+        expected_epoch: u64,
+    ) -> bool {
         let Ok(mut inner) = self.inner.lock() else {
-            return;
+            return false;
         };
+        if inner.epoch != expected_epoch {
+            return false;
+        }
         if !inner.entries.contains_key(&key) {
             inner.order.push_back(key.clone());
         }
@@ -279,6 +305,7 @@ impl ReferenceSearchCache {
                 None => break,
             }
         }
+        true
     }
 }
 
@@ -339,10 +366,13 @@ pub fn search_references_with_result_cache_and_files(
             root.as_ref().display()
         )
     })?;
+    let cache_epoch = search_cache.epoch();
     let key = SearchCacheKey {
         root: pathing::normalize_abs_path(&root),
         identifier: identifier.to_string(),
         generation,
+        semantic_family: None,
+        cache_epoch,
     };
     if let Some(cached) = search_cache.get(&key) {
         return Ok((
@@ -356,7 +386,7 @@ pub fn search_references_with_result_cache_and_files(
     }
     let (hits, truncated, timing) =
         search_references_inner(&root, identifier, Some(role_cache), indexed_files)?;
-    search_cache.put(key, hits.clone(), truncated);
+    let _ = search_cache.put_if_epoch(key, hits.clone(), truncated, cache_epoch);
     Ok((hits, truncated, timing))
 }
 
@@ -366,7 +396,14 @@ fn search_references_inner(
     cache: Option<&ReferenceRoleCache>,
     indexed_files: Option<Vec<(String, PathBuf)>>,
 ) -> Result<(Vec<ReferenceHit>, bool, ReferencesTiming)> {
-    search_references_inner_borrowed(root, identifier, cache, indexed_files.as_deref())
+    search_references_inner_borrowed(
+        root,
+        identifier,
+        cache,
+        indexed_files.as_deref(),
+        None,
+        None,
+    )
 }
 
 fn search_references_inner_borrowed(
@@ -374,6 +411,8 @@ fn search_references_inner_borrowed(
     identifier: &str,
     cache: Option<&ReferenceRoleCache>,
     indexed_files: Option<&[(String, PathBuf)]>,
+    semantic_family: Option<SemanticFamily>,
+    config_snapshot: Option<(&WorkspaceConfig, &LanguageResolver)>,
 ) -> Result<(Vec<ReferenceHit>, bool, ReferencesTiming)> {
     let root = root.as_ref().canonicalize().with_context(|| {
         format!(
@@ -391,14 +430,21 @@ fn search_references_inner_borrowed(
     let matcher = RegexMatcher::new(&pattern)
         .with_context(|| format!("failed to compile reference pattern {pattern}"))?;
 
-    let (config, _config_issue) = WorkspaceConfig::load(&root);
-    let language_resolver = LanguageResolver::from_workspace_config(&root, &config);
+    let loaded_snapshot = config_snapshot.is_none().then(|| {
+        let config = WorkspaceConfig::load(&root).0;
+        let resolver = LanguageResolver::from_workspace_config(&root, &config);
+        (config, resolver)
+    });
+    let (config, language_resolver) = config_snapshot.unwrap_or_else(|| {
+        let (config, resolver) = loaded_snapshot.as_ref().expect("loaded config snapshot");
+        (config, resolver)
+    });
     let discover_started = Instant::now();
     let discovered;
     let candidates = match indexed_files {
         Some(files) if !files.is_empty() => files,
         _ => {
-            discovered = discover_reference_files(&root, &config);
+            discovered = discover_reference_files(&root, config);
             &discovered
         }
     };
@@ -414,6 +460,11 @@ fn search_references_inner_borrowed(
     for candidate_chunk in candidates.chunks(REFERENCE_SEARCH_CHUNK) {
         let file_results: Result<Vec<_>> = candidate_chunk
             .par_iter()
+            .filter(|(_, path)| {
+                semantic_family.is_none_or(|family| {
+                    language_resolver.language_for_path(path).semantic_family() == family
+                })
+            })
             .map(|(rel_path, path)| {
                 let mut file_hits = Vec::new();
                 let search_started = Instant::now();
@@ -467,13 +518,48 @@ fn search_references_inner_borrowed(
     Ok((hits, truncated, timing))
 }
 
-pub fn search_references_with_shared_files(
+/// Server reference search constrained to the requesting document's semantic
+/// family. The family is part of the complete-result cache identity, so a
+/// same-name C request cannot reuse Go hits (or vice versa).
+#[allow(clippy::too_many_arguments)]
+pub fn search_references_with_shared_files_for_family(
     root: impl AsRef<Path>,
     identifier: &str,
     role_cache: &ReferenceRoleCache,
     search_cache: &ReferenceSearchCache,
     generation: u64,
     indexed_files: Option<Arc<Vec<(String, PathBuf)>>>,
+    semantic_family: SemanticFamily,
+    cache_epoch: u64,
+    workspace_config: WorkspaceConfig,
+    language_resolver: LanguageResolver,
+) -> Result<(Vec<ReferenceHit>, bool, ReferencesTiming)> {
+    search_references_with_shared_files_filtered(
+        root,
+        identifier,
+        role_cache,
+        search_cache,
+        generation,
+        indexed_files,
+        Some(semantic_family),
+        cache_epoch,
+        workspace_config,
+        language_resolver,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn search_references_with_shared_files_filtered(
+    root: impl AsRef<Path>,
+    identifier: &str,
+    role_cache: &ReferenceRoleCache,
+    search_cache: &ReferenceSearchCache,
+    generation: u64,
+    indexed_files: Option<Arc<Vec<(String, PathBuf)>>>,
+    semantic_family: Option<SemanticFamily>,
+    cache_epoch: u64,
+    workspace_config: WorkspaceConfig,
+    language_resolver: LanguageResolver,
 ) -> Result<(Vec<ReferenceHit>, bool, ReferencesTiming)> {
     let root = root.as_ref().canonicalize().with_context(|| {
         format!(
@@ -485,6 +571,8 @@ pub fn search_references_with_shared_files(
         root: pathing::normalize_abs_path(&root),
         identifier: identifier.to_string(),
         generation,
+        semantic_family,
+        cache_epoch,
     };
     if let Some(cached) = search_cache.get(&key) {
         return Ok((
@@ -501,8 +589,10 @@ pub fn search_references_with_shared_files(
         identifier,
         Some(role_cache),
         indexed_files.as_deref().map(Vec::as_slice),
+        semantic_family,
+        Some((&workspace_config, &language_resolver)),
     )?;
-    search_cache.put(key, hits.clone(), truncated);
+    let _ = search_cache.put_if_epoch(key, hits.clone(), truncated, cache_epoch);
     Ok((hits, truncated, timing))
 }
 

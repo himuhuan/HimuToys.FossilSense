@@ -625,6 +625,11 @@ impl RelationQueryIndex {
         let call_path = self.strings.get(call.path);
         for candidate_id in keys {
             let candidate = self.entity_by_id(*candidate_id);
+            if call.form != CallForm::QualifiedName
+                && candidate.owner_kind == Some(OwnerKindHint::Record)
+            {
+                continue;
+            }
             let mut evidence = EvidenceBits::default();
             if let Some(qualified) = call
                 .qualified_name
@@ -729,7 +734,6 @@ fn relation_order(
 
 fn eligible_free_function(entity: &CallableEntity) -> bool {
     entity.kind == CallableKind::Function
-        && entity.owner_kind != Some(OwnerKindHint::Record)
         && !(entity.owner.is_some() && entity.owner_kind == Some(OwnerKindHint::Unknown))
 }
 

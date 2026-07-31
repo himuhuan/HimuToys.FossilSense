@@ -190,6 +190,7 @@ impl<'a> MemberStoreView<'a> {
         self.resolve_record_candidates_inner(names, ctx, &mut visited)
     }
 
+    #[cfg(test)]
     pub fn record_rows_by_name_limited(
         &self,
         name: &str,
@@ -198,6 +199,31 @@ impl<'a> MemberStoreView<'a> {
         let sql = format!(
             "{RECORD_READ_SELECT}
              WHERE r.display_name = ?1 OR r.tag_name = ?1 OR r.typedef_name = ?1
+             ORDER BY f.path, r.start_byte, r.id
+             LIMIT ?2"
+        );
+        let mut stmt = self.store.conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            rusqlite::params![name, limit.saturating_add(1) as i64],
+            record_read_row,
+        )?;
+        let mut output = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let truncated = output.len() > limit;
+        output.truncate(limit);
+        Ok((output, truncated))
+    }
+
+    pub fn record_rows_by_name_family_limited(
+        &self,
+        name: &str,
+        semantic_family: crate::semantic_model::SemanticFamily,
+        limit: usize,
+    ) -> Result<(Vec<RecordReadRow>, bool)> {
+        let language = semantic_family_sql_predicate(semantic_family, "rev.language");
+        let sql = format!(
+            "{RECORD_READ_SELECT}
+             WHERE (r.display_name = ?1 OR r.tag_name = ?1 OR r.typedef_name = ?1)
+               AND {language}
              ORDER BY f.path, r.start_byte, r.id
              LIMIT ?2"
         );
@@ -224,6 +250,7 @@ impl<'a> MemberStoreView<'a> {
             .map_err(Into::into)
     }
 
+    #[cfg(test)]
     pub fn alias_rows_by_name_limited(
         &self,
         name: &str,
@@ -232,6 +259,30 @@ impl<'a> MemberStoreView<'a> {
         let sql = format!(
             "{ALIAS_READ_SELECT}
              WHERE a.alias = ?1
+             ORDER BY f.path, a.start_byte, a.id
+             LIMIT ?2"
+        );
+        let mut stmt = self.store.conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            rusqlite::params![name, limit.saturating_add(1) as i64],
+            type_alias_read_row,
+        )?;
+        let mut output = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let truncated = output.len() > limit;
+        output.truncate(limit);
+        Ok((output, truncated))
+    }
+
+    pub fn alias_rows_by_name_family_limited(
+        &self,
+        name: &str,
+        semantic_family: crate::semantic_model::SemanticFamily,
+        limit: usize,
+    ) -> Result<(Vec<TypeAliasReadRow>, bool)> {
+        let language = semantic_family_sql_predicate(semantic_family, "rev.language");
+        let sql = format!(
+            "{ALIAS_READ_SELECT}
+             WHERE a.alias = ?1 AND {language}
              ORDER BY f.path, a.start_byte, a.id
              LIMIT ?2"
         );
@@ -281,13 +332,26 @@ impl<'a> MemberStoreView<'a> {
         }
         let placeholders = vec!["?"; record_ids.len()].join(",");
         let mut sql = format!(
-            "SELECT m.id, m.name, m.kind, m.signature, m.confidence, m.type_name, f.path, f.source, f.directly_included, rev.hash, m.start_byte, m.end_byte, m.start_line, m.start_col, m.end_line, m.end_col \
+            "WITH requested_records AS (
+                 SELECT id, record_key
+                 FROM record_defs
+                 WHERE id IN ({placeholders})
+             )
+             SELECT m.id, m.name, m.kind, m.signature, m.confidence, m.type_name, f.path, f.source, f.directly_included, rev.hash, m.start_byte, m.end_byte, m.start_line, m.start_col, m.end_line, m.end_col \
              FROM members m \
-             JOIN record_defs r ON r.id = m.record_id \
-             JOIN files f ON f.id = r.file_id \
-             JOIN active_file_revisions active ON active.file_id = f.id \
-             JOIN file_revisions rev ON rev.id = active.revision_id \
-             WHERE m.record_id IN ({placeholders})"
+             JOIN files f ON f.id = m.file_id \
+             JOIN file_revisions rev ON rev.id = m.revision_id \
+             WHERE (
+                 (m.record_id IS NOT NULL AND EXISTS (
+                     SELECT 1 FROM requested_records requested
+                     WHERE requested.id = m.record_id
+                 ))
+                 OR
+                 (m.record_id IS NULL AND EXISTS (
+                     SELECT 1 FROM requested_records requested
+                     WHERE requested.record_key = m.record_key
+                 ))
+             )"
         );
         let mut params: Vec<Value> = record_ids.iter().copied().map(Value::Integer).collect();
         if let Some(prefix) = prefix {
@@ -334,21 +398,44 @@ impl<'a> MemberStoreView<'a> {
         limit: usize,
         ctx: Option<&ResolveContext<'_>>,
     ) -> Result<(Vec<MemberCandidate>, bool)> {
+        self.fallback_member_candidates_filtered_limited(prefix, limit, ctx, None)
+    }
+
+    pub fn fallback_member_candidates_family_limited(
+        &self,
+        prefix: &str,
+        limit: usize,
+        ctx: Option<&ResolveContext<'_>>,
+        semantic_family: crate::semantic_model::SemanticFamily,
+    ) -> Result<(Vec<MemberCandidate>, bool)> {
+        self.fallback_member_candidates_filtered_limited(prefix, limit, ctx, Some(semantic_family))
+    }
+
+    fn fallback_member_candidates_filtered_limited(
+        &self,
+        prefix: &str,
+        limit: usize,
+        ctx: Option<&ResolveContext<'_>>,
+        semantic_family: Option<crate::semantic_model::SemanticFamily>,
+    ) -> Result<(Vec<MemberCandidate>, bool)> {
         if limit == 0 {
             return Ok((Vec::new(), false));
         }
         let pattern = format!("{}%", prefix.replace('%', "\\%").replace('_', "\\_"));
-        let mut stmt = self.store.conn.prepare(
+        let language = semantic_family.map_or_else(
+            || "1 = 1".to_string(),
+            |family| semantic_family_sql_predicate(family, "rev.language"),
+        );
+        let sql = format!(
             "SELECT m.id, m.name, m.kind, m.signature, m.confidence, m.type_name, f.path, f.source, f.directly_included, rev.hash, m.start_byte, m.end_byte, m.start_line, m.start_col, m.end_line, m.end_col \
              FROM members m \
-             JOIN record_defs r ON r.id = m.record_id \
-             JOIN files f ON f.id = r.file_id \
-             JOIN active_file_revisions active ON active.file_id = f.id \
-             JOIN file_revisions rev ON rev.id = active.revision_id \
-             WHERE m.name LIKE ?1 ESCAPE '\\' COLLATE NOCASE \
+             JOIN files f ON f.id = m.file_id \
+             JOIN file_revisions rev ON rev.id = m.revision_id \
+             WHERE m.name LIKE ?1 ESCAPE '\\' COLLATE NOCASE AND {language} \
              ORDER BY lower(m.name), m.name, f.path, m.kind, m.signature, m.id \
-             LIMIT ?2",
-        )?;
+             LIMIT ?2"
+        );
+        let mut stmt = self.store.conn.prepare(&sql)?;
         let rows = stmt.query_map(
             rusqlite::params![
                 pattern,
@@ -419,8 +506,7 @@ impl<'a> MemberStoreView<'a> {
         let mut stmt = self.store.conn.prepare(
             "SELECT m.name, f.path, f.source, f.directly_included \
              FROM members m \
-             JOIN record_defs r ON r.id = m.record_id \
-             JOIN files f ON f.id = r.file_id \
+             JOIN files f ON f.id = m.file_id \
              WHERE m.kind = 'field' AND m.name LIKE ?1 ESCAPE '\\' COLLATE NOCASE",
         )?;
         let rows = stmt.query_map([pattern], |row| {
@@ -601,11 +687,22 @@ impl<'a> MemberStoreView<'a> {
     }
 }
 
+fn semantic_family_sql_predicate(
+    semantic_family: crate::semantic_model::SemanticFamily,
+    column: &str,
+) -> String {
+    match semantic_family {
+        crate::semantic_model::SemanticFamily::CFamily => format!("{column} <> 3"),
+        crate::semantic_model::SemanticFamily::Go => format!("{column} = 3"),
+    }
+}
+
 fn record_read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RecordReadRow> {
     let kind_str: String = row.get(4)?;
     let kind = match kind_str.as_str() {
         "union" => crate::semantic_model::RecordKind::Union,
         "class" => crate::semantic_model::RecordKind::Class,
+        "interface" => crate::semantic_model::RecordKind::Interface,
         _ => crate::semantic_model::RecordKind::Struct,
     };
     let source_str: String = row.get(6)?;

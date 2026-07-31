@@ -43,6 +43,11 @@ impl Backend {
             .unwrap_or_default();
         let total_started = std::time::Instant::now();
         let context = self.request_context_for_root(root.clone()).await;
+        let semantic_family = context
+            .engine
+            .workspace_semantics
+            .language_for_uri(&uri)
+            .semantic_family();
         let reach_started = std::time::Instant::now();
         let reach_scope = self
             .reach_scope_from_context(&uri, &context)
@@ -59,6 +64,7 @@ impl Backend {
                 semantic_generation,
                 reach_graph.as_deref(),
                 context.engine.indexed_files.as_deref().map(Vec::as_slice),
+                context.engine.workspace_semantics.clone(),
                 documents,
             )
             .await;
@@ -129,13 +135,14 @@ impl Backend {
         let result = tokio::task::spawn_blocking(
             move || -> Result<(Vec<SignatureInformation>, usize, SemanticRequestPerf)> {
                 let query_started = std::time::Instant::now();
-                let service = CandidateQueryService::new_with_declarations(
+                let service = CandidateQueryService::new_with_declarations_for_family(
                     call_read_handle.as_deref(),
                     declaration_index.as_deref(),
                     &overlay,
                     &current_rel,
                     reach_scope.as_deref(),
                     reach_graph.as_deref(),
+                    semantic_family,
                 );
                 let semantic_set = service.semantic_candidates(
                     &call_name,
@@ -203,6 +210,7 @@ impl Backend {
                         &ranked,
                         active_argument,
                         comment.as_ref(),
+                        candidate.anchor.signature.variadic,
                         candidates.arity_mismatch_fallback,
                     ));
                 }
@@ -255,13 +263,14 @@ pub(super) fn signature_information_for(
     ranked: &query::RankedSignatureCandidate,
     active_argument: u32,
 ) -> SignatureInformation {
-    signature_information_for_with_comment(ranked, active_argument, None, false)
+    signature_information_for_with_comment(ranked, active_argument, None, false, false)
 }
 
 fn signature_information_for_with_comment(
     ranked: &query::RankedSignatureCandidate,
     active_argument: u32,
     comment: Option<&query::RenderedSymbolComment>,
+    variadic: bool,
     arity_mismatch_fallback: bool,
 ) -> SignatureInformation {
     let parts: query::SignatureParts = if ranked.candidate.name.is_empty() {
@@ -282,11 +291,14 @@ fn signature_information_for_with_comment(
             }),
         })
         .collect();
-    let active_parameter = if parameters.is_empty() || active_argument as usize >= parameters.len()
-    {
+    let active_parameter = if parameters.is_empty() {
         None
-    } else {
+    } else if (active_argument as usize) < parameters.len() {
         Some(active_argument)
+    } else if variadic {
+        Some((parameters.len() - 1) as u32)
+    } else {
+        None
     };
     SignatureInformation {
         label: parts.label,
@@ -461,6 +473,7 @@ mod tests {
             0,
             Some(&comment),
             false,
+            false,
         );
         let documentation = match info.documentation.expect("documentation") {
             Documentation::String(value) => value,
@@ -485,6 +498,21 @@ mod tests {
         let info = signature_information_for(
             &candidate("int foo(int a)", crate::model::ScopeTier::Global),
             3,
+        );
+        assert_eq!(info.active_parameter, None);
+    }
+
+    #[test]
+    fn nested_function_pointer_ellipsis_does_not_make_the_outer_function_variadic() {
+        let info = signature_information_for_with_comment(
+            &candidate(
+                "void install(void (*callback)(int, ...))",
+                crate::model::ScopeTier::Reachable,
+            ),
+            1,
+            None,
+            false,
+            false,
         );
         assert_eq!(info.active_parameter, None);
     }

@@ -45,12 +45,14 @@ impl Backend {
         let Some(root) = self.root_for_uri(&uri).await else {
             return Ok(None);
         };
+        let context = self.request_context_for_root(root.clone()).await;
         let current_abs = uri_to_path(&uri);
         let current_rel = current_abs
             .as_deref()
             .and_then(|path| pathing::relative_slash_path(&root, path).ok())
             .unwrap_or_default();
-        let source_language = self.source_language_for_uri(&uri).await;
+        let source_language = context.engine.workspace_semantics.language_for_uri(&uri);
+        let semantic_family = source_language.semantic_family();
         let cursor_byte =
             query::byte_offset_at(&text, position.position.line, position.position.character);
 
@@ -106,12 +108,13 @@ impl Backend {
         ) {
             if let Some(current_abs) = current_abs.as_deref() {
                 if let Some(parsed) = self
-                    .get_or_parse_document(
+                    .get_or_parse_document_with_language(
                         &uri,
                         current_abs,
                         version,
                         &text,
                         crate::parser::ParseFacts::LOCAL_DECLS,
+                        source_language,
                     )
                     .await
                 {
@@ -133,7 +136,6 @@ impl Backend {
             }
         }
 
-        let context = self.request_context_for_root(root.clone()).await;
         let reach_started = std::time::Instant::now();
         let reach_scope = self
             .reach_scope_from_context(&uri, &context)
@@ -151,6 +153,7 @@ impl Backend {
                 semantic_generation,
                 reach_graph.as_deref(),
                 context.engine.indexed_files.as_deref().map(Vec::as_slice),
+                context.engine.workspace_semantics.clone(),
                 documents,
             )
             .await;
@@ -164,13 +167,14 @@ impl Backend {
         let result = tokio::task::spawn_blocking(
             move || -> Result<(Option<String>, SemanticRequestPerf)> {
                 let query_started = std::time::Instant::now();
-                let service = CandidateQueryService::new_with_declarations(
+                let service = CandidateQueryService::new_with_declarations_for_family(
                     call_read_handle.as_deref(),
                     declaration_index.as_deref(),
                     &overlay,
                     &current_rel,
                     reach_scope.as_deref(),
                     reach_graph.as_deref(),
+                    semantic_family,
                 );
                 let call_context = service.complete_call_context_at(source_position)?;
                 let is_call_site = call_context.is_some();
@@ -387,6 +391,8 @@ fn local_binding_hover_markdown(
     let binding_kind = match binding.kind {
         crate::parser::LocalBindingKind::Parameter => "parameter",
         crate::parser::LocalBindingKind::LocalVariable => "local variable",
+        crate::parser::LocalBindingKind::LocalConstant => "local constant",
+        crate::parser::LocalBindingKind::LocalType => "local type",
     };
     let type_note = binding
         .type_text
@@ -611,6 +617,7 @@ fn record_hover_section(
         crate::semantic_model::RecordKind::Struct => "struct",
         crate::semantic_model::RecordKind::Union => "union",
         crate::semantic_model::RecordKind::Class => "class",
+        crate::semantic_model::RecordKind::Interface => "interface",
     };
     let mut section = format!("### {kind} `{}`\n\n", record.display_name);
     if let Some(comment) = type_candidate_comment(

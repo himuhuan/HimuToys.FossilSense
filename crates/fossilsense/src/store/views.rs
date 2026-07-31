@@ -5,7 +5,9 @@ use crate::reachability::OpenReason;
 
 mod call_facts;
 mod declarations;
+mod go_package_graph;
 mod member;
+mod package_imports;
 
 #[allow(unused_imports)]
 pub use call_facts::{CallCoverageRow, CallFactStoreView, CallSiteRow, CallableAnchorRow};
@@ -14,7 +16,14 @@ pub use declarations::{
     DeclarationNameRef, DeclarationNameRow, DeclarationReadRow, DeclarationStoreView,
 };
 #[allow(unused_imports)]
+pub use go_package_graph::{
+    GoImportablePackageRow, GoOpenPackageRow, GoPackageEdgeRow, GoPackageFileRow,
+    GoPackageGraphStoreView, GoPackageResolution,
+};
+#[allow(unused_imports)]
 pub use member::{MemberReadRow, MemberStoreView, RecordReadRow, TypeAliasReadRow};
+#[allow(unused_imports)]
+pub use package_imports::{ImportReadRow, PackageImportStoreView, PackageReadRow};
 
 use super::IndexStore;
 
@@ -83,6 +92,7 @@ pub struct FallbackCompletionRow {
     pub end_line: u32,
     pub end_col: u32,
     pub detail: Option<String>,
+    pub semantic_family: crate::semantic_model::SemanticFamily,
 }
 
 pub struct FallbackCompletionStoreView<'a> {
@@ -97,9 +107,11 @@ impl<'a> FallbackCompletionStoreView<'a> {
     pub fn all(&self) -> Result<Vec<FallbackCompletionRow>> {
         let mut stmt = self.store.conn.prepare(
             "SELECT c.id, c.name, c.kind_hint, f.path, c.start_byte, c.end_byte,
-                    c.start_line, c.start_col, c.end_line, c.end_col, c.detail
+                    c.start_line, c.start_col, c.end_line, c.end_col, c.detail,
+                    rev.language
              FROM fallback_completions c
              JOIN files f ON f.id = c.file_id
+             JOIN file_revisions rev ON rev.id = c.revision_id
              ORDER BY lower(c.name), c.name, f.path, c.start_byte, c.id",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -115,9 +127,20 @@ impl<'a> FallbackCompletionStoreView<'a> {
                 end_line: row.get::<_, i64>(8)? as u32,
                 end_col: row.get::<_, i64>(9)? as u32,
                 detail: row.get(10)?,
+                semantic_family: semantic_family_from_language_code(row.get(11)?)?,
             })
         })?;
         collect_rows(rows)
+    }
+}
+
+fn semantic_family_from_language_code(
+    value: i64,
+) -> rusqlite::Result<crate::semantic_model::SemanticFamily> {
+    match value {
+        0..=2 => Ok(crate::semantic_model::SemanticFamily::CFamily),
+        3 => Ok(crate::semantic_model::SemanticFamily::Go),
+        _ => Err(rusqlite::Error::IntegralValueOutOfRange(11, value)),
     }
 }
 

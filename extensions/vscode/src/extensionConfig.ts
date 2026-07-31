@@ -4,17 +4,16 @@ import { Trace } from 'vscode-languageclient/node';
 import {
   normalizeBoolean,
   normalizeCompletionPrefixRanking,
+  normalizeExternalPathList,
   normalizeIncludeScopingMode,
   normalizeOnOffAuto,
   normalizeProjectContextMode,
 } from './config';
 import { resolveServerPathFromCandidates } from './serverPath';
-
-const CONFLICT_EXTENSIONS = [
-  { id: 'llvm-vs-code-extensions.vscode-clangd', name: 'clangd' },
-  { id: 'ms-vscode.cpptools', name: 'Microsoft C/C++' },
-  { id: 'ccls-project.ccls', name: 'ccls' },
-];
+import {
+  activeLanguageProviderNames,
+  CONFLICT_LANGUAGE_SERVER_EXTENSIONS,
+} from './conflicts';
 
 export function resolveServerPath(context: vscode.ExtensionContext): string | undefined {
   const configured = vscode.workspace
@@ -30,11 +29,15 @@ export function resolveServerPath(context: vscode.ExtensionContext): string | un
 }
 
 export function includePathsFromConfig(): string[] {
-  return vscode.workspace
-    .getConfiguration('fossilsense')
-    .get<string[]>('includePaths', [])
-    .map((entry) => entry.trim())
-    .filter((entry) => entry.length > 0);
+  return normalizeExternalPathList(
+    vscode.workspace.getConfiguration('fossilsense').get<unknown>('includePaths', []),
+  );
+}
+
+export function goModulePathsFromConfig(): string[] {
+  return normalizeExternalPathList(
+    vscode.workspace.getConfiguration('fossilsense').get<unknown>('goModulePaths', []),
+  );
 }
 
 export function debugCandidateReasonsFromConfig(): boolean {
@@ -127,8 +130,19 @@ export function semanticColoringModeFromConfig(): string {
   );
 }
 
-export function detectedCppLanguageServers(): string[] {
-  return CONFLICT_EXTENSIONS.filter((extension) => {
-    return vscode.extensions.getExtension(extension.id) !== undefined;
-  }).map((extension) => extension.name);
+export function detectedLanguageServers(): string[] {
+  const workspaceLanguages = new Set(
+    vscode.workspace.textDocuments
+      .filter(
+        (document) =>
+          document.uri.scheme === 'file' &&
+          vscode.workspace.getWorkspaceFolder(document.uri) !== undefined,
+      )
+      .map((document) => document.languageId),
+  );
+  const installedExtensions = CONFLICT_LANGUAGE_SERVER_EXTENSIONS.map((extension) => {
+    const installed = vscode.extensions.getExtension(extension.id);
+    return { id: extension.id, isActive: installed?.isActive === true };
+  });
+  return activeLanguageProviderNames(installedExtensions, workspaceLanguages);
 }

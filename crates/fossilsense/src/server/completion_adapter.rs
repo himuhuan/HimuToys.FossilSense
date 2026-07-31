@@ -46,6 +46,7 @@ pub(in crate::server) enum CompletionDocumentationData {
         uri: String,
         owner_path: String,
         handle: crate::model::MemberCandidateHandle,
+        semantic_family: crate::semantic_model::SemanticFamily,
         semantic_generation: u64,
         owner_revision_hash: String,
         overlay_epoch: u64,

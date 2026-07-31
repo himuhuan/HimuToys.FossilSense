@@ -5,7 +5,481 @@ use super::{
     FactUnavailableReason, FileSemanticIndex, MemberConfidence, MemberKind, Occurrence, ParseFacts,
     ParserHandle, SymbolKind, SyntacticRole,
 };
-use crate::semantic_model::{SemanticDeclarationKind, SemanticDeclarationRole};
+use crate::semantic_model::{
+    ParseOutcome, SemanticDeclarationKind, SemanticDeclarationRole, SemanticLanguage,
+};
+
+#[test]
+fn go_ast_projects_package_imports_build_guard_and_semantic_facts() {
+    let source = r#"//go:build tinygo && arm
+
+package sensor
+
+import (
+    spi "device/spi"
+    _ "unsafe"
+)
+
+type Reader interface {
+    Read([]byte) (int, error)
+}
+
+type Sample struct {
+    Value int
+}
+
+type Alias = Sample
+
+const DefaultRate = 100
+var Global Sample
+
+func NewSample(value int) Sample {
+    return Sample{Value: value}
+}
+
+func (s *Sample) Read(out []byte) (int, error) {
+    _ = spi.Mode0
+    return copy(out, nil), nil
+}
+
+func Use() {
+    _ = NewSample(DefaultRate)
+}
+"#;
+
+    let index = parse(Path::new("sensor.go"), source);
+
+    assert_eq!(
+        index.package.as_ref().map(|package| package.name.as_str()),
+        Some("sensor")
+    );
+    assert_eq!(index.build_guard.as_deref(), Some("tinygo && arm"));
+    assert!(index
+        .imports
+        .iter()
+        .any(|import| import.path == "device/spi" && import.alias.as_deref() == Some("spi")));
+    assert!(index
+        .imports
+        .iter()
+        .any(|import| import.path == "unsafe" && import.alias.as_deref() == Some("_")));
+
+    for name in [
+        "Reader",
+        "Sample",
+        "Alias",
+        "DefaultRate",
+        "Global",
+        "NewSample",
+        "Read",
+        "Use",
+    ] {
+        let declaration = index
+            .declarations
+            .iter()
+            .find(|declaration| declaration.name == name)
+            .unwrap_or_else(|| panic!("missing Go declaration {name}"));
+        assert_eq!(declaration.identity.language, SemanticLanguage::Go);
+        assert_eq!(declaration.guard.as_deref(), Some("tinygo && arm"));
+    }
+
+    assert!(index.declarations.iter().any(|declaration| {
+        declaration.name == "Read"
+            && declaration.declaration_kind == SemanticDeclarationKind::Method
+            && declaration.owner.as_deref() == Some("Sample")
+    }));
+    assert!(index.declarations.iter().any(|declaration| {
+        declaration.name == "Alias"
+            && declaration.declaration_kind == SemanticDeclarationKind::Alias
+    }));
+    assert!(index
+        .callable_anchors
+        .iter()
+        .any(|anchor| { anchor.name == "NewSample" && anchor.signature.min_arity == Some(1) }));
+    assert!(index.call_sites.iter().any(|call| {
+        call.callee_name.as_deref() == Some("NewSample") && call.argument_count == Some(1)
+    }));
+    assert!(index
+        .members
+        .iter()
+        .any(|member| member.name == "Value" && member.type_name.as_deref() == Some("int")));
+    assert!(index.records.iter().any(|record| {
+        record.display_name == "Reader"
+            && record.kind == crate::semantic_model::RecordKind::Interface
+    }));
+    assert!(index.members.iter().any(|member| {
+        member.name == "Read"
+            && member.kind == MemberKind::Method
+            && member.record_key == "go:.#sensor:Reader"
+    }));
+    assert!(!index.diagnostics.fallback_used);
+}
+
+#[test]
+fn go_filename_constraints_join_source_guards_in_ast_and_fallback_products() {
+    let ast = parse(
+        Path::new("device_linux_arm64.go"),
+        "//go:build tinygo\n\npackage device\nfunc Open() {}\n",
+    );
+    assert_eq!(
+        ast.build_guard.as_deref(),
+        Some("(tinygo) && (filename: linux && arm64)")
+    );
+    assert!(ast.declarations.iter().all(|declaration| {
+        declaration.guard.as_deref() == Some("(tinygo) && (filename: linux && arm64)")
+    }));
+
+    let fallback_source = "//go:build tinygo\npackage device\nfunc (((\n";
+    let fallback = super::lexical_fallback(
+        Path::new("device_windows.go"),
+        fallback_source,
+        Vec::new(),
+        ParseFacts::ALL,
+        crate::config::SourceLanguage::Go,
+    );
+    assert!(fallback.diagnostics.fallback_used);
+    assert_eq!(
+        fallback.build_guard.as_deref(),
+        Some("(tinygo) && (filename: windows)")
+    );
+
+    for ordinary_name in ["linux.go", "amd64.go", "linux_test.go"] {
+        let ordinary = parse(Path::new(ordinary_name), "package device\nvar Value = 1\n");
+        assert_eq!(
+            ordinary.build_guard, None,
+            "{ordinary_name} has no basename_target separator"
+        );
+    }
+}
+
+#[test]
+fn malformed_go_remains_a_bounded_partial_or_fallback_product() {
+    let index = parse(
+        Path::new("broken.go"),
+        "package broken\nfunc Open(value int {\n\treturn value\n",
+    );
+
+    assert!(matches!(
+        index.parse_outcome,
+        ParseOutcome::PartialAst | ParseOutcome::LexicalFallback
+    ));
+    assert!(index
+        .declarations
+        .iter()
+        .all(|declaration| declaration.identity.language == SemanticLanguage::Go));
+    assert!(index.call_sites.len() <= 16);
+    assert_eq!(index.language, crate::semantic_model::SemanticLanguage::Go);
+}
+
+#[test]
+fn go_package_identity_is_physical_stable_and_round_trips_package_linkage() {
+    let first = parse(
+        Path::new("src/sensor/windows.go"),
+        "//go:build windows\n\npackage sensor\n\
+         type Device struct { Windows int }\n\
+         func Open(path string) {}\n\
+         func (device Device) Read(path string) {}\n\
+         var Same = 1\n",
+    );
+    let second = parse(
+        Path::new("src/sensor/linux.go"),
+        "//go:build linux\n\npackage sensor\n\
+         type Device struct { Linux int }\n\
+         func Open(name string) {}\n\
+         func (other Device) Read(name string) {}\n\
+         var Same = 2\n",
+    );
+    let other = parse(
+        Path::new("cmd/tool/main.go"),
+        "package sensor\nfunc Open(name string) {}\nvar Same = 2\n",
+    );
+    let first_open = first
+        .callable_anchors
+        .iter()
+        .find(|anchor| anchor.name == "Open")
+        .expect("first Open");
+    let second_open = second
+        .callable_anchors
+        .iter()
+        .find(|anchor| anchor.name == "Open")
+        .expect("second Open");
+    let other_open = other
+        .callable_anchors
+        .iter()
+        .find(|anchor| anchor.name == "Open")
+        .expect("other Open");
+
+    assert_eq!(first_open.entity_key, second_open.entity_key);
+    assert_ne!(first_open.entity_key, other_open.entity_key);
+    assert!(matches!(
+        first_open.linkage,
+        crate::call_model::LinkageDomain::Package(_)
+    ));
+    let first_open_declaration = first
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name == "Open")
+        .expect("first Open declaration");
+    let second_open_declaration = second
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name == "Open")
+        .expect("second Open declaration");
+    assert_eq!(
+        first_open_declaration.identity.logical_key, second_open_declaration.identity.logical_key,
+        "parameter names and build guards are evidence, not Go declaration identity"
+    );
+    assert_ne!(
+        first_open_declaration.canonical_signature, second_open_declaration.canonical_signature,
+        "the original signature remains presentation evidence"
+    );
+
+    let first_same = first
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name == "Same")
+        .expect("first Same");
+    let second_same = second
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name == "Same")
+        .expect("second Same");
+    assert_ne!(
+        first_same.identity.locator.fingerprint,
+        second_same.identity.locator.fingerprint
+    );
+    assert_eq!(
+        first_same.identity.logical_key, second_same.identity.logical_key,
+        "initializer text must not split a package object identity"
+    );
+    for name in ["Device", "Read"] {
+        let first_fact = first
+            .declarations
+            .iter()
+            .find(|declaration| declaration.name == name)
+            .unwrap_or_else(|| panic!("first {name}"));
+        let second_fact = second
+            .declarations
+            .iter()
+            .find(|declaration| declaration.name == name)
+            .unwrap_or_else(|| panic!("second {name}"));
+        assert_eq!(
+            first_fact.identity.logical_key, second_fact.identity.logical_key,
+            "{name} build variants must share one logical identity"
+        );
+    }
+
+    let first_init = parse(
+        Path::new("src/sensor/init_a.go"),
+        "package sensor\nfunc init() {}\n",
+    );
+    let second_init = parse(
+        Path::new("src/sensor/init_b.go"),
+        "package sensor\nfunc init() {}\n",
+    );
+    assert_ne!(
+        first_init.callable_anchors[0].entity_key,
+        second_init.callable_anchors[0].entity_key
+    );
+    assert_ne!(
+        first_init.declarations[0].identity.logical_key,
+        second_init.declarations[0].identity.logical_key,
+        "each init declaration remains a distinct physical callable"
+    );
+}
+
+#[test]
+fn go_local_declarations_do_not_pollute_package_facts_and_short_vars_are_bound() {
+    let index = parse(
+        Path::new("scope.go"),
+        r#"package scope
+
+func Use(input int) {
+    var first, second int
+    const localConstant = 1
+    type localType int
+    if input > 0 {
+        shortA, shortB := first, second
+        _ = shortA
+        _ = shortB
+    }
+}
+"#,
+    );
+
+    for local in [
+        "first",
+        "second",
+        "localConstant",
+        "localType",
+        "shortA",
+        "shortB",
+    ] {
+        assert!(
+            index
+                .declarations
+                .iter()
+                .all(|declaration| declaration.name != local),
+            "{local} must not become a package declaration"
+        );
+    }
+    for binding in [
+        "input",
+        "first",
+        "second",
+        "localConstant",
+        "localType",
+        "shortA",
+        "shortB",
+    ] {
+        assert!(
+            index
+                .local_bindings
+                .iter()
+                .any(|local| local.name == binding),
+            "missing local binding {binding}"
+        );
+    }
+    let short = index
+        .local_bindings
+        .iter()
+        .find(|binding| binding.name == "shortA")
+        .expect("shortA");
+    assert!(
+        short.scope_start_byte > index.callable_anchors[0].body_range.unwrap().start_byte,
+        "nested-block binding must keep its narrower lexical scope"
+    );
+}
+
+#[test]
+fn go_statement_initializer_bindings_stop_at_the_statement_boundary() {
+    let source = r#"package scope
+
+func Use() {
+    if ifOnly := ready(); ifOnly {
+        _ = ifOnly
+    }
+    _ = ifOnly
+
+    for forOnly := 0; forOnly < 1; forOnly++ {
+        _ = forOnly
+    }
+    _ = forOnly
+
+    switch switchOnly := value(); switchOnly {
+    case 1:
+        _ = switchOnly
+    }
+    _ = switchOnly
+}
+"#;
+    let index = parse(Path::new("statement_scope.go"), source);
+    for name in ["ifOnly", "forOnly", "switchOnly"] {
+        let binding = index
+            .local_bindings
+            .iter()
+            .find(|binding| binding.name == name)
+            .unwrap_or_else(|| panic!("missing {name} binding"));
+        let outside_use = source
+            .rfind(&format!("_ = {name}"))
+            .unwrap_or_else(|| panic!("missing outside use for {name}"));
+        assert!(
+            binding.scope_end_byte < outside_use,
+            "{name} must not remain visible after its owning statement"
+        );
+    }
+}
+
+#[test]
+fn go_package_initializers_and_function_literals_keep_distinct_callers() {
+    let index = parse(
+        Path::new("init.go"),
+        r#"package initpkg
+
+var Default = load()
+
+func Use() {
+    callback := func() { nested() }
+    callback()
+}
+"#,
+    );
+    let initializer = index
+        .callable_anchors
+        .iter()
+        .find(|anchor| anchor.kind == crate::call_model::CallableKind::SyntheticGlobalInitializer)
+        .expect("package initializer");
+    let lambda = index
+        .callable_anchors
+        .iter()
+        .find(|anchor| anchor.kind == crate::call_model::CallableKind::SyntheticLambda)
+        .expect("function literal");
+    assert!(index.call_sites.iter().any(|call| {
+        call.callee_name.as_deref() == Some("load")
+            && call.caller_entity_key == initializer.entity_key
+    }));
+    assert!(index.call_sites.iter().any(|call| {
+        call.callee_name.as_deref() == Some("nested") && call.caller_entity_key == lambda.entity_key
+    }));
+}
+
+#[test]
+fn go_struct_members_keep_direct_fields_and_embedded_names_without_promotion() {
+    let index = parse(
+        Path::new("fields.go"),
+        r#"package fields
+
+type Inner struct{}
+type Outer struct {
+    Inner
+    *pkg.Other
+    Box[int]
+    pkg.Pair[string, int]
+    Nested struct { PromotedWrongly int }
+    First, Second int
+}
+"#,
+    );
+    let outer_key = index
+        .records
+        .iter()
+        .find(|record| record.display_name == "Outer")
+        .expect("Outer")
+        .record_key
+        .clone();
+    let names: std::collections::HashSet<_> = index
+        .members
+        .iter()
+        .filter(|member| member.record_key == outer_key)
+        .map(|member| member.name.as_str())
+        .collect();
+    for expected in ["Inner", "Other", "Box", "Pair", "Nested", "First", "Second"] {
+        assert!(names.contains(expected), "missing direct field {expected}");
+    }
+    assert!(!names.contains("PromotedWrongly"));
+    assert!(!names.contains("int"));
+    assert!(!names.contains("string"));
+}
+
+#[test]
+fn go_build_guard_scans_the_complete_comment_header_and_survives_fallback() {
+    let mut source = String::new();
+    for line in 0..96 {
+        source.push_str(&format!("// license line {line}\n"));
+    }
+    source.push_str("//go:build tinygo && arm\n\npackage guarded\n");
+    assert_eq!(
+        parse(Path::new("guarded.go"), &source)
+            .build_guard
+            .as_deref(),
+        Some("tinygo && arm")
+    );
+
+    let broken = parse(
+        Path::new("broken_guard.go"),
+        "//go:build windows\n\nfunc Broken( {\n",
+    );
+    assert_eq!(broken.build_guard.as_deref(), Some("windows"));
+}
 
 /// Role of the (single) occurrence of `name` in a parsed buffer.
 fn role_of(path: &str, source: &str, name: &str) -> Option<SyntacticRole> {
@@ -1307,6 +1781,7 @@ fn lexical_fallback_product_has_completion_hints_and_no_ast() {
     let source = "#include \"x.h\"\n#define Z 9\n";
     let includes = super::scan_includes(source);
     let index = super::lexical_fallback(
+        Path::new("fallback.c"),
         source,
         includes,
         ParseFacts::ALL,
@@ -2184,6 +2659,7 @@ fn record_declaration_uses_exact_tag_name_range() {
 fn lexical_fallback_is_completion_only_and_has_no_candidate_identity() {
     let source = "#define FALLBACK_VALUE 1\nint fallback_object;\n";
     let index = super::lexical_fallback(
+        Path::new("fallback.c"),
         source,
         super::scan_includes(source),
         ParseFacts::ALL,
@@ -2302,6 +2778,7 @@ fn availability_distinguishes_empty_skipped_and_fallback_ast_vectors() {
 
     let fallback_source = "#include \"x.h\"\n#define ONLY_LEXICAL 1\n";
     let fallback = super::lexical_fallback(
+        Path::new("fallback.c"),
         fallback_source,
         super::scan_includes(fallback_source),
         ParseFacts::ALL,
@@ -2332,6 +2809,7 @@ fn availability_distinguishes_empty_skipped_and_fallback_ast_vectors() {
     );
 
     let fallback_index = super::lexical_fallback(
+        Path::new("fallback.c"),
         fallback_source,
         super::scan_includes(fallback_source),
         ParseFacts::INDEX,

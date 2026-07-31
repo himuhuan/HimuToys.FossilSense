@@ -28,7 +28,8 @@ use crate::query::{
 use crate::reachability::{ReachGraph, ReachScope};
 use crate::resolver::{self, ResolveContext};
 use crate::semantic_model::{
-    DeclarationFact, FallbackCompletionFact, Include, MemberDef, RecordDef, TypeAlias,
+    DeclarationFact, FallbackCompletionFact, ImportFact, Include, MemberDef, PackageFact,
+    RecordDef, SemanticFamily, TypeAlias,
 };
 
 mod callable_queries;
@@ -50,6 +51,9 @@ const MEMBER_FALLBACK_OVERLAY_SCAN_LIMIT: usize = 8_192;
 #[derive(Debug, Clone)]
 pub struct FileCandidateOverlay {
     pub path: String,
+    pub semantic_family: SemanticFamily,
+    pub package: Option<PackageFact>,
+    pub imports: Vec<ImportFact>,
     pub declarations: Vec<DeclarationFact>,
     pub anchors: Vec<CallableAnchor>,
     pub calls: Vec<CallSiteFact>,
@@ -78,7 +82,11 @@ impl FileCandidateOverlay {
             call.path.clone_from(&path);
         }
         Self {
+            semantic_family: crate::config::SourceLanguage::default_for_path(Path::new(&path))
+                .semantic_family(),
             path,
+            package: None,
+            imports: Vec::new(),
             declarations: Vec::new(),
             anchors,
             calls,
@@ -98,6 +106,9 @@ impl FileCandidateOverlay {
             index.callable_anchors.clone(),
             index.call_sites.clone(),
         );
+        overlay.semantic_family = index.language.semantic_family();
+        overlay.package.clone_from(&index.package);
+        overlay.imports.clone_from(&index.imports);
         overlay.declarations = index
             .declarations
             .iter()
@@ -144,6 +155,16 @@ impl FileCandidateOverlay {
         overlay.facts_complete = false;
         overlay
     }
+
+    pub fn tombstone_for_family(
+        path: String,
+        text: Arc<str>,
+        semantic_family: SemanticFamily,
+    ) -> Self {
+        let mut overlay = Self::tombstone(path, text);
+        overlay.semantic_family = semantic_family;
+        overlay
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -177,6 +198,7 @@ pub struct OverlayCompletionName {
     pub name: String,
     pub path: String,
     pub kind: String,
+    pub semantic_family: SemanticFamily,
     pub external: bool,
     pub directly_included: bool,
     pub start_line: u32,
@@ -197,6 +219,8 @@ pub struct CandidateOverlaySnapshot {
     #[allow(dead_code)] // Captured for request tracing and cross-snapshot diagnostics.
     pub epoch: u64,
     shadowed_paths: HashSet<String>,
+    semantic_family_by_path: HashMap<String, SemanticFamily>,
+    go_overlay_packages: HashMap<String, Option<(String, crate::reachability::OpenReason)>>,
     callable_by_name: HashMap<String, Vec<CallableAnchor>>,
     callable_by_path: HashMap<String, Vec<CallableAnchor>>,
     declaration_by_name: HashMap<String, Vec<OverlayDeclarationFact>>,
@@ -227,6 +251,22 @@ impl CandidateOverlaySnapshot {
         };
         for file in files {
             snapshot.shadowed_paths.insert(file.path.clone());
+            snapshot
+                .semantic_family_by_path
+                .insert(file.path.clone(), file.semantic_family);
+            if file.semantic_family == SemanticFamily::Go {
+                let reason = if file.imports.iter().any(|import| import.path == "C") {
+                    crate::reachability::OpenReason::UnsupportedLanguageBoundary
+                } else {
+                    crate::reachability::OpenReason::UnresolvedInclude
+                };
+                snapshot.go_overlay_packages.insert(
+                    file.path.clone(),
+                    file.package
+                        .as_ref()
+                        .map(|package| (physical_package_key(&file.path, &package.name), reason)),
+                );
+            }
             if let Some(text) = file.text.clone() {
                 snapshot.source_by_path.insert(file.path.clone(), text);
             }
@@ -511,7 +551,7 @@ impl CandidateOverlaySnapshot {
                 open.push((source.clone(), reason));
             }
         }
-        let graph = match base {
+        let mut graph = match base {
             Some(base) => base.with_refreshed_sources_with_kinds(&sources, edges, open),
             None => {
                 let unresolved = open
@@ -531,6 +571,14 @@ impl CandidateOverlaySnapshot {
                 ReachGraph::new_with_kinds(edges, unresolved, ambiguous)
             }
         };
+        if !self.go_overlay_packages.is_empty() {
+            graph = graph.with_refreshed_go_overlays(
+                self.go_overlay_packages
+                    .iter()
+                    .map(|(path, package)| (path.clone(), package.clone()))
+                    .collect(),
+            );
+        }
         if let Some(base) = base {
             let published = base.directly_included_external_paths();
             let effective = graph.directly_included_external_paths();
@@ -569,6 +617,11 @@ impl CandidateOverlaySnapshot {
         paths
             .into_iter()
             .map(|path| FileCandidateOverlay {
+                semantic_family: self
+                    .semantic_family_for_path(&path)
+                    .unwrap_or(SemanticFamily::CFamily),
+                package: None,
+                imports: Vec::new(),
                 anchors: self
                     .callable_by_path
                     .get(&path)
@@ -600,6 +653,10 @@ impl CandidateOverlaySnapshot {
         &self.shadowed_paths
     }
 
+    pub fn semantic_family_for_path(&self, path: &str) -> Option<SemanticFamily> {
+        self.semantic_family_by_path.get(path).copied()
+    }
+
     pub fn has_incomplete_facts(&self) -> bool {
         !self.incomplete_paths.is_empty()
     }
@@ -617,11 +674,33 @@ impl CandidateOverlaySnapshot {
             .unwrap_or_default()
     }
 
+    pub fn callable_anchors_for_family(
+        &self,
+        name: &str,
+        family: SemanticFamily,
+    ) -> Vec<&CallableAnchor> {
+        self.callable_anchors(name)
+            .iter()
+            .filter(|anchor| self.semantic_family_for_path(&anchor.path) == Some(family))
+            .collect()
+    }
+
     pub fn declarations(&self, name: &str) -> &[OverlayDeclarationFact] {
         self.declaration_by_name
             .get(name)
             .map(Vec::as_slice)
             .unwrap_or_default()
+    }
+
+    pub fn declarations_for_family(
+        &self,
+        name: &str,
+        family: SemanticFamily,
+    ) -> Vec<&OverlayDeclarationFact> {
+        self.declarations(name)
+            .iter()
+            .filter(|entry| entry.fact.identity.language.semantic_family() == family)
+            .collect()
     }
 
     pub fn declaration_by_fingerprint(&self, fingerprint: &str) -> Option<&OverlayDeclarationFact> {
@@ -640,6 +719,17 @@ impl CandidateOverlaySnapshot {
             .get(name)
             .map(Vec::as_slice)
             .unwrap_or_default()
+    }
+
+    pub fn records_for_family(
+        &self,
+        name: &str,
+        family: SemanticFamily,
+    ) -> Vec<&OverlayRecordFact> {
+        self.records(name)
+            .iter()
+            .filter(|entry| self.semantic_family_for_path(&entry.path) == Some(family))
+            .collect()
     }
 
     pub fn record_by_parser_key(&self, path: &str, record_key: &str) -> Option<&OverlayRecordFact> {
@@ -661,6 +751,7 @@ impl CandidateOverlaySnapshot {
             .unwrap_or_default()
     }
 
+    #[cfg(test)]
     fn fallback_members_by_prefix_limited(
         &self,
         prefix: &str,
@@ -678,6 +769,37 @@ impl CandidateOverlaySnapshot {
         for fact in &self.member_prefix_index[start..] {
             if !fact.name_lower.starts_with(&needle) {
                 break;
+            }
+            if matches.len() >= limit {
+                truncated = true;
+                break;
+            }
+            matches.push(fact);
+        }
+        (matches, truncated)
+    }
+
+    fn fallback_members_by_prefix_for_family_limited(
+        &self,
+        prefix: &str,
+        family: SemanticFamily,
+        limit: usize,
+    ) -> (Vec<&OverlayMemberFact>, bool) {
+        if limit == 0 {
+            return (Vec::new(), false);
+        }
+        let needle = prefix.to_ascii_lowercase();
+        let start = self
+            .member_prefix_index
+            .partition_point(|fact| fact.name_lower.as_str() < needle.as_str());
+        let mut matches = Vec::new();
+        let mut truncated = false;
+        for fact in &self.member_prefix_index[start..] {
+            if !fact.name_lower.starts_with(&needle) {
+                break;
+            }
+            if self.semantic_family_for_path(&fact.path) != Some(family) {
+                continue;
             }
             if matches.len() >= limit {
                 truncated = true;
@@ -721,6 +843,7 @@ impl CandidateOverlaySnapshot {
                     name: fact.fact.name.clone(),
                     path: fact.path.clone(),
                     kind: declaration_kind_name(fact.fact.declaration_kind).to_string(),
+                    semantic_family: fact.fact.identity.language.semantic_family(),
                     external,
                     directly_included,
                     start_line: fact.fact.name_range.start.line,
@@ -733,6 +856,7 @@ impl CandidateOverlaySnapshot {
                         },
                         logical_key: fact.fact.identity.logical_key.clone(),
                         locator_fingerprint: fact.fact.identity.locator.fingerprint.clone(),
+                        semantic_family: fact.fact.identity.language.semantic_family(),
                     }),
                 }
             })
@@ -750,6 +874,13 @@ impl CandidateOverlaySnapshot {
             .get(name)
             .map(Vec::as_slice)
             .unwrap_or_default()
+    }
+
+    pub fn aliases_for_family(&self, name: &str, family: SemanticFamily) -> Vec<&OverlayAliasFact> {
+        self.aliases(name)
+            .iter()
+            .filter(|entry| self.semantic_family_for_path(&entry.path) == Some(family))
+            .collect()
     }
 
     pub fn source_text(&self, path: &str) -> Option<&str> {
@@ -783,6 +914,15 @@ fn position_in_range(position: SourcePosition, range: SourceRange) -> bool {
         && (position.line, position.character) <= (range.end.line, range.end.character)
 }
 
+fn physical_package_key(path: &str, package_name: &str) -> String {
+    let directory = path
+        .rsplit_once('/')
+        .map(|(directory, _)| directory)
+        .filter(|directory| !directory.is_empty())
+        .unwrap_or(".");
+    format!("{directory}#{package_name}")
+}
+
 fn candidate_origin_priority(origin: CandidateOrigin) -> u8 {
     match origin {
         CandidateOrigin::Base => 0,
@@ -798,6 +938,7 @@ mod tests {
 
     use super::*;
     use crate::parser::{parse_with_handle, ParseFacts};
+    use crate::store::views::{GoPackageEdgeRow, GoPackageFileRow, GoPackageResolution};
     use crate::store::{FileFingerprint, FileSource, IndexStore};
 
     fn absolute_test_path(name: &str) -> String {
@@ -1243,6 +1384,71 @@ mod tests {
         assert_eq!(
             added_set.groups[0].counterpart_evidence,
             crate::query::CounterpartEvidence::StrictOneToOne
+        );
+    }
+
+    #[test]
+    fn dirty_go_file_drops_stale_published_import_reach_and_opens_its_package() {
+        let published = ReachGraph::from_rows_with_packages(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![
+                GoPackageFileRow {
+                    package_key: "app#main".into(),
+                    path: "app/main.go".into(),
+                },
+                GoPackageFileRow {
+                    package_key: "app#main".into(),
+                    path: "app/helper.go".into(),
+                },
+                GoPackageFileRow {
+                    package_key: "lib#lib".into(),
+                    path: "lib/lib.go".into(),
+                },
+            ],
+            vec![GoPackageEdgeRow {
+                source_package_key: "app#main".into(),
+                target_package_key: "lib#lib".into(),
+                resolution: GoPackageResolution::Exact,
+            }],
+            Vec::new(),
+        );
+        assert!(published
+            .reachable("app/main.go")
+            .files
+            .contains("lib/lib.go"));
+
+        let dirty = parse_with_handle(
+            Path::new("app/main.go"),
+            "package main\n\nfunc main() {}\n",
+            None,
+            ParseFacts::HOVER_SEMANTICS,
+        );
+        let mut snapshot = CandidateOverlaySnapshot::new(
+            8,
+            vec![FileCandidateOverlay::from_index(
+                "app/main.go".into(),
+                &dirty,
+            )],
+        );
+        snapshot.refresh_reach_graph(
+            Some(&published),
+            ["app/main.go", "app/helper.go", "lib/lib.go"],
+            &[],
+        );
+
+        let scope = snapshot
+            .effective_reach_graph(Some(&published))
+            .expect("overlay graph")
+            .reachable("app/main.go");
+        assert!(scope.files.contains("app/main.go"));
+        assert!(scope.files.contains("app/helper.go"));
+        assert!(!scope.files.contains("lib/lib.go"));
+        assert!(scope.open);
+        assert_eq!(
+            scope.reason,
+            Some(crate::reachability::OpenReason::UnresolvedInclude)
         );
     }
 
@@ -1876,6 +2082,216 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["first.c", "second.c"]
         );
+    }
+
+    #[test]
+    fn go_and_c_candidate_families_do_not_cross_overlay_or_stale_handle_boundaries() {
+        let c = parse_with_handle(
+            Path::new("shared.c"),
+            "int SharedOpen(void) { return 1; }\n",
+            None,
+            ParseFacts::HOVER_SEMANTICS,
+        );
+        let go = parse_with_handle(
+            Path::new("shared.go"),
+            "package shared\nfunc SharedOpen() int { return 1 }\n",
+            None,
+            ParseFacts::HOVER_SEMANTICS,
+        );
+        let snapshot = CandidateOverlaySnapshot::new(
+            1,
+            vec![
+                FileCandidateOverlay::from_index("shared.c".into(), &c),
+                FileCandidateOverlay::from_index("shared.go".into(), &go),
+            ],
+        );
+
+        let go_service = CandidateQueryService::new(None, &snapshot, "main.go", None, None);
+        let go_candidates = go_service
+            .semantic_candidates("SharedOpen", SemanticIntent::Call)
+            .expect("Go candidates");
+        let go_candidate = go_candidates
+            .all
+            .iter()
+            .flat_map(|group| &group.candidates)
+            .next()
+            .expect("Go candidate");
+        assert_eq!(
+            go_candidates
+                .all
+                .iter()
+                .flat_map(|group| &group.candidates)
+                .map(|candidate| candidate.fact.identity.language)
+                .collect::<Vec<_>>(),
+            vec![crate::semantic_model::SemanticLanguage::Go]
+        );
+        let stale_go_handle = CandidateHandle {
+            locator: CandidateHandleLocator::Overlay {
+                fingerprint: go_candidate.fact.identity.locator.fingerprint.clone(),
+            },
+            logical_key: go_candidate.fact.identity.logical_key.clone(),
+            locator_fingerprint: go_candidate.fact.identity.locator.fingerprint.clone(),
+            semantic_family: crate::config::SemanticFamily::Go,
+        };
+
+        let c_service = CandidateQueryService::new(None, &snapshot, "main.c", None, None);
+        assert!(c_service
+            .resolve_candidate_handle(&stale_go_handle)
+            .expect("stale handle resolution")
+            .is_none());
+        let callables = go_service
+            .callable_candidates("SharedOpen", None)
+            .expect("Go callables");
+        assert!(callables
+            .anchors
+            .iter()
+            .all(|anchor| anchor.anchor.path.ends_with(".go")));
+    }
+
+    #[test]
+    fn unguarded_go_variant_ranks_before_guarded_variant_without_filtering_either() {
+        let guarded = parse_with_handle(
+            Path::new("pkg/a_guarded.go"),
+            "//go:build tinygo\n\npackage pkg\nfunc Open() {}\n",
+            None,
+            ParseFacts::HOVER_SEMANTICS,
+        );
+        let unguarded = parse_with_handle(
+            Path::new("pkg/z_unguarded.go"),
+            "package pkg\nfunc Open() {}\n",
+            None,
+            ParseFacts::HOVER_SEMANTICS,
+        );
+        let snapshot = CandidateOverlaySnapshot::new(
+            1,
+            vec![
+                FileCandidateOverlay::from_index("pkg/a_guarded.go".into(), &guarded),
+                FileCandidateOverlay::from_index("pkg/z_unguarded.go".into(), &unguarded),
+            ],
+        );
+        let graph = ReachGraph::from_rows_with_packages(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![
+                GoPackageFileRow {
+                    package_key: "pkg#pkg".into(),
+                    path: "pkg/use.go".into(),
+                },
+                GoPackageFileRow {
+                    package_key: "pkg#pkg".into(),
+                    path: "pkg/a_guarded.go".into(),
+                },
+                GoPackageFileRow {
+                    package_key: "pkg#pkg".into(),
+                    path: "pkg/z_unguarded.go".into(),
+                },
+            ],
+            Vec::new(),
+            Vec::new(),
+        );
+        let reach = graph.reachable("pkg/use.go");
+        let semantic = CandidateQueryService::new(
+            None,
+            &snapshot,
+            "pkg/use.go",
+            Some(reach.as_ref()),
+            Some(&graph),
+        )
+        .semantic_candidates("Open", SemanticIntent::Call)
+        .expect("Go variants");
+        let candidates: Vec<_> = semantic
+            .all
+            .iter()
+            .flat_map(|group| &group.candidates)
+            .collect();
+
+        assert_eq!(candidates.len(), 2, "guards are evidence, not filters");
+        assert_eq!(candidates[0].fact.path, "pkg/z_unguarded.go");
+        assert!(candidates[0].fact.guard.is_none());
+        assert_eq!(candidates[1].fact.guard.as_deref(), Some("tinygo"));
+    }
+
+    #[test]
+    fn go_and_c_candidate_families_do_not_cross_durable_reads() {
+        let dir = tempdir().expect("tempdir");
+        let db = dir.path().join("index.sqlite");
+        let mut store = IndexStore::open(&db, dir.path()).expect("store");
+        upsert_candidate_test_file(
+            &mut store,
+            "src/shared.c",
+            "int SharedOpen(void) { return 1; }\n",
+        );
+        upsert_candidate_test_file(
+            &mut store,
+            "src/shared.go",
+            "package shared\nfunc SharedOpen() int { return 1 }\n",
+        );
+        drop(store);
+
+        let handle = CallReadHandle::capture(db).expect("read handle");
+        let snapshot = CandidateOverlaySnapshot::default();
+        let service = CandidateQueryService::new(Some(&handle), &snapshot, "main.go", None, None);
+
+        let semantic = service
+            .semantic_candidates("SharedOpen", SemanticIntent::Call)
+            .expect("Go declarations");
+        assert_eq!(
+            semantic
+                .all
+                .iter()
+                .flat_map(|group| &group.candidates)
+                .map(|candidate| candidate.fact.identity.language)
+                .collect::<Vec<_>>(),
+            vec![crate::semantic_model::SemanticLanguage::Go]
+        );
+        let callables = service
+            .callable_candidates("SharedOpen", None)
+            .expect("Go callables");
+        assert!(!callables.anchors.is_empty());
+        assert!(callables
+            .anchors
+            .iter()
+            .all(|candidate| candidate.anchor.path.ends_with(".go")));
+    }
+
+    #[test]
+    fn go_and_c_record_and_member_facts_do_not_cross_durable_reads() {
+        let dir = tempdir().expect("tempdir");
+        let db = dir.path().join("index.sqlite");
+        let mut store = IndexStore::open(&db, dir.path()).expect("store");
+        upsert_candidate_test_file(
+            &mut store,
+            "src/shared.c",
+            "struct Shared { int c_field; };\n",
+        );
+        upsert_candidate_test_file(
+            &mut store,
+            "src/shared.go",
+            "package shared\ntype Shared struct { GoField int }\n",
+        );
+        drop(store);
+
+        let handle = CallReadHandle::capture(db).expect("read handle");
+        let snapshot = CandidateOverlaySnapshot::default();
+        let service = CandidateQueryService::new(Some(&handle), &snapshot, "main.go", None, None);
+        let records = service
+            .records_for_type_name_with_evidence("Shared")
+            .expect("Go records")
+            .records;
+        assert!(!records.is_empty());
+        assert!(records.iter().all(|record| record.path.ends_with(".go")));
+        let members = service
+            .members_for_records_limited(&records, None, 16)
+            .expect("Go members");
+        assert!(members
+            .candidates
+            .iter()
+            .any(|member| member.name == "GoField"));
+        assert!(members
+            .candidates
+            .iter()
+            .all(|member| member.name != "c_field"));
     }
 
     #[test]

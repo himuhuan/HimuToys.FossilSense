@@ -205,7 +205,15 @@ fn local_kind_for_occurrence(
     local_bindings: &[LocalBinding],
 ) -> Option<ColorKind> {
     if occ.role == SyntacticRole::TypeUse {
-        return None;
+        return local_bindings
+            .iter()
+            .filter(|binding| {
+                binding.name == occ.name
+                    && binding.kind == LocalBindingKind::LocalType
+                    && local_binding_visible_at_occurrence(binding, occ.start_byte)
+            })
+            .max_by_key(|binding| binding.decl_start_byte)
+            .map(|_| ColorKind::Type);
     }
 
     local_bindings
@@ -217,6 +225,8 @@ fn local_kind_for_occurrence(
         .map(|binding| match binding.kind {
             LocalBindingKind::Parameter => ColorKind::Parameter,
             LocalBindingKind::LocalVariable => ColorKind::Variable,
+            LocalBindingKind::LocalConstant => ColorKind::Variable,
+            LocalBindingKind::LocalType => ColorKind::Type,
         })
 }
 
@@ -224,6 +234,8 @@ fn local_binding_visible_at_occurrence(binding: &LocalBinding, byte_offset: usiz
     byte_offset == binding.decl_start_byte
         || (binding.function_start_byte <= byte_offset
             && byte_offset <= binding.function_end_byte
+            && binding.scope_start_byte < byte_offset
+            && byte_offset <= binding.scope_end_byte
             && binding.decl_start_byte < byte_offset)
 }
 

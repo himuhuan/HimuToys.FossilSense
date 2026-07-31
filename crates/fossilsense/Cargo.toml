@@ -1,6 +1,6 @@
 [package]
 name = "fossilsense"
-version = "1.4.5"
+version = "1.5.0"
 edition = "2021"
 publish = false
 
@@ -31,9 +31,11 @@ tower-lsp = "0.20"
 tree-sitter = "0.25"
 tree-sitter-c = "0.24"
 tree-sitter-cpp = "0.23"
+tree-sitter-go = "0.25"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
+    "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",

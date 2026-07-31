@@ -32,6 +32,8 @@ pub(super) struct IndexScheduleState {
     pub(super) scheduled: bool,
     pub(super) pending_requested: bool,
     pub(super) pending_full: bool,
+    pub(super) pending_all_roots: bool,
+    pub(super) pending_full_roots: Vec<PathBuf>,
     pub(super) pending_force: bool,
     pub(super) pending_changes: Vec<RootDirtyChange>,
 }
@@ -44,14 +46,76 @@ pub(super) struct RootDirtyChange {
 }
 
 pub(super) enum WatchDecision {
-    Full,
+    Full(PathBuf),
     ProjectContext(PathBuf),
     Dirty(RootDirtyChange),
 }
 
-enum ScheduledIndex {
-    Full { force: bool },
+pub(super) enum ScheduledIndex {
+    Full {
+        roots: Option<Vec<PathBuf>>,
+        force: bool,
+        changes: Vec<RootDirtyChange>,
+    },
     Dirty(Vec<RootDirtyChange>),
+}
+
+impl IndexScheduleState {
+    pub(super) fn request_dirty_changes(&mut self, changes: Vec<RootDirtyChange>) {
+        self.pending_requested = true;
+        self.pending_changes.extend(changes);
+    }
+
+    pub(super) fn request_all_roots(&mut self, force: bool) {
+        self.pending_requested = true;
+        self.pending_full = true;
+        self.pending_all_roots = true;
+        self.pending_full_roots.clear();
+        self.pending_force |= force;
+        self.pending_changes.clear();
+    }
+
+    pub(super) fn request_full_roots(&mut self, roots: Vec<PathBuf>) {
+        if roots.is_empty() {
+            return;
+        }
+        self.pending_requested = true;
+        self.pending_full = true;
+        if self.pending_all_roots {
+            return;
+        }
+        self.pending_full_roots.extend(roots);
+        self.pending_full_roots.sort();
+        self.pending_full_roots.dedup();
+        self.pending_changes
+            .retain(|change| !self.pending_full_roots.contains(&change.root));
+    }
+
+    pub(super) fn take_scheduled_index(&mut self) -> ScheduledIndex {
+        self.pending_requested = false;
+        if !self.pending_full {
+            return ScheduledIndex::Dirty(std::mem::take(&mut self.pending_changes));
+        }
+
+        self.pending_full = false;
+        let force = std::mem::take(&mut self.pending_force);
+        let roots = if std::mem::take(&mut self.pending_all_roots) {
+            self.pending_full_roots.clear();
+            self.pending_changes.clear();
+            None
+        } else {
+            let roots = std::mem::take(&mut self.pending_full_roots);
+            self.pending_changes
+                .retain(|change| !roots.contains(&change.root));
+            Some(roots)
+        };
+        let changes = std::mem::take(&mut self.pending_changes);
+        ScheduledIndex::Full {
+            roots,
+            force,
+            changes,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -134,6 +198,7 @@ impl Backend {
             roots: self.workspace_roots.clone(),
         };
         let include_paths = self.include_paths.lock().await.clone();
+        let go_module_paths = self.go_module_paths.lock().await.clone();
         let client = self.client.clone();
         let index_schedule = self.index_schedule.clone();
         let cache = self.session.cache.clone();
@@ -142,8 +207,7 @@ impl Backend {
             .load(std::sync::atomic::Ordering::Relaxed);
 
         let mut state = index_schedule.lock().await;
-        state.pending_requested = true;
-        state.pending_changes.extend(changes);
+        state.request_dirty_changes(changes);
         if state.running || state.scheduled {
             return;
         }
@@ -155,6 +219,7 @@ impl Backend {
                 client,
                 workspace_state,
                 include_paths,
+                go_module_paths,
                 cache,
                 index_schedule,
                 perf_logging_enabled,
@@ -164,26 +229,52 @@ impl Backend {
     }
 
     pub(super) async fn spawn_index_roots(&self, force: Option<bool>) {
+        self.spawn_index_roots_with_scope(None, force.unwrap_or(false))
+            .await;
+    }
+
+    pub(super) async fn spawn_index_root_changes(&self, roots: Vec<PathBuf>) {
+        self.spawn_index_roots_with_scope(Some(roots), false).await;
+    }
+
+    async fn spawn_index_roots_with_scope(&self, roots: Option<Vec<PathBuf>>, force: bool) {
         self.session.cache.invalidate_after_index_change().await;
+        let root_scope = match roots.as_ref() {
+            Some(roots) => roots.clone(),
+            None => self.workspace_roots.lock().await.clone(),
+        };
+        // A user-triggered refresh/rebuild must observe fossilsense.json even
+        // when no file-watcher event arrived.
+        self.config_cache
+            .lock()
+            .await
+            .retain(|root, _| !root_scope.contains(root));
+        #[cfg(test)]
+        self.invalidate_external_source_root_cache(&root_scope)
+            .await;
         let workspace_state = IndexWorkspaceState {
             documents: self.session.documents.clone(),
             roots: self.workspace_roots.clone(),
         };
         let include_paths = self.include_paths.lock().await.clone();
+        let go_module_paths = self.go_module_paths.lock().await.clone();
         let client = self.client.clone();
         let index_schedule = self.index_schedule.clone();
         let cache = self.session.cache.clone();
-        let force = force.unwrap_or(false);
         let perf_logging_enabled = self
             .perf_logging_enabled
             .load(std::sync::atomic::Ordering::Relaxed);
 
         let mut state = index_schedule.lock().await;
-        state.pending_requested = true;
-        state.pending_full = true;
-        state.pending_force |= force;
-        state.pending_changes.clear();
+        if let Some(roots) = roots {
+            state.request_full_roots(roots);
+        } else {
+            state.request_all_roots(force);
+        }
         if state.running || state.scheduled {
+            return;
+        }
+        if !state.pending_requested {
             return;
         }
         state.scheduled = true;
@@ -194,6 +285,7 @@ impl Backend {
                 client,
                 workspace_state,
                 include_paths,
+                go_module_paths,
                 cache,
                 index_schedule,
                 perf_logging_enabled,
@@ -207,6 +299,7 @@ async fn run_scheduled_indexes(
     client: Client,
     workspace_state: IndexWorkspaceState,
     include_paths: Vec<String>,
+    go_module_paths: Vec<String>,
     cache: CacheLedger,
     index_schedule: IndexSchedule,
     perf_logging_enabled: bool,
@@ -218,37 +311,52 @@ async fn run_scheduled_indexes(
             let mut state = index_schedule.lock().await;
             state.scheduled = false;
             state.running = true;
-            state.pending_requested = false;
-            if state.pending_full {
-                state.pending_full = false;
-                state.pending_changes.clear();
-                let force = state.pending_force;
-                state.pending_force = false;
-                ScheduledIndex::Full { force }
-            } else {
-                let changes = std::mem::take(&mut state.pending_changes);
-                ScheduledIndex::Dirty(changes)
-            }
+            state.take_scheduled_index()
         };
 
         match scheduled {
-            ScheduledIndex::Full { force } => {
-                let roots = workspace_state.roots.lock().await.clone();
+            ScheduledIndex::Full {
+                roots,
+                force,
+                changes,
+            } => {
+                let current_roots = workspace_state.roots.lock().await.clone();
+                let roots = roots.map_or_else(
+                    || current_roots.clone(),
+                    |mut scoped| {
+                        scoped.retain(|root| current_roots.contains(root));
+                        scoped
+                    },
+                );
                 index_roots(
                     client.clone(),
-                    roots.clone(),
+                    roots,
                     include_paths.clone(),
+                    go_module_paths.clone(),
                     cache.clone(),
                     workspace_state.clone(),
                     force,
                     perf_logging_enabled,
                 )
                 .await;
+                if !changes.is_empty() {
+                    index_dirty_roots(
+                        client.clone(),
+                        include_paths.clone(),
+                        go_module_paths.clone(),
+                        cache.clone(),
+                        workspace_state.clone(),
+                        changes,
+                        perf_logging_enabled,
+                    )
+                    .await;
+                }
             }
             ScheduledIndex::Dirty(changes) if !changes.is_empty() => {
                 index_dirty_roots(
                     client.clone(),
                     include_paths.clone(),
+                    go_module_paths.clone(),
                     cache.clone(),
                     workspace_state.clone(),
                     changes,
@@ -276,10 +384,12 @@ async fn run_scheduled_indexes(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn index_roots(
     client: Client,
     roots: Vec<PathBuf>,
     include_paths: Vec<String>,
+    go_module_paths: Vec<String>,
     cache: CacheLedger,
     workspace_state: IndexWorkspaceState,
     force: bool,
@@ -304,19 +414,34 @@ async fn index_roots(
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let index_root = root.clone();
         let include_paths_for_index = include_paths.clone();
+        let go_module_paths_for_index = go_module_paths.clone();
         let result = tokio::task::spawn_blocking(move || {
-            indexer::index_workspace(
-                index_root,
+            let prepared = indexer::prepare_index_configuration(
+                &index_root,
+                &include_paths_for_index,
+                &go_module_paths_for_index,
+            )?;
+            let stats = indexer::index_workspace(
+                &index_root,
                 IndexOptions {
                     db_path: None,
                     force,
                     include_paths: include_paths_for_index,
+                    go_module_paths: go_module_paths_for_index,
+                    prepared_configuration: Some(prepared.clone()),
                     ..Default::default()
                 },
                 |status| {
                     let _ = sender.send(status);
                 },
-            )
+            )?;
+            let workspace_semantics = Arc::new(
+                super::workspace_config::PublishedWorkspaceSemantics::from_index_configuration(
+                    &index_root,
+                    &prepared,
+                ),
+            );
+            Ok::<_, anyhow::Error>((stats, workspace_semantics))
         });
 
         while let Some(status) = receiver.recv().await {
@@ -339,7 +464,7 @@ async fn index_roots(
         }
 
         match result.await {
-            Ok(Ok(mut stats)) => {
+            Ok(Ok((mut stats, workspace_semantics))) => {
                 if let Some(warning) = &stats.maintenance_warning {
                     client
                         .log_message(MessageType::WARNING, warning.clone())
@@ -364,7 +489,10 @@ async fn index_roots(
                         ),
                     )
                     .await;
-                match cache.publish_full_index(&client, root.clone()).await {
+                match cache
+                    .publish_full_index_with_semantics(&client, root.clone(), workspace_semantics)
+                    .await
+                {
                     Ok(report) => {
                         if !workspace_state.roots.lock().await.contains(&root) {
                             cache
@@ -483,6 +611,7 @@ async fn index_roots(
 async fn index_dirty_roots(
     client: Client,
     include_paths: Vec<String>,
+    go_module_paths: Vec<String>,
     cache: CacheLedger,
     workspace_state: IndexWorkspaceState,
     changes: Vec<RootDirtyChange>,
@@ -502,6 +631,41 @@ async fn index_dirty_roots(
         if !workspace_state.roots.lock().await.contains(&root) {
             continue;
         }
+        let published = cache.current_engine_snapshot(&root).await;
+        let store_generation = cache::load_store_semantic_generation(root.clone()).await;
+        let may_increment = published.as_ref().is_some_and(|snapshot| {
+            snapshot.semantic_generation != crate::call_model::SemanticGeneration::MISSING
+                && store_generation
+                    .as_ref()
+                    .is_ok_and(|generation| *generation == snapshot.semantic_generation)
+        });
+        if !may_increment {
+            client
+                .log_message(
+                    MessageType::WARNING,
+                    format!(
+                        "dirty update for {} has no direct published base; rebuilding the full workspace",
+                        root.display()
+                    ),
+                )
+                .await;
+            index_roots(
+                client.clone(),
+                vec![root],
+                include_paths.clone(),
+                go_module_paths.clone(),
+                cache.clone(),
+                workspace_state.clone(),
+                false,
+                perf_logging_enabled,
+            )
+            .await;
+            continue;
+        }
+        let workspace_semantics = published
+            .expect("incremental eligibility requires a published snapshot")
+            .workspace_semantics
+            .clone();
         let display_root = root.display().to_string();
         let rel_paths: Vec<String> = changes
             .iter()
@@ -521,22 +685,28 @@ async fn index_dirty_roots(
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let index_root = root.clone();
         let include_paths_for_index = include_paths.clone();
+        let go_module_paths_for_index = go_module_paths.clone();
+        let workspace_semantics_for_index = workspace_semantics.clone();
         let dirty_changes: Vec<indexer::DirtyFileChange> =
             changes.into_iter().map(|change| change.change).collect();
         let result = tokio::task::spawn_blocking(move || {
-            indexer::index_dirty_files(
-                index_root,
+            let prepared = workspace_semantics_for_index.index_configuration_snapshot();
+            let stats = indexer::index_dirty_files(
+                &index_root,
                 dirty_changes,
                 IndexOptions {
                     db_path: None,
                     force: false,
                     include_paths: include_paths_for_index,
+                    go_module_paths: go_module_paths_for_index,
+                    prepared_configuration: Some(prepared.clone()),
                     ..Default::default()
                 },
                 |status| {
                     let _ = sender.send(status);
                 },
-            )
+            )?;
+            Ok::<_, anyhow::Error>((stats, workspace_semantics_for_index))
         });
 
         while let Some(status) = receiver.recv().await {
@@ -556,7 +726,7 @@ async fn index_dirty_roots(
         }
 
         match result.await {
-            Ok(Ok(mut stats)) => {
+            Ok(Ok((mut stats, workspace_semantics))) => {
                 if let Some(warning) = &stats.maintenance_warning {
                     client
                         .log_message(MessageType::WARNING, warning.clone())
@@ -581,11 +751,12 @@ async fn index_dirty_roots(
                     )
                     .await;
                 match cache
-                    .publish_dirty_index(
+                    .publish_dirty_index_with_semantics(
                         &client,
                         root.clone(),
                         &rel_paths,
                         &stats.include_edge_sources_rebuilt,
+                        workspace_semantics,
                     )
                     .await
                 {
@@ -702,6 +873,25 @@ async fn index_dirty_roots(
     }
 }
 
+#[cfg(test)]
+impl Backend {
+    pub(super) async fn run_dirty_index_for_test(&self, changes: Vec<RootDirtyChange>) {
+        index_dirty_roots(
+            self.client.clone(),
+            self.include_paths.lock().await.clone(),
+            self.go_module_paths.lock().await.clone(),
+            self.session.cache.clone(),
+            IndexWorkspaceState {
+                documents: self.session.documents.clone(),
+                roots: self.workspace_roots.clone(),
+            },
+            changes,
+            false,
+        )
+        .await;
+    }
+}
+
 async fn log_cache_degradation(
     client: &Client,
     display_root: &str,
@@ -717,6 +907,20 @@ async fn log_cache_degradation(
             .log_message(
                 MessageType::WARNING,
                 format!("include completion table {operation} failed for {display_root}: {detail}"),
+            )
+            .await;
+    }
+    if report.degraded.go_import_table {
+        let detail = report
+            .go_import_table_error
+            .as_deref()
+            .unwrap_or("unavailable");
+        client
+            .log_message(
+                MessageType::WARNING,
+                format!(
+                    "Go import completion table {operation} failed for {display_root}: {detail}"
+                ),
             )
             .await;
     }

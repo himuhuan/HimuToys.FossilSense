@@ -56,20 +56,47 @@ impl Backend {
         let uri_owned = uri.to_string();
         let completion_overlay_epoch = documents.overlay_epoch;
         let roots = self.workspace_roots.lock().await.clone();
-        let primary_root = self.root_for_uri(uri).await;
+        let primary_root = path.as_ref().and_then(|path| {
+            roots
+                .iter()
+                .filter(|root| pathing::path_is_within(root, path))
+                .max_by_key(|root| root.components().count())
+                .cloned()
+        });
+        let primary_context = match primary_root.as_ref() {
+            Some(root) => Some(self.request_context_for_root(root.clone()).await),
+            None => None,
+        };
+        let authoritative_family = primary_context.as_ref().map(|context| {
+            context
+                .engine
+                .workspace_semantics
+                .language_for_uri(uri)
+                .semantic_family()
+        });
         let mut member_root_contexts: HashMap<PathBuf, MemberRootQueryContext> = HashMap::new();
-        let mut primary_context = None;
         for root in &roots {
-            let context = self.request_context_for_root(root.clone()).await;
-            if primary_root.as_ref() == Some(root) {
-                primary_context = Some(context.clone());
-            }
+            let context = match primary_context
+                .as_ref()
+                .filter(|_| primary_root.as_ref() == Some(root))
+            {
+                Some(context) => context.clone(),
+                None => self.request_context_for_root(root.clone()).await,
+            };
+            let semantic_family = authoritative_family.unwrap_or_else(|| {
+                context
+                    .engine
+                    .workspace_semantics
+                    .language_for_uri(uri)
+                    .semantic_family()
+            });
             let overlay = self
                 .candidate_overlay_snapshot_from_documents(
                     root,
                     context.engine.semantic_generation,
                     context.engine.reach_graph.as_deref(),
                     context.engine.indexed_files.as_deref().map(Vec::as_slice),
+                    context.engine.workspace_semantics.clone(),
                     documents.clone(),
                 )
                 .await;
@@ -87,6 +114,7 @@ impl Backend {
                     current_path,
                     reach_graph: context.engine.reach_graph.clone(),
                     semantic_generation: context.engine.semantic_generation,
+                    semantic_family,
                 },
             );
         }
@@ -101,6 +129,15 @@ impl Backend {
             .as_ref()
             .and_then(|context| self.reach_scope_from_context(uri, context));
         let member_reach = reach_info.map(|(_, reach)| (*reach).clone());
+        let source_language = primary_context
+            .as_ref()
+            .map(|context| context.engine.workspace_semantics.language_for_uri(uri))
+            .unwrap_or_else(|| {
+                crate::config::SourceLanguage::default_for_path(
+                    path.as_deref()
+                        .unwrap_or_else(|| std::path::Path::new(uri.path())),
+                )
+            });
 
         // Use the live-document parse cache; receiver inference only needs
         // local_declarations, but caching the full parse avoids re-parsing
@@ -108,12 +145,13 @@ impl Backend {
         // symbols.
         let cached_index: Option<Arc<FileSemanticIndex>> = match (&receiver, &path) {
             (Some(_), Some(path)) => {
-                self.get_or_parse_document(
+                self.get_or_parse_document_with_language(
                     uri,
                     path,
                     version,
                     &text_owned,
                     parser::ParseFacts::MEMBER,
+                    source_language,
                 )
                 .await
             }
@@ -291,6 +329,7 @@ impl Backend {
                                     member,
                                     root.clone(),
                                     context.semantic_generation,
+                                    context.semantic_family,
                                     weak_owner_used,
                                     owner_ambiguous,
                                 );
@@ -330,6 +369,7 @@ impl Backend {
                                 candidate,
                                 root.clone(),
                                 context.semantic_generation,
+                                context.semantic_family,
                                 false,
                                 false,
                             );
@@ -393,11 +433,12 @@ impl Backend {
                             .clone()
                             .and_then(|owner_revision_hash| {
                                 serde_json::to_value(CompletionDocumentationData::Member {
-                                    version: 4,
+                                    version: 5,
                                     root: presentation.root.to_string_lossy().into_owned(),
                                     uri: uri_owned.clone(),
                                     owner_path: member.owner_path.clone(),
                                     handle: member.handle.clone(),
+                                    semantic_family: presentation.semantic_family,
                                     semantic_generation: presentation.semantic_generation.0,
                                     owner_revision_hash,
                                     overlay_epoch: completion_overlay_epoch,
@@ -491,6 +532,7 @@ struct MemberPresentation {
     candidate: crate::model::MemberCandidate,
     root: PathBuf,
     semantic_generation: crate::call_model::SemanticGeneration,
+    semantic_family: crate::semantic_model::SemanticFamily,
     weak_receiver: bool,
     ambiguous_owner: bool,
 }
@@ -503,17 +545,19 @@ struct MemberRootQueryContext {
     current_path: String,
     reach_graph: Option<Arc<crate::reachability::ReachGraph>>,
     semantic_generation: crate::call_model::SemanticGeneration,
+    semantic_family: crate::semantic_model::SemanticFamily,
 }
 
 impl MemberRootQueryContext {
     fn service(&self) -> CandidateQueryService<'_> {
-        CandidateQueryService::new_with_declarations(
+        CandidateQueryService::new_with_declarations_for_family(
             self.handle.as_deref(),
             self.declaration_index.as_deref(),
             self.overlay.as_ref(),
             &self.current_path,
             None,
             self.reach_graph.as_deref(),
+            self.semantic_family,
         )
     }
 }
@@ -871,6 +915,7 @@ mod tests {
                     candidate,
                     PathBuf::from("test-root"),
                     crate::call_model::SemanticGeneration(1),
+                    crate::semantic_model::SemanticFamily::CFamily,
                     false,
                     false,
                 );

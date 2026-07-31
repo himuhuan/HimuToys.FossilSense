@@ -88,7 +88,10 @@ fn feature_and_cli_call_sites_use_read_views_for_exact_store_queries() {
     );
     assert_present(
         "src/main.rs",
-        &["CandidateQueryService::new(", "semantic_candidates("],
+        &[
+            "CandidateQueryService::new_for_family(",
+            "semantic_candidates(",
+        ],
     );
 }
 
@@ -117,7 +120,7 @@ fn core_symbol_features_route_through_candidate_sets_and_stable_handles() {
     assert_present(
         "src/server/completion_candidate_documentation.rs",
         &[
-            "new_with_declarations(",
+            "new_with_declarations_for_family(",
             "resolve_candidate_handle(&handle)",
             "semantic_candidates(",
             "persistent_id == Some(declaration_id)",
@@ -129,7 +132,10 @@ fn core_symbol_features_route_through_candidate_sets_and_stable_handles() {
     );
     assert_present(
         "src/candidate_service/semantic.rs",
-        &["exact_name_hits_scoped(", "payloads_by_ids(handle, &ids)"],
+        &[
+            "exact_name_hits_scoped_for_family(",
+            "payloads_by_ids(handle, &ids)",
+        ],
     );
     assert_absent(
         "src/server/completion_documentation.rs",

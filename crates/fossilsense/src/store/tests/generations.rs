@@ -158,12 +158,417 @@ fn abandoned_build_cannot_replace_active_facts() {
         .unwrap();
 
     let replacement = store.begin_index_build(false).unwrap();
+    let raw_revisions: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM file_revisions", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        raw_revisions, 1,
+        "starting a replacement build must reclaim abandoned staging revisions"
+    );
     assert!(store.declarations_by_name("stable").unwrap().len() == 1);
     assert!(store.declarations_by_name("abandoned").unwrap().is_empty());
     store
         .commit_index_build(replacement, &IncludeGraphUpdate::default())
         .unwrap();
     assert!(store.declarations_by_name("stable").unwrap().len() == 1);
+}
+
+#[test]
+fn inactive_cleanup_deletes_child_facts_before_revision_parents() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("index.sqlite");
+    let mut store = IndexStore::open(&db, dir.path()).unwrap();
+    upsert_source(&mut store, "main.c", "int before_cleanup(void);\n");
+    store
+        .conn
+        .execute_batch(
+            "CREATE TRIGGER require_child_first_cleanup
+             BEFORE DELETE ON file_revisions
+             WHEN EXISTS(
+                 SELECT 1 FROM declaration_facts WHERE revision_id = OLD.id
+             )
+             BEGIN
+                 SELECT RAISE(ABORT, 'revision deleted before child facts');
+             END;",
+        )
+        .unwrap();
+
+    let source = "int after_cleanup(void);\n";
+    let parsed = parse(std::path::Path::new("main.c"), source);
+    let fp = fingerprint("main.c", source, 2);
+    let build = store.begin_index_build(false).unwrap();
+    store
+        .stage_file_updates(
+            build,
+            &[FileIndexUpdate {
+                fingerprint: &fp,
+                source: FileSource::Workspace,
+                payload: FileIndexPayload::Ok(&parsed),
+            }],
+        )
+        .unwrap();
+    let outcome = store
+        .commit_index_build(build, &IncludeGraphUpdate::default())
+        .unwrap();
+
+    assert!(
+        outcome.cleanup_warning.is_none(),
+        "bulk cleanup must remove child facts before parent revisions: {:?}",
+        outcome.cleanup_warning
+    );
+    let raw_revisions: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM file_revisions", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(raw_revisions, 1);
+}
+
+#[test]
+fn cleanup_preserves_parent_cascade_for_cross_file_fact_pairs() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("index.sqlite");
+    let mut store = IndexStore::open(&db, dir.path()).unwrap();
+    upsert_source(&mut store, "a.c", "int stale_from_a(void);\n");
+    upsert_source(&mut store, "b.c", "int stable_from_b(void);\n");
+
+    let b_file_id: i64 = store
+        .conn
+        .query_row(
+            "SELECT id FROM file_entries WHERE path = 'b.c'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE declaration_facts SET file_id = ?1
+             WHERE name = 'stale_from_a'",
+            [b_file_id],
+        )
+        .unwrap();
+    let mut pre_cleanup_check = store.conn.prepare("PRAGMA foreign_key_check").unwrap();
+    assert!(
+        !pre_cleanup_check.exists([]).unwrap(),
+        "the schema permits independently valid revision/file foreign keys"
+    );
+    drop(pre_cleanup_check);
+
+    let source = "int fresh_from_a(void);\n";
+    let parsed = parse(std::path::Path::new("a.c"), source);
+    let fp = fingerprint("a.c", source, 2);
+    let build = store.begin_index_build(false).unwrap();
+    store
+        .stage_file_updates(
+            build,
+            &[FileIndexUpdate {
+                fingerprint: &fp,
+                source: FileSource::Workspace,
+                payload: FileIndexPayload::Ok(&parsed),
+            }],
+        )
+        .unwrap();
+    let outcome = store
+        .commit_index_build(build, &IncludeGraphUpdate::default())
+        .unwrap();
+
+    assert!(
+        outcome.cleanup_warning.is_none(),
+        "bulk cleanup must fall back to revision-only cascade semantics: {:?}",
+        outcome.cleanup_warning
+    );
+    assert!(store
+        .declarations_by_name("stale_from_a")
+        .unwrap()
+        .is_empty());
+    assert_eq!(store.declarations_by_name("fresh_from_a").unwrap().len(), 1);
+    let revision_counts: (i64, i64) = store
+        .conn
+        .query_row(
+            "SELECT
+                 (SELECT COUNT(*) FROM file_revisions),
+                 (SELECT COUNT(*) FROM active_file_revisions)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(revision_counts, (2, 2));
+}
+
+#[test]
+fn failed_cleanup_rolls_back_and_next_build_retries_the_whole_debt() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("index.sqlite");
+    let mut store = IndexStore::open(&db, dir.path()).unwrap();
+    upsert_source(&mut store, "old.c", "int old_only(void) { return 1; }\n");
+    store
+        .conn
+        .execute_batch(
+            "CREATE TRIGGER fail_orphan_call_string_cleanup
+             BEFORE DELETE ON call_strings
+             WHEN OLD.text = 'old_only'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected call-string cleanup failure');
+             END;",
+        )
+        .unwrap();
+
+    let source = "int new_only(void) { return 2; }\n";
+    let parsed = parse(std::path::Path::new("new.c"), source);
+    let fp = fingerprint("new.c", source, 1);
+    let build = store.begin_index_build(true).unwrap();
+    store
+        .stage_file_updates(
+            build,
+            &[FileIndexUpdate {
+                fingerprint: &fp,
+                source: FileSource::Workspace,
+                payload: FileIndexPayload::Ok(&parsed),
+            }],
+        )
+        .unwrap();
+    let outcome = store
+        .commit_index_build(
+            build,
+            &IncludeGraphUpdate {
+                clear_all: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(outcome
+        .cleanup_warning
+        .as_deref()
+        .is_some_and(|warning| warning.contains("injected call-string cleanup failure")));
+    assert_eq!(store.semantic_generation().unwrap(), 2);
+    assert!(store.declarations_by_name("old_only").unwrap().is_empty());
+    assert_eq!(store.declarations_by_name("new_only").unwrap().len(), 1);
+
+    let raw_revisions: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM file_revisions", [], |row| row.get(0))
+        .unwrap();
+    let raw_old_declarations: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM declaration_facts WHERE name = 'old_only'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let cleanup_required: String = store
+        .conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'cleanup_required'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        (
+            raw_revisions,
+            raw_old_declarations,
+            cleanup_required.as_str()
+        ),
+        (2, 1, "1"),
+        "a late cleanup failure must roll back every cleanup delete and persist retry debt"
+    );
+    let foreign_keys_enabled: i64 = store
+        .conn
+        .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        foreign_keys_enabled, 1,
+        "cleanup failure must restore foreign-key enforcement"
+    );
+
+    store
+        .conn
+        .execute_batch("DROP TRIGGER fail_orphan_call_string_cleanup")
+        .unwrap();
+    let _next = store.begin_index_build(false).unwrap();
+    let remaining_revisions: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM file_revisions", [], |row| row.get(0))
+        .unwrap();
+    let remaining_old_strings: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM call_strings WHERE text = 'old_only'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let cleanup_required: String = store
+        .conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'cleanup_required'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(remaining_revisions, 1);
+    assert_eq!(remaining_old_strings, 0);
+    assert_eq!(cleanup_required, "0");
+    let mut foreign_key_check = store.conn.prepare("PRAGMA foreign_key_check").unwrap();
+    assert!(!foreign_key_check.exists([]).unwrap());
+}
+
+#[test]
+fn current_schema_without_cleanup_marker_is_audited_before_the_next_build() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("index.sqlite");
+    let mut store = IndexStore::open(&db, dir.path()).unwrap();
+    upsert_source(&mut store, "main.c", "int stable(void);\n");
+
+    let source = "int abandoned(void);\n";
+    let parsed = parse(std::path::Path::new("main.c"), source);
+    let fp = fingerprint("main.c", source, 2);
+    let abandoned = store.begin_index_build(false).unwrap();
+    store
+        .stage_file_updates(
+            abandoned,
+            &[FileIndexUpdate {
+                fingerprint: &fp,
+                source: FileSource::Workspace,
+                payload: FileIndexPayload::Ok(&parsed),
+            }],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute("DELETE FROM meta WHERE key = 'cleanup_required'", [])
+        .unwrap();
+    drop(store);
+
+    let mut reopened = IndexStore::open(&db, dir.path()).unwrap();
+    let backfilled_marker: String = reopened
+        .conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'cleanup_required'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        backfilled_marker, "1",
+        "an existing current-schema database without the marker needs one legacy audit"
+    );
+
+    let _next = reopened.begin_index_build(false).unwrap();
+    let raw_revisions: i64 = reopened
+        .conn
+        .query_row("SELECT COUNT(*) FROM file_revisions", [], |row| row.get(0))
+        .unwrap();
+    let cleanup_required: String = reopened
+        .conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'cleanup_required'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(raw_revisions, 1);
+    assert_eq!(cleanup_required, "0");
+}
+
+#[test]
+fn bulk_cleanup_removes_every_revision_owned_fact_family() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("index.sqlite");
+    let mut store = IndexStore::open(&db, dir.path()).unwrap();
+    upsert_source(
+        &mut store,
+        "src/rich.c",
+        "#include \"dep.h\"\n\
+         struct Item { int value; };\n\
+         typedef struct Item ItemAlias;\n\
+         static int helper(int value) { return value; }\n\
+         int caller(void) { return helper(1); }\n",
+    );
+    upsert_source(
+        &mut store,
+        "src/rich.go",
+        "package rich\nimport device \"example.com/device\"\n\
+         func Read() { device.Open() }\n",
+    );
+    upsert_source(&mut store, "src/broken.c", "((( guessed(value);\n");
+
+    let revision_fact_tables = [
+        "fallback_completion_facts",
+        "declaration_facts",
+        "package_facts",
+        "import_facts",
+        "include_facts",
+        "record_facts",
+        "member_facts",
+        "type_alias_facts",
+        "callable_anchor_facts",
+        "call_site_facts",
+    ];
+    for table in revision_fact_tables {
+        let count: i64 = store
+            .conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(count > 0, "fixture must populate {table}");
+    }
+
+    let source = "int only_active(void) { return 1; }\n";
+    let parsed = parse(std::path::Path::new("src/fresh.c"), source);
+    let fp = fingerprint("src/fresh.c", source, 1);
+    let build = store.begin_index_build(true).unwrap();
+    store
+        .stage_file_updates(
+            build,
+            &[FileIndexUpdate {
+                fingerprint: &fp,
+                source: FileSource::Workspace,
+                payload: FileIndexPayload::Ok(&parsed),
+            }],
+        )
+        .unwrap();
+    let outcome = store
+        .commit_index_build(
+            build,
+            &IncludeGraphUpdate {
+                clear_all: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(outcome.cleanup_warning.is_none());
+
+    for table in revision_fact_tables {
+        let stale: i64 = store
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM {table} facts
+                     WHERE facts.revision_id NOT IN (
+                         SELECT revision_id FROM active_file_revisions
+                     )"
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale, 0, "{table} retained an inactive revision");
+    }
+    let revision_counts: (i64, i64) = store
+        .conn
+        .query_row(
+            "SELECT
+                 (SELECT COUNT(*) FROM file_revisions),
+                 (SELECT COUNT(*) FROM active_file_revisions)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(revision_counts, (1, 1));
 }
 
 #[test]

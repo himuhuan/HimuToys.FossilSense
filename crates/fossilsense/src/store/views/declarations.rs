@@ -20,6 +20,7 @@ const SELECT: &str = "SELECT
     d.linkage_kind, d.guard, d.language, d.language_fidelity, d.provenance,
     d.fact_fidelity, d.logical_key_digest, d.locator_fingerprint,
     d.logical_linkage_domain, d.guard_fingerprint,
+    d.logical_canonical_signature,
     d.backing_kind, d.backing_id, d.backing_key,
     d.backing_start_byte, d.backing_end_byte,
     f.path, rev.source, f.directly_included,
@@ -30,7 +31,7 @@ const SELECT: &str = "SELECT
 
 const SELECT_NAME: &str = "SELECT
     d.id, d.name, d.declaration_kind, d.role,
-    f.path, rev.source, f.directly_included
+    d.language, f.path, rev.source, f.directly_included
     FROM declarations d
     JOIN file_entries f ON f.id = d.file_id
     JOIN file_revisions rev ON rev.id = d.revision_id";
@@ -58,6 +59,7 @@ pub struct DeclarationNameRow {
     pub name: String,
     pub declaration_kind: SemanticDeclarationKind,
     pub role: SemanticDeclarationRole,
+    pub semantic_family: crate::semantic_model::SemanticFamily,
     pub path: String,
     pub external: bool,
     pub directly_included: bool,
@@ -73,6 +75,7 @@ pub struct DeclarationNameRef<'a> {
     pub name: &'a str,
     pub declaration_kind: SemanticDeclarationKind,
     pub role: SemanticDeclarationRole,
+    pub semantic_family: crate::semantic_model::SemanticFamily,
     pub path: &'a str,
     pub external: bool,
     pub directly_included: bool,
@@ -104,8 +107,8 @@ impl<'a> DeclarationStoreView<'a> {
         while let Some(row) = rows.next()? {
             let id = row.get(0)?;
             let name = row.get_ref(1)?.as_str()?;
-            let path = row.get_ref(4)?.as_str()?;
-            let source = row.get_ref(5)?.as_str()?;
+            let path = row.get_ref(5)?.as_str()?;
+            let source = row.get_ref(6)?.as_str()?;
             visitor(DeclarationNameRef {
                 id,
                 name,
@@ -113,9 +116,10 @@ impl<'a> DeclarationStoreView<'a> {
                     .with_context(|| format!("invalid declaration kind for row {id}"))?,
                 role: declaration_role(row.get(3)?)
                     .with_context(|| format!("invalid declaration role for row {id}"))?,
+                semantic_family: semantic_language(row.get(4)?)?.semantic_family(),
                 path,
                 external: source == "external",
-                directly_included: row.get::<_, i64>(6)? != 0,
+                directly_included: row.get::<_, i64>(7)? != 0,
             })?;
             count += 1;
         }
@@ -173,12 +177,25 @@ impl<'a> DeclarationStoreView<'a> {
         Ok(output)
     }
 
+    #[cfg(test)]
     pub fn by_name_limited(
         &self,
         name: &str,
         limit: usize,
     ) -> Result<(Vec<DeclarationReadRow>, bool)> {
         let sql = format!("{SELECT} WHERE d.name = ?1 ORDER BY d.id LIMIT ?2");
+        let rows = self.read(&sql, params![name, limit.saturating_add(1) as i64])?;
+        Ok(truncate(rows, limit))
+    }
+
+    pub fn by_name_family_limited(
+        &self,
+        name: &str,
+        semantic_family: crate::semantic_model::SemanticFamily,
+        limit: usize,
+    ) -> Result<(Vec<DeclarationReadRow>, bool)> {
+        let language = semantic_family_sql_predicate(semantic_family, "d.language");
+        let sql = format!("{SELECT} WHERE d.name = ?1 AND {language} ORDER BY d.id LIMIT ?2");
         let rows = self.read(&sql, params![name, limit.saturating_add(1) as i64])?;
         Ok(truncate(rows, limit))
     }
@@ -193,6 +210,7 @@ impl<'a> DeclarationStoreView<'a> {
     /// only after the ordinary workspace-wide read proves that its cap hid
     /// rows, so current and reachable declarations cannot be starved by
     /// earlier unrelated declarations with the same spelling.
+    #[cfg(test)]
     pub fn by_name_in_paths_limited(
         &self,
         name: &str,
@@ -205,6 +223,36 @@ impl<'a> DeclarationStoreView<'a> {
             let placeholders = vec!["?"; chunk.len()].join(",");
             let sql = format!(
                 "{SELECT} WHERE d.name = ? AND f.path IN ({placeholders}) \
+                 ORDER BY d.id LIMIT {probe_limit}"
+            );
+            let mut values = Vec::with_capacity(chunk.len() + 1);
+            values.push(name);
+            values.extend(chunk.iter().map(String::as_str));
+            output.extend(self.read(&sql, rusqlite::params_from_iter(values))?);
+            if output.len() > limit {
+                break;
+            }
+        }
+        Ok(truncate(output, limit))
+    }
+
+    pub fn by_name_family_in_paths_limited(
+        &self,
+        name: &str,
+        semantic_family: crate::semantic_model::SemanticFamily,
+        paths: &[String],
+        limit: usize,
+    ) -> Result<(Vec<DeclarationReadRow>, bool)> {
+        let mut output = Vec::new();
+        let language = semantic_family_sql_predicate(semantic_family, "d.language");
+        for chunk in paths.chunks(399) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let probe_limit = limit.saturating_sub(output.len()).saturating_add(1);
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "{SELECT} WHERE d.name = ? AND {language} AND f.path IN ({placeholders}) \
                  ORDER BY d.id LIMIT {probe_limit}"
             );
             let mut values = Vec::with_capacity(chunk.len() + 1);
@@ -233,6 +281,7 @@ impl<'a> DeclarationStoreView<'a> {
         Ok(ids.iter().filter_map(|id| by_id.get(id).cloned()).collect())
     }
 
+    #[cfg(test)]
     pub fn by_logical_key_limited(
         &self,
         key: &LogicalEntityKey,
@@ -246,6 +295,31 @@ impl<'a> DeclarationStoreView<'a> {
             .unwrap_or(key.qualified_name.as_str());
         let sql = format!(
             "{SELECT} WHERE d.name = ?1 AND d.logical_key_digest = ?2 ORDER BY d.id LIMIT ?3"
+        );
+        let rows = self.read(&sql, params![name, digest, limit.saturating_add(1) as i64])?;
+        let rows = rows
+            .into_iter()
+            .filter(|row| &row.fact.identity.logical_key == key)
+            .collect();
+        Ok(truncate(rows, limit))
+    }
+
+    pub fn by_logical_key_family_limited(
+        &self,
+        key: &LogicalEntityKey,
+        semantic_family: crate::semantic_model::SemanticFamily,
+        limit: usize,
+    ) -> Result<(Vec<DeclarationReadRow>, bool)> {
+        let digest = logical_key_digest(key)?;
+        let name = key
+            .qualified_name
+            .rsplit("::")
+            .next()
+            .unwrap_or(key.qualified_name.as_str());
+        let language = semantic_family_sql_predicate(semantic_family, "d.language");
+        let sql = format!(
+            "{SELECT} WHERE d.name = ?1 AND d.logical_key_digest = ?2 AND {language} \
+             ORDER BY d.id LIMIT ?3"
         );
         let rows = self.read(&sql, params![name, digest, limit.saturating_add(1) as i64])?;
         let rows = rows
@@ -278,9 +352,10 @@ fn declaration_name_row(row: &rusqlite::Row<'_>) -> Result<DeclarationNameRow> {
             .with_context(|| format!("invalid declaration kind for row {id}"))?,
         role: declaration_role(row.get(3)?)
             .with_context(|| format!("invalid declaration role for row {id}"))?,
-        path: row.get(4)?,
-        external: row.get::<_, String>(5)? == "external",
-        directly_included: row.get::<_, i64>(6)? != 0,
+        semantic_family: semantic_language(row.get(4)?)?.semantic_family(),
+        path: row.get(5)?,
+        external: row.get::<_, String>(6)? == "external",
+        directly_included: row.get::<_, i64>(7)? != 0,
     })
 }
 
@@ -302,11 +377,20 @@ fn declaration_row(row: &rusqlite::Row<'_>) -> Result<DeclarationReadRow> {
         .with_context(|| format!("invalid declarator shape for declaration row {id}"))?;
     let has_initializer = row.get::<_, Option<i64>>(19)?.map(|value| value != 0);
     let owner: Option<String> = row.get(20)?;
-    let path: String = row.get(36)?;
+    let path: String = row.get(37)?;
+    let logical_linkage_domain: String = row.get(29)?;
     let linkage = match row.get::<_, i64>(21)? {
         0 => LinkageDomain::External,
         1 => LinkageDomain::Internal(path.clone()),
         2 => LinkageDomain::Unknown,
+        3 => LinkageDomain::Package(
+            logical_linkage_domain
+                .strip_prefix("package:")
+                .with_context(|| {
+                    format!("package linkage is missing its domain for declaration row {id}")
+                })?
+                .to_string(),
+        ),
         value => anyhow::bail!("invalid linkage kind {value} for declaration row {id}"),
     };
     let guard: Option<String> = row.get(22)?;
@@ -323,17 +407,22 @@ fn declaration_row(row: &rusqlite::Row<'_>) -> Result<DeclarationReadRow> {
         logical_key_digest.len() == 12,
         "invalid logical key digest for declaration row {id}"
     );
-    let locator_fingerprint: String = row.get(28)?;
-    let logical_linkage_domain: String = row.get(29)?;
-    let guard_fingerprint: Option<String> = row.get(30)?;
-    let backing_kind: String = row.get(31)?;
-    let backing_id: Option<i64> = row.get(32)?;
-    let backing_key: Option<String> = row.get(33)?;
-    let backing_start: Option<i64> = row.get(34)?;
-    let backing_end: Option<i64> = row.get(35)?;
+    let locator_fingerprint = stored_digest_hex(row.get(28)?, "locator fingerprint", id)?;
+    let guard_fingerprint = row
+        .get::<_, Option<Vec<u8>>>(30)?
+        .map(|value| stored_digest_hex(value, "guard fingerprint", id))
+        .transpose()?;
+    let logical_canonical_signature =
+        stored_logical_signature(row.get(31)?, canonical_signature.as_deref(), id)?;
+    let backing_kind = declaration_backing_kind(row.get(32)?)
+        .with_context(|| format!("invalid backing kind for declaration row {id}"))?;
+    let backing_id: Option<i64> = row.get(33)?;
+    let backing_key: Option<String> = row.get(34)?;
+    let backing_start: Option<i64> = row.get(35)?;
+    let backing_end: Option<i64> = row.get(36)?;
     let backing = declaration_backing(
         id,
-        &backing_kind,
+        backing_kind,
         backing_key,
         backing_start,
         backing_end,
@@ -344,7 +433,7 @@ fn declaration_row(row: &rusqlite::Row<'_>) -> Result<DeclarationReadRow> {
         qualified_name: qualified_name.clone(),
         declaration_kind,
         owner: owner.clone(),
-        canonical_signature: canonical_signature.clone(),
+        canonical_signature: logical_canonical_signature,
         linkage_domain: logical_linkage_domain,
         guard_fingerprint,
     };
@@ -383,14 +472,14 @@ fn declaration_row(row: &rusqlite::Row<'_>) -> Result<DeclarationReadRow> {
         id,
         fact,
         logical_key_digest,
-        backing_kind,
+        backing_kind: backing_kind.to_string(),
         backing_id,
-        external: row.get::<_, String>(37)? == "external",
-        directly_included: row.get::<_, i64>(38)? != 0,
-        revision_id: row.get(39)?,
-        revision_size: row.get::<_, i64>(40)? as u64,
-        revision_mtime_ns: row.get(41)?,
-        revision_hash: row.get(42)?,
+        external: row.get::<_, String>(38)? == "external",
+        directly_included: row.get::<_, i64>(39)? != 0,
+        revision_id: row.get(40)?,
+        revision_size: row.get::<_, i64>(41)? as u64,
+        revision_mtime_ns: row.get(42)?,
+        revision_hash: row.get(43)?,
     })
 }
 
@@ -443,6 +532,60 @@ fn declaration_backing(
     })
 }
 
+fn declaration_backing_kind(value: i64) -> Result<&'static str> {
+    Ok(match value {
+        0 => "callable_anchor",
+        1 => "record",
+        2 => "type_alias",
+        3 => "source_range",
+        4 => "none",
+        _ => anyhow::bail!("unknown declaration backing kind code {value}"),
+    })
+}
+
+fn stored_digest_hex(value: Vec<u8>, field: &str, row_id: i64) -> Result<String> {
+    anyhow::ensure!(
+        value.len() == 12,
+        "invalid {field} length {} for declaration row {row_id}",
+        value.len()
+    );
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(24);
+    for byte in value {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    Ok(output)
+}
+
+fn stored_logical_signature(
+    value: Option<Vec<u8>>,
+    canonical_signature: Option<&str>,
+    row_id: i64,
+) -> Result<Option<String>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let Some((&tag, payload)) = value.split_first() else {
+        anyhow::bail!("empty logical signature tag for declaration row {row_id}");
+    };
+    match tag {
+        0 if payload.is_empty() => canonical_signature
+            .map(str::to_string)
+            .with_context(|| {
+                format!("logical signature references an absent display value for row {row_id}")
+            })
+            .map(Some),
+        0 => {
+            anyhow::bail!("same-value logical signature has a payload for declaration row {row_id}")
+        }
+        1 => String::from_utf8(payload.to_vec())
+            .with_context(|| format!("logical signature is not UTF-8 for declaration row {row_id}"))
+            .map(Some),
+        _ => anyhow::bail!("unknown logical signature tag {tag} for declaration row {row_id}"),
+    }
+}
+
 fn declaration_kind(value: i64) -> Result<SemanticDeclarationKind> {
     Ok(match value {
         0 => SemanticDeclarationKind::Function,
@@ -471,8 +614,19 @@ fn semantic_language(value: i64) -> Result<SemanticLanguage> {
         0 => SemanticLanguage::C,
         1 => SemanticLanguage::Cpp,
         2 => SemanticLanguage::Unknown,
+        3 => SemanticLanguage::Go,
         _ => anyhow::bail!("unknown semantic language code {value}"),
     })
+}
+
+fn semantic_family_sql_predicate(
+    semantic_family: crate::semantic_model::SemanticFamily,
+    column: &str,
+) -> String {
+    match semantic_family {
+        crate::semantic_model::SemanticFamily::CFamily => format!("{column} <> 3"),
+        crate::semantic_model::SemanticFamily::Go => format!("{column} = 3"),
+    }
 }
 
 fn language_fidelity(value: i64) -> Result<LanguageFidelity> {

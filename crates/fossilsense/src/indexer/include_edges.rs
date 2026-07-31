@@ -159,6 +159,7 @@ pub(super) fn build_include_edges(
         unresolved,
         ambiguous,
         clear_all: only.is_none(),
+        ..Default::default()
     })
 }
 

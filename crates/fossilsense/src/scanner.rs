@@ -94,12 +94,17 @@ mod tests {
         )
         .expect("main");
         fs::write(dir.path().join("src/lib.HPP"), "#pragma once").expect("header");
+        fs::write(
+            dir.path().join("src/device.go"),
+            "package device\n\nfunc Ready() bool { return true }\n",
+        )
+        .expect("go source");
         fs::write(dir.path().join("src/readme.txt"), "ignored").expect("txt");
         fs::write(dir.path().join("target/generated.c"), "ignored();").expect("generated");
 
         let (summary, _) = scan_workspace(dir.path()).expect("scan");
 
-        assert_eq!(summary.files.len(), 2);
+        assert_eq!(summary.files.len(), 3);
         assert!(summary
             .files
             .iter()
@@ -108,6 +113,11 @@ mod tests {
             .files
             .iter()
             .any(|file| file.ends_with("src/lib.HPP")));
+        assert!(summary
+            .files
+            .iter()
+            .any(|file| file.ends_with("src/device.go")));
+        assert_eq!(summary.extension_counts.get("go"), Some(&1));
     }
 
     #[test]

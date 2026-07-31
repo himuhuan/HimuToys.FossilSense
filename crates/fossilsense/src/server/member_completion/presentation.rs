@@ -13,6 +13,7 @@ pub(super) fn remember_member(
     candidate: crate::model::MemberCandidate,
     root: PathBuf,
     semantic_generation: crate::call_model::SemanticGeneration,
+    semantic_family: crate::semantic_model::SemanticFamily,
     weak_receiver: bool,
     ambiguous_owner: bool,
 ) {
@@ -21,6 +22,7 @@ pub(super) fn remember_member(
         candidate,
         root,
         semantic_generation,
+        semantic_family,
         weak_receiver,
         ambiguous_owner,
     };

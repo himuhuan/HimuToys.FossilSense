@@ -41,7 +41,7 @@ use crate::store::IndexStore;
 #[derive(Debug, Parser)]
 #[command(name = "fossilsense")]
 #[command(version)]
-#[command(about = "FossilSense best-effort C/C++ navigation and analysis")]
+#[command(about = "FossilSense best-effort C/C++ and Go navigation and analysis")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -49,9 +49,13 @@ struct Cli {
 
 #[cfg(test)]
 mod cli_tests {
-    use clap::{error::ErrorKind, Parser};
+    use std::fs;
+    use std::path::Path;
 
-    use super::Cli;
+    use clap::{error::ErrorKind, CommandFactory, Parser};
+    use tempfile::tempdir;
+
+    use super::{query_semantic_family, Cli};
 
     #[test]
     fn version_flag_reports_the_crate_version() {
@@ -60,6 +64,38 @@ mod cli_tests {
 
         assert_eq!(error.kind(), ErrorKind::DisplayVersion);
         assert!(error.to_string().contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn cli_help_describes_c_cpp_and_go_support() {
+        let help = Cli::command().render_long_help().to_string();
+
+        assert!(help.contains("C/C++ and Go"));
+        assert!(help.contains("supported C/C++ and Go files"));
+    }
+
+    #[test]
+    fn cli_query_family_uses_go_extensions_and_workspace_language_overrides() {
+        let root = tempdir().expect("workspace");
+        fs::create_dir_all(root.path().join("legacy")).expect("legacy");
+        fs::write(
+            root.path().join("fossilsense.json"),
+            r#"{
+              "languageOverrides": [
+                { "glob": "legacy/**/*.h", "language": "go" }
+              ]
+            }"#,
+        )
+        .expect("config");
+
+        assert_eq!(
+            query_semantic_family(root.path(), Path::new("main.go")),
+            crate::semantic_model::SemanticFamily::Go
+        );
+        assert_eq!(
+            query_semantic_family(root.path(), Path::new("legacy/api.h")),
+            crate::semantic_model::SemanticFamily::Go
+        );
     }
 }
 
@@ -78,7 +114,7 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Scan a workspace and report C/C++ files that would enter the index.
+    /// Scan a workspace and report supported C/C++ and Go files that would enter the index.
     Scan {
         /// Workspace root to scan.
         workspace: PathBuf,
@@ -271,7 +307,6 @@ fn run_query(kind: QueryCommand) -> Result<()> {
             col,
             db,
         } => {
-            let db_path = resolve_db_path(db, &workspace)?;
             let abs = workspace.join(&file);
             let content = fs::read_to_string(&abs)
                 .with_context(|| format!("failed to read {}", abs.display()))?;
@@ -287,14 +322,16 @@ fn run_query(kind: QueryCommand) -> Result<()> {
             }
 
             let rel = pathing::normalize_path_string(&file);
-            let handle = call_service::CallReadHandle::capture(db_path)?;
+            let semantic_family = query_semantic_family(&workspace, &file);
+            let handle = capture_query_handle(db, &workspace)?;
             let overlay = candidate_service::CandidateOverlaySnapshot::default();
-            let service = candidate_service::CandidateQueryService::new(
+            let service = candidate_service::CandidateQueryService::new_for_family(
                 Some(&handle),
                 &overlay,
                 &rel,
                 None,
                 None,
+                semantic_family,
             );
             let semantic =
                 service.semantic_candidates(&word, candidate_service::SemanticIntent::Neutral)?;
@@ -348,10 +385,10 @@ fn run_query(kind: QueryCommand) -> Result<()> {
             incoming,
             db,
         } => {
-            let db_path = resolve_db_path(db, &workspace)?;
             let build_started = Instant::now();
-            let handle = call_service::CallReadHandle::capture(db_path)?;
+            let handle = capture_query_handle(db, &workspace)?;
             let rel = pathing::normalize_path_string(&file);
+            let semantic_family = query_semantic_family(&workspace, &file);
             let position = call_model::SourcePosition {
                 line: line.checked_sub(1).context("line is 1-based")? as u32,
                 character: col.checked_sub(1).context("column is 1-based")? as u32,
@@ -362,7 +399,13 @@ fn run_query(kind: QueryCommand) -> Result<()> {
             } else {
                 call_model::RelationDirection::Outgoing
             };
-            let (query_index, entity_key, page) = call_service::CallRelationService::new(&handle)
+            let (query_index, entity_key, page) =
+                call_service::CallRelationService::for_request_with_reach_and_family(
+                    &handle,
+                    &[],
+                    None,
+                    semantic_family,
+                )
                 .query_at(&rel, position, direction, 0, 200, 200)
                 .with_context(|| format!("no callable at {}:{line}:{col}", file.display()))?;
             let entity = query_index
@@ -417,13 +460,18 @@ fn run_query(kind: QueryCommand) -> Result<()> {
                 serde_json::to_string(query_index.coverage())?
             );
             for relation in relations {
-                let target = relation
-                    .callee
-                    .as_ref()
-                    .map_or("<unresolved>", |callee| callee.qualified_name.as_str());
+                let counterpart = match relation.direction {
+                    call_model::RelationDirection::Incoming => {
+                        relation.caller.qualified_name.as_str()
+                    }
+                    call_model::RelationDirection::Outgoing => relation
+                        .callee
+                        .as_ref()
+                        .map_or("<unresolved>", |callee| callee.qualified_name.as_str()),
+                };
                 println!(
                     "{}\t{:?}\t{} sites\t{:?}",
-                    target,
+                    counterpart,
                     relation.confidence,
                     relation.call_sites.len(),
                     relation.evidence
@@ -434,12 +482,33 @@ fn run_query(kind: QueryCommand) -> Result<()> {
     }
 }
 
+fn query_semantic_family(workspace: &Path, file: &Path) -> semantic_model::SemanticFamily {
+    let (config, _) = config::WorkspaceConfig::load(workspace);
+    config::LanguageResolver::from_workspace_config(workspace, &config)
+        .language_for_path(&workspace.join(file))
+        .semantic_family()
+}
+
 fn resolve_db_path(db: Option<PathBuf>, workspace: &Path) -> Result<PathBuf> {
     match db {
         Some(path) => Ok(path),
         None => {
             let workspace = pathing::canonical_workspace(workspace)?;
             pathing::default_index_path(&workspace)
+        }
+    }
+}
+
+fn capture_query_handle(
+    db: Option<PathBuf>,
+    workspace: &Path,
+) -> Result<call_service::CallReadHandle> {
+    match db {
+        Some(path) => call_service::CallReadHandle::capture(path),
+        None => {
+            let workspace = pathing::canonical_workspace(workspace)?;
+            let path = pathing::default_index_path(&workspace)?;
+            call_service::CallReadHandle::capture_default_generation(path)
         }
     }
 }

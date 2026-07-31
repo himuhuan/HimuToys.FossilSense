@@ -11,6 +11,7 @@ pub(crate) fn anchor_from_row(row: CallableAnchorRow) -> CallableAnchor {
         // canonical workspace-relative path. Normalize the domain here so a
         // same-file static call compares like with like.
         "internal" => LinkageDomain::Internal(row.path.clone()),
+        "package" => LinkageDomain::Package(row.linkage_file.clone().unwrap_or_default()),
         _ => LinkageDomain::Unknown,
     };
     CallableAnchor {

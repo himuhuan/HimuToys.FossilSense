@@ -2,15 +2,18 @@ use tempfile::tempdir;
 
 use crate::parser::parse;
 
-use super::{FileFingerprint, FileSource, IndexStore};
+use super::{drain_sqlite_wal, FileFingerprint, FileSource, IndexStore, IndexWriterLock};
 use std::collections::HashSet;
 
 mod basic;
 mod call_facts;
 mod fallback_facts;
+mod generation_cleanup;
 mod generations;
+mod go_facts;
 mod maintenance;
 mod members;
+mod migration_atomicity;
 mod parser_consumer_migration;
 mod query_scoping;
 mod read_model_parity;

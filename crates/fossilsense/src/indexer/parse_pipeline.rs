@@ -175,15 +175,21 @@ fn parse_candidate(candidate: FileCandidate, language_resolver: &LanguageResolve
                 fingerprint.hash = blake3::hash(&bytes).to_hex().to_string();
             }
             let source = String::from_utf8_lossy(&bytes);
+            let language = language_resolver.language_for_path(&candidate.absolute_path);
+            let identity_path = if language == crate::config::SourceLanguage::Go {
+                std::path::Path::new(&fingerprint.path)
+            } else {
+                candidate.absolute_path.as_path()
+            };
             // The thread-local parser uses the INDEX mask, skipping
             // request-time occurrence and local-declaration collection (those
             // vectors would be cleared before writing anyway).
             // It is infallible for ordinary parse problems (degrades to the
             // isolated completion fallback), so the only error here is the file read.
             let mut index = parse_thread_local_with_language(
-                &candidate.absolute_path,
+                identity_path,
                 &source,
-                language_resolver.language_for_path(&candidate.absolute_path),
+                language,
                 ParseFacts::INDEX,
             );
             if candidate.source == FileSource::External {
@@ -201,5 +207,52 @@ fn parse_candidate(candidate: FileCandidate, language_resolver: &LanguageResolve
         fingerprint,
         source: candidate.source,
         result,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::call_model::LinkageDomain;
+    use crate::config::WorkspaceConfig;
+    use crate::store::FileFingerprint;
+
+    #[test]
+    fn go_parse_pipeline_uses_workspace_relative_identity_path() {
+        let workspace = tempdir().expect("workspace");
+        let absolute_path = workspace.path().join("src/sensor/read.go");
+        fs::create_dir_all(absolute_path.parent().expect("parent")).expect("src");
+        fs::write(&absolute_path, "package sensor\nfunc Read() {}\n").expect("source");
+        let candidate = FileCandidate {
+            absolute_path,
+            fingerprint: FileFingerprint {
+                path: "src/sensor/read.go".to_string(),
+                extension: "go".to_string(),
+                size: 30,
+                mtime_ns: 1,
+                hash: "hash".to_string(),
+            },
+            source: FileSource::Workspace,
+        };
+        let resolver =
+            LanguageResolver::from_workspace_config(workspace.path(), &WorkspaceConfig::default());
+
+        let parsed = parse_candidate(candidate, &resolver)
+            .result
+            .expect("parsed Go file");
+        let read = parsed
+            .declarations
+            .iter()
+            .find(|declaration| declaration.name == "Read")
+            .expect("Read declaration");
+        assert_eq!(read.path, "src/sensor/read.go");
+        assert_eq!(
+            read.linkage,
+            LinkageDomain::Package("src/sensor#sensor".to_string())
+        );
     }
 }

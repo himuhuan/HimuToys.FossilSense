@@ -8,6 +8,7 @@ use super::super::IndexStore;
 pub struct CallableAnchorRow {
     pub id: i64,
     pub path: String,
+    pub semantic_family: crate::semantic_model::SemanticFamily,
     pub source: String,
     pub directly_included: bool,
     pub entity_key: String,
@@ -71,20 +72,28 @@ impl<'a> CallFactStoreView<'a> {
         Self { store }
     }
 
-    pub fn anchors_by_entity_key_limited(
+    pub fn anchors_by_entity_key_family_limited(
         &self,
         entity_key: &str,
+        semantic_family: crate::semantic_model::SemanticFamily,
         limit: usize,
     ) -> Result<(Vec<CallableAnchorRow>, bool)> {
-        self.anchor_query_limited("WHERE a.entity_digest = unhex(?1)", [entity_key], limit)
+        let language = semantic_family_sql_predicate(semantic_family, "rev.language");
+        self.anchor_query_limited(
+            &format!("WHERE a.entity_digest = unhex(?1) AND {language}"),
+            [entity_key],
+            limit,
+        )
     }
 
-    pub fn anchors_by_path_limited(
+    pub fn anchors_by_path_family_limited(
         &self,
         path: &str,
+        semantic_family: crate::semantic_model::SemanticFamily,
         limit: usize,
     ) -> Result<(Vec<CallableAnchorRow>, bool)> {
-        self.anchor_query_limited("WHERE f.path = ?1", [path], limit)
+        let language = semantic_family_sql_predicate(semantic_family, "rev.language");
+        self.anchor_query_limited(&format!("WHERE f.path = ?1 AND {language}"), [path], limit)
     }
 
     pub fn anchors_at_limited(
@@ -112,6 +121,36 @@ impl<'a> CallFactStoreView<'a> {
         )
     }
 
+    pub fn anchors_at_family_limited(
+        &self,
+        path: &str,
+        line: u32,
+        character: u32,
+        semantic_family: crate::semantic_model::SemanticFamily,
+        limit: usize,
+    ) -> Result<(Vec<CallableAnchorRow>, bool)> {
+        let line = line.to_string();
+        let character = character.to_string();
+        let language = semantic_family_sql_predicate(semantic_family, "rev.language");
+        self.anchor_query_limited(
+            &format!(
+                "WHERE a.revision_id = (
+                    SELECT active.revision_id FROM active_file_revisions active
+                    JOIN file_entries entry ON entry.id = active.file_id
+                    WHERE entry.path = ?1
+                 ) AND {language} AND (
+                    (a.name_start_line = ?2 AND a.name_end_line = ?2
+                     AND a.name_start_col <= ?3 AND a.name_end_col >= ?3)
+                    OR (a.declaration_start_line <= ?2 AND a.declaration_end_line >= ?2)
+                    OR (a.body_start_line <= ?2 AND a.body_end_line >= ?2)
+                )"
+            ),
+            [path, line.as_str(), character.as_str()],
+            limit,
+        )
+    }
+
+    #[cfg(test)]
     pub fn anchors_by_names_limited(
         &self,
         names: &[String],
@@ -120,6 +159,22 @@ impl<'a> CallFactStoreView<'a> {
         self.anchors_by_values_limited("name_text.text", names, false, limit)
     }
 
+    pub fn anchors_by_names_family_limited(
+        &self,
+        names: &[String],
+        semantic_family: crate::semantic_model::SemanticFamily,
+        limit: usize,
+    ) -> Result<(Vec<CallableAnchorRow>, bool)> {
+        self.anchors_by_values_family_limited(
+            "name_text.text",
+            names,
+            false,
+            semantic_family,
+            limit,
+        )
+    }
+
+    #[cfg(test)]
     pub fn anchors_by_name_limited(
         &self,
         name: &str,
@@ -140,6 +195,26 @@ impl<'a> CallFactStoreView<'a> {
         Ok((output, truncated))
     }
 
+    pub fn anchors_by_name_family_limited(
+        &self,
+        name: &str,
+        semantic_family: crate::semantic_model::SemanticFamily,
+        limit: usize,
+    ) -> Result<(Vec<CallableAnchorRow>, bool)> {
+        let language = semantic_family_sql_predicate(semantic_family, "rev.language");
+        let predicate = format!(
+            "WHERE a.name_id = (SELECT id FROM call_strings WHERE text = ?1) AND {language}"
+        );
+        let mut output = Vec::new();
+        self.visit_anchors(&predicate, &[name], Some(limit.saturating_add(1)), |row| {
+            output.push(row);
+            Ok(())
+        })?;
+        let truncated = output.len() > limit;
+        output.truncate(limit);
+        Ok((output, truncated))
+    }
+
     /// Bounded exact-name read restricted to a caller-provided path set.
     ///
     /// Request-local reachability lives outside SQLite (and may include dirty
@@ -148,6 +223,7 @@ impl<'a> CallFactStoreView<'a> {
     /// ordinary workspace-wide fallback. Paths are chunked below SQLite's
     /// conservative bind-parameter budget; every chunk keeps the exact-name
     /// predicate and a LIMIT+1 probe.
+    #[cfg(test)]
     pub fn anchors_by_name_in_paths_limited(
         &self,
         name: &str,
@@ -178,14 +254,51 @@ impl<'a> CallFactStoreView<'a> {
         Ok((output, truncated))
     }
 
-    pub fn anchors_by_entity_keys_limited(
+    pub fn anchors_by_name_family_in_paths_limited(
         &self,
-        keys: &[String],
+        name: &str,
+        semantic_family: crate::semantic_model::SemanticFamily,
+        paths: &[String],
         limit: usize,
     ) -> Result<(Vec<CallableAnchorRow>, bool)> {
-        self.anchors_by_values_limited("a.entity_digest", keys, true, limit)
+        let mut output = Vec::new();
+        let language = semantic_family_sql_predicate(semantic_family, "rev.language");
+        for chunk in paths.chunks(399) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let probe_limit = limit.saturating_sub(output.len()).saturating_add(1);
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let predicate = format!(
+                "WHERE a.name_id = (SELECT id FROM call_strings WHERE text = ?) \
+                 AND {language} AND f.path IN ({placeholders})"
+            );
+            let mut params = Vec::with_capacity(chunk.len() + 1);
+            params.push(name);
+            params.extend(chunk.iter().map(String::as_str));
+            self.visit_anchors(&predicate, &params, Some(probe_limit), |row| {
+                output.push(row);
+                Ok(())
+            })?;
+            if output.len() > limit {
+                break;
+            }
+        }
+        let truncated = output.len() > limit;
+        output.truncate(limit);
+        Ok((output, truncated))
     }
 
+    pub fn anchors_by_entity_keys_family_limited(
+        &self,
+        keys: &[String],
+        semantic_family: crate::semantic_model::SemanticFamily,
+        limit: usize,
+    ) -> Result<(Vec<CallableAnchorRow>, bool)> {
+        self.anchors_by_values_family_limited("a.entity_digest", keys, true, semantic_family, limit)
+    }
+
+    #[cfg(test)]
     pub fn call_sites_by_caller_limited(
         &self,
         entity_key: &str,
@@ -198,6 +311,21 @@ impl<'a> CallFactStoreView<'a> {
         )
     }
 
+    pub fn call_sites_by_caller_family_limited(
+        &self,
+        entity_key: &str,
+        semantic_family: crate::semantic_model::SemanticFamily,
+        limit: usize,
+    ) -> Result<(Vec<CallSiteRow>, bool)> {
+        let language = semantic_family_sql_predicate(semantic_family, "rev.language");
+        self.call_site_query_limited(
+            &format!("WHERE caller.entity_digest = unhex(?1) AND {language}"),
+            [entity_key],
+            limit,
+        )
+    }
+
+    #[cfg(test)]
     pub fn call_sites_by_callee_limited(
         &self,
         name: &str,
@@ -205,6 +333,24 @@ impl<'a> CallFactStoreView<'a> {
     ) -> Result<(Vec<CallSiteRow>, bool)> {
         self.call_site_query_limited(
             "WHERE c.callee_name_id = (SELECT id FROM call_strings WHERE text = ?1)",
+            [name],
+            limit,
+        )
+    }
+
+    pub fn call_sites_by_callee_family_limited(
+        &self,
+        name: &str,
+        semantic_family: crate::semantic_model::SemanticFamily,
+        limit: usize,
+    ) -> Result<(Vec<CallSiteRow>, bool)> {
+        let language = semantic_family_sql_predicate(semantic_family, "rev.language");
+        self.call_site_query_limited(
+            &format!(
+                "WHERE c.callee_name_id = (
+                    SELECT id FROM call_strings WHERE text = ?1
+                 ) AND {language}"
+            ),
             [name],
             limit,
         )
@@ -232,6 +378,34 @@ impl<'a> CallFactStoreView<'a> {
         )
     }
 
+    pub fn call_sites_at_family_limited(
+        &self,
+        path: &str,
+        line: u32,
+        character: u32,
+        semantic_family: crate::semantic_model::SemanticFamily,
+        limit: usize,
+    ) -> Result<(Vec<CallSiteRow>, bool)> {
+        let line = line.to_string();
+        let character = character.to_string();
+        let language = semantic_family_sql_predicate(semantic_family, "rev.language");
+        self.call_site_query_limited(
+            &format!(
+                "WHERE c.revision_id = (
+                    SELECT active.revision_id FROM active_file_revisions active
+                    JOIN file_entries entry ON entry.id = active.file_id
+                    WHERE entry.path = ?1
+                 ) AND {language}
+                 AND c.callee_start_line = ?2
+                 AND c.callee_end_line = ?2 AND c.callee_start_col <= ?3
+                 AND c.callee_end_col >= ?3"
+            ),
+            [path, line.as_str(), character.as_str()],
+            limit,
+        )
+    }
+
+    #[cfg(test)]
     fn anchors_by_values_limited(
         &self,
         column: &str,
@@ -248,6 +422,35 @@ impl<'a> CallFactStoreView<'a> {
             let placeholder = if hex_values { "unhex(?)" } else { "?" };
             let placeholders = vec![placeholder; chunk.len()].join(",");
             let predicate = format!("WHERE {column} IN ({placeholders})");
+            let params: Vec<&str> = chunk.iter().map(String::as_str).collect();
+            self.visit_anchors(&predicate, &params, Some(probe_limit), |row| {
+                output.push(row);
+                Ok(())
+            })?;
+            if output.len() > limit {
+                break;
+            }
+        }
+        let truncated = output.len() > limit;
+        output.truncate(limit);
+        Ok((output, truncated))
+    }
+
+    fn anchors_by_values_family_limited(
+        &self,
+        column: &str,
+        values: &[String],
+        hex_values: bool,
+        semantic_family: crate::semantic_model::SemanticFamily,
+        limit: usize,
+    ) -> Result<(Vec<CallableAnchorRow>, bool)> {
+        let mut output = Vec::new();
+        let language = semantic_family_sql_predicate(semantic_family, "rev.language");
+        for chunk in values.chunks(400) {
+            let probe_limit = limit.saturating_sub(output.len()).saturating_add(1);
+            let placeholder = if hex_values { "unhex(?)" } else { "?" };
+            let placeholders = vec![placeholder; chunk.len()].join(",");
+            let predicate = format!("WHERE {column} IN ({placeholders}) AND {language}");
             let params: Vec<&str> = chunk.iter().map(String::as_str).collect();
             self.visit_anchors(&predicate, &params, Some(probe_limit), |row| {
                 output.push(row);
@@ -349,7 +552,10 @@ impl<'a> CallFactStoreView<'a> {
                          ELSE 'function' END,
                     CASE a.role WHEN 1 THEN 'definition' WHEN 2 THEN 'synthetic'
                          ELSE 'declaration' END,
-                    CASE a.linkage_kind WHEN 1 THEN 'external' WHEN 2 THEN 'internal'
+                    CASE a.linkage_kind
+                        WHEN 1 THEN 'external'
+                        WHEN 2 THEN 'internal'
+                        WHEN 3 THEN 'package'
                          ELSE 'unknown' END,
                     linkage_text.text, signature_text.text, canonical_text.text,
                     presentation_text.text, a.signature_fidelity,
@@ -363,9 +569,10 @@ impl<'a> CallFactStoreView<'a> {
                     a.body_start_col, a.body_end_line, a.body_end_col,
                     guard_text.text,
                     CASE (a.flags & 255) WHEN 2 THEN 'synthetic' ELSE 'ast' END,
-                    ((a.flags & 256) != 0), f.directly_included
+                    ((a.flags & 256) != 0), rev.language, f.directly_included
              FROM callable_anchors a
              JOIN files f ON f.id = a.file_id
+             JOIN file_revisions rev ON rev.id = a.revision_id
              JOIN call_strings name_text ON name_text.id = a.name_id
              JOIN call_strings qualified_text ON qualified_text.id = a.qualified_name_id
              JOIN call_strings signature_text ON signature_text.id = a.signature_id
@@ -430,6 +637,7 @@ impl<'a> CallFactStoreView<'a> {
                     ((c.flags & 256) != 0)
              FROM call_sites c
              JOIN files f ON f.id = c.file_id
+             JOIN file_revisions rev ON rev.id = c.revision_id
              JOIN callable_anchor_facts caller ON caller.id = c.caller_anchor_id
              LEFT JOIN call_strings callee_text ON callee_text.id = c.callee_name_id
              LEFT JOIN call_strings qualified_text ON qualified_text.id = c.qualified_name_id
@@ -450,8 +658,9 @@ fn map_anchor(row: &rusqlite::Row<'_>) -> rusqlite::Result<CallableAnchorRow> {
     Ok(CallableAnchorRow {
         id: row.get(0)?,
         path: row.get(1)?,
+        semantic_family: semantic_family(row.get(41)?),
         source: row.get(2)?,
-        directly_included: row.get::<_, i64>(41)? != 0,
+        directly_included: row.get::<_, i64>(42)? != 0,
         entity_key: row.get(3)?,
         anchor_fingerprint: row.get(4)?,
         name: row.get(5)?,
@@ -476,6 +685,24 @@ fn map_anchor(row: &rusqlite::Row<'_>) -> rusqlite::Result<CallableAnchorRow> {
         provenance: row.get(39)?,
         syntax_error_overlap: row.get::<_, i64>(40)? != 0,
     })
+}
+
+fn semantic_family(language: i64) -> crate::semantic_model::SemanticFamily {
+    if language == 3 {
+        crate::semantic_model::SemanticFamily::Go
+    } else {
+        crate::semantic_model::SemanticFamily::CFamily
+    }
+}
+
+fn semantic_family_sql_predicate(
+    semantic_family: crate::semantic_model::SemanticFamily,
+    column: &str,
+) -> String {
+    match semantic_family {
+        crate::semantic_model::SemanticFamily::CFamily => format!("{column} <> 3"),
+        crate::semantic_model::SemanticFamily::Go => format!("{column} = 3"),
+    }
 }
 
 fn signature_fidelity(code: i64) -> SignatureFidelity {

@@ -75,10 +75,10 @@ pub(super) fn capture_call_read_handle(
     root: &Path,
     generation: SemanticGeneration,
 ) -> Result<Arc<CallReadHandle>> {
-    Ok(Arc::new(CallReadHandle::at_generation(
+    Ok(Arc::new(CallReadHandle::at_default_generation(
         pathing::default_index_path(root)?,
         generation,
-    )))
+    )?))
 }
 
 pub(super) async fn update_declaration_index_paths(
@@ -119,10 +119,10 @@ pub(super) async fn update_declaration_index_paths(
 pub(super) async fn rebuild_project_context(
     client: &Client,
     root: PathBuf,
+    config: crate::config::WorkspaceConfig,
 ) -> Option<Arc<ProjectContextIndex>> {
     let build_root = root.clone();
     let built = tokio::task::spawn_blocking(move || -> Result<ProjectContextIndex> {
-        let (config, _) = crate::config::WorkspaceConfig::load(&build_root);
         project_context::discover_project_contexts(&build_root, &config)
     })
     .await;

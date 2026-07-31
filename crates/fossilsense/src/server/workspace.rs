@@ -11,6 +11,7 @@ use super::LocalWordCache;
 use crate::call_model::SemanticGeneration;
 use crate::candidate_service::CandidateOverlaySnapshot;
 use crate::completion_words;
+use crate::config::SourceLanguage;
 use crate::parser::{FileSemanticIndex, ParseFacts};
 use crate::pathing;
 #[cfg(test)]
@@ -28,9 +29,21 @@ pub(super) use models::{
 };
 pub(super) use session::WorkspaceSession;
 
-type LiveParseCache = Arc<RwLock<HashMap<Url, (i32, ParseFacts, Arc<FileSemanticIndex>)>>>;
+type LiveParseCache =
+    Arc<RwLock<HashMap<Url, (i32, SourceLanguage, ParseFacts, Arc<FileSemanticIndex>)>>>;
+type ExternalOverlayParseCache =
+    Arc<Mutex<HashMap<ExternalOverlayParseKey, Arc<FileSemanticIndex>>>>;
 type LiveParseGates = Arc<Mutex<HashMap<Url, Arc<Mutex<()>>>>>;
 type LiveParseCancellations = Arc<Mutex<HashMap<Url, (i32, Arc<AtomicBool>)>>>;
+const MAX_EXTERNAL_OVERLAY_PARSE_CACHE_ENTRIES: usize = 64;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ExternalOverlayParseKey {
+    uri: Url,
+    version: i32,
+    language: SourceLanguage,
+    identity_path: String,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RelationOverlayState {
@@ -57,6 +70,7 @@ pub(super) struct DocumentStore {
     open_docs: Arc<Mutex<HashMap<Url, OpenDocument>>>,
     overlay_epoch: Arc<AtomicU64>,
     pub(in crate::server) live_parse_cache: LiveParseCache,
+    external_overlay_parse_cache: ExternalOverlayParseCache,
     live_parse_gates: LiveParseGates,
     live_parse_cancellations: LiveParseCancellations,
     pub(in crate::server) local_word_cache: LocalWordCache,
@@ -274,9 +288,44 @@ impl DocumentStore {
 
     pub(super) async fn clear_live_state(&self, uri: &Url) {
         self.live_parse_cache.write().await.remove(uri);
+        self.external_overlay_parse_cache
+            .lock()
+            .await
+            .retain(|key, _| &key.uri != uri);
         self.local_word_cache.lock().await.remove(uri);
         if let Some((_, cancellation)) = self.live_parse_cancellations.lock().await.remove(uri) {
             cancellation.store(true, Ordering::Relaxed);
+        }
+    }
+
+    pub(super) async fn invalidate_language_config_roots(&self, roots: &[PathBuf]) {
+        let affected = {
+            let mut documents = self.open_docs.lock().await;
+            let mut affected = Vec::new();
+            for (uri, document) in documents.iter_mut() {
+                let Some(path) = uri.to_file_path().ok() else {
+                    continue;
+                };
+                if !roots
+                    .iter()
+                    .any(|root| pathing::path_is_within(root, &path))
+                {
+                    continue;
+                }
+                if matches!(document.relation_overlay, RelationOverlayState::Clean) {
+                    document.relation_overlay = RelationOverlayState::SavedAwaitingContentHash(
+                        blake3::hash(document.text.as_bytes()).to_hex().to_string(),
+                    );
+                }
+                affected.push(uri.clone());
+            }
+            if !affected.is_empty() {
+                self.bump_overlay_epoch();
+            }
+            affected
+        };
+        for uri in affected {
+            self.clear_live_state(&uri).await;
         }
     }
 
@@ -328,23 +377,53 @@ impl DocumentStore {
         &self,
         uri: &Url,
         version: i32,
+        language: SourceLanguage,
         facts: ParseFacts,
     ) -> Option<Arc<FileSemanticIndex>> {
         let cache = self.live_parse_cache.read().await;
         cache
             .get(uri)
-            .and_then(|(cached_version, cached_facts, parsed)| {
-                (*cached_version == version && cached_facts.contains(facts)).then(|| parsed.clone())
+            .and_then(|(cached_version, cached_language, cached_facts, parsed)| {
+                (*cached_version == version
+                    && *cached_language == language
+                    && cached_facts.contains(facts))
+                .then(|| parsed.clone())
             })
     }
 
-    pub(super) async fn cached_live_parse_facts(&self, uri: &Url, version: i32) -> ParseFacts {
+    pub(super) async fn cached_external_overlay_parse(
+        &self,
+        uri: &Url,
+        version: i32,
+        language: SourceLanguage,
+        identity_path: &str,
+    ) -> Option<Arc<FileSemanticIndex>> {
+        self.external_overlay_parse_cache
+            .lock()
+            .await
+            .get(&ExternalOverlayParseKey {
+                uri: uri.clone(),
+                version,
+                language,
+                identity_path: identity_path.to_string(),
+            })
+            .cloned()
+    }
+
+    pub(super) async fn cached_live_parse_facts(
+        &self,
+        uri: &Url,
+        version: i32,
+        language: SourceLanguage,
+    ) -> ParseFacts {
         self.live_parse_cache
             .read()
             .await
             .get(uri)
-            .filter(|(cached_version, _, _)| *cached_version == version)
-            .map_or(ParseFacts::empty(), |(_, facts, _)| *facts)
+            .filter(|(cached_version, cached_language, _, _)| {
+                *cached_version == version && *cached_language == language
+            })
+            .map_or(ParseFacts::empty(), |(_, _, facts, _)| *facts)
     }
 
     pub(super) async fn live_parse_gate(&self, uri: &Url) -> Arc<Mutex<()>> {
@@ -373,6 +452,7 @@ impl DocumentStore {
         &self,
         uri: Url,
         version: i32,
+        language: SourceLanguage,
         facts: ParseFacts,
         parsed: Arc<FileSemanticIndex>,
     ) {
@@ -388,8 +468,40 @@ impl DocumentStore {
             self.live_parse_cache
                 .write()
                 .await
-                .insert(uri, (version, facts, parsed));
+                .insert(uri, (version, language, facts, parsed));
         }
+    }
+
+    pub(super) async fn store_external_overlay_parse(
+        &self,
+        uri: Url,
+        version: i32,
+        language: SourceLanguage,
+        identity_path: String,
+        parsed: Arc<FileSemanticIndex>,
+    ) {
+        let open_docs = self.open_docs.lock().await;
+        if open_docs.get(&uri).map(|document| document.version) != Some(version) {
+            return;
+        }
+        let key = ExternalOverlayParseKey {
+            uri,
+            version,
+            language,
+            identity_path,
+        };
+        let mut cache = self.external_overlay_parse_cache.lock().await;
+        if cache.len() >= MAX_EXTERNAL_OVERLAY_PARSE_CACHE_ENTRIES && !cache.contains_key(&key) {
+            if let Some(evicted) = cache.keys().next().cloned() {
+                cache.remove(&evicted);
+            }
+        }
+        cache.insert(key, parsed);
+    }
+
+    #[cfg(test)]
+    pub(super) async fn external_overlay_parse_cache_len_for_test(&self) -> usize {
+        self.external_overlay_parse_cache.lock().await.len()
     }
 
     pub(super) async fn capture_request_snapshot(
@@ -444,7 +556,12 @@ impl DocumentStore {
         version: i32,
         parsed: Arc<FileSemanticIndex>,
     ) {
-        self.store_live_parse(uri, version, ParseFacts::ALL, parsed)
+        let language = uri
+            .to_file_path()
+            .ok()
+            .map(|path| SourceLanguage::default_for_path(&path))
+            .unwrap_or(SourceLanguage::C);
+        self.store_live_parse(uri, version, language, ParseFacts::ALL, parsed)
             .await;
     }
 
@@ -454,7 +571,7 @@ impl DocumentStore {
             .read()
             .await
             .get(uri)
-            .map(|(_, _, parsed)| parsed.clone())
+            .map(|(_, _, _, parsed)| parsed.clone())
     }
 
     #[cfg(test)]
@@ -498,6 +615,22 @@ impl CacheLedger {
         self.engine_snapshots.lock().await.get(root).cloned()
     }
 
+    pub(in crate::server) async fn publish_workspace_semantics_if_absent(
+        &self,
+        root: PathBuf,
+        workspace_semantics: Arc<super::workspace_config::PublishedWorkspaceSemantics>,
+    ) -> Arc<EngineSnapshot> {
+        let _publish_guard = self.publish_gate.lock().await;
+        if let Some(current) = self.current_engine_snapshot(&root).await {
+            return current;
+        }
+
+        let mut snapshot = EngineSnapshot::empty(root);
+        snapshot.epoch = self.allocate_engine_epoch();
+        snapshot.workspace_semantics = workspace_semantics;
+        self.publish_engine_snapshot(snapshot).await
+    }
+
     pub(super) async fn remove_workspace_roots(&self, roots: &[PathBuf]) {
         if roots.is_empty() {
             return;
@@ -513,6 +646,15 @@ impl CacheLedger {
         drop(overlays);
         self.clear_all_completion_memos().await;
         self.invalidate_references();
+    }
+
+    pub(super) async fn invalidate_candidate_overlay_roots(&self, roots: &[PathBuf]) {
+        let mut overlays = self.candidate_overlays.lock().await;
+        for root in roots {
+            invalidate_candidate_overlay_root(&mut overlays, root);
+        }
+        drop(overlays);
+        self.clear_all_completion_memos().await;
     }
 
     pub(in crate::server) fn allocate_engine_epoch(&self) -> state::EngineEpoch {
@@ -710,9 +852,11 @@ impl CacheLedger {
             fallback_completion_table: current.fallback_completion_table.clone(),
             reach_graph: current.reach_graph.clone(),
             include_table: current.include_table.clone(),
+            go_import_table: current.go_import_table.clone(),
             indexed_files: current.indexed_files.clone(),
             project_context: current.project_context.clone(),
             call_read_handle: current.call_read_handle.clone(),
+            workspace_semantics: current.workspace_semantics.clone(),
             degraded: current.degraded.clone(),
         })
         .await;
@@ -737,9 +881,11 @@ impl CacheLedger {
             fallback_completion_table: current.fallback_completion_table.clone(),
             reach_graph: current.reach_graph.clone(),
             include_table: current.include_table.clone(),
+            go_import_table: current.go_import_table.clone(),
             indexed_files: Some(files),
             project_context: current.project_context.clone(),
             call_read_handle: current.call_read_handle.clone(),
+            workspace_semantics: current.workspace_semantics.clone(),
             degraded: current.degraded.clone(),
         })
         .await;
@@ -760,9 +906,11 @@ impl CacheLedger {
             fallback_completion_table: current.fallback_completion_table.clone(),
             reach_graph: Some(graph),
             include_table: current.include_table.clone(),
+            go_import_table: current.go_import_table.clone(),
             indexed_files: current.indexed_files.clone(),
             project_context: current.project_context.clone(),
             call_read_handle: current.call_read_handle.clone(),
+            workspace_semantics: current.workspace_semantics.clone(),
             degraded: current.degraded.clone(),
         })
         .await;

@@ -235,6 +235,26 @@ fn result_cache_reuses_search_hits_until_cleared() {
 }
 
 #[test]
+fn stale_in_flight_search_cannot_refill_the_cache_after_clear() {
+    let cache = ReferenceSearchCache::new();
+    let epoch = cache.epoch();
+    let key = SearchCacheKey {
+        root: "/workspace".into(),
+        identifier: "Target".into(),
+        generation: 7,
+        semantic_family: Some(crate::semantic_model::SemanticFamily::Go),
+        cache_epoch: epoch,
+    };
+
+    cache.clear();
+    assert!(
+        !cache.put_if_epoch(key, Vec::new(), false, epoch),
+        "a request started before invalidation must not repopulate the new cache epoch"
+    );
+    assert_eq!(cache.len_for_test(), 0);
+}
+
+#[test]
 fn result_cache_generation_change_bypasses_stale_hits() {
     let dir = tempdir().expect("tempdir");
     let a = dir.path().join("a.c");

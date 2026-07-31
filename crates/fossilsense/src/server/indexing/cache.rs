@@ -10,7 +10,9 @@ use crate::pathing;
 use crate::progress::DegradedCapabilities;
 use crate::reachability::ReachGraph;
 use crate::server::workspace::EngineSnapshot;
-use crate::server::{CacheLedger, CachePublishReport, IncludeCompletionTable};
+use crate::server::{
+    CacheLedger, CachePublishReport, GoImportCompletionTable, IncludeCompletionTable,
+};
 use crate::store::IndexStore;
 
 mod declaration_models;
@@ -35,13 +37,23 @@ async fn load_reach_graph(root: PathBuf) -> Result<Arc<ReachGraph>> {
     }
 }
 
+pub(super) async fn load_store_semantic_generation(
+    root: PathBuf,
+) -> Result<crate::call_model::SemanticGeneration> {
+    load_semantic_generation(root).await
+}
+
 fn build_reach_graph_from_db(db_path: &Path) -> Result<ReachGraph> {
     let store = IndexStore::open_readonly(db_path)?;
     let reach_view = store.reach_graph_view();
-    Ok(ReachGraph::from_rows(
+    let package_view = store.go_package_graph_view();
+    Ok(ReachGraph::from_rows_with_packages(
         reach_view.include_edges()?,
         reach_view.unresolved_includes()?,
         reach_view.ambiguous_includes()?,
+        package_view.package_files()?,
+        package_view.package_edges()?,
+        package_view.open_packages()?,
     ))
 }
 
@@ -73,6 +85,9 @@ async fn refresh_reach_graph_incremental(
             Some(graph) => Some(graph),
             None => rebuild_reach_graph(client, root).await,
         };
+    }
+    if source_paths.iter().any(|path| path.ends_with(".go")) {
+        return rebuild_reach_graph(client, root).await;
     }
 
     let Some(previous) = previous else {
@@ -141,6 +156,25 @@ fn build_include_table_from_db(db_path: &Path) -> Result<IncludeCompletionTable>
     ))
 }
 
+pub(in crate::server) async fn rebuild_go_import_table(
+    root: PathBuf,
+) -> Result<Arc<GoImportCompletionTable>> {
+    let built = tokio::task::spawn_blocking(move || -> Result<GoImportCompletionTable> {
+        let db_path = pathing::default_index_path(&root)?;
+        let store = IndexStore::open_readonly(&db_path)?;
+        Ok(GoImportCompletionTable::build(
+            store.go_package_graph_view().importable_packages()?,
+        ))
+    })
+    .await;
+
+    match built {
+        Ok(Ok(table)) => Ok(Arc::new(table)),
+        Ok(Err(err)) => Err(err),
+        Err(err) => Err(err.into()),
+    }
+}
+
 pub(in crate::server) async fn rebuild_indexed_file_list(
     root: PathBuf,
 ) -> Result<Arc<Vec<(String, PathBuf)>>> {
@@ -204,19 +238,49 @@ async fn update_indexed_file_list(
 }
 
 impl CacheLedger {
+    #[cfg(test)]
     pub(in crate::server) async fn publish_full_index(
         &self,
         client: &Client,
         root: PathBuf,
     ) -> Result<CachePublishReport> {
+        let workspace_semantics = Arc::new(
+            super::super::workspace_config::PublishedWorkspaceSemantics::load_current(
+                &root,
+                &[],
+                &[],
+            ),
+        );
+        self.publish_full_index_with_semantics(client, root, workspace_semantics)
+            .await
+    }
+
+    pub(in crate::server) async fn publish_full_index_with_semantics(
+        &self,
+        client: &Client,
+        root: PathBuf,
+        workspace_semantics: Arc<super::super::workspace_config::PublishedWorkspaceSemantics>,
+    ) -> Result<CachePublishReport> {
         // SQLite has one writer and the runtime has one snapshot publisher. The
         // previous engine snapshot stays visible while every next component is
         // built off to the side.
         let _publish_guard = self.publish_gate.lock().await;
+        self.publish_full_index_under_gate(client, root, workspace_semantics)
+            .await
+    }
+
+    async fn publish_full_index_under_gate(
+        &self,
+        client: &Client,
+        root: PathBuf,
+        workspace_semantics: Arc<super::super::workspace_config::PublishedWorkspaceSemantics>,
+    ) -> Result<CachePublishReport> {
         let semantic_generation = load_semantic_generation(root.clone()).await?;
 
         let nt_started = tokio::time::Instant::now();
-        let project_context = rebuild_project_context(client, root.clone()).await;
+        let project_context =
+            rebuild_project_context(client, root.clone(), workspace_semantics.workspace.clone())
+                .await;
         let declaration_index = rebuild_declaration_index(
             root.clone(),
             project_context.clone(),
@@ -259,6 +323,15 @@ impl CacheLedger {
             }
         };
         let include_count = include_table.as_ref().map_or(0, |table| table.len());
+        let mut go_import_table_error = None;
+        let go_import_table = match rebuild_go_import_table(root.clone()).await {
+            Ok(table) => Some(table),
+            Err(err) => {
+                degraded.go_import_table = true;
+                go_import_table_error = Some(format!("{err:#}"));
+                None
+            }
+        };
 
         let mut reference_file_list_error = None;
         let indexed_files = match rebuild_indexed_file_list(root.clone()).await {
@@ -287,9 +360,11 @@ impl CacheLedger {
             fallback_completion_table,
             reach_graph,
             include_table,
+            go_import_table,
             indexed_files,
             project_context,
             call_read_handle: Some(call_read_handle),
+            workspace_semantics,
             degraded: degraded.clone(),
         })
         .await;
@@ -305,10 +380,12 @@ impl CacheLedger {
             degraded,
             epoch,
             include_table_error,
+            go_import_table_error,
             reference_file_list_error,
         })
     }
 
+    #[cfg(test)]
     pub(in crate::server) async fn publish_dirty_index(
         &self,
         client: &Client,
@@ -316,9 +393,56 @@ impl CacheLedger {
         rel_paths: &[String],
         include_edge_sources_rebuilt: &[String],
     ) -> Result<CachePublishReport> {
+        let workspace_semantics = self
+            .current_engine_snapshot(&root)
+            .await
+            .map(|snapshot| snapshot.workspace_semantics.clone())
+            .unwrap_or_else(|| {
+                Arc::new(
+                    super::super::workspace_config::PublishedWorkspaceSemantics::load_current(
+                        &root,
+                        &[],
+                        &[],
+                    ),
+                )
+            });
+        self.publish_dirty_index_with_semantics(
+            client,
+            root,
+            rel_paths,
+            include_edge_sources_rebuilt,
+            workspace_semantics,
+        )
+        .await
+    }
+
+    pub(in crate::server) async fn publish_dirty_index_with_semantics(
+        &self,
+        client: &Client,
+        root: PathBuf,
+        rel_paths: &[String],
+        include_edge_sources_rebuilt: &[String],
+        workspace_semantics: Arc<super::super::workspace_config::PublishedWorkspaceSemantics>,
+    ) -> Result<CachePublishReport> {
         let _publish_guard = self.publish_gate.lock().await;
         let semantic_generation = load_semantic_generation(root.clone()).await?;
         let previous = self.current_engine_snapshot(&root).await;
+        let direct_base = previous.as_ref().is_some_and(|snapshot| {
+            snapshot.semantic_generation != crate::call_model::SemanticGeneration::MISSING
+                && snapshot.semantic_generation.0.checked_add(1) == Some(semantic_generation.0)
+        });
+        if !direct_base {
+            return self
+                .publish_full_index_under_gate(client, root, workspace_semantics)
+                .await;
+        }
+        anyhow::ensure!(
+            previous.as_ref().is_some_and(|snapshot| Arc::ptr_eq(
+                &snapshot.workspace_semantics,
+                &workspace_semantics
+            )),
+            "dirty index configuration differs from its published base; full index required"
+        );
         let project_context = previous
             .as_ref()
             .and_then(|snapshot| snapshot.project_context.clone());
@@ -367,6 +491,15 @@ impl CacheLedger {
             }
         };
         let include_count = include_table.as_ref().map_or(0, |table| table.len());
+        let mut go_import_table_error = None;
+        let go_import_table = match rebuild_go_import_table(root.clone()).await {
+            Ok(table) => Some(table),
+            Err(err) => {
+                degraded.go_import_table = true;
+                go_import_table_error = Some(format!("{err:#}"));
+                None
+            }
+        };
 
         let mut reference_file_list_error = None;
         let indexed_files = match update_indexed_file_list(
@@ -403,9 +536,11 @@ impl CacheLedger {
             fallback_completion_table,
             reach_graph,
             include_table,
+            go_import_table,
             indexed_files,
             project_context,
             call_read_handle: Some(call_read_handle),
+            workspace_semantics,
             degraded: degraded.clone(),
         })
         .await;
@@ -421,6 +556,7 @@ impl CacheLedger {
             degraded,
             epoch,
             include_table_error,
+            go_import_table_error,
             reference_file_list_error,
         };
         drop(_publish_guard);
@@ -504,9 +640,11 @@ impl CacheLedger {
             fallback_completion_table: current.fallback_completion_table.clone(),
             reach_graph: current.reach_graph.clone(),
             include_table: current.include_table.clone(),
+            go_import_table: current.go_import_table.clone(),
             indexed_files: current.indexed_files.clone(),
             project_context: current.project_context.clone(),
             call_read_handle: current.call_read_handle.clone(),
+            workspace_semantics: current.workspace_semantics.clone(),
             degraded: current.degraded.clone(),
         })
         .await;
@@ -527,7 +665,12 @@ impl CacheLedger {
             .current_engine_snapshot(&root)
             .await
             .context("project context refresh requires a published engine snapshot")?;
-        let project_context = rebuild_project_context(client, root.clone()).await;
+        let project_context = rebuild_project_context(
+            client,
+            root.clone(),
+            previous.workspace_semantics.workspace.clone(),
+        )
+        .await;
         let project_count = project_context
             .as_ref()
             .map_or(0, |index| index.projects().len());
@@ -549,9 +692,11 @@ impl CacheLedger {
             fallback_completion_table: previous.fallback_completion_table.clone(),
             reach_graph: previous.reach_graph.clone(),
             include_table: previous.include_table.clone(),
+            go_import_table: previous.go_import_table.clone(),
             indexed_files: previous.indexed_files.clone(),
             project_context,
             call_read_handle: previous.call_read_handle.clone(),
+            workspace_semantics: previous.workspace_semantics.clone(),
             degraded,
         })
         .await;

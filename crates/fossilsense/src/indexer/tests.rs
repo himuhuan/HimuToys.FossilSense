@@ -7,5 +7,7 @@ use crate::store::IndexStore;
 
 mod ambiguity;
 mod basic;
+mod go_packages;
 mod include_edges;
 mod slop_cases;
+mod writer_lock;

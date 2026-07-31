@@ -48,6 +48,7 @@ mod call_hierarchy;
 mod candidate_context;
 mod completion_candidate_documentation;
 mod completion_documentation;
+mod go_import_completion;
 mod hover;
 mod include_completion;
 mod indexing;
@@ -64,6 +65,7 @@ mod signature_help;
 mod state;
 mod workspace;
 
+use go_import_completion::GoImportCompletionTable;
 use include_completion::{
     collect_include_candidates_with_table_and_evidence, configured_include_paths,
     location_at_file_start, resolve_include_paths, CurrentIncludeEvidence, ExternalIncludeDirCache,
@@ -72,6 +74,7 @@ use include_completion::{
 #[cfg(test)]
 use indexing::{
     ready_cache_message, rebuild_include_table, rebuild_indexed_file_list, RootDirtyChange,
+    ScheduledIndex,
 };
 use indexing::{watched_change_in_scope, IndexScheduleState, WatchDecision};
 use lsp_adapters::{
@@ -83,8 +86,9 @@ use options::{
     candidate_reason_log_lines, completion_trigger_characters, empty_completion_list,
     member_completion_is_incomplete, parse_completion_history_mode, parse_completion_mode,
     parse_completion_prefix_ranking, parse_debug_candidate_reasons, parse_debug_perf_logs,
-    parse_include_paths, parse_include_scoping_enabled, parse_initial_project_context_selection,
-    parse_semantic_coloring_mode, parse_semantic_index_memory_budget_mb, signature_help_options,
+    parse_go_module_paths, parse_include_paths, parse_include_scoping_enabled,
+    parse_initial_project_context_selection, parse_semantic_coloring_mode,
+    parse_semantic_index_memory_budget_mb, signature_help_options,
 };
 use workspace::{
     CacheLedger, CachePublishReport, DocumentRequestSnapshot, DocumentStore, RequestContext,
@@ -134,6 +138,7 @@ pub async fn run_stdio() -> Result<()> {
         session: WorkspaceSession::new(DocumentStore::default(), CacheLedger::default()),
         external_include_dir_cache: Arc::new(StdMutex::new(HashMap::new())),
         include_paths: Arc::new(Mutex::new(Vec::new())),
+        go_module_paths: Arc::new(Mutex::new(Vec::new())),
         completion_enabled: AtomicBool::new(true),
         strict_prefix_ranking: AtomicBool::new(true),
         semantic_coloring_enabled: AtomicBool::new(true),
@@ -146,6 +151,9 @@ pub async fn run_stdio() -> Result<()> {
         debug_candidate_reasons: AtomicBool::new(false),
         perf_logging_enabled: AtomicBool::new(false),
         config_cache: Arc::new(Mutex::new(HashMap::new())),
+        workspace_semantics_bootstrap: Arc::new(Mutex::new(Default::default())),
+        #[cfg(test)]
+        external_source_roots_cache: Arc::new(Mutex::new(Default::default())),
         resource_monitor_shutdown: Arc::new(tokio::sync::Notify::new()),
     });
 
@@ -164,6 +172,9 @@ struct Backend {
     /// External include reference directories (normalized) forwarded from the
     /// client; used for indexing, include-path completion, and jump-to-header.
     include_paths: Arc<Mutex<Vec<String>>>,
+    /// Explicit external Go module roots forwarded from the client. Each root
+    /// remains subject to the indexer's independent file/byte caps.
+    go_module_paths: Arc<Mutex<Vec<String>>>,
     /// Whether completion is enabled (based on initializationOptions).
     completion_enabled: AtomicBool,
     /// Whether ordinary identifier completion guards exact/literal-prefix
@@ -200,6 +211,14 @@ struct Backend {
     /// Request hot paths never read or parse `fossilsense.json`; the entry is
     /// invalidated when that file changes or its workspace root is removed.
     config_cache: Arc<Mutex<HashMap<PathBuf, WorkspaceRootConfig>>>,
+    /// Per-root single-flight gates for the first immutable configuration
+    /// snapshot. The map is pruned when workspace roots are removed.
+    workspace_semantics_bootstrap: Arc<Mutex<workspace_config::WorkspaceSemanticsBootstrap>>,
+    #[cfg(test)]
+    /// Test-only current-configuration mapping used by isolated overlay/cache
+    /// regressions. Production requests use the immutable mapping owned by
+    /// `EngineSnapshot.workspace_semantics`.
+    external_source_roots_cache: Arc<Mutex<workspace_config::ExternalSourceRootsCache>>,
     /// Cancels the `fossilsense/resourceUsage` background reporter when the
     /// server shuts down. The reporter is spawned in `initialized` and stopped
     /// in `shutdown`.
@@ -209,24 +228,29 @@ struct Backend {
 #[derive(Clone)]
 struct WorkspaceRootConfig {
     workspace: WorkspaceConfig,
+    #[cfg(test)]
     language: LanguageResolver,
 }
 
 impl WorkspaceRootConfig {
     fn load(root: &Path) -> Self {
         let workspace = WorkspaceConfig::load(root).0;
+        #[cfg(test)]
         let language = LanguageResolver::from_workspace_config(root, &workspace);
         Self {
             workspace,
+            #[cfg(test)]
             language,
         }
     }
 
-    fn fallback(root: &Path) -> Self {
+    fn fallback(_root: &Path) -> Self {
         let workspace = WorkspaceConfig::default();
-        let language = LanguageResolver::from_workspace_config(root, &workspace);
+        #[cfg(test)]
+        let language = LanguageResolver::from_workspace_config(_root, &workspace);
         Self {
             workspace,
+            #[cfg(test)]
             language,
         }
     }
@@ -282,6 +306,7 @@ impl Backend {
     /// (all-facts) parse result so that multiple request types (semantic
     /// tokens, member completion, document symbols) for the same version
     /// share a single parse. Parsing is spawned on the blocking thread-pool.
+    #[cfg(test)]
     async fn get_or_parse_document(
         &self,
         uri: &Url,
@@ -291,8 +316,37 @@ impl Backend {
         requested_facts: parser::ParseFacts,
     ) -> Option<Arc<FileSemanticIndex>> {
         let language = self.source_language_for_path(path).await;
+        self.get_or_parse_document_with_language(
+            uri,
+            path,
+            version,
+            text,
+            requested_facts,
+            language,
+        )
+        .await
+    }
+
+    async fn get_or_parse_document_with_language(
+        &self,
+        uri: &Url,
+        path: &Path,
+        version: i32,
+        text: &str,
+        requested_facts: parser::ParseFacts,
+        language: SourceLanguage,
+    ) -> Option<Arc<FileSemanticIndex>> {
+        let identity_path = if language == SourceLanguage::Go {
+            self.root_for_uri(uri)
+                .await
+                .and_then(|root| pathing::relative_slash_path(&root, path).ok())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| path.to_path_buf())
+        } else {
+            path.to_path_buf()
+        };
         if version == 0 {
-            let path_owned = path.to_path_buf();
+            let path_owned = identity_path;
             let text_owned = text.to_string();
             return tokio::task::spawn_blocking(move || {
                 Arc::new(parser::parse_thread_local_with_language(
@@ -310,7 +364,7 @@ impl Backend {
         if let Some(cached) = self
             .session
             .documents
-            .cached_live_parse(uri, version, requested_facts)
+            .cached_live_parse(uri, version, language, requested_facts)
             .await
         {
             self.perf_log(|| live_parse_cache_log(LiveParseCacheEvent::Hit).to_string())
@@ -327,7 +381,7 @@ impl Backend {
         if let Some(cached) = self
             .session
             .documents
-            .cached_live_parse(uri, version, requested_facts)
+            .cached_live_parse(uri, version, language, requested_facts)
             .await
         {
             self.perf_log(|| live_parse_cache_log(LiveParseCacheEvent::Coalesced).to_string())
@@ -338,12 +392,12 @@ impl Backend {
         // Cache miss: parse on the blocking thread-pool and store.
         self.perf_log(|| live_parse_cache_log(LiveParseCacheEvent::Miss).to_string())
             .await;
-        let path_owned = path.to_path_buf();
+        let path_owned = identity_path;
         let text_owned = text.to_string();
         let facts = self
             .session
             .documents
-            .cached_live_parse_facts(uri, version)
+            .cached_live_parse_facts(uri, version, language)
             .await
             | requested_facts;
         let cancellation = self
@@ -370,9 +424,82 @@ impl Backend {
 
         self.session
             .documents
-            .store_live_parse(uri.clone(), version, facts, index.clone())
+            .store_live_parse(uri.clone(), version, language, facts, index.clone())
             .await;
         Some(index)
+    }
+
+    /// Parse one authorized external-document identity. The identity is part
+    /// of the cache key because parser output stores declaration paths, while
+    /// the URI/version pair lets independent workspace roots share the same
+    /// result when they publish the same identity and language.
+    async fn get_or_parse_external_overlay_document(
+        &self,
+        uri: &Url,
+        identity_path: &str,
+        version: i32,
+        text: &str,
+        language: SourceLanguage,
+    ) -> Option<Arc<FileSemanticIndex>> {
+        if let Some(cached) = self
+            .session
+            .documents
+            .cached_external_overlay_parse(uri, version, language, identity_path)
+            .await
+        {
+            return Some(cached);
+        }
+
+        // The gate is URI-scoped so concurrent requests from different roots
+        // cannot duplicate the same external parse. Distinct identities still
+        // serialize, and candidate overlay construction applies a hard count
+        // bound before calling this method.
+        let parse_gate = self.session.documents.live_parse_gate(uri).await;
+        let _parse_guard = parse_gate.lock().await;
+        if let Some(cached) = self
+            .session
+            .documents
+            .cached_external_overlay_parse(uri, version, language, identity_path)
+            .await
+        {
+            return Some(cached);
+        }
+
+        let cancellation = self
+            .session
+            .documents
+            .live_parse_cancellation(uri, version)
+            .await;
+        let parse_cancellation = cancellation.clone();
+        let path_owned = PathBuf::from(identity_path);
+        let text_owned = text.to_string();
+        let parsed = tokio::task::spawn_blocking(move || {
+            parser::parse_thread_local_with_language_cancel(
+                &path_owned,
+                &text_owned,
+                language,
+                parser::ParseFacts::HOVER_SEMANTICS,
+                &parse_cancellation,
+            )
+            .map(Arc::new)
+        })
+        .await
+        .ok()??;
+        if cancellation.load(Ordering::Relaxed) {
+            return None;
+        }
+
+        self.session
+            .documents
+            .store_external_overlay_parse(
+                uri.clone(),
+                version,
+                language,
+                identity_path.to_string(),
+                parsed.clone(),
+            )
+            .await;
+        Some(parsed)
     }
 
     fn reach_scope_from_context(
@@ -405,6 +532,7 @@ impl Backend {
     }
 
     async fn request_context_for_root(&self, root: PathBuf) -> RequestContext {
+        self.ensure_workspace_semantics(&root).await;
         self.session
             .request_context_for_root_with_settings(root, self.request_settings())
             .await

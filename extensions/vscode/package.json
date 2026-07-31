@@ -1,8 +1,8 @@
 {
   "name": "fossilsense-vscode",
   "displayName": "FossilSense",
-  "description": "FossilSense C/C++ best-effort semantics: stable Definition/Declaration navigation, C callable normalization, role-aware candidates, reachability evidence, full record hover, and call relations.",
-  "version": "1.4.5",
+  "description": "FossilSense C/C++ and Go best-effort semantics: stable navigation, role-aware candidates, bounded reachability evidence, Hover, completion, references, and call relations.",
+  "version": "1.5.0",
   "private": true,
   "license": "UNLICENSED",
   "publisher": "himutoys",
@@ -14,7 +14,8 @@
   ],
   "activationEvents": [
     "onLanguage:c",
-    "onLanguage:cpp"
+    "onLanguage:cpp",
+    "onLanguage:go"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -107,7 +108,7 @@
     "viewsWelcome": [
       {
         "view": "fossilsense.callRelations",
-        "contents": "Place the cursor on a free function, then [Analyse Call Hierarchy](command:fossilsense.showCallRelations)."
+        "contents": "Place the cursor on a C/C++ or Go function, then [Analyse Call Hierarchy](command:fossilsense.showCallRelations)."
       },
       {
         "view": "fossilsense.callSites",
@@ -118,12 +119,12 @@
       "editor/context": [
         {
           "command": "fossilsense.findAllPossibleTargets",
-          "when": "editorLangId == c || editorLangId == cpp",
+          "when": "editorLangId == c || editorLangId == cpp || editorLangId == go",
           "group": "navigation@19"
         },
         {
           "command": "fossilsense.showCallRelations",
-          "when": "editorLangId == c || editorLangId == cpp",
+          "when": "editorLangId == c || editorLangId == cpp || editorLangId == go",
           "group": "navigation@20"
         }
       ],
@@ -161,7 +162,7 @@
             "off"
           ],
           "default": "auto",
-          "description": "Overall FossilSense server mode. 'auto' starts FossilSense and reports a one-time mutual-exclusion warning if clangd, Microsoft C/C++, or ccls is detected; 'on' starts without that warning; 'off' prevents the server from starting."
+          "description": "Overall FossilSense server mode. 'auto' starts FossilSense and reports a one-time coexistence warning if a known C/C++ or Go language server is detected; 'on' starts without that warning; 'off' prevents the server from starting."
         },
         "fossilsense.completion.mode": {
           "type": "string",
@@ -171,7 +172,7 @@
             "off"
           ],
           "default": "auto",
-          "description": "Controls FossilSense completion, including ordinary identifiers, include paths, and degraded '.'/'->' field/method member completion. 'auto' and 'on' enable completion; 'off' disables completion. C/C++ language-server conflicts are reported by fossilsense.mode, not silently handled per feature."
+          "description": "Controls FossilSense completion, including ordinary identifiers, C/C++ include paths, indexed Go import paths, and degraded field/method member completion. 'auto' and 'on' enable completion; 'off' disables completion. Language-server conflicts are reported by fossilsense.mode, not silently handled per feature."
         },
         "fossilsense.completion.prefixRanking": {
           "type": "string",
@@ -200,7 +201,7 @@
             "off"
           ],
           "default": "auto",
-          "markdownDescription": "Controls build-marker project evidence for ordinary identifier completion. `auto` uses the completion file's nearest in-scope marker; `promptOnAmbiguous` also prompts once when an active C/C++ file cannot be assigned while projects are available; `off` enforces baseline completion. Project context never filters candidates or changes navigation, references, coloring, member completion, or include completion."
+          "markdownDescription": "Controls build-marker project evidence for ordinary identifier completion. `auto` uses the completion file's nearest in-scope marker, including Go module/workspace markers; `promptOnAmbiguous` also prompts once when an active C/C++ or Go file cannot be assigned while projects are available; `off` enforces baseline completion. Project context never filters candidates or changes navigation, references, coloring, member completion, or import/include completion."
         },
         "fossilsense.semanticColoring.mode": {
           "type": "string",
@@ -210,7 +211,7 @@
             "off"
           ],
           "default": "auto",
-          "description": "Controls FossilSense semantic coloring of macros, types, and enum constants. 'auto' and 'on' enable coloring; 'off' disables coloring. C/C++ language-server conflicts are reported by fossilsense.mode, not silently handled per feature. This is a degraded text/index-level colorer and may occasionally mis-color multi-meaning names."
+          "description": "Controls FossilSense semantic coloring of macros, types, enum constants, parameters, and local variables where the active language exposes those facts. 'auto' and 'on' enable coloring; 'off' disables coloring. Language-server conflicts are reported by fossilsense.mode. This is a degraded text/index-level colorer and may occasionally mis-color multi-meaning names."
         },
         "fossilsense.includeScoping.mode": {
           "type": "string",
@@ -245,6 +246,14 @@
           },
           "default": [],
           "markdownDescription": "External C/C++ header reference directories (absolute paths) used for `#include` path completion, `#include` jump-to-header, and degraded symbol indexing of those headers. This is **distinct** from workspace scope `include`/`exclude` (which selects workspace subtrees). Safe to point at a toolchain's include directory, e.g. `C:\\TDM-GCC-64\\x86_64-w64-mingw32\\include`. Missing, inaccessible, or wrong-platform headers are skipped, never errors. Symbols from headers directly `#include`d by a workspace file also participate in semantic coloring; transitively-included ones do not."
+        },
+        "fossilsense.goModulePaths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "markdownDescription": "Explicit external Go module directories to index without invoking the Go toolchain. Each root is scanned with independent file/byte caps and merged with `goModulePaths` from `fossilsense.json`. A root should contain `go.mod`; without module metadata, declarations remain bounded but import-path evidence may be incomplete. FossilSense never discovers or scans GOPATH or the machine module cache automatically. Missing, overlapping, or over-budget roots are skipped with visible degraded-status evidence."
         },
         "fossilsense.debug.candidateReasons": {
           "type": "boolean",

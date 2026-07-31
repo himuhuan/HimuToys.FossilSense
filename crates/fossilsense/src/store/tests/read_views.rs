@@ -53,6 +53,23 @@ fn declaration_view_round_trips_canonical_identity_and_backing() {
             !matches!(row.fact.backing, DeclarationBacking::None),
             "{name} must retain an explicit specialized backing"
         );
+        let (expected_backing_kind, expected_backing_code) = match &row.fact.backing {
+            DeclarationBacking::CallableAnchor { .. } => ("callable_anchor", 0),
+            DeclarationBacking::Record { .. } => ("record", 1),
+            DeclarationBacking::TypeAlias { .. } => ("type_alias", 2),
+            DeclarationBacking::SourceRange { .. } => ("source_range", 3),
+            DeclarationBacking::None => ("none", 4),
+        };
+        assert_eq!(row.backing_kind, expected_backing_kind);
+        let stored_backing_code: i64 = reader
+            .conn
+            .query_row(
+                "SELECT backing_kind FROM declaration_facts WHERE id = ?1",
+                [row.id],
+                |stored| stored.get(0),
+            )
+            .expect("stored backing code");
+        assert_eq!(stored_backing_code, expected_backing_code);
         match row.fact.backing {
             DeclarationBacking::CallableAnchor { .. }
             | DeclarationBacking::Record { .. }
@@ -74,6 +91,304 @@ fn declaration_view_round_trips_canonical_identity_and_backing() {
         assert!(!limited);
         assert!(same_entity.iter().any(|candidate| candidate.id == row.id));
     }
+}
+
+#[test]
+fn declaration_storage_compacts_fingerprints_and_backing_kind_without_changing_views() {
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+    let source = "#ifdef CONFIG_X\nint guarded(void);\n#endif\nint plain(void);\n";
+    let parsed = parse(std::path::Path::new("guarded.h"), source);
+    let expected_guarded = parsed
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name == "guarded")
+        .expect("parsed guarded declaration");
+    let expected_locator = expected_guarded.identity.locator.fingerprint.clone();
+    let expected_guard = expected_guarded
+        .identity
+        .logical_key
+        .guard_fingerprint
+        .clone()
+        .expect("parsed guard fingerprint");
+
+    let mut store = IndexStore::open(&db, dir.path()).expect("store");
+    upsert_source(&mut store, "guarded.h", source);
+
+    let stored: (String, i64, String, i64, String, i64) = store
+        .conn
+        .query_row(
+            "SELECT typeof(locator_fingerprint), length(locator_fingerprint),
+                    typeof(guard_fingerprint), length(guard_fingerprint),
+                    typeof(backing_kind), backing_kind
+             FROM declaration_facts
+             WHERE name = 'guarded'
+             ORDER BY id
+             LIMIT 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .expect("compact declaration storage");
+    assert_eq!(
+        stored,
+        (
+            "blob".to_string(),
+            12,
+            "blob".to_string(),
+            12,
+            "integer".to_string(),
+            0,
+        )
+    );
+
+    let plain_guard_is_null: i64 = store
+        .conn
+        .query_row(
+            "SELECT guard_fingerprint IS NULL
+             FROM declaration_facts
+             WHERE name = 'plain'
+             ORDER BY id
+             LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("plain guard");
+    assert_eq!(plain_guard_is_null, 1);
+
+    let invalid_backing_kind = store.conn.execute(
+        "UPDATE declaration_facts SET backing_kind = 0.5 WHERE name = 'plain'",
+        [],
+    );
+    assert!(
+        invalid_backing_kind.is_err(),
+        "schema must reject non-integer backing kinds"
+    );
+
+    let reader = IndexStore::open_readonly(&db).expect("readonly");
+    let guarded = reader
+        .declaration_view()
+        .by_name_limited("guarded", 1)
+        .expect("guarded declaration")
+        .0
+        .pop()
+        .expect("guarded row");
+    let locator = &guarded.fact.identity.locator.fingerprint;
+    assert_eq!(locator, &expected_locator);
+    let guard = guarded
+        .fact
+        .identity
+        .logical_key
+        .guard_fingerprint
+        .as_deref()
+        .expect("guard fingerprint");
+    assert_eq!(guard, expected_guard);
+    assert_eq!(guarded.backing_kind, "callable_anchor");
+
+    let plain = reader
+        .declaration_view()
+        .by_name_limited("plain", 1)
+        .expect("plain declaration")
+        .0
+        .pop()
+        .expect("plain row");
+    assert!(plain.fact.identity.logical_key.guard_fingerprint.is_none());
+}
+
+#[test]
+fn declaration_storage_tags_logical_signature_relations_without_changing_views() {
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+    let mut store = IndexStore::open(&db, dir.path()).expect("store");
+    upsert_source(
+        &mut store,
+        "same.c",
+        "int same_signature(void) { return 0; }\n",
+    );
+    upsert_source(
+        &mut store,
+        "pkg/init.go",
+        "package pkg\n\nfunc Ordinary() {}\nfunc init() {}\n",
+    );
+
+    let stored_relation = |name: &str| -> (String, Option<String>) {
+        store
+            .conn
+            .query_row(
+                "SELECT typeof(logical_canonical_signature),
+                        CASE WHEN logical_canonical_signature IS NULL
+                             THEN NULL
+                             ELSE hex(logical_canonical_signature)
+                        END
+                 FROM declaration_facts
+                 WHERE name = ?1
+                 ORDER BY id
+                 LIMIT 1",
+                [name],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap_or_else(|error| panic!("stored logical signature for {name}: {error}"))
+    };
+    assert_eq!(
+        stored_relation("same_signature"),
+        ("blob".into(), Some("00".into())),
+        "equal display/logical signatures use the one-byte same-value tag"
+    );
+    assert_eq!(
+        stored_relation("Ordinary"),
+        ("null".into(), None),
+        "an absent logical signature remains SQLite NULL"
+    );
+    let (init_type, init_tagged_hex) = stored_relation("init");
+    assert_eq!(init_type, "blob");
+    let init_tagged_hex = init_tagged_hex.expect("custom init signature");
+    assert_eq!(init_tagged_hex.len(), 50);
+    assert!(
+        init_tagged_hex.starts_with("01"),
+        "a custom logical signature uses the explicit-value tag"
+    );
+
+    let reader = IndexStore::open_readonly(&db).expect("readonly");
+    let same = reader
+        .declaration_view()
+        .by_name_limited("same_signature", 1)
+        .expect("same signature")
+        .0
+        .pop()
+        .expect("same declaration");
+    assert_eq!(
+        same.fact.canonical_signature,
+        same.fact.identity.logical_key.canonical_signature
+    );
+
+    let ordinary = reader
+        .declaration_view()
+        .by_name_limited("Ordinary", 1)
+        .expect("ordinary Go declaration")
+        .0
+        .pop()
+        .expect("Ordinary declaration");
+    assert_eq!(
+        ordinary.fact.canonical_signature.as_deref(),
+        Some("func Ordinary()")
+    );
+    assert!(
+        ordinary
+            .fact
+            .identity
+            .logical_key
+            .canonical_signature
+            .is_none(),
+        "ordinary Go entities do not use a signature in their logical key"
+    );
+
+    let init = reader
+        .declaration_view()
+        .by_name_limited("init", 1)
+        .expect("Go init declaration")
+        .0
+        .pop()
+        .expect("init declaration");
+    assert_eq!(
+        init.fact.canonical_signature.as_deref(),
+        Some("func init()")
+    );
+    let init_logical = init
+        .fact
+        .identity
+        .logical_key
+        .canonical_signature
+        .as_deref()
+        .expect("init logical entity key");
+    assert_eq!(init_logical.len(), 24);
+    assert_ne!(Some(init_logical), init.fact.canonical_signature.as_deref());
+    drop(reader);
+
+    for (value, reason) in [
+        ("x''", "empty BLOB"),
+        ("x'0061'", "same-value tag with a payload"),
+        ("x'02'", "unknown tag"),
+        ("'text'", "TEXT value"),
+        ("1", "INTEGER value"),
+    ] {
+        let sql = format!(
+            "UPDATE declaration_facts
+             SET logical_canonical_signature = {value}
+             WHERE name = 'Ordinary'"
+        );
+        assert!(
+            store.conn.execute(&sql, []).is_err(),
+            "schema must reject {reason}"
+        );
+    }
+    assert!(
+        store
+            .conn
+            .execute(
+                "UPDATE declaration_facts
+                 SET canonical_signature = NULL,
+                     logical_canonical_signature = x'00'
+                 WHERE name = 'Ordinary'",
+                [],
+            )
+            .is_err(),
+        "the same-value tag requires a display signature"
+    );
+
+    store
+        .conn
+        .execute(
+            "UPDATE declaration_facts
+             SET logical_canonical_signature = x'01'
+             WHERE name = 'Ordinary'",
+            [],
+        )
+        .expect("persist explicit empty logical signature");
+    let reader = IndexStore::open_readonly(&db).expect("readonly empty override");
+    let ordinary = reader
+        .declaration_view()
+        .by_name_limited("Ordinary", 1)
+        .expect("read explicit empty override")
+        .0
+        .pop()
+        .expect("Ordinary declaration");
+    assert_eq!(
+        ordinary
+            .fact
+            .identity
+            .logical_key
+            .canonical_signature
+            .as_deref(),
+        Some("")
+    );
+    drop(reader);
+
+    store
+        .conn
+        .execute(
+            "UPDATE declaration_facts
+             SET logical_canonical_signature = x'01ff'
+             WHERE name = 'Ordinary'",
+            [],
+        )
+        .expect("tag shape permits an opaque custom payload");
+    let reader = IndexStore::open_readonly(&db).expect("readonly invalid UTF-8");
+    let error = reader
+        .declaration_view()
+        .by_name_limited("Ordinary", 1)
+        .expect_err("typed view must reject an invalid UTF-8 override");
+    assert!(
+        error.to_string().contains("not UTF-8"),
+        "unexpected typed read error: {error:#}"
+    );
 }
 
 #[test]

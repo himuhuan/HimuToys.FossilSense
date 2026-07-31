@@ -57,6 +57,10 @@ impl LanguageServer for Backend {
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let uri = params.text_document.uri.clone();
+        if let Some(path) = uri_to_path(&uri) {
+            self.invalidate_external_source_path_authorization(&path)
+                .await;
+        }
         self.session
             .open_document(
                 uri.clone(),
@@ -104,7 +108,13 @@ impl LanguageServer for Backend {
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
-        self.session.close_document(&params.text_document.uri).await;
+        let uri = params.text_document.uri;
+        let path = uri_to_path(&uri);
+        self.session.close_document(&uri).await;
+        if let Some(path) = path {
+            self.invalidate_external_source_path_authorization(&path)
+                .await;
+        }
     }
 
     async fn goto_definition(
@@ -146,19 +156,31 @@ impl LanguageServer for Backend {
         let search_word = word.clone();
         let role_cache = self.session.cache.reference_role_cache.clone();
         let search_cache = self.session.cache.reference_search_cache.clone();
+        let reference_cache_epoch = search_cache.epoch();
         let context = self.request_context_for_root(root.clone()).await;
         let indexed_generation = context.engine.epoch.as_u64();
         let indexed_files = context.engine.indexed_files.clone();
+        let semantic_family = context
+            .engine
+            .workspace_semantics
+            .language_for_uri(&uri)
+            .semantic_family();
+        let workspace_config = context.engine.workspace_semantics.workspace.clone();
+        let language_resolver = context.engine.workspace_semantics.language.clone();
         let result = tokio::task::spawn_blocking(
             move || -> Result<(Vec<Location>, bool, references::ReferencesTiming)> {
                 let (mut hits, truncated, timing) =
-                    references::search_references_with_shared_files(
+                    references::search_references_with_shared_files_for_family(
                         &root,
                         &search_word,
                         &role_cache,
                         &search_cache,
                         indexed_generation,
                         indexed_files,
+                        semantic_family,
+                        reference_cache_epoch,
+                        workspace_config,
+                        language_resolver,
                     )?;
                 // Group by role for the editor: definition/declaration first, then
                 // call, write, type-use, and plain reads last; ties keep path/line
@@ -299,17 +321,23 @@ impl LanguageServer for Backend {
         let Some(path) = uri_to_path(&uri) else {
             return Ok(None);
         };
+        let source_language = self
+            .request_context_for_uri(&uri)
+            .await
+            .map(|context| context.engine.workspace_semantics.language_for_uri(&uri))
+            .unwrap_or_else(|| SourceLanguage::default_for_path(&path));
 
         let started = tokio::time::Instant::now();
         // Live parse served from the in-memory cache (one parse per document
         // version, shared across semantic tokens, completion, and symbols).
         let index = self
-            .get_or_parse_document(
+            .get_or_parse_document_with_language(
                 &uri,
                 &path,
                 version,
                 &text,
                 parser::ParseFacts::DECLARATIONS | parser::ParseFacts::INCLUDES,
+                source_language,
             )
             .await;
         let Some(index) = index else {
@@ -368,6 +396,41 @@ impl LanguageServer for Backend {
             return self.complete_include(&uri, form, partial, &text).await;
         }
 
+        let current_root = self.root_for_uri(&uri).await;
+        let primary_context = match current_root.as_ref() {
+            Some(root) => Some(self.request_context_for_root(root.clone()).await),
+            None => None,
+        };
+        let source_language = primary_context
+            .as_ref()
+            .map(|context| context.engine.workspace_semantics.language_for_uri(&uri))
+            .unwrap_or_else(|| SourceLanguage::default_for_path(Path::new(uri.path())));
+
+        if source_language == SourceLanguage::Go {
+            if let Some(import_context) = go_import_completion::go_import_completion_context(
+                &text,
+                position.line,
+                position.character,
+            ) {
+                let (table, current_package_key) =
+                    match (current_root.as_ref(), primary_context.as_ref()) {
+                        (Some(root), Some(context)) => {
+                            let current_package_key = uri_to_path(&uri).and_then(|path| {
+                                let identity_path = pathing::relative_slash_path(root, &path)
+                                    .unwrap_or_else(|_| pathing::normalize_abs_path(&path));
+                                go_import_completion::current_go_package_key(&identity_path, &text)
+                            });
+                            (context.engine.go_import_table.clone(), current_package_key)
+                        }
+                        _ => (None, None),
+                    };
+                return Ok(Some(match table {
+                    Some(table) => table.complete(&import_context, current_package_key.as_deref()),
+                    None => empty_completion_list(true),
+                }));
+            }
+        }
+
         if query::is_member_completion_context(line_text, position.character) {
             return self
                 .complete_members(&uri, version, &text, line_text, position, document_request)
@@ -382,7 +445,7 @@ impl LanguageServer for Backend {
             crate::completion::classify_completion_intent(line_text, position.character, &prefix);
         let history_enabled = self.completion_history_mode.lock().await.is_enabled();
         let history_root = if history_enabled {
-            self.root_for_uri(&uri).await
+            current_root.clone()
         } else {
             None
         };
@@ -404,12 +467,13 @@ impl LanguageServer for Backend {
 
         let parsed_document = match uri_to_path(&uri) {
             Some(path) => {
-                self.get_or_parse_document(
+                self.get_or_parse_document_with_language(
                     &uri,
                     &path,
                     version,
                     &text,
                     parser::ParseFacts::COMPLETION,
+                    source_language,
                 )
                 .await
             }
@@ -417,11 +481,16 @@ impl LanguageServer for Backend {
         };
         let local_words = self.local_words_for(&uri, version, &text).await;
 
-        let current_root = self.root_for_uri(&uri).await;
         let mut contexts = {
             let roots = self.workspace_roots.lock().await.clone();
             let mut contexts = Vec::with_capacity(roots.len());
             for root in roots {
+                if current_root.as_ref() == Some(&root) {
+                    if let Some(context) = primary_context.as_ref() {
+                        contexts.push(context.clone());
+                        continue;
+                    }
+                }
                 contexts.push(self.request_context_for_root(root).await);
             }
             contexts
@@ -441,6 +510,7 @@ impl LanguageServer for Backend {
                         context.engine.semantic_generation,
                         context.engine.reach_graph.as_deref(),
                         context.engine.indexed_files.as_deref().map(Vec::as_slice),
+                        context.engine.workspace_semantics.clone(),
                         document_request.clone(),
                     )
                     .await;
@@ -485,24 +555,30 @@ impl LanguageServer for Backend {
                             entry.path.clone(),
                             entry.kind.clone(),
                             entry.directly_included,
+                            entry.semantic_family,
                         )
                     })
                     .collect();
                 let effective_table = table
-                    .with_updated_paths(overlay.shadowed_paths(), rows)
+                    .with_updated_family_paths(overlay.shadowed_paths(), rows)
                     .with_direct_include_overrides(overlay.direct_include_overrides());
                 let overlay_fallbacks = overlay.fallback_completion_facts().iter().map(|entry| {
-                    crate::completion::ordinary_service::FallbackCompletionName {
-                        name: entry.fact.name.clone(),
-                        kind_hint: entry.fact.kind_hint,
-                        detail: entry.fact.detail.clone(),
-                        path: entry.path.clone(),
-                    }
+                    (
+                        crate::completion::ordinary_service::FallbackCompletionName {
+                            name: entry.fact.name.clone(),
+                            kind_hint: entry.fact.kind_hint,
+                            detail: entry.fact.detail.clone(),
+                            path: entry.path.clone(),
+                        },
+                        overlay
+                            .semantic_family_for_path(&entry.path)
+                            .unwrap_or(crate::semantic_model::SemanticFamily::CFamily),
+                    )
                 });
                 let effective_fallback_table = context
                     .engine
                     .fallback_completion_table
-                    .with_updated_paths(overlay.shadowed_paths(), overlay_fallbacks);
+                    .with_updated_family_paths(overlay.shadowed_paths(), overlay_fallbacks);
                 table_generations.push((context.engine.root.clone(), context.engine.epoch));
                 table_roots.push(context.engine.root.clone());
                 table_semantic_generations.push(context.engine.semantic_generation);
@@ -735,11 +811,13 @@ impl LanguageServer for Backend {
             roots.dedup();
         }
         if !removed.is_empty() {
-            self.session.cache.remove_workspace_roots(&removed).await;
+            self.remove_workspace_runtime_roots(&removed).await;
             self.config_cache
                 .lock()
                 .await
                 .retain(|root, _| !removed.contains(root));
+            #[cfg(test)]
+            self.invalidate_external_source_root_cache(&removed).await;
             let removed_history_paths: Vec<PathBuf> = removed
                 .iter()
                 .filter_map(|root| pathing::default_completion_history_path(root).ok())

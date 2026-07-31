@@ -29,3 +29,17 @@ export function normalizeCompletionPrefixRanking(
 export function normalizeBoolean(value: unknown): boolean {
   return value !== false;
 }
+
+export function normalizeExternalPathList(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return [
+    ...new Set(
+      value
+        .filter((entry): entry is string => typeof entry === 'string')
+        .map((entry) => entry.trim())
+        .filter((entry) => entry.length > 0),
+    ),
+  ];
+}

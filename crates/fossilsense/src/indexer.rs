@@ -4,23 +4,28 @@ use std::time::Instant;
 
 use anyhow::Result;
 
-use crate::config::{resolve_include_roots, LanguageResolver, WorkspaceConfig};
+use crate::config::{
+    resolve_go_module_roots, resolve_include_roots, ConfigIssue, LanguageResolver, WorkspaceConfig,
+};
 use crate::pathing::{
-    canonical_workspace, default_index_path, default_index_staging_path, normalize_abs_path,
-    publish_default_index, relative_slash_path,
+    canonical_workspace, default_index_directory, default_index_path, default_index_staging_path,
+    normalize_abs_path, publish_default_index, relative_slash_path, ExplicitIndexPublication,
 };
 use crate::progress::{IndexStats, IndexStatus};
-use crate::store::IndexStore;
+use crate::store::{IndexStore, IndexWriterLock};
 
 mod candidates;
+mod go_packages;
 mod include_edges;
 mod parse_pipeline;
 mod progress_limiter;
 
 use candidates::{
     candidate_for_path, canonicalize_existing_prefix, discover_candidates,
-    discover_external_candidates, DEFAULT_EXTERNAL_MAX_BYTES, DEFAULT_EXTERNAL_MAX_FILES,
+    discover_external_candidates, discover_external_go_candidates, DEFAULT_EXTERNAL_MAX_BYTES,
+    DEFAULT_EXTERNAL_MAX_FILES,
 };
+use go_packages::build_go_package_graph;
 use include_edges::{build_include_edges, sql_affected_include_edge_sources};
 use parse_pipeline::{parse_and_write_changed, parse_thread_count, ParsePipelineConfig};
 use progress_limiter::ProgressLimiter;
@@ -32,12 +37,59 @@ pub struct IndexOptions {
     /// External include reference directories forwarded from the LSP client,
     /// merged with `fossilsense.json`'s `includePaths`.
     pub include_paths: Vec<String>,
+    /// Explicit external Go module roots forwarded from the LSP client,
+    /// merged with `fossilsense.json`'s `goModulePaths`.
+    pub go_module_paths: Vec<String>,
     /// Override the per-root external file-count cap (defaults to ~20k).
     pub external_max_files: Option<usize>,
     /// Override the per-root external byte cap (defaults to ~512 MB).
     pub external_max_bytes: Option<u64>,
     /// Override parser worker count. Defaults to a small bounded pool.
     pub parse_threads: Option<usize>,
+    /// Configuration and resolved external roots captured by the caller for
+    /// this exact index run. The LSP uses this to publish request semantics
+    /// with the same generation; CLI callers normally leave it unset.
+    pub prepared_configuration: Option<IndexConfigurationSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexConfigurationSnapshot {
+    pub workspace: PathBuf,
+    pub config: WorkspaceConfig,
+    pub language_resolver: LanguageResolver,
+    pub include_roots: Vec<PathBuf>,
+    pub go_module_roots: Vec<PathBuf>,
+    pub issues: Vec<ConfigIssue>,
+}
+
+pub fn prepare_index_configuration(
+    workspace: impl AsRef<Path>,
+    client_include_paths: &[String],
+    client_go_module_paths: &[String],
+) -> Result<IndexConfigurationSnapshot> {
+    let workspace = canonical_workspace(workspace)?;
+    let (config, config_issue) = WorkspaceConfig::load(&workspace);
+    let mut include_entries = config.include_paths.clone();
+    include_entries.extend(client_include_paths.iter().cloned());
+    let (include_roots, include_issues) = resolve_include_roots(&include_entries);
+    let mut go_module_entries = config.go_module_paths.clone();
+    go_module_entries.extend(client_go_module_paths.iter().cloned());
+    let (go_module_roots, mut go_module_issues) = resolve_go_module_roots(&go_module_entries);
+    let (go_module_roots, overlap_issues) = external_go_module_roots(&workspace, go_module_roots);
+    go_module_issues.extend(overlap_issues);
+    let mut issues = Vec::new();
+    issues.extend(config_issue);
+    issues.extend(include_issues);
+    issues.extend(go_module_issues);
+    let language_resolver = LanguageResolver::from_workspace_config(&workspace, &config);
+    Ok(IndexConfigurationSnapshot {
+        workspace,
+        config,
+        language_resolver,
+        include_roots,
+        go_module_roots,
+        issues,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,10 +112,45 @@ pub fn index_workspace(
     let started = Instant::now();
     let workspace = canonical_workspace(workspace)?;
     let workspace_display = workspace.display().to_string();
-    let explicit_db_path = options.db_path.clone();
-    let (db_path, side_by_side_publication, previous_generation) =
+    let requested_explicit_db_path = options.db_path.clone();
+    let logical_destination = if let Some(path) = requested_explicit_db_path.as_ref() {
+        path.clone()
+    } else {
+        default_index_directory(&workspace)?.join("index.sqlite")
+    };
+    // Hold the stable sibling lock from before active-generation discovery
+    // until every write and any manifest publication have completed. This
+    // serializes default generation cleanup and prevents an older concurrent
+    // build from replacing a newer manifest.
+    let writer_lock = IndexWriterLock::acquire(&logical_destination)?;
+    let explicit_db_path = requested_explicit_db_path
+        .as_ref()
+        .map(|_| writer_lock.destination_path().to_path_buf());
+    let explicit_snapshot = if options.force && explicit_db_path.is_some() {
+        Some(writer_lock.capture_replacement_snapshot()?)
+    } else {
+        None
+    };
+    let mut explicit_publication = explicit_db_path
+        .as_ref()
+        .filter(|_| options.force)
+        .map(|path| ExplicitIndexPublication::new(path.clone()))
+        .transpose()?;
+    let (db_path, default_side_by_side_publication, previous_generation) =
         if let Some(path) = explicit_db_path.as_ref() {
-            (path.clone(), false, 0)
+            if let Some(publication) = explicit_publication.as_ref() {
+                let previous_generation = explicit_snapshot
+                    .as_ref()
+                    .expect("force publication snapshot")
+                    .generation();
+                (
+                    publication.staging_path().to_path_buf(),
+                    false,
+                    previous_generation,
+                )
+            } else {
+                (path.clone(), false, 0)
+            }
         } else {
             let active = match default_index_path(&workspace) {
                 Ok(path) => path,
@@ -92,6 +179,8 @@ pub fn index_workspace(
                 (active, false, 0)
             }
         };
+    let side_by_side_publication =
+        default_side_by_side_publication || explicit_publication.is_some();
     let database_existed = db_path.exists();
     let mut stats = IndexStats::default();
     progress(IndexStatus::indexing_phase(
@@ -100,21 +189,26 @@ pub fn index_workspace(
         "discovering",
     ));
 
-    let (config, config_issue) = WorkspaceConfig::load(&workspace);
-    if let Some(issue) = &config_issue {
-        progress(IndexStatus::indexing_with_message(
-            workspace_display.clone(),
-            &stats,
-            issue.message.clone(),
-        ));
-    }
-
-    // External include reference directories: merge config + client-forwarded
-    // entries, then validate against the filesystem. Invalid entries are skipped
-    // with a note; never fatal.
-    let mut include_entries = config.include_paths.clone();
-    include_entries.extend(options.include_paths.iter().cloned());
-    let (include_roots, include_issues) = resolve_include_roots(&include_entries);
+    let prepared = match options.prepared_configuration.clone() {
+        Some(prepared) => prepared,
+        None => prepare_index_configuration(
+            &workspace,
+            &options.include_paths,
+            &options.go_module_paths,
+        )?,
+    };
+    anyhow::ensure!(
+        prepared.workspace == workspace,
+        "prepared index configuration belongs to a different workspace"
+    );
+    let IndexConfigurationSnapshot {
+        config,
+        language_resolver,
+        include_roots,
+        go_module_roots,
+        issues: configuration_issues,
+        ..
+    } = prepared;
 
     let max_files = options
         .external_max_files
@@ -128,10 +222,19 @@ pub fn index_workspace(
     let (external_candidates, external_issues) =
         discover_external_candidates(&include_roots, &config, max_files, max_bytes);
     candidates.extend(external_candidates);
+    let (external_go_candidates, external_go_issues) =
+        discover_external_go_candidates(&go_module_roots, &config, max_files, max_bytes);
+    candidates.extend(external_go_candidates);
+    candidates.sort_by(|left, right| left.fingerprint.path.cmp(&right.fingerprint.path));
+    candidates.dedup_by(|left, right| left.fingerprint.path == right.fingerprint.path);
     stats.discover_ms = discover_started.elapsed().as_millis();
     stats.total_files = candidates.len();
 
-    for issue in include_issues.into_iter().chain(external_issues) {
+    for issue in configuration_issues
+        .into_iter()
+        .chain(external_issues)
+        .chain(external_go_issues)
+    {
         progress(IndexStatus::indexing_with_message(
             workspace_display.clone(),
             &stats,
@@ -179,9 +282,14 @@ pub fn index_workspace(
         let unchanged = stored_files
             .get(&candidate.fingerprint.path)
             .is_some_and(|stored| {
+                let expected_language = language_resolver
+                    .language_for_path(&candidate.absolute_path)
+                    .semantic_language();
                 candidate.fingerprint.mtime_ns != 0
                     && stored.size == candidate.fingerprint.size
                     && stored.mtime_ns == candidate.fingerprint.mtime_ns
+                    && stored.language_code
+                        == crate::store::semantic_language_storage_code(expected_language)
             });
 
         if unchanged && !options.force {
@@ -199,7 +307,7 @@ pub fn index_workspace(
         changed,
         ParsePipelineConfig {
             parse_threads: parse_thread_count(options.parse_threads),
-            language_resolver: LanguageResolver::from_workspace_config(&workspace, &config),
+            language_resolver,
         },
         build,
         &mut store,
@@ -217,7 +325,12 @@ pub fn index_workspace(
     // Rebuild the full include graph that backs reachability scoping, and
     // derive the first-layer `directly_included` flag in the same pass.
     let include_edge_started = Instant::now();
-    let include_graph = build_include_edges(&store, build, &include_roots, None)?;
+    let mut include_graph = build_include_edges(&store, build, &include_roots, None)?;
+    let go_package_graph = build_go_package_graph(&store, build, &workspace, &go_module_roots)?;
+    include_graph.go_package_edges = go_package_graph.edges;
+    include_graph.go_open_packages = go_package_graph.open_packages;
+    include_graph.go_importable_packages = go_package_graph.importable_packages;
+    include_graph.clear_all_go_packages = true;
     let commit = store.commit_index_build(build, &include_graph)?;
     stats.semantic_generation = commit.generation;
     stats.maintenance_warning = commit.cleanup_warning;
@@ -240,12 +353,28 @@ pub fn index_workspace(
         progress(IndexStatus::indexing_phase(
             workspace_display.clone(),
             &stats,
-            "publishing database generation",
+            if default_side_by_side_publication {
+                "publishing database generation"
+            } else {
+                "publishing explicit database"
+            },
         ));
         let publication_started = Instant::now();
         store.prepare_full_build_publication()?;
         drop(store);
-        publish_default_index(&workspace, &db_path, stats.semantic_generation)?;
+        if default_side_by_side_publication {
+            publish_default_index(&workspace, &db_path, stats.semantic_generation)?;
+        } else {
+            let publication = explicit_publication
+                .take()
+                .expect("explicit side-by-side publication");
+            writer_lock.prepare_for_atomic_replacement(
+                explicit_snapshot
+                    .as_ref()
+                    .expect("explicit publication snapshot"),
+            )?;
+            publication.publish()?;
+        }
         stats.publication_ms = publication_started.elapsed().as_millis();
     } else if defer_call_indexes {
         progress(IndexStatus::indexing_phase(
@@ -294,9 +423,17 @@ pub fn index_dirty_files(
     let started = Instant::now();
     let workspace = canonical_workspace(workspace)?;
     let workspace_display = workspace.display().to_string();
-    let db_path = match options.db_path {
-        Some(path) => path,
-        None => default_index_path(&workspace)?,
+    let requested_explicit_db_path = options.db_path.clone();
+    let logical_destination = if let Some(path) = requested_explicit_db_path.as_ref() {
+        path.clone()
+    } else {
+        default_index_directory(&workspace)?.join("index.sqlite")
+    };
+    let writer_lock = IndexWriterLock::acquire(&logical_destination)?;
+    let db_path = if requested_explicit_db_path.is_some() {
+        writer_lock.destination_path().to_path_buf()
+    } else {
+        default_index_path(&workspace)?
     };
     let mut stats = IndexStats {
         total_files: changes.len(),
@@ -309,19 +446,27 @@ pub fn index_dirty_files(
         "updating",
     ));
 
-    let (config, config_issue) = WorkspaceConfig::load(&workspace);
-    if let Some(issue) = &config_issue {
-        progress(IndexStatus::indexing_with_message(
-            workspace_display.clone(),
-            &stats,
-            issue.message.clone(),
-        ));
-    }
-
-    let mut include_entries = config.include_paths.clone();
-    include_entries.extend(options.include_paths.iter().cloned());
-    let (include_roots, include_issues) = resolve_include_roots(&include_entries);
-    for issue in include_issues {
+    let prepared = match options.prepared_configuration.clone() {
+        Some(prepared) => prepared,
+        None => prepare_index_configuration(
+            &workspace,
+            &options.include_paths,
+            &options.go_module_paths,
+        )?,
+    };
+    anyhow::ensure!(
+        prepared.workspace == workspace,
+        "prepared index configuration belongs to a different workspace"
+    );
+    let IndexConfigurationSnapshot {
+        config,
+        language_resolver,
+        include_roots,
+        go_module_roots,
+        issues: configuration_issues,
+        ..
+    } = prepared;
+    for issue in configuration_issues {
         progress(IndexStatus::indexing_with_message(
             workspace_display.clone(),
             &stats,
@@ -387,7 +532,7 @@ pub fn index_dirty_files(
         upserts,
         ParsePipelineConfig {
             parse_threads: parse_thread_count(options.parse_threads),
-            language_resolver: LanguageResolver::from_workspace_config(&workspace, &config),
+            language_resolver,
         },
         build,
         &mut store,
@@ -410,7 +555,13 @@ pub fn index_dirty_files(
     let affected_rels =
         sql_affected_include_edge_sources(&store, &roots_slash, &upsert_rels, &changed_rels)?;
     stats.include_edge_sources_rebuilt = affected_rels.clone();
-    let include_graph = build_include_edges(&store, build, &include_roots, Some(&affected_rels))?;
+    let mut include_graph =
+        build_include_edges(&store, build, &include_roots, Some(&affected_rels))?;
+    let go_package_graph = build_go_package_graph(&store, build, &workspace, &go_module_roots)?;
+    include_graph.go_package_edges = go_package_graph.edges;
+    include_graph.go_open_packages = go_package_graph.open_packages;
+    include_graph.go_importable_packages = go_package_graph.importable_packages;
+    include_graph.clear_all_go_packages = true;
     let commit = store.commit_index_build(build, &include_graph)?;
     stats.semantic_generation = commit.generation;
     stats.maintenance_warning = commit.cleanup_warning;
@@ -422,6 +573,44 @@ pub fn index_dirty_files(
     stats.elapsed_ms = started.elapsed().as_millis();
     progress(IndexStatus::ready(workspace_display, &stats));
     Ok(stats)
+}
+
+fn external_go_module_roots(
+    workspace: &Path,
+    roots: Vec<PathBuf>,
+) -> (Vec<PathBuf>, Vec<ConfigIssue>) {
+    let mut external = Vec::new();
+    let mut issues = Vec::new();
+    let mut seen = HashSet::new();
+    for root in roots {
+        let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+        if canonical.starts_with(workspace) || workspace.starts_with(&canonical) {
+            issues.push(ConfigIssue {
+                message: format!(
+                    "goModulePaths root overlaps the workspace and would index workspace files \
+                     twice; skipping external duplicate: {}",
+                    canonical.display()
+                ),
+            });
+            continue;
+        }
+        let identity = normalize_abs_path(&canonical).to_ascii_lowercase();
+        if !seen.insert(identity) {
+            issues.push(ConfigIssue {
+                message: format!(
+                    "goModulePaths roots resolve to the same directory, skipping duplicate: {}",
+                    canonical.display()
+                ),
+            });
+            continue;
+        }
+        // Canonical paths are comparison identities only. On Windows,
+        // `canonicalize` may add a verbatim `\\?\` prefix; feeding that back
+        // into discovery would change the persisted absolute path spelling
+        // and break equality with other normalized external-root consumers.
+        external.push(root);
+    }
+    (external, issues)
 }
 
 #[cfg(test)]

@@ -5,7 +5,8 @@ use crate::project_context::{ProjectContextIndex, ProjectKey};
 use crate::store::views::DeclarationNameRef;
 
 use super::{
-    CompactNameEntry, NameEntry, NameEntryRef, NameSegment, NameString, NameTable, NO_PROJECT_ID,
+    CompactNameEntry, CompactNameFlags, NameEntry, NameEntryRef, NameSegment, NameString,
+    NameTable, NO_PROJECT_ID,
 };
 
 /// Cold-build accumulator that interns borrowed SQLite text into segment-local
@@ -64,8 +65,7 @@ impl<'a> NameIndexBuilder<'a> {
             project_id,
             kind: super::parser_kind_from_declaration_kind(row.declaration_kind),
             role: super::symbol_role_from_declaration_role(row.role),
-            external: row.external,
-            directly_included: row.directly_included,
+            flags: CompactNameFlags::new(row.semantic_family, row.external, row.directly_included),
         });
     }
 
@@ -82,8 +82,11 @@ impl<'a> NameIndexBuilder<'a> {
             project_id,
             kind: entry.kind,
             role: entry.role,
-            external: entry.external,
-            directly_included: entry.directly_included,
+            flags: CompactNameFlags::new(
+                entry.semantic_family,
+                entry.external,
+                entry.directly_included,
+            ),
         });
     }
 
@@ -101,8 +104,11 @@ impl<'a> NameIndexBuilder<'a> {
             project_id,
             kind: entry.kind,
             role: entry.role,
-            external: entry.external,
-            directly_included: entry.directly_included,
+            flags: CompactNameFlags::new(
+                entry.semantic_family,
+                entry.external,
+                entry.directly_included,
+            ),
         });
     }
 
@@ -128,8 +134,11 @@ impl<'a> NameIndexBuilder<'a> {
             project_id,
             kind: entry.kind,
             role: entry.role,
-            external: entry.external,
-            directly_included: entry.directly_included,
+            flags: CompactNameFlags::new(
+                entry.semantic_family,
+                entry.external,
+                entry.directly_included,
+            ),
         });
     }
 

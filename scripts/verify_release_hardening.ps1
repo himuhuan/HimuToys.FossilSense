@@ -380,7 +380,7 @@ $baseDocumentRequirements = @(
 )
 Require-DocumentPatterns (Join-Path $RepoRoot 'README.md') $baseDocumentRequirements
 Require-DocumentPatterns (Join-Path $RepoRoot 'extensions/vscode/README.md') $baseDocumentRequirements
-Require-DocumentPatterns (Join-Path $RepoRoot 'CLAUDE.md') $baseDocumentRequirements
+Require-DocumentPatterns (Join-Path $RepoRoot 'AGENTS.md') $baseDocumentRequirements
 
 if ($isV142Release) {
     $semanticReleaseRequirements = @(
@@ -391,7 +391,7 @@ if ($isV142Release) {
     )
     Require-DocumentPatterns (Join-Path $RepoRoot 'README.md') $semanticReleaseRequirements
     Require-DocumentPatterns (Join-Path $RepoRoot 'extensions/vscode/README.md') $semanticReleaseRequirements
-    Require-DocumentPatterns (Join-Path $RepoRoot 'CLAUDE.md') @(
+    Require-DocumentPatterns (Join-Path $RepoRoot 'AGENTS.md') @(
         $semanticReleaseRequirements + @(
             @{ Label = 'schema 16'; Pattern = '(?i)schema\s*16' },
             @{ Label = 'closed, bidirectionally unique pairing'; Pattern = '(?i)\u53cc\u5411\u552f\u4e00|bidirectionally\s+unique|degree\s*=\s*1' }

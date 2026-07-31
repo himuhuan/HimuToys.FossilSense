@@ -222,7 +222,7 @@ fn sqlite_trigger_rejects_declarations_for_fallback_revisions() {
             logical_linkage_domain, backing_kind
          ) VALUES (
             ?1, ?2, 'bad', 'bad', 0, 0, 0, 3, 0, 0, 0, 3, 0, 3,
-            0, 0, 0, 3, 0, 0, 0, 0, 0, zeroblob(12), 'bad', 'external', 4
+            0, 0, 0, 3, 0, 0, 0, 0, 0, zeroblob(12), zeroblob(12), 'external', 4
          )",
         rusqlite::params![revision_id, file_id],
     );

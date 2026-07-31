@@ -9,3 +9,5 @@ assert.strictEqual(sourceWatchGlob(['ino']), '**/*.ino');
 assert.strictEqual(sourceWatchGlob(['c', 'ino']), '**/*.{c,ino}');
 assert.strictEqual(sourceWatchGlob([]), undefined);
 assert.ok(extensionsFromConfigText('{invalid').includes('cpp'));
+assert.ok(extensionsFromConfigText(undefined).includes('go'));
+assert.ok(extensionsFromConfigText('{invalid').includes('go'));

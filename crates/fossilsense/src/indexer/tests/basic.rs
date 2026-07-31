@@ -1,4 +1,7 @@
 use super::*;
+use crate::store::test_support::{
+    hold_external_wal_writer, inspect_explicit_replacement, install_old_revision_cleanup_guard,
+};
 
 #[test]
 fn indexes_mini_workspace_and_skips_unchanged_files() {
@@ -115,6 +118,72 @@ fn indexer_uses_language_overrides_for_header_declaration_metadata() {
 }
 
 #[test]
+fn incremental_index_reparses_unchanged_source_when_language_override_changes() {
+    let dir = tempdir().expect("tempdir");
+    fs::create_dir_all(dir.path().join("legacy")).expect("legacy");
+    let config_path = dir.path().join("fossilsense.json");
+    let source_path = dir.path().join("legacy/api.h");
+    fs::write(
+        &config_path,
+        r#"{"languageOverrides":[{"glob":"legacy/**/*.h","language":"cpp"}]}"#,
+    )
+    .expect("initial config");
+    fs::write(&source_path, "int language_sensitive_object;\n").expect("header");
+    let original_metadata = fs::metadata(&source_path).expect("source metadata");
+    let db = dir.path().join("index.sqlite");
+
+    index_workspace(
+        dir.path(),
+        IndexOptions {
+            db_path: Some(db.clone()),
+            force: false,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("initial index");
+
+    fs::write(
+        &config_path,
+        r#"{"languageOverrides":[{"glob":"legacy/**/*.h","language":"c"}]}"#,
+    )
+    .expect("updated config");
+    let unchanged_metadata = fs::metadata(&source_path).expect("unchanged source metadata");
+    assert_eq!(unchanged_metadata.len(), original_metadata.len());
+    assert_eq!(
+        unchanged_metadata.modified().expect("unchanged mtime"),
+        original_metadata.modified().expect("original mtime")
+    );
+
+    let updated = index_workspace(
+        dir.path(),
+        IndexOptions {
+            db_path: Some(db.clone()),
+            force: false,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("incremental index");
+    assert_eq!(updated.indexed_files, 1);
+    assert_eq!(updated.skipped_files, 0);
+
+    let store = IndexStore::open_readonly(&db).expect("store");
+    let declaration = store
+        .declarations_by_name("language_sensitive_object")
+        .expect("declaration");
+    assert_eq!(declaration.len(), 1);
+    assert_eq!(
+        declaration[0].fact.identity.language,
+        crate::semantic_model::SemanticLanguage::C
+    );
+    assert_eq!(
+        declaration[0].fact.role,
+        crate::semantic_model::SemanticDeclarationRole::TentativeDefinition
+    );
+}
+
+#[test]
 fn default_full_rebuild_publishes_side_by_side_and_preserves_old_reader() {
     let workspace = tempdir().expect("workspace");
     let source = workspace.path().join("main.c");
@@ -215,6 +284,132 @@ fn default_full_rebuild_publishes_side_by_side_and_preserves_old_reader() {
     drop(new_reader);
     drop(old_reader);
     fs::remove_dir_all(cache_dir).expect("clean unique test cache");
+}
+
+#[test]
+fn explicit_force_rebuild_publishes_a_fresh_database_without_old_cleanup_debt() {
+    let workspace = tempdir().expect("workspace");
+    let source = workspace.path().join("main.c");
+    let db = workspace.path().join("explicit.sqlite");
+    fs::write(&source, "int first_generation(void) { return 1; }\n").expect("first source");
+
+    let first = index_workspace(
+        workspace.path(),
+        IndexOptions {
+            db_path: Some(db.clone()),
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("first explicit build");
+    assert_eq!(first.semantic_generation, 1);
+
+    install_old_revision_cleanup_guard(&db).expect("install old-database cleanup guard");
+
+    fs::write(&source, "int second_generation(void) { return 2; }\n").expect("second source");
+    let second = index_workspace(
+        workspace.path(),
+        IndexOptions {
+            db_path: Some(db.clone()),
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("second explicit build");
+
+    assert_eq!(second.semantic_generation, 2);
+    assert_eq!(
+        second.maintenance_warning, None,
+        "a fresh explicit build must not inherit old cleanup failures"
+    );
+    let store = IndexStore::open_readonly(&db).expect("new explicit database");
+    assert!(store
+        .declarations_by_name("first_generation")
+        .expect("old declaration")
+        .is_empty());
+    assert_eq!(
+        store
+            .declarations_by_name("second_generation")
+            .expect("new declaration")
+            .len(),
+        1
+    );
+    drop(store);
+
+    let replacement = inspect_explicit_replacement(&db).expect("inspect replaced database");
+    assert_eq!(
+        replacement.trigger_count, 0,
+        "the old schema must not be copied"
+    );
+    assert_eq!(
+        replacement.revision_count, 1,
+        "the replacement must contain only the published generation"
+    );
+}
+
+#[test]
+fn explicit_force_rebuild_preserves_old_database_when_wal_cannot_be_drained() {
+    let workspace = tempdir().expect("workspace");
+    let source = workspace.path().join("main.c");
+    let db = workspace.path().join("explicit.sqlite");
+    fs::write(&source, "int first_generation(void) { return 1; }\n").expect("first source");
+    index_workspace(
+        workspace.path(),
+        IndexOptions {
+            db_path: Some(db.clone()),
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("first explicit build");
+
+    let blocker = hold_external_wal_writer(&db).expect("hold external WAL writer");
+    fs::write(&source, "int second_generation(void) { return 2; }\n").expect("second source");
+
+    let error = index_workspace(
+        workspace.path(),
+        IndexOptions {
+            db_path: Some(db.clone()),
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect_err("a live external WAL writer must block replacement");
+    assert!(
+        error.to_string().contains("locked") || error.to_string().contains("journal"),
+        "unexpected WAL drain error: {error:#}"
+    );
+    blocker.release().expect("release external writer");
+
+    let store = IndexStore::open_readonly(&db).expect("preserved old database");
+    assert_eq!(store.semantic_generation().expect("old generation"), 1);
+    assert_eq!(
+        store
+            .declarations_by_name("first_generation")
+            .expect("old declaration")
+            .len(),
+        1
+    );
+    assert!(store
+        .declarations_by_name("second_generation")
+        .expect("unpublished declaration")
+        .is_empty());
+    drop(store);
+    let staging_count = fs::read_dir(workspace.path())
+        .expect("workspace entries")
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".fossilsense-index-build-")
+        })
+        .count();
+    assert_eq!(staging_count, 0, "failed staging must be reclaimed");
 }
 
 #[test]

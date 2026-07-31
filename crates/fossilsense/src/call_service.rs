@@ -9,6 +9,7 @@ use crate::call_model::{CallSiteFact, CallableAnchor, CoverageSummary, SourceRan
 use crate::call_model::{CallableLocator, RelationDirection, SemanticGeneration, SourcePosition};
 use crate::pathing::IndexDbLease;
 use crate::reachability::ReachGraph;
+use crate::semantic_model::SemanticFamily;
 use crate::store::views::CallFactStoreView;
 use crate::store::IndexStore;
 
@@ -31,15 +32,31 @@ impl CallReadHandle {
         }
     }
 
+    pub(crate) fn at_default_generation(
+        db_path: PathBuf,
+        generation: SemanticGeneration,
+    ) -> Result<Self> {
+        Ok(Self {
+            db: IndexDbLease::acquire_default_generation(db_path)?,
+            generation,
+        })
+    }
+
     pub fn capture(db_path: PathBuf) -> Result<Self> {
         let store = IndexStore::open_readonly(&db_path)?;
         let guard = store.begin_semantic_read(None)?;
         let generation = SemanticGeneration(guard.generation());
         guard.finish()?;
-        Ok(Self {
-            db: IndexDbLease::acquire(db_path),
-            generation,
-        })
+        Ok(Self::at_generation(db_path, generation))
+    }
+
+    pub(crate) fn capture_default_generation(db_path: PathBuf) -> Result<Self> {
+        let db = IndexDbLease::acquire_default_generation(db_path)?;
+        let store = IndexStore::open_readonly(db.path())?;
+        let guard = store.begin_semantic_read(None)?;
+        let generation = SemanticGeneration(guard.generation());
+        guard.finish()?;
+        Ok(Self { db, generation })
     }
 
     /// Run a typed read against the exact semantic generation captured by
@@ -58,14 +75,17 @@ pub struct CallRelationService<'a> {
     handle: &'a CallReadHandle,
     overlays: &'a [FileCallOverlay],
     reach_graph: Option<&'a ReachGraph>,
+    semantic_family: SemanticFamily,
 }
 
 impl<'a> CallRelationService<'a> {
+    #[cfg(test)]
     pub fn new(handle: &'a CallReadHandle) -> Self {
         Self {
             handle,
             overlays: &[],
             reach_graph: None,
+            semantic_family: SemanticFamily::CFamily,
         }
     }
 
@@ -75,9 +95,11 @@ impl<'a> CallRelationService<'a> {
             handle,
             overlays,
             reach_graph: None,
+            semantic_family: SemanticFamily::CFamily,
         }
     }
 
+    #[cfg(test)]
     pub fn for_request_with_reach(
         handle: &'a CallReadHandle,
         overlays: &'a [FileCallOverlay],
@@ -87,6 +109,21 @@ impl<'a> CallRelationService<'a> {
             handle,
             overlays,
             reach_graph,
+            semantic_family: SemanticFamily::CFamily,
+        }
+    }
+
+    pub fn for_request_with_reach_and_family(
+        handle: &'a CallReadHandle,
+        overlays: &'a [FileCallOverlay],
+        reach_graph: Option<&'a ReachGraph>,
+        semantic_family: SemanticFamily,
+    ) -> Self {
+        Self {
+            handle,
+            overlays,
+            reach_graph,
+            semantic_family,
         }
     }
 
@@ -99,6 +136,7 @@ impl<'a> CallRelationService<'a> {
             path,
             position,
             self.reach_graph,
+            self.semantic_family,
         )?;
         guard.finish()?;
         Ok(catalog)
@@ -116,8 +154,14 @@ impl<'a> CallRelationService<'a> {
         let store = IndexStore::open_readonly(self.handle.db.path())?;
         let guard = store.begin_semantic_read(Some(self.handle.generation.0))?;
         let view = guard.store().call_fact_view();
-        let locator_catalog =
-            locator_catalog(&view, self.overlays, path, position, self.reach_graph)?;
+        let locator_catalog = locator_catalog(
+            &view,
+            self.overlays,
+            path,
+            position,
+            self.reach_graph,
+            self.semantic_family,
+        )?;
         let entity = locator_catalog
             .entity_at(path, position)
             .context("no callable at requested position")?;
@@ -140,6 +184,7 @@ impl<'a> CallRelationService<'a> {
                 call_site_limit,
                 overlays: self.overlays,
                 reach_graph: self.reach_graph,
+                semantic_family: self.semantic_family,
             },
         )?;
         guard.finish()?;
@@ -165,13 +210,15 @@ impl<'a> CallRelationService<'a> {
             &mut seen,
             self.overlays
                 .iter()
+                .filter(|overlay| overlay.semantic_family == self.semantic_family)
                 .flat_map(|overlay| overlay.anchors.iter())
                 .filter(|anchor| anchor.entity_key == raw_key || anchor.path == locator.path)
                 .cloned(),
             DEFAULT_CANDIDATE_EXPANSION_LIMIT,
         );
         let remaining = DEFAULT_CANDIDATE_EXPANSION_LIMIT.saturating_sub(anchors.len());
-        let (rows, durable_limited) = view.anchors_by_entity_key_limited(raw_key, remaining)?;
+        let (rows, durable_limited) =
+            view.anchors_by_entity_key_family_limited(raw_key, self.semantic_family, remaining)?;
         candidate_recall_limited |= durable_limited;
         append_anchors_bounded(
             &mut anchors,
@@ -183,7 +230,11 @@ impl<'a> CallRelationService<'a> {
         );
         if anchors.is_empty() && !candidate_recall_limited {
             let remaining = DEFAULT_CANDIDATE_EXPANSION_LIMIT.saturating_sub(anchors.len());
-            let (rows, path_limited) = view.anchors_by_path_limited(&locator.path, remaining)?;
+            let (rows, path_limited) = view.anchors_by_path_family_limited(
+                &locator.path,
+                self.semantic_family,
+                remaining,
+            )?;
             candidate_recall_limited |= path_limited;
             append_anchors_bounded(
                 &mut anchors,
@@ -194,7 +245,8 @@ impl<'a> CallRelationService<'a> {
                 DEFAULT_CANDIDATE_EXPANSION_LIMIT,
             );
         }
-        let (anchors, expansion_limited) = expand_anchor_names(&view, self.overlays, anchors)?;
+        let (anchors, expansion_limited) =
+            expand_anchor_names(&view, self.overlays, anchors, self.semantic_family)?;
         candidate_recall_limited |= expansion_limited;
         let coverage = coverage_summary(view.request_coverage()?);
         let locator_catalog = RelationQueryIndex::build_from_facts_with_context(
@@ -202,7 +254,7 @@ impl<'a> CallRelationService<'a> {
             Vec::<CallSiteFact>::new(),
             coverage,
             self.reach_graph,
-            overlays_incomplete(self.overlays),
+            overlays_incomplete(self.overlays, self.semantic_family),
             candidate_recall_limited,
         );
         let entity = locator_catalog
@@ -226,6 +278,7 @@ impl<'a> CallRelationService<'a> {
                 call_site_limit,
                 overlays: self.overlays,
                 reach_graph: self.reach_graph,
+                semantic_family: self.semantic_family,
             },
         )?;
         guard.finish()?;
@@ -251,13 +304,15 @@ impl<'a> CallRelationService<'a> {
             &mut seen,
             self.overlays
                 .iter()
+                .filter(|overlay| overlay.semantic_family == self.semantic_family)
                 .flat_map(|overlay| overlay.anchors.iter())
                 .filter(|anchor| anchor.entity_key == raw_key)
                 .cloned(),
             DEFAULT_CANDIDATE_EXPANSION_LIMIT,
         );
         let remaining = DEFAULT_CANDIDATE_EXPANSION_LIMIT.saturating_sub(anchors.len());
-        let (rows, durable_limited) = view.anchors_by_entity_key_limited(raw_key, remaining)?;
+        let (rows, durable_limited) =
+            view.anchors_by_entity_key_family_limited(raw_key, self.semantic_family, remaining)?;
         candidate_recall_limited |= durable_limited;
         append_anchors_bounded(
             &mut anchors,
@@ -267,7 +322,8 @@ impl<'a> CallRelationService<'a> {
                 .map(anchor_from_row),
             DEFAULT_CANDIDATE_EXPANSION_LIMIT,
         );
-        let (anchors, expansion_limited) = expand_anchor_names(&view, self.overlays, anchors)?;
+        let (anchors, expansion_limited) =
+            expand_anchor_names(&view, self.overlays, anchors, self.semantic_family)?;
         candidate_recall_limited |= expansion_limited;
         let coverage = coverage_summary(view.request_coverage()?);
         let locator_catalog = RelationQueryIndex::build_from_facts_with_context(
@@ -275,7 +331,7 @@ impl<'a> CallRelationService<'a> {
             Vec::<CallSiteFact>::new(),
             coverage,
             self.reach_graph,
-            overlays_incomplete(self.overlays),
+            overlays_incomplete(self.overlays, self.semantic_family),
             candidate_recall_limited,
         );
         let entity = locator_catalog
@@ -300,6 +356,7 @@ impl<'a> CallRelationService<'a> {
                 call_site_limit,
                 overlays: self.overlays,
                 reach_graph: self.reach_graph,
+                semantic_family: self.semantic_family,
             },
         )?;
         guard.finish()?;
@@ -313,12 +370,14 @@ fn locator_catalog(
     path: &str,
     position: SourcePosition,
     reach_graph: Option<&ReachGraph>,
+    semantic_family: SemanticFamily,
 ) -> Result<RelationQueryIndex> {
     let (path_anchors, mut candidate_recall_limited): (Vec<CallableAnchor>, bool) =
         if let Some(overlay) = overlay_for(overlays, path) {
             let mut anchors: Vec<_> = overlay
                 .anchors
                 .iter()
+                .filter(|_| overlay.semantic_family == semantic_family)
                 .filter(|anchor| anchor_matches_position(anchor, position))
                 .take(DEFAULT_CANDIDATE_EXPANSION_LIMIT.saturating_add(1))
                 .cloned()
@@ -327,10 +386,11 @@ fn locator_catalog(
             anchors.truncate(DEFAULT_CANDIDATE_EXPANSION_LIMIT);
             (anchors, limited)
         } else {
-            let (rows, limited) = view.anchors_at_limited(
+            let (rows, limited) = view.anchors_at_family_limited(
                 path,
                 position.line,
                 position.character,
+                semantic_family,
                 DEFAULT_CANDIDATE_EXPANSION_LIMIT,
             )?;
             (rows.into_iter().map(anchor_from_row).collect(), limited)
@@ -340,6 +400,7 @@ fn locator_catalog(
             let mut calls: Vec<_> = overlay
                 .calls
                 .iter()
+                .filter(|_| overlay.semantic_family == semantic_family)
                 .filter(|call| position_in_range(position, call.callee_range))
                 .take(DEFAULT_SCANNED_SITE_LIMIT.saturating_add(1))
                 .cloned()
@@ -348,10 +409,11 @@ fn locator_catalog(
             calls.truncate(DEFAULT_SCANNED_SITE_LIMIT);
             (calls, limited)
         } else {
-            let (rows, limited) = view.call_sites_at_limited(
+            let (rows, limited) = view.call_sites_at_family_limited(
                 path,
                 position.line,
                 position.character,
+                semantic_family,
                 DEFAULT_SCANNED_SITE_LIMIT,
             )?;
             (rows.into_iter().map(call_from_row).collect(), limited)
@@ -377,13 +439,15 @@ fn locator_catalog(
         &mut seen,
         overlays
             .iter()
+            .filter(|overlay| overlay.semantic_family == semantic_family)
             .flat_map(|overlay| overlay.anchors.iter())
             .filter(|anchor| name_set.contains(anchor.name.as_str()))
             .cloned(),
         DEFAULT_CANDIDATE_EXPANSION_LIMIT,
     );
     let remaining = DEFAULT_CANDIDATE_EXPANSION_LIMIT.saturating_sub(lookup_anchors.len());
-    let (rows, durable_limited) = view.anchors_by_names_limited(&names, remaining)?;
+    let (rows, durable_limited) =
+        view.anchors_by_names_family_limited(&names, semantic_family, remaining)?;
     candidate_recall_limited |= durable_limited;
     candidate_recall_limited |= append_anchors_bounded(
         &mut lookup_anchors,
@@ -398,7 +462,7 @@ fn locator_catalog(
         path_calls,
         coverage_summary(view.request_coverage()?),
         reach_graph,
-        overlays_incomplete(overlays),
+        overlays_incomplete(overlays, semantic_family),
         candidate_recall_limited,
     ))
 }
@@ -413,6 +477,7 @@ struct ResolvedQuery<'a> {
     call_site_limit: usize,
     overlays: &'a [FileCallOverlay],
     reach_graph: Option<&'a ReachGraph>,
+    semantic_family: SemanticFamily,
 }
 
 fn query_resolved(
@@ -429,11 +494,14 @@ fn query_resolved(
         call_site_limit,
         overlays,
         reach_graph,
+        semantic_family,
     } = query;
     let (base_rows, mut scan_limited) = match direction {
-        RelationDirection::Incoming => {
-            view.call_sites_by_callee_limited(name, DEFAULT_SCANNED_SITE_LIMIT)?
-        }
+        RelationDirection::Incoming => view.call_sites_by_callee_family_limited(
+            name,
+            semantic_family,
+            DEFAULT_SCANNED_SITE_LIMIT,
+        )?,
         RelationDirection::Outgoing => {
             let mut rows = Vec::new();
             let mut limited = false;
@@ -444,7 +512,7 @@ fn query_resolved(
                     break;
                 }
                 let (mut next, next_limited) =
-                    view.call_sites_by_caller_limited(raw_key, remaining)?;
+                    view.call_sites_by_caller_family_limited(raw_key, semantic_family, remaining)?;
                 rows.append(&mut next);
                 limited |= next_limited;
             }
@@ -458,6 +526,7 @@ fn query_resolved(
         .collect();
     let mut overlay_calls: Vec<_> = overlays
         .iter()
+        .filter(|overlay| overlay.semantic_family == semantic_family)
         .flat_map(|overlay| overlay.calls.iter())
         .filter(|call| match direction {
             RelationDirection::Incoming => call.callee_name.as_deref() == Some(name),
@@ -494,6 +563,7 @@ fn query_resolved(
         &mut seen,
         overlays
             .iter()
+            .filter(|overlay| overlay.semantic_family == semantic_family)
             .flat_map(|overlay| overlay.anchors.iter())
             .filter(|anchor| {
                 caller_set.contains(anchor.entity_key.as_str())
@@ -504,7 +574,7 @@ fn query_resolved(
     );
     let remaining = DEFAULT_CANDIDATE_EXPANSION_LIMIT.saturating_sub(anchors.len());
     let (caller_rows, caller_limited) =
-        view.anchors_by_entity_keys_limited(&caller_keys, remaining)?;
+        view.anchors_by_entity_keys_family_limited(&caller_keys, semantic_family, remaining)?;
     candidate_recall_limited |= caller_limited;
     candidate_recall_limited |= append_anchors_bounded(
         &mut anchors,
@@ -516,7 +586,8 @@ fn query_resolved(
         DEFAULT_CANDIDATE_EXPANSION_LIMIT,
     );
     let remaining = DEFAULT_CANDIDATE_EXPANSION_LIMIT.saturating_sub(anchors.len());
-    let (callee_rows, callee_limited) = view.anchors_by_names_limited(&callee_names, remaining)?;
+    let (callee_rows, callee_limited) =
+        view.anchors_by_names_family_limited(&callee_names, semantic_family, remaining)?;
     candidate_recall_limited |= callee_limited;
     candidate_recall_limited |= append_anchors_bounded(
         &mut anchors,
@@ -534,7 +605,7 @@ fn query_resolved(
         calls,
         coverage_summary(view.request_coverage()?),
         reach_graph,
-        overlays_incomplete(overlays),
+        overlays_incomplete(overlays, semantic_family),
         candidate_recall_limited,
     );
     let mut page = catalog.relation_page(direction, key, cursor, relation_limit, call_site_limit);
@@ -583,6 +654,7 @@ fn expand_anchor_names(
     view: &CallFactStoreView<'_>,
     overlays: &[FileCallOverlay],
     anchors: Vec<CallableAnchor>,
+    semantic_family: SemanticFamily,
 ) -> Result<(Vec<CallableAnchor>, bool)> {
     let mut expanded = Vec::new();
     let mut seen = HashSet::new();
@@ -599,13 +671,15 @@ fn expand_anchor_names(
         &mut seen,
         overlays
             .iter()
+            .filter(|overlay| overlay.semantic_family == semantic_family)
             .flat_map(|overlay| overlay.anchors.iter())
             .filter(|anchor| name_set.contains(anchor.name.as_str()))
             .cloned(),
         DEFAULT_CANDIDATE_EXPANSION_LIMIT,
     );
     let remaining = DEFAULT_CANDIDATE_EXPANSION_LIMIT.saturating_sub(expanded.len());
-    let (rows, durable_limited) = view.anchors_by_names_limited(&names, remaining)?;
+    let (rows, durable_limited) =
+        view.anchors_by_names_family_limited(&names, semantic_family, remaining)?;
     candidate_limited |= durable_limited;
     candidate_limited |= append_anchors_bounded(
         &mut expanded,
@@ -642,8 +716,10 @@ fn append_anchors_bounded(
     false
 }
 
-fn overlays_incomplete(overlays: &[FileCallOverlay]) -> bool {
-    overlays.iter().any(|overlay| !overlay.facts_complete)
+fn overlays_incomplete(overlays: &[FileCallOverlay], semantic_family: SemanticFamily) -> bool {
+    overlays
+        .iter()
+        .any(|overlay| overlay.semantic_family == semantic_family && !overlay.facts_complete)
 }
 
 fn overlay_for<'a>(overlays: &'a [FileCallOverlay], path: &str) -> Option<&'a FileCallOverlay> {
@@ -814,6 +890,228 @@ mod tests {
             merged_page.total, 2,
             "incoming must merge calls from other dirty documents"
         );
+    }
+
+    #[test]
+    fn go_call_relations_do_not_merge_same_named_c_facts() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            workspace.join("calls.go"),
+            "package main\nfunc target() {}\nfunc goCaller() { target() }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.join("calls.c"),
+            "void target(void) {}\nvoid cCaller(void) { target(); }\n",
+        )
+        .unwrap();
+        let db_path = temp.path().join("index.sqlite");
+        index_workspace(
+            &workspace,
+            IndexOptions {
+                db_path: Some(db_path.clone()),
+                force: true,
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .unwrap();
+
+        let handle = CallReadHandle::capture(db_path).unwrap();
+        let (_, _, page) = CallRelationService::for_request_with_reach_and_family(
+            &handle,
+            &[],
+            None,
+            crate::semantic_model::SemanticFamily::Go,
+        )
+        .query_at(
+            "calls.go",
+            SourcePosition {
+                line: 1,
+                character: 6,
+            },
+            RelationDirection::Incoming,
+            0,
+            100,
+            100,
+        )
+        .unwrap();
+
+        assert_eq!(page.relations.len(), 1);
+        assert_eq!(page.relations[0].caller.name, "goCaller");
+        assert!(page.relations[0]
+            .callee
+            .as_ref()
+            .expect("Go callee")
+            .variants
+            .iter()
+            .all(|anchor| anchor.path.ends_with(".go")));
+    }
+
+    #[test]
+    fn go_method_selector_call_keeps_same_named_method_as_a_candidate() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            workspace.join("worker.go"),
+            "package p\n\
+             type Worker struct{}\n\
+             func (Worker) Run() {}\n\
+             func Use() { var worker Worker; worker.Run() }\n",
+        )
+        .unwrap();
+        let db_path = temp.path().join("index.sqlite");
+        index_workspace(
+            &workspace,
+            IndexOptions {
+                db_path: Some(db_path.clone()),
+                force: true,
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .unwrap();
+
+        let handle = CallReadHandle::capture(db_path).unwrap();
+        let (_, _, page) = CallRelationService::for_request_with_reach_and_family(
+            &handle,
+            &[],
+            None,
+            crate::semantic_model::SemanticFamily::Go,
+        )
+        .query_at(
+            "worker.go",
+            SourcePosition {
+                line: 2,
+                character: 15,
+            },
+            RelationDirection::Incoming,
+            0,
+            100,
+            100,
+        )
+        .unwrap();
+
+        assert_eq!(page.relations.len(), 1);
+        assert_eq!(page.relations[0].caller.name, "Use");
+        assert_eq!(
+            page.relations[0]
+                .callee
+                .as_ref()
+                .expect("method callee")
+                .owner
+                .as_deref(),
+            Some("Worker")
+        );
+    }
+
+    #[test]
+    fn go_direct_call_does_not_target_same_named_method() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            workspace.join("worker.go"),
+            "package p\n\
+             type Worker struct{}\n\
+             func (Worker) Run() {}\n\
+             func Run() {}\n\
+             func Use() { Run() }\n",
+        )
+        .unwrap();
+        let db_path = temp.path().join("index.sqlite");
+        index_workspace(
+            &workspace,
+            IndexOptions {
+                db_path: Some(db_path.clone()),
+                force: true,
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .unwrap();
+
+        let handle = CallReadHandle::capture(db_path).unwrap();
+        let service = CallRelationService::for_request_with_reach_and_family(
+            &handle,
+            &[],
+            None,
+            crate::semantic_model::SemanticFamily::Go,
+        );
+        let (_, _, method_incoming) = service
+            .query_at(
+                "worker.go",
+                SourcePosition {
+                    line: 2,
+                    character: 15,
+                },
+                RelationDirection::Incoming,
+                0,
+                100,
+                100,
+            )
+            .unwrap();
+        assert_eq!(method_incoming.total, 0);
+
+        let (_, _, package_incoming) = service
+            .query_at(
+                "worker.go",
+                SourcePosition {
+                    line: 3,
+                    character: 6,
+                },
+                RelationDirection::Incoming,
+                0,
+                100,
+                100,
+            )
+            .unwrap();
+        assert_eq!(package_incoming.relations.len(), 1);
+        assert_eq!(package_incoming.relations[0].caller.name, "Use");
+        assert!(package_incoming.relations[0]
+            .callee
+            .as_ref()
+            .expect("package function")
+            .owner
+            .is_none());
+    }
+
+    #[test]
+    fn family_limited_anchor_recall_filters_before_spending_the_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("a.c"), "void shared(void) {}\n").unwrap();
+        std::fs::write(workspace.join("z.go"), "package main\nfunc shared() {}\n").unwrap();
+        let db_path = temp.path().join("index.sqlite");
+        index_workspace(
+            &workspace,
+            IndexOptions {
+                db_path: Some(db_path.clone()),
+                force: true,
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .unwrap();
+
+        let handle = CallReadHandle::capture(db_path).unwrap();
+        let (rows, limited) = handle
+            .read(|store| {
+                store.call_fact_view().anchors_by_names_family_limited(
+                    &["shared".to_string()],
+                    crate::semantic_model::SemanticFamily::Go,
+                    1,
+                )
+            })
+            .unwrap();
+
+        assert!(!limited);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "z.go");
     }
 
     #[test]

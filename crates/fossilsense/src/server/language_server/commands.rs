@@ -55,19 +55,31 @@ impl Backend {
             };
             let role_cache = self.session.cache.reference_role_cache.clone();
             let search_cache = self.session.cache.reference_search_cache.clone();
+            let reference_cache_epoch = search_cache.epoch();
             let context = self.request_context_for_root(root.clone()).await;
             let indexed_generation = context.engine.epoch.as_u64();
             let indexed_files = context.engine.indexed_files.clone();
+            let semantic_family = context
+                .engine
+                .workspace_semantics
+                .language_for_uri(&uri)
+                .semantic_family();
+            let workspace_config = context.engine.workspace_semantics.workspace.clone();
+            let language_resolver = context.engine.workspace_semantics.language.clone();
             let result = tokio::task::spawn_blocking(
                 move || -> Result<(Vec<GroupedReferenceItem>, bool, references::ReferencesTiming)> {
                     let (mut hits, truncated, timing) =
-                        references::search_references_with_shared_files(
+                        references::search_references_with_shared_files_for_family(
                             &root,
                             &word,
                             &role_cache,
                             &search_cache,
                             indexed_generation,
                             indexed_files,
+                            semantic_family,
+                            reference_cache_epoch,
+                            workspace_config,
+                            language_resolver,
                         )?;
                     references::sort_hits_by_role(&mut hits);
                     Ok((grouped_reference_items(&root, &hits), truncated, timing))

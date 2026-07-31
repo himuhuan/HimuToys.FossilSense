@@ -35,9 +35,10 @@ struct ItemData {
 pub(super) struct RelationRequestState {
     pub(super) root: PathBuf,
     pub(super) handle: Arc<CallReadHandle>,
-    overlays: Arc<Vec<FileCallOverlay>>,
+    pub(super) overlays: Arc<Vec<FileCallOverlay>>,
     pub(super) revision: RelationRevision,
     reach_graph: Option<std::sync::Arc<ReachGraph>>,
+    semantic_family: crate::semantic_model::SemanticFamily,
 }
 
 impl RelationRequestState {
@@ -53,17 +54,23 @@ impl RelationRequestState {
         let handle = self.handle.clone();
         let overlays = self.overlays.clone();
         let reach_graph = self.reach_graph.clone();
+        let semantic_family = self.semantic_family;
         let path = path.to_string();
         let (catalog, key, mut page) = tokio::task::spawn_blocking(move || {
-            CallRelationService::for_request_with_reach(&handle, &overlays, reach_graph.as_deref())
-                .query_at(
-                    &path,
-                    position,
-                    direction,
-                    cursor,
-                    relation_limit,
-                    call_site_limit,
-                )
+            CallRelationService::for_request_with_reach_and_family(
+                &handle,
+                &overlays,
+                reach_graph.as_deref(),
+                semantic_family,
+            )
+            .query_at(
+                &path,
+                position,
+                direction,
+                cursor,
+                relation_limit,
+                call_site_limit,
+            )
         })
         .await??;
         self.with_reachability(&mut page.relations);
@@ -81,10 +88,16 @@ impl RelationRequestState {
         let handle = self.handle.clone();
         let overlays = self.overlays.clone();
         let reach_graph = self.reach_graph.clone();
+        let semantic_family = self.semantic_family;
         let key = key.to_string();
         let (catalog, key, mut page) = tokio::task::spawn_blocking(move || {
-            CallRelationService::for_request_with_reach(&handle, &overlays, reach_graph.as_deref())
-                .query_key(&key, direction, cursor, relation_limit, call_site_limit)
+            CallRelationService::for_request_with_reach_and_family(
+                &handle,
+                &overlays,
+                reach_graph.as_deref(),
+                semantic_family,
+            )
+            .query_key(&key, direction, cursor, relation_limit, call_site_limit)
         })
         .await??;
         self.with_reachability(&mut page.relations);
@@ -102,10 +115,22 @@ impl RelationRequestState {
         let handle = self.handle.clone();
         let overlays = self.overlays.clone();
         let reach_graph = self.reach_graph.clone();
+        let semantic_family = self.semantic_family;
         let locator = locator.clone();
         let (catalog, key, mut page) = tokio::task::spawn_blocking(move || {
-            CallRelationService::for_request_with_reach(&handle, &overlays, reach_graph.as_deref())
-                .query_locator(&locator, direction, cursor, relation_limit, call_site_limit)
+            CallRelationService::for_request_with_reach_and_family(
+                &handle,
+                &overlays,
+                reach_graph.as_deref(),
+                semantic_family,
+            )
+            .query_locator(
+                &locator,
+                direction,
+                cursor,
+                relation_limit,
+                call_site_limit,
+            )
         })
         .await??;
         self.with_reachability(&mut page.relations);
@@ -207,20 +232,43 @@ impl Backend {
     }
 
     pub(super) async fn relation_state_for_uri(&self, uri: &Url) -> Option<RelationRequestState> {
+        let documents = self
+            .session
+            .documents
+            .capture_request_snapshot(Some(uri))
+            .await;
         let root = self.root_for_uri(uri).await?;
         let context = self.request_context_for_root(root.clone()).await;
+        self.relation_state_from_context(uri, root, context, documents)
+            .await
+    }
+
+    pub(super) async fn relation_state_from_context(
+        &self,
+        uri: &Url,
+        root: PathBuf,
+        context: super::RequestContext,
+        documents: super::workspace::DocumentRequestSnapshot,
+    ) -> Option<RelationRequestState> {
         let handle = context.engine.call_read_handle.clone()?;
         let overlay = self
-            .candidate_overlay_snapshot(
+            .candidate_overlay_snapshot_from_documents(
                 &root,
                 context.engine.semantic_generation,
                 context.engine.reach_graph.as_deref(),
                 context.engine.indexed_files.as_deref().map(Vec::as_slice),
+                context.engine.workspace_semantics.clone(),
+                documents,
             )
             .await;
         let overlay_epoch = overlay.epoch;
         let reach_graph = overlay.effective_reach_graph_arc(context.engine.reach_graph.clone());
         let overlays = overlay.call_relation_overlays();
+        let semantic_family = context
+            .engine
+            .workspace_semantics
+            .language_for_uri(uri)
+            .semantic_family();
         Some(RelationRequestState {
             root,
             handle,
@@ -232,6 +280,7 @@ impl Backend {
                 resolver_version: CALLABLE_CANDIDATE_RESOLVER_VERSION,
             },
             reach_graph,
+            semantic_family,
         })
     }
 
@@ -246,14 +295,20 @@ impl Backend {
         let handle = state.handle.clone();
         let overlays = state.overlays.clone();
         let reach_graph = state.reach_graph.clone();
+        let semantic_family = state.semantic_family;
         let prepare_position = SourcePosition {
             line: position.line,
             character: position.character,
         };
         let prepare_rel = rel.clone();
         let catalog = tokio::task::spawn_blocking(move || {
-            CallRelationService::for_request_with_reach(&handle, &overlays, reach_graph.as_deref())
-                .prepare_at(&prepare_rel, prepare_position)
+            CallRelationService::for_request_with_reach_and_family(
+                &handle,
+                &overlays,
+                reach_graph.as_deref(),
+                semantic_family,
+            )
+            .prepare_at(&prepare_rel, prepare_position)
         })
         .await
         .ok()?

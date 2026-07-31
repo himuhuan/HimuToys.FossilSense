@@ -140,6 +140,201 @@ fn current_schema_has_members_table_and_version_9_or_newer() {
 }
 
 #[test]
+fn opening_schema_25_rebuilds_without_locator_lookup_index() {
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+    {
+        let mut store = IndexStore::open(&db, dir.path()).expect("store");
+        upsert_source(
+            &mut store,
+            "src/legacy.c",
+            "int legacy_locator(void) { return 1; }\n",
+        );
+        let declaration_count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM declaration_facts", [], |row| {
+                row.get(0)
+            })
+            .expect("legacy declaration count");
+        assert!(declaration_count > 0, "fixture must persist a declaration");
+
+        store
+            .conn
+            .execute(
+                "UPDATE meta SET value = '25' WHERE key = 'schema_version'",
+                [],
+            )
+            .expect("mark schema 25");
+        store
+            .conn
+            .execute(
+                "CREATE INDEX IF NOT EXISTS idx_declaration_facts_locator
+                 ON declaration_facts(locator_fingerprint)",
+                [],
+            )
+            .expect("seed schema 25 locator index");
+    }
+
+    let store = IndexStore::open(&db, dir.path()).expect("migrate schema 25");
+    let version: String = store
+        .conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("schema version");
+    assert_eq!(version, crate::store::schema::SCHEMA_VERSION.to_string());
+
+    let declaration_count: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM declaration_facts", [], |row| {
+            row.get(0)
+        })
+        .expect("declaration count after migration");
+    assert_eq!(
+        declaration_count, 0,
+        "schema migration must invalidate schema 25 declaration facts"
+    );
+
+    let columns: Vec<String> = store
+        .conn
+        .prepare("PRAGMA table_info(declaration_facts)")
+        .expect("declaration columns")
+        .query_map([], |row| row.get(1))
+        .expect("query declaration columns")
+        .collect::<rusqlite::Result<_>>()
+        .expect("collect declaration columns");
+    assert!(
+        columns.contains(&"locator_fingerprint".to_string()),
+        "the locator identity remains part of the persisted semantic fact"
+    );
+
+    let locator_index_count: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'index' AND name = 'idx_declaration_facts_locator'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("locator index count");
+    assert_eq!(
+        locator_index_count, 0,
+        "schema 26 must not recreate the unused locator lookup index"
+    );
+}
+
+#[test]
+fn opening_schema_26_rebuilds_with_compact_declaration_scalars() {
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+    {
+        let mut store = IndexStore::open(&db, dir.path()).expect("store");
+        upsert_source(
+            &mut store,
+            "src/legacy.c",
+            "int legacy_scalars(void) { return 1; }\n",
+        );
+        store
+            .conn
+            .execute(
+                "UPDATE meta SET value = '26' WHERE key = 'schema_version'",
+                [],
+            )
+            .expect("mark schema 26");
+    }
+
+    let store = IndexStore::open(&db, dir.path()).expect("migrate schema 26");
+    let version: String = store
+        .conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("schema version");
+    assert_eq!(version, crate::store::schema::SCHEMA_VERSION.to_string());
+
+    let declaration_count: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM declaration_facts", [], |row| {
+            row.get(0)
+        })
+        .expect("declaration count after migration");
+    assert_eq!(
+        declaration_count, 0,
+        "schema migration must invalidate schema 26 declaration facts"
+    );
+
+    let columns: Vec<(String, String)> = store
+        .conn
+        .prepare("PRAGMA table_info(declaration_facts)")
+        .expect("declaration columns")
+        .query_map([], |row| Ok((row.get(1)?, row.get(2)?)))
+        .expect("query declaration columns")
+        .collect::<rusqlite::Result<_>>()
+        .expect("collect declaration columns");
+    assert!(columns.contains(&("locator_fingerprint".into(), "BLOB".into())));
+    assert!(columns.contains(&("guard_fingerprint".into(), "BLOB".into())));
+    assert!(columns.contains(&("backing_kind".into(), "INTEGER".into())));
+}
+
+#[test]
+fn opening_schema_27_rebuilds_with_tagged_logical_signatures() {
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+    {
+        let mut store = IndexStore::open(&db, dir.path()).expect("store");
+        upsert_source(
+            &mut store,
+            "src/legacy.c",
+            "int legacy_signature(void) { return 1; }\n",
+        );
+        store
+            .conn
+            .execute(
+                "UPDATE meta SET value = '27' WHERE key = 'schema_version'",
+                [],
+            )
+            .expect("mark schema 27");
+    }
+
+    let store = IndexStore::open(&db, dir.path()).expect("migrate schema 27");
+    let version: String = store
+        .conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("schema version");
+    assert_eq!(version, "28");
+
+    let declaration_count: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM declaration_facts", [], |row| {
+            row.get(0)
+        })
+        .expect("declaration count after migration");
+    assert_eq!(
+        declaration_count, 0,
+        "schema migration must invalidate schema 27 declaration facts"
+    );
+
+    let logical_signature_type: String = store
+        .conn
+        .query_row(
+            "SELECT type FROM pragma_table_info('declaration_facts')
+             WHERE name = 'logical_canonical_signature'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("logical signature column type");
+    assert_eq!(logical_signature_type, "BLOB");
+}
+
+#[test]
 fn opening_v8_schema_drops_old_field_rows_for_full_rebuild() {
     let dir = tempdir().expect("tempdir");
     let db = dir.path().join("index.sqlite");
@@ -285,7 +480,7 @@ fn current_schema_migrate_by_drop_clears_old_data() {
 }
 
 #[test]
-fn opening_schema_18_parser_fact_4_drops_old_symbol_data_for_schema_19_rebuild() {
+fn opening_old_schema_and_parser_facts_drops_old_symbol_data_for_current_rebuild() {
     let dir = tempdir().expect("tempdir");
     let db = dir.path().join("index.sqlite");
     {
@@ -331,7 +526,7 @@ fn opening_schema_18_parser_fact_4_drops_old_symbol_data_for_schema_19_rebuild()
         .expect("seed schema 18 parser-fact-4 data");
     }
 
-    let store = IndexStore::open(&db, dir.path()).expect("open schema 19");
+    let store = IndexStore::open(&db, dir.path()).expect("open current schema");
     let version: String = store
         .conn
         .query_row(
@@ -340,7 +535,7 @@ fn opening_schema_18_parser_fact_4_drops_old_symbol_data_for_schema_19_rebuild()
             |row| row.get(0),
         )
         .expect("schema version");
-    assert_eq!(version, "19");
+    assert_eq!(version, crate::store::schema::SCHEMA_VERSION.to_string());
 
     let anchor_count: i64 = store
         .conn

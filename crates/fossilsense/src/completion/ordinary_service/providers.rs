@@ -86,6 +86,19 @@ pub(super) fn completion_items_for_local_bindings(
 ) -> Vec<OrdinaryPipelineCandidate> {
     hits.into_iter()
         .map(|hit| {
+            let (candidate_kind, presentation_kind) = match hit.kind {
+                parser::LocalBindingKind::Parameter | parser::LocalBindingKind::LocalVariable => (
+                    CompletionCandidateKind::Variable,
+                    OrdinaryCompletionKind::Variable,
+                ),
+                parser::LocalBindingKind::LocalConstant => (
+                    CompletionCandidateKind::EnumConstant,
+                    OrdinaryCompletionKind::EnumConstant,
+                ),
+                parser::LocalBindingKind::LocalType => {
+                    (CompletionCandidateKind::Type, OrdinaryCompletionKind::Type)
+                }
+            };
             let mut evidence = CandidateEvidence::new(
                 CandidateSource::LocalBinding,
                 model::ScopeTier::Current,
@@ -93,13 +106,13 @@ pub(super) fn completion_items_for_local_bindings(
                 hit.score,
             );
             evidence.match_score = hit.match_score;
-            evidence.kind = CompletionCandidateKind::Variable;
+            evidence.kind = candidate_kind;
             set_completion_history_key(&mut evidence, &hit.name);
             OrdinaryPipelineCandidate::new(
                 hit.name.clone(),
                 evidence,
                 OrdinaryCompletionPresentation {
-                    kind: OrdinaryCompletionKind::Variable,
+                    kind: presentation_kind,
                     detail: Some(hit.detail),
                     documentation: None,
                     initial_sort_text: Some(format!("{:08}", 100_000_000 - hit.score)),
@@ -195,6 +208,7 @@ pub(super) fn completion_items_for_current_file_overlay(
                                     .locator
                                     .fingerprint
                                     .clone(),
+                                semantic_family: declaration.identity.language.semantic_family(),
                             },
                         }
                     });
@@ -286,10 +300,11 @@ pub(super) fn exact_indexed_completion_candidates_for_local_word(
     local_score: i32,
     scope: Option<&query::CompletionScope>,
     limit: usize,
+    semantic_family: crate::semantic_model::SemanticFamily,
     context: IndexedCompletionContext<'_>,
 ) -> Vec<OrdinaryPipelineCandidate> {
     table
-        .exact_name_hits_scoped(word, limit, scope)
+        .exact_name_hits_scoped_for_family(word, limit, scope, semantic_family)
         .into_iter()
         .map(|hit| {
             let (confidence, reason) =

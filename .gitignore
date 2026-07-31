@@ -2,6 +2,8 @@
 /samples/*
 !/samples/mini-c/
 !/samples/mini-c/**
+!/samples/mini-go/
+!/samples/mini-go/**
 node_modules/
 dist/
 out/

@@ -59,11 +59,23 @@ impl Backend {
                 reach: (*reach).clone(),
             });
 
+        let source_language = context
+            .as_ref()
+            .map(|context| context.engine.workspace_semantics.language_for_uri(uri))
+            .unwrap_or_else(|| crate::config::SourceLanguage::default_for_path(&path));
         let cached = self
-            .get_or_parse_document(uri, &path, version, &text, ParseFacts::COLOR_LIVE)
+            .get_or_parse_document_with_language(
+                uri,
+                &path,
+                version,
+                &text,
+                ParseFacts::COLOR_LIVE,
+                source_language,
+            )
             .await;
         let index: Option<Arc<FileSemanticIndex>> = cached;
         let index = index?;
+        let semantic_family = index.language.semantic_family();
 
         let result = tokio::task::spawn_blocking(move || -> Result<Vec<coloring::ColoredToken>> {
             let defs = index.coloring_defs();
@@ -99,7 +111,11 @@ impl Backend {
                 Some(table) => {
                     let wanted_set: std::collections::HashSet<&str> =
                         wanted.iter().copied().collect();
-                    table.colorable_kind_counts(&wanted_set, color_scope.as_ref())
+                    table.colorable_kind_counts_for_family(
+                        &wanted_set,
+                        color_scope.as_ref(),
+                        semantic_family,
+                    )
                 }
                 None => HashMap::new(),
             };

@@ -66,12 +66,18 @@ impl CandidateQueryService<'_> {
             let (base_records, record_truncated, base_aliases, alias_truncated) = match self.handle
             {
                 Some(handle) => handle.read(|store| {
-                    let (record_rows, record_truncated) = store
-                        .member_view()
-                        .record_rows_by_name_limited(&next_name, TYPE_CANDIDATE_LIMIT)?;
-                    let (alias_rows, alias_truncated) = store
-                        .member_view()
-                        .alias_rows_by_name_limited(&next_name, TYPE_CANDIDATE_LIMIT)?;
+                    let (record_rows, record_truncated) =
+                        store.member_view().record_rows_by_name_family_limited(
+                            &next_name,
+                            self.semantic_family,
+                            TYPE_CANDIDATE_LIMIT,
+                        )?;
+                    let (alias_rows, alias_truncated) =
+                        store.member_view().alias_rows_by_name_family_limited(
+                            &next_name,
+                            self.semantic_family,
+                            TYPE_CANDIDATE_LIMIT,
+                        )?;
                     Ok((record_rows, record_truncated, alias_rows, alias_truncated))
                 })?,
                 None => (Vec::new(), false, Vec::new(), false),
@@ -116,10 +122,14 @@ impl CandidateQueryService<'_> {
             enqueue_alias_targets(&converted_aliases, &mut names);
             aliases.extend(converted_aliases);
 
-            let overlay_records = self.overlays.records(&next_name);
-            let overlay_aliases = self.overlays.aliases(&next_name);
+            let overlay_records = self
+                .overlays
+                .records_for_family(&next_name, self.semantic_family);
+            let overlay_aliases = self
+                .overlays
+                .aliases_for_family(&next_name, self.semantic_family);
             scanned += overlay_records.len() + overlay_aliases.len();
-            records.extend(overlay_records.iter().map(|fact| {
+            records.extend(overlay_records.into_iter().map(|fact| {
                 let (external, directly_included) =
                     self.path_evidence(&fact.path, Path::new(&fact.path).is_absolute(), false);
                 let tier = resolver::scope_tier(
@@ -131,7 +141,7 @@ impl CandidateQueryService<'_> {
                 RecordCandidate::from_overlay(fact.path.clone(), fact.record.clone(), tier)
             }));
             let converted_overlay_aliases: Vec<_> = overlay_aliases
-                .iter()
+                .into_iter()
                 .map(|fact| {
                     let (external, directly_included) =
                         self.path_evidence(&fact.path, Path::new(&fact.path).is_absolute(), false);
@@ -461,19 +471,25 @@ impl CandidateQueryService<'_> {
         };
         let (mut members, mut truncated) = match self.handle {
             Some(handle) => handle.read(|store| {
-                store.member_view().fallback_member_candidates_limited(
-                    prefix,
-                    limit,
-                    Some(&resolve_context),
-                )
+                store
+                    .member_view()
+                    .fallback_member_candidates_family_limited(
+                        prefix,
+                        limit,
+                        Some(&resolve_context),
+                        self.semantic_family,
+                    )
             })?,
             None => (Vec::new(), false),
         };
         members.retain(|member| !self.overlays.shadows(&member.owner_path));
 
-        let (overlay_members, overlay_truncated) = self
-            .overlays
-            .fallback_members_by_prefix_limited(prefix, MEMBER_FALLBACK_OVERLAY_SCAN_LIMIT);
+        let (overlay_members, overlay_truncated) =
+            self.overlays.fallback_members_by_prefix_for_family_limited(
+                prefix,
+                self.semantic_family,
+                MEMBER_FALLBACK_OVERLAY_SCAN_LIMIT,
+            );
         truncated |= overlay_truncated;
         for fact in overlay_members {
             let path = &fact.path;

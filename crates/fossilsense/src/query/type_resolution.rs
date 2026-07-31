@@ -756,6 +756,7 @@ fn record_kind_keyword(kind: RecordKind) -> &'static str {
         RecordKind::Struct => "struct",
         RecordKind::Union => "union",
         RecordKind::Class => "class",
+        RecordKind::Interface => "interface",
     }
 }
 
@@ -764,6 +765,7 @@ fn record_kind_rank(kind: RecordKind) -> u8 {
         RecordKind::Struct => 0,
         RecordKind::Union => 1,
         RecordKind::Class => 2,
+        RecordKind::Interface => 3,
     }
 }
 

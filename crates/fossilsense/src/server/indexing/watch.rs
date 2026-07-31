@@ -20,7 +20,7 @@ pub(in crate::server) async fn watched_change_in_scope(
         // event re-reads the config. Nested files with this basename are not
         // workspace configuration unless their directory is itself a root.
         config_cache.lock().await.remove(root);
-        return Some(WatchDecision::Full);
+        return Some(WatchDecision::Full(root.clone()));
     }
 
     // Use cached config to avoid re-reading fossilsense.json on every event.
@@ -40,12 +40,18 @@ pub(in crate::server) async fn watched_change_in_scope(
         }
     };
 
-    if path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(crate::project_context::is_supported_marker_file_name)
+    let marker_name = path.file_name().and_then(|name| name.to_str());
+    if marker_name.is_some_and(crate::project_context::is_supported_marker_file_name)
         && config.workspace.is_project_marker_in_scope(&rel)
     {
+        if marker_name.is_some_and(|name| {
+            name.eq_ignore_ascii_case("go.mod") || name.eq_ignore_ascii_case("go.work")
+        }) {
+            // Go module/workspace metadata affects both project evidence and
+            // the package import graph, so a marker-only refresh is
+            // insufficient.
+            return Some(WatchDecision::Full(root.clone()));
+        }
         return Some(WatchDecision::ProjectContext(root.clone()));
     }
 

@@ -4,6 +4,7 @@ import * as path from 'path';
 import {
   normalizeBoolean,
   normalizeCompletionPrefixRanking,
+  normalizeExternalPathList,
   normalizeIncludeScopingMode,
   normalizeOnOffAuto,
   normalizeProjectContextMode,
@@ -34,6 +35,11 @@ assert.strictEqual(normalizeBoolean(false), false);
 assert.strictEqual(normalizeBoolean(undefined), true);
 assert.strictEqual(normalizeBoolean('unexpected'), true);
 assert.strictEqual(normalizeBoolean(0), true);
+assert.deepStrictEqual(
+  normalizeExternalPathList([' C:\\deps\\device ', '', 7, '/opt/go/device', 'C:\\deps\\device']),
+  ['C:\\deps\\device', '/opt/go/device'],
+);
+assert.deepStrictEqual(normalizeExternalPathList('C:\\deps'), []);
 
 const packageJson = JSON.parse(
   fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8'),
@@ -54,3 +60,8 @@ const resourceMonitorEnabled =
   packageJson.contributes.configuration.properties['fossilsense.resourceMonitor.enabled'];
 assert.strictEqual(resourceMonitorEnabled.type, 'boolean');
 assert.strictEqual(resourceMonitorEnabled.default, true);
+
+const goModulePaths =
+  packageJson.contributes.configuration.properties['fossilsense.goModulePaths'];
+assert.strictEqual(goModulePaths.type, 'array');
+assert.deepStrictEqual(goModulePaths.default, []);

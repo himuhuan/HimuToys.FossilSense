@@ -4,35 +4,139 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use serde_json::Value;
 
+pub use crate::semantic_model::SemanticFamily;
+use crate::semantic_model::SemanticLanguage;
+
 mod matching;
 use matching::{language_override_glob_matches, path_matches_glob_entry};
 
-pub const DEFAULT_EXTENSIONS: &[&str] = &["c", "h", "cpp", "hpp", "cc", "hh", "cxx", "hxx", "inl"];
 pub const DEFAULT_EXCLUDED_DIRS: &[&str] =
     &[".git", ".vscode", "node_modules", "target", "out", "build"];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SourceLanguage {
     C,
     Cpp,
+    Go,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParserFrontend {
+    CFamily,
+    Go,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct LanguageBackend {
+    pub language: SourceLanguage,
+    pub config_name: &'static str,
+    pub default_extensions: &'static [&'static str],
+    pub semantic_family: SemanticFamily,
+    pub parser_frontend: ParserFrontend,
+    grammar: fn() -> tree_sitter::Language,
+}
+
+const BUILT_IN_LANGUAGE_BACKENDS: &[LanguageBackend] = &[
+    LanguageBackend {
+        language: SourceLanguage::C,
+        config_name: "c",
+        default_extensions: &["c"],
+        semantic_family: SemanticFamily::CFamily,
+        parser_frontend: ParserFrontend::CFamily,
+        grammar: c_grammar,
+    },
+    LanguageBackend {
+        language: SourceLanguage::Cpp,
+        config_name: "cpp",
+        default_extensions: &["h", "cpp", "hpp", "cc", "hh", "cxx", "hxx", "inl"],
+        semantic_family: SemanticFamily::CFamily,
+        parser_frontend: ParserFrontend::CFamily,
+        grammar: cpp_grammar,
+    },
+    LanguageBackend {
+        language: SourceLanguage::Go,
+        config_name: "go",
+        default_extensions: &["go"],
+        semantic_family: SemanticFamily::Go,
+        parser_frontend: ParserFrontend::Go,
+        grammar: go_grammar,
+    },
+];
+
+pub fn built_in_language_backends() -> &'static [LanguageBackend] {
+    BUILT_IN_LANGUAGE_BACKENDS
+}
+
+impl LanguageBackend {
+    pub fn tree_sitter_language(self) -> tree_sitter::Language {
+        (self.grammar)()
+    }
+}
+
+fn c_grammar() -> tree_sitter::Language {
+    tree_sitter_c::LANGUAGE.into()
+}
+
+fn cpp_grammar() -> tree_sitter::Language {
+    tree_sitter_cpp::LANGUAGE.into()
+}
+
+fn go_grammar() -> tree_sitter::Language {
+    tree_sitter_go::LANGUAGE.into()
+}
+
+fn default_extensions() -> impl Iterator<Item = &'static str> {
+    built_in_language_backends()
+        .iter()
+        .flat_map(|backend| backend.default_extensions.iter().copied())
 }
 
 impl SourceLanguage {
     pub fn default_for_path(path: &Path) -> Self {
-        match normalized_extension(path)
-            .map(str::to_ascii_lowercase)
+        let extension = normalized_extension(path).map(str::to_ascii_lowercase);
+        extension
             .as_deref()
-        {
-            Some("h" | "cpp" | "hpp" | "cc" | "hh" | "cxx" | "hxx" | "inl") => Self::Cpp,
-            _ => Self::C,
+            .and_then(|extension| {
+                built_in_language_backends()
+                    .iter()
+                    .find(|backend| backend.default_extensions.contains(&extension))
+                    .map(|backend| backend.language)
+            })
+            .unwrap_or(Self::C)
+    }
+
+    pub fn from_config_name(name: &str) -> Option<Self> {
+        built_in_language_backends()
+            .iter()
+            .find(|backend| backend.config_name == name)
+            .map(|backend| backend.language)
+    }
+
+    pub fn semantic_family(self) -> SemanticFamily {
+        self.backend().semantic_family
+    }
+
+    pub fn semantic_language(self) -> SemanticLanguage {
+        match self {
+            Self::C => SemanticLanguage::C,
+            Self::Cpp => SemanticLanguage::Cpp,
+            Self::Go => SemanticLanguage::Go,
         }
     }
 
+    pub fn parser_frontend(self) -> ParserFrontend {
+        self.backend().parser_frontend
+    }
+
     pub fn tree_sitter_language(self) -> tree_sitter::Language {
-        match self {
-            Self::C => tree_sitter_c::LANGUAGE.into(),
-            Self::Cpp => tree_sitter_cpp::LANGUAGE.into(),
-        }
+        self.backend().tree_sitter_language()
+    }
+
+    fn backend(self) -> &'static LanguageBackend {
+        BUILT_IN_LANGUAGE_BACKENDS
+            .iter()
+            .find(|backend| backend.language == self)
+            .expect("every SourceLanguage must have one built-in backend")
     }
 }
 
@@ -99,6 +203,9 @@ pub struct WorkspaceConfig {
     /// Distinct from `include`, which selects *workspace* subtrees. Empty by
     /// default; never affects workspace traversal.
     pub include_paths: Vec<String>,
+    /// Explicit external Go module directories. They are independently capped
+    /// and never inferred from the machine's GOPATH or module cache.
+    pub go_module_paths: Vec<String>,
     pub language_overrides: Vec<LanguageOverride>,
 
     /// Precomputed lookup structures derived from include/exclude/extensions
@@ -141,8 +248,7 @@ impl Default for PrecomputedMatchers {
                 .iter()
                 .map(|d| d.to_ascii_lowercase())
                 .collect(),
-            extension_set: DEFAULT_EXTENSIONS
-                .iter()
+            extension_set: default_extensions()
                 .map(|ext| format!(".{}", ext.to_ascii_lowercase()))
                 .collect(),
             include_ancestor_prefixes: Vec::new(),
@@ -232,8 +338,7 @@ impl Default for WorkspaceConfig {
         Self {
             include: Vec::new(),
             exclude: Vec::new(),
-            extensions: DEFAULT_EXTENSIONS
-                .iter()
+            extensions: default_extensions()
                 .map(|extension| extension.to_string())
                 .collect(),
             excluded_dirs: DEFAULT_EXCLUDED_DIRS
@@ -241,6 +346,7 @@ impl Default for WorkspaceConfig {
                 .map(|dir| dir.to_string())
                 .collect(),
             include_paths: Vec::new(),
+            go_module_paths: Vec::new(),
             language_overrides: Vec::new(),
             matchers: PrecomputedMatchers::default(),
         }
@@ -257,6 +363,8 @@ struct RawConfig {
     extensions: Option<Vec<String>>,
     #[serde(default, rename = "includePaths")]
     include_paths: Option<Vec<String>>,
+    #[serde(default, rename = "goModulePaths")]
+    go_module_paths: Option<Vec<String>>,
     #[serde(default, rename = "languageOverrides")]
     language_overrides: Option<Value>,
 }
@@ -313,6 +421,17 @@ impl WorkspaceConfig {
             issues.extend(duplicate_issues);
         }
 
+        if let Some(go_module_paths) = raw.go_module_paths {
+            let (deduped, duplicate_issues) = dedupe_external_paths_with_issues(
+                go_module_paths
+                    .into_iter()
+                    .map(normalize_include_path_entry),
+                "goModulePaths",
+            );
+            config.go_module_paths = deduped;
+            issues.extend(duplicate_issues);
+        }
+
         if let Some(overrides) = raw.language_overrides {
             let overrides = match overrides {
                 Value::Array(overrides) => overrides,
@@ -338,11 +457,8 @@ impl WorkspaceConfig {
                 };
                 let raw_glob = rule.glob;
                 let glob = normalize_language_override_glob(raw_glob.clone());
-                let language = match rule.language.trim().to_ascii_lowercase().as_str() {
-                    "c" => Some(SourceLanguage::C),
-                    "cpp" => Some(SourceLanguage::Cpp),
-                    _ => None,
-                };
+                let normalized_language = rule.language.trim().to_ascii_lowercase();
+                let language = SourceLanguage::from_config_name(&normalized_language);
                 if glob.is_empty() || !valid_language_override_glob(&glob) {
                     issues.push(ConfigIssue {
                         message: format!(
@@ -619,6 +735,13 @@ fn valid_language_override_glob(glob: &str) -> bool {
 fn dedupe_include_paths_with_issues(
     entries: impl Iterator<Item = String>,
 ) -> (Vec<String>, Vec<ConfigIssue>) {
+    dedupe_external_paths_with_issues(entries, "includePaths")
+}
+
+fn dedupe_external_paths_with_issues(
+    entries: impl Iterator<Item = String>,
+    field_name: &str,
+) -> (Vec<String>, Vec<ConfigIssue>) {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     let mut issues = Vec::new();
@@ -630,7 +753,7 @@ fn dedupe_include_paths_with_issues(
             out.push(entry);
         } else {
             issues.push(ConfigIssue {
-                message: format!("includePaths entry is a duplicate, skipping: {entry}"),
+                message: format!("{field_name} entry is a duplicate, skipping: {entry}"),
             });
         }
     }
@@ -642,24 +765,36 @@ fn dedupe_include_paths_with_issues(
 /// entry that is missing, not a directory, or a duplicate. Never fails: an
 /// unusable entry is skipped with a note so indexing always proceeds.
 pub fn resolve_include_roots(entries: &[String]) -> (Vec<PathBuf>, Vec<ConfigIssue>) {
-    let (deduped, mut issues) = dedupe_include_paths_with_issues(entries.iter().cloned());
+    resolve_external_roots(entries, "includePaths")
+}
+
+pub fn resolve_go_module_roots(entries: &[String]) -> (Vec<PathBuf>, Vec<ConfigIssue>) {
+    resolve_external_roots(entries, "goModulePaths")
+}
+
+fn resolve_external_roots(
+    entries: &[String],
+    field_name: &str,
+) -> (Vec<PathBuf>, Vec<ConfigIssue>) {
+    let (deduped, mut issues) =
+        dedupe_external_paths_with_issues(entries.iter().cloned(), field_name);
     let mut roots = Vec::new();
 
     for entry in deduped {
         let path = PathBuf::from(&entry);
         if !path.is_absolute() {
             issues.push(ConfigIssue {
-                message: format!("includePaths entry is not absolute, skipping: {entry}"),
+                message: format!("{field_name} entry is not absolute, skipping: {entry}"),
             });
             continue;
         }
         match std::fs::metadata(&path) {
             Ok(meta) if meta.is_dir() => roots.push(path),
             Ok(_) => issues.push(ConfigIssue {
-                message: format!("includePaths entry is not a directory, skipping: {entry}"),
+                message: format!("{field_name} entry is not a directory, skipping: {entry}"),
             }),
             Err(_) => issues.push(ConfigIssue {
-                message: format!("includePaths entry not found, skipping: {entry}"),
+                message: format!("{field_name} entry not found, skipping: {entry}"),
             }),
         }
     }

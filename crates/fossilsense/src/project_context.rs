@@ -118,6 +118,8 @@ pub fn is_supported_marker_file_name(file_name: &str) -> bool {
             | "build.bazel"
             | "workspace"
             | "workspace.bazel"
+            | "go.mod"
+            | "go.work"
     ) || [".pro", ".sln", ".vcxproj", ".vcproj"]
         .iter()
         .any(|suffix| lower.ends_with(suffix))
@@ -263,6 +265,8 @@ mod tests {
             "BUILD.bazel",
             "WORKSPACE",
             "WORKSPACE.bazel",
+            "go.mod",
+            "go.work",
         ] {
             assert!(is_supported_marker_file_name(marker), "{marker}");
         }

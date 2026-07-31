@@ -110,6 +110,7 @@ impl OwnerKindHint {
 pub enum LinkageDomain {
     External,
     Internal(String),
+    Package(String),
     Unknown,
 }
 

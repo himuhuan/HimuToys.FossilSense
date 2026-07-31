@@ -1,6 +1,7 @@
 use super::*;
 use crate::reachability::ReachScope;
 use crate::resource::current_process_memory_bytes;
+use crate::semantic_model::SemanticFamily;
 
 #[test]
 #[ignore = "diagnostic large-workspace NameTable benchmark; set FOSSILSENSE_BENCH_DB"]
@@ -155,6 +156,32 @@ fn compact_name_entry_stays_within_three_ids_and_flags_layout() {
         std::mem::size_of::<CompactNameEntry>() <= 24,
         "compact entries must not regain per-symbol pointers"
     );
+}
+
+#[test]
+fn compact_name_flags_round_trip_family_and_scope_evidence() {
+    let cases = [
+        (SemanticFamily::CFamily, false, false, false),
+        (SemanticFamily::CFamily, false, true, false),
+        (SemanticFamily::CFamily, true, false, false),
+        (SemanticFamily::CFamily, true, true, true),
+        (SemanticFamily::Go, false, false, false),
+        (SemanticFamily::Go, false, true, false),
+        (SemanticFamily::Go, true, false, false),
+        (SemanticFamily::Go, true, true, true),
+    ];
+
+    assert_eq!(std::mem::size_of::<CompactNameFlags>(), 1);
+    for (semantic_family, external, directly_included, expected_directly_included) in cases {
+        let flags = CompactNameFlags::new(semantic_family, external, directly_included);
+        assert_eq!(flags.semantic_family(), semantic_family);
+        assert_eq!(flags.external(), external);
+        assert_eq!(
+            flags.directly_included(),
+            expected_directly_included,
+            "workspace entries cannot carry direct-external evidence"
+        );
+    }
 }
 
 #[test]
@@ -1095,6 +1122,49 @@ fn streamed_name_index_matches_typed_row_builder_with_project_context() {
         );
     }
     assert_eq!(streamed.project_indices(&key), legacy.project_indices(&key));
+}
+
+#[test]
+fn compact_name_recall_filters_c_family_and_go_before_spending_budget() {
+    use crate::config::SemanticFamily;
+    use crate::semantic_model::{SemanticDeclarationKind, SemanticDeclarationRole};
+    use crate::store::views::DeclarationNameRow;
+
+    let table = NameTable::build_from_declaration_name_rows_with_project_context(
+        vec![
+            DeclarationNameRow {
+                id: 1,
+                name: "SharedOpen".to_string(),
+                declaration_kind: SemanticDeclarationKind::Function,
+                role: SemanticDeclarationRole::Definition,
+                path: "src/open.c".to_string(),
+                external: false,
+                directly_included: false,
+                semantic_family: SemanticFamily::CFamily,
+            },
+            DeclarationNameRow {
+                id: 2,
+                name: "SharedOpen".to_string(),
+                declaration_kind: SemanticDeclarationKind::Function,
+                role: SemanticDeclarationRole::Definition,
+                path: "src/open.go".to_string(),
+                external: false,
+                directly_included: false,
+                semantic_family: SemanticFamily::Go,
+            },
+        ],
+        None,
+    );
+
+    let c_hits =
+        table.exact_name_hits_scoped_for_family("SharedOpen", 1, None, SemanticFamily::CFamily);
+    let go_hits =
+        table.exact_name_hits_scoped_for_family("SharedOpen", 1, None, SemanticFamily::Go);
+    assert_eq!(c_hits.iter().map(|hit| hit.id).collect::<Vec<_>>(), vec![1]);
+    assert_eq!(
+        go_hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+        vec![2]
+    );
 }
 
 #[test]

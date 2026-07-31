@@ -135,13 +135,14 @@ impl Backend {
                 uri,
                 owner_path,
                 handle,
+                semantic_family,
                 semantic_generation,
                 owner_revision_hash,
                 overlay_epoch,
                 document_version,
             } => {
                 let root = PathBuf::from(root);
-                if version != 4 || !self.is_workspace_root(&root).await {
+                if version != 5 || !self.is_workspace_root(&root).await {
                     return Ok(item);
                 }
                 let context = self.request_context_for_root(root.clone()).await;
@@ -149,36 +150,57 @@ impl Backend {
                     return Ok(item);
                 }
                 let roots = vec![root];
-                let client_include_roots = self.include_paths.lock().await.clone();
-                let configured = self
-                    .include_roots_for_workspace(
-                        roots.first().map(PathBuf::as_path),
-                        &client_include_roots,
-                    )
-                    .await;
-                let allowed_external_roots: Vec<PathBuf> = configured
-                    .into_iter()
-                    .map(PathBuf::from)
-                    .filter(|path| path.is_absolute())
-                    .collect();
-                let language_resolver = self.workspace_root_config(&roots[0]).await.language;
+                let workspace_semantics = context.engine.workspace_semantics.clone();
+                let language_resolver = workspace_semantics.language.clone();
                 let owner = Path::new(&owner_path);
                 let owner_is_absolute = owner.is_absolute();
-                let owner_allowed = if owner.is_absolute() {
-                    allowed_external_roots
-                        .iter()
-                        .any(|root| pathing::path_is_within(root, owner))
-                } else {
-                    !owner.components().any(|component| {
-                        matches!(
-                            component,
-                            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                let authorized_owner_path = if owner_is_absolute {
+                    let external_roots = workspace_semantics.external_roots.clone();
+                    let owner = owner.to_path_buf();
+                    let requested_owner = owner.clone();
+                    tokio::task::spawn_blocking(move || {
+                        external_roots.authorized_path(&owner, semantic_family)
+                    })
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|authorized| {
+                        let identity =
+                            authorized.identity_for_requested_path(requested_owner.as_path())?;
+                        Some((authorized.canonical_path, identity))
+                    })
+                } else if !owner.components().any(|component| {
+                    matches!(
+                        component,
+                        Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                    )
+                }) {
+                    let workspace_root = roots[0].clone();
+                    let candidate =
+                        workspace_root.join(owner_path.replace('/', std::path::MAIN_SEPARATOR_STR));
+                    let language_identity = candidate.clone();
+                    tokio::task::spawn_blocking(move || {
+                        super::workspace_config::authorized_workspace_source_path(
+                            &workspace_root,
+                            &candidate,
                         )
                     })
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|canonical| (canonical, language_identity))
+                } else {
+                    None
                 };
-                if !owner_allowed {
+                let Some((owner_parse_path, owner_language_path)) = authorized_owner_path else {
+                    return Ok(item);
+                };
+                let owner_language = language_resolver.language_for_path(&owner_language_path);
+                if owner_language.semantic_family() != semantic_family {
                     return Ok(item);
                 }
+                let canonical_owner_path = owner_parse_path.clone();
+                let authorized_owner_path = owner_parse_path.to_string_lossy().into_owned();
                 let request_uri = Url::parse(&uri).ok();
                 let documents = self
                     .session
@@ -201,8 +223,6 @@ impl Backend {
                         super::uri_to_path(&uri).map(|path| (path, snapshot.text))
                     })
                     .collect();
-                let normalized_owner =
-                    owner_is_absolute.then(|| pathing::normalize_abs_path(Path::new(&owner_path)));
                 let result = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
                     for root in roots {
                         let (current_rel, current_text) = current_document
@@ -215,29 +235,26 @@ impl Backend {
                                 )
                             })
                             .unwrap_or_else(|| (String::new(), ""));
-                        let source_kind = if owner_is_absolute {
-                            "external"
-                        } else {
-                            "workspace"
-                        };
                         let open_source = open_documents.iter().find_map(|(path, text)| {
-                            let matches = if owner_is_absolute {
-                                normalized_owner.as_ref().is_some_and(|owner| {
-                                    pathing::normalize_abs_path(path) == *owner
-                                })
-                            } else {
-                                pathing::relative_slash_path(&root, path)
-                                    .is_ok_and(|relative| relative == owner_path)
-                            };
-                            matches.then(|| text.to_string())
+                            let matches = super::workspace_config::canonicalize_source_path(path)
+                                .is_some_and(|candidate| {
+                                    pathing::path_is_within(&canonical_owner_path, &candidate)
+                                        && pathing::path_is_within(
+                                            &candidate,
+                                            &canonical_owner_path,
+                                        )
+                                });
+                            (matches
+                                && text.len() as u64 <= super::hover::HOVER_SOURCE_FILE_BYTE_LIMIT)
+                                .then(|| text.to_string())
                         });
                         let source = open_source.or_else(|| {
                             super::hover::candidate_source_text_for_path(
                                 &root,
                                 &current_rel,
                                 current_text,
-                                &owner_path,
-                                source_kind,
+                                &authorized_owner_path,
+                                "external",
                             )
                         });
                         let Some(source) = source else {
@@ -247,16 +264,10 @@ impl Backend {
                         {
                             continue;
                         }
-                        let owner_parse_path = if owner_is_absolute {
-                            PathBuf::from(&owner_path)
-                        } else {
-                            root.join(owner_path.replace('/', std::path::MAIN_SEPARATOR_STR))
-                        };
-                        let language = language_resolver.language_for_path(&owner_parse_path);
                         let parsed = crate::parser::parse_with_language(
                             Path::new(&owner_path),
                             &source,
-                            language,
+                            owner_language,
                             crate::parser::ParseFacts::ALL,
                         );
                         let member = parsed.members.iter().find(|member| {

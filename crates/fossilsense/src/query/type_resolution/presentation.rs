@@ -128,5 +128,6 @@ fn record_kind_keyword(kind: RecordKind) -> &'static str {
         RecordKind::Struct => "struct",
         RecordKind::Union => "union",
         RecordKind::Class => "class",
+        RecordKind::Interface => "interface",
     }
 }

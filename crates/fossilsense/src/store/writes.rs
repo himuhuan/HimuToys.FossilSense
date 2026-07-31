@@ -37,8 +37,8 @@ pub(super) fn stage_file_updates(
         let mut revision_stmt = tx.prepare(
             "INSERT INTO file_revisions (
                 file_id, extension, size, mtime_ns, hash, indexed_at, status, error, source,
-                parser_version, fact_mask, parse_error_count, fallback_used
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                parser_version, language, fact_mask, parse_error_count, fallback_used, build_guard
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         )?;
         let mut pending_stmt = tx.prepare(
             "INSERT INTO pending_file_revisions (build_id, file_id, revision_id)
@@ -61,20 +61,40 @@ pub(super) fn stage_file_updates(
                 canonical_signature, declarator_shape_json, has_initializer, owner,
                 linkage_kind, guard, language, language_fidelity, provenance, fact_fidelity,
                 logical_key_digest, locator_fingerprint, logical_linkage_domain,
-                guard_fingerprint, backing_kind, backing_id, backing_key,
+                guard_fingerprint, logical_canonical_signature,
+                backing_kind, backing_id, backing_key,
                 backing_start_byte, backing_end_byte
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                 ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
                 ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35,
-                ?36, ?37
+                ?36, ?37, ?38
              )",
         )?;
         let mut include_stmt = tx
             .prepare("INSERT INTO include_facts (revision_id, file_id, line, target_text, target_form, target_normalized, target_basename) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")?;
+        let mut package_stmt = tx.prepare(
+            "INSERT INTO package_facts (
+                revision_id, file_id, name, name_start_byte, name_end_byte,
+                name_start_line, name_start_col, name_end_line, name_end_col
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        )?;
+        let mut import_stmt = tx.prepare(
+            "INSERT INTO import_facts (
+                revision_id, file_id, import_path, alias,
+                path_start_byte, path_end_byte, path_start_line, path_start_col,
+                path_end_line, path_end_col,
+                declaration_start_byte, declaration_end_byte,
+                declaration_start_line, declaration_start_col,
+                declaration_end_line, declaration_end_col
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                ?13, ?14, ?15, ?16
+             )",
+        )?;
         let mut record_stmt = tx.prepare(
             "INSERT INTO record_facts (
-                    revision_id, file_id, display_name, tag_name, typedef_name, kind, start_byte, end_byte,
+                    revision_id, file_id, record_key, display_name, tag_name, typedef_name, kind, start_byte, end_byte,
                     start_line, start_col, end_line, end_col,
                     body_start_byte, body_end_byte, body_start_line, body_start_col,
                     body_end_line, body_end_col,
@@ -83,13 +103,17 @@ pub(super) fn stage_file_updates(
                     range_fidelity, signature, confidence, declaration_hash
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
                            ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23,
-                           ?24, ?25, ?26, ?27, ?28)",
+                           ?24, ?25, ?26, ?27, ?28, ?29)",
         )?;
         let mut member_stmt = tx.prepare(
             "INSERT INTO member_facts (
-                    record_id, name, kind, confidence, start_byte, end_byte,
+                    revision_id, file_id, record_id, record_key,
+                    name, kind, confidence, start_byte, end_byte,
                     start_line, start_col, end_line, end_col, signature, type_name
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                    ?11, ?12, ?13, ?14, ?15
+                 )",
         )?;
         let mut alias_stmt = tx.prepare(
             "INSERT INTO type_alias_facts (
@@ -156,17 +180,19 @@ pub(super) fn stage_file_updates(
 
         for update in updates {
             let fingerprint = update.fingerprint;
-            let (status, error, fact_mask, parse_error_count, fallback_used) = match update.payload
-            {
-                FileIndexPayload::Ok(index) => (
-                    "ok",
-                    None,
-                    index.persistence_diagnostics().fact_mask as i64,
-                    index.persistence_diagnostics().parse_error_count as i64,
-                    i64::from(index.persistence_diagnostics().fallback_used),
-                ),
-                FileIndexPayload::Error(error) => ("error", Some(error), 0, 0, 0),
-            };
+            let (status, error, language, fact_mask, parse_error_count, fallback_used, build_guard) =
+                match update.payload {
+                    FileIndexPayload::Ok(index) => (
+                        "ok",
+                        None,
+                        semantic_language_code(index.persistent_facts().language),
+                        index.persistence_diagnostics().fact_mask as i64,
+                        index.persistence_diagnostics().parse_error_count as i64,
+                        i64::from(index.persistence_diagnostics().fallback_used),
+                        index.persistent_facts().build_guard,
+                    ),
+                    FileIndexPayload::Error(error) => ("error", Some(error), 2, 0, 0, 0, None),
+                };
             file_stmt.execute(params![
                 fingerprint.path.as_str(),
                 fingerprint.extension.as_str(),
@@ -192,9 +218,11 @@ pub(super) fn stage_file_updates(
                 error,
                 update.source.as_str(),
                 PARSER_FACT_VERSION,
+                language,
                 fact_mask,
                 parse_error_count,
                 fallback_used,
+                build_guard,
             ])?;
             let revision_id = tx.last_insert_rowid();
             pending_stmt.execute(params![build.id, file_id, revision_id])?;
@@ -221,7 +249,9 @@ pub(super) fn stage_file_updates(
                 anyhow::bail!("fallback revision attempted to persist declarations");
             }
             if fallback_used != 0
-                && (!facts.records.is_empty()
+                && (facts.package.is_some()
+                    || !facts.imports.is_empty()
+                    || !facts.records.is_empty()
                     || !facts.fields.is_empty()
                     || !facts.members.is_empty()
                     || !facts.aliases.is_empty()
@@ -267,6 +297,41 @@ pub(super) fn stage_file_updates(
                 ])?;
             }
 
+            if let Some(package) = facts.package {
+                package_stmt.execute(params![
+                    revision_id,
+                    file_id,
+                    package.name.as_str(),
+                    package.name_range.start_byte as i64,
+                    package.name_range.end_byte as i64,
+                    package.name_range.start.line as i64,
+                    package.name_range.start.character as i64,
+                    package.name_range.end.line as i64,
+                    package.name_range.end.character as i64,
+                ])?;
+            }
+
+            for import in facts.imports {
+                import_stmt.execute(params![
+                    revision_id,
+                    file_id,
+                    import.path.as_str(),
+                    import.alias.as_deref(),
+                    import.path_range.start_byte as i64,
+                    import.path_range.end_byte as i64,
+                    import.path_range.start.line as i64,
+                    import.path_range.start.character as i64,
+                    import.path_range.end.line as i64,
+                    import.path_range.end.character as i64,
+                    import.declaration_range.start_byte as i64,
+                    import.declaration_range.end_byte as i64,
+                    import.declaration_range.start.line as i64,
+                    import.declaration_range.start.character as i64,
+                    import.declaration_range.end.line as i64,
+                    import.declaration_range.end.character as i64,
+                ])?;
+            }
+
             let mut record_key_to_id = HashMap::new();
             let mut record_name_to_ids: std::collections::HashMap<String, Vec<i64>> =
                 std::collections::HashMap::new();
@@ -274,6 +339,7 @@ pub(super) fn stage_file_updates(
                 record_stmt.execute(params![
                     revision_id,
                     file_id,
+                    record.record_key.as_str(),
                     record.display_name.as_str(),
                     record.tag_name.as_deref(),
                     record.typedef_name.as_deref(),
@@ -329,22 +395,23 @@ pub(super) fn stage_file_updates(
                         let ids = record_name_to_ids.get(owner)?;
                         (ids.len() == 1).then_some(ids[0])
                     });
-                if let Some(rid) = record_id {
-                    member_stmt.execute(params![
-                        rid,
-                        member.name.as_str(),
-                        member_kind_to_str(member.kind),
-                        member_confidence_to_str(member.confidence),
-                        member.start_byte as i64,
-                        member.end_byte as i64,
-                        member.start_line as i64,
-                        member.start_col as i64,
-                        member.end_line as i64,
-                        member.end_col as i64,
-                        member.signature.as_str(),
-                        member.type_name.as_deref(),
-                    ])?;
-                }
+                member_stmt.execute(params![
+                    revision_id,
+                    file_id,
+                    record_id,
+                    member.record_key.as_str(),
+                    member.name.as_str(),
+                    member_kind_to_str(member.kind),
+                    member_confidence_to_str(member.confidence),
+                    member.start_byte as i64,
+                    member.end_byte as i64,
+                    member.start_line as i64,
+                    member.start_col as i64,
+                    member.end_line as i64,
+                    member.end_col as i64,
+                    member.signature.as_str(),
+                    member.type_name.as_deref(),
+                ])?;
             }
 
             let mut alias_fingerprint_to_id = HashMap::new();
@@ -397,6 +464,9 @@ pub(super) fn stage_file_updates(
                 let (linkage_kind, linkage_file) = match &anchor.linkage {
                     crate::call_model::LinkageDomain::External => (1i64, None),
                     crate::call_model::LinkageDomain::Internal(path) => (2, Some(path.as_str())),
+                    crate::call_model::LinkageDomain::Package(package) => {
+                        (3, Some(package.as_str()))
+                    }
                     crate::call_model::LinkageDomain::Unknown => (0, None),
                 };
                 let name_id = intern_call_string(&anchor.name)?;
@@ -517,10 +587,12 @@ pub(super) fn stage_file_updates(
                     .locator
                     .path
                     .clone_from(&fingerprint.path);
-                if matches!(
-                    declaration.linkage,
-                    crate::call_model::LinkageDomain::Internal(_)
-                ) {
+                if declaration.identity.language != SemanticLanguage::Go
+                    && matches!(
+                        declaration.linkage,
+                        crate::call_model::LinkageDomain::Internal(_)
+                    )
+                {
                     declaration.linkage =
                         crate::call_model::LinkageDomain::Internal(fingerprint.path.clone());
                     declaration.identity.logical_key.linkage_domain =
@@ -529,21 +601,21 @@ pub(super) fn stage_file_updates(
                 let (backing_kind, backing_id, backing_key, backing_start, backing_end) =
                     match &declaration.backing {
                         DeclarationBacking::CallableAnchor { fingerprint } => (
-                            "callable_anchor",
+                            0,
                             callable_id_by_fingerprint.get(fingerprint).copied(),
                             Some(fingerprint.clone()),
                             None,
                             None,
                         ),
                         DeclarationBacking::Record { record_key } => (
-                            "record",
+                            1,
                             record_key_to_id.get(record_key).copied(),
                             Some(record_key.clone()),
                             None,
                             None,
                         ),
                         DeclarationBacking::TypeAlias { fingerprint } => (
-                            "type_alias",
+                            2,
                             alias_fingerprint_to_id.get(fingerprint).copied(),
                             Some(fingerprint.clone()),
                             None,
@@ -555,14 +627,14 @@ pub(super) fn stage_file_updates(
                                 "source-range declaration backing must round-trip through the stored name range"
                             );
                             (
-                                "source_range",
+                                3,
                                 None,
                                 None,
                                 Some(range.start_byte as i64),
                                 Some(range.end_byte as i64),
                             )
                         }
-                        DeclarationBacking::None => ("none", None, None, None, None),
+                        DeclarationBacking::None => (4, None, None, None, None),
                     };
                 let logical_key = serde_json::to_vec(&declaration.identity.logical_key)?;
                 let declarator_shape_json = declaration
@@ -570,6 +642,22 @@ pub(super) fn stage_file_updates(
                     .as_ref()
                     .map(serde_json::to_string)
                     .transpose()?;
+                let locator_fingerprint = digest_bytes(&declaration.identity.locator.fingerprint)?;
+                let guard_fingerprint = declaration
+                    .identity
+                    .logical_key
+                    .guard_fingerprint
+                    .as_deref()
+                    .map(digest_bytes)
+                    .transpose()?;
+                let logical_canonical_signature = tagged_logical_signature(
+                    declaration.canonical_signature.as_deref(),
+                    declaration
+                        .identity
+                        .logical_key
+                        .canonical_signature
+                        .as_deref(),
+                );
                 declaration_stmt.execute(params![
                     revision_id,
                     file_id,
@@ -600,13 +688,10 @@ pub(super) fn stage_file_updates(
                     semantic_provenance_code(declaration.identity.provenance),
                     semantic_fidelity_code(declaration.identity.fact_fidelity),
                     digest_value(&logical_key),
-                    declaration.identity.locator.fingerprint.as_str(),
+                    locator_fingerprint,
                     declaration.identity.logical_key.linkage_domain.as_str(),
-                    declaration
-                        .identity
-                        .logical_key
-                        .guard_fingerprint
-                        .as_deref(),
+                    guard_fingerprint,
+                    logical_canonical_signature,
                     backing_kind,
                     backing_id,
                     backing_key,
@@ -624,14 +709,31 @@ fn digest_bytes(value: &str) -> Result<Vec<u8>> {
     if value.len() != 24 {
         anyhow::bail!("fact digest must contain exactly 24 hexadecimal characters");
     }
+    if !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        anyhow::bail!("fact digest contains a non-hexadecimal byte");
+    }
     value
         .as_bytes()
         .chunks_exact(2)
         .map(|pair| {
-            let text = std::str::from_utf8(pair).context("call digest is not UTF-8")?;
-            u8::from_str_radix(text, 16).context("call digest contains a non-hexadecimal byte")
+            let text = std::str::from_utf8(pair).context("fact digest is not UTF-8")?;
+            u8::from_str_radix(text, 16).context("fact digest contains a non-hexadecimal byte")
         })
         .collect()
+}
+
+fn tagged_logical_signature(
+    canonical_signature: Option<&str>,
+    logical_canonical_signature: Option<&str>,
+) -> Option<Vec<u8>> {
+    let logical_canonical_signature = logical_canonical_signature?;
+    if canonical_signature == Some(logical_canonical_signature) {
+        return Some(vec![0]);
+    }
+    let mut tagged = Vec::with_capacity(logical_canonical_signature.len().saturating_add(1));
+    tagged.push(1);
+    tagged.extend_from_slice(logical_canonical_signature.as_bytes());
+    Some(tagged)
 }
 
 fn digest_value(value: &[u8]) -> Vec<u8> {
@@ -673,14 +775,16 @@ fn linkage_kind_code(linkage: &crate::call_model::LinkageDomain) -> i64 {
         crate::call_model::LinkageDomain::External => 0,
         crate::call_model::LinkageDomain::Internal(_) => 1,
         crate::call_model::LinkageDomain::Unknown => 2,
+        crate::call_model::LinkageDomain::Package(_) => 3,
     }
 }
 
-fn semantic_language_code(language: SemanticLanguage) -> i64 {
+pub(super) fn semantic_language_code(language: SemanticLanguage) -> i64 {
     match language {
         SemanticLanguage::C => 0,
         SemanticLanguage::Cpp => 1,
         SemanticLanguage::Unknown => 2,
+        SemanticLanguage::Go => 3,
     }
 }
 
@@ -775,4 +879,41 @@ fn fact_flags(provenance: crate::call_model::FactProvenance, syntax_error: bool)
         crate::call_model::FactProvenance::Synthetic => 2,
     };
     provenance | (i64::from(syntax_error) << 8)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{digest_bytes, tagged_logical_signature};
+
+    #[test]
+    fn digest_bytes_rejects_signs_and_non_hex_but_accepts_uppercase() {
+        assert!(digest_bytes("+f0000000000000000000000").is_err());
+        assert!(digest_bytes("gg0000000000000000000000").is_err());
+        assert!(digest_bytes("00").is_err());
+
+        let mut expected = vec![0; 12];
+        expected[0] = 0x0f;
+        assert_eq!(
+            digest_bytes("0F0000000000000000000000").expect("uppercase digest"),
+            expected
+        );
+    }
+
+    #[test]
+    fn tagged_logical_signature_preserves_all_three_relation_states() {
+        assert_eq!(tagged_logical_signature(Some("same"), None), None);
+        assert_eq!(
+            tagged_logical_signature(Some("same"), Some("same")),
+            Some(vec![0])
+        );
+        assert_eq!(
+            tagged_logical_signature(Some("display"), Some("")),
+            Some(vec![1]),
+            "an explicit empty override must not collide with the same-value tag"
+        );
+        assert_eq!(
+            tagged_logical_signature(None, Some("custom")),
+            Some(b"\x01custom".to_vec())
+        );
+    }
 }

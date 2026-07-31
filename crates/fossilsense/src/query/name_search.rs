@@ -27,11 +27,32 @@ impl NameTable {
         out
     }
 
+    #[cfg(test)]
     pub fn exact_name_hits_scoped(
         &self,
         name: &str,
         limit: usize,
         scope: Option<&CompletionScope>,
+    ) -> Vec<RankedNameHit> {
+        self.exact_name_hits_scoped_filtered(name, limit, scope, None)
+    }
+
+    pub fn exact_name_hits_scoped_for_family(
+        &self,
+        name: &str,
+        limit: usize,
+        scope: Option<&CompletionScope>,
+        semantic_family: crate::semantic_model::SemanticFamily,
+    ) -> Vec<RankedNameHit> {
+        self.exact_name_hits_scoped_filtered(name, limit, scope, Some(semantic_family))
+    }
+
+    fn exact_name_hits_scoped_filtered(
+        &self,
+        name: &str,
+        limit: usize,
+        scope: Option<&CompletionScope>,
+        semantic_family: Option<crate::semantic_model::SemanticFamily>,
     ) -> Vec<RankedNameHit> {
         if name.is_empty() || limit == 0 {
             return Vec::new();
@@ -40,7 +61,11 @@ impl NameTable {
         let indices: Vec<usize> = self
             .prefix_candidates(&needle)
             .into_iter()
-            .filter(|index| self.entry(*index).lower == needle)
+            .filter(|index| {
+                let entry = self.entry(*index);
+                entry.lower == needle
+                    && semantic_family.is_none_or(|family| entry.semantic_family == family)
+            })
             .collect();
         let ctx_owned: Option<ResolveContext<'_>> = scope.map(|s| s.resolve_context());
         self.rank_indices(&needle, limit, ctx_owned.as_ref(), &indices)
@@ -70,10 +95,29 @@ impl NameTable {
     /// external → `Global` (does not color). Names with no colorable in-scope
     /// definition are absent from the result (they resolve to no color),
     /// matching the SQL behavior.
+    #[cfg(test)]
     pub fn colorable_kind_counts(
         &self,
         names: &HashSet<&str>,
         scope: Option<&CompletionScope>,
+    ) -> HashMap<String, HashMap<String, usize>> {
+        self.colorable_kind_counts_filtered(names, scope, None)
+    }
+
+    pub fn colorable_kind_counts_for_family(
+        &self,
+        names: &HashSet<&str>,
+        scope: Option<&CompletionScope>,
+        semantic_family: crate::semantic_model::SemanticFamily,
+    ) -> HashMap<String, HashMap<String, usize>> {
+        self.colorable_kind_counts_filtered(names, scope, Some(semantic_family))
+    }
+
+    fn colorable_kind_counts_filtered(
+        &self,
+        names: &HashSet<&str>,
+        scope: Option<&CompletionScope>,
+        semantic_family: Option<crate::semantic_model::SemanticFamily>,
     ) -> HashMap<String, HashMap<String, usize>> {
         let mut counts: HashMap<String, HashMap<String, usize>> = HashMap::new();
         if names.is_empty() {
@@ -96,6 +140,9 @@ impl NameTable {
         let ctx_ref = ctx_owned.as_ref();
         for index in self.active_indices() {
             let entry = self.entry(index);
+            if semantic_family.is_some_and(|family| entry.semantic_family != family) {
+                continue;
+            }
             let kind = match entry.kind {
                 ParserKind::Macro => "macro",
                 ParserKind::Type => "type",
@@ -273,8 +320,51 @@ impl NameTable {
         active_project: Option<&ProjectKey>,
         prior_pool: Option<&[usize]>,
     ) -> (Vec<RankedNameHit>, Vec<usize>, CompletionRecallMetrics) {
+        self.search_completion_recall_pooled_with_project_filtered(
+            query,
+            quotas,
+            scope,
+            active_project,
+            prior_pool,
+            None,
+        )
+    }
+
+    pub fn search_completion_recall_pooled_with_project_for_family(
+        &self,
+        query: &str,
+        quotas: CompletionRecallQuotas,
+        scope: Option<&CompletionScope>,
+        active_project: Option<&ProjectKey>,
+        prior_pool: Option<&[usize]>,
+        semantic_family: crate::semantic_model::SemanticFamily,
+    ) -> (Vec<RankedNameHit>, Vec<usize>, CompletionRecallMetrics) {
+        self.search_completion_recall_pooled_with_project_filtered(
+            query,
+            quotas,
+            scope,
+            active_project,
+            prior_pool,
+            Some(semantic_family),
+        )
+    }
+
+    fn search_completion_recall_pooled_with_project_filtered(
+        &self,
+        query: &str,
+        quotas: CompletionRecallQuotas,
+        scope: Option<&CompletionScope>,
+        active_project: Option<&ProjectKey>,
+        prior_pool: Option<&[usize]>,
+        semantic_family: Option<crate::semantic_model::SemanticFamily>,
+    ) -> (Vec<RankedNameHit>, Vec<usize>, CompletionRecallMetrics) {
         let total_limit = quotas.total_indexed;
-        let (scored, pool) = self.scored_pool_for_query(query, scope, prior_pool);
+        let (mut scored, mut pool) = self.scored_pool_for_query(query, scope, prior_pool);
+        if let Some(semantic_family) = semantic_family {
+            scored
+                .retain(|candidate| self.entry(candidate.index).semantic_family == semantic_family);
+            pool.retain(|index| self.entry(*index).semantic_family == semantic_family);
+        }
         let reserved = quotas
             .reachable
             .saturating_add(quotas.external)
@@ -506,6 +596,7 @@ impl NameTable {
                     name: entry.name.to_string(),
                     kind: entry.kind,
                     role: entry.role,
+                    semantic_family: entry.semantic_family,
                     project_key: entry.project_key.cloned(),
                 }
             })

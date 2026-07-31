@@ -20,7 +20,7 @@ export async function findAllPossibleTargets(client: LanguageClient | undefined)
   const editor = vscode.window.activeTextEditor;
   if (!editor) {
     void vscode.window.showInformationMessage(
-      'Open a C/C++ file and place the cursor on an identifier.',
+      'Open a C/C++ or Go file and place the cursor on an identifier.',
     );
     return;
   }
@@ -59,7 +59,9 @@ export async function findReferencesGrouped(client: LanguageClient | undefined):
   }
   const editor = vscode.window.activeTextEditor;
   if (!editor) {
-    void vscode.window.showInformationMessage('Open a C/C++ file and place the cursor on an identifier.');
+    void vscode.window.showInformationMessage(
+      'Open a C/C++ or Go file and place the cursor on an identifier.',
+    );
     return;
   }
   const position = editor.selection.active;
