@@ -59,7 +59,7 @@ C++ 记录类型中的方法名会作为 function-kind 名称进入普通标识�
 | `Full Rebuild Index` | 强制重新扫描并建立完整索引 |
 | `Find All Possible Definitions / Declarations` | 查看默认跳转压制前的有界候选与不确定性证据 |
 | `Find References (Grouped by Role)` | 按语法角色查看引用候选 |
-| `Analyse Call Hierarchy` | 查看 C/C++ 或 Go 直接调用的 incoming / outgoing 关系和调用点 |
+| `Analyse Call Hierarchy` | 查看 C/C++ 或 Go 直接调用的 incoming / outgoing 关系和调用点；打开 Relations 面板后可切换 incoming/outgoing、刷新并逐条查看调用点与候选证据 |
 | `Select Project Context` | 选择自动识别的项目范围或关闭项目证据 |
 | `Clear Completion History` | 清除当前工作区的本地补全历史 |
 
@@ -100,6 +100,7 @@ VS Code 设置中常用的选项：
 - `fossilsense.completion.prefixRanking`：默认 `strict`，优先精确名和字面前缀；`scopeFirst` 更重视作用域证据。
 - `fossilsense.projectContext.mode`：自动项目证据、歧义时询问或关闭。
 - `fossilsense.semanticColoring.mode`：启用或关闭 FossilSense 着色。
+- `fossilsense.includeScoping.mode`：限制 `#include` 可达性范围。`auto` 时着色与补全只接受当前文件 include 图可达的定义、直接外部头和有界启发式 include 目标，排除无关的全库定义；`off` 回到全库行为。
 - `fossilsense.resourceMonitor.enabled`：在状态栏显示 FossilSense 进程内存和索引数据库磁盘占用，默认开启，每 5 秒刷新；关闭仅隐藏状态栏，不影响服务行为。
 - `fossilsense.semanticIndex.memoryBudgetMB`：声明语义索引的总内存目标。常驻的紧凑补全召回索引先占用预算，剩余部分缓存 Hover、跳转和补全详情共享的声明 payload；设为 `0` 仍保留召回索引，并按需从本地数据库读取选中的事实。
 
@@ -127,4 +128,4 @@ Find All 是有界发现入口，不是编译器或链接器结果。它会明�
 
 索引、补全历史和查询都在本机完成。FossilSense 不上传源码，不发送匿名 telemetry，不做 cloud sync，也不使用云端 ML ranker。补全历史只保存在当前工作区本地缓存中，可随时关闭或清除。
 
-贡献、编译、测试和打包方法见 [CLAUDE.md](CLAUDE.md)。
+贡献、编译、测试和打包方法见 [AGENTS.md](AGENTS.md)。

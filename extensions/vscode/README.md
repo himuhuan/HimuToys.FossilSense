@@ -53,7 +53,7 @@ If an active clangd, Microsoft C/C++, ccls, or Go extension matches a source lan
 | `FossilSense: Full Rebuild Index` | Rebuild the full in-scope index |
 | `FossilSense: Find All Possible Definitions / Declarations` | Inspect bounded variants and their uncertainty evidence |
 | `FossilSense: Find References (Grouped by Role)` | Inspect best-effort reference roles |
-| `FossilSense: Analyse Call Hierarchy` | Open incoming/outgoing direct-call relations and call sites |
+| `FossilSense: Analyse Call Hierarchy` | Open incoming/outgoing direct-call relations and call sites in the FossilSense Relations panel |
 | `FossilSense: Select Project Context` | Select automatic, manual, unspecified, or disabled project evidence |
 | `FossilSense: Clear Completion History` | Remove local completion-ranking history |
 
@@ -89,6 +89,7 @@ All fields are optional. `.c` defaults to C; `.h`, `.inl`, and the standard C++ 
 - `fossilsense.completionHistory.mode`: enable or disable local accepted-completion history.
 - `fossilsense.projectContext.mode`: use automatic project evidence, prompt when ambiguous, or disable it.
 - `fossilsense.semanticColoring.mode`: enable or disable FossilSense semantic coloring.
+- `fossilsense.includeScoping.mode`: narrow coloring and completion using the current file's resolved `#include` graph. `auto` (default) accepts exact reachable definitions, direct external headers, and bounded heuristic include targets while excluding unrelated whole-workspace definitions when the scope is open; `off` reverts to whole-index behavior.
 - `fossilsense.references.showRanges`: show line suffixes in grouped reference rows.
 - `fossilsense.resourceMonitor.enabled`: show a status bar item with the server's process memory and the on-disk size of its index cache. On by default; updates every 5 seconds while the server is running. Turning it off only hides the item.
 - `fossilsense.semanticIndex.memoryBudgetMB`: total target for the declaration semantic index. The always-resident compact completion recall index is charged first; the remainder caches canonical declaration payloads shared by completion resolve, Hover, and navigation. `0` retains recall and loads selected facts from the local database on demand.

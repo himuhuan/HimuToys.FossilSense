@@ -1,4 +1,4 @@
-# CLAUDE.md
+# AGENTS.md
 
 ## 工作方式
 
@@ -15,7 +15,7 @@ FossilSense 的实现事实只来自**当前源码、测试、清单和脚本**�
 
 ## 项目定位
 
-FossilSense `1.5.0` 是一个面向大型 Windows C/C++ 工作区的 VS Code 代码导航与分析工具。它把“缺少可靠编译环境”视为正常场景：用户不需要先准备 `compile_commands.json`、clangd、ctags 或完整构建链。
+FossilSense `1.5.0` 是一个面向大型 Windows C/C++ 与 Go 工作区的 VS Code 代码导航与分析工具。它把“缺少可靠编译环境”视为正常场景：用户不需要先准备 `compile_commands.json`、clangd、gopls、ctags、Go 或完整构建链。Go 后端以实验能力提供，遵守与 C/C++ 相同的候选式语义、容错与有界查询原则。
 
 核心原则：
 
@@ -25,7 +25,7 @@ FossilSense `1.5.0` 是一个面向大型 Windows C/C++ 工作区的 VS Code 代
 - **开箱即用**：对外 VSIX 必须包含 Rust 原生二进制，不依赖用户额外安装工具链。
 - **不确定性可见**：结果需要保留 confidence、reason、ambiguity、coverage 或 truncation 等证据。
 
-当前明确不做完整 C++ 语义绑定，包括继承、模板、重载决议、宏展开、访问控制和表达式类型推断。遇到 unsupported 形态时保守返回候选或降级，不猜测唯一答案。
+当前明确不做完整 C++ 语义绑定，包括继承、模板、重载决议、宏展开、访问控制和表达式类型推断；Go 侧同样不做接口动态派发、泛型实例化、嵌入成员提升、方法集证明或表达式类型推断。遇到 unsupported 形态时保守返回候选或降级，不猜测唯一答案。
 
 ## 源码入口
 
@@ -41,7 +41,7 @@ Rust 引擎      crates/fossilsense/src
 - `crates/fossilsense/src/main.rs`：CLI 的 `scan`、`index`、`query`、`lsp` 入口。
 - `crates/fossilsense/src/server.rs` 与 `server/`：LSP 生命周期和协议适配。
 - `crates/fossilsense/src/indexer.rs` 与 `indexer/`：扫描、解析、索引和发布。
-- `crates/fossilsense/src/parser.rs` 与 `parser/`：C/C++ 容错事实提取。
+- `crates/fossilsense/src/parser.rs` 与 `parser/`：C/C++ 与 Go 容错事实提取。
 - `crates/fossilsense/src/query.rs`、`query/`、`resolver.rs`：候选查询和排序。
 - `crates/fossilsense/src/store.rs` 与 `store/`：SQLite schema、读视图和写入。
 - `extensions/vscode/package.json`：客户可见命令、配置、版本和打包入口。
@@ -51,7 +51,7 @@ Rust 引擎      crates/fossilsense/src
 
 ## 符号事实与查询架构
 
-符号链路保持单向：parser 从容错语法树和词法 fallback 提取声明事实，indexer 把带稳定 declaration ID、role、range、signature、linkage、guard 和 revision 的事实写入 SQLite；store 的 typed read view 是持久化语义边界；`CandidateQueryService` 在同一 semantic generation 内合并这些事实、include reachability、项目证据和未保存文档 overlay；server 最后才转换成 LSP 类型。
+符号链路保持单向：parser 从容错语法树和词法 fallback 提取声明事实，indexer 把带稳定 declaration ID、role、range、signature、linkage、guard 和 revision 的事实写入 SQLite；store 的 typed read view 是持久化语义边界；`CandidateQueryService` 在同一 semantic generation 内合并这些事实、include reachability、项目证据和未保存文档 overlay；server 最后才转换成 LSP 类型。Go 同链路由 package/import 图提供可达性证据：同 package 文件共享可见性，`go.mod`、`go.work`、工作区 `vendor` 和用户明示的外部模块根提供有界依赖证据；Go 事实携带 package identity 和 build guard，与 C/C++ 属于不同语义家族，同名符号不跨语言混入普通查询。
 
 普通补全列表因为每次键入都会触发，单独使用常驻的 compact `NameTable` 做有界召回。它只保存 name、kind、role、path、scope 信号和 canonical declaration ID，不复制完整 declaration payload，也不能在列表热路径读取 SQLite。这个分支是性能索引，不是第二套语义模型：completion resolve 必须携带 ID 和原始 name 回到 `CandidateQueryService`；Hover、Definition、Declaration、Find All、Signature Help 和 workspace symbol 的最终展示同样按 ID 水合 typed `DeclarationReadRow`。因此补全详情与导航共享 role、range、signature、linkage、guard 和 overlay 规则；禁止重新引入常驻 `DeclarationCoreRow`、`core_by_id` 或从轻量召回项直接构造最终语义结果。
 
@@ -173,7 +173,7 @@ dist/fossilsense-vscode-<version>_BUILD<YYYYMMDD_HHMMSS>.vsix
 
 仓库长期维护的 Markdown 仅包括：
 
-- `CLAUDE.md`：基本工程守则、验证、编译和打包方法，不超过 500 行。
+- `AGENTS.md`（本文件）：基本工程守则、验证、编译和打包方法，不超过 500 行；`CLAUDE.md` 仅保留指向本文件的链接。
 - 根 `README.md`：面向客户的产品介绍、安装和使用。
 - `extensions/vscode/README.md`：VSIX Marketplace 内容。
 - `docs/benchmark/`：可复现的性能测试方法与结果。

@@ -84,7 +84,7 @@ function New-HardeningFixture {
     Write-FixtureFile $Root 'extensions/vscode/src/extension.ts' "export {};`n"
     Write-FixtureFile $Root 'extensions/vscode/media/relations.svg' '<svg></svg>'
     Write-FixtureFile $Root 'README.md' "$docs`n"
-    Write-FixtureFile $Root 'CLAUDE.md' "$docs`n"
+    Write-FixtureFile $Root 'AGENTS.md' "$docs`n"
 }
 
 function Read-ReleaseFingerprint {
