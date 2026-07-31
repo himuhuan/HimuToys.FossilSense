@@ -6,7 +6,7 @@
 >
 > **分析基线**：FossilSense `1.5.0`，源码提交 `3fbe93d`，2026-07-31。
 >
-> **证据边界**：结论来自当前源码、测试、脚本和公开一手资料。现在没有真实用户机器上的端到端 trace、CPU profile、blocking queue wait 或稳定的 p95/p99 数据，因此本文会区分“源码已确认事实”和“仍需运行时验证的占比判断”。
+> **证据边界**：结论来自当前源码、测试和脚本。当前已经有完整 U-Boot engine 上直接调用生产 `LanguageServer::completion` 的 64 请求 release replay，以及 context/parse/local words/overlay/worker/render 分段和稳定 P95；仍没有 VS Code renderer 的 key-to-paint、stdio transport trace 或真实用户机器 CPU profile，因此服务端门禁不能冒充 UI 端到端结论。
 
 # 1.5.1 实施状态
 
@@ -17,10 +17,10 @@
 | 阶段 | 状态 | 当前成果 | 尚未完成 |
 |---|---|---|---|
 | Phase 0A：latest-request-wins 与前台 admission | 已通过阶段验证 | completion token 在 RPC 首个 `await` 前按请求顺序注册；`didOpen`、`didChange`、`didSave`、`didClose` 在异步 mutation 前后 supersede 竞态窗口内的旧 token；memo 只允许 current token 提交，最终 publish check 后不再挂起；前台 CPU admission 保留 1–2 个 permit，排队旧请求可提前退出；生产 pooled recall 的 scan 与精确 top-K selection 均每 256 个 entry 协作检查取消；stale partial hits/pool 不会进入返回或 memo | overlay 构建、live parse 和其它 feature 的 blocking closure 尚未接入同一 token；专用 CPU pool 与 background credit 尚未实现 |
-| Phase 0B：生产路径观测 | 已通过阶段验证 | `[perf] completion` 新增互不重叠的 context/admission wait、worker time、scan inspected、selection inspected 和 cancel-check 数；取消路径累计 superseded、queue cancellation、worker cancellation、worker failure 与 stale inspected entries；新增 ignored production pooled-recall component benchmark，直接调用普通补全使用的 pooled recall，而不是 `search_ranked` 快路径；U-Boot 冷态基线已采集 | 并发 LSP replay、端到端 stdio replay 与 VS Code key-to-paint trace 尚未实现 |
+| Phase 0B：生产路径观测 | 已通过阶段验证 | `[perf] completion` 新增互不重叠的 context/parse/local words/overlay/admission wait/worker/render 时间，以及 scan/selection/cancel 指标；取消路径累计 superseded、queue cancellation、worker cancellation、worker failure 与 stale inspected entries；production pooled-recall component 与 64 请求生产 handler replay 均已接入 U-Boot 自动门禁 | 并发突发 replay、端到端 stdio replay 与 VS Code key-to-paint trace 尚未实现 |
 | Phase 0C：full-build 门禁恢复 | 已通过阶段验证 | disposable full build 在事实写入期间延迟全部非唯一 lookup index，完成后批量恢复；在线/增量路径、quick/foreign-key check、generation lease 与原子发布不变 | Wine 发布候选门禁留到最终阶段 |
-| Phase 1：identity / persistent overlay | 未开始 | — | `RecallUniverseId`、shadow/projection/exact revision 分层与 graph/path/NameTable view |
-| Phase 2：bounded recall v2 | 未开始 | — | bounded prefix cursor、统一请求预算、truncation/coverage 与 differential oracle |
+| Phase 1：identity / persistent overlay | 核心 identity 已通过阶段验证 | completion-only `RecallUniverseId` 由实际投影内容计算；当前文档 body-only 编辑复用同一 immutable overlay Arc 与 memo generation，include 或其它 dirty 文档声明变化会失效；当前文档仍立即 tombstone durable path，精确解析结果与 exact `overlay_epoch` 分别负责当前候选和 resolve 新鲜度；完整 hover/navigation overlay 保持原 exact-version cache | persistent graph/path/NameTable view 与细粒度 edge delta 尚未实现；当前只缓存每个 root/base 最新的 completion projection，不能标记整个 Phase 1 完成 |
+| Phase 2：bounded recall v2 | 最终独立复审无 blocker，正式门禁通过 | base/delta 使用惰性 k-way bounded prefix cursor；所有 root 共用 `16,384` candidate budget；C/Go 在消费预算前隔离；mixed segment 通过 active path 与 selected-project compact prefix posting 恢复，scope/project/recovery 的 source、metadata probe 和 candidate pop 各自保留份额，总和仍受原 1/8 priority budget 与 `4,096` metadata cap 约束；跨源同一 declaration 只评分一次；项目/语言族 presence 与 segment-local project ID 均由发布时 O(1) map 提供；direct-external 请求投影封顶 `4,096`；完整 matcher 仍消费全部 query 字符；truncated pool 不再用于 memo narrowing；U-Boot 生产 handler replay P95 `26.264 ms`、最大 inspected `16,384`、payload SQL reads `0` | 200 分任意子序列长尾仍是显式截断的均匀 fallback；include/import 改动触发 completion overlay cache miss 时仍会复制 workspace graph/path 结构，留待 Phase 1 persistent graph；stdio/VS Code UI 延迟不属于当前门禁 |
 | Phase 3：增量文档与 parse | 未开始 | — | line map/local words、incremental tree/facts 与客户端完整字符策略验证 |
 
 当前已通过的 TDD/结构性验证：
@@ -31,9 +31,21 @@
 - `server::tests::completion_runtime_supersedes_queued_request_before_cpu_admission`：单 permit 被占用时，同 URI 新请求使旧排队请求先于 permit 释放退出。
 - `server::tests::document_change_supersedes_active_completion_token`：文档 revision 变化立即使活动 token 失效。
 - `server::tests::completion_runtime_never_allows_older_work_to_replace_a_post_change_request` 与 `cancelled_request_cannot_repopulate_a_memo_after_waiting_for_its_lock`：覆盖旧 snapshot 晚完成和 memo mutex 排队交错，旧请求既不能反向取消新请求，也不能在 change/close 后复活 memo 或返回结果。
-- `cargo test -p fossilsense`：`1048 passed; 0 failed; 7 ignored`；`cargo clippy -p fossilsense --all-targets -- -D warnings`、VS Code `pnpm run test` 与 completion perf-summary 定向测试通过。
 - `store::tests::maintenance::full_build_defers_secondary_indexes_until_facts_are_complete`：full build 构建中不维护代表性查询 lookup index，finalize 后全部恢复；构建期间仅保留发布清理明确依赖的窄 `idx_file_revisions_file_id` 维护索引。
-- 完整复验为 `cargo fmt --all -- --check`、`cargo clippy -p fossilsense --all-targets -- -D warnings`、`cargo test -p fossilsense` 全部通过；当前 Rust 统计 `1048 passed; 0 failed; 7 ignored`，VS Code `pnpm run test` 通过。复验曾捕获 full-build 清理缺少维护索引的回归，补充不变量测试并修复后全量转绿。
+- `query::tests::bounded_completion_recall_has_a_hard_budget_and_keeps_full_query_matching` 及相邻 differential cases：候选生成共享 `16,384` 硬预算，语言家族在消费预算前隔离，最终 matcher 使用完整输入；重复名称 expansion、delta/tombstone 与 fuzzy posting 都有回归覆盖。
+- `server::tests::completion_overlay_reuses_recall_universe_across_current_body_edits`、`completion_overlay_invalidates_when_another_dirty_declaration_changes` 与 `current_completion_projection_tombstones_renamed_indexed_declaration`：分别证明 body-only 复用、语义投影变化失效和当前 dirty path 不泄漏 durable 声明。
+- `server::tests::completion_memo_generation_tracks_recall_universe_not_body_revision` 与 `overlay_completion_resolve_rejects_a_newer_overlay_epoch`：base memo 使用稳定召回身份，completion resolve 仍以 exact epoch 拒绝旧结果。
+- `bounded_*_recall_skips_tombstoned_sibling_path_inside_{one_delta,base}` 六个用例：base 与多路径 delta 中的一个 path 后续 tombstone 后，另一个仍存活 path 不会被同 segment 内超过预算的 stale rows 饿死；prefix、single-character 与 fuzzy 三种入口均保持 `entries_inspected <= budget`。
+- `selected_project_recall_skips_tombstoned_sibling_path_inside_base`：selected-project posting 的 head 属于已删除 base path 时，仍能在 priority budget 内召回同项目 active sibling。
+- `priority_source_setup_deduplicates_scope_and_mixed_segment_recovery` 与 `priority_source_setup_observes_cancellation_before_scope_fanout`：scope/recovery 的同一 path cursor 只初始化一次；100-path scope 在 candidate budget 为 32 时最多尝试 4 个 source，且已取消请求在第一次 source 前退出。
+- `selected_project_recall_keeps_a_source_after_unmatched_scope_fanout`、`reachable_recall_keeps_a_source_after_selected_project_fanout` 与 `selected_project_recall_keeps_candidate_budget_after_long_scope_cursor`：source probe、source slot 与 candidate pop 三层均按 scope/project/recovery 分区；无匹配 fanout、四个 project cursor 和长 reachable cursor 都不能跨通道吃掉显式 quota，未使用份额才在第二轮回收。
+- `priority_recovery_counts_inactive_path_probes_and_cancels_cooperatively` 与 `priority_scope_counts_missing_path_probes_and_cancels_cooperatively`：inactive prefix-path pair 和不存在的 scope path 也消费 metadata probe；分别在 32 probes 截断、256 probes 协作取消，不再隐藏 `O(paths)` 前置扫描。
+- `priority_candidate_deferral_checks_cancellation_before_heap_fanout`：257-row 非整块 share 在 defer 前取消，256-row 整块 share 不会对每个 deferred cursor 重复执行原子取消读取；独立 deferred counter 同时封住漏检查和过度检查。
+- `bounded_recall_scores_each_index_once_across_priority_and_global_sources`：同一 declaration 同时由 project、scope 和 global prefix 召回时只进入 matcher/pool 一次，不能在最终去重前挤占 top-K 或 channel quota。
+- `project_posting_carries_its_segment_id_for_constant_time_prefix_recovery`：256 个项目中位于末尾的 selected project 直接从现有 `by_project` value 取得 segment-local ID；project prefix positions 只保存 `u32` pair 位置，HashMap bucket 与各 Vec capacity 全部进入 recall core 计账。
+- `selected_project_presence_is_language_partitioned_without_copying_indices`：除语言隔离外，还验证 499 个 path tombstone 后 active count 从 500 变为 1、最后一个 path 从 Go 切换到 C 后两个 family count 同步为 0/1，并显式覆盖 `compacted()` 与 marker `with_project_context()` 重建计数；production presence 只做一次 HashMap lookup。
+- `request_direct_external_projection_is_bounded_by_the_reach_node_cap`：单源超过上限的 external fanout 只投影词典序前 `4,096` 个；超过上限的 workspace edge 噪声不能把排在输入末尾的 direct external exact edge 挤掉。
+- 当前完整复验为 `cargo fmt --all -- --check`、`cargo clippy -p fossilsense --all-targets -- -D warnings`、`cargo test -p fossilsense` 全部通过；Rust 主套件统计 `1098 passed; 0 failed; 8 ignored`，CLI `1/1`、LSP integration `2/2`，VS Code `pnpm run compile` 与 `pnpm run test` 通过。`scripts/verify.ps1 -SkipInstall` 总门禁与 `scripts/test_benchmark_entrypoints.ps1` 均通过，后者验证了 runner 内部 120 秒双时钟 gate、completion replay metric whitelist 与 case/harness 路由；最终 reviewer 明确结论为“未发现新的 Phase 2 可执行 blocker”。正式 U-Boot 组合门禁及组件数据见下文。
 
 ## 2026-08-01 U-Boot 阶段数据
 
@@ -59,17 +71,134 @@
 
 production pooled-recall component 基线直接调用 `search_completion_recall_pooled_with_project_for_family`。初始 40 次 cold samples 为 p50 `98,465 µs`、p95 `161,579 µs`；改用可取消的固定容量精确 top-K heap 后，同库复验为 p50 `89,840 µs`、p95 `99,940 µs`，分别改善约 8.76% 与 38.13%，SQLite payload reads 仍为 `0`。但两次每个样本都检查全部 `654,890` entries，因此该数据只证明普通补全使用的召回组件仍为冷态 `O(D)` 且没有因取消机制产生性能回退；admission 与 stale cancellation 的正确性由并发结构测试证明，尚不能据此推断端到端延迟。Phase 2 在将 inspected entries 收敛到固定预算、并补齐并发 LSP replay 前不能宣称交互性能完成。
 
+## 2026-08-01 Phase 2 bounded recall 阶段数据
+
+本节数据仍来自同一 U-Boot 数据库与机器，测量入口是 ordinary completion 使用的 production pooled-recall component；它包含 compact candidate generation、完整 `score_match`、scope/project channel selection 与精确 top-K，但不包含 LSP JSON、overlay 构建、payload hydration、最终渲染和 VS Code suggest widget，因此只用于算法组件门禁。
+
+| 指标 | Phase 0 全扫描 | Phase 2 当前结果 |
+|---|---:|---:|
+| cold p50 | 89,840 µs | 10,786 µs |
+| cold p95 | 99,940 µs | 19,040 µs |
+| candidate entries inspected p50 / max | 654,890 / 654,890 | 16,384 / 16,384 |
+| selection entries inspected max | 受全扫描命中量驱动 | 66,925；结构上不超过 candidate budget 的 6 倍 |
+| SQLite payload reads | 0 | 0 |
+| candidate coverage | 隐式完整全扫 | 达到预算时 `truncated=true`；prefix/posting/uniform sample 分别计数 |
+
+代表性 exact/prefix 质量用同一次 full-scan 作为 oracle：`i/in/init/d/de/dev/c/cmd` 八组的 Top-100 均为 `100/100`。初版 lexicographic cursor 的单字符结果曾只有 `63/51/38`，因此增加了每声明至多一个 `u32` 的 static-quality head posting；这是由失败质量对照驱动的修复，而不是事后只记录成功样本。
+
+非前缀 fuzzy 进一步区分可索引的高质量层与任意子序列长尾。修复原 matcher 的贪心边界误判后，continuous substring 与 camel/underscore boundary-subsequence posting 对 `dbdtn/ugdbn/ogn/bif` 的 `base_match >= 400` oracle 覆盖分别为 `2/2`、`2/2`、`54/54`、`100/100`；前三个目标 `device_bind_driver_to_node`、`uclass_get_device_by_name`、`ofnode_get_name` 在 bounded 原始列表中分别位于第 `1/1/19`。`board_init_f` 因大量重复声明连 legacy full-scan 的 300 条原始声明配额也未进入，bounded 与 oracle 的存在性一致，不能把该旧有去重前配额问题归因于 bounded recall。
+
+`base_match = 200` 的任意字符子序列不能由有限连续/boundary trigram 证明完整；它继续使用剩余预算的确定性 workspace-wide sample，并明确设置 `truncated=true`。因此当前保证是：预算覆盖全集时与 full scan 完全一致；大型表的 exact/prefix 与已索引 fuzzy tier 通过上述 differential gate；低质量任意子序列是诚实的有界近似，而不是伪装成完整结果。U-Boot 单代/双代 hydration、120 秒 full-index、生产 handler replay 与全量回归现已通过；Phase 2 只等待审查修复后的独立复核收口。
+
+### 稳定召回身份的 RED → GREEN 证据
+
+第一次把完整 U-Boot engine 接入生产 `LanguageServer::completion` 时，bounded recall 已经生效，但每次 body edit 仍用新的 `overlay_epoch` 重建 completion overlay。该 RED 运行的 P50/P95/max 为 `68.789/83.843/102.105 ms`，分段 P95 为 context `51 ms`、overlay `50 ms`、worker `34 ms`；说明剩余主因不是 recall 又退回全扫描，而是请求 identity 把无关 body revision 扩散到工作区 projection。
+
+现在 completion-only overlay 先从 dirty 文件提取有界投影并计算 BLAKE3 `RecallUniverseId`。当前文件的 durable path 始终 tombstone，但其 declaration/fallback 不进入稳定 workspace 投影，由同请求精确 parse 单独提供；其它 dirty 文件的声明、fallback、include/import、package 与 facts availability 进入投影。相同 universe 复用原 `Arc<CandidateOverlaySnapshot>`，不同 universe 才刷新 reach graph。完整 semantic overlay 仍按 exact epoch 构建，completion item/resolve 也继续携带并校验实际 `overlay_epoch`，因此该复用不放宽新鲜度边界。
+
+正式运行见下表。stable universe 首次把 P95 从 RED 的 `83.843 ms` 降至 `37.143 ms`；首轮审查修复加入 active-delta 优先和 scope/project compact posting，P95 为 `25.296 ms`；第二轮再关闭 mixed-delta、项目 presence 与 direct-external fanout 后为 `25.497 ms`；第三轮补齐 base sibling 与 source 初始化预算后为 `28.409 ms`；末轮把 source/probe/candidate 三层配额、inactive metadata、跨源去重与 selected-project path posting 全部收口后，当前正式 P95 为 `26.264 ms`，context/overlay P95 为 `4/4 ms`，worker P95 为 `22 ms`。这既保留了 identity 修复的因果证据，也避免只展示最后一次成功数字。
+
+| 生产 handler replay | RED：epoch identity | stable universe 首轮 | 首轮审查修复后 | 第二轮审查修复后 | 第三轮审查修复后 | 最终复审修复后 |
+|---|---:|---:|---:|---:|---:|---:|
+| requests / declarations | 64 / 654,890 | 64 / 654,890 | 64 / 654,890 | 64 / 654,890 | 64 / 654,890 | 64 / 654,890 |
+| P50 | 68.789 ms | 27.495 ms | 17.520 ms | 18.343 ms | 20.291 ms | 19.212 ms |
+| P95 | 83.843 ms | 37.143 ms | 25.296 ms | 25.497 ms | 28.409 ms | 26.264 ms |
+| max | 102.105 ms | 62.640 ms | 26.109 ms | 26.085 ms | 30.819 ms | 28.451 ms |
+| context P95 | 51 ms | 2 ms | 2 ms | 2 ms | 4 ms | 4 ms |
+| overlay P95 | 50 ms | 2 ms | 1 ms | 2 ms | 4 ms | 4 ms |
+| worker P95 | 34 ms | 35 ms | 23 ms | 22 ms | 24 ms | 22 ms |
+| inspected max / payload SQL reads | 16,384 / 0 | 16,384 / 0 | 16,384 / 0 | 16,384 / 0 | 16,384 / 0 | 16,384 / 0 |
+
+P95 的硬门禁是 `<= 50 ms`，不是用平均值掩盖尾部；各阶段 max 也保留在表中。replay 在同一进程中先做 2 轮 warm-up，再对 `i/in/init/d/de/dev/c/cmd` 各测 8 次，共 64 个样本。审查修复后不再只断言“response 非空”：每个请求还必须实际返回 indexed candidate、看到至少 500,000 active entries、使用精确 `16,384` candidate budget、`entries_inspected` 位于 `1..=16,384` 且在大表上标记 `truncated=true`；source attempt、source/name/declaration metadata probe 也分别执行 `2,048/4,096` 上限检查。当前 64/64 请求均满足，indexed returned 最小值为 `350`，source probe/attempt/initialized 最大值为 `2/1/1`，fuzzy name/declaration probe 最大值为 `0/0`，payload SQL reads 为 `0`。它覆盖 production handler、dirty edit、parse/overlay/recall/rank/render，但不覆盖 stdio、扩展宿主或 VS Code suggest widget。
+
+### 首轮独立审查与修复
+
+首轮 reviewer 没有发现 stable `RecallUniverseId`、当前文档声明排除、exact overlay epoch resolve 或 incomplete-pool narrowing 的直接 stale 泄漏，但发现两项候选正确性问题和三项门禁/隐藏工作问题。修复均先加入必红测试，再转绿：
+
+| 审查问题 | 修复与验证 |
+|---|---|
+| 大量 shadowed base rows 可先耗尽 prefix/single/fuzzy budget，使唯一 active delta 消失 | prefix/single heap 先比较 active 状态，fuzzy posting 先消费最新 delta segment；新增超过预算的 stale base + 唯一 active replacement 三类回归，仍断言总 inspected `<= budget` |
+| lexical 全局截断发生在 reach/project tier 计算前，reachable 或 selected-project 唯一候选可能被挤掉 | `NameSegment` 新增按 path、project 和 semantic family 分区的 compact posting；在同一总预算内保留 1/8 priority prefix channel，最后仍由完整 matcher 与统一 resolver 评分；超过预算 global 噪声的 reachable/project 用例转绿 |
+| selected-project 通过 `project_indices()` 最多构造三次全项目 `Vec<usize>`，且混入另一语言家族 | production path 改为 family-partitioned project posting 的无分配 presence/membership；same-project top-K 直接检查 compact entry 的 `ProjectKey`；Go-only selected project 不再为 C completion 开启项目 quota |
+| production replay 只要求 response 非空，禁用 indexed recall 也可能假绿 | 新增纯 gate 测试拒绝 64 个全零 fast metrics；真实 replay 逐请求断言 indexed/active/budget/inspected/truncated，并将聚合最小值写入 JSON/Markdown |
+| 120 秒 full-index 只靠调用方传 timeout，未校验完成后的 outer/engine elapsed | runner 内部引入独立 gate helper、case-specific timeout 和双时钟事后检查；入口 fixture 覆盖两个 `120,001 ms` 失败分支 |
+
+另外补充 completion overlay cache 竞态测试：不同 universe 中 epoch 2 先发布后，epoch 1 晚完成不能覆盖；随后新 engine publication 的双侧 cache revision invalidation 必须让旧 universe lookup miss。
+
+### 第二轮独立审查与修复
+
+第二轮 reviewer 证明“每个 segment 的当前 heap head 优先 active”还不足以处理一次增量同时写入多个 path、随后只替换其中一部分的布局，并继续检查了 candidate budget 之前的隐藏工作。四项代码问题已经用新的失败用例固定并转绿：
+
+| 审查问题 | 修复与验证 |
+|---|---|
+| 同一 delta 中 path A 有大量 stale rows，path B 仍 active，但单一 segment cursor 看不到 A 后面的 B | `NameTable` 持久维护每个 delta 的 active path 列表；只要 delta 变为 mixed，就从仍存活 path 的 family-partitioned CSR posting 建独立 cursor，最多准备 `4,096` 个 path source，pop 仍消费原总 candidate budget 的 1/8，没有额外候选预算；prefix/single/fuzzy 三类 mixed-delta + subset-tombstone RED 用例全部转绿 |
+| selected-project presence 在 candidate budget 分配前扫描 project posting，最坏仍为 O(D) | base publication 建立 `ProjectKey -> [C count, Go count]`，每次 path replacement 在发布阶段按旧/新 path posting 增减 active count；request 只做 O(1) lookup。测试覆盖 500→1 tombstone、Go→C family switch 和跨语言 quota 隔离 |
+| 单个源文件的 direct-external include 数无上限，请求会克隆、排序并建任意数量 cursor | reach graph 构建和 source refresh 将 direct external exact edge 稳定排在其它 edge 前；request projection 只检查并克隆前 `MAX_REACH_NODES = 4,096` 条。测试同时覆盖 4,160 个 external edge 的确定性截断，以及 4,160 个 workspace 噪声后仍保留输入末尾 external edge |
+| single-character heap 的 `Eq`/`Ord` 对重复稳定声明不一致；engine 发布后旧 builder 的最终交错没有显式测试 | `ShortPrefixHeapEntry::cmp` 增加全局虚拟 index tie-break；专用 heap contract 测试保证不同 slot 不比较为 Equal。cache 竞态测试现在真的在 engine publication 后用旧 revision 再次 publish，并断言旧 engine key 仍为空 |
+
+第二轮结束时，正式 U-Boot handler P95 从 `25.296 ms` 变为 `25.497 ms`，仍保留约 24.5 ms 的门禁余量；recall core 增加到 `164.28 MiB`，单代与双代 Private Bytes 仍分别低于 384/512 MiB。第三轮继续处理的遗漏见下节。
+
+### 第三轮独立审查与修复
+
+第三轮 reviewer 将 mixed-delta 结论推广到 base segment，构造出“base path A 有超过预算的 stale rows、base path B 仍 active，随后只 tombstone A”的遗漏布局；同时证明 priority channel 虽然只 pop 4 个 row，却可能在 pop 前建立数千个 cursor。两项 blocker 均先以失败测试复现，再修改实现：
+
+| 审查问题 | 修复与验证 |
+|---|---|
+| `active_delta_paths` 只能恢复 mixed delta；base 中已删除 path 的排序头仍能遮蔽 active sibling，prefix/single/fuzzy 与 selected-project 均受影响 | `NameTable` 同步维护排序后的 `active_base_paths`；仅当 base/delta 处于 mixed 状态且当前 prefix/project/fuzzy posting head 确实 inactive 时，才开启 active path CSR cursor。base prefix/single/fuzzy 三个 RED 用例及 selected-project base 用例全部转绿，且不在 clean segment 增加恢复 source |
+| candidate budget 为 32、priority budget 为 4 时，mixed/scope/project 循环仍可预建约 8,192 个 heap source，初始化工作没有计数且不能取消 | source key 统一为 segment/family/path-or-project/mode，scope 与 recovery 跨通道去重；source 尝试总数取 `min(priority budget, 4,096)`，第一次尝试前及之后每 256 次检查取消；`priority_source_attempts` 与 `priority_sources_initialized` 同时进入 recall 指标和 `[perf] completion`。100-path scope 明确断言只尝试/初始化 4 个，取消场景在 0 次尝试、0 个 inspected row 时退出 |
+
+第三轮还补充了 `active_project_family_counts` 在 `compacted()`、移除 marker ownership 以及重新应用 `with_project_context()` 后的显式不变量。reviewer 同时确认一个 Phase 1 残余：include/import 变化导致 stable-universe cache miss 时，当前代码仍会复制完整 workspace path/basename lookup、克隆 reach graph 主结构并扫描全局 direct-external evidence；最终请求 projection 虽已封顶 `4,096`，但 miss 前置工作还不是 workspace-size independent。本阶段不把它伪装成已完成，下一阶段继续改为 persistent graph/path view。
+
+### 最终独立复审与配额闭环
+
+最终 reviewer 继续从“已初始化 source 是否真的能得到 candidate 份额”和“指标是否覆盖所有前置工作”构造反例。下列问题均先由确定性 RED 复现，再转绿；最终复审结论为未发现新的 Phase 2 可执行 blocker：
+
+| 审查问题 | 修复与验证 |
+|---|---|
+| scope 先耗尽 probe 会饿死 project，简单交换顺序又会产生对称饥饿；一个长 scope cursor 还可吃掉全部 priority candidate pop | source attempt、metadata probe、candidate pop 都按 Scope/Project/Recovery 分区，第一轮保留份额，只有未使用份额才回收；两个对称 source fanout 用例和 long-scope cursor 用例分别覆盖三层配额 |
+| inactive recovery pair、missing scope path 和 project-pass mismatch 在计数/取消前 `continue`，实际可扫描大量路径但 metrics 近零 | 每个 raw path/pair examination 先消费 channel metadata probe；32-probe 截断和 256-probe 取消用例转绿。selected-project 使用 project-partitioned prefix positions，避免为找项目候选重新扫描全 prefix path range |
+| selected-project segment ID 通过 `Vec<ProjectKey>::position` 线性查找 | 现有 `by_project` value 扩展为 `CompactProjectPostings { project_id, by_family }`，不复制第二份 key；256-project 尾部 selected key 直接 O(1) 取 ID |
+| priority/project/scope/global 多个 source 可把同一 index 重复送入 matcher，最终去重前挤占 top-K | priority 与普通 prefix 均只在 `seen.insert(index)` 首次成功时评分；跨三种 source 的 pool 长度等于 unique index 数 |
+| saturated channel 的 deferred heap head 搬移既可能连续 2,048 次不检查取消，也可能在 share 恰为 256 倍数时逐 cursor 原子读取 | deferred 使用独立 counter 每 256 次检查；entries-based check 只在实际消费 candidate 前执行。257-row 取消用例从旧实现的 512 inspected 收敛到 257，256-row share 的完整请求 cancellation checks 保持低于 64 |
+
+`project_positions` 只保存指向已有 `(token, path_id)` pair 的 `u32` 位置；HashMap bucket、每个 positions Vec capacity 和 `CompactProjectPostings` value 已全部进入 `NameTable::accounted_bytes()`。这项新增常驻内存使旧双代数据作废，因此下节使用末轮源码重新执行 hydration 与 completion replay，而不是沿用第三轮报告。
+
+### 正式 U-Boot 组合门禁
+
+2026-08-01 最终复审修复后当前源码的组合报告为 `target/benchmark/large-workspace-20260801_070943.{json,md}`；三项 case 使用同一次新建数据库，样本与机器信息同上。
+
+| 门禁 | 正式结果 | 限制 | 结论 |
+|---|---:|---:|---|
+| full-index engine / outer elapsed | 34,025 / 35,095.326 ms | 各自 `<= 120,000 ms` | 通过 |
+| full-index write / secondary / publication | 11,664 / 6,749 / 4,365 ms | 诊断保留 | — |
+| full-index peak Private / database | 147,181,568 / 355,282,944 B | 诊断保留 | — |
+| hydration declarations / files | 654,890 / 13,244 | `>= 500,000 / 10,000` | 通过 |
+| recall core | 175,450,934 B（167.32 MiB） | 计入常驻 compact core | — |
+| single generation Private | 266,166,272 B（253.84 MiB） | `<= 384 MiB` | 通过 |
+| two-generation peak Private | 513,466,368 B（489.68 MiB） | `<= 512 MiB` | 通过；余量约 22.32 MiB |
+| first / second hydration build | 6,439 / 6,350 ms | 诊断保留 | — |
+| completion P50 / P95 / max | 19.212 / 26.264 / 28.451 ms | P95 `<= 50 ms` | 通过 |
+| completion indexed min / truncated requests | 350 / 64 | `> 0 / = 64` | 通过 |
+| completion active min / budget min-max | 654,890 / 16,384–16,384 | `>= 500,000 / = 16,384` | 通过 |
+| completion inspected min-max / payload SQL reads | 16,384–16,384 / 0 | `1..=16,384 / = 0` | 通过 |
+| priority source probe / attempt / initialized max | 2 / 1 / 1 | `<= 4,096 / <= 2,048 / = attempts` | 通过 |
+| priority fuzzy name / declaration probe max | 0 / 0 | 各自 `<= 4,096` | 通过 |
+
+自动化入口新增 `-IncludeCompletionReplay` 与 `u-boot-completion-replay`，可同 full-index/hydration 组合运行；`scripts/test_benchmark_entrypoints.ps1` 已验证默认 case 不会意外包含昂贵 replay、显式开关会列出且只执行指定三项。replay harness 现在要求完整输出 source/fuzzy metadata probes，并逐请求拒绝超过硬上限或 attempt/initialized 不一致的假绿结果。full-index runner 对外层进程耗时与引擎输出 `elapsed_ms` 分别执行 `<= 120,000` 的事后硬检查，并把 full-index process timeout 自动收紧到 `min(调用参数, 120s)`；fixture 明确证明 `120,000` 通过、任一时钟 `120,001` 失败。索引门禁放宽没有传播到补全门禁。
+
 # 结论
 
 > **硬约束：全字符参与匹配。**当前补全上下文中的每个输入字符都必须进入最新 prefix，并参与最终候选校验和评分。允许取消过期请求、合并队列工作和使用倒排索引缩小候选集，但不允许删减 trigger coverage、采样 query 字符或忽略尾字符来换取性能。
 
-当前困境并不是 SQLite 查询慢，也不是 `EngineSnapshot` 的不可变发布模型本身有问题。更准确地说，系统已经在**持久化代一致性**和**旧快照持续服务**上做对了主要选择，但交互热路径把一次很小的字符编辑放大成了多组与工作区规模相关的工作：
+本节到“分阶段交付与回滚”之前保留的是 1.5.0 分析基线与当时源码因果链，用于解释 1.5.1 改动为何发生；它不是对当前分支仍未实现能力的重复声明。当前实施事实、复验数字与残余风险以上方“1.5.1 实施状态”为准。
+
+1.5.0 的困境并不是 SQLite 查询慢，也不是 `EngineSnapshot` 的不可变发布模型本身有问题。更准确地说，系统已经在**持久化代一致性**和**旧快照持续服务**上做对了主要选择，但交互热路径把一次很小的字符编辑放大成了多组与工作区规模相关的工作：
 
 `didChange → overlay_epoch 变化 → overlay cache miss + CompletionMemo generation 变化 → 请求级图/路径/NameTable 派生 → 普通补全全表候选评分 → isIncomplete=true → 下一按键再次请求`
 
 与此同时，旧请求的若干 `spawn_blocking` 工作不能被 Tokio 强制中止，后台索引、内存模型发布、语义着色和补全又共享 CPU、内存带宽及 Tokio blocking pool。其结果是：单个函数的微基准可以很快，但连续输入时会出现**请求放大、失效放大和排队放大**。字符回显本身不应该等待 LSP 响应，因此如果字符也明显迟滞，优先怀疑的是 CPU 饱和、旧阻塞任务残留、扩展宿主/renderer 调度和建议列表 UI churn，而不能只看服务端某个 `total_ms`。
 
-当前最核心的五个问题是：
+该分析基线最核心的五个问题是：
 
 1. **身份域耦合**：`overlay_epoch` 既参与 overlay cache，又参与 completion generation。每个成功的 `didChange` 都递增 epoch，因此 `a → ab → abc` 通常无法复用上一前缀候选池。
 2. **生产召回仍是冷态 `O(D)`**：普通补全使用 scoped/project pooled recall；没有 prior pool 时遍历所有 active entries。现有 hot benchmark 测的是另一个 prefix-index 快路径。
@@ -629,13 +758,11 @@ parse tree/facts 分层应紧随这三项。若第一阶段 trace 证明大文�
 
 # 最终判断
 
-从算法角度看，当前最严重的问题是 production ordinary completion 的冷召回仍与 `D` 线性相关；从架构角度看，更根本的问题是 `overlay_epoch` 把每键新鲜度传播到了不应该失效的全局候选池和请求级工作区派生结构；从运行时角度看，缺少 latest-request-wins 与 foreground QoS 让所有重复工作在后台继续竞争。
+production ordinary completion 的冷召回已经从全量 `O(D)` 扫描改为受 `16,384` 硬预算约束的 compact posting traversal，body-only 编辑也不再让 `overlay_epoch` 无条件击穿 completion universe；latest-request token、前台 admission 和 scan/selection 协作取消已经切断了最主要的重复工作闭环。source 初始化、metadata probe、candidate pop 与跨源评分现在都有独立但总量有界的证据，U-Boot 生产 handler P95 为 `26.264 ms`，因此 Phase 2 的算法目标已经有正式门禁与独立复审证据，而不再只是设计建议。
 
-所以这不是“索引算法、overlay、缓存 identity 或调度”四选一。它们形成了一条闭环：
+当前最重要的残余从“每键必然全表召回”转移到了两个边界：第一，include/import 变化造成 completion overlay cache miss 时，graph/path projection 仍复制或扫描 workspace-size 状态；第二，当前文档文本、line map、local words 与 parse facts 仍有接近 `O(L)` 的重复工作，且 overlay/live parse 等 blocking closure 尚未全部接入同一个 cooperative token。stdio、扩展宿主和 VS Code suggest widget 也还没有 key-to-paint 数据，服务端 P95 不能替代 UI 结论。
 
-`粗粒度失效 → 大规模重算 → 不可中止 → 排队与 CPU 竞争 → 下一键再失效`
-
-正确的拆解顺序是：先让旧工作可停止并把端到端时间测准，再把 overlay 变成结构共享的增量 view，最后让 `NameTable` 在评分前产生受预算约束的候选。这样可以保留现有最重要的不变量：immutable generation snapshot、dirty path shadow、old snapshot continued service、language family isolation、candidate ambiguity 与 explicit fallback；同时把交互成本从“工作区规模驱动”转成“编辑 delta 与候选预算驱动”。
+后续顺序因此是：先完成 persistent reach/path/NameTable view，给 include edit cache miss 增加规模门禁；再进入增量 line map/local words/syntax facts 与剩余 blocking work 的统一取消；最后补并发突发、stdio 与 VS Code UI trace。整个过程中继续保持 immutable generation snapshot、dirty path shadow、old snapshot continued service、language family isolation、candidate ambiguity、完整输入匹配与 explicit truncation/fallback。
 
 # 公开参考资料
 

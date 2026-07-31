@@ -11,7 +11,7 @@ use super::super::include_completion::IncludeCompletionTable;
 use super::super::state;
 use crate::call_model::SemanticGeneration;
 use crate::call_service::CallReadHandle;
-use crate::candidate_service::CandidateOverlaySnapshot;
+use crate::candidate_service::{CandidateOverlaySnapshot, RecallUniverseId};
 use crate::declaration_index::SemanticDeclarationIndex;
 use crate::project_context::ProjectContextIndex;
 use crate::query::NameTable;
@@ -33,6 +33,7 @@ pub(in crate::server) struct CacheLedger {
 #[derive(Default)]
 pub(super) struct CandidateOverlayCache {
     pub(super) entries: HashMap<CandidateOverlayCacheKey, Arc<CandidateOverlaySnapshot>>,
+    pub(super) completion_entries: HashMap<CompletionOverlayCacheKey, CompletionOverlayCacheEntry>,
     pub(super) root_revisions: HashMap<PathBuf, u64>,
 }
 
@@ -43,8 +44,22 @@ pub(super) struct CandidateOverlayCacheKey {
     pub(super) overlay_epoch: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) struct CompletionOverlayCacheKey {
+    pub(super) root: PathBuf,
+    pub(super) engine_epoch: state::EngineEpoch,
+    pub(super) semantic_generation: SemanticGeneration,
+}
+
+pub(super) struct CompletionOverlayCacheEntry {
+    pub(super) universe: RecallUniverseId,
+    pub(super) newest_overlay_epoch: u64,
+    pub(super) snapshot: Arc<CandidateOverlaySnapshot>,
+}
+
 pub(super) fn invalidate_candidate_overlay_root(cache: &mut CandidateOverlayCache, root: &Path) {
     cache.entries.retain(|key, _| key.root != root);
+    cache.completion_entries.retain(|key, _| key.root != root);
     let revision = cache.root_revisions.entry(root.to_path_buf()).or_default();
     *revision = revision.wrapping_add(1).max(1);
 }

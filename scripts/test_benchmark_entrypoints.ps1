@@ -6,6 +6,38 @@ Set-StrictMode -Version Latest
 
 $benchmarkScript = Join-Path $PSScriptRoot 'benchmark_large_workspace.ps1'
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot '..')
+$gateHelpers = Join-Path $PSScriptRoot 'benchmark_gate_helpers.ps1'
+if (-not (Test-Path -LiteralPath $gateHelpers -PathType Leaf)) {
+    throw 'The benchmark hard-gate helper is missing.'
+}
+. $gateHelpers
+
+Assert-FullIndexPerformanceGate `
+    -CaseId 'u-boot-full-index' -OuterElapsedMs 120000 -EngineElapsedMs 120000
+foreach ($invalid in @(
+    @{ Outer = 120001; Engine = 120000 },
+    @{ Outer = 120000; Engine = 120001 }
+)) {
+    $rejected = $false
+    try {
+        Assert-FullIndexPerformanceGate `
+            -CaseId 'u-boot-full-index' `
+            -OuterElapsedMs $invalid.Outer `
+            -EngineElapsedMs $invalid.Engine
+    } catch {
+        $rejected = $true
+    }
+    if (-not $rejected) {
+        throw "The 120,000 ms full-index gate accepted outer=$($invalid.Outer), engine=$($invalid.Engine)."
+    }
+}
+$benchmarkSource = Get-Content -Raw -LiteralPath $benchmarkScript
+if ($benchmarkSource -notmatch 'Assert-FullIndexPerformanceGate' -or
+    $benchmarkSource -notmatch "-like '\*-full-index'" -or
+    $benchmarkSource -notmatch '\[Math\]::Min\(\$TimeoutSeconds, 120\)') {
+    throw 'The large-workspace runner does not enforce the full-index gate and timeout internally.'
+}
+
 $defaultCases = @(
     & powershell -NoProfile -ExecutionPolicy Bypass -File $benchmarkScript -ListCases 2>&1 |
         ForEach-Object { $_.ToString() }
@@ -19,6 +51,9 @@ if (@($defaultCases | Where-Object { $_ -like 'v142-*' }).Count -ne 0) {
 if ($defaultCases -contains 'u-boot-engine-hydration') {
     throw 'The U-Boot engine hydration case leaked into the default benchmark plan.'
 }
+if ($defaultCases -contains 'u-boot-completion-replay') {
+    throw 'The U-Boot completion replay case leaked into the default benchmark plan.'
+}
 
 $engineCases = @(
     & powershell -NoProfile -ExecutionPolicy Bypass -File $benchmarkScript `
@@ -28,17 +63,26 @@ $engineCases = @(
 if ($LASTEXITCODE -ne 0 -or $engineCases -notcontains 'u-boot-engine-hydration') {
     throw "Engine hydration benchmark case listing failed:`n$($engineCases -join "`n")"
 }
+$completionCases = @(
+    & powershell -NoProfile -ExecutionPolicy Bypass -File $benchmarkScript `
+        -ListCases -IncludeCompletionReplay 2>&1 |
+        ForEach-Object { $_.ToString() }
+)
+if ($LASTEXITCODE -ne 0 -or $completionCases -notcontains 'u-boot-completion-replay') {
+    throw "Completion replay benchmark case listing failed:`n$($completionCases -join "`n")"
+}
 $combinedGateCases = @(
     & powershell -NoProfile -ExecutionPolicy Bypass -File $benchmarkScript `
-        -ListCases -IncludeFullIndex -IncludeEngineHydration `
-        -CaseFilter 'u-boot-full-index,u-boot-engine-hydration' 2>&1 |
+        -ListCases -IncludeFullIndex -IncludeEngineHydration -IncludeCompletionReplay `
+        -CaseFilter 'u-boot-full-index,u-boot-engine-hydration,u-boot-completion-replay' 2>&1 |
         ForEach-Object { $_.ToString() }
 )
 if ($LASTEXITCODE -ne 0 -or
-    $combinedGateCases.Count -ne 2 -or
+    $combinedGateCases.Count -ne 3 -or
     $combinedGateCases -notcontains 'u-boot-full-index' -or
-    $combinedGateCases -notcontains 'u-boot-engine-hydration') {
-    throw "Combined full-index and hydration filtering failed:`n$($combinedGateCases -join "`n")"
+    $combinedGateCases -notcontains 'u-boot-engine-hydration' -or
+    $combinedGateCases -notcontains 'u-boot-completion-replay') {
+    throw "Combined full-index, hydration, and completion filtering failed:`n$($combinedGateCases -join "`n")"
 }
 $engineHarness = Join-Path $PSScriptRoot 'benchmark_engine_hydration.ps1'
 if (-not (Test-Path -LiteralPath $engineHarness -PathType Leaf)) {
@@ -50,6 +94,17 @@ if ($engineHarnessSource -notmatch 'cargo test' -or
     $engineHarnessSource -notmatch 'FOSSILSENSE_BENCH_DB' -or
     $engineHarnessSource -notmatch 'FOSSILSENSE_BENCH_ROOT') {
     throw 'The engine hydration harness does not execute the release U-Boot memory gate.'
+}
+$completionHarness = Join-Path $PSScriptRoot 'benchmark_completion_replay.ps1'
+if (-not (Test-Path -LiteralPath $completionHarness -PathType Leaf)) {
+    throw 'The completion replay benchmark harness is missing.'
+}
+$completionHarnessSource = Get-Content -Raw -LiteralPath $completionHarness
+if ($completionHarnessSource -notmatch 'cargo test' -or
+    $completionHarnessSource -notmatch 'benchmark_uboot_lsp_completion_replay_stays_within_latency_and_sql_gates' -or
+    $completionHarnessSource -notmatch 'FOSSILSENSE_BENCH_DB' -or
+    $completionHarnessSource -notmatch 'FOSSILSENSE_BENCH_ROOT') {
+    throw 'The completion replay harness does not execute the release U-Boot LSP gate.'
 }
 
 $allCases = @(

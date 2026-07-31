@@ -95,6 +95,24 @@ fn is_strong_resolution(resolution: ResolutionKind) -> bool {
     )
 }
 
+fn is_direct_external_edge(edge: &ReachEdge) -> bool {
+    edge.resolution == ResolutionKind::ExternalExact
+        && Path::new(edge.target.as_str()).is_absolute()
+}
+
+fn normalize_reach_edges(edges: &mut Vec<ReachEdge>) {
+    // Direct external targets are the only request-time first-layer projection.
+    // Keep them first so the projection can stop after MAX_REACH_NODES examined
+    // edges without losing a later direct target behind unrelated fanout.
+    edges.sort_by(|left, right| {
+        (!is_direct_external_edge(left))
+            .cmp(&!is_direct_external_edge(right))
+            .then_with(|| left.target.cmp(&right.target))
+            .then_with(|| left.resolution.as_str().cmp(right.resolution.as_str()))
+    });
+    edges.dedup();
+}
+
 #[cfg(test)]
 fn legacy_strong_resolution(target: &str) -> ResolutionKind {
     if Path::new(target).is_absolute() {
@@ -164,6 +182,9 @@ impl ReachGraph {
                 target: dst,
                 resolution,
             });
+        }
+        for targets in edges.values_mut() {
+            normalize_reach_edges(targets);
         }
         let mut open: HashMap<String, OpenReason> = HashMap::new();
         for path in ambiguous_files {
@@ -300,6 +321,11 @@ impl ReachGraph {
                 target: dst,
                 resolution,
             });
+        }
+        for source in sources {
+            if let Some(targets) = self.edges.get_mut(source) {
+                normalize_reach_edges(targets);
+            }
         }
 
         // Apply open flags with UnresolvedInclude > AmbiguousInclude precedence.
@@ -500,10 +526,8 @@ impl ReachGraph {
             .get(source)
             .into_iter()
             .flatten()
-            .filter(|edge| {
-                edge.resolution == ResolutionKind::ExternalExact
-                    && Path::new(&edge.target).is_absolute()
-            })
+            .take(MAX_REACH_NODES)
+            .filter(|edge| is_direct_external_edge(edge))
             .map(|edge| edge.target.clone())
             .collect()
     }
@@ -707,6 +731,57 @@ mod tests {
         assert!(graph
             .directly_included_external_paths_from("other.c")
             .is_empty());
+    }
+
+    #[test]
+    fn request_direct_external_projection_is_bounded_by_the_reach_node_cap() {
+        let edges = (0..(MAX_REACH_NODES + 64))
+            .map(|index| {
+                (
+                    "main.c".to_string(),
+                    absolute_test_path(&format!("external_{index:05}.h")),
+                    ResolutionKind::ExternalExact,
+                )
+            })
+            .collect();
+        let graph = ReachGraph::new_with_kinds(edges, vec![], vec![]);
+
+        assert_eq!(
+            graph.directly_included_external_paths_from("main.c").len(),
+            MAX_REACH_NODES,
+            "completion scope preparation must not clone an unbounded direct-external fanout"
+        );
+        let bounded = graph.directly_included_external_paths_from("main.c");
+        assert!(bounded.contains(&absolute_test_path("external_00000.h")));
+        assert!(
+            !bounded.contains(&absolute_test_path(&format!(
+                "external_{:05}.h",
+                MAX_REACH_NODES + 63
+            ))),
+            "the deterministic lexical cap must omit targets beyond the bounded prefix"
+        );
+
+        let mut noisy_edges = (0..(MAX_REACH_NODES + 64))
+            .map(|index| {
+                (
+                    "noisy.c".to_string(),
+                    format!("workspace/local_{index:05}.h"),
+                    ResolutionKind::WorkspaceExact,
+                )
+            })
+            .collect::<Vec<_>>();
+        let late_external = absolute_test_path("late_external.h");
+        noisy_edges.push((
+            "noisy.c".to_string(),
+            late_external.clone(),
+            ResolutionKind::ExternalExact,
+        ));
+        let noisy_graph = ReachGraph::new_with_kinds(noisy_edges, vec![], vec![]);
+        assert_eq!(
+            noisy_graph.directly_included_external_paths_from("noisy.c"),
+            HashSet::from([late_external]),
+            "bounded traversal must prioritize direct-external edges before unrelated fanout"
+        );
     }
 
     #[test]

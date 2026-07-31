@@ -36,7 +36,7 @@ pub enum CompletionKindHint {
     Object,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FallbackCompletionFact {
     pub name: String,
@@ -148,7 +148,7 @@ pub struct DeclarationIdentity {
     pub role: SemanticDeclarationRole,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeclarationFact {
     pub identity: DeclarationIdentity,
@@ -380,7 +380,7 @@ pub enum SyntacticRole {
     TypeUse,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Include {
     pub line: usize,
     pub target_text: String,
@@ -389,7 +389,7 @@ pub struct Include {
 /// Go package declaration for a source file. Package membership is a
 /// language-front-end fact; module/import-path resolution remains an indexer
 /// concern so parsing never depends on a Go toolchain.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PackageFact {
     pub name: String,
     pub name_range: SourceRange,
@@ -397,7 +397,7 @@ pub struct PackageFact {
 
 /// Go import declaration. The path is stored without string delimiters and the
 /// optional alias preserves named, dot, and blank imports.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ImportFact {
     pub path: String,
     pub alias: Option<String>,

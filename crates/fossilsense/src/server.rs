@@ -152,6 +152,8 @@ pub async fn run_stdio() -> Result<()> {
         project_context_selection_epoch: AtomicU64::new(1),
         debug_candidate_reasons: AtomicBool::new(false),
         perf_logging_enabled: AtomicBool::new(false),
+        #[cfg(test)]
+        completion_perf_observations: Arc::new(StdMutex::new(Vec::new())),
         config_cache: Arc::new(Mutex::new(HashMap::new())),
         workspace_semantics_bootstrap: Arc::new(Mutex::new(Default::default())),
         #[cfg(test)]
@@ -212,6 +214,15 @@ struct Backend {
     /// Whether `[perf]` request/index timings are sent to the output panel.
     /// Off by default; enabled by `RUST_LOG` debug/trace or client init options.
     perf_logging_enabled: AtomicBool,
+    #[cfg(test)]
+    completion_perf_observations: Arc<
+        StdMutex<
+            Vec<(
+                completion::CompletionStageTimings,
+                completion::CompletionPipelineMetrics,
+            )>,
+        >,
+    >,
     /// Cache for workspace configuration and its derived language resolver.
     /// Request hot paths never read or parse `fossilsense.json`; the entry is
     /// invalidated when that file changes or its workspace root is removed.
@@ -600,6 +611,33 @@ impl Backend {
             build_message,
         )
         .await;
+    }
+
+    #[cfg(test)]
+    fn record_completion_perf_for_test(
+        &self,
+        timings: completion::CompletionStageTimings,
+        metrics: completion::CompletionPipelineMetrics,
+    ) {
+        self.completion_perf_observations
+            .lock()
+            .expect("completion perf observations poisoned")
+            .push((timings, metrics));
+    }
+
+    #[cfg(test)]
+    fn take_completion_perf_for_test(
+        &self,
+    ) -> Vec<(
+        completion::CompletionStageTimings,
+        completion::CompletionPipelineMetrics,
+    )> {
+        std::mem::take(
+            &mut *self
+                .completion_perf_observations
+                .lock()
+                .expect("completion perf observations poisoned"),
+        )
     }
 
     async fn preload_completion_history(&self) {

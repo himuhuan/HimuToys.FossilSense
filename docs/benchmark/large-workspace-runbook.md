@@ -27,7 +27,7 @@ samples/wine
 
 These directories are local and git-ignored. Query cases additionally require current indexes under `target/benchmark/`; create them with the full-index cases instead of reusing a database from an older schema.
 
-## Required 60-second gate
+## Required 120-second full-index gate
 
 Every release, major feature, or architecture/index/storage/parser/query/concurrency change must run at least one release full-index case:
 
@@ -71,6 +71,29 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark_engine_hyd
   -Workspace samples/u-boot
 ```
 
+## Required production completion replay gate
+
+Changes to completion recall, dirty overlays, request scheduling, memo identity, or rendering must also run the production U-Boot LSP replay. Prebuild the release test binary, then run the full-index and replay cases in order:
+
+```powershell
+cargo test --release -p fossilsense --bin fossilsense --no-run
+
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark_large_workspace.ps1 `
+  -Repeats 1 -IncludeFullIndex -IncludeCompletionReplay `
+  -CaseFilter u-boot-full-index,u-boot-completion-replay -TimeoutSeconds 120
+```
+
+The replay hydrates the complete immutable U-Boot engine model, applies dirty current-buffer edits, and calls the production `LanguageServer::completion` entry point. After two warm-up passes it measures 64 requests across `i/in/init/d/de/dev/c/cmd`. The hard gates are P95 at most `50,000 us`, `1..=16,384` inspected recall entries per request, an exact `16,384` candidate budget, and zero declaration-payload SQLite reads. Every request must also return an indexed candidate, observe at least 500,000 active declarations, and report bounded truncation; a fast builtin-only or disabled-index response therefore fails. Build/hydration time is outside the request samples.
+
+To run full index, hydration memory, and completion latency together:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark_large_workspace.ps1 `
+  -Repeats 1 -IncludeFullIndex -IncludeEngineHydration -IncludeCompletionReplay `
+  -CaseFilter u-boot-full-index,u-boot-engine-hydration,u-boot-completion-replay `
+  -TimeoutSeconds 120
+```
+
 ## Repeated diagnostic runs
 
 After the hard gate passes, repeated runs can be used to compare branches:
@@ -80,7 +103,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark_large_work
   -Repeats 3 -IncludeFullIndex -CaseFilter wine-full-index -TimeoutSeconds 120
 ```
 
-Compare medians while retaining individual runs. A change is meaningful only when it is larger than same-build run-to-run spread. A median below 60 seconds does not hide an individual required run above the gate.
+Compare medians while retaining individual runs. A change is meaningful only when it is larger than same-build run-to-run spread. A median below 120 seconds does not hide an individual required run above the gate.
 
 The script writes JSON and Markdown reports under `target/benchmark/`. It starts a fresh process per repetition and samples Working Set and Private Bytes every 20 ms.
 

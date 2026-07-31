@@ -239,6 +239,19 @@ fn camel_initials_match_as_subsequence() {
 }
 
 #[test]
+fn boundary_initials_match_is_not_lost_to_an_earlier_internal_character() {
+    let table = NameTable::build(vec![(1, "device_bind_driver_to_node".to_string(), false)]);
+
+    let hits = table.search_ranked("dbdtn", 10);
+
+    assert_eq!(hits.first().map(|hit| hit.id), Some(1));
+    assert_eq!(
+        hits[0].base_match, 400,
+        "an available all-boundary subsequence must keep the initials tier"
+    );
+}
+
+#[test]
 fn non_subsequence_is_rejected() {
     let table = table();
     let hits = table.search("zzz", 10);
@@ -618,6 +631,25 @@ impl CompletionQueryCancellation for CancelOnRecallCheck {
     }
 }
 
+struct NeverCancelRecall;
+
+struct CountRecallChecks {
+    checks: AtomicUsize,
+}
+
+impl CompletionQueryCancellation for NeverCancelRecall {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
+
+impl CompletionQueryCancellation for CountRecallChecks {
+    fn is_cancelled(&self) -> bool {
+        self.checks.fetch_add(1, Ordering::Relaxed);
+        false
+    }
+}
+
 impl CompletionQueryCancellation for CancelAfterFirstRecallBlock {
     fn is_cancelled(&self) -> bool {
         self.checks.fetch_add(1, Ordering::Relaxed) > 0
@@ -654,6 +686,7 @@ fn production_completion_recall_reports_work_and_observes_cooperative_cancellati
             prior_pool: None,
             semantic_family: None,
             cancellation: Some(&cancellation),
+            candidate_budget: usize::MAX,
         });
     assert!(cancelled_metrics.cancelled);
     assert!(
@@ -698,6 +731,7 @@ fn production_completion_recall_checks_cancellation_during_post_scan_selection()
             prior_pool: None,
             semantic_family: None,
             cancellation: Some(&cancellation),
+            candidate_budget: usize::MAX,
         });
 
     assert!(metrics.cancelled, "selection must observe stale requests");
@@ -749,6 +783,7 @@ fn production_completion_recall_counts_and_cancels_sparse_channel_filtering() {
             prior_pool: None,
             semantic_family: None,
             cancellation: Some(&cancellation),
+            candidate_budget: usize::MAX,
         });
 
     assert!(metrics.cancelled);
@@ -758,6 +793,2064 @@ fn production_completion_recall_counts_and_cancels_sparse_channel_filtering() {
         metrics.selection_entries_inspected,
         table.len() + COMPLETION_CANCELLATION_CHECK_INTERVAL,
         "filtered-out source entries must still consume the cancellation budget"
+    );
+}
+
+#[test]
+fn bounded_completion_recall_matches_full_scan_when_budget_covers_table() {
+    let table = NameTable::build(vec![
+        (1, "NeedleTarget".to_string(), false),
+        (2, "needle_prefix".to_string(), false),
+        (3, "boundary_needle".to_string(), false),
+        (4, "NotEveryLetter".to_string(), false),
+        (5, "unrelated".to_string(), false),
+    ]);
+    let quotas = CompletionRecallQuotas::default_for_completion_limit(100);
+    let oracle = table.search_completion_recall_pooled("needle", quotas, None, None);
+    let cancellation = NeverCancelRecall;
+    let bounded = table.search_completion_recall_pooled_controlled(CompletionRecallQuery {
+        query: "needle",
+        quotas,
+        scope: None,
+        active_project: None,
+        prior_pool: None,
+        semantic_family: None,
+        cancellation: Some(&cancellation),
+        candidate_budget: 64,
+    });
+
+    assert_eq!(bounded.0, oracle.0);
+    assert_eq!(bounded.1, oracle.1);
+    assert!(!bounded.2.truncated);
+    assert_eq!(bounded.2.active_entries_total, table.len());
+    assert_eq!(bounded.2.candidate_budget, 64);
+    assert_eq!(bounded.2.entries_inspected, table.len());
+}
+
+#[test]
+fn bounded_completion_recall_matches_full_scan_across_match_tiers() {
+    let table = NameTable::build(vec![
+        (1, "needle".to_string(), false),
+        (2, "needle_prefix".to_string(), false),
+        (3, "word_needle_suffix".to_string(), false),
+        (4, "preneedlepost".to_string(), false),
+        (5, "NetworkEventDispatcher".to_string(), false),
+        (6, "narrow_even_deeper_link".to_string(), false),
+        (7, "alpha_beta".to_string(), false),
+        (8, "unrelated".to_string(), false),
+    ]);
+    let quotas = CompletionRecallQuotas::default_for_completion_limit(100);
+    let cancellation = NeverCancelRecall;
+
+    for query in ["needle", "nee", "edle", "ned", "ndl", "ab", "alpha_b"] {
+        let oracle = table.search_completion_recall_pooled(query, quotas, None, None);
+        let bounded = table.search_completion_recall_pooled_controlled(CompletionRecallQuery {
+            query,
+            quotas,
+            scope: None,
+            active_project: None,
+            prior_pool: None,
+            semantic_family: None,
+            cancellation: Some(&cancellation),
+            candidate_budget: table.len(),
+        });
+
+        assert_eq!(bounded.0, oracle.0, "ranked hits diverged for {query}");
+        assert_eq!(bounded.1, oracle.1, "candidate pool diverged for {query}");
+        assert!(
+            !bounded.2.truncated,
+            "complete scan marked {query} truncated"
+        );
+        assert_eq!(
+            bounded.2.prefix_entries_inspected + bounded.2.fuzzy_entries_inspected,
+            bounded.2.entries_inspected,
+            "candidate work accounting diverged for {query}"
+        );
+        assert!(
+            bounded.2.selection_entries_inspected <= bounded.2.entries_inspected.saturating_mul(6),
+            "selection work escaped its fixed channel bound for {query}: {:?}",
+            bounded.2
+        );
+    }
+}
+
+#[test]
+fn bounded_completion_recall_filters_semantic_family_before_spending_budget() {
+    use crate::semantic_model::{SemanticDeclarationKind, SemanticDeclarationRole};
+    use crate::store::views::DeclarationNameRow;
+
+    let mut rows: Vec<_> = (0..400)
+        .map(|index| DeclarationNameRow {
+            id: i64::from(index),
+            name: format!("api_aaa_go_{index:04}"),
+            declaration_kind: SemanticDeclarationKind::Function,
+            role: SemanticDeclarationRole::Definition,
+            path: format!("go/{index}.go"),
+            external: false,
+            directly_included: false,
+            semantic_family: SemanticFamily::Go,
+        })
+        .collect();
+    rows.push(DeclarationNameRow {
+        id: 10_000,
+        name: "api_zzz_c_target".to_string(),
+        declaration_kind: SemanticDeclarationKind::Function,
+        role: SemanticDeclarationRole::Definition,
+        path: "src/target.c".to_string(),
+        external: false,
+        directly_included: false,
+        semantic_family: SemanticFamily::CFamily,
+    });
+    let table = NameTable::build_from_declaration_name_rows_with_project_context(rows, None);
+    let cancellation = NeverCancelRecall;
+    let (hits, _, metrics) =
+        table.search_completion_recall_pooled_controlled(CompletionRecallQuery {
+            query: "api",
+            quotas: CompletionRecallQuotas::default_for_completion_limit(10),
+            scope: None,
+            active_project: None,
+            prior_pool: None,
+            semantic_family: Some(SemanticFamily::CFamily),
+            cancellation: Some(&cancellation),
+            candidate_budget: 32,
+        });
+
+    assert_eq!(
+        hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+        vec![10_000]
+    );
+    assert!(metrics.entries_inspected <= 32, "{metrics:?}");
+    assert!(
+        !metrics.truncated,
+        "the only C-family candidate fits in budget: {metrics:?}"
+    );
+}
+
+#[test]
+fn selected_project_presence_is_language_partitioned_without_copying_indices() {
+    use crate::project_context::{ProjectContext, ProjectContextIndex, ProjectKey};
+    use crate::semantic_model::{SemanticDeclarationKind, SemanticDeclarationRole};
+    use crate::store::views::DeclarationNameRow;
+
+    let key = ProjectKey {
+        workspace_root_id: "root".to_string(),
+        project_path: "selected".to_string(),
+    };
+    let projects = ProjectContextIndex::new(
+        "root".to_string(),
+        "workspace".to_string(),
+        vec![ProjectContext {
+            key: key.clone(),
+            workspace_name: "workspace".to_string(),
+            marker_files: vec!["selected/go.mod".to_string()],
+        }],
+    );
+    let table = NameTable::build_from_declaration_name_rows_with_project_context(
+        (0..500)
+            .map(|index| DeclarationNameRow {
+                id: i64::from(index),
+                name: format!("ProjectGo{index:03}"),
+                declaration_kind: SemanticDeclarationKind::Function,
+                role: SemanticDeclarationRole::Definition,
+                path: format!("selected/pkg{index:03}.go"),
+                external: false,
+                directly_included: false,
+                semantic_family: SemanticFamily::Go,
+            })
+            .collect(),
+        Some(&projects),
+    );
+
+    assert!(table.has_project_for_family(&key, SemanticFamily::Go));
+    assert!(
+        !table.has_project_for_family(&key, SemanticFamily::CFamily),
+        "a C completion must not enable selected-project quotas from Go-only postings"
+    );
+    assert_eq!(
+        table.active_project_family_count(&key, SemanticFamily::Go),
+        500
+    );
+
+    let shadowed_paths = (0..499)
+        .map(|index| format!("selected/pkg{index:03}.go"))
+        .collect::<HashSet<_>>();
+    let updated = table.with_updated_declaration_name_rows_with_project_context(
+        &shadowed_paths,
+        Vec::new(),
+        Some(&projects),
+    );
+    assert_eq!(
+        updated.active_project_family_count(&key, SemanticFamily::Go),
+        1,
+        "project/family presence must be maintained from active rows at publication time"
+    );
+    assert!(updated.has_project_for_family(&key, SemanticFamily::Go));
+
+    let last_path = HashSet::from(["selected/pkg499.go".to_string()]);
+    let switched = updated.with_updated_declaration_name_rows_with_project_context(
+        &last_path,
+        vec![DeclarationNameRow {
+            id: 10_000,
+            name: "ProjectCReplacement".to_string(),
+            declaration_kind: SemanticDeclarationKind::Function,
+            role: SemanticDeclarationRole::Definition,
+            path: "selected/pkg499.go".to_string(),
+            external: false,
+            directly_included: false,
+            semantic_family: SemanticFamily::CFamily,
+        }],
+        Some(&projects),
+    );
+    assert_eq!(
+        switched.active_project_family_count(&key, SemanticFamily::Go),
+        0
+    );
+    assert_eq!(
+        switched.active_project_family_count(&key, SemanticFamily::CFamily),
+        1
+    );
+    assert!(!switched.has_project_for_family(&key, SemanticFamily::Go));
+    assert!(switched.has_project_for_family(&key, SemanticFamily::CFamily));
+
+    let compacted = switched.compacted();
+    assert_eq!(
+        compacted.active_project_family_count(&key, SemanticFamily::Go),
+        0
+    );
+    assert_eq!(
+        compacted.active_project_family_count(&key, SemanticFamily::CFamily),
+        1,
+        "compaction must rebuild active project/family counts from live rows"
+    );
+
+    let unowned = compacted.with_project_context(None);
+    assert_eq!(
+        unowned.active_project_family_count(&key, SemanticFamily::CFamily),
+        0,
+        "removing marker ownership must clear the active project summary"
+    );
+    let reassigned = unowned.with_project_context(Some(&projects));
+    assert_eq!(
+        reassigned.active_project_family_count(&key, SemanticFamily::CFamily),
+        1,
+        "marker refresh must rebuild the active project summary"
+    );
+}
+
+#[test]
+fn bounded_single_character_recall_preserves_static_top_quality() {
+    let mut names: Vec<_> = (0..1_000)
+        .map(|index| {
+            (
+                i64::from(index),
+                format!("caaaaaaaa_workspace_candidate_{index:04}"),
+                false,
+            )
+        })
+        .collect();
+    names.extend((0..20).map(|index| (10_000 + i64::from(index), format!("czz{index:02}"), false)));
+    let table = NameTable::build(names);
+    let quotas = CompletionRecallQuotas::default_for_completion_limit(20);
+    let oracle = table.search_completion_recall_pooled("c", quotas, None, None);
+    let cancellation = NeverCancelRecall;
+    let bounded = table.search_completion_recall_pooled_controlled(CompletionRecallQuery {
+        query: "c",
+        quotas,
+        scope: None,
+        active_project: None,
+        prior_pool: None,
+        semantic_family: Some(SemanticFamily::CFamily),
+        cancellation: Some(&cancellation),
+        candidate_budget: 128,
+    });
+    let oracle_top: Vec<_> = oracle.0.iter().take(20).map(|hit| hit.id).collect();
+    let bounded_top: Vec<_> = bounded.0.iter().take(20).map(|hit| hit.id).collect();
+
+    assert_eq!(bounded_top, oracle_top);
+    assert!(bounded.2.truncated);
+    assert!(bounded.2.entries_inspected <= 128, "{:?}", bounded.2);
+}
+
+#[test]
+fn bounded_single_character_postings_respect_delta_shadow_and_tombstone() {
+    let mut names: Vec<_> = (0..100)
+        .map(|index| {
+            (
+                i64::from(index),
+                format!("c_workspace_candidate_{index:04}"),
+                false,
+                format!("src/{index}.c"),
+                "function".to_string(),
+                false,
+            )
+        })
+        .collect();
+    names.push((
+        1_000,
+        "c_old".to_string(),
+        false,
+        "src/changed.c".to_string(),
+        "function".to_string(),
+        false,
+    ));
+    let table = NameTable::build_with_paths(names);
+    let changed = HashSet::from(["src/changed.c".to_string()]);
+    let updated = table.with_updated_paths(
+        &changed,
+        vec![(
+            2_000,
+            "c_new".to_string(),
+            false,
+            "src/changed.c".to_string(),
+            "function".to_string(),
+            false,
+        )],
+    );
+    let cancellation = NeverCancelRecall;
+    let recall = |table: &NameTable| {
+        table.search_completion_recall_pooled_controlled(CompletionRecallQuery {
+            query: "c",
+            quotas: CompletionRecallQuotas::default_for_completion_limit(10),
+            scope: None,
+            active_project: None,
+            prior_pool: None,
+            semantic_family: Some(SemanticFamily::CFamily),
+            cancellation: Some(&cancellation),
+            candidate_budget: 16,
+        })
+    };
+
+    let (hits, _, metrics) = recall(&updated);
+    assert!(hits.iter().any(|hit| hit.id == 2_000));
+    assert!(hits.iter().all(|hit| hit.id != 1_000));
+    assert!(metrics.entries_inspected <= 16, "{metrics:?}");
+
+    let deleted = updated.with_updated_paths(&changed, vec![]);
+    let (hits, _, metrics) = recall(&deleted);
+    assert!(hits.iter().all(|hit| hit.id != 1_000 && hit.id != 2_000));
+    assert!(metrics.entries_inspected <= 16, "{metrics:?}");
+}
+
+#[test]
+fn bounded_prefix_budget_cannot_be_consumed_by_shadowed_base_rows() {
+    let stale_path = "src/generated_api.h".to_string();
+    let table = NameTable::build_with_paths(
+        (0..80)
+            .map(|index| {
+                (
+                    i64::from(index),
+                    format!("aa_old_{index:03}"),
+                    false,
+                    stale_path.clone(),
+                    "function".to_string(),
+                    false,
+                )
+            })
+            .collect(),
+    );
+    let updated = table.with_updated_paths(
+        &HashSet::from([stale_path.clone()]),
+        vec![(
+            10_000,
+            "aazzz_live".to_string(),
+            false,
+            stale_path,
+            "function".to_string(),
+            false,
+        )],
+    );
+    let cancellation = NeverCancelRecall;
+    let (hits, _, metrics) =
+        updated.search_completion_recall_pooled_controlled(CompletionRecallQuery {
+            query: "aa",
+            quotas: CompletionRecallQuotas::default_for_completion_limit(10),
+            scope: None,
+            active_project: None,
+            prior_pool: None,
+            semantic_family: Some(SemanticFamily::CFamily),
+            cancellation: Some(&cancellation),
+            candidate_budget: 32,
+        });
+
+    assert!(
+        hits.iter().any(|hit| hit.id == 10_000),
+        "the only active delta declaration was starved by stale base rows: {metrics:?}"
+    );
+    assert!(hits.iter().all(|hit| hit.id < 0 || hit.id >= 10_000));
+    assert!(metrics.entries_inspected <= 32, "{metrics:?}");
+}
+
+#[test]
+fn bounded_short_prefix_budget_cannot_be_consumed_by_shadowed_base_rows() {
+    let stale_path = "src/generated_api.h".to_string();
+    let table = NameTable::build_with_paths(
+        (0..80)
+            .map(|index| {
+                (
+                    i64::from(index),
+                    format!("a{index:03}"),
+                    false,
+                    stale_path.clone(),
+                    "function".to_string(),
+                    false,
+                )
+            })
+            .collect(),
+    );
+    let updated = table.with_updated_paths(
+        &HashSet::from([stale_path.clone()]),
+        vec![(
+            10_000,
+            "azzz_live".to_string(),
+            false,
+            stale_path,
+            "function".to_string(),
+            false,
+        )],
+    );
+    let cancellation = NeverCancelRecall;
+    let (hits, _, metrics) =
+        updated.search_completion_recall_pooled_controlled(CompletionRecallQuery {
+            query: "a",
+            quotas: CompletionRecallQuotas::default_for_completion_limit(10),
+            scope: None,
+            active_project: None,
+            prior_pool: None,
+            semantic_family: Some(SemanticFamily::CFamily),
+            cancellation: Some(&cancellation),
+            candidate_budget: 32,
+        });
+
+    assert!(
+        hits.iter().any(|hit| hit.id == 10_000),
+        "the active single-character posting was starved by stale base rows: {metrics:?}"
+    );
+    assert!(metrics.entries_inspected <= 32, "{metrics:?}");
+}
+
+fn mixed_delta_after_subset_tombstone(stale_names: Vec<String>, live_name: &str) -> NameTable {
+    let base = NameTable::build_with_paths(
+        (0..96)
+            .map(|index| {
+                (
+                    i64::from(index),
+                    format!("zz_unrelated_{index:03}"),
+                    false,
+                    format!("src/base_{index:03}.c"),
+                    "function".to_string(),
+                    false,
+                )
+            })
+            .collect(),
+    );
+    let stale_path = "generated/stale.h".to_string();
+    let live_path = "generated/live.h".to_string();
+    let mut mixed_entries: Vec<_> = stale_names
+        .into_iter()
+        .enumerate()
+        .map(|(index, name)| {
+            (
+                10_000 + index as i64,
+                name,
+                false,
+                stale_path.clone(),
+                "function".to_string(),
+                false,
+            )
+        })
+        .collect();
+    mixed_entries.push((
+        99_999,
+        live_name.to_string(),
+        false,
+        live_path.clone(),
+        "function".to_string(),
+        false,
+    ));
+    let mixed = base.with_updated_paths(
+        &HashSet::from([stale_path.clone(), live_path]),
+        mixed_entries,
+    );
+    mixed.with_updated_paths(&HashSet::from([stale_path]), vec![])
+}
+
+fn assert_mixed_delta_live_candidate_is_recalled(table: &NameTable, query: &str) {
+    let cancellation = NeverCancelRecall;
+    let (hits, _, metrics) =
+        table.search_completion_recall_pooled_controlled(CompletionRecallQuery {
+            query,
+            quotas: CompletionRecallQuotas::default_for_completion_limit(10),
+            scope: None,
+            active_project: None,
+            prior_pool: None,
+            semantic_family: Some(SemanticFamily::CFamily),
+            cancellation: Some(&cancellation),
+            candidate_budget: 32,
+        });
+
+    assert!(
+        hits.iter().any(|hit| hit.id == 99_999),
+        "the live path behind a tombstoned sibling in the same delta was starved: {metrics:?}"
+    );
+    assert!(
+        hits.iter().all(|hit| hit.id < 10_000 || hit.id == 99_999),
+        "tombstoned sibling declarations escaped recall: {hits:?}"
+    );
+    assert!(
+        metrics.priority_source_attempts <= metrics.candidate_budget / 8,
+        "priority source setup escaped its request-local share: {metrics:?}"
+    );
+    assert!(
+        metrics.priority_source_probes <= metrics.candidate_budget,
+        "priority source probes escaped their bounded multiplier: {metrics:?}"
+    );
+    assert!(
+        metrics.priority_sources_initialized <= metrics.priority_source_attempts,
+        "initialized cursor count cannot exceed unique bounded attempts: {metrics:?}"
+    );
+    assert!(
+        metrics.priority_fuzzy_name_probes <= COMPLETION_PRIORITY_METADATA_PROBE_LIMIT,
+        "priority fuzzy metadata probes escaped their hard cap: {metrics:?}"
+    );
+    assert!(
+        metrics.priority_fuzzy_declaration_probes <= COMPLETION_PRIORITY_METADATA_PROBE_LIMIT,
+        "priority fuzzy multi-path probes escaped their hard cap: {metrics:?}"
+    );
+    assert!(metrics.entries_inspected <= 32, "{metrics:?}");
+}
+
+#[test]
+fn bounded_prefix_recall_skips_tombstoned_sibling_path_inside_one_delta() {
+    let table = mixed_delta_after_subset_tombstone(
+        (0..80).map(|index| format!("aa_old_{index:03}")).collect(),
+        "aazzz_live",
+    );
+    assert_mixed_delta_live_candidate_is_recalled(&table, "aa");
+}
+
+#[test]
+fn bounded_short_prefix_recall_skips_tombstoned_sibling_path_inside_one_delta() {
+    let table = mixed_delta_after_subset_tombstone(
+        (0..80).map(|index| format!("a{index:03}")).collect(),
+        "azzz_live_with_longer_static_rank",
+    );
+    assert_mixed_delta_live_candidate_is_recalled(&table, "a");
+}
+
+#[test]
+fn bounded_fuzzy_recall_skips_tombstoned_sibling_path_inside_one_delta() {
+    let table = mixed_delta_after_subset_tombstone(
+        (0..80)
+            .map(|index| format!("pre_needle_old_{index:03}"))
+            .collect(),
+        "zz_needle_live_with_a_lexically_late_long_suffix",
+    );
+    assert_mixed_delta_live_candidate_is_recalled(&table, "needle");
+}
+
+fn base_after_subset_tombstone(stale_names: Vec<String>, live_name: &str) -> NameTable {
+    let stale_path = "generated/stale.h".to_string();
+    let live_path = "generated/live.h".to_string();
+    let mut entries: Vec<_> = stale_names
+        .into_iter()
+        .enumerate()
+        .map(|(index, name)| {
+            (
+                10_000 + index as i64,
+                name,
+                false,
+                stale_path.clone(),
+                "function".to_string(),
+                false,
+            )
+        })
+        .collect();
+    entries.push((
+        99_999,
+        live_name.to_string(),
+        false,
+        live_path,
+        "function".to_string(),
+        false,
+    ));
+    entries.extend((0..96).map(|index| {
+        (
+            i64::from(index),
+            format!("zz_unrelated_{index:03}"),
+            false,
+            format!("src/base_{index:03}.c"),
+            "function".to_string(),
+            false,
+        )
+    }));
+    NameTable::build_with_paths(entries).with_updated_paths(&HashSet::from([stale_path]), vec![])
+}
+
+#[test]
+fn bounded_prefix_recall_skips_tombstoned_sibling_path_inside_base() {
+    let table = base_after_subset_tombstone(
+        (0..80).map(|index| format!("aa_old_{index:03}")).collect(),
+        "aazzz_live",
+    );
+    assert_mixed_delta_live_candidate_is_recalled(&table, "aa");
+}
+
+#[test]
+fn bounded_short_prefix_recall_skips_tombstoned_sibling_path_inside_base() {
+    let table = base_after_subset_tombstone(
+        (0..80).map(|index| format!("a{index:03}")).collect(),
+        "azzz_live_with_longer_static_rank",
+    );
+    assert_mixed_delta_live_candidate_is_recalled(&table, "a");
+}
+
+#[test]
+fn bounded_fuzzy_recall_skips_tombstoned_sibling_path_inside_base() {
+    let table = base_after_subset_tombstone(
+        (0..80)
+            .map(|index| format!("pre_needle_old_{index:03}"))
+            .collect(),
+        "zz_needle_live_with_a_lexically_late_long_suffix",
+    );
+    assert_mixed_delta_live_candidate_is_recalled(&table, "needle");
+}
+
+fn base_with_active_head_stale_middle_and_active_tail(
+    active_head: &str,
+    stale_names: Vec<String>,
+    active_tail: &str,
+) -> NameTable {
+    let live_path = "generated/live.h".to_string();
+    let stale_path = "generated/stale.h".to_string();
+    let mut entries = vec![
+        (
+            9_998,
+            active_head.to_string(),
+            false,
+            live_path.clone(),
+            "function".to_string(),
+            false,
+        ),
+        (
+            99_999,
+            active_tail.to_string(),
+            false,
+            live_path,
+            "function".to_string(),
+            false,
+        ),
+    ];
+    entries.extend(stale_names.into_iter().enumerate().map(|(index, name)| {
+        (
+            10_000 + index as i64,
+            name,
+            false,
+            stale_path.clone(),
+            "function".to_string(),
+            false,
+        )
+    }));
+    entries.extend((0..128).map(|index| {
+        (
+            i64::from(index),
+            format!("zz_unrelated_{index:03}"),
+            false,
+            format!("src/base_{index:03}.c"),
+            "function".to_string(),
+            false,
+        )
+    }));
+    NameTable::build_with_paths(entries).with_updated_paths(&HashSet::from([stale_path]), vec![])
+}
+
+#[test]
+fn bounded_prefix_recall_crosses_a_stale_middle_after_an_active_base_head() {
+    let table = base_with_active_head_stale_middle_and_active_tail(
+        "aa000_live_head",
+        (0..80)
+            .map(|index| format!("aa100_old_{index:03}"))
+            .collect(),
+        "aazzz_live_target",
+    );
+    assert_mixed_delta_live_candidate_is_recalled(&table, "aa");
+}
+
+#[test]
+fn bounded_short_prefix_recall_crosses_a_stale_middle_after_an_active_base_head() {
+    let table = base_with_active_head_stale_middle_and_active_tail(
+        "a0",
+        (0..80)
+            .map(|index| format!("a100_old_{index:03}"))
+            .collect(),
+        "azzz_live_target_with_longer_static_rank",
+    );
+    assert_mixed_delta_live_candidate_is_recalled(&table, "a");
+}
+
+#[test]
+fn bounded_fuzzy_recall_crosses_a_stale_middle_after_an_active_base_head() {
+    let table = base_with_active_head_stale_middle_and_active_tail(
+        "needle",
+        (0..80)
+            .map(|index| format!("pre_needle_old_{index:03}"))
+            .collect(),
+        "zz_needle_live_target_with_a_longer_static_rank",
+    );
+    assert_mixed_delta_live_candidate_is_recalled(&table, "needle");
+}
+
+#[test]
+fn bounded_prefix_recovery_does_not_spend_sources_on_unrelated_earlier_paths() {
+    let stale_path = "middle/stale.h".to_string();
+    let mut entries = (0..80)
+        .map(|index| {
+            (
+                10_000 + i64::from(index),
+                format!("aa_old_{index:03}"),
+                false,
+                stale_path.clone(),
+                "function".to_string(),
+                false,
+            )
+        })
+        .collect::<Vec<_>>();
+    entries.push((
+        99_999,
+        "aazzz_live".to_string(),
+        false,
+        "zzz/live.h".to_string(),
+        "function".to_string(),
+        false,
+    ));
+    entries.extend((0..32).map(|index| {
+        (
+            i64::from(index),
+            format!("zz_unrelated_{index:03}"),
+            false,
+            format!("aaa/unrelated_{index:03}.h"),
+            "function".to_string(),
+            false,
+        )
+    }));
+    let table = NameTable::build_with_paths(entries)
+        .with_updated_paths(&HashSet::from([stale_path]), vec![]);
+
+    assert_mixed_delta_live_candidate_is_recalled(&table, "aa");
+}
+
+#[test]
+fn bounded_fuzzy_recovery_uses_token_matches_not_unrelated_path_heads() {
+    let stale_path = "generated/stale.h".to_string();
+    let live_path = "generated/live.h".to_string();
+    let mut entries = (0..80)
+        .map(|index| {
+            (
+                10_000 + i64::from(index),
+                format!("pre_needle_old_{index:03}"),
+                false,
+                stale_path.clone(),
+                "function".to_string(),
+                false,
+            )
+        })
+        .collect::<Vec<_>>();
+    entries.extend((0..16).map(|index| {
+        (
+            5_000 + i64::from(index),
+            format!("aa_unrelated_live_{index:03}"),
+            false,
+            live_path.clone(),
+            "function".to_string(),
+            false,
+        )
+    }));
+    entries.push((
+        99_999,
+        "zz_needle_live_target".to_string(),
+        false,
+        live_path,
+        "function".to_string(),
+        false,
+    ));
+    entries.extend((0..96).map(|index| {
+        (
+            i64::from(index),
+            format!("zz_workspace_noise_{index:03}"),
+            false,
+            format!("src/noise_{index:03}.c"),
+            "function".to_string(),
+            false,
+        )
+    }));
+    let table = NameTable::build_with_paths(entries)
+        .with_updated_paths(&HashSet::from([stale_path]), vec![]);
+
+    assert_mixed_delta_live_candidate_is_recalled(&table, "needle");
+}
+
+#[test]
+fn bounded_fuzzy_recovery_skips_stale_locals_for_a_multi_path_name() {
+    let stale_path = "generated/stale.h".to_string();
+    let live_path = "generated/live.h".to_string();
+    let mut entries = (0..80)
+        .map(|index| {
+            (
+                10_000 + i64::from(index),
+                "pre_needle_shared".to_string(),
+                false,
+                stale_path.clone(),
+                "function".to_string(),
+                false,
+            )
+        })
+        .collect::<Vec<_>>();
+    entries.push((
+        99_999,
+        "pre_needle_shared".to_string(),
+        false,
+        live_path,
+        "function".to_string(),
+        false,
+    ));
+    entries.extend((0..128).map(|index| {
+        (
+            i64::from(index),
+            format!("zz_workspace_noise_{index:03}"),
+            false,
+            format!("src/noise_{index:03}.c"),
+            "function".to_string(),
+            false,
+        )
+    }));
+    let table = NameTable::build_with_paths(entries)
+        .with_updated_paths(&HashSet::from([stale_path]), vec![]);
+
+    assert_mixed_delta_live_candidate_is_recalled(&table, "needle");
+}
+
+#[test]
+fn selected_project_recall_skips_tombstoned_sibling_path_inside_base() {
+    use crate::project_context::{ProjectContext, ProjectContextIndex, ProjectKey};
+
+    let key = ProjectKey {
+        workspace_root_id: "root".to_string(),
+        project_path: "selected".to_string(),
+    };
+    let projects = ProjectContextIndex::new(
+        "root".to_string(),
+        "workspace".to_string(),
+        vec![ProjectContext {
+            key: key.clone(),
+            workspace_name: "workspace".to_string(),
+            marker_files: vec!["selected/Makefile".to_string()],
+        }],
+    );
+    let stale_path = "selected/000-stale.h".to_string();
+    let mut names = (0..80)
+        .map(|index| {
+            (
+                10_000 + i64::from(index),
+                format!("aa_old_{index:03}"),
+                false,
+                stale_path.clone(),
+                "function".to_string(),
+                false,
+            )
+        })
+        .collect::<Vec<_>>();
+    names.push((
+        99_999,
+        "aazzz_project_live".to_string(),
+        false,
+        "selected/001-live.h".to_string(),
+        "function".to_string(),
+        false,
+    ));
+    names.extend((0..96).map(|index| {
+        (
+            i64::from(index),
+            format!("aa_unrelated_{index:03}"),
+            false,
+            format!("zzz/global_{index:03}.h"),
+            "function".to_string(),
+            false,
+        )
+    }));
+    let table = NameTable::build_with_paths_and_project_context(names, &projects)
+        .with_updated_paths(&HashSet::from([stale_path]), vec![]);
+    let cancellation = NeverCancelRecall;
+    let (hits, _, metrics) =
+        table.search_completion_recall_pooled_controlled(CompletionRecallQuery {
+            query: "aa",
+            quotas: CompletionRecallQuotas::with_project_context(10),
+            scope: None,
+            active_project: Some(&key),
+            prior_pool: None,
+            semantic_family: Some(SemanticFamily::CFamily),
+            cancellation: Some(&cancellation),
+            candidate_budget: 32,
+        });
+
+    assert!(
+        hits.iter().any(|hit| hit.id == 99_999),
+        "selected-project base recovery was pinned behind a tombstoned sibling: {metrics:?}"
+    );
+    assert_eq!(metrics.same_project, 1, "{metrics:?}");
+    assert!(metrics.priority_source_attempts <= 4, "{metrics:?}");
+    assert!(metrics.entries_inspected <= 32, "{metrics:?}");
+}
+
+#[test]
+fn selected_project_recall_keeps_a_source_after_unmatched_scope_fanout() {
+    use crate::project_context::{ProjectContext, ProjectContextIndex, ProjectKey};
+
+    let key = ProjectKey {
+        workspace_root_id: "root".to_string(),
+        project_path: "selected".to_string(),
+    };
+    let projects = ProjectContextIndex::new(
+        "root".to_string(),
+        "workspace".to_string(),
+        vec![ProjectContext {
+            key: key.clone(),
+            workspace_name: "workspace".to_string(),
+            marker_files: vec!["selected/Makefile".to_string()],
+        }],
+    );
+    let mut names = (0..64)
+        .map(|index| {
+            (
+                i64::from(index),
+                format!("aa000_global_{index:03}"),
+                false,
+                format!("global/{index:03}.h"),
+                "function".to_string(),
+                false,
+            )
+        })
+        .collect::<Vec<_>>();
+    names.extend((0..32).map(|index| {
+        (
+            1_000 + i64::from(index),
+            format!("zz_scope_{index:03}"),
+            false,
+            format!("scope/{index:03}.h"),
+            "function".to_string(),
+            false,
+        )
+    }));
+    names.push((
+        99_999,
+        "aazzz_project_target".to_string(),
+        false,
+        "selected/live.h".to_string(),
+        "function".to_string(),
+        false,
+    ));
+    let table = NameTable::build_with_paths_and_project_context(names, &projects);
+    let scope = CompletionScope {
+        current_path: None,
+        reach: ReachScope {
+            files: (0..32).map(|index| format!("scope/{index:03}.h")).collect(),
+            heuristic_files: HashSet::new(),
+            open: false,
+            reason: None,
+        },
+        direct_external_files: HashSet::new(),
+    };
+    let cancellation = NeverCancelRecall;
+    let (hits, _, metrics) =
+        table.search_completion_recall_pooled_controlled(CompletionRecallQuery {
+            query: "aa",
+            quotas: CompletionRecallQuotas::with_project_context(10),
+            scope: Some(&scope),
+            active_project: Some(&key),
+            prior_pool: None,
+            semantic_family: Some(SemanticFamily::CFamily),
+            cancellation: Some(&cancellation),
+            candidate_budget: 32,
+        });
+
+    assert!(
+        hits.iter().any(|hit| hit.id == 99_999),
+        "unmatched scope fanout starved the selected-project source: {metrics:?}"
+    );
+    assert_eq!(metrics.same_project, 1, "{metrics:?}");
+    assert!(metrics.priority_source_probes <= 32, "{metrics:?}");
+    assert!(metrics.priority_source_attempts <= 4, "{metrics:?}");
+    assert!(metrics.entries_inspected <= 32, "{metrics:?}");
+}
+
+#[test]
+fn reachable_recall_keeps_a_source_after_selected_project_fanout() {
+    use crate::project_context::{ProjectContext, ProjectContextIndex, ProjectKey};
+    use crate::semantic_model::{SemanticDeclarationKind, SemanticDeclarationRole};
+    use crate::store::views::DeclarationNameRow;
+
+    let key = ProjectKey {
+        workspace_root_id: "root".to_string(),
+        project_path: "selected".to_string(),
+    };
+    let projects = ProjectContextIndex::new(
+        "root".to_string(),
+        "workspace".to_string(),
+        vec![ProjectContext {
+            key: key.clone(),
+            workspace_name: "workspace".to_string(),
+            marker_files: vec!["selected/Makefile".to_string()],
+        }],
+    );
+    let mut rows = (0..64)
+        .map(|index| DeclarationNameRow {
+            id: i64::from(index),
+            name: format!("aa000_global_{index:03}"),
+            declaration_kind: SemanticDeclarationKind::Function,
+            role: SemanticDeclarationRole::Definition,
+            semantic_family: SemanticFamily::CFamily,
+            path: format!("global/{index:03}.h"),
+            external: false,
+            directly_included: false,
+        })
+        .collect::<Vec<_>>();
+    rows.push(DeclarationNameRow {
+        id: 99_999,
+        name: "aazzz_scope_target".to_string(),
+        declaration_kind: SemanticDeclarationKind::Function,
+        role: SemanticDeclarationRole::Definition,
+        semantic_family: SemanticFamily::CFamily,
+        path: "reachable/target.h".to_string(),
+        external: false,
+        directly_included: false,
+    });
+    rows.push(DeclarationNameRow {
+        id: 10_000,
+        name: "aa_project_base".to_string(),
+        declaration_kind: SemanticDeclarationKind::Function,
+        role: SemanticDeclarationRole::Definition,
+        semantic_family: SemanticFamily::CFamily,
+        path: "selected/base.h".to_string(),
+        external: false,
+        directly_included: false,
+    });
+    let mut table =
+        NameTable::build_from_declaration_name_rows_with_project_context(rows, Some(&projects));
+    for index in 0..3 {
+        let path = format!("selected/delta_{index}.h");
+        table = table.with_updated_declaration_name_rows_with_project_context(
+            &HashSet::from([path.clone()]),
+            vec![DeclarationNameRow {
+                id: 10_001 + i64::from(index),
+                name: format!("aa_project_delta_{index}"),
+                declaration_kind: SemanticDeclarationKind::Function,
+                role: SemanticDeclarationRole::Definition,
+                semantic_family: SemanticFamily::CFamily,
+                path,
+                external: false,
+                directly_included: false,
+            }],
+            Some(&projects),
+        );
+    }
+    let scope = CompletionScope {
+        current_path: Some("reachable/current.c".to_string()),
+        reach: ReachScope {
+            files: HashSet::from(["reachable/target.h".to_string()]),
+            heuristic_files: HashSet::new(),
+            open: false,
+            reason: None,
+        },
+        direct_external_files: HashSet::new(),
+    };
+    let cancellation = NeverCancelRecall;
+    let (hits, _, metrics) =
+        table.search_completion_recall_pooled_controlled(CompletionRecallQuery {
+            query: "aa",
+            quotas: CompletionRecallQuotas::with_project_context(10),
+            scope: Some(&scope),
+            active_project: Some(&key),
+            prior_pool: None,
+            semantic_family: Some(SemanticFamily::CFamily),
+            cancellation: Some(&cancellation),
+            candidate_budget: 32,
+        });
+
+    assert!(
+        hits.iter().any(|hit| hit.id == 99_999),
+        "selected-project fanout starved the reachable source: {metrics:?}"
+    );
+    assert_eq!(metrics.reachable, 1, "{metrics:?}");
+    assert!(metrics.priority_source_probes <= 32, "{metrics:?}");
+    assert!(metrics.priority_source_attempts <= 4, "{metrics:?}");
+    assert!(metrics.entries_inspected <= 32, "{metrics:?}");
+}
+
+#[test]
+fn selected_project_recall_keeps_candidate_budget_after_long_scope_cursor() {
+    use crate::project_context::{ProjectContext, ProjectContextIndex, ProjectKey};
+
+    let key = ProjectKey {
+        workspace_root_id: "root".to_string(),
+        project_path: "selected".to_string(),
+    };
+    let projects = ProjectContextIndex::new(
+        "root".to_string(),
+        "workspace".to_string(),
+        vec![ProjectContext {
+            key: key.clone(),
+            workspace_name: "workspace".to_string(),
+            marker_files: vec!["selected/Makefile".to_string()],
+        }],
+    );
+    let mut names = (0..100)
+        .map(|index| {
+            (
+                i64::from(index),
+                format!("aa000_scope_{index:03}"),
+                false,
+                "reachable/many.h".to_string(),
+                "function".to_string(),
+                false,
+            )
+        })
+        .collect::<Vec<_>>();
+    names.extend((0..64).map(|index| {
+        (
+            1_000 + i64::from(index),
+            format!("aa001_global_{index:03}"),
+            false,
+            format!("global/{index:03}.h"),
+            "function".to_string(),
+            false,
+        )
+    }));
+    names.push((
+        99_999,
+        "aazzz_project_target".to_string(),
+        false,
+        "selected/live.h".to_string(),
+        "function".to_string(),
+        false,
+    ));
+    let table = NameTable::build_with_paths_and_project_context(names, &projects);
+    let scope = CompletionScope {
+        current_path: Some("reachable/current.c".to_string()),
+        reach: ReachScope {
+            files: HashSet::from(["reachable/many.h".to_string()]),
+            heuristic_files: HashSet::new(),
+            open: false,
+            reason: None,
+        },
+        direct_external_files: HashSet::new(),
+    };
+    let cancellation = NeverCancelRecall;
+    let (hits, _, metrics) =
+        table.search_completion_recall_pooled_controlled(CompletionRecallQuery {
+            query: "aa",
+            quotas: CompletionRecallQuotas::with_project_context(10),
+            scope: Some(&scope),
+            active_project: Some(&key),
+            prior_pool: None,
+            semantic_family: Some(SemanticFamily::CFamily),
+            cancellation: Some(&cancellation),
+            candidate_budget: 32,
+        });
+
+    assert!(
+        hits.iter().any(|hit| hit.id == 99_999),
+        "a long scope cursor consumed the selected-project candidate share: {metrics:?}"
+    );
+    assert_eq!(metrics.same_project, 1, "{metrics:?}");
+    assert!(metrics.entries_inspected <= 32, "{metrics:?}");
+}
+
+#[test]
+fn project_posting_carries_its_segment_id_for_constant_time_prefix_recovery() {
+    use crate::project_context::{ProjectContext, ProjectContextIndex, ProjectKey};
+
+    let contexts = (0..256)
+        .map(|index| ProjectContext {
+            key: ProjectKey {
+                workspace_root_id: "root".to_string(),
+                project_path: format!("projects/{index:03}"),
+            },
+            workspace_name: "workspace".to_string(),
+            marker_files: vec![format!("projects/{index:03}/Makefile")],
+        })
+        .collect::<Vec<_>>();
+    let selected = contexts
+        .last()
+        .expect("contexts must not be empty")
+        .key
+        .clone();
+    let projects = ProjectContextIndex::new("root".to_string(), "workspace".to_string(), contexts);
+    let table = NameTable::build_with_paths_and_project_context(
+        (0..256)
+            .map(|index| {
+                (
+                    i64::from(index),
+                    format!("aa_project_{index:03}"),
+                    false,
+                    format!("projects/{index:03}/decl.h"),
+                    "function".to_string(),
+                    false,
+                )
+            })
+            .collect(),
+        &projects,
+    );
+    let posting = table
+        .base
+        .by_project
+        .get(&selected)
+        .expect("selected project posting must exist");
+
+    assert_eq!(
+        table.base.projects[posting.project_id as usize], selected,
+        "prefix recovery must not linearly search every segment project key"
+    );
+}
+
+#[test]
+fn priority_source_setup_deduplicates_scope_and_mixed_segment_recovery() {
+    let table = mixed_delta_after_subset_tombstone(
+        (0..80).map(|index| format!("aa_old_{index:03}")).collect(),
+        "aazzz_live",
+    );
+    let scope = CompletionScope {
+        current_path: Some("generated/live.h".to_string()),
+        reach: ReachScope {
+            files: HashSet::from(["generated/live.h".to_string()]),
+            heuristic_files: HashSet::new(),
+            open: false,
+            reason: None,
+        },
+        direct_external_files: HashSet::new(),
+    };
+    let cancellation = NeverCancelRecall;
+    let (hits, _, metrics) =
+        table.search_completion_recall_pooled_controlled(CompletionRecallQuery {
+            query: "aa",
+            quotas: CompletionRecallQuotas::default_for_completion_limit(10),
+            scope: Some(&scope),
+            active_project: None,
+            prior_pool: None,
+            semantic_family: Some(SemanticFamily::CFamily),
+            cancellation: Some(&cancellation),
+            candidate_budget: 32,
+        });
+
+    assert!(hits.iter().any(|hit| hit.id == 99_999), "{metrics:?}");
+    assert_eq!(metrics.priority_source_attempts, 1, "{metrics:?}");
+    assert_eq!(metrics.priority_sources_initialized, 1, "{metrics:?}");
+}
+
+#[test]
+fn priority_source_setup_observes_cancellation_before_scope_fanout() {
+    let names = (0..100)
+        .map(|index| {
+            (
+                i64::from(index),
+                format!("api_{index:03}"),
+                false,
+                format!("scope/{index:03}.h"),
+                "function".to_string(),
+                false,
+            )
+        })
+        .collect::<Vec<_>>();
+    let scope = CompletionScope {
+        current_path: None,
+        reach: ReachScope {
+            files: (0..100)
+                .map(|index| format!("scope/{index:03}.h"))
+                .collect(),
+            heuristic_files: HashSet::new(),
+            open: false,
+            reason: None,
+        },
+        direct_external_files: HashSet::new(),
+    };
+    let table = NameTable::build_with_paths(names);
+    let cancellation = CancelOnRecallCheck {
+        checks: AtomicUsize::new(0),
+        cancel_on: 1,
+    };
+    let (hits, pool, metrics) =
+        table.search_completion_recall_pooled_controlled(CompletionRecallQuery {
+            query: "api",
+            quotas: CompletionRecallQuotas::default_for_completion_limit(10),
+            scope: Some(&scope),
+            active_project: None,
+            prior_pool: None,
+            semantic_family: Some(SemanticFamily::CFamily),
+            cancellation: Some(&cancellation),
+            candidate_budget: 32,
+        });
+
+    assert!(metrics.cancelled, "{metrics:?}");
+    assert_eq!(metrics.priority_source_attempts, 0, "{metrics:?}");
+    assert_eq!(metrics.entries_inspected, 0, "{metrics:?}");
+    assert!(hits.is_empty());
+    assert!(pool.is_empty());
+
+    let never_cancel = NeverCancelRecall;
+    let (_, _, bounded_metrics) =
+        table.search_completion_recall_pooled_controlled(CompletionRecallQuery {
+            query: "api",
+            quotas: CompletionRecallQuotas::default_for_completion_limit(10),
+            scope: Some(&scope),
+            active_project: None,
+            prior_pool: None,
+            semantic_family: Some(SemanticFamily::CFamily),
+            cancellation: Some(&never_cancel),
+            candidate_budget: 32,
+        });
+    assert_eq!(
+        bounded_metrics.priority_source_attempts, 4,
+        "{bounded_metrics:?}"
+    );
+    assert_eq!(
+        bounded_metrics.priority_sources_initialized, 4,
+        "{bounded_metrics:?}"
+    );
+}
+
+#[test]
+fn priority_recovery_counts_inactive_path_probes_and_cancels_cooperatively() {
+    let stale_paths = (0..600)
+        .map(|index| format!("aaa/stale_{index:03}.h"))
+        .collect::<HashSet<_>>();
+    let mut names = stale_paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            (
+                index as i64,
+                format!("aa_old_{index:03}"),
+                false,
+                path.clone(),
+                "function".to_string(),
+                false,
+            )
+        })
+        .collect::<Vec<_>>();
+    names.push((
+        99_999,
+        "aazzz_live_target".to_string(),
+        false,
+        "zzz/live.h".to_string(),
+        "function".to_string(),
+        false,
+    ));
+    let table = NameTable::build_with_paths(names).with_updated_paths(&stale_paths, vec![]);
+    let never_cancel = NeverCancelRecall;
+    let (_, _, bounded_metrics) =
+        table.search_completion_recall_pooled_controlled(CompletionRecallQuery {
+            query: "aa",
+            quotas: CompletionRecallQuotas::default_for_completion_limit(10),
+            scope: None,
+            active_project: None,
+            prior_pool: None,
+            semantic_family: Some(SemanticFamily::CFamily),
+            cancellation: Some(&never_cancel),
+            candidate_budget: 32,
+        });
+    assert_eq!(
+        bounded_metrics.priority_source_probes, 32,
+        "inactive path-pair examination must consume the bounded metadata budget: {bounded_metrics:?}"
+    );
+    assert!(bounded_metrics.truncated, "{bounded_metrics:?}");
+
+    let cancellation = CancelOnRecallCheck {
+        checks: AtomicUsize::new(0),
+        cancel_on: 2,
+    };
+    let (hits, pool, cancelled_metrics) =
+        table.search_completion_recall_pooled_controlled(CompletionRecallQuery {
+            query: "aa",
+            quotas: CompletionRecallQuotas::default_for_completion_limit(10),
+            scope: None,
+            active_project: None,
+            prior_pool: None,
+            semantic_family: Some(SemanticFamily::CFamily),
+            cancellation: Some(&cancellation),
+            candidate_budget: 512,
+        });
+    assert!(cancelled_metrics.cancelled, "{cancelled_metrics:?}");
+    assert_eq!(
+        cancelled_metrics.priority_source_probes, 256,
+        "recovery metadata must check cancellation every probe block: {cancelled_metrics:?}"
+    );
+    assert_eq!(cancellation.checks.load(Ordering::Relaxed), 2);
+    assert!(hits.is_empty());
+    assert!(pool.is_empty());
+}
+
+#[test]
+fn priority_scope_counts_missing_path_probes_and_cancels_cooperatively() {
+    let table = NameTable::build_with_paths(
+        (0..600)
+            .map(|index| {
+                (
+                    i64::from(index),
+                    format!("aa_global_{index:03}"),
+                    false,
+                    format!("global/{index:03}.h"),
+                    "function".to_string(),
+                    false,
+                )
+            })
+            .collect(),
+    );
+    let scope = CompletionScope {
+        current_path: None,
+        reach: ReachScope {
+            files: (0..600)
+                .map(|index| format!("missing/{index:03}.h"))
+                .collect(),
+            heuristic_files: HashSet::new(),
+            open: false,
+            reason: None,
+        },
+        direct_external_files: HashSet::new(),
+    };
+    let cancellation = CancelOnRecallCheck {
+        checks: AtomicUsize::new(0),
+        cancel_on: 2,
+    };
+    let (hits, pool, metrics) =
+        table.search_completion_recall_pooled_controlled(CompletionRecallQuery {
+            query: "aa",
+            quotas: CompletionRecallQuotas::default_for_completion_limit(10),
+            scope: Some(&scope),
+            active_project: None,
+            prior_pool: None,
+            semantic_family: Some(SemanticFamily::CFamily),
+            cancellation: Some(&cancellation),
+            candidate_budget: 512,
+        });
+
+    assert!(metrics.cancelled, "{metrics:?}");
+    assert_eq!(metrics.priority_source_probes, 256, "{metrics:?}");
+    assert_eq!(metrics.entries_inspected, 0, "{metrics:?}");
+    assert_eq!(cancellation.checks.load(Ordering::Relaxed), 2);
+    assert!(hits.is_empty());
+    assert!(pool.is_empty());
+}
+
+#[test]
+fn priority_candidate_deferral_checks_cancellation_before_heap_fanout() {
+    use crate::project_context::{ProjectContext, ProjectContextIndex, ProjectKey};
+
+    let key = ProjectKey {
+        workspace_root_id: "root".to_string(),
+        project_path: "selected".to_string(),
+    };
+    let projects = ProjectContextIndex::new(
+        "root".to_string(),
+        "workspace".to_string(),
+        vec![ProjectContext {
+            key: key.clone(),
+            workspace_name: "workspace".to_string(),
+            marker_files: vec!["selected/Makefile".to_string()],
+        }],
+    );
+    let mut names = Vec::with_capacity(4_515);
+    for index in 0..257 {
+        let path = format!("scope/{index:03}.h");
+        names.push((
+            i64::from(index) * 2,
+            format!("aa000_head_{index:03}"),
+            false,
+            path.clone(),
+            "function".to_string(),
+            false,
+        ));
+        names.push((
+            i64::from(index) * 2 + 1,
+            format!("aa999_tail_{index:03}"),
+            false,
+            path,
+            "function".to_string(),
+            false,
+        ));
+    }
+    names.extend((0..4_000).map(|index| {
+        (
+            10_000 + i64::from(index),
+            format!("zz_global_{index:04}"),
+            false,
+            format!("global/{index:04}.h"),
+            "function".to_string(),
+            false,
+        )
+    }));
+    names.push((
+        99_999,
+        "aazzz_project_target".to_string(),
+        false,
+        "selected/live.h".to_string(),
+        "function".to_string(),
+        false,
+    ));
+    let table = NameTable::build_with_paths_and_project_context(names, &projects);
+    let scope = CompletionScope {
+        current_path: None,
+        reach: ReachScope {
+            files: (0..257)
+                .map(|index| format!("scope/{index:03}.h"))
+                .collect(),
+            heuristic_files: HashSet::new(),
+            open: false,
+            reason: None,
+        },
+        direct_external_files: HashSet::new(),
+    };
+    let cancellation = CancelOnRecallCheck {
+        checks: AtomicUsize::new(0),
+        cancel_on: 5,
+    };
+    let (hits, pool, metrics) =
+        table.search_completion_recall_pooled_controlled(CompletionRecallQuery {
+            query: "aa",
+            quotas: CompletionRecallQuotas::with_project_context(10),
+            scope: Some(&scope),
+            active_project: Some(&key),
+            prior_pool: None,
+            semantic_family: Some(SemanticFamily::CFamily),
+            cancellation: Some(&cancellation),
+            candidate_budget: 4_112,
+        });
+
+    assert!(metrics.cancelled, "{metrics:?}");
+    assert_eq!(
+        metrics.entries_inspected, 257,
+        "saturated cursor deferral must observe cancellation before moving hundreds of heap heads: {metrics:?}"
+    );
+    assert_eq!(cancellation.checks.load(Ordering::Relaxed), 5);
+    assert!(hits.is_empty());
+    assert!(pool.is_empty());
+
+    let counted = CountRecallChecks {
+        checks: AtomicUsize::new(0),
+    };
+    let (_, _, counted_metrics) =
+        table.search_completion_recall_pooled_controlled(CompletionRecallQuery {
+            query: "aa",
+            quotas: CompletionRecallQuotas::with_project_context(10),
+            scope: Some(&scope),
+            active_project: Some(&key),
+            prior_pool: None,
+            semantic_family: Some(SemanticFamily::CFamily),
+            cancellation: Some(&counted),
+            candidate_budget: 4_096,
+        });
+    assert!(
+        counted_metrics.cancellation_checks < 64,
+        "a saturated 256-row share must not poll cancellation once per deferred cursor: {counted_metrics:?}"
+    );
+    assert_eq!(
+        counted_metrics.cancellation_checks,
+        counted.checks.load(Ordering::Relaxed)
+    );
+}
+
+#[test]
+fn bounded_recall_scores_each_index_once_across_priority_and_global_sources() {
+    use crate::project_context::{ProjectContext, ProjectContextIndex, ProjectKey};
+
+    let key = ProjectKey {
+        workspace_root_id: "root".to_string(),
+        project_path: "selected".to_string(),
+    };
+    let projects = ProjectContextIndex::new(
+        "root".to_string(),
+        "workspace".to_string(),
+        vec![ProjectContext {
+            key: key.clone(),
+            workspace_name: "workspace".to_string(),
+            marker_files: vec!["selected/Makefile".to_string()],
+        }],
+    );
+    let mut names = (0..64)
+        .map(|index| {
+            (
+                i64::from(index),
+                format!("aa_global_{index:03}"),
+                false,
+                format!("global/{index:03}.h"),
+                "function".to_string(),
+                false,
+            )
+        })
+        .collect::<Vec<_>>();
+    names.push((
+        99_999,
+        "aa000_selected_reachable".to_string(),
+        false,
+        "selected/live.h".to_string(),
+        "function".to_string(),
+        false,
+    ));
+    let table = NameTable::build_with_paths_and_project_context(names, &projects);
+    let scope = CompletionScope {
+        current_path: Some("selected/current.c".to_string()),
+        reach: ReachScope {
+            files: HashSet::from(["selected/live.h".to_string()]),
+            heuristic_files: HashSet::new(),
+            open: false,
+            reason: None,
+        },
+        direct_external_files: HashSet::new(),
+    };
+    let cancellation = NeverCancelRecall;
+    let (hits, pool, metrics) =
+        table.search_completion_recall_pooled_controlled(CompletionRecallQuery {
+            query: "aa",
+            quotas: CompletionRecallQuotas::with_project_context(10),
+            scope: Some(&scope),
+            active_project: Some(&key),
+            prior_pool: None,
+            semantic_family: Some(SemanticFamily::CFamily),
+            cancellation: Some(&cancellation),
+            candidate_budget: 32,
+        });
+
+    let unique_pool = pool.iter().copied().collect::<HashSet<_>>();
+    assert_eq!(
+        pool.len(),
+        unique_pool.len(),
+        "one declaration was scored repeatedly across project/scope/global sources: {metrics:?}"
+    );
+    assert_eq!(
+        hits.iter().filter(|hit| hit.id == 99_999).count(),
+        1,
+        "selected/reachable candidate must remain unique: {metrics:?}"
+    );
+}
+
+#[test]
+fn bounded_fuzzy_recall_preserves_boundary_initial_candidates() {
+    let mut names: Vec<_> = (0..1_000)
+        .map(|index| {
+            (
+                i64::from(index),
+                format!("unrelated_workspace_candidate_{index:04}"),
+                false,
+            )
+        })
+        .collect();
+    names.extend((0..20).map(|index| {
+        (
+            10_000 + i64::from(index),
+            format!("DeviceBindDriverToNode_{index:02}"),
+            false,
+        )
+    }));
+    let table = NameTable::build(names);
+    let quotas = CompletionRecallQuotas::default_for_completion_limit(20);
+    let oracle = table.search_completion_recall_pooled("dbdtn", quotas, None, None);
+    let cancellation = NeverCancelRecall;
+    let bounded = table.search_completion_recall_pooled_controlled(CompletionRecallQuery {
+        query: "dbdtn",
+        quotas,
+        scope: None,
+        active_project: None,
+        prior_pool: None,
+        semantic_family: Some(SemanticFamily::CFamily),
+        cancellation: Some(&cancellation),
+        candidate_budget: 128,
+    });
+
+    assert_eq!(
+        bounded
+            .0
+            .iter()
+            .take(20)
+            .map(|hit| hit.id)
+            .collect::<Vec<_>>(),
+        oracle
+            .0
+            .iter()
+            .take(20)
+            .map(|hit| hit.id)
+            .collect::<Vec<_>>()
+    );
+    assert!(bounded.2.truncated);
+    assert!(bounded.2.entries_inspected <= 128, "{:?}", bounded.2);
+}
+
+#[test]
+fn bounded_fuzzy_recall_preserves_contiguous_substring_candidates() {
+    let mut names: Vec<_> = (0..1_000)
+        .map(|index| {
+            (
+                i64::from(index),
+                format!("unrelated_workspace_candidate_{index:04}"),
+                false,
+            )
+        })
+        .collect();
+    names.extend((0..20).map(|index| {
+        (
+            20_000 + i64::from(index),
+            format!("pre_needle_chunk_{index:02}"),
+            false,
+        )
+    }));
+    let table = NameTable::build(names);
+    let quotas = CompletionRecallQuotas::default_for_completion_limit(20);
+    let oracle = table.search_completion_recall_pooled("needle", quotas, None, None);
+    let cancellation = NeverCancelRecall;
+    let bounded = table.search_completion_recall_pooled_controlled(CompletionRecallQuery {
+        query: "needle",
+        quotas,
+        scope: None,
+        active_project: None,
+        prior_pool: None,
+        semantic_family: Some(SemanticFamily::CFamily),
+        cancellation: Some(&cancellation),
+        candidate_budget: 128,
+    });
+
+    assert_eq!(
+        bounded
+            .0
+            .iter()
+            .take(20)
+            .map(|hit| hit.id)
+            .collect::<Vec<_>>(),
+        oracle
+            .0
+            .iter()
+            .take(20)
+            .map(|hit| hit.id)
+            .collect::<Vec<_>>()
+    );
+    assert!(bounded.2.truncated);
+    assert!(bounded.2.entries_inspected <= 128, "{:?}", bounded.2);
+}
+
+#[test]
+fn bounded_fuzzy_name_posting_expansion_cannot_escape_candidate_budget() {
+    let mut names: Vec<_> = (0..1_000)
+        .map(|index| {
+            (
+                i64::from(index),
+                "pre_needle_chunk".to_string(),
+                false,
+                format!("src/duplicate_{index:04}.c"),
+                "function".to_string(),
+                false,
+            )
+        })
+        .collect();
+    names.extend((0..1_000).map(|index| {
+        (
+            10_000 + i64::from(index),
+            format!("unrelated_workspace_candidate_{index:04}"),
+            false,
+            format!("src/noise_{index:04}.c"),
+            "function".to_string(),
+            false,
+        )
+    }));
+    let table = NameTable::build_with_paths(names);
+    let cancellation = NeverCancelRecall;
+
+    let (hits, _, metrics) =
+        table.search_completion_recall_pooled_controlled(CompletionRecallQuery {
+            query: "needle",
+            quotas: CompletionRecallQuotas::default_for_completion_limit(100),
+            scope: None,
+            active_project: None,
+            prior_pool: None,
+            semantic_family: Some(SemanticFamily::CFamily),
+            cancellation: Some(&cancellation),
+            candidate_budget: 64,
+        });
+
+    assert!(!hits.is_empty());
+    assert!(hits.iter().all(|hit| hit.name == "pre_needle_chunk"));
+    assert!(metrics.truncated, "{metrics:?}");
+    assert!(
+        metrics.entries_inspected <= 64,
+        "one compact name posting expanded beyond the request budget: {metrics:?}"
+    );
+    assert!(
+        metrics.fuzzy_entries_inspected <= metrics.entries_inspected,
+        "fuzzy expansion accounting diverged: {metrics:?}"
+    );
+}
+
+#[test]
+fn bounded_fuzzy_postings_respect_delta_shadow_and_tombstone() {
+    let mut names: Vec<_> = (0..200)
+        .map(|index| {
+            (
+                i64::from(index),
+                format!("unrelated_workspace_candidate_{index:04}"),
+                false,
+                format!("src/noise_{index:04}.c"),
+                "function".to_string(),
+                false,
+            )
+        })
+        .collect();
+    names.push((
+        1_000,
+        "pre_needle_old".to_string(),
+        false,
+        "src/changed.c".to_string(),
+        "function".to_string(),
+        false,
+    ));
+    let table = NameTable::build_with_paths(names);
+    let changed = HashSet::from(["src/changed.c".to_string()]);
+    let updated = table.with_updated_paths(
+        &changed,
+        vec![(
+            2_000,
+            "pre_replacement_new".to_string(),
+            false,
+            "src/changed.c".to_string(),
+            "function".to_string(),
+            false,
+        )],
+    );
+    let cancellation = NeverCancelRecall;
+    let recall = |table: &NameTable| {
+        table.search_completion_recall_pooled_controlled(CompletionRecallQuery {
+            query: "replacement",
+            quotas: CompletionRecallQuotas::default_for_completion_limit(10),
+            scope: None,
+            active_project: None,
+            prior_pool: None,
+            semantic_family: Some(SemanticFamily::CFamily),
+            cancellation: Some(&cancellation),
+            candidate_budget: 32,
+        })
+    };
+
+    let (hits, _, metrics) = recall(&updated);
+    assert!(hits.iter().any(|hit| hit.id == 2_000), "{hits:?}");
+    assert!(hits.iter().all(|hit| hit.id != 1_000));
+    assert!(metrics.entries_inspected <= 32, "{metrics:?}");
+
+    let deleted = updated.with_updated_paths(&changed, vec![]);
+    let (hits, _, metrics) = recall(&deleted);
+    assert!(hits.iter().all(|hit| hit.id != 1_000 && hit.id != 2_000));
+    assert!(metrics.entries_inspected <= 32, "{metrics:?}");
+}
+
+#[test]
+fn bounded_fuzzy_budget_cannot_be_consumed_by_shadowed_base_rows() {
+    let stale_path = "src/generated_api.h".to_string();
+    let table = NameTable::build_with_paths(
+        (0..80)
+            .map(|index| {
+                (
+                    i64::from(index),
+                    format!("pre_needle_old_{index:03}"),
+                    false,
+                    stale_path.clone(),
+                    "function".to_string(),
+                    false,
+                )
+            })
+            .collect(),
+    );
+    let updated = table.with_updated_paths(
+        &HashSet::from([stale_path.clone()]),
+        vec![(
+            10_000,
+            "zz_needle_live_with_a_lexically_late_long_suffix".to_string(),
+            false,
+            stale_path,
+            "function".to_string(),
+            false,
+        )],
+    );
+    let cancellation = NeverCancelRecall;
+    let (hits, _, metrics) =
+        updated.search_completion_recall_pooled_controlled(CompletionRecallQuery {
+            query: "needle",
+            quotas: CompletionRecallQuotas::default_for_completion_limit(10),
+            scope: None,
+            active_project: None,
+            prior_pool: None,
+            semantic_family: Some(SemanticFamily::CFamily),
+            cancellation: Some(&cancellation),
+            candidate_budget: 32,
+        });
+
+    assert!(
+        hits.iter().any(|hit| hit.id == 10_000),
+        "the active fuzzy posting was starved by stale base rows: {metrics:?}"
+    );
+    assert!(metrics.entries_inspected <= 32, "{metrics:?}");
+}
+
+#[test]
+fn bounded_recall_reserves_work_for_reachable_prefix_candidates() {
+    let mut names: Vec<_> = (0..200)
+        .map(|index| {
+            (
+                i64::from(index),
+                format!("api_aaa_global_{index:03}"),
+                false,
+                format!("global/{index:03}.h"),
+                "function".to_string(),
+                false,
+            )
+        })
+        .collect();
+    names.push((
+        10_000,
+        "api_zzz_reachable_target".to_string(),
+        false,
+        "reachable/api.h".to_string(),
+        "function".to_string(),
+        false,
+    ));
+    let table = NameTable::build_with_paths(names);
+    let scope = CompletionScope {
+        current_path: Some("src/main.c".to_string()),
+        reach: ReachScope {
+            files: HashSet::from(["reachable/api.h".to_string()]),
+            heuristic_files: HashSet::new(),
+            open: false,
+            reason: None,
+        },
+        direct_external_files: HashSet::new(),
+    };
+    let cancellation = NeverCancelRecall;
+    let (hits, _, metrics) =
+        table.search_completion_recall_pooled_controlled(CompletionRecallQuery {
+            query: "api",
+            quotas: CompletionRecallQuotas::default_for_completion_limit(10),
+            scope: Some(&scope),
+            active_project: None,
+            prior_pool: None,
+            semantic_family: Some(SemanticFamily::CFamily),
+            cancellation: Some(&cancellation),
+            candidate_budget: 32,
+        });
+
+    let target = hits
+        .iter()
+        .find(|hit| hit.id == 10_000)
+        .expect("reachable candidate must have its own bounded recall channel");
+    assert_eq!(target.tier, ScopeTier::Reachable);
+    assert!(metrics.entries_inspected <= 32, "{metrics:?}");
+}
+
+#[test]
+fn bounded_recall_reserves_work_for_selected_project_prefix_candidates() {
+    use crate::project_context::{ProjectContext, ProjectContextIndex, ProjectKey};
+
+    let key = ProjectKey {
+        workspace_root_id: "root".to_string(),
+        project_path: "selected".to_string(),
+    };
+    let projects = ProjectContextIndex::new(
+        "root".to_string(),
+        "workspace".to_string(),
+        vec![ProjectContext {
+            key: key.clone(),
+            workspace_name: "workspace".to_string(),
+            marker_files: vec!["selected/Makefile".to_string()],
+        }],
+    );
+    let mut names: Vec<_> = (0..200)
+        .map(|index| {
+            (
+                i64::from(index),
+                format!("api_aaa_global_{index:03}"),
+                false,
+                format!("global/{index:03}.h"),
+                "function".to_string(),
+                false,
+            )
+        })
+        .collect();
+    names.push((
+        10_000,
+        "api_zzz_project_target".to_string(),
+        false,
+        "selected/api.h".to_string(),
+        "function".to_string(),
+        false,
+    ));
+    let table = NameTable::build_with_paths_and_project_context(names, &projects);
+    let cancellation = NeverCancelRecall;
+    let (hits, _, metrics) =
+        table.search_completion_recall_pooled_controlled(CompletionRecallQuery {
+            query: "api",
+            quotas: CompletionRecallQuotas::with_project_context(10),
+            scope: None,
+            active_project: Some(&key),
+            prior_pool: None,
+            semantic_family: Some(SemanticFamily::CFamily),
+            cancellation: Some(&cancellation),
+            candidate_budget: 32,
+        });
+
+    assert!(
+        hits.iter().any(|hit| hit.id == 10_000),
+        "selected-project candidate must have its own bounded recall channel: {metrics:?}"
+    );
+    assert_eq!(metrics.same_project, 1);
+    assert!(metrics.entries_inspected <= 32, "{metrics:?}");
+}
+
+#[test]
+fn bounded_completion_recall_has_a_hard_budget_and_keeps_full_query_matching() {
+    let mut names: Vec<_> = (0..50_000)
+        .map(|index| {
+            (
+                i64::from(index),
+                format!("zz_workspace_candidate_{index:05}"),
+                false,
+            )
+        })
+        .collect();
+    names.push((60_001, "needle_target".to_string(), false));
+    names.push((60_002, "needle_targe_noise".to_string(), false));
+    let table = NameTable::build(names);
+    let quotas = CompletionRecallQuotas::default_for_completion_limit(10);
+    let cancellation = NeverCancelRecall;
+
+    let (hits, pool, metrics) =
+        table.search_completion_recall_pooled_controlled(CompletionRecallQuery {
+            query: "needle_target",
+            quotas,
+            scope: None,
+            active_project: None,
+            prior_pool: None,
+            semantic_family: None,
+            cancellation: Some(&cancellation),
+            candidate_budget: 128,
+        });
+
+    assert!(
+        metrics.truncated,
+        "large cold recall must expose truncation"
+    );
+    assert_eq!(metrics.active_entries_total, table.len());
+    assert_eq!(metrics.candidate_budget, 128);
+    assert!(
+        metrics.entries_inspected <= metrics.candidate_budget,
+        "candidate generation exceeded its hard budget: {metrics:?}"
+    );
+    assert!(metrics.prefix_entries_inspected >= 1);
+    assert!(hits.iter().any(|hit| hit.id == 60_001));
+    assert!(pool
+        .iter()
+        .any(|index| table.active_entry(*index).id == 60_001));
+    assert!(
+        hits.iter().all(|hit| hit.id != 60_002),
+        "the final matcher must consume the query's trailing character"
     );
 }
 

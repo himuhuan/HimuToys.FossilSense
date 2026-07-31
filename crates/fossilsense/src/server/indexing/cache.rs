@@ -16,6 +16,8 @@ use crate::server::{
 use crate::store::IndexStore;
 
 mod declaration_models;
+#[cfg(test)]
+use declaration_models::build_declaration_index_from_db;
 use declaration_models::{
     capture_call_read_handle, load_semantic_generation, rebuild_declaration_index,
     rebuild_fallback_completion_table, rebuild_project_context, update_declaration_index_paths,
@@ -238,6 +240,79 @@ async fn update_indexed_file_list(
 }
 
 impl CacheLedger {
+    /// Hydrate the same immutable read-model components as a full publication,
+    /// but from an explicit benchmark database. This deliberately exists only
+    /// for production-path LSP tests: normal runtime publication must keep using
+    /// the generation-leased default index path for the workspace.
+    #[cfg(test)]
+    pub(in crate::server) async fn publish_full_index_from_db_for_test(
+        &self,
+        root: PathBuf,
+        db_path: PathBuf,
+    ) -> Result<Arc<EngineSnapshot>> {
+        let total_budget_bytes = self.semantic_index_memory_budget_bytes();
+        let epoch = self.allocate_engine_epoch();
+        let build_root = root.clone();
+        let snapshot = tokio::task::spawn_blocking(move || -> Result<EngineSnapshot> {
+            let (config, _) = crate::config::WorkspaceConfig::load(&build_root);
+            let project_context = Arc::new(crate::project_context::discover_project_contexts(
+                &build_root,
+                &config,
+            )?);
+            let declaration_index = Arc::new(build_declaration_index_from_db(
+                &db_path,
+                Some(&project_context),
+                total_budget_bytes,
+            )?);
+            let store = IndexStore::open_readonly(&db_path)?;
+            let guard = store.begin_semantic_read(None)?;
+            let semantic_generation = crate::call_model::SemanticGeneration(guard.generation());
+            guard.finish()?;
+            let fallback_completion_table = Arc::new(
+                crate::completion::ordinary_service::FallbackCompletionNameTable::build(
+                    store.fallback_completion_view().all()?,
+                ),
+            );
+            let go_import_table = Arc::new(GoImportCompletionTable::build(
+                store.go_package_graph_view().importable_packages()?,
+            ));
+            let reach_graph = Arc::new(build_reach_graph_from_db(&db_path)?);
+            let include_table = Arc::new(build_include_table_from_db(&db_path)?);
+            let indexed_files = Arc::new(build_indexed_file_list_from_db(&db_path, &build_root)?);
+            let call_read_handle = Arc::new(crate::call_service::CallReadHandle::at_generation(
+                db_path,
+                semantic_generation,
+            ));
+            let workspace_semantics = Arc::new(
+                super::super::workspace_config::PublishedWorkspaceSemantics::load_current(
+                    &build_root,
+                    &[],
+                    &[],
+                ),
+            );
+
+            Ok(EngineSnapshot {
+                root: build_root,
+                epoch,
+                semantic_generation,
+                declaration_index: Some(declaration_index.clone()),
+                name_table: Some(declaration_index.name_table_arc()),
+                fallback_completion_table,
+                reach_graph: Some(reach_graph),
+                include_table: Some(include_table),
+                go_import_table: Some(go_import_table),
+                indexed_files: Some(indexed_files),
+                project_context: Some(project_context),
+                call_read_handle: Some(call_read_handle),
+                workspace_semantics,
+                degraded: DegradedCapabilities::default(),
+            })
+        })
+        .await??;
+
+        Ok(self.publish_engine_snapshot(snapshot).await)
+    }
+
     #[cfg(test)]
     pub(in crate::server) async fn publish_full_index(
         &self,

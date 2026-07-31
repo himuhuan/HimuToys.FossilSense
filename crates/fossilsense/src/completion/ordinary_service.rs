@@ -373,6 +373,7 @@ fn fallback_name_boundary(bytes: &[u8], index: usize) -> bool {
 pub(crate) struct OrdinaryCompletionOutput {
     pub items: Vec<OrdinaryCompletionItem>,
     pub new_pools: Vec<Vec<usize>>,
+    pub new_pool_complete: Vec<bool>,
     pub metrics: CompletionPipelineMetrics,
     pub recall_ms: u128,
     pub merge_rank_ms: u128,
@@ -442,19 +443,21 @@ pub(crate) fn complete_ordinary_identifier(
 pub(crate) fn complete_ordinary_identifier_controlled(
     input: OrdinaryCompletionInput,
     cancellation: &dyn query::CompletionQueryCancellation,
-) -> std::result::Result<OrdinaryCompletionOutput, CancelledOrdinaryCompletion> {
+) -> std::result::Result<OrdinaryCompletionOutput, Box<CancelledOrdinaryCompletion>> {
     complete_ordinary_identifier_inner(input, Some(cancellation))
 }
 
 fn complete_ordinary_identifier_inner(
     input: OrdinaryCompletionInput,
     cancellation: Option<&dyn query::CompletionQueryCancellation>,
-) -> std::result::Result<OrdinaryCompletionOutput, CancelledOrdinaryCompletion> {
+) -> std::result::Result<OrdinaryCompletionOutput, Box<CancelledOrdinaryCompletion>> {
     let recall_started = std::time::Instant::now();
     let open_reason = input.scope.as_ref().and_then(|scope| scope.reach.reason);
     let mut candidates: Vec<OrdinaryPipelineCandidate> = Vec::new();
     let mut new_pools: Vec<Vec<usize>> = Vec::with_capacity(input.tables.len());
+    let mut new_pool_complete: Vec<bool> = Vec::with_capacity(input.tables.len());
     let mut recall_channels = query::CompletionRecallMetrics::default();
+    let mut remaining_candidate_budget = query::COMPLETION_RECALL_CANDIDATE_BUDGET;
     if cancellation.is_some_and(query::CompletionQueryCancellation::is_cancelled) {
         return Err(cancelled_completion(recall_started, recall_channels));
     }
@@ -480,37 +483,33 @@ fn complete_ordinary_identifier_inner(
         let table_project_context = input
             .active_project_context
             .as_ref()
-            .filter(|key| table.table.project_indices(key).is_some());
+            .filter(|key| table.table.has_project_for_family(key, semantic_family));
         let quotas = if table_project_context.is_some() {
             query::CompletionRecallQuotas::with_project_context(input.limit)
         } else {
             query::CompletionRecallQuotas::default_for_completion_limit(input.limit)
         };
         let prior = input.prior_pools.get(idx).and_then(|pool| pool.as_deref());
-        let (mut hits, pool, metrics) = match cancellation {
-            Some(cancellation) => table.table.search_completion_recall_pooled_controlled(
-                query::CompletionRecallQuery {
+        let tables_left = input.tables.len() - idx;
+        let candidate_budget = remaining_candidate_budget.div_ceil(tables_left);
+        let (mut hits, pool, metrics) =
+            table
+                .table
+                .search_completion_recall_pooled_bounded(query::CompletionRecallQuery {
                     query: &input.prefix,
                     quotas,
                     scope: input.scope.as_ref(),
                     active_project: table_project_context,
                     prior_pool: prior,
                     semantic_family: Some(semantic_family),
-                    cancellation: Some(cancellation),
-                },
-            ),
-            None => table
-                .table
-                .search_completion_recall_pooled_with_project_for_family(
-                    &input.prefix,
-                    quotas,
-                    input.scope.as_ref(),
-                    table_project_context,
-                    prior,
-                    semantic_family,
-                ),
-        };
+                    cancellation,
+                    candidate_budget,
+                });
+        remaining_candidate_budget =
+            remaining_candidate_budget.saturating_sub(metrics.entries_inspected);
+        let pool_complete = !metrics.truncated;
         recall_channels.merge_from(metrics);
+        recall_channels.candidate_budget = query::COMPLETION_RECALL_CANDIDATE_BUDGET;
         if recall_channels.cancelled {
             return Err(cancelled_completion(recall_started, recall_channels));
         }
@@ -521,6 +520,7 @@ fn complete_ordinary_identifier_inner(
             hits.retain(|hit| hit.tier != model::ScopeTier::Current);
         }
         new_pools.push(pool);
+        new_pool_complete.push(pool_complete);
         candidates.extend(completion_items_for_indexed_hits(
             hits,
             IndexedCompletionContext {
@@ -748,6 +748,7 @@ fn complete_ordinary_identifier_inner(
     Ok(OrdinaryCompletionOutput {
         items,
         new_pools,
+        new_pool_complete,
         metrics: output.metrics,
         recall_ms,
         merge_rank_ms,
@@ -757,11 +758,11 @@ fn complete_ordinary_identifier_inner(
 fn cancelled_completion(
     recall_started: std::time::Instant,
     recall_metrics: query::CompletionRecallMetrics,
-) -> CancelledOrdinaryCompletion {
-    CancelledOrdinaryCompletion {
+) -> Box<CancelledOrdinaryCompletion> {
+    Box::new(CancelledOrdinaryCompletion {
         recall_metrics,
         recall_ms: recall_started.elapsed().as_millis(),
-    }
+    })
 }
 
 fn ordinary_kind_from_hint(kind: CompletionKindHint) -> OrdinaryCompletionKind {
@@ -831,7 +832,10 @@ mod tests {
     use crate::model::ScopeTier;
     use crate::parser;
     use crate::project_context::{ProjectContext, ProjectContextIndex, ProjectKey};
-    use crate::query::{CompletionScope, NameTable, COMPLETION_LIMIT, COMPLETION_LOCALITY_BONUS};
+    use crate::query::{
+        CompletionScope, NameTable, COMPLETION_LIMIT, COMPLETION_LOCALITY_BONUS,
+        COMPLETION_RECALL_CANDIDATE_BUDGET,
+    };
     use crate::reachability::{OpenReason, ReachScope};
     use crate::semantic_model::{SemanticDeclarationKind, SemanticDeclarationRole};
     use crate::store::views::DeclarationNameRow;
@@ -2108,5 +2112,55 @@ mod tests {
                 "metrics differ for {case}"
             );
         }
+    }
+
+    #[test]
+    fn ordinary_completion_shares_one_hard_candidate_budget_across_roots() {
+        let table = |root: usize| {
+            Arc::new(NameTable::build(
+                (0..20_000)
+                    .map(|index| {
+                        (
+                            (root * 20_000 + index) as i64,
+                            format!("api_root_{root}_{index:05}"),
+                            false,
+                        )
+                    })
+                    .collect(),
+            ))
+        };
+        let output = complete_ordinary_identifier(OrdinaryCompletionInput {
+            prefix: "api".to_string(),
+            text: Arc::from("api"),
+            line: 0,
+            character: 3,
+            parsed_document: None,
+            local_words: Arc::new(HashSet::new()),
+            tables: vec![
+                OrdinaryCompletionNameTable::test(table(0)),
+                OrdinaryCompletionNameTable::test(table(1)),
+            ],
+            scope: None,
+            active_project_context: None,
+            prior_pools: vec![None, None],
+            intent: CompletionIntent::default(),
+            history_enabled: false,
+            history: CompletionHistorySnapshot::default(),
+            prefix_bucket: "api".to_string(),
+            prefix_ranking: CompletionPrefixRanking::Strict,
+            limit: 10,
+            locality_bonus: COMPLETION_LOCALITY_BONUS,
+        });
+
+        assert!(output.metrics.recall_channels.truncated);
+        assert_eq!(output.metrics.recall_channels.active_entries_total, 40_000);
+        assert_eq!(
+            output.metrics.recall_channels.candidate_budget,
+            COMPLETION_RECALL_CANDIDATE_BUDGET
+        );
+        assert!(
+            output.metrics.recall_channels.entries_inspected <= COMPLETION_RECALL_CANDIDATE_BUDGET
+        );
+        assert_eq!(output.new_pool_complete, vec![false, false]);
     }
 }

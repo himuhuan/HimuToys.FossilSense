@@ -11,6 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
+use serde::Serialize;
 
 use crate::call_catalog::rows::{anchor_from_row, call_from_row};
 use crate::call_model::{CallSiteFact, CallableAnchor, LinkageDomain, SourcePosition, SourceRange};
@@ -47,6 +48,34 @@ pub use type_queries::{BoundedMemberCandidates, TypeCandidateBundle, TypeRecordR
 
 pub const DEFAULT_EXACT_NAME_CANDIDATE_LIMIT: usize = 256;
 const MEMBER_FALLBACK_OVERLAY_SCAN_LIMIT: usize = 8_192;
+
+/// Stable identity of the dirty-document facts that can change ordinary
+/// completion's indexed recall universe. The current document's declarations
+/// and body are deliberately absent: its exact request parse supplies those
+/// positional candidates separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct RecallUniverseId([u8; 32]);
+
+impl RecallUniverseId {
+    #[cfg(test)]
+    pub(crate) fn for_test(value: u8) -> Self {
+        let mut bytes = [0; 32];
+        bytes[0] = value;
+        Self(bytes)
+    }
+}
+
+#[derive(Serialize)]
+struct CompletionRecallFileProjection<'a> {
+    path: &'a str,
+    semantic_family: SemanticFamily,
+    package: &'a Option<PackageFact>,
+    imports: &'a [ImportFact],
+    declarations: &'a [DeclarationFact],
+    includes: &'a [Include],
+    fallback_completions: &'a [FallbackCompletionFact],
+    facts_complete: bool,
+}
 
 #[derive(Debug, Clone)]
 pub struct FileCandidateOverlay {
@@ -149,6 +178,57 @@ impl FileCandidateOverlay {
         overlay
     }
 
+    /// Minimal file projection consumed by ordinary identifier completion.
+    /// `include_declarations=false` is used for the current request document:
+    /// it still tombstones durable rows and refreshes live include/package
+    /// evidence, while current declarations and fallback hints come directly
+    /// from the exact positional parse.
+    pub(crate) fn from_completion_index(
+        path: String,
+        index: &FileSemanticIndex,
+        include_declarations: bool,
+    ) -> Self {
+        let mut overlay = Self::new(path, Vec::new(), Vec::new());
+        overlay.semantic_family = index.language.semantic_family();
+        overlay.package.clone_from(&index.package);
+        overlay.imports.clone_from(&index.imports);
+        if include_declarations {
+            overlay.declarations = index
+                .declarations
+                .iter()
+                .cloned()
+                .map(|mut declaration| {
+                    declaration.path.clone_from(&overlay.path);
+                    declaration.identity.locator.path.clone_from(&overlay.path);
+                    if matches!(declaration.linkage, LinkageDomain::Internal(_)) {
+                        declaration.linkage = LinkageDomain::Internal(overlay.path.clone());
+                        declaration.identity.logical_key.linkage_domain =
+                            format!("internal:{}", overlay.path);
+                    }
+                    declaration
+                })
+                .collect();
+            overlay
+                .fallback_completions
+                .clone_from(&index.fallback_completions);
+        }
+        overlay.includes.clone_from(&index.includes);
+        // Include scanning is available even on lexical fallback. A cancelled
+        // parse is represented by `completion_tombstone_for_family` instead.
+        overlay.facts_complete = true;
+        overlay
+    }
+
+    pub(crate) fn completion_tombstone_for_family(
+        path: String,
+        semantic_family: SemanticFamily,
+    ) -> Self {
+        let mut overlay = Self::new(path, Vec::new(), Vec::new());
+        overlay.semantic_family = semantic_family;
+        overlay.facts_complete = false;
+        overlay
+    }
+
     pub fn tombstone(path: String, text: Arc<str>) -> Self {
         let mut overlay = Self::new(path, Vec::new(), Vec::new());
         overlay.text = Some(text);
@@ -165,6 +245,30 @@ impl FileCandidateOverlay {
         overlay.semantic_family = semantic_family;
         overlay
     }
+}
+
+pub(crate) fn completion_recall_universe_id(files: &[FileCandidateOverlay]) -> RecallUniverseId {
+    let mut projections: Vec<_> = files
+        .iter()
+        .map(|file| CompletionRecallFileProjection {
+            path: &file.path,
+            semantic_family: file.semantic_family,
+            package: &file.package,
+            imports: &file.imports,
+            declarations: &file.declarations,
+            includes: &file.includes,
+            fallback_completions: &file.fallback_completions,
+            facts_complete: file.facts_complete,
+        })
+        .collect();
+    projections.sort_by(|left, right| {
+        left.path
+            .cmp(right.path)
+            .then_with(|| (left.semantic_family as u8).cmp(&(right.semantic_family as u8)))
+    });
+    let encoded = serde_json::to_vec(&projections)
+        .expect("completion recall projection contains serializable semantic facts");
+    RecallUniverseId(*blake3::hash(&encoded).as_bytes())
 }
 
 #[derive(Debug, Clone)]

@@ -8,6 +8,7 @@ param(
     [int]$TimeoutSeconds = 600,
     [switch]$IncludeFullIndex,
     [switch]$IncludeEngineHydration,
+    [switch]$IncludeCompletionReplay,
     [switch]$IncludeV142SemanticCases,
     [string]$V142Harness = '',
     [switch]$ListCases,
@@ -16,6 +17,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+. (Join-Path $PSScriptRoot 'benchmark_gate_helpers.ps1')
 
 if (-not $Binary) {
     $Binary = Join-Path $PSScriptRoot '..\target\release\fossilsense.exe'
@@ -123,6 +125,31 @@ function Convert-WhitelistedMetrics([string[]]$Lines) {
         publication_ms = $true
         name_table_ms = $true
         reach_graph_ms = $true
+        completion_lsp_replay_declarations = $true
+        completion_lsp_replay_requests = $true
+        completion_lsp_replay_p50_us = $true
+        completion_lsp_replay_p95_us = $true
+        completion_lsp_replay_max_us = $true
+        completion_lsp_replay_p95_limit_us = $true
+        completion_lsp_replay_context_p95_ms = $true
+        completion_lsp_replay_parse_p95_ms = $true
+        completion_lsp_replay_local_words_p95_ms = $true
+        completion_lsp_replay_overlay_p95_ms = $true
+        completion_lsp_replay_worker_p95_ms = $true
+        completion_lsp_replay_render_p95_ms = $true
+        completion_lsp_replay_indexed_returned_min = $true
+        completion_lsp_replay_active_entries_min = $true
+        completion_lsp_replay_candidate_budget_min = $true
+        completion_lsp_replay_candidate_budget_max = $true
+        completion_lsp_replay_truncated_requests = $true
+        completion_lsp_replay_entries_inspected_min = $true
+        completion_lsp_replay_entries_inspected_max = $true
+        completion_lsp_replay_priority_source_probes_max = $true
+        completion_lsp_replay_priority_source_attempts_max = $true
+        completion_lsp_replay_priority_sources_initialized_max = $true
+        completion_lsp_replay_priority_fuzzy_name_probes_max = $true
+        completion_lsp_replay_priority_fuzzy_declaration_probes_max = $true
+        completion_lsp_replay_sql_reads = $true
         callable_query_us = $true
         candidate_rows_scanned = $true
         candidate_rows_filtered = $true
@@ -265,6 +292,36 @@ if ($IncludeEngineHydration) {
     }
 }
 
+if ($IncludeCompletionReplay) {
+    $completionReplayHarness = Resolve-FullPath (
+        Join-Path $PSScriptRoot 'benchmark_completion_replay.ps1'
+    )
+    if (-not (Test-Path -LiteralPath $completionReplayHarness -PathType Leaf)) {
+        throw "completion replay benchmark harness not found: $completionReplayHarness"
+    }
+    $completionWorkspace = Join-Path $repoRoot 'samples\u-boot'
+    $completionDatabase = Join-Path $benchmarkPath 'index-u-boot-rebuild.sqlite'
+    $cases += [pscustomobject]@{
+        Id = 'u-boot-completion-replay'
+        Executable = 'powershell.exe'
+        Workspace = $completionWorkspace
+        Database = $completionDatabase
+        ResetDatabase = $null
+        OuterMetricsComparable = $false
+        Arguments = @(
+            '-NoProfile',
+            '-ExecutionPolicy',
+            'Bypass',
+            '-File',
+            $completionReplayHarness,
+            '-Database',
+            $completionDatabase,
+            '-Workspace',
+            $completionWorkspace
+        )
+    }
+}
+
 # The v1.4.2 semantic cases are deliberately opt-in. They use an in-process
 # Rust harness so the normal large-workspace benchmark and CI remain unchanged.
 # An executable harness receives `--case` / `--benchmark-root`; a PowerShell
@@ -385,8 +442,23 @@ foreach ($case in $cases) {
             }
         }
         Write-Host "benchmark $($case.Id) run $run/$Repeats"
+        $caseTimeoutSeconds = if ($case.Id -like '*-full-index') {
+            [Math]::Min($TimeoutSeconds, 120)
+        } else {
+            $TimeoutSeconds
+        }
         $sample = Invoke-SampledProcess -FilePath $case.Executable -ArgumentList $case.Arguments `
-            -Timeout $TimeoutSeconds
+            -Timeout $caseTimeoutSeconds
+        $metrics = Convert-WhitelistedMetrics $sample.Stdout
+        if ($case.Id -like '*-full-index') {
+            if (-not $metrics.Contains('elapsed_ms')) {
+                throw "$($case.Id) emitted no engine elapsed_ms for the full-index gate"
+            }
+            Assert-FullIndexPerformanceGate `
+                -CaseId $case.Id `
+                -OuterElapsedMs $sample.ElapsedMs `
+                -EngineElapsedMs $metrics.elapsed_ms
+        }
         $outerMetricsComparable = if (
             $case.PSObject.Properties.Name -contains 'OuterMetricsComparable'
         ) {
@@ -409,7 +481,7 @@ foreach ($case in $cases) {
             } else {
                 $null
             }
-            metrics = Convert-WhitelistedMetrics $sample.Stdout
+            metrics = $metrics
         })
     }
 }
@@ -547,6 +619,40 @@ if ($engineHydrationResults.Count -gt 0) {
             "$([Math]::Round($metrics.engine_hydration_peak_private_bytes / 1MB, 2)) | " +
             "$($metrics.engine_hydration_first_build_ms) | " +
             "$($metrics.engine_hydration_second_build_ms) |"
+        )
+    }
+}
+$completionReplayResults = @(
+    $results | Where-Object { $_.case_id -eq 'u-boot-completion-replay' }
+)
+if ($completionReplayResults.Count -gt 0) {
+    $markdown.Add('')
+    $markdown.Add('## Production LSP completion replay gate')
+    $markdown.Add('')
+    $markdown.Add('The ignored release test hydrates a complete U-Boot engine snapshot, applies dirty-buffer edits, and calls the production `LanguageServer::completion` entry point. P95 must remain at or below 50 ms; recall must stay within 16,384 inspected entries and perform zero declaration-payload SQL reads.')
+    $markdown.Add('')
+    $markdown.Add('| Run | Declarations | Requests | P50 us | P95 us | Max us | Limit us | Context p95 ms | Overlay p95 ms | Worker p95 ms | Indexed min | Active min | Budget min/max | Truncated | Inspected min/max | Source probes/attempts/init max | Fuzzy name/decl probes max | SQL reads |')
+    $markdown.Add('|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|')
+    foreach ($result in $completionReplayResults) {
+        $metrics = $result.metrics
+        $markdown.Add(
+            "| $($result.run) | $($metrics.completion_lsp_replay_declarations) | " +
+            "$($metrics.completion_lsp_replay_requests) | " +
+            "$($metrics.completion_lsp_replay_p50_us) | " +
+            "$($metrics.completion_lsp_replay_p95_us) | " +
+            "$($metrics.completion_lsp_replay_max_us) | " +
+            "$($metrics.completion_lsp_replay_p95_limit_us) | " +
+            "$($metrics.completion_lsp_replay_context_p95_ms) | " +
+            "$($metrics.completion_lsp_replay_overlay_p95_ms) | " +
+            "$($metrics.completion_lsp_replay_worker_p95_ms) | " +
+            "$($metrics.completion_lsp_replay_indexed_returned_min) | " +
+            "$($metrics.completion_lsp_replay_active_entries_min) | " +
+            "$($metrics.completion_lsp_replay_candidate_budget_min)/$($metrics.completion_lsp_replay_candidate_budget_max) | " +
+            "$($metrics.completion_lsp_replay_truncated_requests) | " +
+            "$($metrics.completion_lsp_replay_entries_inspected_min)/$($metrics.completion_lsp_replay_entries_inspected_max) | " +
+            "$($metrics.completion_lsp_replay_priority_source_probes_max)/$($metrics.completion_lsp_replay_priority_source_attempts_max)/$($metrics.completion_lsp_replay_priority_sources_initialized_max) | " +
+            "$($metrics.completion_lsp_replay_priority_fuzzy_name_probes_max)/$($metrics.completion_lsp_replay_priority_fuzzy_declaration_probes_max) | " +
+            "$($metrics.completion_lsp_replay_sql_reads) |"
         )
     }
 }

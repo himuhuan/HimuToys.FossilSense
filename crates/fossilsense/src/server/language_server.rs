@@ -501,6 +501,7 @@ impl LanguageServer for Backend {
             _ => crate::completion_history::CompletionHistorySnapshot::default(),
         };
 
+        let parse_started = tokio::time::Instant::now();
         let parsed_document = match uri_to_path(&uri) {
             Some(path) => {
                 self.get_or_parse_document_with_language(
@@ -515,14 +516,18 @@ impl LanguageServer for Backend {
             }
             None => None,
         };
+        let parse_ms = parse_started.elapsed().as_millis();
         if completion_request.stop_before_worker() {
             return Ok(Some(empty_completion_list(true)));
         }
+        let local_words_started = tokio::time::Instant::now();
         let local_words = self.local_words_for(&uri, version, &text).await;
+        let local_words_ms = local_words_started.elapsed().as_millis();
         if completion_request.stop_before_worker() {
             return Ok(Some(empty_completion_list(true)));
         }
 
+        let overlay_started = tokio::time::Instant::now();
         let mut contexts = {
             let roots = self.workspace_roots.lock().await.clone();
             let mut contexts = Vec::with_capacity(roots.len());
@@ -543,19 +548,28 @@ impl LanguageServer for Backend {
         let mut table_roots = Vec::new();
         let mut table_semantic_generations = Vec::new();
         let mut table_generations = Vec::new();
+        let mut table_recall_universes = Vec::new();
         let mut effective_completion_scope = None;
         for context in &contexts {
             if completion_request.stop_before_worker() {
                 return Ok(Some(empty_completion_list(true)));
             }
             if let Some(table) = context.engine.name_table.clone() {
-                let overlay = self
-                    .candidate_overlay_snapshot_from_documents(
-                        &context.engine.root,
-                        context.engine.semantic_generation,
-                        context.engine.reach_graph.as_deref(),
-                        context.engine.indexed_files.as_deref().map(Vec::as_slice),
-                        context.engine.workspace_semantics.clone(),
+                let (overlay, recall_universe) = self
+                    .completion_overlay_snapshot_from_documents(
+                        super::candidate_context::CompletionOverlayRequest {
+                            root: &context.engine.root,
+                            current_uri: &uri,
+                            engine_epoch: context.engine.epoch,
+                            generation: context.engine.semantic_generation,
+                            base_reach_graph: context.engine.reach_graph.as_deref(),
+                            indexed_workspace_files: context
+                                .engine
+                                .indexed_files
+                                .as_deref()
+                                .map(Vec::as_slice),
+                            workspace_semantics: context.engine.workspace_semantics.clone(),
+                        },
                         document_request.clone(),
                     )
                     .await;
@@ -628,6 +642,7 @@ impl LanguageServer for Backend {
                     .fallback_completion_table
                     .with_updated_family_paths(overlay.shadowed_paths(), overlay_fallbacks);
                 table_generations.push((context.engine.root.clone(), context.engine.epoch));
+                table_recall_universes.push(recall_universe);
                 table_roots.push(context.engine.root.clone());
                 table_semantic_generations.push(context.engine.semantic_generation);
                 tables.push(OrdinaryCompletionNameTable {
@@ -654,6 +669,7 @@ impl LanguageServer for Backend {
         }
         let (active_project_context, project_selection_epoch) =
             self.effective_project_for_uri(&uri, &contexts).await;
+        let overlay_ms = overlay_started.elapsed().as_millis();
 
         // Limited include-reachability scope: re-ranks candidates by their
         // `ScopeTier` (current / reachable / first-layer external / unknown /
@@ -672,7 +688,7 @@ impl LanguageServer for Backend {
             &table_generations,
             project_selection_epoch,
             active_project_context.as_ref(),
-            completion_overlay_epoch,
+            &table_recall_universes,
         );
         let memo_lookup = self
             .session
@@ -769,6 +785,9 @@ impl LanguageServer for Backend {
                 let timings = crate::completion::CompletionStageTimings {
                     total_ms: ordinary_started.elapsed().as_millis(),
                     context_ms,
+                    parse_ms,
+                    local_words_ms,
+                    overlay_ms,
                     admission_wait_ms,
                     worker_ms,
                     recall_ms: output.recall_ms,
@@ -776,6 +795,8 @@ impl LanguageServer for Backend {
                     render_ms,
                 };
                 let metrics = output.metrics;
+                #[cfg(test)]
+                self.record_completion_perf_for_test(timings, metrics);
                 self.perf_log(|| {
                     crate::completion::completion_perf_summary(
                         &memo_prefix,
@@ -797,6 +818,7 @@ impl LanguageServer for Backend {
                         memo_prefix,
                         completion_generation,
                         output.new_pools,
+                        output.new_pool_complete,
                     )
                     .await;
                 // No await may follow this check: it is the response

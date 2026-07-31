@@ -399,31 +399,193 @@ mod tests {
 
         let mut samples = Vec::new();
         let mut inspected = Vec::new();
+        let mut fuzzy_posting_inspected = Vec::new();
+        let mut fuzzy_sample_inspected = Vec::new();
+        let mut selection_inspected = Vec::new();
         for prefix in ["i", "in", "init", "d", "de", "dev", "c", "cmd"] {
+            let (oracle_hits, _, oracle_metrics) = index
+                .name_table()
+                .search_completion_recall_pooled_bounded(crate::query::CompletionRecallQuery {
+                    query: prefix,
+                    quotas,
+                    scope: None,
+                    active_project: None,
+                    prior_pool: None,
+                    semantic_family: Some(crate::semantic_model::SemanticFamily::CFamily),
+                    cancellation: None,
+                    candidate_budget: usize::MAX,
+                });
+            assert!(!oracle_metrics.truncated);
+            let (bounded_hits, _, bounded_metrics) = index
+                .name_table()
+                .search_completion_recall_pooled_bounded(crate::query::CompletionRecallQuery {
+                    query: prefix,
+                    quotas,
+                    scope: None,
+                    active_project: None,
+                    prior_pool: None,
+                    semantic_family: Some(crate::semantic_model::SemanticFamily::CFamily),
+                    cancellation: None,
+                    candidate_budget: crate::query::COMPLETION_RECALL_CANDIDATE_BUDGET,
+                });
+            let oracle_top: std::collections::HashSet<_> =
+                oracle_hits.iter().take(100).map(|hit| hit.id).collect();
+            let overlap = bounded_hits
+                .iter()
+                .take(100)
+                .filter(|hit| oracle_top.contains(&hit.id))
+                .count();
+            println!("completion_quality_{prefix}_top100_overlap: {overlap}");
+            println!(
+                "completion_quality_{prefix}_bounded_hits: {}",
+                bounded_hits.len()
+            );
+            println!(
+                "completion_quality_{prefix}_oracle_hits: {}",
+                oracle_hits.len()
+            );
+            assert_eq!(
+                overlap,
+                oracle_top.len(),
+                "bounded top-100 prefix quality diverged for {prefix}"
+            );
+            assert!(
+                bounded_metrics.selection_entries_inspected
+                    <= crate::query::COMPLETION_RECALL_CANDIDATE_BUDGET.saturating_mul(6),
+                "post-recall selection escaped the fixed channel bound: {bounded_metrics:?}"
+            );
             for _ in 0..5 {
                 let started = std::time::Instant::now();
                 let (hits, pool, metrics) = index
                     .name_table()
-                    .search_completion_recall_pooled_with_project_for_family(
-                        prefix,
+                    .search_completion_recall_pooled_bounded(crate::query::CompletionRecallQuery {
+                        query: prefix,
                         quotas,
-                        None,
-                        None,
-                        None,
-                        crate::semantic_model::SemanticFamily::CFamily,
-                    );
+                        scope: None,
+                        active_project: None,
+                        prior_pool: None,
+                        semantic_family: Some(crate::semantic_model::SemanticFamily::CFamily),
+                        cancellation: None,
+                        candidate_budget: crate::query::COMPLETION_RECALL_CANDIDATE_BUDGET,
+                    });
                 samples.push(started.elapsed().as_micros());
                 inspected.push(metrics.entries_inspected);
+                fuzzy_posting_inspected.push(metrics.fuzzy_posting_entries_inspected);
+                fuzzy_sample_inspected.push(metrics.fuzzy_sample_entries_inspected);
+                selection_inspected.push(metrics.selection_entries_inspected);
                 assert!(!metrics.cancelled);
+                assert!(metrics.truncated);
+                assert!(
+                    metrics.entries_inspected <= crate::query::COMPLETION_RECALL_CANDIDATE_BUDGET
+                );
                 std::hint::black_box((hits, pool));
             }
         }
+        for (query, target_name) in [
+            ("dbdtn", "device_bind_driver_to_node"),
+            ("ugdbn", "uclass_get_device_by_name"),
+            ("ogn", "ofnode_get_name"),
+            ("bif", "board_init_f"),
+        ] {
+            let (oracle_hits, _, oracle_metrics) = index
+                .name_table()
+                .search_completion_recall_pooled_bounded(crate::query::CompletionRecallQuery {
+                    query,
+                    quotas,
+                    scope: None,
+                    active_project: None,
+                    prior_pool: None,
+                    semantic_family: Some(crate::semantic_model::SemanticFamily::CFamily),
+                    cancellation: None,
+                    candidate_budget: usize::MAX,
+                });
+            let (bounded_hits, _, bounded_metrics) = index
+                .name_table()
+                .search_completion_recall_pooled_bounded(crate::query::CompletionRecallQuery {
+                    query,
+                    quotas,
+                    scope: None,
+                    active_project: None,
+                    prior_pool: None,
+                    semantic_family: Some(crate::semantic_model::SemanticFamily::CFamily),
+                    cancellation: None,
+                    candidate_budget: crate::query::COMPLETION_RECALL_CANDIDATE_BUDGET,
+                });
+            assert!(!oracle_metrics.truncated);
+            assert!(
+                !oracle_hits.is_empty(),
+                "fuzzy oracle has no hits for {query}"
+            );
+            let quality_limit = oracle_hits.len().min(100);
+            let oracle_top: std::collections::HashSet<_> = oracle_hits
+                .iter()
+                .take(quality_limit)
+                .map(|hit| hit.id)
+                .collect();
+            let overlap = bounded_hits
+                .iter()
+                .take(quality_limit)
+                .filter(|hit| oracle_top.contains(&hit.id))
+                .count();
+            println!("completion_fuzzy_quality_{query}_limit: {quality_limit}");
+            println!("completion_fuzzy_quality_{query}_overlap: {overlap}");
+            let oracle_indexed_quality: std::collections::HashSet<_> = oracle_hits
+                .iter()
+                .filter(|hit| hit.base_match >= 400)
+                .take(100)
+                .map(|hit| hit.id)
+                .collect();
+            let indexed_quality_overlap = bounded_hits
+                .iter()
+                .filter(|hit| hit.base_match >= 400)
+                .take(100)
+                .filter(|hit| oracle_indexed_quality.contains(&hit.id))
+                .count();
+            let target_rank = bounded_hits
+                .iter()
+                .position(|hit| hit.name == target_name)
+                .map(|rank| rank + 1);
+            let oracle_target_rank = oracle_hits
+                .iter()
+                .position(|hit| hit.name == target_name)
+                .map(|rank| rank + 1);
+            println!(
+                "completion_fuzzy_quality_{query}_indexed_oracle: {}",
+                oracle_indexed_quality.len()
+            );
+            println!("completion_fuzzy_quality_{query}_indexed_overlap: {indexed_quality_overlap}");
+            println!("completion_fuzzy_quality_{query}_oracle_target_rank: {oracle_target_rank:?}");
+            println!("completion_fuzzy_quality_{query}_target_rank: {target_rank:?}");
+            println!(
+                "completion_fuzzy_quality_{query}_entries_inspected: {}",
+                bounded_metrics.entries_inspected
+            );
+            assert_eq!(
+                indexed_quality_overlap,
+                oracle_indexed_quality.len(),
+                "bounded indexed fuzzy tier diverged for {query}"
+            );
+            assert_eq!(
+                target_rank.is_some(),
+                oracle_target_rank.is_some(),
+                "bounded target presence diverged from the full-scan oracle for {query}"
+            );
+        }
         samples.sort_unstable();
         inspected.sort_unstable();
+        fuzzy_posting_inspected.sort_unstable();
+        fuzzy_sample_inspected.sort_unstable();
+        selection_inspected.sort_unstable();
         let p50 = samples[samples.len() / 2];
         let p95 = samples[samples.len() * 95 / 100];
         let inspected_p50 = inspected[inspected.len() / 2];
         let inspected_max = inspected[inspected.len() - 1];
+        let fuzzy_posting_p50 = fuzzy_posting_inspected[fuzzy_posting_inspected.len() / 2];
+        let fuzzy_posting_max = fuzzy_posting_inspected[fuzzy_posting_inspected.len() - 1];
+        let fuzzy_sample_p50 = fuzzy_sample_inspected[fuzzy_sample_inspected.len() / 2];
+        let fuzzy_sample_max = fuzzy_sample_inspected[fuzzy_sample_inspected.len() - 1];
+        let selection_p50 = selection_inspected[selection_inspected.len() / 2];
+        let selection_max = selection_inspected[selection_inspected.len() - 1];
         let stats = index.payload_cache_stats();
         assert_eq!(
             stats.sql_reads, 0,
@@ -434,6 +596,17 @@ mod tests {
         println!("completion_production_cold_p95_us: {p95}");
         println!("completion_production_entries_inspected_p50: {inspected_p50}");
         println!("completion_production_entries_inspected_max: {inspected_max}");
+        println!("completion_production_fuzzy_posting_inspected_p50: {fuzzy_posting_p50}");
+        println!("completion_production_fuzzy_posting_inspected_max: {fuzzy_posting_max}");
+        println!("completion_production_fuzzy_sample_inspected_p50: {fuzzy_sample_p50}");
+        println!("completion_production_fuzzy_sample_inspected_max: {fuzzy_sample_max}");
+        println!("completion_production_selection_inspected_p50: {selection_p50}");
+        println!("completion_production_selection_inspected_max: {selection_max}");
+        println!(
+            "completion_production_candidate_budget: {}",
+            crate::query::COMPLETION_RECALL_CANDIDATE_BUDGET
+        );
+        println!("completion_production_truncated: true");
         println!("completion_production_sql_reads: {}", stats.sql_reads);
     }
 }
