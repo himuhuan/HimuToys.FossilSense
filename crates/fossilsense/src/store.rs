@@ -109,14 +109,16 @@ fn take_migration_failpoint(expected: MigrationFailpoint) -> bool {
     })
 }
 
-/// Cross-process writer lock for one explicit index destination.
+/// Cross-process writer lock for one logical index destination.
 ///
-/// Every FossilSense writer that receives an explicit `--db` path holds an
-/// exclusive transaction on a small, stable sibling lock database. SQLite
-/// releases that transaction after normal exit or process death, avoiding a
-/// stale PID-file protocol. The lock database itself intentionally remains so
-/// no close/delete/open race can split cooperating writers across two inodes.
-pub struct ExplicitIndexLock {
+/// Every FossilSense writer holds an exclusive transaction on a small, stable
+/// sibling lock database. Default indexes use the generation family's stable
+/// `index.sqlite` fallback path as their logical destination; explicit
+/// `--db` indexes use the requested destination. SQLite releases the
+/// transaction after normal exit or process death, avoiding a stale PID-file
+/// protocol. The lock database itself intentionally remains so no
+/// close/delete/open race can split cooperating writers across two inodes.
+pub struct IndexWriterLock {
     _connection: Connection,
     destination: PathBuf,
 }
@@ -246,22 +248,18 @@ fn include_normalized_metadata(target_text: &str) -> (&'static str, String, Stri
     (form_str, normalized, basename)
 }
 
-impl ExplicitIndexLock {
+impl IndexWriterLock {
     pub fn acquire(destination: &Path) -> Result<Self> {
-        let destination = normalized_explicit_destination(destination)?;
-        let lock_path = explicit_lock_path(&destination);
-        let connection = Connection::open(&lock_path).with_context(|| {
-            format!(
-                "failed to open explicit index writer lock {}",
-                lock_path.display()
-            )
-        })?;
+        let destination = normalized_index_destination(destination)?;
+        let lock_path = index_writer_lock_path(&destination);
+        let connection = Connection::open(&lock_path)
+            .with_context(|| format!("failed to open index writer lock {}", lock_path.display()))?;
         connection.busy_timeout(Duration::from_millis(250))?;
         let journal_mode: String =
             connection.query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))?;
         anyhow::ensure!(
             journal_mode.eq_ignore_ascii_case("delete"),
-            "explicit index writer lock kept unexpected journal mode {journal_mode}"
+            "index writer lock kept unexpected journal mode {journal_mode}"
         );
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection
@@ -273,7 +271,7 @@ impl ExplicitIndexLock {
             )
             .with_context(|| {
                 format!(
-                    "explicit index destination {} is locked by another FossilSense writer",
+                    "index destination {} is locked by another FossilSense writer",
                     destination.display()
                 )
             })?;
@@ -970,7 +968,7 @@ fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     sidecar.into()
 }
 
-fn normalized_explicit_destination(destination: &Path) -> Result<PathBuf> {
+fn normalized_index_destination(destination: &Path) -> Result<PathBuf> {
     let file_name = destination
         .file_name()
         .ok_or_else(|| anyhow::anyhow!("explicit index destination has no file name"))?;
@@ -1008,7 +1006,7 @@ fn normalized_explicit_destination(destination: &Path) -> Result<PathBuf> {
     }
 }
 
-fn explicit_lock_path(destination: &Path) -> PathBuf {
+fn index_writer_lock_path(destination: &Path) -> PathBuf {
     let mut hasher = blake3::Hasher::new();
     #[cfg(windows)]
     {

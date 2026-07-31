@@ -8,11 +8,11 @@ use crate::config::{
     resolve_go_module_roots, resolve_include_roots, ConfigIssue, LanguageResolver, WorkspaceConfig,
 };
 use crate::pathing::{
-    canonical_workspace, default_index_path, default_index_staging_path, normalize_abs_path,
-    publish_default_index, relative_slash_path, ExplicitIndexPublication,
+    canonical_workspace, default_index_directory, default_index_path, default_index_staging_path,
+    normalize_abs_path, publish_default_index, relative_slash_path, ExplicitIndexPublication,
 };
 use crate::progress::{IndexStats, IndexStatus};
-use crate::store::{ExplicitIndexLock, IndexStore};
+use crate::store::{IndexStore, IndexWriterLock};
 
 mod candidates;
 mod go_packages;
@@ -113,18 +113,21 @@ pub fn index_workspace(
     let workspace = canonical_workspace(workspace)?;
     let workspace_display = workspace.display().to_string();
     let requested_explicit_db_path = options.db_path.clone();
-    let explicit_lock = requested_explicit_db_path
-        .as_deref()
-        .map(ExplicitIndexLock::acquire)
-        .transpose()?;
-    let explicit_db_path = explicit_lock
+    let logical_destination = if let Some(path) = requested_explicit_db_path.as_ref() {
+        path.clone()
+    } else {
+        default_index_directory(&workspace)?.join("index.sqlite")
+    };
+    // Hold the stable sibling lock from before active-generation discovery
+    // until every write and any manifest publication have completed. This
+    // serializes default generation cleanup and prevents an older concurrent
+    // build from replacing a newer manifest.
+    let writer_lock = IndexWriterLock::acquire(&logical_destination)?;
+    let explicit_db_path = requested_explicit_db_path
         .as_ref()
-        .map(|lock| lock.destination_path().to_path_buf());
-    let explicit_snapshot = if options.force {
-        explicit_lock
-            .as_ref()
-            .map(ExplicitIndexLock::capture_replacement_snapshot)
-            .transpose()?
+        .map(|_| writer_lock.destination_path().to_path_buf());
+    let explicit_snapshot = if options.force && explicit_db_path.is_some() {
+        Some(writer_lock.capture_replacement_snapshot()?)
     } else {
         None
     };
@@ -365,14 +368,11 @@ pub fn index_workspace(
             let publication = explicit_publication
                 .take()
                 .expect("explicit side-by-side publication");
-            explicit_lock
-                .as_ref()
-                .expect("explicit publication writer lock")
-                .prepare_for_atomic_replacement(
-                    explicit_snapshot
-                        .as_ref()
-                        .expect("explicit publication snapshot"),
-                )?;
+            writer_lock.prepare_for_atomic_replacement(
+                explicit_snapshot
+                    .as_ref()
+                    .expect("explicit publication snapshot"),
+            )?;
             publication.publish()?;
         }
         stats.publication_ms = publication_started.elapsed().as_millis();
@@ -424,14 +424,17 @@ pub fn index_dirty_files(
     let workspace = canonical_workspace(workspace)?;
     let workspace_display = workspace.display().to_string();
     let requested_explicit_db_path = options.db_path.clone();
-    let explicit_lock = requested_explicit_db_path
-        .as_deref()
-        .map(ExplicitIndexLock::acquire)
-        .transpose()?;
-    let db_path = explicit_lock
-        .as_ref()
-        .map(|lock| lock.destination_path().to_path_buf())
-        .map_or_else(|| default_index_path(&workspace), Ok)?;
+    let logical_destination = if let Some(path) = requested_explicit_db_path.as_ref() {
+        path.clone()
+    } else {
+        default_index_directory(&workspace)?.join("index.sqlite")
+    };
+    let writer_lock = IndexWriterLock::acquire(&logical_destination)?;
+    let db_path = if requested_explicit_db_path.is_some() {
+        writer_lock.destination_path().to_path_buf()
+    } else {
+        default_index_path(&workspace)?
+    };
     let mut stats = IndexStats {
         total_files: changes.len(),
         ..Default::default()

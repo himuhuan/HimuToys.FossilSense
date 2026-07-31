@@ -208,6 +208,43 @@ impl Drop for ExplicitIndexPublication {
     }
 }
 
+#[derive(Debug)]
+struct UnpublishedDefaultIndex {
+    database: PathBuf,
+    manifest_staging: Option<PathBuf>,
+    published: bool,
+}
+
+impl UnpublishedDefaultIndex {
+    fn new(database: PathBuf) -> Self {
+        Self {
+            database,
+            manifest_staging: None,
+            published: false,
+        }
+    }
+
+    fn own_manifest_staging(&mut self, path: PathBuf) {
+        self.manifest_staging = Some(path);
+    }
+
+    fn mark_published(mut self) {
+        self.published = true;
+    }
+}
+
+impl Drop for UnpublishedDefaultIndex {
+    fn drop(&mut self) {
+        if self.published {
+            return;
+        }
+        if let Some(manifest_staging) = self.manifest_staging.as_deref() {
+            let _ = fs::remove_file(manifest_staging);
+        }
+        remove_sqlite_file_family(&self.database);
+    }
+}
+
 /// Publish a completed, closed staging database through the workspace's active
 /// manifest. The database rename happens first; the manifest replacement is the
 /// single visibility point. Older generation files are intentionally retained
@@ -244,6 +281,7 @@ fn publish_index_in_directory(
             final_path.display()
         )
     })?;
+    let mut unpublished = UnpublishedDefaultIndex::new(final_path.clone());
 
     let manifest = directory.join("active-index");
     let manifest_staging = directory.join(format!("active-index-{token}.tmp"));
@@ -257,11 +295,13 @@ fn publish_index_in_directory(
                 manifest_staging.display()
             )
         })?;
+    unpublished.own_manifest_staging(manifest_staging.clone());
     file.write_all(final_name.as_bytes())?;
     file.write_all(b"\n")?;
     file.sync_all()?;
     drop(file);
     atomic_replace(&manifest_staging, &manifest)?;
+    unpublished.mark_published();
     let _ = cleanup_index_directory(directory, stale_temp_cutoff());
     Ok(final_path)
 }
@@ -497,6 +537,9 @@ pub fn normalize_abs_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
+#[cfg(all(test, windows))]
+mod windows_tests;
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -553,6 +596,39 @@ mod tests {
         drop(first_lease);
         assert!(!first.exists(), "released old generation is cleaned");
         assert_eq!(fs::read(&second).unwrap(), b"second");
+    }
+
+    #[test]
+    fn manifest_staging_collision_reclaims_generation_without_deleting_conflicting_file() {
+        let dir = tempdir().expect("tempdir");
+        let first_staging = dir.path().join("index-build-first.sqlite");
+        fs::write(&first_staging, b"first").expect("first staging");
+        let first =
+            publish_index_in_directory(dir.path(), &first_staging, 1).expect("publish first");
+
+        let conflicting_manifest_staging = dir.path().join("active-index-collision.tmp");
+        fs::write(&conflicting_manifest_staging, b"foreign").expect("conflicting manifest staging");
+        let second_staging = dir.path().join("index-build-collision.sqlite");
+        fs::write(&second_staging, b"second").expect("second staging");
+        let error = publish_index_in_directory(dir.path(), &second_staging, 2)
+            .expect_err("create_new must reject conflicting manifest staging");
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to create index manifest staging file"),
+            "unexpected publication error: {error:#}"
+        );
+        assert_eq!(resolve_active_index(dir.path()).unwrap(), first);
+        assert_eq!(
+            fs::read(&conflicting_manifest_staging).expect("preserved conflicting file"),
+            b"foreign",
+            "guard must only remove manifest staging it created"
+        );
+        assert!(
+            !dir.path().join("index-g2-collision.sqlite").exists(),
+            "unpublished generation must be reclaimed after create_new failure"
+        );
     }
 
     #[test]

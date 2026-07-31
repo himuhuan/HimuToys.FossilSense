@@ -293,12 +293,12 @@ fn explicit_index_lock_serializes_writers_and_rejects_target_advancement() {
         upsert_source(&mut store, "main.c", "int first(void) { return 1; }\n");
     }
 
-    let lock = ExplicitIndexLock::acquire(&db).expect("first writer lock");
+    let lock = IndexWriterLock::acquire(&db).expect("first writer lock");
     let snapshot = lock
         .capture_replacement_snapshot()
         .expect("replacement snapshot");
     assert_eq!(snapshot.generation(), 1);
-    let competing_error = ExplicitIndexLock::acquire(&db)
+    let competing_error = IndexWriterLock::acquire(&db)
         .err()
         .expect("a second writer must not share the lock");
     assert!(
@@ -326,7 +326,7 @@ fn explicit_index_lock_serializes_writers_and_rejects_target_advancement() {
     );
     drop(lock);
 
-    ExplicitIndexLock::acquire(&db).expect("process exit releases writer lock");
+    IndexWriterLock::acquire(&db).expect("process exit releases writer lock");
 }
 
 #[test]
@@ -345,7 +345,7 @@ fn explicit_replacement_snapshot_rejects_an_invalid_generation() {
             .expect("corrupt generation");
     }
 
-    let lock = ExplicitIndexLock::acquire(&db).expect("writer lock");
+    let lock = IndexWriterLock::acquire(&db).expect("writer lock");
     let error = lock
         .capture_replacement_snapshot()
         .expect_err("invalid generation must not silently become zero");

@@ -768,3 +768,40 @@ TDD 使用独立 `migration_atomicity.rs`，没有继续膨胀原 625 行 resili
 按用户要求，本阶段中途清除了已完成阶段的本地生成物：`target/benchmark` 与 `target/validation-1.5.0` 当时合计 14,866,136,504 bytes（约 13.85 GiB），包括阶段 4C–4H SQLite 实验副本和旧原始 benchmark/validation 文件；历史数值已保留在本报告，但此前章节引用的本地原始路径不再存在。Stage 4I 的 benchmark 随后重新创建当前 `target/benchmark`，只保留本阶段 JSON/Markdown、当前 U-Boot DB 和预期的 8 KiB writer lock。
 
 边界保持明确：该事务保证 SQLite schema migration 在 SQL 错误、Rust error return 和被验证的进程 `abort` 下不会暴露半迁移状态；它不扩张为对介质永久损坏、文件系统违反持久化承诺或已提交数据库被外部程序篡改的恢复保证。full-build migration 成功后的 disposable runtime PRAGMA/专用 call-string setup 属于未发布 build target 初始化，不在原地 schema migration 的发布边界内。schema 仍为 28，因为持久化形状没有变化。
+
+### 阶段 4J：Windows 发布失败回收与默认索引跨进程串行化（已完成）
+
+状态：实现、真实 Windows 句柄故障注入、跨进程竞争与强制终止测试、完整 Rust 门禁、U-Boot full-index/hydration/no-change 门禁和两轮独立 reviewer 均已通过。
+
+阶段 4G 已让显式 `--force` 使用旁路数据库和原子替换，但当时仍缺少 Windows 目标被不共享删除的句柄占用时的真实 `MoveFileExW` 失败证据。当前源码复核还发现默认 generation 发布的另一个泄漏窗口：staging 数据库先被 rename 为最终 `index-g*.sqlite`，随后才创建并替换 `active-index` manifest；若 manifest 临时文件碰撞、写入失败或 Windows 拒绝替换 manifest，旧 active generation 保持安全，但新封存数据库和 manifest 临时文件没有所有权 guard，会永久留在缓存目录。
+
+本阶段先用 Win32 `CreateFileW` 打开目标并只声明 `FILE_SHARE_READ | FILE_SHARE_WRITE`，明确省略 `FILE_SHARE_DELETE`。显式发布测试证明 `MoveFileExW` 失败时旧目标逐字节不变、唯一 staging 被回收，关闭句柄后同一路径可成功重试；该分支是既有正确行为的 Windows 回归证据。默认 manifest 测试在旧实现上则稳定失败：旧 manifest/旧 generation 可读，但未发布的新 generation 仍存在。实现增加 `UnpublishedDefaultIndex` 所有权 guard：数据库 rename 成功后立即接管完整 SQLite family；manifest 临时文件只有在 `create_new` 成功后才纳入所有权，避免误删碰撞的外部文件；仅在 `atomic_replace` 成功后解除回滚。同步错误和 Drop 会尽力删除新数据库及 `-wal`、`-shm`、`-journal` sidecar，同时保留旧 manifest、旧数据库和并非本次创建的冲突文件。
+
+首轮 reviewer 在失败回收实现上没有发现所有权或 Windows API 问题，但指出一个更高优先级的跨进程发布竞态：默认 publisher A 封存 generation 后暂停，publisher B 切换 manifest 并清理目录时看不到 A 的进程内 lease，可能删除 A 的 generation；A 随后仍能把 manifest 切到已不存在的文件。较早开始、较晚完成的构建还可能覆盖较新内容并使 semantic generation 回退。LSP 内的异步 gate 只能串行化单进程任务，不能约束另一个 LSP 或 CLI 进程。
+
+修复把原先只服务显式目标的 SQLite sibling lock 泛化为 `IndexWriterLock`。默认索引始终以 workspace cache generation family 内稳定的 `index.sqlite` fallback 路径作为逻辑目标，显式索引仍以规范化后的 `--db` 目标作为逻辑目标；完整路径经 BLAKE3 导出同目录稳定的 8 KiB lock 数据库。全量和 dirty 默认写入都在读取 `active-index`、旧 generation 或 schema 之前执行 `BEGIN EXCLUSIVE`，并把连接保留到数据库提交、manifest 切换和清理全部结束；显式 replacement snapshot、WAL drain 和发布前身份/generation 复核仍在同一锁持有期内。竞争 writer 在 250 ms busy timeout 后明确失败，不读取陈旧 generation 继续构建。锁数据库不删除，避免 close/delete/open 把 cooperating writers 分裂到不同 inode；连接正常释放、错误展开或进程终止时，SQLite/操作系统会释放事务锁。
+
+跨进程 TDD 使用当前 Rust test executable 启动精确子测试。父进程先持有默认逻辑目标锁，子进程执行真实默认 `force` index；修改前子进程成功构建并发布 generation 1，父测试因预期 `locked` 错误而稳定 RED，修改后在任何 active-generation 读取和写入前被拒绝并转为 PASS。reviewer 复审确认原 P1 完整关闭且无新 finding，同时指出尚缺“持锁进程被强制终止”的直接证据。补充测试让子进程取得锁后把精确 `writer-lock-acquired\n` 写入唯一临时文件、`sync_all()`、关闭并原子 rename 为 ready marker；父进程验证完整 marker 后直接终止并有界轮询回收子进程，随后同一默认目标可立即重新取得锁。测试 guard 覆盖正常作用域退出和可展开 panic；helper 另有 30 秒自限时，因此父测试被 timeout、`abort` 或外部强杀时也不会永久遗留持锁进程。
+
+`CreateFileW` 的 Rust 签名需要 `windows-sys/Win32_Security` 类型，因此 Cargo 只为既有 `windows-sys 0.61` 增加该 compile-time feature；没有新增 crate、许可证、运行时 DLL 或 VSIX 外部依赖。Windows 专用测试隔离在 `pathing/windows_tests.rs`，主 `pathing.rs` 保持 796 行，没有越过架构 fitness 的 800 行阈值。
+
+独立 test-executor 的最终门禁：
+
+| 命令/门禁 | 结果 |
+|---|---|
+| `cargo fmt --all -- --check` | PASS，1.779 s |
+| `cargo test -p fossilsense` | PASS，unit 1032 passed / 6 ignored，CLI 1 passed，LSP 2 passed；0 failed |
+| `cargo clippy -p fossilsense --all-targets -- -D warnings` | PASS，1.318 s（增量复跑） |
+| `cargo build --release -p fossilsense` | PASS，54.36 s |
+| `cargo test --release -p fossilsense --bin fossilsense --no-run` | PASS |
+| U-Boot full-index | PASS，wrapper 38,090.534 ms；engine 37,039 ms |
+| U-Boot engine hydration | PASS，单代峰值 183,783,424 bytes；双代绝对峰值 348,844,032 bytes |
+| U-Boot existing explicit DB no-change | PASS，wrapper 4,403.945 ms；engine 4,162 ms |
+
+大型门禁使用 U-Boot commit `6741b0dfb41dc82a284ab1cff4c58af6ef2f3f9c`；样本保留 `boot/scene.c`、`boot/vbe_abrec.c` 两处既存空白差异，准确标记为 dirty。机器为 Acer Nitro AN515-58、Intel Core i5-12500H（12 cores / 16 logical processors）、25,459,482,624 bytes RAM、Windows 11 Pro Insider build 26220。
+
+full-index 保持 13,244 files、654,890 declarations、91,919 callable anchors 和 582,522 call sites。分段为 discover 781 ms、parse 6,114、write 18,547、check 8、include edge 3,131、secondary index 3,404、publication 4,371；峰值 Working Set 165,855,232 bytes、Private Bytes 158,576,640。fresh DB 为 363,053,056 bytes、88,636 pages、freelist 0。hydration compact recall 为 93,747,480 bytes，首/次代构建 4,304/4,009 ms；单代峰值约 175.27 MiB、旧快照存活时双代绝对峰值约 332.68 MiB，分别低于 384/512 MiB 硬门禁。原始报告为 `target/benchmark/large-workspace-20260731_100103.json` 与同名 Markdown。
+
+同一已有显式数据库随后不带 `--force` 打开，13,244 个文件全部 skipped；engine 4,162 ms，其中 discover 787、check 52、include edge 2,767，parse/write/secondary-index/publication 都为 0。关闭后数据库为 363,302,912 bytes、88,697 pages、freelist 0，schema 28、semantic generation 2、13,244 file revisions 与 13,244 active revisions、pending revisions 0、staging builds 0、654,890 declarations、`cleanup_required=0`、`quick_check=ok`、foreign-key violations=0。这同时证明大型真实目标在 full-index 结束后已释放 sibling lock，普通重开没有退化为 full rebuild。
+
+边界保持明确：跨进程锁只约束遵守 FossilSense 协议的 writer，不能阻止直接绕过 sibling lock 修改 SQLite/manifest 的外部程序；Windows 文件系统拒绝删除失败产物时，Drop 回收仍只能 best-effort，但旧发布状态保持安全。显式 `--db --force` 在进程被强杀时仍可能留下唯一命名的 `.fossilsense-index-build-*` staging；自动删除任意用户指定目录中的此类文件缺少可证明的 durable ownership，当前不以文件名猜测所有权。该残余风险是磁盘累积而非半发布或旧库损坏，后续若处理应先引入严格 claim/owner 协议，不能直接扩大启动清理范围。
