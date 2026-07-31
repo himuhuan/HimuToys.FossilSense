@@ -869,3 +869,23 @@ TDD 的首个子进程用当前 Rust test executable 持有 G1 lease、原子发
 full-index 保持 13,244 files、654,890 declarations、91,919 callable anchors 和 582,522 call sites。分段为 discover 2,422 ms、parse 6,621、write 18,201、check 10、include edge 3,004、secondary index 3,381、publication 4,351；峰值 Working Set 171,491,328 bytes、Private Bytes 161,083,392。fresh DB 为 363,139,072 bytes、88,657 pages，schema 28、semantic generation 1、13,244 file/active revisions、`cleanup_required=0`、`quick_check=ok`、foreign-key violations=0。hydration compact recall 为 93,747,480 bytes，首/次代构建 4,377/4,339 ms；单代约 175.28 MiB、双代约 332.72 MiB，分别低于 384/512 MiB 硬门禁。原始报告为 `target/benchmark/large-workspace-20260731_113419.json` 与同名 Markdown。
 
 边界保持明确：租约只保护遵守 FossilSense 默认 generation 协议的 reader/cleanup，不能阻止外部程序直接删除数据库；reader-release cleanup 的 1 秒等待仍是有界 best-effort，极端长期占用可把空间回收延后到下一次 publication、staging maintenance 或 reader release，但不会发布半更新快照。稳定 family coordinator 约 8 KiB；per-generation lease DB 只在对应 reader 生命周期需要，正常释放、失败 acquisition、旧代删除与后续 orphan sweep都会回收。Stage 4J 已记录的显式 `--db --force` 进程强杀后唯一 staging 残留仍不按文件名自动删除，因为任意用户目录缺少可证明的 durable ownership；该边界是磁盘残留，不影响旧数据库和 manifest 正确性。按用户指示，Stage 4L 通过后不再扩展低概率边缘审计，转入最终发布验证。
+
+### 1.5.0 最终发布判定（可发布）
+
+最终 release source commit 为 `6e8aa03769f285515fc065b538848b1eaddbe1dc`。仓库一键入口 `build.ps1` 完整通过：locked pnpm install 未修改 lockfile；Rust 再次通过 unit 1041 / CLI 1 / LSP 2、0 failed；扩展 TypeScript compile/test 通过；release Rust binary、esbuild 单文件 client 和 `release-build.json` 被装入同一个 VSIX；`verify_release_hardening.ps1 -Version 1.5.0` 验证版本 1.5.0、schema 28、parser fact 8、resolver 5、relation protocol 2、内置 Windows binary 可执行性和全部 payload hash 后返回 PASS。
+
+随后执行完整仓库门禁 `scripts/verify.ps1 -SkipInstall`，格式、Clippy、Rust 1044 项、architecture golden 8/8、真实架构扫描 fail 0 / warn 14 / allowlisted 0、release-hardening fixtures、benchmark entrypoint fixtures 与 VS Code 扩展测试全部通过，最终输出 `FossilSense verification passed.`。14 项 warning 仍全部是报告已知的既有 production 大文件提示，没有新增架构失败。
+
+最终可发布工件：
+
+| 字段 | 值 |
+|---|---|
+| VSIX | `dist/fossilsense-vscode-1.5.0_BUILD20260731_113858.vsix` |
+| 文件大小 | 6,199,143 bytes |
+| VSIX SHA-256 | `a57a9eab726fd3a9ea31ba9ba721adabd3aef0de433e2f48786bb5fd676e4986` |
+| release-input SHA-256 | `3bbaab3b38268d3eb0477553ce6f6a7d79240327c2f83a1eda839a5af4611b85`（213 files） |
+| artifact payload SHA-256 | `9d634e6ba36abc0ede686b0ecd56273c48cb7fe321400af2d27011835bc5c998` |
+| native binary SHA-256 | `cd99125543cb64a62193d6cc1dd577e8cfe1f9f793455b47decfcfe6723528ec` |
+| source commit | `6e8aa03769f285515fc065b538848b1eaddbe1dc` |
+
+`release-build.json` 的 `worktreeDirty=true` 仅由用户持有且未跟踪的根 `AGENTS.md` 产生；该文件未修改、未提交，也不属于 213 个 release inputs。所有 tracked 文件在打包时干净，发布硬化脚本按实际 release-input 内容指纹验证通过。当前结论是 1.5.0 已满足代码正确性、架构、完整性、大型工作区 60 秒性能、双代内存、自包含打包和发布硬化要求；无需继续处理低优先级边缘项即可发布。
