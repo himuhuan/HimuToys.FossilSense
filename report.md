@@ -831,3 +831,41 @@ Stage 4J 提交后的附加架构扫描发现当前 HEAD 有一项历史失败�
 | `node scripts/test_architecture_fitness.js` | PASS，golden 8/8 |
 
 14 项 warning 全部是既有超过 800 行的 production source 提示；本阶段新增的 `store/test_support.rs` 只有场景化测试 helper，没有新增大文件或 warning。因为当前提交对 production build 的有效 token stream 为零变化，没有重复运行 U-Boot full-index/hydration；Stage 4J 的 release 二进制与 `large-workspace-20260731_100103` 数据仍精确对应当前 production 源码。后续最终全仓门禁必须继续保持 architecture fail=0，不能把这次修复降格为 allowlist。
+
+### 阶段 4L：默认 generation 的跨进程读租约与安全回收（已完成）
+
+状态：真实跨进程 RED、Windows 强制终止、显式路径隔离、新旧快照重叠、并发析构、孤儿锁与 SQLite sidecar 测试，完整 Rust/架构门禁、U-Boot full-index/hydration 和四轮修复后独立 reviewer 均已通过；最终 targeted review 为 `No findings`。
+
+源码审计确认 Stage 4J 只串行化 writer，旧 generation 的读租约仍是进程内 `OnceLock<Mutex<HashMap<PathBuf, Weak<()>>>>`。另一个 FossilSense 进程持有旧 `CallReadHandle` 时，新进程无法看见该 lease，会在 manifest 切换后的目录清理中删除旧数据库路径；`CallReadHandle` 每次请求按 path 重新打开 SQLite，因此 Unix 后续请求会直接得到 missing file，Windows 仅可能被文件共享语义偶然掩盖。原 `capture` 还先开闭数据库、再取得进程内 lease，存在同进程 TOCTOU。
+
+最终实现没有引入 PID/heartbeat sidecar、第三方 crate、schema 版本或 parser fact 变化，而是把 SQLite DELETE-journal 锁作为操作系统自动回收的跨进程事实：
+
+1. 默认 index family 保留稳定的 `.fossilsense-generation-leases.sqlite`，只用于短时协调 reader acquisition、manifest publication 与 cleanup；publication 在封存 generation 到原子替换 manifest 的整个可见性窗口持有 family exclusive transaction。
+2. 每个 canonical `index-g*.sqlite` 使用按文件名 BLAKE3 导出的独立 hidden lease SQLite。reader 在 family coordinator 内创建/打开该文件，执行 `BEGIN` 与真实 guard `SELECT` 取得 SHARED lock，并在锁内复核目标仍是 regular file；成功后只长期保留本 generation 的 shared transaction。cleanup 在 family coordinator 下逐 generation 尝试零等待 `BEGIN EXCLUSIVE`，因此当前 G2 reader 不会阻止回收无人使用的 G1，而跨进程 G1 reader会明确使 G1 跳过。
+3. `IndexDbLease::acquire` 现在明确表示显式路径且没有目录副作用；只有由默认索引调用链选择的 `acquire_default_generation` 才创建跨进程租约。CLI 的显式 `--db C:\...\index-g1-custom.sqlite` 即使 basename 碰巧符合 generation 形状，也不会创建 hidden family DB 或触发任意用户目录清理。server、默认 CLI query 与并发 publication benchmark 已切到受保护入口；显式 benchmark/temp DB 保持原路径语义。
+4. 最后一个 `Arc<IndexDbLeaseToken>` 的唯一析构先关闭 per-generation shared transaction，再触发目录维护，删除了基于 `Arc::strong_count` 选举清理者的竞态。不同旧 generation 同时析构时，reader-release 专用 cleanup 对 family coordinator 最多等待 1 秒；普通 publication/staging 维护仍使用 nonblocking acquisition，避免把常规 writer 清理变成长等待。
+5. 目标在 manifest resolve 与 lease acquisition 之间消失时，构造函数现在返回错误而不是悬空 handle，并在仍持 family coordinator 时关闭新 shared connection、取得 exclusive 后回收 unused hashed lease。目录维护还会识别并安全回收进程异常退出留下的无读者 hashed lease family；活跃 shared transaction会使 sweep保守跳过。generation 归组同时覆盖 `-wal`、`-shm` 与 `-journal`。
+
+TDD 的首个子进程用当前 Rust test executable 持有 G1 lease、原子发布精确 ready marker并阻塞在父进程 stdin。旧实现的另一个进程运行 cleanup 后实际删除 G1，断言稳定 RED；新实现连续运行两次 cleanup 都保留 G1。父进程随后直接 kill child、有界轮询回收，再次 cleanup 会删除 G1，直接证明进程终止由 SQLite/OS 释放 shared transaction。reviewer 发现的三个初版设计问题也分别先形成 RED：仅按 basename 推断会给显式 `index-g1-custom.sqlite` 创建 family DB；family-wide lifetime shared lock 会让 G2 永久阻塞 G1 回收；目标已删时 `at_generation` 会返回成功悬空 handle。修正后显式路径无副作用，G1/G2 同时持有时释放 G1 会立即回收 G1，missing target 明确失败。
+
+后续 reviewer 的并发与残留审查又形成并关闭四类失败证据：两个最终 clone 并发 drop 在旧 `strong_count` 实现上第 1 次即漏清理；两个不同 generation 同时 drop 在第 6 组漏掉其中一代；missing target 会留下 hashed lease SQLite；旧 rollback journal 不会被归组。最终测试对同 token 和不同 generation 各执行 64 轮 barrier 并发释放，另覆盖真实 hashed orphan 的后续 sweep、active cross-process lease 的连续两次 cleanup、以及 WAL/SHM/journal 三类 sidecar。最后一轮 reviewer 专门复核 close→exclusive→unlink 顺序、family/per-generation 锁序、Unix split-inode、Windows 删除、析构递归和 1 秒等待，结论为无 P0–P2 finding。
+
+独立 test-executor 与最终本机门禁：
+
+| 命令/门禁 | 结果 |
+|---|---|
+| `cargo fmt --all -- --check` | PASS，最终复跑 1.812 s |
+| `cargo test -p fossilsense` | PASS，unit 1041 passed / 6 ignored，CLI 1 passed，LSP 2 passed；总计 1044 passed / 0 failed |
+| `cargo clippy -p fossilsense --all-targets -- -D warnings` | PASS |
+| `scripts/verify_architecture_fitness.ps1` | PASS，fail 0 / warn 14 / allowlisted 0 |
+| `node scripts/test_architecture_fitness.js` | PASS，golden 8/8 |
+| `cargo build --release -p fossilsense` | PASS，45.52 s |
+| `cargo test --release -p fossilsense --bin fossilsense --no-run` | PASS，94 s |
+| U-Boot full-index | PASS，wrapper 39,692.479 ms；engine 38,702 ms |
+| U-Boot engine hydration | PASS，单代峰值 183,795,712 bytes；双代绝对峰值 348,880,896 bytes |
+
+大型门禁继续使用 U-Boot commit `6741b0dfb41dc82a284ab1cff4c58af6ef2f3f9c`；样本保留 `boot/scene.c`、`boot/vbe_abrec.c` 两处既存空白差异并准确视为 dirty。机器与 Stage 4J 相同：Acer Nitro AN515-58、Intel Core i5-12500H（12 cores / 16 logical processors）、25,459,482,624 bytes RAM、Windows 11 Pro Insider build 26220。
+
+full-index 保持 13,244 files、654,890 declarations、91,919 callable anchors 和 582,522 call sites。分段为 discover 2,422 ms、parse 6,621、write 18,201、check 10、include edge 3,004、secondary index 3,381、publication 4,351；峰值 Working Set 171,491,328 bytes、Private Bytes 161,083,392。fresh DB 为 363,139,072 bytes、88,657 pages，schema 28、semantic generation 1、13,244 file/active revisions、`cleanup_required=0`、`quick_check=ok`、foreign-key violations=0。hydration compact recall 为 93,747,480 bytes，首/次代构建 4,377/4,339 ms；单代约 175.28 MiB、双代约 332.72 MiB，分别低于 384/512 MiB 硬门禁。原始报告为 `target/benchmark/large-workspace-20260731_113419.json` 与同名 Markdown。
+
+边界保持明确：租约只保护遵守 FossilSense 默认 generation 协议的 reader/cleanup，不能阻止外部程序直接删除数据库；reader-release cleanup 的 1 秒等待仍是有界 best-effort，极端长期占用可把空间回收延后到下一次 publication、staging maintenance 或 reader release，但不会发布半更新快照。稳定 family coordinator 约 8 KiB；per-generation lease DB 只在对应 reader 生命周期需要，正常释放、失败 acquisition、旧代删除与后续 orphan sweep都会回收。Stage 4J 已记录的显式 `--db --force` 进程强杀后唯一 staging 残留仍不按文件名自动删除，因为任意用户目录缺少可证明的 durable ownership；该边界是磁盘残留，不影响旧数据库和 manifest 正确性。按用户指示，Stage 4L 通过后不再扩展低概率边缘审计，转入最终发布验证。

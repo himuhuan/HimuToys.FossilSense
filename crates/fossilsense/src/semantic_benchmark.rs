@@ -458,7 +458,7 @@ fn concurrent_publication_hover_definition() -> Result<BenchmarkMetrics> {
     let index_directory = crate::pathing::default_index_directory(&workspace_path)?;
     let _cleanup = IndexFamilyCleanup(index_directory);
     let old_path = crate::pathing::default_index_path(&workspace_path)?;
-    let old_handle = CallReadHandle::capture(old_path)?;
+    let old_handle = CallReadHandle::capture_default_generation(old_path)?;
     let empty_overlay = CandidateOverlaySnapshot::default();
     let initial = query_store_candidates(&old_handle, &empty_overlay)?;
     let expected_old = candidate_signatures(&initial);
@@ -507,7 +507,7 @@ fn concurrent_publication_hover_definition() -> Result<BenchmarkMetrics> {
         Ok(Err(_)) | Err(_) => metrics.publication_conflicts += 1,
     }
     let new_path = crate::pathing::default_index_path(&workspace_path)?;
-    let new_handle = CallReadHandle::capture(new_path)?;
+    let new_handle = CallReadHandle::capture_default_generation(new_path)?;
     let published = query_store_candidates(&new_handle, &empty_overlay)?;
     let new_signatures = candidate_signatures(&published);
     if new_handle.generation.0 <= old_handle.generation.0

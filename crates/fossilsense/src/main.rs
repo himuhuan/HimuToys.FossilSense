@@ -307,7 +307,6 @@ fn run_query(kind: QueryCommand) -> Result<()> {
             col,
             db,
         } => {
-            let db_path = resolve_db_path(db, &workspace)?;
             let abs = workspace.join(&file);
             let content = fs::read_to_string(&abs)
                 .with_context(|| format!("failed to read {}", abs.display()))?;
@@ -324,7 +323,7 @@ fn run_query(kind: QueryCommand) -> Result<()> {
 
             let rel = pathing::normalize_path_string(&file);
             let semantic_family = query_semantic_family(&workspace, &file);
-            let handle = call_service::CallReadHandle::capture(db_path)?;
+            let handle = capture_query_handle(db, &workspace)?;
             let overlay = candidate_service::CandidateOverlaySnapshot::default();
             let service = candidate_service::CandidateQueryService::new_for_family(
                 Some(&handle),
@@ -386,9 +385,8 @@ fn run_query(kind: QueryCommand) -> Result<()> {
             incoming,
             db,
         } => {
-            let db_path = resolve_db_path(db, &workspace)?;
             let build_started = Instant::now();
-            let handle = call_service::CallReadHandle::capture(db_path)?;
+            let handle = capture_query_handle(db, &workspace)?;
             let rel = pathing::normalize_path_string(&file);
             let semantic_family = query_semantic_family(&workspace, &file);
             let position = call_model::SourcePosition {
@@ -497,6 +495,20 @@ fn resolve_db_path(db: Option<PathBuf>, workspace: &Path) -> Result<PathBuf> {
         None => {
             let workspace = pathing::canonical_workspace(workspace)?;
             pathing::default_index_path(&workspace)
+        }
+    }
+}
+
+fn capture_query_handle(
+    db: Option<PathBuf>,
+    workspace: &Path,
+) -> Result<call_service::CallReadHandle> {
+    match db {
+        Some(path) => call_service::CallReadHandle::capture(path),
+        None => {
+            let workspace = pathing::canonical_workspace(workspace)?;
+            let path = pathing::default_index_path(&workspace)?;
+            call_service::CallReadHandle::capture_default_generation(path)
         }
     }
 }

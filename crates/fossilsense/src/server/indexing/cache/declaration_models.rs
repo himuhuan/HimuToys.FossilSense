@@ -75,10 +75,10 @@ pub(super) fn capture_call_read_handle(
     root: &Path,
     generation: SemanticGeneration,
 ) -> Result<Arc<CallReadHandle>> {
-    Ok(Arc::new(CallReadHandle::at_generation(
+    Ok(Arc::new(CallReadHandle::at_default_generation(
         pathing::default_index_path(root)?,
         generation,
-    )))
+    )?))
 }
 
 pub(super) async fn update_declaration_index_paths(

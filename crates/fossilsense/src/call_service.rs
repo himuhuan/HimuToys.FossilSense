@@ -32,15 +32,31 @@ impl CallReadHandle {
         }
     }
 
+    pub(crate) fn at_default_generation(
+        db_path: PathBuf,
+        generation: SemanticGeneration,
+    ) -> Result<Self> {
+        Ok(Self {
+            db: IndexDbLease::acquire_default_generation(db_path)?,
+            generation,
+        })
+    }
+
     pub fn capture(db_path: PathBuf) -> Result<Self> {
         let store = IndexStore::open_readonly(&db_path)?;
         let guard = store.begin_semantic_read(None)?;
         let generation = SemanticGeneration(guard.generation());
         guard.finish()?;
-        Ok(Self {
-            db: IndexDbLease::acquire(db_path),
-            generation,
-        })
+        Ok(Self::at_generation(db_path, generation))
+    }
+
+    pub(crate) fn capture_default_generation(db_path: PathBuf) -> Result<Self> {
+        let db = IndexDbLease::acquire_default_generation(db_path)?;
+        let store = IndexStore::open_readonly(db.path())?;
+        let guard = store.begin_semantic_read(None)?;
+        let generation = SemanticGeneration(guard.generation());
+        guard.finish()?;
+        Ok(Self { db, generation })
     }
 
     /// Run a typed read against the exact semantic generation captured by

@@ -11,6 +11,7 @@ use crate::semantic_model::{
     PARSER_FACT_VERSION,
 };
 
+mod generation_lease;
 mod generations;
 mod go_package_graph;
 mod includes;
@@ -18,6 +19,10 @@ mod queries;
 mod schema;
 pub mod views;
 mod writes;
+
+pub(crate) use generation_lease::{
+    GenerationCleanupLease, GenerationPublicationLease, GenerationReadLease,
+};
 
 /// Whether an indexed file belongs to the workspace or to an external include
 /// reference directory. Stored on `files.source`.
