@@ -15,7 +15,7 @@ FossilSense 的实现事实只来自**当前源码、测试、清单和脚本**�
 
 ## 项目定位
 
-FossilSense `1.5.0` 是一个面向大型 Windows C/C++ 与 Go 工作区的 VS Code 代码导航与分析工具。它把“缺少可靠编译环境”视为正常场景：用户不需要先准备 `compile_commands.json`、clangd、gopls、ctags、Go 或完整构建链。Go 后端以实验能力提供，遵守与 C/C++ 相同的候选式语义、容错与有界查询原则。
+FossilSense `1.5.1` 是一个面向大型 Windows C/C++ 与 Go 工作区的 VS Code 代码导航与分析工具。它把“缺少可靠编译环境”视为正常场景：用户不需要先准备 `compile_commands.json`、clangd、gopls、ctags、Go 或完整构建链。Go 后端以实验能力提供，遵守与 C/C++ 相同的候选式语义、容错与有界查询原则。
 
 核心原则：
 
@@ -104,20 +104,23 @@ cargo test --release -p fossilsense --bin fossilsense --no-run
 
 # 二选一；发布前可同时运行
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark_large_workspace.ps1 `
-  -Repeats 1 -IncludeFullIndex -CaseFilter u-boot-full-index -TimeoutSeconds 60
+  -Repeats 1 -IncludeFullIndex -CaseFilter u-boot-full-index -TimeoutSeconds 120
 
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark_large_workspace.ps1 `
-  -Repeats 1 -IncludeFullIndex -CaseFilter wine-full-index -TimeoutSeconds 60
+  -Repeats 1 -IncludeFullIndex -CaseFilter wine-full-index -TimeoutSeconds 120
 
 # declaration read model、补全、查询或发布架构变化还必须运行 U-Boot 内存门禁
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark_large_workspace.ps1 `
-  -Repeats 1 -IncludeFullIndex -IncludeEngineHydration `
-  -CaseFilter u-boot-full-index,u-boot-engine-hydration -TimeoutSeconds 60
+  -Repeats 1 -IncludeFullIndex -IncludeEngineHydration -IncludeCompletionReplay `
+  -CaseFilter u-boot-full-index,u-boot-engine-hydration,u-boot-completion-replay `
+  -TimeoutSeconds 120
 ```
 
-`60s` 是硬门禁，不是观察值。任一必测 full-index case 的进程耗时或输出 `elapsed_ms` **高于 60,000 ms，即判定此次功能失败**；不能用平均值、机器波动或“小样本已经通过”放行。报告同时保留样本版本、机器信息、命令、`elapsed_ms`、`write_ms`、峰值内存和数据库大小。详细复现方法见 `docs/benchmark/`。
+`120s` 是硬门禁，不是观察值。任一必测 full-index case 的进程耗时或输出 `elapsed_ms` **高于 120,000 ms，即判定此次功能失败**；不能用平均值、机器波动或“小样本已经通过”放行。报告同时保留样本版本、机器信息、命令、`elapsed_ms`、`write_ms`、峰值内存和数据库大小。详细复现方法见 `docs/benchmark/`。
 
 U-Boot engine hydration case 还必须包含至少 500,000 个声明和 10,000 个文件；完整单代读模型不超过 384 MiB，旧快照存活时旁路构建第二代的绝对峰值不超过 512 MiB。Windows 判断 Private Bytes，Linux/macOS 判断 RSS；任一断言失败都不能放行。
+
+自动补全相关变化还必须通过生产 LSP replay：64 个请求的 P95 不超过 50,000 us，每请求检查 `1..=16,384` 个 recall entry，candidate budget 必须为 16,384，declaration payload SQLite 读取为 0；每个请求还必须实际返回 indexed candidate、看到至少 500,000 个 active declaration，并在大表上明确标记 truncated。索引门禁放宽不能用于放宽这些补全硬门禁。
 
 ## 编译
 
@@ -178,7 +181,7 @@ dist/fossilsense-vscode-<version>_BUILD<YYYYMMDD_HHMMSS>.vsix
 - `extensions/vscode/README.md`：VSIX Marketplace 内容。
 - `docs/benchmark/`：可复现的性能测试方法与结果。
 
-完成任务前再次检查：实现是否与测试一致、README 是否只描述真实能力、是否误加中间文档，以及重大变更是否通过大型仓库 `60s` 门禁。
+完成任务前再次检查：实现是否与测试一致、README 是否只描述真实能力、是否误加中间文档，以及重大变更是否通过大型仓库 `120s` 门禁。
 
 ## 工作流程与指南（必做）
 

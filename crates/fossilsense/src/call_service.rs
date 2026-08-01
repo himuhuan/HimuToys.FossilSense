@@ -1298,7 +1298,11 @@ mod tests {
         .unwrap();
         let handle = CallReadHandle::capture(db_path).unwrap();
 
-        let base = ReachGraph::new(vec![("impl.c".into(), "old.h".into())], vec![], vec![]);
+        let base = Arc::new(ReachGraph::new(
+            vec![("impl.c".into(), "old.h".into())],
+            vec![],
+            vec![],
+        ));
         let dirty_text: Arc<str> =
             Arc::from("#include \"new.h\"\nint target(int value) { return value + 1; }\n");
         let dirty = crate::parser::parse_with_handle(
@@ -1315,7 +1319,15 @@ mod tests {
                 dirty_text,
             )],
         );
-        snapshot.refresh_reach_graph(Some(&base), ["impl.c", "old.h", "new.h"], &[]);
+        snapshot.refresh_reach_graph(
+            Some(base),
+            Some(Arc::new(crate::candidate_service::IncludePathIndex::build(
+                ["impl.c", "old.h", "new.h"]
+                    .into_iter()
+                    .map(|path| (path.to_string(), true)),
+            ))),
+            &[],
+        );
         let reach = snapshot.effective_reach_graph_arc(None).unwrap();
         let overlays = snapshot.call_relation_overlays();
         let catalog =
@@ -1344,14 +1356,14 @@ mod tests {
             .collect();
         assert_eq!(variant_paths, HashSet::from(["impl.c", "new.h"]));
 
-        let base = ReachGraph::new(
+        let base = Arc::new(ReachGraph::new(
             vec![
                 ("impl.c".into(), "old.h".into()),
                 ("impl.c".into(), "new.h".into()),
             ],
             vec![],
             vec![],
-        );
+        ));
         let mut snapshot = CandidateOverlaySnapshot::new(
             2,
             vec![FileCallOverlay::tombstone(
@@ -1359,7 +1371,15 @@ mod tests {
                 Arc::from("int target(int value);\n"),
             )],
         );
-        snapshot.refresh_reach_graph(Some(&base), ["impl.c", "old.h", "new.h"], &[]);
+        snapshot.refresh_reach_graph(
+            Some(base),
+            Some(Arc::new(crate::candidate_service::IncludePathIndex::build(
+                ["impl.c", "old.h", "new.h"]
+                    .into_iter()
+                    .map(|path| (path.to_string(), true)),
+            ))),
+            &[],
+        );
         let reach = snapshot.effective_reach_graph_arc(None).unwrap();
         let overlays = snapshot.call_relation_overlays();
         let catalog =

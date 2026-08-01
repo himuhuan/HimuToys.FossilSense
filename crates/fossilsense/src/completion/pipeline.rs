@@ -362,6 +362,11 @@ impl Default for CompletionPipelineMetrics {
 pub(crate) struct CompletionStageTimings {
     pub total_ms: u128,
     pub context_ms: u128,
+    pub parse_ms: u128,
+    pub local_words_ms: u128,
+    pub overlay_ms: u128,
+    pub admission_wait_ms: u128,
+    pub worker_ms: u128,
     pub recall_ms: u128,
     pub merge_rank_ms: u128,
     pub render_ms: u128,

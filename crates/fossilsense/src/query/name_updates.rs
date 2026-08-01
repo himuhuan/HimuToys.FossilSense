@@ -15,6 +15,49 @@ fn string_set_bytes(values: &HashSet<String>) -> usize {
     )
 }
 
+fn project_family_counts_for_path(
+    segment: &NameSegment,
+    path: &str,
+) -> HashMap<ProjectKey, [usize; 2]> {
+    let Some(path_id) = segment.path_ids.get(path).copied() else {
+        return HashMap::new();
+    };
+    let mut counts = HashMap::<ProjectKey, [usize; 2]>::new();
+    for family_slot in ALL_SEMANTIC_FAMILY_SLOTS {
+        for &local in segment.path_postings_by_family[family_slot].posting(path_id) {
+            let entry = segment.entries[local as usize];
+            if entry.project_id == NO_PROJECT_ID {
+                continue;
+            }
+            counts
+                .entry(segment.projects[entry.project_id as usize].clone())
+                .or_default()[family_slot] += 1;
+        }
+    }
+    counts
+}
+
+fn adjust_project_family_counts(
+    active: &mut HashMap<ProjectKey, [usize; 2]>,
+    segment: &NameSegment,
+    path: &str,
+    add: bool,
+) {
+    for (key, change) in project_family_counts_for_path(segment, path) {
+        let counts = active.entry(key).or_default();
+        for family_slot in ALL_SEMANTIC_FAMILY_SLOTS {
+            counts[family_slot] = if add {
+                counts[family_slot].saturating_add(change[family_slot])
+            } else {
+                counts[family_slot]
+                    .checked_sub(change[family_slot])
+                    .expect("active project/family counts must cover the replaced path")
+            };
+        }
+    }
+    active.retain(|_, counts| counts.iter().any(|count| *count > 0));
+}
+
 impl NameTable {
     pub(crate) fn accounted_bytes(&self) -> usize {
         let arc_header = size_of::<usize>().saturating_mul(2);
@@ -24,6 +67,25 @@ impl NameTable {
         let path_overrides = self.path_overrides.iter().fold(0usize, |bytes, (path, _)| {
             bytes.saturating_add(path.len()).saturating_add(arc_header)
         });
+        let active_base_paths = arc_header.saturating_add(
+            self.active_base_paths
+                .capacity()
+                .saturating_mul(size_of::<Arc<str>>()),
+        );
+        let active_delta_paths = self.active_delta_paths.iter().fold(0usize, |bytes, paths| {
+            bytes
+                .saturating_add(arc_header)
+                .saturating_add(size_of::<Vec<Arc<str>>>())
+                .saturating_add(paths.capacity().saturating_mul(size_of::<Arc<str>>()))
+        });
+        let active_project_family_counts =
+            self.active_project_family_counts
+                .iter()
+                .fold(0usize, |bytes, (key, _)| {
+                    bytes
+                        .saturating_add(key.workspace_root_id.len())
+                        .saturating_add(key.project_path.len())
+                });
         let direct_overrides = self
             .direct_include_overrides
             .keys()
@@ -43,6 +105,17 @@ impl NameTable {
                 self.path_overrides.capacity(),
             ))
             .saturating_add(path_overrides)
+            .saturating_add(active_base_paths)
+            .saturating_add(
+                self.active_delta_paths
+                    .capacity()
+                    .saturating_mul(size_of::<Arc<Vec<Arc<str>>>>()),
+            )
+            .saturating_add(active_delta_paths)
+            .saturating_add(hash_table_bytes::<ProjectKey, [usize; 2]>(
+                self.active_project_family_counts.capacity(),
+            ))
+            .saturating_add(active_project_family_counts)
             .saturating_add(
                 self.delta_offsets
                     .capacity()
@@ -100,12 +173,39 @@ impl NameTable {
         self.with_updated_entries(paths, declaration_name_entries(rows, project_context))
     }
 
+    pub(crate) fn has_project_for_family(
+        &self,
+        key: &ProjectKey,
+        semantic_family: crate::semantic_model::SemanticFamily,
+    ) -> bool {
+        let family_slot = super::semantic_family_slot(semantic_family);
+        self.active_project_family_counts
+            .get(key)
+            .is_some_and(|counts| counts[family_slot] > 0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_project_family_count(
+        &self,
+        key: &ProjectKey,
+        semantic_family: crate::semantic_model::SemanticFamily,
+    ) -> usize {
+        self.active_project_family_counts
+            .get(key)
+            .map_or(0, |counts| {
+                counts[super::semantic_family_slot(semantic_family)]
+            })
+    }
+
+    #[cfg(test)]
     pub fn project_indices(&self, key: &ProjectKey) -> Option<Vec<usize>> {
         let mut indices = Vec::new();
         if let Some(base) = self.base.by_project.get(key) {
             indices.extend(
-                base.iter()
-                    .copied()
+                base.by_family
+                    .iter()
+                    .flatten()
+                    .map(|index| *index as usize)
                     .filter(|index| self.is_active_index(*index)),
             );
         }
@@ -116,11 +216,14 @@ impl NameTable {
             let offset = self.delta_offsets[delta_index];
             indices.extend(
                 project
+                    .by_family
                     .iter()
-                    .map(|index| offset + index)
+                    .flatten()
+                    .map(|index| offset + *index as usize)
                     .filter(|index| self.is_active_index(*index)),
             );
         }
+        indices.sort_unstable();
         (!indices.is_empty()).then_some(indices)
     }
 
@@ -147,6 +250,9 @@ impl NameTable {
                 base: self.base.clone(),
                 deltas: self.deltas.clone(),
                 path_overrides: self.path_overrides.clone(),
+                active_base_paths: self.active_base_paths.clone(),
+                active_delta_paths: self.active_delta_paths.clone(),
+                active_project_family_counts: self.active_project_family_counts.clone(),
                 delta_offsets: self.delta_offsets.clone(),
                 active_len: self.active_len,
                 slot_len: self.slot_len,
@@ -164,6 +270,9 @@ impl NameTable {
             base: self.base.clone(),
             deltas: self.deltas.clone(),
             path_overrides: self.path_overrides.clone(),
+            active_base_paths: self.active_base_paths.clone(),
+            active_delta_paths: self.active_delta_paths.clone(),
+            active_project_family_counts: self.active_project_family_counts.clone(),
             delta_offsets: self.delta_offsets.clone(),
             active_len: self.active_len,
             slot_len: self.slot_len,
@@ -186,9 +295,51 @@ impl NameTable {
         let fresh_slots = fresh_segment.entries.len();
 
         let mut overrides = self.path_overrides.as_ref().clone();
+        let active_base_paths = self
+            .active_base_paths
+            .iter()
+            .filter(|path| !paths.contains(path.as_ref()))
+            .cloned()
+            .collect();
+        let mut active_delta_paths = self.active_delta_paths.as_ref().clone();
+        let mut active_project_family_counts = self.active_project_family_counts.as_ref().clone();
+        let touched_previous_deltas = paths
+            .iter()
+            .filter_map(|path| match self.path_overrides.get(path.as_str()) {
+                Some(Some(delta)) => Some(*delta),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        for previous_delta in touched_previous_deltas {
+            let retained = active_delta_paths[previous_delta]
+                .iter()
+                .filter(|path| !paths.contains(path.as_ref()))
+                .cloned()
+                .collect();
+            active_delta_paths[previous_delta] = Arc::new(retained);
+        }
         let mut active_len = self.active_len;
         for path in paths {
-            let old_count = match overrides.get(path.as_str()) {
+            let old_segment = match self.path_overrides.get(path.as_str()) {
+                Some(Some(previous_delta)) => Some(self.deltas[*previous_delta].as_ref()),
+                Some(None) => None,
+                None => Some(self.base.as_ref()),
+            };
+            if let Some(old_segment) = old_segment {
+                adjust_project_family_counts(
+                    &mut active_project_family_counts,
+                    old_segment,
+                    path,
+                    false,
+                );
+            }
+            adjust_project_family_counts(
+                &mut active_project_family_counts,
+                &fresh_segment,
+                path,
+                true,
+            );
+            let old_count = match self.path_overrides.get(path.as_str()) {
                 Some(Some(previous_delta)) => self.deltas[*previous_delta].path_count(path),
                 Some(None) => 0,
                 None => self.base.path_count(path),
@@ -200,6 +351,17 @@ impl NameTable {
                 .unwrap_or_else(|| Arc::<str>::from(path.as_str()));
             overrides.insert(interned_path, (fresh_count > 0).then_some(delta_index));
         }
+        let mut fresh_active_paths = paths
+            .iter()
+            .filter(|path| fresh_segment.path_count(path) > 0)
+            .map(|path| {
+                fresh_segment
+                    .interned_path(path)
+                    .expect("fresh active path must be interned by its segment")
+            })
+            .collect::<Vec<_>>();
+        fresh_active_paths.sort_unstable();
+        active_delta_paths.push(Arc::new(fresh_active_paths));
 
         let mut all_workspace_reach = self.all_workspace_reach.as_ref().clone();
         for path in paths {
@@ -219,6 +381,9 @@ impl NameTable {
             base: self.base.clone(),
             deltas: Arc::new(deltas),
             path_overrides: Arc::new(overrides),
+            active_base_paths: Arc::new(active_base_paths),
+            active_delta_paths: Arc::new(active_delta_paths),
+            active_project_family_counts: Arc::new(active_project_family_counts),
             delta_offsets: Arc::new(offsets),
             active_len,
             slot_len: self.slot_len + fresh_slots,

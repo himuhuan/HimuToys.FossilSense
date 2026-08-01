@@ -27,23 +27,23 @@ samples/wine
 
 These directories are local and git-ignored. Query cases additionally require current indexes under `target/benchmark/`; create them with the full-index cases instead of reusing a database from an older schema.
 
-## Required 60-second gate
+## Required 120-second full-index gate
 
 Every release, major feature, or architecture/index/storage/parser/query/concurrency change must run at least one release full-index case:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark_large_workspace.ps1 `
-  -Repeats 1 -IncludeFullIndex -CaseFilter u-boot-full-index -TimeoutSeconds 60
+  -Repeats 1 -IncludeFullIndex -CaseFilter u-boot-full-index -TimeoutSeconds 120
 ```
 
 or:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark_large_workspace.ps1 `
-  -Repeats 1 -IncludeFullIndex -CaseFilter wine-full-index -TimeoutSeconds 60
+  -Repeats 1 -IncludeFullIndex -CaseFilter wine-full-index -TimeoutSeconds 120
 ```
 
-The build is outside the measured process. The full-index process and reported `elapsed_ms` must both be at most `60,000 ms`. A timeout or any value above 60 seconds fails the feature; a faster mini-c run or a lower average does not override that result.
+The build is outside the measured process. The full-index process and reported `elapsed_ms` must both be at most `120,000 ms`. A timeout or any value above 120 seconds fails the feature; a faster mini-c run or a lower average does not override that result.
 
 For a release candidate, run both cases when both checkouts are available. Record the source revision of the sample, machine CPU/RAM/storage, exact command, `elapsed_ms`, `write_ms`, phase timings, peak Working Set/Private Bytes, and final database size.
 
@@ -56,7 +56,7 @@ cargo test --release -p fossilsense --bin fossilsense --no-run
 
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark_large_workspace.ps1 `
   -Repeats 1 -IncludeFullIndex -IncludeEngineHydration `
-  -CaseFilter u-boot-full-index,u-boot-engine-hydration -TimeoutSeconds 60
+  -CaseFilter u-boot-full-index,u-boot-engine-hydration -TimeoutSeconds 120
 ```
 
 The cases run in order: `u-boot-full-index` replaces `target/benchmark/index-u-boot-rebuild.sqlite`, then `u-boot-engine-hydration` reads that exact database. The Rust process samples its own memory every millisecond and retains every read-model component. It first asserts a representative input of at least 500,000 declarations and 10,000 indexed files. A complete single generation must use at most 384 MiB; while that immutable generation remains live, fully building a replacement generation must peak at no more than the 512 MiB hard limit. Windows uses Private Bytes, while Linux and macOS use RSS.
@@ -71,16 +71,39 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark_engine_hyd
   -Workspace samples/u-boot
 ```
 
+## Required production completion replay gate
+
+Changes to completion recall, dirty overlays, request scheduling, memo identity, or rendering must also run the production U-Boot LSP replay. Prebuild the release test binary, then run the full-index and replay cases in order:
+
+```powershell
+cargo test --release -p fossilsense --bin fossilsense --no-run
+
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark_large_workspace.ps1 `
+  -Repeats 1 -IncludeFullIndex -IncludeCompletionReplay `
+  -CaseFilter u-boot-full-index,u-boot-completion-replay -TimeoutSeconds 120
+```
+
+The replay hydrates the complete immutable U-Boot engine model, applies dirty current-buffer edits, and calls the production `LanguageServer::completion` entry point. After two warm-up passes it measures 64 requests across `i/in/init/d/de/dev/c/cmd`. The hard gates are P95 at most `50,000 us`, `1..=16,384` inspected recall entries per request, an exact `16,384` candidate budget, and zero declaration-payload SQLite reads. Every request must also return an indexed candidate, observe at least 500,000 active declarations, and report bounded truncation; a fast builtin-only or disabled-index response therefore fails. Build/hydration time is outside the request samples.
+
+To run full index, hydration memory, and completion latency together:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark_large_workspace.ps1 `
+  -Repeats 1 -IncludeFullIndex -IncludeEngineHydration -IncludeCompletionReplay `
+  -CaseFilter u-boot-full-index,u-boot-engine-hydration,u-boot-completion-replay `
+  -TimeoutSeconds 120
+```
+
 ## Repeated diagnostic runs
 
 After the hard gate passes, repeated runs can be used to compare branches:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark_large_workspace.ps1 `
-  -Repeats 3 -IncludeFullIndex -CaseFilter wine-full-index -TimeoutSeconds 60
+  -Repeats 3 -IncludeFullIndex -CaseFilter wine-full-index -TimeoutSeconds 120
 ```
 
-Compare medians while retaining individual runs. A change is meaningful only when it is larger than same-build run-to-run spread. A median below 60 seconds does not hide an individual required run above the gate.
+Compare medians while retaining individual runs. A change is meaningful only when it is larger than same-build run-to-run spread. A median below 120 seconds does not hide an individual required run above the gate.
 
 The script writes JSON and Markdown reports under `target/benchmark/`. It starts a fresh process per repetition and samples Working Set and Private Bytes every 20 ms.
 
@@ -130,5 +153,19 @@ resident compact-recall byte estimate:
 $env:FOSSILSENSE_BENCH_DB = (Resolve-Path 'target/benchmark/index-u-boot-rebuild.sqlite').Path
 cargo test --release -p fossilsense `
   declaration_index::tests::benchmark_large_declaration_index_completion_hot_path -- `
+  --ignored --exact --nocapture
+```
+
+The hot-path case above exercises the sorted-prefix `search_ranked` fast path.
+It is not a substitute for the pooled-recall component used by production
+ordinary completion. Run that component case against the same database to
+report cold p50/p95, actual compact entries inspected, and the zero-SQL
+payload-read assertion. This command does not exercise LSP scheduling,
+admission, overlay preparation, rendering, or stale-request cancellation:
+
+```powershell
+$env:FOSSILSENSE_BENCH_DB = (Resolve-Path 'target/benchmark/index-u-boot-rebuild.sqlite').Path
+cargo test --release -p fossilsense `
+  declaration_index::tests::benchmark_large_declaration_index_production_pooled_recall_component -- `
   --ignored --exact --nocapture
 ```

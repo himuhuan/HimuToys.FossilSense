@@ -45,12 +45,14 @@ fn test_backend_service() -> LspService<super::Backend> {
         )),
         completion_history: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         completion_history_write_gate: Arc::new(tokio::sync::Mutex::new(())),
+        completion_runtime: super::completion_runtime::CompletionRuntime::default(),
         project_context_selection: Arc::new(tokio::sync::Mutex::new(
             crate::project_context::ProjectContextSelection::Auto,
         )),
         project_context_selection_epoch: AtomicU64::new(1),
         debug_candidate_reasons: AtomicBool::new(false),
         perf_logging_enabled: AtomicBool::new(false),
+        completion_perf_observations: Arc::new(StdMutex::new(Vec::new())),
         config_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         workspace_semantics_bootstrap: Arc::new(tokio::sync::Mutex::new(Default::default())),
         external_source_roots_cache: Arc::new(tokio::sync::Mutex::new(Default::default())),
@@ -65,6 +67,23 @@ fn empty_workspace_semantics(
     Arc::new(super::workspace_config::PublishedWorkspaceSemantics::empty(
         root,
     ))
+}
+
+fn completion_overlay_request<'a>(
+    root: &'a std::path::Path,
+    current_uri: &'a Url,
+    engine_epoch: super::state::EngineEpoch,
+    generation: crate::call_model::SemanticGeneration,
+) -> super::candidate_context::CompletionOverlayRequest<'a> {
+    super::candidate_context::CompletionOverlayRequest {
+        root,
+        current_uri,
+        engine_epoch,
+        generation,
+        base_reach_graph: None,
+        indexed_workspace_files: None,
+        workspace_semantics: empty_workspace_semantics(root),
+    }
 }
 
 async fn current_test_workspace_semantics(
@@ -736,6 +755,7 @@ async fn workspace_folder_removal_drops_root_and_published_snapshot() {
             include_table: None,
             go_import_table: None,
             indexed_files: None,
+            include_path_index: None,
             project_context: None,
             call_read_handle: None,
             workspace_semantics: empty_workspace_semantics(&root),
@@ -818,6 +838,7 @@ async fn name_index_compaction_publishes_only_for_the_expected_engine_epoch() {
             include_table: None,
             go_import_table: None,
             indexed_files: None,
+            include_path_index: None,
             project_context: None,
             call_read_handle: None,
             workspace_semantics: empty_workspace_semantics(&root),
@@ -917,6 +938,422 @@ async fn indexed_backend_with_open_doc(
         .expect("publish test index");
     open_test_document(&service, uri.clone(), 1, open_text).await;
     (dir, service, uri, line, character)
+}
+
+#[cfg(debug_assertions)]
+fn require_release_completion_benchmark() {
+    panic!("the U-Boot LSP completion replay must run with cargo test --release");
+}
+
+#[cfg(not(debug_assertions))]
+fn require_release_completion_benchmark() {}
+
+fn validate_completion_replay_recall(
+    metrics: &[crate::query::CompletionRecallMetrics],
+    minimum_active_entries: usize,
+) -> std::result::Result<(), String> {
+    if metrics.is_empty() {
+        return Err("completion replay recorded no recall observations".to_string());
+    }
+    for (request, metric) in metrics.iter().enumerate() {
+        if metric.indexed_returned == 0 {
+            return Err(format!(
+                "completion replay request {request} returned no indexed candidates"
+            ));
+        }
+        if metric.active_entries_total < minimum_active_entries {
+            return Err(format!(
+                "completion replay request {request} saw only {} active entries",
+                metric.active_entries_total
+            ));
+        }
+        if metric.candidate_budget != crate::query::COMPLETION_RECALL_CANDIDATE_BUDGET {
+            return Err(format!(
+                "completion replay request {request} used candidate budget {}",
+                metric.candidate_budget
+            ));
+        }
+        if metric.entries_inspected == 0
+            || metric.entries_inspected > crate::query::COMPLETION_RECALL_CANDIDATE_BUDGET
+        {
+            return Err(format!(
+                "completion replay request {request} inspected {} entries",
+                metric.entries_inspected
+            ));
+        }
+        let source_attempt_limit = metric
+            .candidate_budget
+            .saturating_div(8)
+            .min(crate::query::COMPLETION_PRIORITY_METADATA_PROBE_LIMIT);
+        if metric.priority_source_attempts > source_attempt_limit {
+            return Err(format!(
+                "completion replay request {request} initialized {} priority sources",
+                metric.priority_source_attempts
+            ));
+        }
+        if metric.priority_sources_initialized != metric.priority_source_attempts {
+            return Err(format!(
+                "completion replay request {request} reported {}/{} initialized/attempted priority sources",
+                metric.priority_sources_initialized, metric.priority_source_attempts
+            ));
+        }
+        for (label, probes) in [
+            ("priority source", metric.priority_source_probes),
+            ("priority fuzzy name", metric.priority_fuzzy_name_probes),
+            (
+                "priority fuzzy declaration",
+                metric.priority_fuzzy_declaration_probes,
+            ),
+        ] {
+            if probes > crate::query::COMPLETION_PRIORITY_METADATA_PROBE_LIMIT {
+                return Err(format!(
+                    "completion replay request {request} performed {probes} {label} probes"
+                ));
+            }
+        }
+        if !metric.truncated {
+            return Err(format!(
+                "completion replay request {request} did not expose bounded truncation"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn completion_replay_gate_rejects_non_indexed_false_green() {
+    let empty_fast_metrics = vec![crate::query::CompletionRecallMetrics::default(); 64];
+    assert!(
+        validate_completion_replay_recall(&empty_fast_metrics, 500_000).is_err(),
+        "a fast builtin-only response must not satisfy the production recall gate"
+    );
+
+    let valid = crate::query::CompletionRecallMetrics {
+        indexed_returned: 1,
+        entries_inspected: crate::query::COMPLETION_RECALL_CANDIDATE_BUDGET,
+        active_entries_total: 654_890,
+        candidate_budget: crate::query::COMPLETION_RECALL_CANDIDATE_BUDGET,
+        truncated: true,
+        ..Default::default()
+    };
+    assert!(validate_completion_replay_recall(&vec![valid; 64], 500_000).is_ok());
+
+    let mut unbounded_sources = valid;
+    unbounded_sources.priority_source_probes = 4_097;
+    assert!(
+        validate_completion_replay_recall(&[unbounded_sources], 500_000).is_err(),
+        "the replay gate must reject hidden source metadata work"
+    );
+    let mut unbounded_fuzzy = valid;
+    unbounded_fuzzy.priority_fuzzy_name_probes = 4_097;
+    assert!(
+        validate_completion_replay_recall(&[unbounded_fuzzy], 500_000).is_err(),
+        "the replay gate must reject hidden fuzzy metadata work"
+    );
+    let mut inconsistent_sources = valid;
+    inconsistent_sources.priority_source_attempts = 1;
+    assert!(
+        validate_completion_replay_recall(&[inconsistent_sources], 500_000).is_err(),
+        "every successful source attempt must initialize exactly one cursor"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "U-Boot production LSP completion replay; set FOSSILSENSE_BENCH_DB and FOSSILSENSE_BENCH_ROOT and run with --release"]
+async fn benchmark_uboot_lsp_completion_replay_stays_within_latency_and_sql_gates() {
+    require_release_completion_benchmark();
+    let db_path = std::env::var_os("FOSSILSENSE_BENCH_DB")
+        .map(PathBuf::from)
+        .expect("set FOSSILSENSE_BENCH_DB to a current-schema U-Boot database");
+    let root = std::env::var_os("FOSSILSENSE_BENCH_ROOT")
+        .map(PathBuf::from)
+        .expect("set FOSSILSENSE_BENCH_ROOT to the indexed U-Boot checkout");
+    assert!(db_path.is_file(), "benchmark database does not exist");
+    assert!(root.is_dir(), "benchmark workspace does not exist");
+
+    let service = test_backend_service();
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(root.clone());
+    service
+        .inner()
+        .set_completion_history_mode_for_test(crate::completion_history::CompletionHistoryMode::Off)
+        .await;
+    let snapshot = service
+        .inner()
+        .session
+        .cache
+        .publish_full_index_from_db_for_test(root.clone(), db_path)
+        .await
+        .expect("hydrate and publish benchmark engine snapshot");
+    let declaration_index = snapshot
+        .declaration_index
+        .clone()
+        .expect("benchmark declaration index");
+    assert!(
+        declaration_index.len() >= 500_000,
+        "LSP replay requires the full U-Boot declaration set"
+    );
+
+    let uri = Url::from_file_path(root.join(".fossilsense-completion-replay.c"))
+        .expect("benchmark document URI");
+    const REPLAY_SELF_INCLUDE: &str = ".fossilsense-completion-replay.c";
+    const REPLAY_MISSING_INCLUDE: &str = ".fossilsense-completion-replay-missing.h";
+    let (initial_text, line, character) = text_and_position(&format!(
+        "#include \"{REPLAY_SELF_INCLUDE}\"\nvoid completion_replay(void) {{ i/*cursor*/; }}\n"
+    ));
+    open_test_document(&service, uri.clone(), 1, initial_text).await;
+    let sql_reads_before = declaration_index.payload_cache_stats().sql_reads;
+    let prefixes = ["i", "in", "init", "d", "de", "dev", "c", "cmd"];
+    let mut samples = Vec::with_capacity(prefixes.len() * 8);
+    let mut version = 1;
+
+    for pass in 0..10 {
+        for (prefix_index, prefix) in prefixes.iter().copied().enumerate() {
+            if pass == 2 && prefix_index == 0 {
+                service
+                    .inner()
+                    .session
+                    .cache
+                    .reset_completion_overlay_cache_metrics_for_test();
+            }
+            version += 1;
+            // Alternate the include projection on every request. This forces a
+            // stable-universe cache miss at U-Boot scale while retaining the
+            // ordinary completion handler, render and bounded-recall gates.
+            let include_target = if (pass * prefixes.len() + prefix_index).is_multiple_of(2) {
+                REPLAY_SELF_INCLUDE
+            } else {
+                REPLAY_MISSING_INCLUDE
+            };
+            let (text, current_line, current_character) = text_and_position(&format!(
+                "#include \"{include_target}\"\nvoid completion_replay(void) {{ {prefix}/*cursor*/; }}\n"
+            ));
+            assert_eq!(
+                (current_line, current_character),
+                (line, character + prefix.len() as u32 - 1)
+            );
+            service
+                .inner()
+                .session
+                .change_document(uri.clone(), version, text)
+                .await;
+
+            let started = std::time::Instant::now();
+            let response = service
+                .inner()
+                .completion(completion_params(
+                    uri.clone(),
+                    current_line,
+                    current_character,
+                ))
+                .await
+                .expect("completion request")
+                .expect("completion response");
+            let elapsed_us = started.elapsed().as_micros();
+            assert!(completion_response_is_incomplete(&response));
+            assert!(
+                !completion_items(response).is_empty(),
+                "U-Boot replay returned no completion items for {prefix}"
+            );
+            if pass >= 2 {
+                samples.push(elapsed_us);
+            }
+        }
+    }
+
+    samples.sort_unstable();
+    let p50 = samples[samples.len() / 2];
+    let p95 = samples[samples.len() * 95 / 100];
+    let max = samples[samples.len() - 1];
+    let observations = service.inner().take_completion_perf_for_test();
+    assert_eq!(observations.len(), prefixes.len() * 10);
+    let observations = &observations[prefixes.len() * 2..];
+    let recall_observations: Vec<_> = observations
+        .iter()
+        .map(|(_, metrics)| metrics.recall_channels)
+        .collect();
+    validate_completion_replay_recall(&recall_observations, 500_000)
+        .expect("production LSP replay indexed-recall gate");
+    let percentile = |values: &mut Vec<u128>, percentile: usize| {
+        values.sort_unstable();
+        values[values.len() * percentile / 100]
+    };
+    let context_p95 = percentile(
+        &mut observations
+            .iter()
+            .map(|(timings, _)| timings.context_ms)
+            .collect(),
+        95,
+    );
+    let parse_p95 = percentile(
+        &mut observations
+            .iter()
+            .map(|(timings, _)| timings.parse_ms)
+            .collect(),
+        95,
+    );
+    let local_words_p95 = percentile(
+        &mut observations
+            .iter()
+            .map(|(timings, _)| timings.local_words_ms)
+            .collect(),
+        95,
+    );
+    let overlay_p95 = percentile(
+        &mut observations
+            .iter()
+            .map(|(timings, _)| timings.overlay_ms)
+            .collect(),
+        95,
+    );
+    let worker_p95 = percentile(
+        &mut observations
+            .iter()
+            .map(|(timings, _)| timings.worker_ms)
+            .collect(),
+        95,
+    );
+    let render_p95 = percentile(
+        &mut observations
+            .iter()
+            .map(|(timings, _)| timings.render_ms)
+            .collect(),
+        95,
+    );
+    let entries_inspected_max = observations
+        .iter()
+        .map(|(_, metrics)| metrics.recall_channels.entries_inspected)
+        .max()
+        .unwrap_or_default();
+    let entries_inspected_min = recall_observations
+        .iter()
+        .map(|metrics| metrics.entries_inspected)
+        .min()
+        .unwrap_or_default();
+    let indexed_returned_min = recall_observations
+        .iter()
+        .map(|metrics| metrics.indexed_returned)
+        .min()
+        .unwrap_or_default();
+    let active_entries_min = recall_observations
+        .iter()
+        .map(|metrics| metrics.active_entries_total)
+        .min()
+        .unwrap_or_default();
+    let candidate_budget_min = recall_observations
+        .iter()
+        .map(|metrics| metrics.candidate_budget)
+        .min()
+        .unwrap_or_default();
+    let candidate_budget_max = recall_observations
+        .iter()
+        .map(|metrics| metrics.candidate_budget)
+        .max()
+        .unwrap_or_default();
+    let truncated_requests = recall_observations
+        .iter()
+        .filter(|metrics| metrics.truncated)
+        .count();
+    let priority_source_probes_max = recall_observations
+        .iter()
+        .map(|metrics| metrics.priority_source_probes)
+        .max()
+        .unwrap_or_default();
+    let priority_source_attempts_max = recall_observations
+        .iter()
+        .map(|metrics| metrics.priority_source_attempts)
+        .max()
+        .unwrap_or_default();
+    let priority_sources_initialized_max = recall_observations
+        .iter()
+        .map(|metrics| metrics.priority_sources_initialized)
+        .max()
+        .unwrap_or_default();
+    let priority_fuzzy_name_probes_max = recall_observations
+        .iter()
+        .map(|metrics| metrics.priority_fuzzy_name_probes)
+        .max()
+        .unwrap_or_default();
+    let priority_fuzzy_declaration_probes_max = recall_observations
+        .iter()
+        .map(|metrics| metrics.priority_fuzzy_declaration_probes)
+        .max()
+        .unwrap_or_default();
+    let sql_reads_after = declaration_index.payload_cache_stats().sql_reads;
+    let (overlay_cache_hits, overlay_cache_misses) = service
+        .inner()
+        .session
+        .cache
+        .completion_overlay_cache_metrics_for_test();
+    const P95_LIMIT_US: u128 = 50_000;
+
+    println!(
+        "completion_lsp_replay_declarations: {}",
+        declaration_index.len()
+    );
+    println!("completion_lsp_replay_requests: {}", samples.len());
+    println!(
+        "completion_lsp_replay_forced_include_miss_requests: {}",
+        overlay_cache_misses
+    );
+    println!("completion_lsp_replay_p50_us: {p50}");
+    println!("completion_lsp_replay_p95_us: {p95}");
+    println!("completion_lsp_replay_max_us: {max}");
+    println!("completion_lsp_replay_p95_limit_us: {P95_LIMIT_US}");
+    println!("completion_lsp_replay_context_p95_ms: {context_p95}");
+    println!("completion_lsp_replay_parse_p95_ms: {parse_p95}");
+    println!("completion_lsp_replay_local_words_p95_ms: {local_words_p95}");
+    println!("completion_lsp_replay_overlay_p95_ms: {overlay_p95}");
+    println!("completion_lsp_replay_worker_p95_ms: {worker_p95}");
+    println!("completion_lsp_replay_render_p95_ms: {render_p95}");
+    println!("completion_lsp_replay_indexed_returned_min: {indexed_returned_min}");
+    println!("completion_lsp_replay_active_entries_min: {active_entries_min}");
+    println!("completion_lsp_replay_candidate_budget_min: {candidate_budget_min}");
+    println!("completion_lsp_replay_candidate_budget_max: {candidate_budget_max}");
+    println!("completion_lsp_replay_truncated_requests: {truncated_requests}");
+    println!("completion_lsp_replay_entries_inspected_min: {entries_inspected_min}");
+    println!("completion_lsp_replay_entries_inspected_max: {entries_inspected_max}");
+    println!("completion_lsp_replay_priority_source_probes_max: {priority_source_probes_max}");
+    println!("completion_lsp_replay_priority_source_attempts_max: {priority_source_attempts_max}");
+    println!(
+        "completion_lsp_replay_priority_sources_initialized_max: {priority_sources_initialized_max}"
+    );
+    println!(
+        "completion_lsp_replay_priority_fuzzy_name_probes_max: {priority_fuzzy_name_probes_max}"
+    );
+    println!(
+        "completion_lsp_replay_priority_fuzzy_declaration_probes_max: {priority_fuzzy_declaration_probes_max}"
+    );
+    println!(
+        "completion_lsp_replay_sql_reads: {}",
+        sql_reads_after.saturating_sub(sql_reads_before)
+    );
+
+    assert_eq!(
+        sql_reads_after, sql_reads_before,
+        "ordinary completion lists must not hydrate declaration payloads"
+    );
+    assert_eq!(
+        overlay_cache_hits, 0,
+        "alternating include universes must not hit the completion overlay cache"
+    );
+    assert_eq!(
+        overlay_cache_misses,
+        samples.len() as u64,
+        "the replay must measure one real overlay miss per sampled request"
+    );
+    assert!(
+        entries_inspected_max <= crate::query::COMPLETION_RECALL_CANDIDATE_BUDGET,
+        "production LSP recall escaped the shared request budget"
+    );
+    assert!(
+        p95 <= P95_LIMIT_US,
+        "U-Boot production LSP completion p95 {p95} us exceeded {P95_LIMIT_US} us"
+    );
 }
 
 #[tokio::test]
@@ -4305,6 +4742,7 @@ async fn project_context_commands_validate_selection_and_outside_uri_has_no_auto
             include_table: current.include_table.clone(),
             go_import_table: current.go_import_table.clone(),
             indexed_files: current.indexed_files.clone(),
+            include_path_index: current.include_path_index.clone(),
             project_context: None,
             call_read_handle: None,
             workspace_semantics: current.workspace_semantics.clone(),
@@ -4699,6 +5137,30 @@ async fn cache_ledger_completion_memo_reuses_prefix_only_with_same_generation() 
 }
 
 #[tokio::test]
+async fn cache_ledger_never_narrows_from_an_incomplete_candidate_pool() {
+    let cache = super::CacheLedger::default();
+    let uri = Url::parse("file:///tmp/incomplete-memo.c").expect("uri");
+
+    cache
+        .record_completion_memo_with_completeness_for_test(
+            uri.clone(),
+            "fo".to_string(),
+            42,
+            vec![vec![1, 2, 3], vec![7, 8]],
+            vec![false, true],
+        )
+        .await;
+
+    let narrowed = cache.completion_memo_pools(&uri, 42, "foo", 2).await;
+    assert_eq!(narrowed.hit_kind, "pool");
+    assert_eq!(
+        narrowed.prior_pools,
+        vec![None, Some(vec![7, 8])],
+        "a truncated pool cannot be treated as a complete prefix superset"
+    );
+}
+
+#[tokio::test]
 async fn cache_ledger_clears_reference_search_cache_after_document_and_index_changes() {
     let documents = super::DocumentStore::default();
     let cache = super::CacheLedger::default();
@@ -4829,6 +5291,614 @@ async fn request_document_capture_keeps_current_all_and_epoch_atomic_during_chan
         tokio::task::yield_now().await;
     }
     writer.await.expect("writer");
+}
+
+#[tokio::test]
+async fn completion_overlay_reuses_recall_universe_across_current_body_edits() {
+    let service = test_backend_service();
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().to_path_buf();
+    let uri = Url::from_file_path(root.join("main.c")).expect("main uri");
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(root.clone());
+    open_test_document(
+        &service,
+        uri.clone(),
+        1,
+        "void stable(void) { first_prefix; }\n".into(),
+    )
+    .await;
+    let generation = crate::call_model::SemanticGeneration::MISSING;
+    let engine_epoch = super::state::EngineEpoch::published(1);
+
+    let first_documents = service
+        .inner()
+        .session
+        .documents
+        .capture_request_snapshot(Some(&uri))
+        .await;
+    let (first, first_universe) = service
+        .inner()
+        .completion_overlay_snapshot_from_documents(
+            completion_overlay_request(&root, &uri, engine_epoch, generation),
+            first_documents,
+        )
+        .await;
+
+    service
+        .inner()
+        .session
+        .change_document(
+            uri.clone(),
+            2,
+            "void stable(void) { second_prefix; }\n".into(),
+        )
+        .await;
+    let second_documents = service
+        .inner()
+        .session
+        .documents
+        .capture_request_snapshot(Some(&uri))
+        .await;
+    let (second, second_universe) = service
+        .inner()
+        .completion_overlay_snapshot_from_documents(
+            completion_overlay_request(&root, &uri, engine_epoch, generation),
+            second_documents,
+        )
+        .await;
+
+    assert_eq!(first_universe, second_universe);
+    assert!(
+        Arc::ptr_eq(&first, &second),
+        "body-only edits must reuse the immutable completion overlay projection"
+    );
+
+    service
+        .inner()
+        .session
+        .change_document(
+            uri.clone(),
+            3,
+            "#include \"replacement.h\"\nvoid stable(void) { second_prefix; }\n".into(),
+        )
+        .await;
+    let changed_documents = service
+        .inner()
+        .session
+        .documents
+        .capture_request_snapshot(Some(&uri))
+        .await;
+    let (changed, changed_universe) = service
+        .inner()
+        .completion_overlay_snapshot_from_documents(
+            completion_overlay_request(&root, &uri, engine_epoch, generation),
+            changed_documents,
+        )
+        .await;
+
+    assert_ne!(second_universe, changed_universe);
+    assert!(!Arc::ptr_eq(&second, &changed));
+}
+
+#[tokio::test]
+async fn completion_include_miss_reuses_generation_pinned_path_and_graph_bases() {
+    let service = test_backend_service();
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().to_path_buf();
+    let uri = Url::from_file_path(root.join("src/main.c")).expect("main uri");
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(root.clone());
+
+    let mut indexed_files = (0..8_192)
+        .map(|index| {
+            let path = format!("include/noise_{index}.h");
+            let absolute = root.join(path.replace('/', std::path::MAIN_SEPARATOR_STR));
+            (path, absolute)
+        })
+        .collect::<Vec<_>>();
+    indexed_files.push(("include/api.h".to_string(), root.join("include/api.h")));
+    indexed_files.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    service
+        .inner()
+        .session
+        .cache
+        .set_indexed_file_list_for_test(root.clone(), Arc::new(indexed_files))
+        .await;
+    let published_graph = Arc::new(crate::reachability::ReachGraph::new(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    ));
+    service
+        .inner()
+        .session
+        .cache
+        .set_reach_graph_for_test(root.clone(), published_graph.clone())
+        .await;
+    let engine = service
+        .inner()
+        .session
+        .cache
+        .current_engine_snapshot(&root)
+        .await
+        .expect("published engine");
+
+    open_test_document(
+        &service,
+        uri.clone(),
+        1,
+        "#include \"include/api.h\"\nvoid use(void) {}\n".into(),
+    )
+    .await;
+    let documents = service
+        .inner()
+        .session
+        .documents
+        .capture_request_snapshot(Some(&uri))
+        .await;
+    let (overlay, _) = service
+        .inner()
+        .completion_overlay_snapshot_from_documents(
+            super::candidate_context::CompletionOverlayRequest {
+                root: &root,
+                current_uri: &uri,
+                engine_epoch: engine.epoch,
+                generation: engine.semantic_generation,
+                base_reach_graph: engine.reach_graph.as_deref(),
+                indexed_workspace_files: engine.indexed_files.as_deref().map(Vec::as_slice),
+                workspace_semantics: engine.workspace_semantics.clone(),
+            },
+            documents,
+        )
+        .await;
+
+    let published_paths = engine
+        .include_path_index
+        .as_ref()
+        .expect("published include paths");
+    assert_eq!(
+        overlay.include_path_view_shape_for_test(published_paths),
+        (true, 1),
+        "the cache miss must retain the published path Arc and own only src/main.c"
+    );
+    let effective_graph = overlay
+        .effective_reach_graph(None)
+        .expect("effective graph");
+    assert_eq!(
+        effective_graph.request_overlay_shape_for_test(&published_graph),
+        (true, 1, 1),
+        "the request graph must retain the published Arc and replace one source"
+    );
+    assert!(effective_graph
+        .reachable("src/main.c")
+        .files
+        .contains("include/api.h"));
+}
+
+#[tokio::test]
+async fn completion_overlay_invalidates_when_another_dirty_declaration_changes() {
+    let service = test_backend_service();
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().to_path_buf();
+    let current_uri = Url::from_file_path(root.join("main.c")).expect("main uri");
+    let header_uri = Url::from_file_path(root.join("api.h")).expect("header uri");
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(root.clone());
+    open_test_document(
+        &service,
+        current_uri.clone(),
+        1,
+        "void use(void) { Dirty; }\n".into(),
+    )
+    .await;
+    open_test_document(
+        &service,
+        header_uri.clone(),
+        1,
+        "int DirtyBefore(void);\n".into(),
+    )
+    .await;
+    let generation = crate::call_model::SemanticGeneration::MISSING;
+    let engine_epoch = super::state::EngineEpoch::published(1);
+    let first_documents = service
+        .inner()
+        .session
+        .documents
+        .capture_request_snapshot(Some(&current_uri))
+        .await;
+    let (first, first_universe) = service
+        .inner()
+        .completion_overlay_snapshot_from_documents(
+            completion_overlay_request(&root, &current_uri, engine_epoch, generation),
+            first_documents,
+        )
+        .await;
+    assert!(first
+        .completion_names()
+        .iter()
+        .any(|entry| entry.name == "DirtyBefore"));
+
+    service
+        .inner()
+        .session
+        .change_document(header_uri, 2, "int DirtyAfter(void);\n".into())
+        .await;
+    let second_documents = service
+        .inner()
+        .session
+        .documents
+        .capture_request_snapshot(Some(&current_uri))
+        .await;
+    let (second, second_universe) = service
+        .inner()
+        .completion_overlay_snapshot_from_documents(
+            completion_overlay_request(&root, &current_uri, engine_epoch, generation),
+            second_documents,
+        )
+        .await;
+
+    assert_ne!(first_universe, second_universe);
+    assert!(!Arc::ptr_eq(&first, &second));
+    let names = second.completion_names();
+    assert!(names.iter().any(|entry| entry.name == "DirtyAfter"));
+    assert!(names.iter().all(|entry| entry.name != "DirtyBefore"));
+}
+
+#[tokio::test]
+async fn completion_overlay_cache_rejects_late_old_universe_and_engine_publication() {
+    let cache = super::CacheLedger::default();
+    let root = tempdir().expect("root").path().to_path_buf();
+    let engine_epoch = super::state::EngineEpoch::published(1);
+    let generation = crate::call_model::SemanticGeneration(1);
+    let old_universe = crate::candidate_service::RecallUniverseId::for_test(1);
+    let new_universe = crate::candidate_service::RecallUniverseId::for_test(2);
+    let (_, cache_revision) = cache
+        .completion_overlay(&root, engine_epoch, generation, 1, old_universe)
+        .await;
+    let old_snapshot = Arc::new(crate::candidate_service::CandidateOverlaySnapshot::new(
+        1,
+        Vec::new(),
+    ));
+    let new_snapshot = Arc::new(crate::candidate_service::CandidateOverlaySnapshot::new(
+        2,
+        Vec::new(),
+    ));
+
+    let published_new = cache
+        .publish_completion_overlay(super::workspace::CompletionOverlayPublication {
+            root: root.clone(),
+            engine_epoch,
+            semantic_generation: generation,
+            overlay_epoch: 2,
+            universe: new_universe,
+            expected_cache_revision: cache_revision,
+            snapshot: new_snapshot.clone(),
+        })
+        .await;
+    assert!(Arc::ptr_eq(&published_new, &new_snapshot));
+
+    let returned_old = cache
+        .publish_completion_overlay(super::workspace::CompletionOverlayPublication {
+            root: root.clone(),
+            engine_epoch,
+            semantic_generation: generation,
+            overlay_epoch: 1,
+            universe: old_universe,
+            expected_cache_revision: cache_revision,
+            snapshot: old_snapshot.clone(),
+        })
+        .await;
+    assert!(Arc::ptr_eq(&returned_old, &old_snapshot));
+    let (cached_new, _) = cache
+        .completion_overlay(&root, engine_epoch, generation, 2, new_universe)
+        .await;
+    assert!(cached_new.is_some_and(|cached| Arc::ptr_eq(&cached, &new_snapshot)));
+    assert!(cache
+        .completion_overlay(&root, engine_epoch, generation, 2, old_universe)
+        .await
+        .0
+        .is_none());
+
+    cache
+        .publish_engine_snapshot(super::workspace::EngineSnapshot {
+            root: root.clone(),
+            epoch: super::state::EngineEpoch::published(2),
+            semantic_generation: crate::call_model::SemanticGeneration(2),
+            declaration_index: None,
+            name_table: None,
+            fallback_completion_table: Arc::new(Default::default()),
+            reach_graph: None,
+            include_table: None,
+            go_import_table: None,
+            indexed_files: None,
+            include_path_index: None,
+            project_context: None,
+            call_read_handle: None,
+            workspace_semantics: empty_workspace_semantics(&root),
+            degraded: Default::default(),
+        })
+        .await;
+    assert!(cache
+        .completion_overlay(&root, engine_epoch, generation, 3, new_universe)
+        .await
+        .0
+        .is_none());
+
+    let late_snapshot = Arc::new(crate::candidate_service::CandidateOverlaySnapshot::new(
+        3,
+        Vec::new(),
+    ));
+    let returned_late = cache
+        .publish_completion_overlay(super::workspace::CompletionOverlayPublication {
+            root: root.clone(),
+            engine_epoch,
+            semantic_generation: generation,
+            overlay_epoch: 3,
+            universe: new_universe,
+            expected_cache_revision: cache_revision,
+            snapshot: late_snapshot.clone(),
+        })
+        .await;
+    assert!(Arc::ptr_eq(&returned_late, &late_snapshot));
+    assert!(
+        cache
+            .completion_overlay(&root, engine_epoch, generation, 3, new_universe)
+            .await
+            .0
+            .is_none(),
+        "a builder captured before engine publication must not repopulate the old engine key"
+    );
+}
+
+#[tokio::test]
+async fn overlay_caches_reject_snapshots_with_pending_external_path_probes() {
+    let external = tempdir().expect("external include root");
+    std::fs::write(external.path().join("api.h"), "int external_api(void);\n")
+        .expect("external header");
+    let parsed = crate::parser::parse_with_handle(
+        std::path::Path::new("main.c"),
+        "#include <api.h>\nint main(void) { return 0; }\n",
+        None,
+        crate::parser::ParseFacts::HOVER_SEMANTICS,
+    );
+    let mut pending = crate::candidate_service::CandidateOverlaySnapshot::new(
+        1,
+        vec![crate::candidate_service::FileCandidateOverlay::from_index(
+            "main.c".into(),
+            &parsed,
+        )],
+    );
+    pending.refresh_reach_graph(
+        Some(Arc::new(crate::reachability::ReachGraph::new(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ))),
+        Some(Arc::new(crate::candidate_service::IncludePathIndex::build(
+            [("main.c".to_string(), true)],
+        ))),
+        &[crate::pathing::normalize_abs_path(external.path())],
+    );
+    assert!(
+        !pending.path_view_cacheable(),
+        "the first request must not wait for the filesystem probe"
+    );
+    let pending = Arc::new(pending);
+
+    let cache = super::CacheLedger::default();
+    let root = tempdir().expect("workspace root").path().to_path_buf();
+    let engine_epoch = super::state::EngineEpoch::published(1);
+    let generation = crate::call_model::SemanticGeneration(1);
+    let universe = crate::candidate_service::RecallUniverseId::for_test(9);
+    let (_, completion_revision) = cache
+        .completion_overlay(&root, engine_epoch, generation, 1, universe)
+        .await;
+    cache
+        .publish_completion_overlay(super::workspace::CompletionOverlayPublication {
+            root: root.clone(),
+            engine_epoch,
+            semantic_generation: generation,
+            overlay_epoch: 1,
+            universe,
+            expected_cache_revision: completion_revision,
+            snapshot: pending.clone(),
+        })
+        .await;
+    assert!(
+        cache
+            .completion_overlay(&root, engine_epoch, generation, 1, universe)
+            .await
+            .0
+            .is_none(),
+        "completion cache must rebuild after a pending background probe"
+    );
+
+    let (_, candidate_revision) = cache.candidate_overlay(&root, generation, 1).await;
+    cache
+        .publish_candidate_overlay(root.clone(), generation, 1, candidate_revision, pending)
+        .await;
+    assert!(
+        cache
+            .candidate_overlay(&root, generation, 1)
+            .await
+            .0
+            .is_none(),
+        "semantic candidate cache must rebuild after a pending background probe"
+    );
+}
+
+#[tokio::test]
+async fn completion_overlay_cache_metrics_measure_real_hits_and_misses() {
+    let cache = super::CacheLedger::default();
+    let root = tempdir().expect("workspace root").path().to_path_buf();
+    let engine_epoch = super::state::EngineEpoch::published(1);
+    let generation = crate::call_model::SemanticGeneration(1);
+    let universe = crate::candidate_service::RecallUniverseId::for_test(11);
+    cache.reset_completion_overlay_cache_metrics_for_test();
+
+    let (_, revision) = cache
+        .completion_overlay(&root, engine_epoch, generation, 1, universe)
+        .await;
+    cache
+        .publish_completion_overlay(super::workspace::CompletionOverlayPublication {
+            root: root.clone(),
+            engine_epoch,
+            semantic_generation: generation,
+            overlay_epoch: 1,
+            universe,
+            expected_cache_revision: revision,
+            snapshot: Arc::new(crate::candidate_service::CandidateOverlaySnapshot::new(
+                1,
+                Vec::new(),
+            )),
+        })
+        .await;
+    assert!(cache
+        .completion_overlay(&root, engine_epoch, generation, 2, universe)
+        .await
+        .0
+        .is_some());
+    assert_eq!(cache.completion_overlay_cache_metrics_for_test(), (1, 1));
+}
+
+#[tokio::test]
+async fn current_completion_projection_tombstones_renamed_indexed_declaration() {
+    let (_dir, service, uri, _, _) = indexed_backend_with_open_doc(
+        &[],
+        "main.c",
+        "int OldCurrent(void);\nvoid use(void) { Old/*cursor*/; }\n",
+    )
+    .await;
+    let (changed, line, character) =
+        text_and_position("int NewCurrent(void);\nvoid use(void) { New/*cursor*/; }\n");
+    service
+        .inner()
+        .session
+        .change_document(uri.clone(), 2, changed)
+        .await;
+
+    let response = service
+        .inner()
+        .completion(completion_params(uri, line, character))
+        .await
+        .expect("completion request")
+        .expect("completion response");
+    let items = completion_items(response);
+
+    assert!(items.iter().any(|item| item.label == "NewCurrent"));
+    assert!(
+        items.iter().all(|item| item.label != "OldCurrent"),
+        "the current dirty path must tombstone its durable declarations"
+    );
+}
+
+#[tokio::test]
+async fn completion_memo_generation_tracks_recall_universe_not_body_revision() {
+    let service = test_backend_service();
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().to_path_buf();
+    let uri = Url::from_file_path(root.join("main.c")).expect("main uri");
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(root.clone());
+    service
+        .inner()
+        .session
+        .cache
+        .set_name_table_for_test(
+            root,
+            Arc::new(crate::query::NameTable::build(vec![
+                (1, "able_symbol".to_string(), false),
+                (2, "about_symbol".to_string(), false),
+            ])),
+        )
+        .await;
+    let (first_text, first_line, first_character) =
+        text_and_position("void use(void) { a/*cursor*/; }\n");
+    open_test_document(&service, uri.clone(), 1, first_text).await;
+    service
+        .inner()
+        .completion(completion_params(uri.clone(), first_line, first_character))
+        .await
+        .expect("first completion request")
+        .expect("first completion response");
+    let first_generation = service
+        .inner()
+        .session
+        .cache
+        .completion_memo_for_test(&uri)
+        .await
+        .expect("first memo")
+        .generation;
+
+    let (body_text, body_line, body_character) =
+        text_and_position("void use(void) { ab/*cursor*/; }\n");
+    service
+        .inner()
+        .session
+        .change_document(uri.clone(), 2, body_text)
+        .await;
+    service
+        .inner()
+        .completion(completion_params(uri.clone(), body_line, body_character))
+        .await
+        .expect("body completion request")
+        .expect("body completion response");
+    let body_generation = service
+        .inner()
+        .session
+        .cache
+        .completion_memo_for_test(&uri)
+        .await
+        .expect("body memo")
+        .generation;
+    assert_eq!(
+        first_generation, body_generation,
+        "a body-only edit must retain the indexed recall universe"
+    );
+
+    let (include_text, include_line, include_character) =
+        text_and_position("#include \"replacement.h\"\nvoid use(void) { ab/*cursor*/; }\n");
+    service
+        .inner()
+        .session
+        .change_document(uri.clone(), 3, include_text)
+        .await;
+    service
+        .inner()
+        .completion(completion_params(
+            uri.clone(),
+            include_line,
+            include_character,
+        ))
+        .await
+        .expect("include completion request")
+        .expect("include completion response");
+    let include_generation = service
+        .inner()
+        .session
+        .cache
+        .completion_memo_for_test(&uri)
+        .await
+        .expect("include memo")
+        .generation;
+    assert_ne!(body_generation, include_generation);
 }
 
 #[tokio::test]
@@ -4978,6 +6048,7 @@ async fn did_close_prevents_a_late_external_authorization_cache_write() {
             include_table: None,
             go_import_table: None,
             indexed_files: None,
+            include_path_index: None,
             project_context: None,
             call_read_handle: None,
             workspace_semantics: semantics.clone(),
@@ -5781,6 +6852,7 @@ async fn candidate_overlay_does_not_adopt_a_new_graph_after_request_publication(
             include_table: None,
             go_import_table: None,
             indexed_files: None,
+            include_path_index: None,
             project_context: None,
             call_read_handle: None,
             workspace_semantics: empty_workspace_semantics(&root),
@@ -5813,6 +6885,7 @@ async fn candidate_overlay_does_not_adopt_a_new_graph_after_request_publication(
             include_table: None,
             go_import_table: None,
             indexed_files: None,
+            include_path_index: None,
             project_context: None,
             call_read_handle: None,
             workspace_semantics: old.workspace_semantics.clone(),
@@ -5852,6 +6925,7 @@ async fn candidate_overlay_cache_rejects_a_late_build_after_publication() {
             include_table: None,
             go_import_table: None,
             indexed_files: None,
+            include_path_index: None,
             project_context: None,
             call_read_handle: None,
             workspace_semantics: empty_workspace_semantics(&root),
@@ -5902,6 +6976,7 @@ async fn indexed_completion_resolve_rejects_cross_generation_context_before_over
             include_table: None,
             go_import_table: None,
             indexed_files: None,
+            include_path_index: None,
             project_context: None,
             call_read_handle: None,
             workspace_semantics: empty_workspace_semantics(&root),
@@ -5986,6 +7061,7 @@ async fn reach_scope_uses_captured_request_context_graph() {
             include_table: None,
             go_import_table: None,
             indexed_files: None,
+            include_path_index: None,
             project_context: None,
             call_read_handle: None,
             workspace_semantics: empty_workspace_semantics(&root),
@@ -6275,6 +7351,7 @@ async fn member_completion_resolve_allows_go_module_owner_and_rejects_sibling() 
             include_table: None,
             go_import_table: None,
             indexed_files: None,
+            include_path_index: None,
             project_context: None,
             call_read_handle: None,
             workspace_semantics,
@@ -6410,6 +7487,7 @@ async fn member_completion_resolve_uses_alias_identity_language_override() {
             include_table: None,
             go_import_table: None,
             indexed_files: None,
+            include_path_index: None,
             project_context: None,
             call_read_handle: None,
             workspace_semantics,
@@ -7912,6 +8990,149 @@ fn completion_memo_invalid_when_prior_prefix_empty() {
     assert!(!super::state::completion_memo_is_valid(1, 1, "", "foo"));
 }
 
+#[tokio::test]
+async fn completion_runtime_supersedes_queued_request_before_cpu_admission() {
+    let runtime = super::completion_runtime::CompletionRuntime::with_permits_for_test(1);
+    let blocker_uri = Url::parse("file:///workspace/blocker.c").expect("blocker uri");
+    let target_uri = Url::parse("file:///workspace/target.c").expect("target uri");
+
+    let blocker = runtime.begin(blocker_uri);
+    let blocker_permit = blocker
+        .acquire()
+        .await
+        .expect("first request owns the only foreground permit");
+
+    let queued = runtime.begin(target_uri.clone());
+    let queued_wait = tokio::spawn(async move { queued.acquire().await.is_some() });
+    tokio::task::yield_now().await;
+
+    let latest = runtime.begin(target_uri);
+    assert!(
+        !queued_wait.await.expect("queued request task"),
+        "a superseded request must leave the admission queue"
+    );
+
+    drop(blocker_permit);
+    let latest_permit = latest
+        .acquire()
+        .await
+        .expect("latest request receives the released permit");
+    drop(latest_permit);
+
+    let metrics = runtime.metrics_for_test();
+    assert_eq!(metrics.superseded, 1);
+    assert_eq!(metrics.cancelled_before_admission, 1);
+}
+
+#[test]
+fn document_change_supersedes_active_completion_token() {
+    let runtime = super::completion_runtime::CompletionRuntime::with_permits_for_test(1);
+    let uri = Url::parse("file:///workspace/target.c").expect("target uri");
+    let request = runtime.begin(uri.clone());
+
+    runtime.supersede(&uri);
+
+    assert!(request.is_cancelled());
+    assert!(request.stop_before_worker());
+    let metrics = runtime.metrics_for_test();
+    assert_eq!(metrics.superseded, 1);
+    assert_eq!(metrics.cancelled_before_worker, 1);
+}
+
+#[test]
+fn completion_runtime_never_allows_older_work_to_replace_a_post_change_request() {
+    let runtime = super::completion_runtime::CompletionRuntime::with_permits_for_test(1);
+    let uri = Url::parse("file:///workspace/target.c").expect("target uri");
+    let mut older = runtime.begin(uri.clone());
+
+    runtime.supersede(&uri);
+    let mut latest = runtime.begin(uri);
+
+    assert!(older.is_cancelled());
+    assert!(!older.is_current());
+    assert!(latest.is_current());
+    assert!(!older.finish(), "old work must not become publishable");
+    assert!(latest.finish(), "the post-change request remains current");
+}
+
+#[tokio::test]
+async fn cancelled_request_cannot_repopulate_a_memo_after_waiting_for_its_lock() {
+    let runtime = super::completion_runtime::CompletionRuntime::with_permits_for_test(1);
+    let cache = super::CacheLedger::default();
+    let uri = Url::parse("file:///workspace/target.c").expect("target uri");
+    let request = runtime.begin(uri.clone());
+    let memo_guard = cache.completion_memo.clone().lock_owned().await;
+
+    let waiting_cache = cache.clone();
+    let waiting_uri = uri.clone();
+    let commit = tokio::spawn(async move {
+        let mut request = request;
+        let committed = waiting_cache
+            .record_completion_memo_if_current(
+                &request,
+                waiting_uri,
+                super::state::CompletionMemo {
+                    prefix: "tar".to_string(),
+                    generation: 7,
+                    pools: vec![vec![1, 2, 3]],
+                    pool_complete: vec![true],
+                },
+                true,
+            )
+            .await;
+        let publishable = request.finish();
+        (committed, publishable)
+    });
+    tokio::task::yield_now().await;
+
+    runtime.supersede(&uri);
+    let mut latest = runtime.begin(uri.clone());
+    drop(memo_guard);
+
+    let (committed, publishable) = commit.await.expect("memo commit task");
+    assert!(
+        !committed,
+        "a stale request must not write its candidate pool"
+    );
+    assert!(!publishable, "a stale request must not return its result");
+    assert!(
+        cache.completion_memo_for_test(&uri).await.is_none(),
+        "didChange/didClose must not be followed by stale memo resurrection"
+    );
+    assert!(latest.finish());
+}
+
+#[tokio::test]
+async fn probe_dependent_completion_clears_prior_narrowing_memo() {
+    let runtime = super::completion_runtime::CompletionRuntime::with_permits_for_test(1);
+    let cache = super::CacheLedger::default();
+    let uri = Url::parse("file:///workspace/target.c").expect("target uri");
+    cache
+        .record_completion_memo(uri.clone(), "ta".into(), 6, vec![vec![1, 2]])
+        .await;
+    let request = runtime.begin(uri.clone());
+
+    let committed = cache
+        .record_completion_memo_if_current(
+            &request,
+            uri.clone(),
+            super::state::CompletionMemo {
+                prefix: "tar".into(),
+                generation: 7,
+                pools: vec![vec![1, 2, 3]],
+                pool_complete: vec![true],
+            },
+            false,
+        )
+        .await;
+
+    assert!(committed, "the request is still current");
+    assert!(
+        cache.completion_memo_for_test(&uri).await.is_none(),
+        "a probe-dependent ranking must not be reused after its path epoch changes"
+    );
+}
+
 #[test]
 fn engine_epoch_reserves_zero_for_missing_state() {
     assert_eq!(super::state::EngineEpoch::missing().as_u64(), 0);
@@ -7932,25 +9153,43 @@ fn combined_completion_generation_changes_with_engine_selection_or_project() {
         project_path: "app".into(),
     };
 
-    let combined_first =
-        super::state::combine_completion_generation(&[(root.clone(), first)], 1, None, 0);
-    let combined_second =
-        super::state::combine_completion_generation(&[(root.clone(), second)], 1, None, 0);
-    let combined_selection =
-        super::state::combine_completion_generation(&[(root.clone(), first)], 2, None, 0);
-    let combined_project =
-        super::state::combine_completion_generation(&[(root, first)], 1, Some(&project), 0);
-    let combined_overlay = super::state::combine_completion_generation(
+    let first_universe = crate::candidate_service::RecallUniverseId::for_test(1);
+    let second_universe = crate::candidate_service::RecallUniverseId::for_test(2);
+    let combined_first = super::state::combine_completion_generation(
+        &[(root.clone(), first)],
+        1,
+        None,
+        &[first_universe],
+    );
+    let combined_second = super::state::combine_completion_generation(
+        &[(root.clone(), second)],
+        1,
+        None,
+        &[first_universe],
+    );
+    let combined_selection = super::state::combine_completion_generation(
+        &[(root.clone(), first)],
+        2,
+        None,
+        &[first_universe],
+    );
+    let combined_project = super::state::combine_completion_generation(
+        &[(root, first)],
+        1,
+        Some(&project),
+        &[first_universe],
+    );
+    let combined_universe = super::state::combine_completion_generation(
         &[(PathBuf::from("workspace"), first)],
         1,
         None,
-        1,
+        &[second_universe],
     );
 
     assert_ne!(combined_first, combined_second);
     assert_ne!(combined_first, combined_selection);
     assert_ne!(combined_first, combined_project);
-    assert_ne!(combined_first, combined_overlay);
+    assert_ne!(combined_first, combined_universe);
 }
 
 // --- R7: local word vs indexed candidate tier ordering --------------------

@@ -6,10 +6,13 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tower_lsp::lsp_types::{Position, TextDocumentContentChangeEvent, Url};
 
+use super::completion_runtime::CompletionRequest;
 use super::state;
 use super::LocalWordCache;
 use crate::call_model::SemanticGeneration;
-use crate::candidate_service::CandidateOverlaySnapshot;
+#[cfg(test)]
+use crate::candidate_service::IncludePathIndex;
+use crate::candidate_service::{CandidateOverlaySnapshot, RecallUniverseId};
 use crate::completion_words;
 use crate::config::SourceLanguage;
 use crate::parser::{FileSemanticIndex, ParseFacts};
@@ -22,7 +25,10 @@ use crate::store::IndexStore;
 
 mod models;
 mod session;
-use models::{invalidate_candidate_overlay_root, CandidateOverlayCacheKey};
+use models::{
+    invalidate_candidate_overlay_root, CandidateOverlayCacheKey, CompletionOverlayCacheEntry,
+    CompletionOverlayCacheKey,
+};
 pub(super) use models::{
     CacheLedger, CachePublishReport, CompletionMemoLookup, EngineSnapshot, RequestContext,
     RequestSettings,
@@ -36,6 +42,16 @@ type ExternalOverlayParseCache =
 type LiveParseGates = Arc<Mutex<HashMap<Url, Arc<Mutex<()>>>>>;
 type LiveParseCancellations = Arc<Mutex<HashMap<Url, (i32, Arc<AtomicBool>)>>>;
 const MAX_EXTERNAL_OVERLAY_PARSE_CACHE_ENTRIES: usize = 64;
+
+pub(super) struct CompletionOverlayPublication {
+    pub(super) root: PathBuf,
+    pub(super) engine_epoch: state::EngineEpoch,
+    pub(super) semantic_generation: SemanticGeneration,
+    pub(super) overlay_epoch: u64,
+    pub(super) universe: RecallUniverseId,
+    pub(super) expected_cache_revision: u64,
+    pub(super) snapshot: Arc<CandidateOverlaySnapshot>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct ExternalOverlayParseKey {
@@ -700,8 +716,86 @@ impl CacheLedger {
                 semantic_generation,
                 overlay_epoch,
             })
+            .filter(|snapshot| snapshot.path_view_cacheable())
             .cloned();
         (cached, revision)
+    }
+
+    pub(super) async fn completion_overlay(
+        &self,
+        root: &Path,
+        engine_epoch: state::EngineEpoch,
+        semantic_generation: SemanticGeneration,
+        overlay_epoch: u64,
+        universe: RecallUniverseId,
+    ) -> (Option<Arc<CandidateOverlaySnapshot>>, u64) {
+        let mut overlays = self.candidate_overlays.lock().await;
+        let revision = overlays.root_revisions.get(root).copied().unwrap_or(0);
+        let key = CompletionOverlayCacheKey {
+            root: root.to_path_buf(),
+            engine_epoch,
+            semantic_generation,
+        };
+        let cached = overlays.completion_entries.get_mut(&key).and_then(|entry| {
+            (entry.universe == universe && entry.snapshot.path_view_cacheable()).then(|| {
+                // The stable projection can outlive the epoch that built it.
+                // Request cancellation and completion-resolve validation keep
+                // using the caller's exact document epoch outside this cache.
+                entry.newest_overlay_epoch = entry.newest_overlay_epoch.max(overlay_epoch);
+                entry.snapshot.clone()
+            })
+        });
+        #[cfg(test)]
+        if cached.is_some() {
+            self.completion_overlay_cache_hits
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.completion_overlay_cache_misses
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        (cached, revision)
+    }
+
+    pub(super) async fn publish_completion_overlay(
+        &self,
+        publication: CompletionOverlayPublication,
+    ) -> Arc<CandidateOverlaySnapshot> {
+        let CompletionOverlayPublication {
+            root,
+            engine_epoch,
+            semantic_generation,
+            overlay_epoch,
+            universe,
+            expected_cache_revision,
+            snapshot,
+        } = publication;
+        let key = CompletionOverlayCacheKey {
+            root: root.clone(),
+            engine_epoch,
+            semantic_generation,
+        };
+        let mut cache = self.candidate_overlays.lock().await;
+        if cache.root_revisions.get(&root).copied().unwrap_or(0) != expected_cache_revision {
+            return snapshot;
+        }
+        if let Some(existing) = cache.completion_entries.get_mut(&key) {
+            if existing.universe == universe && existing.snapshot.path_view_cacheable() {
+                existing.newest_overlay_epoch = existing.newest_overlay_epoch.max(overlay_epoch);
+                return existing.snapshot.clone();
+            }
+            if existing.newest_overlay_epoch > overlay_epoch {
+                return snapshot;
+            }
+        }
+        cache.completion_entries.insert(
+            key,
+            CompletionOverlayCacheEntry {
+                universe,
+                newest_overlay_epoch: overlay_epoch,
+                snapshot: snapshot.clone(),
+            },
+        );
+        snapshot
     }
 
     /// Publish one fully-built immutable overlay. A concurrent request may
@@ -724,7 +818,11 @@ impl CacheLedger {
         if cache.root_revisions.get(&root).copied().unwrap_or(0) != expected_cache_revision {
             return overlay;
         }
-        if let Some(existing) = cache.entries.get(&key) {
+        if let Some(existing) = cache
+            .entries
+            .get(&key)
+            .filter(|existing| existing.path_view_cacheable())
+        {
             return existing.clone();
         }
         let newest_epoch = cache
@@ -749,6 +847,22 @@ impl CacheLedger {
     #[cfg(test)]
     pub(super) async fn candidate_overlay_cache_len_for_test(&self) -> usize {
         self.candidate_overlays.lock().await.entries.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn reset_completion_overlay_cache_metrics_for_test(&self) {
+        self.completion_overlay_cache_hits
+            .store(0, Ordering::Release);
+        self.completion_overlay_cache_misses
+            .store(0, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(super) fn completion_overlay_cache_metrics_for_test(&self) -> (u64, u64) {
+        (
+            self.completion_overlay_cache_hits.load(Ordering::Acquire),
+            self.completion_overlay_cache_misses.load(Ordering::Acquire),
+        )
     }
 
     pub(super) async fn request_context(
@@ -779,6 +893,7 @@ impl CacheLedger {
         self.completion_memo.lock().await.clear();
     }
 
+    #[cfg(test)]
     pub(super) async fn record_completion_memo(
         &self,
         uri: Url,
@@ -786,14 +901,57 @@ impl CacheLedger {
         generation: u64,
         pools: Vec<Vec<usize>>,
     ) {
+        let pool_complete = vec![true; pools.len()];
         self.completion_memo.lock().await.insert(
             uri,
             state::CompletionMemo {
                 prefix,
                 generation,
                 pools,
+                pool_complete,
             },
         );
+    }
+
+    #[cfg(test)]
+    pub(super) async fn record_completion_memo_with_completeness_for_test(
+        &self,
+        uri: Url,
+        prefix: String,
+        generation: u64,
+        pools: Vec<Vec<usize>>,
+        pool_complete: Vec<bool>,
+    ) {
+        assert_eq!(pools.len(), pool_complete.len());
+        self.completion_memo.lock().await.insert(
+            uri,
+            state::CompletionMemo {
+                prefix,
+                generation,
+                pools,
+                pool_complete,
+            },
+        );
+    }
+
+    pub(super) async fn record_completion_memo_if_current(
+        &self,
+        request: &CompletionRequest,
+        uri: Url,
+        entry: state::CompletionMemo,
+        cacheable: bool,
+    ) -> bool {
+        debug_assert_eq!(entry.pools.len(), entry.pool_complete.len());
+        let mut memo = self.completion_memo.lock().await;
+        request
+            .run_if_current(|| {
+                if cacheable {
+                    memo.insert(uri, entry);
+                } else {
+                    memo.remove(&uri);
+                }
+            })
+            .is_some()
     }
 
     pub(super) async fn completion_memo_pools(
@@ -806,20 +964,28 @@ impl CacheLedger {
         let memo = self.completion_memo.lock().await;
         match memo.get(uri) {
             Some(m)
-                if state::completion_memo_is_valid(m.generation, generation, &m.prefix, prefix)
-                    && prefix == m.prefix =>
-            {
-                CompletionMemoLookup {
-                    prior_pools: m.pools.iter().cloned().map(Some).collect(),
-                    hit_kind: "hot",
-                }
-            }
-            Some(m)
                 if state::completion_memo_is_valid(m.generation, generation, &m.prefix, prefix) =>
             {
+                let prior_pools: Vec<_> = (0..table_count)
+                    .map(|index| {
+                        m.pool_complete
+                            .get(index)
+                            .copied()
+                            .unwrap_or(false)
+                            .then(|| m.pools.get(index).cloned())
+                            .flatten()
+                    })
+                    .collect();
+                let reusable = prior_pools.iter().any(Option::is_some);
                 CompletionMemoLookup {
-                    prior_pools: m.pools.iter().cloned().map(Some).collect(),
-                    hit_kind: "pool",
+                    prior_pools,
+                    hit_kind: if !reusable {
+                        "cold"
+                    } else if prefix == m.prefix {
+                        "hot"
+                    } else {
+                        "pool"
+                    },
                 }
             }
             Some(_) | None => CompletionMemoLookup {
@@ -854,6 +1020,7 @@ impl CacheLedger {
             include_table: current.include_table.clone(),
             go_import_table: current.go_import_table.clone(),
             indexed_files: current.indexed_files.clone(),
+            include_path_index: current.include_path_index.clone(),
             project_context: current.project_context.clone(),
             call_read_handle: current.call_read_handle.clone(),
             workspace_semantics: current.workspace_semantics.clone(),
@@ -868,6 +1035,12 @@ impl CacheLedger {
         root: PathBuf,
         files: Arc<Vec<(String, PathBuf)>>,
     ) {
+        let include_path_index = Arc::new(IncludePathIndex::build(
+            files
+                .iter()
+                .map(|(path, _)| (path.clone(), true))
+                .collect::<Vec<_>>(),
+        ));
         let current = self
             .current_engine_snapshot(&root)
             .await
@@ -883,6 +1056,7 @@ impl CacheLedger {
             include_table: current.include_table.clone(),
             go_import_table: current.go_import_table.clone(),
             indexed_files: Some(files),
+            include_path_index: Some(include_path_index),
             project_context: current.project_context.clone(),
             call_read_handle: current.call_read_handle.clone(),
             workspace_semantics: current.workspace_semantics.clone(),
@@ -908,6 +1082,7 @@ impl CacheLedger {
             include_table: current.include_table.clone(),
             go_import_table: current.go_import_table.clone(),
             indexed_files: current.indexed_files.clone(),
+            include_path_index: current.include_path_index.clone(),
             project_context: current.project_context.clone(),
             call_read_handle: current.call_read_handle.clone(),
             workspace_semantics: current.workspace_semantics.clone(),

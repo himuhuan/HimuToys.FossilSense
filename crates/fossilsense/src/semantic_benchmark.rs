@@ -364,8 +364,10 @@ fn multi_dirty_overlay_merge() -> Result<BenchmarkMetrics> {
         paths.push(path);
     }
     let mut overlays = CandidateOverlaySnapshot::new(1, files);
-    let path_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
-    overlays.refresh_reach_graph(None, path_refs.iter().copied(), &[]);
+    let include_path_index = Arc::new(crate::candidate_service::IncludePathIndex::build(
+        paths.iter().cloned().map(|path| (path, true)),
+    ));
+    overlays.refresh_reach_graph(None, Some(include_path_index), &[]);
     let overlay_merge_us = elapsed_us(merge_started);
     let reach_started = Instant::now();
     let reach = overlays

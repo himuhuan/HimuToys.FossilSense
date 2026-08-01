@@ -11,7 +11,7 @@ use super::super::include_completion::IncludeCompletionTable;
 use super::super::state;
 use crate::call_model::SemanticGeneration;
 use crate::call_service::CallReadHandle;
-use crate::candidate_service::CandidateOverlaySnapshot;
+use crate::candidate_service::{CandidateOverlaySnapshot, IncludePathIndex, RecallUniverseId};
 use crate::declaration_index::SemanticDeclarationIndex;
 use crate::project_context::ProjectContextIndex;
 use crate::query::NameTable;
@@ -28,11 +28,16 @@ pub(in crate::server) struct CacheLedger {
     pub(in crate::server) completion_memo: Arc<Mutex<HashMap<Url, state::CompletionMemo>>>,
     pub(super) candidate_overlays: Arc<Mutex<CandidateOverlayCache>>,
     pub(super) semantic_index_memory_budget_bytes: Arc<AtomicU64>,
+    #[cfg(test)]
+    pub(super) completion_overlay_cache_hits: Arc<AtomicU64>,
+    #[cfg(test)]
+    pub(super) completion_overlay_cache_misses: Arc<AtomicU64>,
 }
 
 #[derive(Default)]
 pub(super) struct CandidateOverlayCache {
     pub(super) entries: HashMap<CandidateOverlayCacheKey, Arc<CandidateOverlaySnapshot>>,
+    pub(super) completion_entries: HashMap<CompletionOverlayCacheKey, CompletionOverlayCacheEntry>,
     pub(super) root_revisions: HashMap<PathBuf, u64>,
 }
 
@@ -43,8 +48,22 @@ pub(super) struct CandidateOverlayCacheKey {
     pub(super) overlay_epoch: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) struct CompletionOverlayCacheKey {
+    pub(super) root: PathBuf,
+    pub(super) engine_epoch: state::EngineEpoch,
+    pub(super) semantic_generation: SemanticGeneration,
+}
+
+pub(super) struct CompletionOverlayCacheEntry {
+    pub(super) universe: RecallUniverseId,
+    pub(super) newest_overlay_epoch: u64,
+    pub(super) snapshot: Arc<CandidateOverlaySnapshot>,
+}
+
 pub(super) fn invalidate_candidate_overlay_root(cache: &mut CandidateOverlayCache, root: &Path) {
     cache.entries.retain(|key, _| key.root != root);
+    cache.completion_entries.retain(|key, _| key.root != root);
     let revision = cache.root_revisions.entry(root.to_path_buf()).or_default();
     *revision = revision.wrapping_add(1).max(1);
 }
@@ -64,6 +83,7 @@ pub(in crate::server) struct EngineSnapshot {
     pub(in crate::server) include_table: Option<Arc<IncludeCompletionTable>>,
     pub(in crate::server) go_import_table: Option<Arc<GoImportCompletionTable>>,
     pub(in crate::server) indexed_files: Option<Arc<Vec<(String, PathBuf)>>>,
+    pub(in crate::server) include_path_index: Option<Arc<IncludePathIndex>>,
     pub(in crate::server) project_context: Option<Arc<ProjectContextIndex>>,
     pub(in crate::server) call_read_handle: Option<Arc<CallReadHandle>>,
     pub(in crate::server) workspace_semantics:
@@ -88,6 +108,7 @@ impl EngineSnapshot {
             include_table: None,
             go_import_table: None,
             indexed_files: None,
+            include_path_index: None,
             project_context: None,
             call_read_handle: None,
             workspace_semantics,
@@ -107,6 +128,10 @@ impl Default for CacheLedger {
             completion_memo: Arc::new(Mutex::new(HashMap::new())),
             candidate_overlays: Arc::new(Mutex::new(CandidateOverlayCache::default())),
             semantic_index_memory_budget_bytes: Arc::new(AtomicU64::new(256 * 1024 * 1024)),
+            #[cfg(test)]
+            completion_overlay_cache_hits: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            completion_overlay_cache_misses: Arc::new(AtomicU64::new(0)),
         }
     }
 }

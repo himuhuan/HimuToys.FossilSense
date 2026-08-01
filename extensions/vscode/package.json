@@ -2,7 +2,7 @@
   "name": "fossilsense-vscode",
   "displayName": "FossilSense",
   "description": "FossilSense C/C++ and Go best-effort semantics: stable navigation, role-aware candidates, bounded reachability evidence, Hover, completion, references, and call relations.",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "private": true,
   "license": "UNLICENSED",
   "publisher": "himutoys",

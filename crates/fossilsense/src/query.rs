@@ -68,6 +68,37 @@ pub use text::{
 };
 pub use type_resolution::*;
 
+/// Maximum number of compact recall entries processed between cooperative
+/// cancellation checks. The check is deliberately block-based so the hot loop
+/// does not perform an atomic load for every declaration.
+pub(crate) const COMPLETION_CANCELLATION_CHECK_INTERVAL: usize = 256;
+/// Maximum compact NameTable entries/posting rows touched by one ordinary
+/// completion request across all workspace roots. Result quotas cap output;
+/// this independent budget caps candidate generation CPU.
+pub(crate) const COMPLETION_RECALL_CANDIDATE_BUDGET: usize = 16_384;
+/// Maximum compact source/name metadata probes used by a priority completion
+/// channel. Production replay asserts this separately from declaration rows so
+/// hidden setup work cannot pass the latency gate with a misleading row count.
+pub(crate) const COMPLETION_PRIORITY_METADATA_PROBE_LIMIT: usize = 4_096;
+
+/// Request-owned cancellation observed by long-running completion recall.
+/// Implementations must be cheap and thread-safe because checks run inside the
+/// foreground blocking worker.
+pub(crate) trait CompletionQueryCancellation: Send + Sync {
+    fn is_cancelled(&self) -> bool;
+}
+
+pub(crate) struct CompletionRecallQuery<'a> {
+    pub query: &'a str,
+    pub quotas: CompletionRecallQuotas,
+    pub scope: Option<&'a CompletionScope>,
+    pub active_project: Option<&'a ProjectKey>,
+    pub prior_pool: Option<&'a [usize]>,
+    pub semantic_family: Option<crate::semantic_model::SemanticFamily>,
+    pub cancellation: Option<&'a dyn CompletionQueryCancellation>,
+    pub candidate_budget: usize,
+}
+
 #[cfg(test)]
 use name_search::{sort_scored, top_scored};
 #[cfg(test)]
@@ -259,6 +290,22 @@ pub struct CompletionRecallMetrics {
     pub same_project: usize,
     pub pool_total: usize,
     pub indexed_returned: usize,
+    pub entries_inspected: usize,
+    pub prefix_entries_inspected: usize,
+    pub fuzzy_entries_inspected: usize,
+    pub fuzzy_posting_entries_inspected: usize,
+    pub fuzzy_sample_entries_inspected: usize,
+    pub priority_source_probes: usize,
+    pub priority_source_attempts: usize,
+    pub priority_sources_initialized: usize,
+    pub priority_fuzzy_name_probes: usize,
+    pub priority_fuzzy_declaration_probes: usize,
+    pub selection_entries_inspected: usize,
+    pub active_entries_total: usize,
+    pub candidate_budget: usize,
+    pub cancellation_checks: usize,
+    pub cancelled: bool,
+    pub truncated: bool,
 }
 
 impl CompletionRecallMetrics {
@@ -270,6 +317,22 @@ impl CompletionRecallMetrics {
         self.same_project += other.same_project;
         self.pool_total += other.pool_total;
         self.indexed_returned += other.indexed_returned;
+        self.entries_inspected += other.entries_inspected;
+        self.prefix_entries_inspected += other.prefix_entries_inspected;
+        self.fuzzy_entries_inspected += other.fuzzy_entries_inspected;
+        self.fuzzy_posting_entries_inspected += other.fuzzy_posting_entries_inspected;
+        self.fuzzy_sample_entries_inspected += other.fuzzy_sample_entries_inspected;
+        self.priority_source_probes += other.priority_source_probes;
+        self.priority_source_attempts += other.priority_source_attempts;
+        self.priority_sources_initialized += other.priority_sources_initialized;
+        self.priority_fuzzy_name_probes += other.priority_fuzzy_name_probes;
+        self.priority_fuzzy_declaration_probes += other.priority_fuzzy_declaration_probes;
+        self.selection_entries_inspected += other.selection_entries_inspected;
+        self.active_entries_total += other.active_entries_total;
+        self.candidate_budget += other.candidate_budget;
+        self.cancellation_checks += other.cancellation_checks;
+        self.cancelled |= other.cancelled;
+        self.truncated |= other.truncated;
     }
 }
 
@@ -307,8 +370,299 @@ struct NameSegment {
     path_counts: Vec<usize>,
     path_is_external: Vec<bool>,
     projects: Vec<ProjectKey>,
-    sorted: Vec<usize>,
-    by_project: HashMap<ProjectKey, Vec<usize>>,
+    /// Entry indices sorted by `(lowercased name, original name)`, partitioned
+    /// by semantic family. Every entry occurs in exactly one partition, so
+    /// family isolation does not duplicate the resident per-declaration index.
+    sorted_by_family: [Vec<usize>; 2],
+    /// One-byte normalized head postings for single-character completion.
+    /// Each declaration occurs in at most one bucket as a compact `u32` local
+    /// index; buckets are ordered by the static portion of completion ranking.
+    short_prefix_heads_by_family: [HashMap<u8, Vec<u32>>; 2],
+    /// Compact continuous-name and boundary-initial trigram postings. The high
+    /// token bit distinguishes the two match classes; every posting stores
+    /// segment-local `u32` indices ordered by static completion quality.
+    fuzzy_postings_by_family: [CompactFuzzyPostings; 2],
+    /// Each name's sole declaring path, or `MULTI_PATH_ID` when declarations
+    /// span paths. Fuzzy recovery can reject a tombstoned name from compact
+    /// metadata without expanding declaration rows outside the request budget.
+    sole_path_by_name: Vec<u32>,
+    /// Unique `(three-byte name head, path)` pairs. A query uses the first one,
+    /// two, or three bytes as a range key, locating relevant active path
+    /// postings without probing unrelated paths in lexical path order.
+    prefix_paths_by_family: [CompactPrefixPathPostings; 2],
+    /// Per-path declaration postings in lexical name order. The CSR form adds
+    /// one compact `u32` per declaration and lets bounded completion reserve a
+    /// reachability channel without scanning unrelated workspace entries.
+    path_postings_by_family: [CompactPathPostings; 2],
+    /// Project postings are language-partitioned and lexical. Request-time
+    /// project checks therefore neither allocate a workspace-sized index list
+    /// nor inspect declarations from another semantic family.
+    by_project: HashMap<ProjectKey, CompactProjectPostings>,
+}
+
+struct CompactProjectPostings {
+    project_id: u32,
+    by_family: [Vec<u32>; 2],
+}
+
+#[derive(Clone, Copy)]
+struct CompactPostingRange {
+    start: u32,
+    len: u32,
+}
+
+/// CSR-style fuzzy posting storage. The dictionary maps a trigram token to a
+/// range in one exact-capacity name-ID array. Name IDs, rather than declaration
+/// IDs, avoid repeating the same trigram for every redeclaration; request-time
+/// expansion back to compact declarations remains under the candidate budget.
+struct CompactFuzzyPostings {
+    ranges: HashMap<u32, CompactPostingRange>,
+    name_ids: Vec<u32>,
+}
+
+const UNSEEN_PATH_ID: u32 = u32::MAX - 1;
+const MULTI_PATH_ID: u32 = u32::MAX;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CompactPrefixPathPair {
+    token: u32,
+    path_id: u32,
+}
+
+struct CompactPrefixPathPostings {
+    pairs: Vec<CompactPrefixPathPair>,
+    /// Positions into `pairs`, grouped by the segment-local project ID and
+    /// still ordered by prefix token. Selected-project recovery can therefore
+    /// skip unrelated workspace paths without duplicating each pair payload.
+    project_positions: HashMap<u32, Vec<u32>>,
+}
+
+struct CompactPathPostings {
+    offsets: Vec<u32>,
+    indices: Vec<u32>,
+}
+
+impl CompactPathPostings {
+    fn build(entries: &[CompactNameEntry], sorted_indices: &[usize], path_count: usize) -> Self {
+        let mut counts = vec![0u32; path_count];
+        for &index in sorted_indices {
+            let path = entries[index].path_id as usize;
+            counts[path] = counts[path]
+                .checked_add(1)
+                .expect("path posting length exceeds u32");
+        }
+
+        let mut offsets = Vec::with_capacity(path_count + 1);
+        offsets.push(0u32);
+        for count in counts {
+            let next = offsets
+                .last()
+                .copied()
+                .unwrap_or_default()
+                .checked_add(count)
+                .expect("path posting offsets exceed u32");
+            offsets.push(next);
+        }
+        let mut positions = offsets[..path_count].to_vec();
+        let mut indices = vec![0u32; sorted_indices.len()];
+        for &index in sorted_indices {
+            let path = entries[index].path_id as usize;
+            let position = positions[path] as usize;
+            indices[position] = u32::try_from(index).expect("name segment exceeds u32 indices");
+            positions[path] += 1;
+        }
+        Self { offsets, indices }
+    }
+
+    fn posting(&self, path_id: u32) -> &[u32] {
+        let path = path_id as usize;
+        let start = self.offsets[path] as usize;
+        let end = self.offsets[path + 1] as usize;
+        &self.indices[start..end]
+    }
+
+    fn accounted_bytes(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(self.offsets.capacity().saturating_mul(size_of::<u32>()))
+            .saturating_add(self.indices.capacity().saturating_mul(size_of::<u32>()))
+    }
+}
+
+impl CompactFuzzyPostings {
+    fn build(ordered_name_ids: &[u32], names: &[NameString]) -> Self {
+        let mut slot_by_token = HashMap::<u32, u32>::new();
+        let mut counts = Vec::<u32>::new();
+        for &name_id in ordered_name_ids {
+            for token in fuzzy_tokens_for_name(&names[name_id as usize]) {
+                let slot = *slot_by_token.entry(token).or_insert_with(|| {
+                    let slot = u32::try_from(counts.len()).expect("fuzzy token slots exceed u32");
+                    counts.push(0);
+                    slot
+                });
+                counts[slot as usize] = counts[slot as usize]
+                    .checked_add(1)
+                    .expect("fuzzy posting length exceeds u32");
+            }
+        }
+
+        let mut starts = Vec::with_capacity(counts.len());
+        let mut total = 0u32;
+        for &count in &counts {
+            starts.push(total);
+            total = total
+                .checked_add(count)
+                .expect("fuzzy posting rows exceed u32");
+        }
+        let mut cursors = starts.clone();
+        let mut name_ids = vec![0u32; total as usize];
+        for &name_id in ordered_name_ids {
+            for token in fuzzy_tokens_for_name(&names[name_id as usize]) {
+                let slot = slot_by_token[&token] as usize;
+                let cursor = &mut cursors[slot];
+                name_ids[*cursor as usize] = name_id;
+                *cursor += 1;
+            }
+        }
+        let mut ranges = HashMap::with_capacity(slot_by_token.len());
+        for (token, slot) in slot_by_token {
+            let slot = slot as usize;
+            ranges.insert(
+                token,
+                CompactPostingRange {
+                    start: starts[slot],
+                    len: counts[slot],
+                },
+            );
+        }
+        Self { ranges, name_ids }
+    }
+
+    fn posting(&self, token: u32) -> &[u32] {
+        let Some(range) = self.ranges.get(&token) else {
+            return &[];
+        };
+        let start = range.start as usize;
+        &self.name_ids[start..start + range.len as usize]
+    }
+
+    fn accounted_bytes(&self) -> usize {
+        hash_table_bytes::<u32, CompactPostingRange>(self.ranges.capacity())
+            .saturating_add(self.name_ids.capacity().saturating_mul(size_of::<u32>()))
+    }
+}
+
+fn three_byte_prefix_token(value: &str) -> Option<u32> {
+    let bytes = value.as_bytes();
+    let first = *bytes.first()?;
+    Some(
+        (u32::from(first) << 16)
+            | (u32::from(bytes.get(1).copied().unwrap_or_default()) << 8)
+            | u32::from(bytes.get(2).copied().unwrap_or_default()),
+    )
+}
+
+fn three_byte_prefix_bounds(value: &str) -> Option<(u32, u32)> {
+    let bytes = value.as_bytes();
+    let first = *bytes.first()?;
+    let lower = match bytes.len() {
+        1 => u32::from(first) << 16,
+        2 => (u32::from(first) << 16) | (u32::from(bytes[1]) << 8),
+        _ => (u32::from(first) << 16) | (u32::from(bytes[1]) << 8) | u32::from(bytes[2]),
+    };
+    let width = match bytes.len() {
+        1 => 1 << 16,
+        2 => 1 << 8,
+        _ => 1,
+    };
+    Some((lower, lower + width))
+}
+
+impl CompactPrefixPathPostings {
+    fn build(entries: &[CompactNameEntry], names: &[NameString], family_slot: usize) -> Self {
+        let mut raw_pairs = entries
+            .iter()
+            .filter(|entry| semantic_family_slot(entry.flags.semantic_family()) == family_slot)
+            .filter_map(|entry| {
+                three_byte_prefix_token(&names[entry.name_id as usize].lower).map(|token| {
+                    (
+                        CompactPrefixPathPair {
+                            token,
+                            path_id: entry.path_id,
+                        },
+                        entry.project_id,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        raw_pairs
+            .sort_unstable_by_key(|(pair, project_id)| (pair.token, pair.path_id, *project_id));
+        raw_pairs.dedup();
+
+        let mut pairs = Vec::with_capacity(raw_pairs.len());
+        let mut project_positions = HashMap::<u32, Vec<u32>>::new();
+        for (pair, project_id) in raw_pairs {
+            let position = if pairs.last() == Some(&pair) {
+                u32::try_from(pairs.len() - 1).expect("prefix path positions exceed u32")
+            } else {
+                let position =
+                    u32::try_from(pairs.len()).expect("prefix path positions exceed u32");
+                pairs.push(pair);
+                position
+            };
+            if project_id != NO_PROJECT_ID {
+                let positions = project_positions.entry(project_id).or_default();
+                if positions.last().copied() != Some(position) {
+                    positions.push(position);
+                }
+            }
+        }
+        Self {
+            pairs,
+            project_positions,
+        }
+    }
+
+    fn paths_for_prefix(&self, prefix: &str) -> &[CompactPrefixPathPair] {
+        let Some((lower, upper)) = three_byte_prefix_bounds(prefix) else {
+            return &[];
+        };
+        let start = self.pairs.partition_point(|pair| pair.token < lower);
+        let end = self.pairs.partition_point(|pair| pair.token < upper);
+        &self.pairs[start..end]
+    }
+
+    fn project_positions_for_prefix(&self, project_id: u32, prefix: &str) -> &[u32] {
+        let Some((lower, upper)) = three_byte_prefix_bounds(prefix) else {
+            return &[];
+        };
+        let Some(positions) = self.project_positions.get(&project_id) else {
+            return &[];
+        };
+        let start =
+            positions.partition_point(|position| self.pairs[*position as usize].token < lower);
+        let end =
+            positions.partition_point(|position| self.pairs[*position as usize].token < upper);
+        &positions[start..end]
+    }
+
+    fn accounted_bytes(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(
+                self.pairs
+                    .capacity()
+                    .saturating_mul(size_of::<CompactPrefixPathPair>()),
+            )
+            .saturating_add(hash_table_bytes::<u32, Vec<u32>>(
+                self.project_positions.capacity(),
+            ))
+            .saturating_add(
+                self.project_positions
+                    .values()
+                    .fold(0usize, |bytes, positions| {
+                        bytes.saturating_add(positions.capacity().saturating_mul(size_of::<u32>()))
+                    }),
+            )
+    }
 }
 
 /// Segmented workspace name index. Full publication installs one immutable base;
@@ -322,6 +676,19 @@ pub struct NameTable {
     deltas: Arc<Vec<Arc<NameSegment>>>,
     /// Path -> active delta segment. `None` is a deletion tombstone.
     path_overrides: Arc<HashMap<Arc<str>, Option<usize>>>,
+    /// Base paths that remain active in this immutable table view. Publication
+    /// updates this list; request-time recovery can therefore open a bounded
+    /// path posting without walking a stale base cursor first.
+    active_base_paths: Arc<Vec<Arc<str>>>,
+    /// Active paths retained by each delta segment. A later partial replacement
+    /// removes only the affected path from its original delta, allowing bounded
+    /// recall to traverse the remaining path posting directly instead of
+    /// walking an arbitrarily long run of tombstoned sibling declarations.
+    active_delta_paths: Arc<Vec<Arc<Vec<Arc<str>>>>>,
+    /// Active declaration counts for every selected-project/language pair.
+    /// Completion consults this O(1) summary before enabling project quotas;
+    /// it must never scan project postings outside the candidate budget.
+    active_project_family_counts: Arc<HashMap<ProjectKey, [usize; 2]>>,
     delta_offsets: Arc<Vec<usize>>,
     active_len: usize,
     slot_len: usize,
@@ -335,8 +702,168 @@ pub struct NameTable {
     all_workspace_reach: Arc<ReachScope>,
 }
 
-/// Entry indices sorted by `(lowercased name, original name)` for prefix search.
-fn sorted_indices(entries: &[CompactNameEntry], names: &[NameString]) -> Vec<usize> {
+const ALL_SEMANTIC_FAMILY_SLOTS: [usize; 2] = [0, 1];
+
+fn semantic_family_slot(family: crate::semantic_model::SemanticFamily) -> usize {
+    match family {
+        crate::semantic_model::SemanticFamily::CFamily => 0,
+        crate::semantic_model::SemanticFamily::Go => 1,
+    }
+}
+
+fn semantic_family_slots(
+    family: Option<crate::semantic_model::SemanticFamily>,
+) -> &'static [usize] {
+    match family {
+        None => &ALL_SEMANTIC_FAMILY_SLOTS,
+        Some(crate::semantic_model::SemanticFamily::CFamily) => &ALL_SEMANTIC_FAMILY_SLOTS[..1],
+        Some(crate::semantic_model::SemanticFamily::Go) => &ALL_SEMANTIC_FAMILY_SLOTS[1..],
+    }
+}
+
+fn completion_role_recall_priority(role: SymbolRole) -> u8 {
+    match role {
+        SymbolRole::Declaration => 4,
+        SymbolRole::TentativeDefinition => 3,
+        SymbolRole::Definition => 2,
+        SymbolRole::UnknownDeclarationOrDefinition => 1,
+    }
+}
+
+const FUZZY_BOUNDARY_TRIGRAM_TAG: u32 = 1 << 24;
+const MAX_CONTIGUOUS_TRIGRAMS_PER_NAME: usize = 64;
+const MAX_BOUNDARY_INITIALS_FOR_TRIGRAMS: usize = 8;
+
+fn fuzzy_trigram_token(bytes: &[u8], boundary: bool) -> u32 {
+    debug_assert_eq!(bytes.len(), 3);
+    u32::from(bytes[0])
+        | (u32::from(bytes[1]) << 8)
+        | (u32::from(bytes[2]) << 16)
+        | if boundary {
+            FUZZY_BOUNDARY_TRIGRAM_TAG
+        } else {
+            0
+        }
+}
+
+fn sampled_trigram_tokens(bytes: &[u8], boundary: bool, cap: usize, output: &mut Vec<u32>) {
+    let window_count = bytes.len().saturating_sub(2);
+    if window_count <= cap {
+        output.extend(
+            bytes
+                .windows(3)
+                .map(|window| fuzzy_trigram_token(window, boundary)),
+        );
+        return;
+    }
+    for ordinal in 0..cap {
+        let position = if cap <= 1 {
+            0
+        } else {
+            ordinal.saturating_mul(window_count - 1) / (cap - 1)
+        };
+        output.push(fuzzy_trigram_token(
+            &bytes[position..position + 3],
+            boundary,
+        ));
+    }
+}
+
+fn fuzzy_tokens_for_name(name: &NameString) -> Vec<u32> {
+    let mut tokens = Vec::new();
+    sampled_trigram_tokens(
+        name.lower.as_bytes(),
+        false,
+        MAX_CONTIGUOUS_TRIGRAMS_PER_NAME,
+        &mut tokens,
+    );
+    let original = name.original.as_bytes();
+    let lower = name.lower.as_bytes();
+    let boundary_initials: Vec<u8> = (0..lower.len())
+        .filter(|&index| is_boundary(original, index))
+        .map(|index| lower[index])
+        .take(MAX_BOUNDARY_INITIALS_FOR_TRIGRAMS)
+        .collect();
+    for first in 0..boundary_initials.len() {
+        for second in first + 1..boundary_initials.len() {
+            for third in second + 1..boundary_initials.len() {
+                tokens.push(fuzzy_trigram_token(
+                    &[
+                        boundary_initials[first],
+                        boundary_initials[second],
+                        boundary_initials[third],
+                    ],
+                    true,
+                ));
+            }
+        }
+    }
+    tokens.sort_unstable();
+    tokens.dedup();
+    tokens
+}
+
+fn fuzzy_query_tokens(query: &str) -> (Vec<u32>, Vec<u32>) {
+    let mut continuous: Vec<_> = query
+        .as_bytes()
+        .windows(3)
+        .map(|window| fuzzy_trigram_token(window, false))
+        .collect();
+    continuous.sort_unstable();
+    continuous.dedup();
+    let boundary_query: Vec<_> = query
+        .as_bytes()
+        .iter()
+        .copied()
+        .take(MAX_BOUNDARY_INITIALS_FOR_TRIGRAMS)
+        .collect();
+    let mut boundary = Vec::new();
+    for first in 0..boundary_query.len() {
+        for second in first + 1..boundary_query.len() {
+            for third in second + 1..boundary_query.len() {
+                boundary.push(fuzzy_trigram_token(
+                    &[
+                        boundary_query[first],
+                        boundary_query[second],
+                        boundary_query[third],
+                    ],
+                    true,
+                ));
+            }
+        }
+    }
+    boundary.sort_unstable();
+    boundary.dedup();
+    (continuous, boundary)
+}
+
+fn static_segment_entry_order(
+    entries: &[CompactNameEntry],
+    names: &[NameString],
+    paths: &[Arc<str>],
+    left: u32,
+    right: u32,
+) -> std::cmp::Ordering {
+    let left = entries[left as usize];
+    let right = entries[right as usize];
+    let left_name = &names[left.name_id as usize].original;
+    let right_name = &names[right.name_id as usize].original;
+    left_name
+        .len()
+        .cmp(&right_name.len())
+        .then_with(|| left_name.cmp(right_name))
+        .then_with(|| {
+            completion_role_recall_priority(right.role)
+                .cmp(&completion_role_recall_priority(left.role))
+        })
+        .then_with(|| paths[left.path_id as usize].cmp(&paths[right.path_id as usize]))
+        .then_with(|| left.id.cmp(&right.id))
+}
+
+/// Entry indices sorted by `(lowercased name, original name)` for prefix search,
+/// partitioned by semantic family so unrelated languages cannot consume a
+/// bounded request's candidate budget.
+fn sorted_indices_by_family(entries: &[CompactNameEntry], names: &[NameString]) -> [Vec<usize>; 2] {
     let mut name_order: Vec<u32> = (0..names.len())
         .map(|index| u32::try_from(index).expect("name arena exceeds u32 IDs"))
         .collect();
@@ -365,7 +892,72 @@ fn sorted_indices(entries: &[CompactNameEntry], names: &[NameString]) -> Vec<usi
         sorted[*cursor as usize] = index;
         *cursor += 1;
     }
-    sorted
+    let mut by_family = [Vec::new(), Vec::new()];
+    for index in sorted {
+        by_family[semantic_family_slot(entries[index].flags.semantic_family())].push(index);
+    }
+    by_family
+}
+
+fn candidate_postings_by_family(
+    entries: &[CompactNameEntry],
+    names: &[NameString],
+    paths: &[Arc<str>],
+) -> ([HashMap<u8, Vec<u32>>; 2], [CompactFuzzyPostings; 2]) {
+    let mut heads = [HashMap::new(), HashMap::new()];
+    let mut static_order = [Vec::new(), Vec::new()];
+    for (index, entry) in entries.iter().enumerate() {
+        static_order[semantic_family_slot(entry.flags.semantic_family())]
+            .push(u32::try_from(index).expect("name segment exceeds u32 entry indices"));
+    }
+    for indices in &mut static_order {
+        indices.sort_unstable_by(|&left, &right| {
+            static_segment_entry_order(entries, names, paths, left, right)
+        });
+    }
+    for (family_slot, indices) in static_order.iter().enumerate() {
+        for &local in indices {
+            let entry = entries[local as usize];
+            let name = &names[entry.name_id as usize];
+            if let Some(&head) = name.lower.as_bytes().first() {
+                heads[family_slot]
+                    .entry(head)
+                    .or_insert_with(Vec::new)
+                    .push(local);
+            }
+        }
+    }
+    let mut name_families = vec![0u8; names.len()];
+    for entry in entries {
+        name_families[entry.name_id as usize] |=
+            1u8 << semantic_family_slot(entry.flags.semantic_family());
+    }
+    let mut ordered_names = [Vec::new(), Vec::new()];
+    for name_id in 0..names.len() {
+        let name_id = u32::try_from(name_id).expect("name arena exceeds u32 IDs");
+        for (family_slot, family_names) in ordered_names.iter_mut().enumerate() {
+            if name_families[name_id as usize] & (1u8 << family_slot) != 0 {
+                family_names.push(name_id);
+            }
+        }
+    }
+    for family_names in &mut ordered_names {
+        family_names.sort_unstable_by(|&left, &right| {
+            let left_name = &names[left as usize].original;
+            let right_name = &names[right as usize].original;
+            left_name
+                .len()
+                .cmp(&right_name.len())
+                .then_with(|| left_name.cmp(right_name))
+                .then_with(|| left.cmp(&right))
+        });
+    }
+    let [c_names, go_names] = ordered_names;
+    let fuzzy = [
+        CompactFuzzyPostings::build(&c_names, names),
+        CompactFuzzyPostings::build(&go_names, names),
+    ];
+    (heads, fuzzy)
 }
 
 fn all_workspace_reach(segment: &NameSegment) -> ReachScope {
@@ -451,10 +1043,25 @@ impl NameTable {
     fn from_base_segment(base: NameSegment) -> Self {
         let all_workspace_reach = Arc::new(all_workspace_reach(&base));
         let active_len = base.entries.len();
+        let mut active_base_paths = base.paths.clone();
+        active_base_paths.sort_unstable();
+        let active_project_family_counts = base
+            .by_project
+            .iter()
+            .map(|(key, postings)| {
+                (
+                    key.clone(),
+                    [postings.by_family[0].len(), postings.by_family[1].len()],
+                )
+            })
+            .collect();
         Self {
             base: Arc::new(base),
             deltas: Arc::new(Vec::new()),
             path_overrides: Arc::new(HashMap::new()),
+            active_base_paths: Arc::new(active_base_paths),
+            active_delta_paths: Arc::new(Vec::new()),
+            active_project_family_counts: Arc::new(active_project_family_counts),
             delta_offsets: Arc::new(Vec::new()),
             active_len,
             slot_len: active_len,
@@ -501,18 +1108,20 @@ impl NameTable {
         segment: &NameSegment,
         offset: usize,
         needle_lower: &str,
+        semantic_family: Option<crate::semantic_model::SemanticFamily>,
         output: &mut Vec<usize>,
     ) {
-        let start = segment
-            .sorted
-            .partition_point(|&index| segment.entry(index).lower < needle_lower);
-        for &local in &segment.sorted[start..] {
-            if !segment.entry(local).lower.starts_with(needle_lower) {
-                break;
-            }
-            let index = offset + local;
-            if self.is_active_index(index) {
-                output.push(index);
+        for &family_slot in semantic_family_slots(semantic_family) {
+            let sorted = &segment.sorted_by_family[family_slot];
+            let start = sorted.partition_point(|&index| segment.entry(index).lower < needle_lower);
+            for &local in &sorted[start..] {
+                if !segment.entry(local).lower.starts_with(needle_lower) {
+                    break;
+                }
+                let index = offset + local;
+                if self.is_active_index(index) {
+                    output.push(index);
+                }
             }
         }
     }
@@ -562,14 +1171,42 @@ impl NameSegment {
         path_is_external: Vec<bool>,
         projects: Vec<ProjectKey>,
     ) -> Self {
-        let sorted = sorted_indices(&entries, &names);
-        let mut by_project: HashMap<ProjectKey, Vec<usize>> = HashMap::new();
-        for (index, entry) in entries.iter().enumerate() {
-            if entry.project_id != NO_PROJECT_ID {
-                by_project
-                    .entry(projects[entry.project_id as usize].clone())
-                    .or_default()
-                    .push(index);
+        let sorted_by_family = sorted_indices_by_family(&entries, &names);
+        let (short_prefix_heads_by_family, fuzzy_postings_by_family) =
+            candidate_postings_by_family(&entries, &names, &paths);
+        let mut sole_path_by_name = vec![UNSEEN_PATH_ID; names.len()];
+        for entry in &entries {
+            let path = &mut sole_path_by_name[entry.name_id as usize];
+            *path = match *path {
+                UNSEEN_PATH_ID => entry.path_id,
+                existing if existing == entry.path_id => existing,
+                _ => MULTI_PATH_ID,
+            };
+        }
+        debug_assert!(sole_path_by_name
+            .iter()
+            .all(|path_id| *path_id != UNSEEN_PATH_ID));
+        let prefix_paths_by_family = std::array::from_fn(|family_slot| {
+            CompactPrefixPathPostings::build(&entries, &names, family_slot)
+        });
+        let path_postings_by_family = std::array::from_fn(|family_slot| {
+            CompactPathPostings::build(&entries, &sorted_by_family[family_slot], paths.len())
+        });
+        let mut by_project: HashMap<ProjectKey, CompactProjectPostings> = HashMap::new();
+        for (family_slot, sorted) in sorted_by_family.iter().enumerate() {
+            for &index in sorted {
+                let entry = entries[index];
+                if entry.project_id != NO_PROJECT_ID {
+                    let postings = by_project
+                        .entry(projects[entry.project_id as usize].clone())
+                        .or_insert_with(|| CompactProjectPostings {
+                            project_id: entry.project_id,
+                            by_family: std::array::from_fn(|_| Vec::new()),
+                        });
+                    debug_assert_eq!(postings.project_id, entry.project_id);
+                    postings.by_family[family_slot]
+                        .push(u32::try_from(index).expect("name segment exceeds u32 indices"));
+                }
             }
         }
         Self {
@@ -580,7 +1217,12 @@ impl NameSegment {
             path_counts,
             path_is_external,
             projects,
-            sorted,
+            sorted_by_family,
+            short_prefix_heads_by_family,
+            fuzzy_postings_by_family,
+            sole_path_by_name,
+            prefix_paths_by_family,
+            path_postings_by_family,
             by_project,
         }
     }
@@ -635,11 +1277,46 @@ impl NameSegment {
         let by_project = self
             .by_project
             .iter()
-            .fold(0usize, |bytes, (key, indices)| {
+            .fold(0usize, |bytes, (key, postings)| {
                 bytes
                     .saturating_add(key.workspace_root_id.len())
                     .saturating_add(key.project_path.len())
-                    .saturating_add(indices.capacity().saturating_mul(size_of::<usize>()))
+                    .saturating_add(
+                        postings
+                            .by_family
+                            .iter()
+                            .map(|family| family.capacity().saturating_mul(size_of::<u32>()))
+                            .sum::<usize>(),
+                    )
+            });
+        let short_prefix_heads =
+            self.short_prefix_heads_by_family
+                .iter()
+                .fold(0usize, |bytes, family_heads| {
+                    bytes
+                        .saturating_add(hash_table_bytes::<u8, Vec<u32>>(family_heads.capacity()))
+                        .saturating_add(family_heads.values().fold(0usize, |bytes, indices| {
+                            bytes
+                                .saturating_add(indices.capacity().saturating_mul(size_of::<u32>()))
+                        }))
+                });
+        let fuzzy_postings = self
+            .fuzzy_postings_by_family
+            .iter()
+            .fold(0usize, |bytes, postings| {
+                bytes.saturating_add(postings.accounted_bytes())
+            });
+        let prefix_paths = self
+            .prefix_paths_by_family
+            .iter()
+            .fold(0usize, |bytes, postings| {
+                bytes.saturating_add(postings.accounted_bytes())
+            });
+        let path_postings = self
+            .path_postings_by_family
+            .iter()
+            .fold(0usize, |bytes, postings| {
+                bytes.saturating_add(postings.accounted_bytes())
             });
 
         size_of::<Self>()
@@ -673,11 +1350,25 @@ impl NameSegment {
                     .saturating_mul(size_of::<ProjectKey>()),
             )
             .saturating_add(projects)
-            .saturating_add(self.sorted.capacity().saturating_mul(size_of::<usize>()))
-            .saturating_add(hash_table_bytes::<ProjectKey, Vec<usize>>(
+            .saturating_add(
+                self.sorted_by_family
+                    .iter()
+                    .map(|indices| indices.capacity().saturating_mul(size_of::<usize>()))
+                    .sum::<usize>(),
+            )
+            .saturating_add(hash_table_bytes::<ProjectKey, CompactProjectPostings>(
                 self.by_project.capacity(),
             ))
             .saturating_add(by_project)
+            .saturating_add(short_prefix_heads)
+            .saturating_add(fuzzy_postings)
+            .saturating_add(
+                self.sole_path_by_name
+                    .capacity()
+                    .saturating_mul(size_of::<u32>()),
+            )
+            .saturating_add(prefix_paths)
+            .saturating_add(path_postings)
     }
 }
 

@@ -2,6 +2,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
+use crate::candidate_service::RecallUniverseId;
 use crate::project_context::ProjectKey;
 
 /// Narrowing state for one document's in-flight completion. `generation`
@@ -12,11 +13,12 @@ pub(super) struct CompletionMemo {
     pub(super) prefix: String,
     pub(super) generation: u64,
     pub(super) pools: Vec<Vec<usize>>,
+    pub(super) pool_complete: Vec<bool>,
 }
 
 /// Monotonic identity of one atomically published workspace engine snapshot.
 /// Zero is reserved for the pre-index empty snapshot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct EngineEpoch(u64);
 
 impl EngineEpoch {
@@ -38,7 +40,7 @@ pub(super) fn combine_completion_generation(
     generations: &[(PathBuf, EngineEpoch)],
     selection_epoch: u64,
     effective_project: Option<&ProjectKey>,
-    overlay_epoch: u64,
+    recall_universes: &[RecallUniverseId],
 ) -> u64 {
     let mut hasher = DefaultHasher::new();
     for (root, generation) in generations {
@@ -47,7 +49,7 @@ pub(super) fn combine_completion_generation(
     }
     selection_epoch.hash(&mut hasher);
     effective_project.hash(&mut hasher);
-    overlay_epoch.hash(&mut hasher);
+    recall_universes.hash(&mut hasher);
     hasher.finish()
 }
 

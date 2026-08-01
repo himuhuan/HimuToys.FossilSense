@@ -655,11 +655,32 @@ mod tests {
                 moved: 1,
                 max_delta: 2,
             }),
+            recall_channels: crate::query::CompletionRecallMetrics {
+                entries_inspected: 128,
+                prefix_entries_inspected: 96,
+                fuzzy_entries_inspected: 32,
+                fuzzy_posting_entries_inspected: 24,
+                fuzzy_sample_entries_inspected: 8,
+                priority_source_probes: 5,
+                priority_source_attempts: 4,
+                priority_sources_initialized: 3,
+                priority_fuzzy_name_probes: 17,
+                priority_fuzzy_declaration_probes: 19,
+                active_entries_total: 50_000,
+                candidate_budget: 128,
+                truncated: true,
+                ..crate::query::CompletionRecallMetrics::default()
+            },
             ..CompletionPipelineMetrics::default()
         };
         let timings = CompletionStageTimings {
             total_ms: 9,
-            context_ms: 1,
+            context_ms: 4,
+            parse_ms: 1,
+            local_words_ms: 1,
+            overlay_ms: 1,
+            admission_wait_ms: 1,
+            worker_ms: 3,
             recall_ms: 2,
             merge_rank_ms: 3,
             render_ms: 1,
@@ -672,6 +693,24 @@ mod tests {
         assert!(line.contains("returned_current_file_overlay=1"));
         assert!(line.contains("returned_language_builtin=1"));
         assert!(line.contains("guarded_low_trust=2"));
+        assert!(line.contains("parse=1ms"));
+        assert!(line.contains("local_words=1ms"));
+        assert!(line.contains("overlay=1ms"));
+        assert!(line.contains("admission_wait=1ms"));
+        assert!(line.contains("worker=3ms"));
+        assert!(line.contains("recall_entries_inspected=128"));
+        assert!(line.contains("recall_prefix_entries=96"));
+        assert!(line.contains("recall_fuzzy_entries=32"));
+        assert!(line.contains("recall_fuzzy_posting_entries=24"));
+        assert!(line.contains("recall_fuzzy_sample_entries=8"));
+        assert!(line.contains("recall_priority_source_probes=5"));
+        assert!(line.contains("recall_priority_source_attempts=4"));
+        assert!(line.contains("recall_priority_sources_initialized=3"));
+        assert!(line.contains("recall_priority_fuzzy_name_probes=17"));
+        assert!(line.contains("recall_priority_fuzzy_declaration_probes=19"));
+        assert!(line.contains("recall_active_entries=50000"));
+        assert!(line.contains("recall_candidate_budget=128"));
+        assert!(line.contains("recall_truncated=true"));
         assert!(!line.contains("Widget\""));
         assert!(!line.contains("reachable_api"));
         assert!(!line.contains("new_local_type"));
@@ -824,7 +863,12 @@ mod tests {
         };
         let timings = CompletionStageTimings {
             total_ms: 9,
-            context_ms: 1,
+            context_ms: 4,
+            parse_ms: 1,
+            local_words_ms: 1,
+            overlay_ms: 1,
+            admission_wait_ms: 1,
+            worker_ms: 3,
             recall_ms: 2,
             merge_rank_ms: 3,
             render_ms: 1,
@@ -838,6 +882,7 @@ mod tests {
         assert!(line.contains("indexed=1"));
         assert!(line.contains("local_binding=1"));
         assert!(line.contains("shadow_moved=2"));
+        assert!(line.contains("recall_cancel_checks=0"));
         assert!(!line.contains("alpha"));
         assert!(!line.contains("beta"));
         assert!(!line.contains("foo\""));

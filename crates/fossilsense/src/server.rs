@@ -48,6 +48,7 @@ mod call_hierarchy;
 mod candidate_context;
 mod completion_candidate_documentation;
 mod completion_documentation;
+mod completion_runtime;
 mod go_import_completion;
 mod hover;
 mod include_completion;
@@ -146,10 +147,13 @@ pub async fn run_stdio() -> Result<()> {
         completion_history_mode: Arc::new(Mutex::new(CompletionHistoryMode::Auto)),
         completion_history: Arc::new(Mutex::new(HashMap::new())),
         completion_history_write_gate: Arc::new(Mutex::new(())),
+        completion_runtime: completion_runtime::CompletionRuntime::default(),
         project_context_selection: Arc::new(Mutex::new(ProjectContextSelection::Auto)),
         project_context_selection_epoch: AtomicU64::new(1),
         debug_candidate_reasons: AtomicBool::new(false),
         perf_logging_enabled: AtomicBool::new(false),
+        #[cfg(test)]
+        completion_perf_observations: Arc::new(StdMutex::new(Vec::new())),
         config_cache: Arc::new(Mutex::new(HashMap::new())),
         workspace_semantics_bootstrap: Arc::new(Mutex::new(Default::default())),
         #[cfg(test)]
@@ -194,6 +198,9 @@ struct Backend {
     completion_history: Arc<Mutex<HashMap<PathBuf, CompletionHistoryStore>>>,
     /// Serializes atomic history-file replacements without holding the store map.
     completion_history_write_gate: Arc<Mutex<()>>,
+    /// Latest-request-wins admission and cooperative cancellation for ordinary
+    /// completion CPU work.
+    completion_runtime: completion_runtime::CompletionRuntime,
     /// User-selected completion project policy. The extension persists the
     /// choice; the server validates it against current immutable snapshots.
     project_context_selection: Arc<Mutex<ProjectContextSelection>>,
@@ -207,6 +214,15 @@ struct Backend {
     /// Whether `[perf]` request/index timings are sent to the output panel.
     /// Off by default; enabled by `RUST_LOG` debug/trace or client init options.
     perf_logging_enabled: AtomicBool,
+    #[cfg(test)]
+    completion_perf_observations: Arc<
+        StdMutex<
+            Vec<(
+                completion::CompletionStageTimings,
+                completion::CompletionPipelineMetrics,
+            )>,
+        >,
+    >,
     /// Cache for workspace configuration and its derived language resolver.
     /// Request hot paths never read or parse `fossilsense.json`; the entry is
     /// invalidated when that file changes or its workspace root is removed.
@@ -595,6 +611,33 @@ impl Backend {
             build_message,
         )
         .await;
+    }
+
+    #[cfg(test)]
+    fn record_completion_perf_for_test(
+        &self,
+        timings: completion::CompletionStageTimings,
+        metrics: completion::CompletionPipelineMetrics,
+    ) {
+        self.completion_perf_observations
+            .lock()
+            .expect("completion perf observations poisoned")
+            .push((timings, metrics));
+    }
+
+    #[cfg(test)]
+    fn take_completion_perf_for_test(
+        &self,
+    ) -> Vec<(
+        completion::CompletionStageTimings,
+        completion::CompletionPipelineMetrics,
+    )> {
+        std::mem::take(
+            &mut *self
+                .completion_perf_observations
+                .lock()
+                .expect("completion perf observations poisoned"),
+        )
     }
 
     async fn preload_completion_history(&self) {
