@@ -6,9 +6,12 @@
 //! buffers on every request. Completion-only fallback hints remain a separate
 //! typed projection and are never read by semantic candidate APIs.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use serde::Serialize;
@@ -318,6 +321,502 @@ pub struct OverlayFallbackCompletionFact {
     pub fact: FallbackCompletionFact,
 }
 
+/// Published include-resolution paths for one semantic generation. Exact
+/// membership uses the sorted path vector; the basename posting stores compact
+/// positions instead of cloning every full path into a second workspace map.
+#[derive(Debug)]
+pub(crate) struct IncludePathIndex {
+    paths: Vec<String>,
+    workspace_by_basename: HashMap<String, Vec<usize>>,
+}
+
+const EXTERNAL_PATH_PROBE_QUEUE_CAPACITY: usize = 64;
+const EXTERNAL_PATH_PROBE_CACHE_CAPACITY: usize = 1_024;
+const EXTERNAL_PATH_PROBE_MAX_PATH_BYTES: usize = 4 * 1_024;
+const EXTERNAL_PATH_PROBE_PER_VIEW_ENQUEUE_LIMIT: usize = 16;
+const EXTERNAL_PATH_PROBE_OBSERVATION_LIMIT: usize = 64;
+const EXTERNAL_PATH_PRESENT_TTL: Duration = Duration::from_secs(30);
+const EXTERNAL_PATH_MISSING_TTL: Duration = Duration::from_secs(2);
+const REQUEST_SUFFIX_SCAN_LIMIT: usize = 4_096;
+const REQUEST_SUFFIX_CANDIDATE_LIMIT: usize = 256;
+
+#[derive(Debug, Clone, Copy)]
+enum ExternalPathProbeStatus {
+    Pending,
+    Deferred,
+    Ready {
+        exists: bool,
+        valid_until: Instant,
+        version: u64,
+    },
+}
+
+#[derive(Debug)]
+struct ExternalPathProbeEntry {
+    status: ExternalPathProbeStatus,
+    last_used: u64,
+}
+
+#[derive(Debug, Default)]
+struct ExternalPathProbeState {
+    entries: HashMap<String, ExternalPathProbeEntry>,
+    deferred_paths: VecDeque<String>,
+    deferred_set: HashSet<String>,
+    clock: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ExternalPathProbeLookup {
+    NotApplicable,
+    Pending,
+    Ready {
+        exists: bool,
+        valid_until: Instant,
+        version: u64,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct ExternalPathProbeObservation {
+    path: String,
+    version: u64,
+    valid_until: Instant,
+}
+
+/// Process-wide, bounded exact-path probe cache for configured external roots
+/// that intentionally remain path-resolution-only. The completion request
+/// only performs an in-memory lookup and a non-blocking enqueue; one background
+/// worker owns every filesystem probe across engine generations.
+struct ExternalPathProbeCache {
+    state: Arc<Mutex<ExternalPathProbeState>>,
+    sender: SyncSender<String>,
+}
+
+impl ExternalPathProbeCache {
+    fn new() -> Self {
+        let state = Arc::new(Mutex::new(ExternalPathProbeState::default()));
+        let (sender, receiver) = sync_channel::<String>(EXTERNAL_PATH_PROBE_QUEUE_CAPACITY);
+        let worker_state = state.clone();
+        let _ = std::thread::Builder::new()
+            .name("fossilsense-path-probe".to_string())
+            .spawn(move || {
+                let mut deferred_path = None;
+                loop {
+                    let path = match deferred_path.take() {
+                        Some(path) => path,
+                        None => match receiver.recv() {
+                            Ok(path) => path,
+                            Err(_) => break,
+                        },
+                    };
+                    let exists = Path::new(&path).is_file();
+                    let valid_until = Instant::now()
+                        + if exists {
+                            EXTERNAL_PATH_PRESENT_TTL
+                        } else {
+                            EXTERNAL_PATH_MISSING_TTL
+                        };
+                    let mut state = worker_state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    state.clock = state.clock.wrapping_add(1).max(1);
+                    let last_used = state.clock;
+                    if let Some(entry) = state.entries.get_mut(&path) {
+                        entry.status = ExternalPathProbeStatus::Ready {
+                            exists,
+                            valid_until,
+                            version: last_used,
+                        };
+                        entry.last_used = last_used;
+                    }
+                    while let Some(candidate) = state.deferred_paths.pop_front() {
+                        state.deferred_set.remove(&candidate);
+                        let Some(entry) = state.entries.get_mut(&candidate) else {
+                            continue;
+                        };
+                        if matches!(entry.status, ExternalPathProbeStatus::Deferred) {
+                            entry.status = ExternalPathProbeStatus::Pending;
+                            deferred_path = Some(candidate);
+                            break;
+                        }
+                    }
+                }
+            });
+        Self { state, sender }
+    }
+
+    fn lookup_or_schedule(
+        &self,
+        candidate: &str,
+        enqueue_attempts: &AtomicUsize,
+    ) -> ExternalPathProbeLookup {
+        if candidate.len() > EXTERNAL_PATH_PROBE_MAX_PATH_BYTES
+            || !Path::new(candidate).is_absolute()
+        {
+            return ExternalPathProbeLookup::NotApplicable;
+        }
+
+        let now = Instant::now();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.clock = state.clock.wrapping_add(1).max(1);
+        let last_used = state.clock;
+        if let Some(entry) = state.entries.get_mut(candidate) {
+            entry.last_used = last_used;
+            match entry.status {
+                ExternalPathProbeStatus::Pending | ExternalPathProbeStatus::Deferred => {
+                    return ExternalPathProbeLookup::Pending;
+                }
+                ExternalPathProbeStatus::Ready {
+                    exists,
+                    valid_until,
+                    version,
+                } if valid_until > now => {
+                    return ExternalPathProbeLookup::Ready {
+                        exists,
+                        valid_until,
+                        version,
+                    };
+                }
+                ExternalPathProbeStatus::Ready { .. } => {}
+            }
+        }
+        state.entries.remove(candidate);
+
+        if state.entries.len() >= EXTERNAL_PATH_PROBE_CACHE_CAPACITY {
+            let evicted = state
+                .entries
+                .iter()
+                .filter(|(_, entry)| matches!(entry.status, ExternalPathProbeStatus::Ready { .. }))
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(path, _)| path.clone());
+            if let Some(evicted) = evicted {
+                state.entries.remove(&evicted);
+            } else {
+                return ExternalPathProbeLookup::Pending;
+            }
+        }
+
+        if enqueue_attempts
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |attempts| {
+                (attempts < EXTERNAL_PATH_PROBE_PER_VIEW_ENQUEUE_LIMIT)
+                    .then_some(attempts.saturating_add(1))
+            })
+            .is_err()
+        {
+            let candidate = candidate.to_string();
+            state.entries.insert(
+                candidate.clone(),
+                ExternalPathProbeEntry {
+                    status: ExternalPathProbeStatus::Deferred,
+                    last_used,
+                },
+            );
+            if state.deferred_set.insert(candidate.clone()) {
+                state.deferred_paths.push_back(candidate);
+            }
+            return ExternalPathProbeLookup::Pending;
+        }
+
+        state.entries.insert(
+            candidate.to_string(),
+            ExternalPathProbeEntry {
+                status: ExternalPathProbeStatus::Pending,
+                last_used,
+            },
+        );
+        drop(state);
+
+        match self.sender.try_send(candidate.to_string()) {
+            Ok(()) => ExternalPathProbeLookup::Pending,
+            Err(TrySendError::Full(path) | TrySendError::Disconnected(path)) => {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(entry) = state.entries.get_mut(&path) {
+                    if matches!(entry.status, ExternalPathProbeStatus::Pending) {
+                        entry.status = ExternalPathProbeStatus::Deferred;
+                        if state.deferred_set.insert(path.clone()) {
+                            state.deferred_paths.push_back(path);
+                        }
+                    }
+                }
+                ExternalPathProbeLookup::Pending
+            }
+        }
+    }
+
+    fn observations_are_current(&self, observations: &[ExternalPathProbeObservation]) -> bool {
+        let now = Instant::now();
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        observations.iter().all(|observation| {
+            observation.valid_until > now
+                && state.entries.get(&observation.path).is_some_and(|entry| {
+                    matches!(
+                        entry.status,
+                        ExternalPathProbeStatus::Ready {
+                            valid_until,
+                            version,
+                            ..
+                        } if valid_until > now && version == observation.version
+                    )
+                })
+        })
+    }
+}
+
+fn external_path_probe_cache() -> &'static ExternalPathProbeCache {
+    static CACHE: OnceLock<ExternalPathProbeCache> = OnceLock::new();
+    CACHE.get_or_init(ExternalPathProbeCache::new)
+}
+
+impl IncludePathIndex {
+    /// Build from `(normalized path, participates in workspace suffix recall)`.
+    /// External paths remain exact-matchable but never enter the suffix tier.
+    pub(crate) fn build(paths: impl IntoIterator<Item = (String, bool)>) -> Self {
+        let mut paths = paths.into_iter().collect::<Vec<_>>();
+        paths.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        let mut deduplicated: Vec<(String, bool)> = Vec::with_capacity(paths.len());
+        for (path, workspace) in paths {
+            if let Some(last) = deduplicated.last_mut().filter(|last| last.0 == path) {
+                last.1 |= workspace;
+            } else {
+                deduplicated.push((path, workspace));
+            }
+        }
+        let mut workspace_by_basename: HashMap<String, Vec<usize>> = HashMap::new();
+        for (position, (path, workspace)) in deduplicated.iter().enumerate() {
+            if *workspace {
+                if let Some(name) = path.rsplit('/').next() {
+                    workspace_by_basename
+                        .entry(name.to_string())
+                        .or_default()
+                        .push(position);
+                }
+            }
+        }
+        Self {
+            paths: deduplicated.into_iter().map(|(path, _)| path).collect(),
+            workspace_by_basename,
+        }
+    }
+
+    fn contains(&self, candidate: &str) -> bool {
+        self.paths
+            .binary_search_by(|path| path.as_str().cmp(candidate))
+            .is_ok()
+    }
+
+    fn suffix_candidates_bounded(
+        &self,
+        basename: &str,
+        rel: &str,
+        suffix: &str,
+        scan_limit: usize,
+        candidate_limit: usize,
+    ) -> crate::includes::SuffixCandidateLookup {
+        let Some(posting) = self.workspace_by_basename.get(basename) else {
+            return crate::includes::SuffixCandidateLookup::default();
+        };
+        let mut lookup = crate::includes::SuffixCandidateLookup::default();
+        for position in posting {
+            if lookup.inspected >= scan_limit {
+                lookup.truncated = true;
+                break;
+            }
+            lookup.inspected += 1;
+            let Some(candidate) = self.paths.get(*position) else {
+                continue;
+            };
+            if candidate.as_str() != rel && !candidate.ends_with(suffix) {
+                continue;
+            }
+            if lookup.candidates.len() >= candidate_limit {
+                lookup.truncated = true;
+                break;
+            }
+            lookup.candidates.push(candidate.clone());
+        }
+        lookup
+    }
+}
+
+/// Request-local path delta over the generation-pinned published index. Dirty
+/// paths are the only owned strings; all untouched workspace/external paths
+/// remain behind the shared `Arc`.
+#[derive(Debug)]
+struct IncludePathView {
+    base: Option<Arc<IncludePathIndex>>,
+    delta_paths: HashSet<String>,
+    delta_by_basename: HashMap<String, Vec<String>>,
+    probe_pending: AtomicBool,
+    probe_enqueue_attempts: AtomicUsize,
+    probe_observations: Mutex<Vec<ExternalPathProbeObservation>>,
+    probe_observations_overflowed: AtomicBool,
+}
+
+impl IncludePathView {
+    fn new(
+        base: Option<Arc<IncludePathIndex>>,
+        overlay_paths: impl IntoIterator<Item = String>,
+    ) -> Self {
+        let mut delta_paths = HashSet::new();
+        for path in overlay_paths {
+            if !base.as_deref().is_some_and(|base| base.contains(&path)) {
+                delta_paths.insert(path);
+            }
+        }
+        let mut delta_by_basename: HashMap<String, Vec<String>> = HashMap::new();
+        for path in &delta_paths {
+            if let Some(name) = path.rsplit('/').next() {
+                delta_by_basename
+                    .entry(name.to_string())
+                    .or_default()
+                    .push(path.clone());
+            }
+        }
+        for paths in delta_by_basename.values_mut() {
+            paths.sort_unstable();
+            paths.dedup();
+        }
+        Self {
+            base,
+            delta_paths,
+            delta_by_basename,
+            probe_pending: AtomicBool::new(false),
+            probe_enqueue_attempts: AtomicUsize::new(0),
+            probe_observations: Mutex::new(Vec::new()),
+            probe_observations_overflowed: AtomicBool::new(false),
+        }
+    }
+
+    fn contains(&self, candidate: &str) -> bool {
+        if self.delta_paths.contains(candidate)
+            || self
+                .base
+                .as_deref()
+                .is_some_and(|base| base.contains(candidate))
+        {
+            return true;
+        }
+        match external_path_probe_cache()
+            .lookup_or_schedule(candidate, &self.probe_enqueue_attempts)
+        {
+            ExternalPathProbeLookup::NotApplicable => false,
+            ExternalPathProbeLookup::Pending => {
+                self.probe_pending.store(true, Ordering::Release);
+                false
+            }
+            ExternalPathProbeLookup::Ready {
+                exists,
+                valid_until,
+                version,
+            } => {
+                let mut observations = self
+                    .probe_observations
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(observation) = observations
+                    .iter_mut()
+                    .find(|observation| observation.path == candidate)
+                {
+                    observation.version = version;
+                    observation.valid_until = valid_until;
+                } else if observations.len() < EXTERNAL_PATH_PROBE_OBSERVATION_LIMIT {
+                    observations.push(ExternalPathProbeObservation {
+                        path: candidate.to_string(),
+                        version,
+                        valid_until,
+                    });
+                } else {
+                    self.probe_observations_overflowed
+                        .store(true, Ordering::Release);
+                }
+                exists
+            }
+        }
+    }
+
+    fn cacheable(&self) -> bool {
+        if self.probe_pending.load(Ordering::Acquire)
+            || self.probe_observations_overflowed.load(Ordering::Acquire)
+        {
+            return false;
+        }
+        let observations = self
+            .probe_observations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        observations.is_empty()
+            || external_path_probe_cache().observations_are_current(&observations)
+    }
+
+    #[cfg(test)]
+    fn probe_enqueue_count_for_test(&self) -> usize {
+        self.probe_enqueue_attempts.load(Ordering::Acquire)
+    }
+
+    fn suffix_candidates(
+        &self,
+        basename: &str,
+        rel: &str,
+        suffix: &str,
+    ) -> crate::includes::SuffixCandidateLookup {
+        let mut lookup = crate::includes::SuffixCandidateLookup::default();
+        for candidate in self.delta_by_basename.get(basename).into_iter().flatten() {
+            if lookup.inspected >= REQUEST_SUFFIX_SCAN_LIMIT {
+                lookup.truncated = true;
+                break;
+            }
+            lookup.inspected += 1;
+            if candidate.as_str() != rel && !candidate.ends_with(suffix) {
+                continue;
+            }
+            if lookup.candidates.len() >= REQUEST_SUFFIX_CANDIDATE_LIMIT {
+                lookup.truncated = true;
+                break;
+            }
+            lookup.candidates.push(candidate.clone());
+        }
+        if let Some(base) = self.base.as_deref() {
+            let base_lookup = base.suffix_candidates_bounded(
+                basename,
+                rel,
+                suffix,
+                REQUEST_SUFFIX_SCAN_LIMIT.saturating_sub(lookup.inspected),
+                REQUEST_SUFFIX_CANDIDATE_LIMIT.saturating_sub(lookup.candidates.len()),
+            );
+            lookup.inspected = lookup.inspected.saturating_add(base_lookup.inspected);
+            lookup.truncated |= base_lookup.truncated;
+            lookup.candidates.extend(base_lookup.candidates);
+        }
+        lookup.candidates.sort_unstable();
+        lookup.candidates.dedup();
+        lookup
+    }
+
+    fn resolve_include(
+        &self,
+        target_text: &str,
+        source_dir: &str,
+        include_roots: &[String],
+    ) -> crate::includes::IncludeResolution {
+        crate::includes::resolve_include_with_lookup(
+            target_text,
+            source_dir,
+            include_roots,
+            |candidate| self.contains(candidate),
+            |basename, (rel, suffix)| self.suffix_candidates(basename, rel, suffix),
+        )
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct CandidateOverlaySnapshot {
     #[allow(dead_code)] // Captured for request tracing and cross-snapshot diagnostics.
@@ -340,6 +839,7 @@ pub struct CandidateOverlaySnapshot {
     includes_by_path: HashMap<String, Vec<Include>>,
     fallback_completions: Vec<OverlayFallbackCompletionFact>,
     incomplete_paths: HashSet<String>,
+    include_path_view: Option<Arc<IncludePathView>>,
     effective_reach_graph: Option<Arc<ReachGraph>>,
     /// Only external paths whose workspace-wide first-layer status differs
     /// from the published graph. Ordinary completion applies this sparse map
@@ -566,48 +1066,17 @@ impl CandidateOverlaySnapshot {
     /// Build the immutable request-local include graph for every shadowed
     /// document. Durable out-edges for those paths are replaced, never mutated
     /// in place; unresolved/ambiguous live includes open the affected scope.
-    pub fn refresh_reach_graph<'p>(
+    pub fn refresh_reach_graph(
         &mut self,
-        base: Option<&ReachGraph>,
-        indexed_workspace_paths: impl IntoIterator<Item = &'p str>,
+        base: Option<Arc<ReachGraph>>,
+        indexed_paths: Option<Arc<IncludePathIndex>>,
         include_roots: &[String],
     ) {
         if self.shadowed_paths.is_empty() {
             return;
         }
         self.direct_include_overrides.clear();
-        let mut workspace_paths: HashSet<String> = indexed_workspace_paths
-            .into_iter()
-            .map(str::to_string)
-            .collect();
-        workspace_paths.extend(self.shadowed_paths.iter().cloned());
-        let mut by_basename: HashMap<String, Vec<String>> = HashMap::new();
-        for path in &workspace_paths {
-            if let Some(name) = path.rsplit('/').next() {
-                by_basename
-                    .entry(name.to_string())
-                    .or_default()
-                    .push(path.clone());
-            }
-        }
-        for paths in by_basename.values_mut() {
-            paths.sort();
-            paths.dedup();
-        }
-        let mut all_paths = workspace_paths;
-        for include in self.includes_by_path.values().flatten() {
-            let Some((_form, relative)) =
-                crate::includes::normalize_include_target(&include.target_text)
-            else {
-                continue;
-            };
-            for root in include_roots {
-                let candidate = format!("{}/{}", root.trim_end_matches('/'), relative);
-                if Path::new(&candidate).is_file() {
-                    all_paths.insert(candidate);
-                }
-            }
-        }
+        let path_view = IncludePathView::new(indexed_paths, self.shadowed_paths.iter().cloned());
 
         let mut sources: Vec<String> = self.shadowed_paths.iter().cloned().collect();
         sources.sort();
@@ -624,13 +1093,7 @@ impl CandidateOverlaySnapshot {
             let source_dir = source.rsplit_once('/').map_or("", |(dir, _)| dir);
             let mut reason = None;
             for include in self.includes_by_path.get(source).into_iter().flatten() {
-                match crate::includes::resolve_include(
-                    &include.target_text,
-                    source_dir,
-                    include_roots,
-                    &all_paths,
-                    &by_basename,
-                ) {
+                match path_view.resolve_include(&include.target_text, source_dir, include_roots) {
                     crate::includes::IncludeResolution::Edge { dst, kind } => {
                         edges.push((source.clone(), dst, kind));
                     }
@@ -655,42 +1118,25 @@ impl CandidateOverlaySnapshot {
                 open.push((source.clone(), reason));
             }
         }
-        let mut graph = match base {
-            Some(base) => base.with_refreshed_sources_with_kinds(&sources, edges, open),
-            None => {
-                let unresolved = open
-                    .iter()
-                    .filter(|(_, reason)| {
-                        *reason == crate::reachability::OpenReason::UnresolvedInclude
-                    })
-                    .map(|(path, _)| path.clone())
-                    .collect();
-                let ambiguous = open
-                    .iter()
-                    .filter(|(_, reason)| {
-                        *reason == crate::reachability::OpenReason::AmbiguousInclude
-                    })
-                    .map(|(path, _)| path.clone())
-                    .collect();
-                ReachGraph::new_with_kinds(edges, unresolved, ambiguous)
-            }
-        };
-        if !self.go_overlay_packages.is_empty() {
-            graph = graph.with_refreshed_go_overlays(
-                self.go_overlay_packages
-                    .iter()
-                    .map(|(path, package)| (path.clone(), package.clone()))
-                    .collect(),
-            );
-        }
-        if let Some(base) = base {
-            let published = base.directly_included_external_paths();
-            let effective = graph.directly_included_external_paths();
-            for path in published.symmetric_difference(&effective) {
-                self.direct_include_overrides
-                    .insert(path.clone(), effective.contains(path));
-            }
-        }
+        let graph_base = base.unwrap_or_else(|| {
+            Arc::new(ReachGraph::new_with_kinds(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ))
+        });
+        let graph = ReachGraph::with_request_overrides(
+            graph_base,
+            &sources,
+            edges,
+            open,
+            self.go_overlay_packages
+                .iter()
+                .map(|(path, package)| (path.clone(), package.clone()))
+                .collect(),
+        );
+        self.direct_include_overrides = graph.direct_external_presence_overrides();
+        self.include_path_view = Some(Arc::new(path_view));
         self.effective_reach_graph = Some(Arc::new(graph));
     }
 
@@ -769,6 +1215,31 @@ impl CandidateOverlaySnapshot {
     /// flags. Paths absent here retain their published value.
     pub fn direct_include_overrides(&self) -> &HashMap<String, bool> {
         &self.direct_include_overrides
+    }
+
+    /// Whether the request-local path projection still represents the exact
+    /// background probe epoch and TTL from which its reachability was built.
+    /// Cache ledgers must re-build snapshots that observed a pending or expired
+    /// path-only external include probe.
+    pub(crate) fn path_view_cacheable(&self) -> bool {
+        self.include_path_view
+            .as_deref()
+            .is_none_or(IncludePathView::cacheable)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn include_path_view_shape_for_test(
+        &self,
+        expected_base: &Arc<IncludePathIndex>,
+    ) -> (bool, usize) {
+        self.include_path_view.as_ref().map_or((false, 0), |view| {
+            (
+                view.base
+                    .as_ref()
+                    .is_some_and(|base| Arc::ptr_eq(base, expected_base)),
+                view.delta_paths.len(),
+            )
+        })
     }
 
     pub fn callable_anchors(&self, name: &str) -> &[CallableAnchor] {
@@ -1051,6 +1522,14 @@ mod tests {
             .join(name)
             .to_string_lossy()
             .replace('\\', "/")
+    }
+
+    fn include_path_index<'a>(paths: impl IntoIterator<Item = &'a str>) -> Arc<IncludePathIndex> {
+        Arc::new(IncludePathIndex::build(
+            paths
+                .into_iter()
+                .map(|path| (path.to_string(), !Path::new(path).is_absolute())),
+        ))
     }
 
     fn upsert_candidate_test_file(store: &mut IndexStore, path: &str, source: &str) {
@@ -1440,11 +1919,11 @@ mod tests {
             None,
             ParseFacts::HOVER_SEMANTICS,
         );
-        let published = ReachGraph::new(
+        let published = Arc::new(ReachGraph::new(
             vec![("api.c".into(), "api.h".into())],
             Vec::new(),
             Vec::new(),
-        );
+        ));
         let mut removed = CandidateOverlaySnapshot::new(
             6,
             vec![
@@ -1452,13 +1931,17 @@ mod tests {
                 FileCandidateOverlay::from_index("api.c".into(), &source_without_include),
             ],
         );
-        removed.refresh_reach_graph(Some(&published), ["api.c", "api.h"], &[]);
+        removed.refresh_reach_graph(
+            Some(published.clone()),
+            Some(include_path_index(["api.c", "api.h"])),
+            &[],
+        );
         let removed_set = CandidateQueryService::new(
             None,
             &removed,
             "api.c",
             Some(&published.reachable("api.c")),
-            Some(&published),
+            Some(published.as_ref()),
         )
         .callable_candidates("api", None)
         .expect("removed include candidates");
@@ -1472,7 +1955,7 @@ mod tests {
             None,
             ParseFacts::HOVER_SEMANTICS,
         );
-        let empty_published = ReachGraph::new(Vec::new(), Vec::new(), Vec::new());
+        let empty_published = Arc::new(ReachGraph::new(Vec::new(), Vec::new(), Vec::new()));
         let mut added = CandidateOverlaySnapshot::new(
             7,
             vec![
@@ -1480,9 +1963,13 @@ mod tests {
                 FileCandidateOverlay::from_index("api.c".into(), &source_with_include),
             ],
         );
-        added.refresh_reach_graph(Some(&empty_published), ["api.c", "api.h"], &[]);
+        added.refresh_reach_graph(
+            Some(empty_published.clone()),
+            Some(include_path_index(["api.c", "api.h"])),
+            &[],
+        );
         let added_set =
-            CandidateQueryService::new(None, &added, "api.c", None, Some(&empty_published))
+            CandidateQueryService::new(None, &added, "api.c", None, Some(empty_published.as_ref()))
                 .callable_candidates("api", None)
                 .expect("added include candidates");
         assert_eq!(
@@ -1492,8 +1979,148 @@ mod tests {
     }
 
     #[test]
+    fn dirty_include_refresh_reuses_published_path_index_without_workspace_copy() {
+        let mut indexed_paths = (0..8_192)
+            .map(|index| (format!("include/noise_{index}.h"), true))
+            .collect::<Vec<_>>();
+        indexed_paths.push(("include/api.h".to_string(), true));
+        let published_paths = Arc::new(IncludePathIndex::build(indexed_paths));
+        let source = parse_with_handle(
+            Path::new("src/main.c"),
+            "#include \"include/api.h\"\nint main(void) { return 0; }\n",
+            None,
+            ParseFacts::HOVER_SEMANTICS,
+        );
+        let mut snapshot = CandidateOverlaySnapshot::new(
+            1,
+            vec![FileCandidateOverlay::from_index(
+                "src/main.c".into(),
+                &source,
+            )],
+        );
+        let published_graph = Arc::new(ReachGraph::new(Vec::new(), Vec::new(), Vec::new()));
+
+        snapshot.refresh_reach_graph(Some(published_graph), Some(published_paths.clone()), &[]);
+
+        let path_view = snapshot
+            .include_path_view
+            .as_ref()
+            .expect("persistent include path view");
+        assert!(Arc::ptr_eq(
+            path_view.base.as_ref().expect("published path base"),
+            &published_paths
+        ));
+        assert_eq!(path_view.delta_paths.len(), 1);
+        assert!(snapshot
+            .effective_reach_graph(None)
+            .expect("effective graph")
+            .reachable("src/main.c")
+            .files
+            .contains("include/api.h"));
+    }
+
+    #[test]
+    fn path_only_external_include_is_probed_off_request_and_cache_tracks_probe_epoch() {
+        let external = tempdir().expect("external include root");
+        std::fs::write(external.path().join("api.h"), "int external_api(void);\n")
+            .expect("external header");
+        let include_roots = vec![crate::pathing::normalize_abs_path(external.path())];
+        let published_paths = Arc::new(IncludePathIndex::build(Vec::new()));
+
+        let first = IncludePathView::new(Some(published_paths.clone()), Vec::new());
+        assert_eq!(
+            first.resolve_include("<api.h>", "", &include_roots),
+            crate::includes::IncludeResolution::Unresolved,
+            "the first lookup must enqueue a probe without waiting for disk"
+        );
+        assert!(
+            !first.cacheable(),
+            "an unresolved background probe must not enter the stable overlay cache"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let observed = IncludePathView::new(Some(published_paths.clone()), Vec::new());
+            if let crate::includes::IncludeResolution::Edge { dst, kind } =
+                observed.resolve_include("<api.h>", "", &include_roots)
+            {
+                assert_eq!(
+                    dst,
+                    crate::pathing::normalize_abs_path(&external.path().join("api.h"))
+                );
+                assert_eq!(kind, crate::includes::ResolutionKind::ExternalExact);
+                assert!(
+                    observed.cacheable(),
+                    "a completed probe may be reused only while its TTL and probe epoch stay valid"
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background path probe did not publish its bounded result"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn external_path_probe_enqueue_is_bounded_per_request_view() {
+        let base = tempdir().expect("probe roots");
+        let include_roots = (0..64)
+            .map(|index| {
+                crate::pathing::normalize_abs_path(&base.path().join(format!("sdk-{index}")))
+            })
+            .collect::<Vec<_>>();
+        let view = IncludePathView::new(
+            Some(Arc::new(IncludePathIndex::build(Vec::new()))),
+            Vec::new(),
+        );
+
+        assert_eq!(
+            view.resolve_include("<missing.h>", "", &include_roots),
+            crate::includes::IncludeResolution::Unresolved
+        );
+        assert_eq!(
+            view.probe_enqueue_count_for_test(),
+            16,
+            "one overlay build must not turn a large configured root list into an I/O storm"
+        );
+        assert!(!view.cacheable());
+    }
+
+    #[test]
+    fn deferred_external_probe_reaches_root_after_expired_negative_prefix() {
+        let base = tempdir().expect("probe roots");
+        let include_roots = (0..17)
+            .map(|index| {
+                crate::pathing::normalize_abs_path(&base.path().join(format!("sdk-{index}")))
+            })
+            .collect::<Vec<_>>();
+        std::fs::create_dir_all(base.path().join("sdk-16")).expect("late include root");
+        std::fs::write(base.path().join("sdk-16/api.h"), "int late_api(void);\n")
+            .expect("late external header");
+        let published = Arc::new(IncludePathIndex::build(Vec::new()));
+
+        let first = IncludePathView::new(Some(published.clone()), Vec::new());
+        assert_eq!(
+            first.resolve_include("<api.h>", "", &include_roots),
+            crate::includes::IncludeResolution::Unresolved
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2_100));
+
+        let second = IncludePathView::new(Some(published), Vec::new());
+        assert!(matches!(
+            second.resolve_include("<api.h>", "", &include_roots),
+            crate::includes::IncludeResolution::Edge {
+                kind: crate::includes::ResolutionKind::ExternalExact,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn dirty_go_file_drops_stale_published_import_reach_and_opens_its_package() {
-        let published = ReachGraph::from_rows_with_packages(
+        let published = Arc::new(ReachGraph::from_rows_with_packages(
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -1517,7 +2144,7 @@ mod tests {
                 resolution: GoPackageResolution::Exact,
             }],
             Vec::new(),
-        );
+        ));
         assert!(published
             .reachable("app/main.go")
             .files
@@ -1537,13 +2164,17 @@ mod tests {
             )],
         );
         snapshot.refresh_reach_graph(
-            Some(&published),
-            ["app/main.go", "app/helper.go", "lib/lib.go"],
+            Some(published.clone()),
+            Some(include_path_index([
+                "app/main.go",
+                "app/helper.go",
+                "lib/lib.go",
+            ])),
             &[],
         );
 
         let scope = snapshot
-            .effective_reach_graph(Some(&published))
+            .effective_reach_graph(Some(published.as_ref()))
             .expect("overlay graph")
             .reachable("app/main.go");
         assert!(scope.files.contains("app/main.go"));
@@ -1570,7 +2201,7 @@ mod tests {
             None,
             ParseFacts::HOVER_SEMANTICS,
         );
-        let base = ReachGraph::new(Vec::new(), Vec::new(), Vec::new());
+        let base = Arc::new(ReachGraph::new(Vec::new(), Vec::new(), Vec::new()));
         let mut snapshot = CandidateOverlaySnapshot::new(
             8,
             vec![
@@ -1578,14 +2209,34 @@ mod tests {
                 FileCandidateOverlay::from_index("src/api.c".into(), &source),
             ],
         );
-        snapshot.refresh_reach_graph(Some(&base), ["src/api.c", "inc/api.h"], &[]);
+        snapshot.refresh_reach_graph(
+            Some(base.clone()),
+            Some(include_path_index(["src/api.c", "inc/api.h"])),
+            &[],
+        );
 
         let scope = snapshot
-            .effective_reach_graph(Some(&base))
+            .effective_reach_graph(Some(base.as_ref()))
             .expect("effective graph")
             .reachable("src/api.c");
         assert!(!scope.files.contains("inc/api.h"));
         assert!(scope.heuristic_files.contains("inc/api.h"));
+    }
+
+    #[test]
+    fn request_suffix_lookup_bounds_duplicate_basename_scan_and_candidates() {
+        let paths = (0..10_000)
+            .map(|index| (format!("generated/{index}/config.h"), true))
+            .collect::<Vec<_>>();
+        let view = IncludePathView::new(
+            Some(Arc::new(IncludePathIndex::build(paths))),
+            ["src/main.c".to_string()],
+        );
+
+        let lookup = view.suffix_candidates("config.h", "config.h", "/config.h");
+        assert!(lookup.truncated);
+        assert!(lookup.inspected <= 4_096, "{lookup:?}");
+        assert!(lookup.candidates.len() <= 256, "{lookup:?}");
     }
 
     #[test]
@@ -1608,7 +2259,7 @@ mod tests {
             None,
             ParseFacts::HOVER_SEMANTICS,
         );
-        let base = ReachGraph::new(Vec::new(), Vec::new(), Vec::new());
+        let base = Arc::new(ReachGraph::new(Vec::new(), Vec::new(), Vec::new()));
         let mut snapshot = CandidateOverlaySnapshot::new(
             9,
             vec![
@@ -1618,13 +2269,17 @@ mod tests {
             ],
         );
         snapshot.refresh_reach_graph(
-            Some(&base),
-            ["src/main.c", "first/api.h", "second/api.h"],
+            Some(base.clone()),
+            Some(include_path_index([
+                "src/main.c",
+                "first/api.h",
+                "second/api.h",
+            ])),
             &[],
         );
 
         let scope = snapshot
-            .effective_reach_graph(Some(&base))
+            .effective_reach_graph(Some(base.as_ref()))
             .expect("effective graph")
             .reachable("src/main.c");
         assert!(scope.open);
@@ -1653,11 +2308,11 @@ mod tests {
             None,
             ParseFacts::HOVER_SEMANTICS,
         );
-        let published = ReachGraph::new(
+        let published = Arc::new(ReachGraph::new(
             vec![("main.c".into(), external.clone())],
             Vec::new(),
             Vec::new(),
-        );
+        ));
         let mut removed = CandidateOverlaySnapshot::new(
             8,
             vec![
@@ -1665,7 +2320,11 @@ mod tests {
                 FileCandidateOverlay::from_index("main.c".into(), &main_without_include),
             ],
         );
-        removed.refresh_reach_graph(Some(&published), ["main.c"], &[]);
+        removed.refresh_reach_graph(
+            Some(published.clone()),
+            Some(include_path_index(["main.c"])),
+            &[],
+        );
 
         assert_eq!(
             removed.direct_include_overrides().get(&external),
@@ -1685,7 +2344,7 @@ mod tests {
             &removed,
             "main.c",
             Some(&published_main_reach),
-            Some(&published),
+            Some(published.as_ref()),
         );
         let removed_candidates = removed_service
             .callable_candidates("external_api", None)
@@ -1725,7 +2384,7 @@ mod tests {
             None,
             ParseFacts::HOVER_SEMANTICS,
         );
-        let empty_published = ReachGraph::new(Vec::new(), Vec::new(), Vec::new());
+        let empty_published = Arc::new(ReachGraph::new(Vec::new(), Vec::new(), Vec::new()));
         let mut added = CandidateOverlaySnapshot::new(
             9,
             vec![
@@ -1738,7 +2397,11 @@ mod tests {
             .expect("external parent")
             .0
             .to_string();
-        added.refresh_reach_graph(Some(&empty_published), ["main.c"], &[external_root]);
+        added.refresh_reach_graph(
+            Some(empty_published.clone()),
+            Some(include_path_index(["main.c"])),
+            &[external_root],
+        );
 
         assert_eq!(
             added.direct_include_overrides().get(&external),
@@ -1752,26 +2415,41 @@ mod tests {
             .expect("external overlay completion name");
         assert!(added_name.external);
         assert!(added_name.directly_included);
-        let added_candidates =
-            CandidateQueryService::new(None, &added, "main.c", None, Some(&empty_published))
-                .callable_candidates("external_api", None)
-                .expect("added include candidates");
+        let added_candidates = CandidateQueryService::new(
+            None,
+            &added,
+            "main.c",
+            None,
+            Some(empty_published.as_ref()),
+        )
+        .callable_candidates("external_api", None)
+        .expect("added include candidates");
         assert_eq!(added_candidates.anchors[0].candidate.source, "external");
         assert_eq!(
             added_candidates.anchors[0].candidate.tier,
             crate::model::ScopeTier::External
         );
-        let unrelated_candidates =
-            CandidateQueryService::new(None, &added, "other.c", None, Some(&empty_published))
-                .callable_candidates("external_api", None)
-                .expect("unrelated-origin external candidates");
+        let unrelated_candidates = CandidateQueryService::new(
+            None,
+            &added,
+            "other.c",
+            None,
+            Some(empty_published.as_ref()),
+        )
+        .callable_candidates("external_api", None)
+        .expect("unrelated-origin external candidates");
         assert_eq!(
             unrelated_candidates.anchors[0].candidate.tier,
             crate::model::ScopeTier::Global,
             "another workspace source must not inherit main.c's direct external evidence"
         );
-        let added_service =
-            CandidateQueryService::new(None, &added, "main.c", None, Some(&empty_published));
+        let added_service = CandidateQueryService::new(
+            None,
+            &added,
+            "main.c",
+            None,
+            Some(empty_published.as_ref()),
+        );
         let added_symbol = added_service
             .semantic_candidates("EXTERNAL_FLAG", SemanticIntent::Value)
             .expect("added include declaration")

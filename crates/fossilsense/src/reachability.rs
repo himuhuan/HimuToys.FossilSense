@@ -7,6 +7,7 @@
 //! that coloring and completion narrow their candidates to; a file whose include
 //! picture we cannot fully resolve is marked "open" so callers soften the gate.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -86,6 +87,21 @@ struct PackageReachEdge {
     heuristic: bool,
 }
 
+/// Sparse request-local replacement data layered over one immutable published
+/// graph. Only dirty source paths and affected Go packages live here; every
+/// untouched lookup falls through to `ReachGraph::base` without copying the
+/// workspace graph.
+#[derive(Debug)]
+struct ReachGraphOverlay {
+    sources: HashSet<String>,
+    edges: HashMap<String, Vec<ReachEdge>>,
+    open: HashMap<String, OpenReason>,
+    package_by_file: HashMap<String, Option<String>>,
+    affected_packages: HashSet<String>,
+    open_packages: HashMap<String, OpenReason>,
+    direct_external_source_counts: HashMap<String, usize>,
+}
+
 fn is_strong_resolution(resolution: ResolutionKind) -> bool {
     matches!(
         resolution,
@@ -111,6 +127,35 @@ fn normalize_reach_edges(edges: &mut Vec<ReachEdge>) {
             .then_with(|| left.resolution.as_str().cmp(right.resolution.as_str()))
     });
     edges.dedup();
+}
+
+fn direct_external_source_counts(
+    edges: &HashMap<String, Vec<ReachEdge>>,
+) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    for (source, targets) in edges {
+        if Path::new(source).is_absolute() {
+            continue;
+        }
+        for edge in targets.iter().filter(|edge| is_direct_external_edge(edge)) {
+            *counts.entry(edge.target.clone()).or_default() += 1;
+        }
+    }
+    counts
+}
+
+fn insert_open_reason(open: &mut HashMap<String, OpenReason>, path: String, reason: OpenReason) {
+    match reason {
+        OpenReason::UnresolvedInclude => {
+            open.insert(path, OpenReason::UnresolvedInclude);
+        }
+        OpenReason::AmbiguousInclude => {
+            open.entry(path).or_insert(OpenReason::AmbiguousInclude);
+        }
+        _ => {
+            open.entry(path).or_insert(reason);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -140,6 +185,9 @@ pub struct ReachGraph {
     files_by_package: HashMap<String, Vec<String>>,
     package_edges: HashMap<String, Vec<PackageReachEdge>>,
     open_packages: HashMap<String, OpenReason>,
+    direct_external_source_counts: HashMap<String, usize>,
+    base: Option<Arc<ReachGraph>>,
+    overlay: Option<ReachGraphOverlay>,
     cache: Mutex<HashMap<String, Arc<ReachScope>>>,
 }
 
@@ -186,6 +234,7 @@ impl ReachGraph {
         for targets in edges.values_mut() {
             normalize_reach_edges(targets);
         }
+        let direct_external_source_counts = direct_external_source_counts(&edges);
         let mut open: HashMap<String, OpenReason> = HashMap::new();
         for path in ambiguous_files {
             open.insert(path, OpenReason::AmbiguousInclude);
@@ -201,6 +250,9 @@ impl ReachGraph {
             files_by_package: HashMap::new(),
             package_edges: HashMap::new(),
             open_packages: HashMap::new(),
+            direct_external_source_counts,
+            base: None,
+            overlay: None,
             cache: Mutex::new(HashMap::new()),
         }
     }
@@ -309,6 +361,28 @@ impl ReachGraph {
         edges: Vec<(String, String, ResolutionKind)>,
         open: Vec<(String, crate::reachability::OpenReason)>,
     ) {
+        debug_assert!(self.base.is_none() && self.overlay.is_none());
+        for source in sources {
+            if Path::new(source).is_absolute() {
+                continue;
+            }
+            let removed = self
+                .edges
+                .get(source)
+                .into_iter()
+                .flatten()
+                .filter(|edge| is_direct_external_edge(edge))
+                .map(|edge| edge.target.clone())
+                .collect::<Vec<_>>();
+            for target in removed {
+                if let Some(count) = self.direct_external_source_counts.get_mut(&target) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        self.direct_external_source_counts.remove(&target);
+                    }
+                }
+            }
+        }
         // Remove stale out-edges for the refreshed sources.
         for src in sources {
             self.edges.remove(src);
@@ -327,23 +401,27 @@ impl ReachGraph {
                 normalize_reach_edges(targets);
             }
         }
+        for source in sources {
+            if Path::new(source).is_absolute() {
+                continue;
+            }
+            for edge in self
+                .edges
+                .get(source)
+                .into_iter()
+                .flatten()
+                .filter(|edge| is_direct_external_edge(edge))
+            {
+                *self
+                    .direct_external_source_counts
+                    .entry(edge.target.clone())
+                    .or_default() += 1;
+            }
+        }
 
         // Apply open flags with UnresolvedInclude > AmbiguousInclude precedence.
         for (path, reason) in open {
-            match reason {
-                crate::reachability::OpenReason::UnresolvedInclude => {
-                    self.open
-                        .insert(path, crate::reachability::OpenReason::UnresolvedInclude);
-                }
-                crate::reachability::OpenReason::AmbiguousInclude => {
-                    self.open
-                        .entry(path)
-                        .or_insert(crate::reachability::OpenReason::AmbiguousInclude);
-                }
-                _ => {
-                    self.open.entry(path).or_insert(reason);
-                }
-            }
+            insert_open_reason(&mut self.open, path, reason);
         }
 
         // Clear the cache so subsequent reachable() calls recompute.
@@ -378,6 +456,7 @@ impl ReachGraph {
         edges: Vec<IncludeEdgeRow>,
         open: Vec<OpenIncludeRow>,
     ) -> Self {
+        debug_assert!(self.base.is_none() && self.overlay.is_none());
         let mut next = Self {
             edges: self.edges.clone(),
             open: self.open.clone(),
@@ -385,81 +464,295 @@ impl ReachGraph {
             files_by_package: self.files_by_package.clone(),
             package_edges: self.package_edges.clone(),
             open_packages: self.open_packages.clone(),
+            direct_external_source_counts: self.direct_external_source_counts.clone(),
+            base: None,
+            overlay: None,
             cache: Mutex::new(HashMap::new()),
         };
         next.refresh_sources_from_rows(sources, edges, open);
         next
     }
 
-    /// Resolution-aware request-local refresh used by dirty document overlays.
-    pub(crate) fn with_refreshed_sources_with_kinds(
-        &self,
+    /// Build a sparse request-local graph over an immutable published base.
+    /// Every dirty source replaces its durable out-edges and open flag. Go
+    /// package overlays additionally replace membership and invalidate only the
+    /// affected packages; untouched C edges and Go package maps stay shared.
+    pub(crate) fn with_request_overrides(
+        base: Arc<Self>,
         sources: &[String],
         edges: Vec<(String, String, ResolutionKind)>,
         open: Vec<(String, OpenReason)>,
+        go_overlays: Vec<(String, Option<(String, OpenReason)>)>,
     ) -> Self {
-        let mut next = Self {
-            edges: self.edges.clone(),
-            open: self.open.clone(),
-            package_by_file: self.package_by_file.clone(),
-            files_by_package: self.files_by_package.clone(),
-            package_edges: self.package_edges.clone(),
-            open_packages: self.open_packages.clone(),
-            cache: Mutex::new(HashMap::new()),
-        };
-        next.refresh_sources_with_kinds(sources, edges, open);
-        next
-    }
+        let source_set: HashSet<String> = sources.iter().cloned().collect();
+        let mut edge_overrides: HashMap<String, Vec<ReachEdge>> = HashMap::new();
+        for (source, target, resolution) in edges {
+            edge_overrides
+                .entry(source)
+                .or_default()
+                .push(ReachEdge { target, resolution });
+        }
+        for source in sources {
+            if let Some(targets) = edge_overrides.get_mut(source) {
+                normalize_reach_edges(targets);
+            }
+        }
+        let mut open_overrides = HashMap::new();
+        for (path, reason) in open {
+            insert_open_reason(&mut open_overrides, path, reason);
+        }
 
-    pub(crate) fn with_refreshed_go_overlays(
-        &self,
-        overlays: Vec<(String, Option<(String, OpenReason)>)>,
-    ) -> Self {
-        let mut next = Self {
-            edges: self.edges.clone(),
-            open: self.open.clone(),
-            package_by_file: self.package_by_file.clone(),
-            files_by_package: self.files_by_package.clone(),
-            package_edges: self.package_edges.clone(),
-            open_packages: self.open_packages.clone(),
-            cache: Mutex::new(HashMap::new()),
+        let mut direct_deltas: HashMap<String, isize> = HashMap::new();
+        for source in &source_set {
+            if Path::new(source).is_absolute() {
+                continue;
+            }
+            for edge in base
+                .edges_for(source)
+                .into_iter()
+                .flatten()
+                .filter(|edge| is_direct_external_edge(edge))
+            {
+                *direct_deltas.entry(edge.target.clone()).or_default() -= 1;
+            }
+            for edge in edge_overrides
+                .get(source)
+                .into_iter()
+                .flatten()
+                .filter(|edge| is_direct_external_edge(edge))
+            {
+                *direct_deltas.entry(edge.target.clone()).or_default() += 1;
+            }
+        }
+        let direct_external_source_counts = direct_deltas
+            .into_iter()
+            .map(|(target, delta)| {
+                let count = (base.direct_external_source_count(&target) as isize + delta).max(0);
+                (target, count as usize)
+            })
+            .collect();
+
+        let mut overlay = ReachGraphOverlay {
+            sources: source_set,
+            edges: edge_overrides,
+            open: open_overrides,
+            package_by_file: HashMap::new(),
+            affected_packages: HashSet::new(),
+            open_packages: HashMap::new(),
+            direct_external_source_counts,
         };
         let mut affected_packages = HashSet::new();
-        for (path, package) in overlays {
-            if let Some(old_package) = next.package_by_file.remove(&path) {
-                affected_packages.insert(old_package.clone());
-                if let Some(files) = next.files_by_package.get_mut(&old_package) {
-                    files.retain(|file| file != &path);
-                }
+        for (path, package) in go_overlays {
+            if let Some(old_package) = base.package_for_file(&path) {
+                affected_packages.insert(old_package.to_string());
             }
-            next.open.remove(&path);
+            overlay.open.remove(&path);
             match package {
                 Some((package_key, reason)) => {
                     affected_packages.insert(package_key.clone());
-                    next.package_by_file
-                        .insert(path.clone(), package_key.clone());
-                    let files = next
-                        .files_by_package
-                        .entry(package_key.clone())
-                        .or_default();
-                    if !files.contains(&path) {
-                        files.push(path);
-                        files.sort();
-                    }
-                    next.open_packages.insert(package_key, reason);
+                    overlay
+                        .package_by_file
+                        .insert(path, Some(package_key.clone()));
+                    overlay.open_packages.insert(package_key, reason);
                 }
                 None => {
-                    next.open.insert(path, OpenReason::UnresolvedInclude);
+                    overlay.package_by_file.insert(path.clone(), None);
+                    overlay.open.insert(path, OpenReason::UnresolvedInclude);
                 }
             }
         }
         for package in affected_packages {
-            next.package_edges.remove(&package);
-            next.open_packages
+            overlay.affected_packages.insert(package.clone());
+            overlay
+                .open_packages
                 .entry(package)
                 .or_insert(OpenReason::UnresolvedInclude);
         }
-        next
+        Self {
+            edges: HashMap::new(),
+            open: HashMap::new(),
+            package_by_file: HashMap::new(),
+            files_by_package: HashMap::new(),
+            package_edges: HashMap::new(),
+            open_packages: HashMap::new(),
+            direct_external_source_counts: HashMap::new(),
+            base: Some(base),
+            overlay: Some(overlay),
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn edges_for(&self, source: &str) -> Option<&[ReachEdge]> {
+        if let Some(overlay) = &self.overlay {
+            if overlay.sources.contains(source) {
+                return Some(
+                    overlay
+                        .edges
+                        .get(source)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default(),
+                );
+            }
+            return self.base.as_deref().and_then(|base| base.edges_for(source));
+        }
+        self.edges.get(source).map(Vec::as_slice)
+    }
+
+    fn open_reason(&self, path: &str) -> Option<OpenReason> {
+        if let Some(overlay) = &self.overlay {
+            if overlay.sources.contains(path) {
+                return overlay.open.get(path).copied();
+            }
+            return self.base.as_deref().and_then(|base| base.open_reason(path));
+        }
+        self.open.get(path).copied()
+    }
+
+    fn package_for_file<'a>(&'a self, path: &str) -> Option<&'a str> {
+        if let Some(overlay) = &self.overlay {
+            if let Some(package) = overlay.package_by_file.get(path) {
+                return package.as_deref();
+            }
+            return self
+                .base
+                .as_deref()
+                .and_then(|base| base.package_for_file(path));
+        }
+        self.package_by_file.get(path).map(String::as_str)
+    }
+
+    #[cfg(test)]
+    fn files_for_package<'a>(&'a self, package: &str) -> Cow<'a, [String]> {
+        self.files_for_package_bounded(package, usize::MAX).0
+    }
+
+    fn files_for_package_bounded<'a>(
+        &'a self,
+        package: &str,
+        limit: usize,
+    ) -> (Cow<'a, [String]>, bool) {
+        let Some(overlay) = &self.overlay else {
+            if let Some(base) = self.base.as_deref() {
+                return base.files_for_package_bounded(package, limit);
+            }
+            let files = self
+                .files_by_package
+                .get(package)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let retained = files.len().min(limit);
+            return (Cow::Borrowed(&files[..retained]), files.len() > retained);
+        };
+        if !overlay.affected_packages.contains(package) {
+            return self.base.as_deref().map_or_else(
+                || (Cow::Borrowed(&[] as &[String]), false),
+                |base| base.files_for_package_bounded(package, limit),
+            );
+        }
+
+        let mut files = overlay
+            .package_by_file
+            .iter()
+            .filter(|(_, effective_package)| effective_package.as_deref() == Some(package))
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        files.sort_unstable();
+        files.dedup();
+        let overlay_files: HashSet<String> = files.iter().cloned().collect();
+        let mut truncated = files.len() > limit;
+        files.truncate(limit);
+
+        if let Some(base) = self.base.as_deref() {
+            let base_scan_limit = limit.saturating_add(overlay.package_by_file.len());
+            let (base_files, base_truncated) =
+                base.files_for_package_bounded(package, base_scan_limit);
+            truncated |= base_truncated;
+            for path in base_files.iter() {
+                if self.package_for_file(path) != Some(package) || overlay_files.contains(path) {
+                    continue;
+                }
+                if files.len() >= limit {
+                    truncated = true;
+                    break;
+                }
+                files.push(path.clone());
+            }
+        }
+        files.sort_unstable();
+        (Cow::Owned(files), truncated)
+    }
+
+    fn package_edges_for(&self, package: &str) -> Option<&[PackageReachEdge]> {
+        if let Some(overlay) = &self.overlay {
+            if overlay.affected_packages.contains(package) {
+                return Some(&[]);
+            }
+            return self
+                .base
+                .as_deref()
+                .and_then(|base| base.package_edges_for(package));
+        }
+        self.package_edges.get(package).map(Vec::as_slice)
+    }
+
+    fn open_package_reason(&self, package: &str) -> Option<OpenReason> {
+        if let Some(overlay) = &self.overlay {
+            if overlay.affected_packages.contains(package) {
+                return overlay.open_packages.get(package).copied();
+            }
+            return self
+                .base
+                .as_deref()
+                .and_then(|base| base.open_package_reason(package));
+        }
+        self.open_packages.get(package).copied()
+    }
+
+    pub(crate) fn direct_external_source_count(&self, target: &str) -> usize {
+        if let Some(overlay) = &self.overlay {
+            if let Some(count) = overlay.direct_external_source_counts.get(target) {
+                return *count;
+            }
+            return self
+                .base
+                .as_deref()
+                .map_or(0, |base| base.direct_external_source_count(target));
+        }
+        self.direct_external_source_counts
+            .get(target)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn direct_external_presence_overrides(&self) -> HashMap<String, bool> {
+        let (Some(base), Some(overlay)) = (self.base.as_deref(), self.overlay.as_ref()) else {
+            return HashMap::new();
+        };
+        overlay
+            .direct_external_source_counts
+            .iter()
+            .filter_map(|(target, effective_count)| {
+                let published = base.direct_external_source_count(target) > 0;
+                let effective = *effective_count > 0;
+                (published != effective).then(|| (target.clone(), effective))
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn request_overlay_shape_for_test(
+        &self,
+        expected_base: &Arc<ReachGraph>,
+    ) -> (bool, usize, usize) {
+        let shares_base = self
+            .base
+            .as_ref()
+            .is_some_and(|base| Arc::ptr_eq(base, expected_base));
+        self.overlay
+            .as_ref()
+            .map_or((shares_base, 0, 0), |overlay| {
+                (shares_base, overlay.sources.len(), overlay.edges.len())
+            })
     }
 
     /// Reachable set for `start`, memoized for this graph generation.
@@ -480,30 +773,30 @@ impl ReachGraph {
     /// from the same shape (`workspace -> absolute external path`); exposing
     /// the request-local projection lets dirty include-edge replacements
     /// invalidate that bit without reading or mutating the published store.
+    #[cfg(test)]
     pub(crate) fn directly_included_external_paths(&self) -> HashSet<String> {
-        self.edges
-            .iter()
-            .filter(|(source, _)| !Path::new(source.as_str()).is_absolute())
-            .flat_map(|(_, targets)| targets)
-            .filter(|edge| {
-                edge.resolution == ResolutionKind::ExternalExact
-                    && Path::new(edge.target.as_str()).is_absolute()
-            })
-            .map(|edge| edge.target.clone())
-            .collect()
+        let mut paths = self
+            .base
+            .as_deref()
+            .map_or_else(HashSet::new, ReachGraph::directly_included_external_paths);
+        if let Some(overlay) = &self.overlay {
+            for (target, count) in &overlay.direct_external_source_counts {
+                if *count == 0 {
+                    paths.remove(target);
+                } else {
+                    paths.insert(target.clone());
+                }
+            }
+            return paths;
+        }
+        self.direct_external_source_counts.keys().cloned().collect()
     }
 
     /// Workspace-wide projection retained for the legacy completion name-table
     /// overlay. Request-scoped candidate resolution must use
     /// [`ReachGraph::directly_includes_external`] instead.
     pub(crate) fn any_workspace_directly_includes_external(&self, target: &str) -> bool {
-        Path::new(target).is_absolute()
-            && self.edges.iter().any(|(source, targets)| {
-                !Path::new(source.as_str()).is_absolute()
-                    && targets.iter().any(|edge| {
-                        edge.target == target && edge.resolution == ResolutionKind::ExternalExact
-                    })
-            })
+        Path::new(target).is_absolute() && self.direct_external_source_count(target) > 0
     }
 
     /// Test origin-specific first-layer external include evidence. Only a
@@ -511,7 +804,7 @@ impl ReachGraph {
     /// including the same target must not affect this request.
     pub(crate) fn directly_includes_external(&self, source: &str, target: &str) -> bool {
         Path::new(target).is_absolute()
-            && self.edges.get(source).is_some_and(|targets| {
+            && self.edges_for(source).is_some_and(|targets| {
                 targets.iter().any(|edge| {
                     edge.target == target && edge.resolution == ResolutionKind::ExternalExact
                 })
@@ -522,8 +815,7 @@ impl ReachGraph {
     /// completion/coloring counterpart to [`Self::directly_includes_external`]
     /// and deliberately does not project evidence from other workspace files.
     pub(crate) fn directly_included_external_paths_from(&self, source: &str) -> HashSet<String> {
-        self.edges
-            .get(source)
+        self.edges_for(source)
             .into_iter()
             .flatten()
             .take(MAX_REACH_NODES)
@@ -533,7 +825,7 @@ impl ReachGraph {
     }
 
     fn compute(&self, start: &str) -> ReachScope {
-        if let Some(package_key) = self.package_by_file.get(start) {
+        if let Some(package_key) = self.package_for_file(start) {
             return self.compute_package(start, package_key);
         }
         let mut files = HashSet::new();
@@ -547,9 +839,9 @@ impl ReachGraph {
         // First-cause precedence (UnresolvedInclude before AmbiguousInclude)
         // is encoded by the order `ReachGraph::new` writes the `open` map: a
         // node present in both lists is stored under `UnresolvedInclude`.
-        if let Some(cause) = self.open.get(start) {
+        if let Some(cause) = self.open_reason(start) {
             open = true;
-            reason = Some(*cause);
+            reason = Some(cause);
         }
 
         let mark_open = |open: &mut bool, cause: OpenReason, reason: &mut Option<OpenReason>| {
@@ -567,7 +859,7 @@ impl ReachGraph {
                 mark_open(&mut open, OpenReason::DepthLimit, &mut reason);
                 continue;
             }
-            let Some(dsts) = self.edges.get(&node) else {
+            let Some(dsts) = self.edges_for(&node) else {
                 continue;
             };
             for edge in dsts {
@@ -587,8 +879,8 @@ impl ReachGraph {
                     false
                 };
                 if inserted {
-                    if let Some(cause) = self.open.get(&edge.target) {
-                        mark_open(&mut open, *cause, &mut reason);
+                    if let Some(cause) = self.open_reason(&edge.target) {
+                        mark_open(&mut open, cause, &mut reason);
                     }
                     queue.push_back((edge.target.clone(), depth + 1, next_is_heuristic));
                 }
@@ -607,7 +899,7 @@ impl ReachGraph {
         let mut files = HashSet::new();
         let mut heuristic_files = HashSet::new();
         let mut open = false;
-        let mut reason = self.open_packages.get(start_package).copied();
+        let mut reason = self.open_package_reason(start_package);
         open |= reason.is_some();
         let mark_open = |open: &mut bool, cause: OpenReason, reason: &mut Option<OpenReason>| {
             *open = true;
@@ -621,10 +913,13 @@ impl ReachGraph {
         let mut scanned_package_edges = 0usize;
 
         'packages: while let Some((package, depth, path_is_heuristic)) = queue.pop_front() {
-            if let Some(cause) = self.open_packages.get(&package) {
-                mark_open(&mut open, *cause, &mut reason);
+            if let Some(cause) = self.open_package_reason(&package) {
+                mark_open(&mut open, cause, &mut reason);
             }
-            for path in self.files_by_package.get(&package).into_iter().flatten() {
+            let remaining = MAX_REACH_NODES.saturating_sub(files.len() + heuristic_files.len());
+            let (package_files, package_files_truncated) =
+                self.files_for_package_bounded(&package, remaining);
+            for path in package_files.iter() {
                 if files.len() + heuristic_files.len() >= MAX_REACH_NODES {
                     mark_open(&mut open, OpenReason::NodeLimit, &mut reason);
                     break;
@@ -638,11 +933,15 @@ impl ReachGraph {
                     heuristic_files.remove(path);
                 }
             }
+            if package_files_truncated {
+                mark_open(&mut open, OpenReason::NodeLimit, &mut reason);
+                break 'packages;
+            }
             if depth >= MAX_REACH_DEPTH {
                 mark_open(&mut open, OpenReason::DepthLimit, &mut reason);
                 continue;
             }
-            let outgoing = self.package_edges.get(&package);
+            let outgoing = self.package_edges_for(&package);
             if files.len() + heuristic_files.len() >= MAX_REACH_NODES
                 && outgoing.is_some_and(|edges| !edges.is_empty())
             {
@@ -1262,5 +1561,172 @@ mod tests {
         let next_scope = next.reachable("a.c");
         assert!(next_scope.files.contains("new.h"));
         assert!(!next_scope.files.contains("old.h"));
+    }
+
+    #[test]
+    fn request_overlay_shares_large_base_and_stores_only_refreshed_sources() {
+        let old_external = absolute_test_path("old.h");
+        let new_external = absolute_test_path("new.h");
+        let mut edges = (0..8_192)
+            .map(|index| {
+                (
+                    format!("src/source_{index}.c"),
+                    format!("include/header_{index}.h"),
+                    ResolutionKind::WorkspaceExact,
+                )
+            })
+            .collect::<Vec<_>>();
+        edges.push((
+            "main.c".to_string(),
+            old_external.clone(),
+            ResolutionKind::ExternalExact,
+        ));
+        let base = Arc::new(ReachGraph::new_with_kinds(edges, Vec::new(), Vec::new()));
+
+        let overlay = ReachGraph::with_request_overrides(
+            base.clone(),
+            &["main.c".to_string()],
+            vec![(
+                "main.c".to_string(),
+                new_external.clone(),
+                ResolutionKind::ExternalExact,
+            )],
+            Vec::new(),
+            Vec::new(),
+        );
+
+        assert!(Arc::ptr_eq(
+            overlay.base.as_ref().expect("persistent base"),
+            &base
+        ));
+        let overrides = overlay.overlay.as_ref().expect("request overrides");
+        assert_eq!(overrides.sources.len(), 1);
+        assert_eq!(overrides.edges.len(), 1);
+        assert_eq!(overlay.direct_external_source_count(&old_external), 0);
+        assert_eq!(overlay.direct_external_source_count(&new_external), 1);
+
+        let effective = overlay.reachable("main.c");
+        assert!(effective.files.contains(&new_external));
+        assert!(!effective.files.contains(&old_external));
+        let published = base.reachable("main.c");
+        assert!(published.files.contains(&old_external));
+        assert!(!published.files.contains(&new_external));
+    }
+
+    #[test]
+    fn unrelated_c_request_overlay_borrows_large_go_package_membership() {
+        let package_files = (0..(MAX_REACH_NODES + 1_000))
+            .map(|index| GoPackageFileRow {
+                package_key: "large#pkg".into(),
+                path: format!("large/file_{index}.go"),
+            })
+            .collect();
+        let base = Arc::new(ReachGraph::from_rows_with_packages(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            package_files,
+            Vec::new(),
+            Vec::new(),
+        ));
+        let overlay = ReachGraph::with_request_overrides(
+            base,
+            &["unrelated.c".into()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        assert!(matches!(
+            overlay.files_for_package("large#pkg"),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn request_overlay_matches_materialized_source_refresh_oracle() {
+        let base = Arc::new(ReachGraph::new_with_kinds(
+            vec![
+                (
+                    "main.c".into(),
+                    "old.h".into(),
+                    ResolutionKind::WorkspaceExact,
+                ),
+                (
+                    "old.h".into(),
+                    "transitive.h".into(),
+                    ResolutionKind::WorkspaceExact,
+                ),
+                (
+                    "other.c".into(),
+                    "stable.h".into(),
+                    ResolutionKind::WorkspaceExact,
+                ),
+            ],
+            vec!["main.c".into()],
+            Vec::new(),
+        ));
+        let sources = vec!["main.c".to_string(), "old.h".to_string()];
+        let rows = vec![IncludeEdgeRow {
+            source_path: "main.c".into(),
+            target_path: "new.h".into(),
+            resolution: ResolutionKind::WorkspaceExact,
+        }];
+        let expected = base.with_refreshed_sources_from_rows(
+            &sources,
+            rows.clone(),
+            vec![OpenIncludeRow {
+                source_path: "main.c".into(),
+                reason: OpenReason::AmbiguousInclude,
+            }],
+        );
+        let layered = ReachGraph::with_request_overrides(
+            base,
+            &sources,
+            rows.into_iter()
+                .map(|row| (row.source_path, row.target_path, row.resolution))
+                .collect(),
+            vec![("main.c".into(), OpenReason::AmbiguousInclude)],
+            Vec::new(),
+        );
+
+        for source in ["main.c", "old.h", "other.c"] {
+            assert_eq!(layered.reachable(source), expected.reachable(source));
+        }
+    }
+
+    #[test]
+    fn request_overlay_direct_external_count_keeps_other_source_evidence() {
+        let external = absolute_test_path("shared.h");
+        let base = Arc::new(ReachGraph::new_with_kinds(
+            vec![
+                (
+                    "first.c".into(),
+                    external.clone(),
+                    ResolutionKind::ExternalExact,
+                ),
+                (
+                    "second.c".into(),
+                    external.clone(),
+                    ResolutionKind::ExternalExact,
+                ),
+            ],
+            Vec::new(),
+            Vec::new(),
+        ));
+        let layered = ReachGraph::with_request_overrides(
+            base,
+            &["first.c".into()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        assert_eq!(layered.direct_external_source_count(&external), 1);
+        assert!(!layered
+            .direct_external_presence_overrides()
+            .contains_key(&external));
+        assert!(!layered.directly_includes_external("first.c", &external));
+        assert!(layered.directly_includes_external("second.c", &external));
     }
 }

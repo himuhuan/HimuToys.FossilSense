@@ -93,6 +93,16 @@ pub enum IncludeResolution {
     Unresolved,
 }
 
+/// Bounded suffix lookup result used by request-local persistent path views.
+/// `truncated` means the callback could not prove uniqueness, even when the
+/// retained prefix contains zero or one matching path.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SuffixCandidateLookup {
+    pub(crate) candidates: Vec<String>,
+    pub(crate) inspected: usize,
+    pub(crate) truncated: bool,
+}
+
 /// Resolve one raw `#include` target text (e.g. `<sys/types.h>`, `"util.h"`)
 /// against the indexed corpus using a form-driven, priority-ordered search.
 ///
@@ -126,6 +136,43 @@ pub fn resolve_include(
     all_paths: &HashSet<String>,
     by_basename: &HashMap<String, Vec<String>>,
 ) -> IncludeResolution {
+    resolve_include_with_lookup(
+        target_text,
+        src_dir,
+        roots_slash,
+        |candidate| all_paths.contains(candidate),
+        |last, suffix| {
+            let posting = by_basename.get(last);
+            let candidates = posting
+                .into_iter()
+                .flatten()
+                .filter(|candidate| candidate.as_str() == suffix.0 || candidate.ends_with(suffix.1))
+                .cloned()
+                .collect();
+            SuffixCandidateLookup {
+                candidates,
+                inspected: posting.map_or(0, Vec::len),
+                truncated: false,
+            }
+        },
+    )
+}
+
+/// Resolve against a persistent path view without materializing its workspace
+/// paths into request-local hash maps. The suffix callback receives the exact
+/// relative spelling and its slash-prefixed suffix so an indexed view can
+/// return only matching workspace candidates.
+pub(crate) fn resolve_include_with_lookup<Contains, SuffixCandidates>(
+    target_text: &str,
+    src_dir: &str,
+    roots_slash: &[String],
+    contains: Contains,
+    suffix_candidates: SuffixCandidates,
+) -> IncludeResolution
+where
+    Contains: Fn(&str) -> bool,
+    SuffixCandidates: Fn(&str, (&str, &str)) -> SuffixCandidateLookup,
+{
     let Some((form, rel)) = normalize_include_target(target_text) else {
         // Macro-constructed or malformed include text: cannot be matched
         // best-effort, so it counts as unresolved.
@@ -136,7 +183,7 @@ pub fn resolve_include(
     let external_exact = || -> Option<String> {
         for root in roots_slash {
             let candidate = format!("{}/{}", root.trim_end_matches('/'), rel);
-            if all_paths.contains(&candidate) {
+            if contains(&candidate) {
                 return Some(candidate);
             }
         }
@@ -148,7 +195,7 @@ pub fn resolve_include(
             return None;
         }
         let candidate = format!("{src_dir}/{rel}");
-        if all_paths.contains(&candidate) {
+        if contains(&candidate) {
             Some(candidate)
         } else {
             None
@@ -159,7 +206,7 @@ pub fn resolve_include(
     // indexed file (workspace or external) here because the indexer feeds all
     // paths through — external exactitudes still round-trip cleanly.
     let workspace_exact = || -> Option<String> {
-        if all_paths.contains(&rel) {
+        if contains(&rel) {
             Some(rel.clone())
         } else {
             None
@@ -210,15 +257,17 @@ pub fn resolve_include(
     // short-circuits on a single hit.
     let last = rel.rsplit('/').next().unwrap_or(&rel).to_string();
     let suffix = format!("/{rel}");
-    let mut candidates: Vec<String> = by_basename
-        .get(&last)
-        .into_iter()
-        .flatten()
-        .filter(|candidate| candidate == &&rel || candidate.ends_with(&suffix))
-        .cloned()
-        .collect();
+    let lookup = suffix_candidates(&last, (&rel, &suffix));
+    let mut candidates = lookup.candidates;
     candidates.sort();
     candidates.dedup();
+    if lookup.truncated {
+        return if candidates.is_empty() {
+            IncludeResolution::Unresolved
+        } else {
+            IncludeResolution::Ambiguous { dsts: candidates }
+        };
+    }
     match candidates.len() {
         0 => IncludeResolution::Unresolved,
         1 => IncludeResolution::Edge {

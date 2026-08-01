@@ -549,6 +549,7 @@ impl LanguageServer for Backend {
         let mut table_semantic_generations = Vec::new();
         let mut table_generations = Vec::new();
         let mut table_recall_universes = Vec::new();
+        let mut completion_overlay_guards = Vec::new();
         let mut effective_completion_scope = None;
         for context in &contexts {
             if completion_request.stop_before_worker() {
@@ -641,6 +642,7 @@ impl LanguageServer for Backend {
                     .engine
                     .fallback_completion_table
                     .with_updated_family_paths(overlay.shadowed_paths(), overlay_fallbacks);
+                completion_overlay_guards.push(overlay.clone());
                 table_generations.push((context.engine.root.clone(), context.engine.epoch));
                 table_recall_universes.push(recall_universe);
                 table_roots.push(context.engine.root.clone());
@@ -690,11 +692,21 @@ impl LanguageServer for Backend {
             active_project_context.as_ref(),
             &table_recall_universes,
         );
-        let memo_lookup = self
-            .session
-            .cache
-            .completion_memo_pools(&uri, completion_generation, &prefix, tables.len())
-            .await;
+        let completion_memo_cacheable = completion_overlay_guards
+            .iter()
+            .all(|overlay| overlay.path_view_cacheable());
+        let memo_lookup = if completion_memo_cacheable {
+            self.session
+                .cache
+                .completion_memo_pools(&uri, completion_generation, &prefix, tables.len())
+                .await
+        } else {
+            self.session.cache.clear_completion_memo(&uri).await;
+            super::workspace::CompletionMemoLookup {
+                prior_pools: vec![None; tables.len()],
+                hit_kind: "cold",
+            }
+        };
         let prior_pools = memo_lookup.prior_pools;
         let hit_kind = memo_lookup.hit_kind;
         let memo_prefix = prefix.clone();
@@ -809,16 +821,23 @@ impl LanguageServer for Backend {
                 })
                 .await;
                 // Record this prefix's pools for the next (extending) keystroke.
+                let memo_cacheable_at_commit = completion_memo_cacheable
+                    && completion_overlay_guards
+                        .iter()
+                        .all(|overlay| overlay.path_view_cacheable());
                 let memo_committed = self
                     .session
                     .cache
                     .record_completion_memo_if_current(
                         &completion_request,
                         uri,
-                        memo_prefix,
-                        completion_generation,
-                        output.new_pools,
-                        output.new_pool_complete,
+                        state::CompletionMemo {
+                            prefix: memo_prefix,
+                            generation: completion_generation,
+                            pools: output.new_pools,
+                            pool_complete: output.new_pool_complete,
+                        },
+                        memo_cacheable_at_commit,
                     )
                     .await;
                 // No await may follow this check: it is the response

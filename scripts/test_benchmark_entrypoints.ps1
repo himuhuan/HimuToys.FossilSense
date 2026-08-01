@@ -102,6 +102,7 @@ if (-not (Test-Path -LiteralPath $completionHarness -PathType Leaf)) {
 $completionHarnessSource = Get-Content -Raw -LiteralPath $completionHarness
 if ($completionHarnessSource -notmatch 'cargo test' -or
     $completionHarnessSource -notmatch 'benchmark_uboot_lsp_completion_replay_stays_within_latency_and_sql_gates' -or
+    $completionHarnessSource -notmatch 'completion_lsp_replay_forced_include_miss_requests' -or
     $completionHarnessSource -notmatch 'FOSSILSENSE_BENCH_DB' -or
     $completionHarnessSource -notmatch 'FOSSILSENSE_BENCH_ROOT') {
     throw 'The completion replay harness does not execute the release U-Boot LSP gate.'

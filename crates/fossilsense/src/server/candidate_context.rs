@@ -216,16 +216,19 @@ impl Backend {
                     })
                 })
         });
+        let owned_include_path_index = published.as_ref().and_then(|snapshot| {
+            (snapshot.epoch == engine_epoch
+                && snapshot.semantic_generation == generation
+                && owned_indexed_files.is_some())
+            .then(|| snapshot.include_path_index.clone())
+            .flatten()
+        });
 
         let built = tokio::task::spawn_blocking(move || {
             let mut overlay = CandidateOverlaySnapshot::new(epoch, files);
             overlay.refresh_reach_graph(
-                owned_reach_graph.as_deref(),
-                owned_indexed_files
-                    .as_deref()
-                    .into_iter()
-                    .flatten()
-                    .map(|(path, _)| path.as_str()),
+                owned_reach_graph,
+                owned_include_path_index,
                 &include_roots,
             );
             Arc::new(overlay)
@@ -349,6 +352,11 @@ impl Backend {
                     })
                 })
         });
+        let owned_include_path_index = published.as_ref().and_then(|snapshot| {
+            (snapshot.semantic_generation == generation && owned_indexed_files.is_some())
+                .then(|| snapshot.include_path_index.clone())
+                .flatten()
+        });
 
         let external_roots = workspace_semantics.external_roots.clone();
         let language_resolver = workspace_semantics.language.clone();
@@ -471,12 +479,8 @@ impl Backend {
                 .collect();
             let mut overlay = CandidateOverlaySnapshot::new(epoch, files);
             overlay.refresh_reach_graph(
-                owned_reach_graph.as_deref(),
-                owned_indexed_files
-                    .as_deref()
-                    .into_iter()
-                    .flatten()
-                    .map(|(path, _)| path.as_str()),
+                owned_reach_graph,
+                owned_include_path_index,
                 &include_roots,
             );
             Arc::new(overlay)

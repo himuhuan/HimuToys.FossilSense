@@ -10,6 +10,8 @@ use super::completion_runtime::CompletionRequest;
 use super::state;
 use super::LocalWordCache;
 use crate::call_model::SemanticGeneration;
+#[cfg(test)]
+use crate::candidate_service::IncludePathIndex;
 use crate::candidate_service::{CandidateOverlaySnapshot, RecallUniverseId};
 use crate::completion_words;
 use crate::config::SourceLanguage;
@@ -714,6 +716,7 @@ impl CacheLedger {
                 semantic_generation,
                 overlay_epoch,
             })
+            .filter(|snapshot| snapshot.path_view_cacheable())
             .cloned();
         (cached, revision)
     }
@@ -734,7 +737,7 @@ impl CacheLedger {
             semantic_generation,
         };
         let cached = overlays.completion_entries.get_mut(&key).and_then(|entry| {
-            (entry.universe == universe).then(|| {
+            (entry.universe == universe && entry.snapshot.path_view_cacheable()).then(|| {
                 // The stable projection can outlive the epoch that built it.
                 // Request cancellation and completion-resolve validation keep
                 // using the caller's exact document epoch outside this cache.
@@ -742,6 +745,14 @@ impl CacheLedger {
                 entry.snapshot.clone()
             })
         });
+        #[cfg(test)]
+        if cached.is_some() {
+            self.completion_overlay_cache_hits
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.completion_overlay_cache_misses
+                .fetch_add(1, Ordering::Relaxed);
+        }
         (cached, revision)
     }
 
@@ -768,7 +779,7 @@ impl CacheLedger {
             return snapshot;
         }
         if let Some(existing) = cache.completion_entries.get_mut(&key) {
-            if existing.universe == universe {
+            if existing.universe == universe && existing.snapshot.path_view_cacheable() {
                 existing.newest_overlay_epoch = existing.newest_overlay_epoch.max(overlay_epoch);
                 return existing.snapshot.clone();
             }
@@ -807,7 +818,11 @@ impl CacheLedger {
         if cache.root_revisions.get(&root).copied().unwrap_or(0) != expected_cache_revision {
             return overlay;
         }
-        if let Some(existing) = cache.entries.get(&key) {
+        if let Some(existing) = cache
+            .entries
+            .get(&key)
+            .filter(|existing| existing.path_view_cacheable())
+        {
             return existing.clone();
         }
         let newest_epoch = cache
@@ -832,6 +847,22 @@ impl CacheLedger {
     #[cfg(test)]
     pub(super) async fn candidate_overlay_cache_len_for_test(&self) -> usize {
         self.candidate_overlays.lock().await.entries.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn reset_completion_overlay_cache_metrics_for_test(&self) {
+        self.completion_overlay_cache_hits
+            .store(0, Ordering::Release);
+        self.completion_overlay_cache_misses
+            .store(0, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(super) fn completion_overlay_cache_metrics_for_test(&self) -> (u64, u64) {
+        (
+            self.completion_overlay_cache_hits.load(Ordering::Acquire),
+            self.completion_overlay_cache_misses.load(Ordering::Acquire),
+        )
     }
 
     pub(super) async fn request_context(
@@ -907,24 +938,18 @@ impl CacheLedger {
         &self,
         request: &CompletionRequest,
         uri: Url,
-        prefix: String,
-        generation: u64,
-        pools: Vec<Vec<usize>>,
-        pool_complete: Vec<bool>,
+        entry: state::CompletionMemo,
+        cacheable: bool,
     ) -> bool {
-        debug_assert_eq!(pools.len(), pool_complete.len());
+        debug_assert_eq!(entry.pools.len(), entry.pool_complete.len());
         let mut memo = self.completion_memo.lock().await;
         request
             .run_if_current(|| {
-                memo.insert(
-                    uri,
-                    state::CompletionMemo {
-                        prefix,
-                        generation,
-                        pools,
-                        pool_complete,
-                    },
-                );
+                if cacheable {
+                    memo.insert(uri, entry);
+                } else {
+                    memo.remove(&uri);
+                }
             })
             .is_some()
     }
@@ -995,6 +1020,7 @@ impl CacheLedger {
             include_table: current.include_table.clone(),
             go_import_table: current.go_import_table.clone(),
             indexed_files: current.indexed_files.clone(),
+            include_path_index: current.include_path_index.clone(),
             project_context: current.project_context.clone(),
             call_read_handle: current.call_read_handle.clone(),
             workspace_semantics: current.workspace_semantics.clone(),
@@ -1009,6 +1035,12 @@ impl CacheLedger {
         root: PathBuf,
         files: Arc<Vec<(String, PathBuf)>>,
     ) {
+        let include_path_index = Arc::new(IncludePathIndex::build(
+            files
+                .iter()
+                .map(|(path, _)| (path.clone(), true))
+                .collect::<Vec<_>>(),
+        ));
         let current = self
             .current_engine_snapshot(&root)
             .await
@@ -1024,6 +1056,7 @@ impl CacheLedger {
             include_table: current.include_table.clone(),
             go_import_table: current.go_import_table.clone(),
             indexed_files: Some(files),
+            include_path_index: Some(include_path_index),
             project_context: current.project_context.clone(),
             call_read_handle: current.call_read_handle.clone(),
             workspace_semantics: current.workspace_semantics.clone(),
@@ -1049,6 +1082,7 @@ impl CacheLedger {
             include_table: current.include_table.clone(),
             go_import_table: current.go_import_table.clone(),
             indexed_files: current.indexed_files.clone(),
+            include_path_index: current.include_path_index.clone(),
             project_context: current.project_context.clone(),
             call_read_handle: current.call_read_handle.clone(),
             workspace_semantics: current.workspace_semantics.clone(),

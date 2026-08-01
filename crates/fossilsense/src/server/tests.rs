@@ -755,6 +755,7 @@ async fn workspace_folder_removal_drops_root_and_published_snapshot() {
             include_table: None,
             go_import_table: None,
             indexed_files: None,
+            include_path_index: None,
             project_context: None,
             call_read_handle: None,
             workspace_semantics: empty_workspace_semantics(&root),
@@ -837,6 +838,7 @@ async fn name_index_compaction_publishes_only_for_the_expected_engine_epoch() {
             include_table: None,
             go_import_table: None,
             indexed_files: None,
+            include_path_index: None,
             project_context: None,
             call_read_handle: None,
             workspace_semantics: empty_workspace_semantics(&root),
@@ -1098,8 +1100,11 @@ async fn benchmark_uboot_lsp_completion_replay_stays_within_latency_and_sql_gate
 
     let uri = Url::from_file_path(root.join(".fossilsense-completion-replay.c"))
         .expect("benchmark document URI");
-    let (initial_text, line, character) =
-        text_and_position("void completion_replay(void) { i/*cursor*/; }\n");
+    const REPLAY_SELF_INCLUDE: &str = ".fossilsense-completion-replay.c";
+    const REPLAY_MISSING_INCLUDE: &str = ".fossilsense-completion-replay-missing.h";
+    let (initial_text, line, character) = text_and_position(&format!(
+        "#include \"{REPLAY_SELF_INCLUDE}\"\nvoid completion_replay(void) {{ i/*cursor*/; }}\n"
+    ));
     open_test_document(&service, uri.clone(), 1, initial_text).await;
     let sql_reads_before = declaration_index.payload_cache_stats().sql_reads;
     let prefixes = ["i", "in", "init", "d", "de", "dev", "c", "cmd"];
@@ -1107,10 +1112,25 @@ async fn benchmark_uboot_lsp_completion_replay_stays_within_latency_and_sql_gate
     let mut version = 1;
 
     for pass in 0..10 {
-        for prefix in prefixes {
+        for (prefix_index, prefix) in prefixes.iter().copied().enumerate() {
+            if pass == 2 && prefix_index == 0 {
+                service
+                    .inner()
+                    .session
+                    .cache
+                    .reset_completion_overlay_cache_metrics_for_test();
+            }
             version += 1;
+            // Alternate the include projection on every request. This forces a
+            // stable-universe cache miss at U-Boot scale while retaining the
+            // ordinary completion handler, render and bounded-recall gates.
+            let include_target = if (pass * prefixes.len() + prefix_index).is_multiple_of(2) {
+                REPLAY_SELF_INCLUDE
+            } else {
+                REPLAY_MISSING_INCLUDE
+            };
             let (text, current_line, current_character) = text_and_position(&format!(
-                "void completion_replay(void) {{ {prefix}/*cursor*/; }}\n"
+                "#include \"{include_target}\"\nvoid completion_replay(void) {{ {prefix}/*cursor*/; }}\n"
             ));
             assert_eq!(
                 (current_line, current_character),
@@ -1264,6 +1284,11 @@ async fn benchmark_uboot_lsp_completion_replay_stays_within_latency_and_sql_gate
         .max()
         .unwrap_or_default();
     let sql_reads_after = declaration_index.payload_cache_stats().sql_reads;
+    let (overlay_cache_hits, overlay_cache_misses) = service
+        .inner()
+        .session
+        .cache
+        .completion_overlay_cache_metrics_for_test();
     const P95_LIMIT_US: u128 = 50_000;
 
     println!(
@@ -1271,6 +1296,10 @@ async fn benchmark_uboot_lsp_completion_replay_stays_within_latency_and_sql_gate
         declaration_index.len()
     );
     println!("completion_lsp_replay_requests: {}", samples.len());
+    println!(
+        "completion_lsp_replay_forced_include_miss_requests: {}",
+        overlay_cache_misses
+    );
     println!("completion_lsp_replay_p50_us: {p50}");
     println!("completion_lsp_replay_p95_us: {p95}");
     println!("completion_lsp_replay_max_us: {max}");
@@ -1307,6 +1336,15 @@ async fn benchmark_uboot_lsp_completion_replay_stays_within_latency_and_sql_gate
     assert_eq!(
         sql_reads_after, sql_reads_before,
         "ordinary completion lists must not hydrate declaration payloads"
+    );
+    assert_eq!(
+        overlay_cache_hits, 0,
+        "alternating include universes must not hit the completion overlay cache"
+    );
+    assert_eq!(
+        overlay_cache_misses,
+        samples.len() as u64,
+        "the replay must measure one real overlay miss per sampled request"
     );
     assert!(
         entries_inspected_max <= crate::query::COMPLETION_RECALL_CANDIDATE_BUDGET,
@@ -4704,6 +4742,7 @@ async fn project_context_commands_validate_selection_and_outside_uri_has_no_auto
             include_table: current.include_table.clone(),
             go_import_table: current.go_import_table.clone(),
             indexed_files: current.indexed_files.clone(),
+            include_path_index: current.include_path_index.clone(),
             project_context: None,
             call_read_handle: None,
             workspace_semantics: current.workspace_semantics.clone(),
@@ -5347,6 +5386,105 @@ async fn completion_overlay_reuses_recall_universe_across_current_body_edits() {
 }
 
 #[tokio::test]
+async fn completion_include_miss_reuses_generation_pinned_path_and_graph_bases() {
+    let service = test_backend_service();
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().to_path_buf();
+    let uri = Url::from_file_path(root.join("src/main.c")).expect("main uri");
+    service
+        .inner()
+        .workspace_roots
+        .lock()
+        .await
+        .push(root.clone());
+
+    let mut indexed_files = (0..8_192)
+        .map(|index| {
+            let path = format!("include/noise_{index}.h");
+            let absolute = root.join(path.replace('/', std::path::MAIN_SEPARATOR_STR));
+            (path, absolute)
+        })
+        .collect::<Vec<_>>();
+    indexed_files.push(("include/api.h".to_string(), root.join("include/api.h")));
+    indexed_files.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    service
+        .inner()
+        .session
+        .cache
+        .set_indexed_file_list_for_test(root.clone(), Arc::new(indexed_files))
+        .await;
+    let published_graph = Arc::new(crate::reachability::ReachGraph::new(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    ));
+    service
+        .inner()
+        .session
+        .cache
+        .set_reach_graph_for_test(root.clone(), published_graph.clone())
+        .await;
+    let engine = service
+        .inner()
+        .session
+        .cache
+        .current_engine_snapshot(&root)
+        .await
+        .expect("published engine");
+
+    open_test_document(
+        &service,
+        uri.clone(),
+        1,
+        "#include \"include/api.h\"\nvoid use(void) {}\n".into(),
+    )
+    .await;
+    let documents = service
+        .inner()
+        .session
+        .documents
+        .capture_request_snapshot(Some(&uri))
+        .await;
+    let (overlay, _) = service
+        .inner()
+        .completion_overlay_snapshot_from_documents(
+            super::candidate_context::CompletionOverlayRequest {
+                root: &root,
+                current_uri: &uri,
+                engine_epoch: engine.epoch,
+                generation: engine.semantic_generation,
+                base_reach_graph: engine.reach_graph.as_deref(),
+                indexed_workspace_files: engine.indexed_files.as_deref().map(Vec::as_slice),
+                workspace_semantics: engine.workspace_semantics.clone(),
+            },
+            documents,
+        )
+        .await;
+
+    let published_paths = engine
+        .include_path_index
+        .as_ref()
+        .expect("published include paths");
+    assert_eq!(
+        overlay.include_path_view_shape_for_test(published_paths),
+        (true, 1),
+        "the cache miss must retain the published path Arc and own only src/main.c"
+    );
+    let effective_graph = overlay
+        .effective_reach_graph(None)
+        .expect("effective graph");
+    assert_eq!(
+        effective_graph.request_overlay_shape_for_test(&published_graph),
+        (true, 1, 1),
+        "the request graph must retain the published Arc and replace one source"
+    );
+    assert!(effective_graph
+        .reachable("src/main.c")
+        .files
+        .contains("include/api.h"));
+}
+
+#[tokio::test]
 async fn completion_overlay_invalidates_when_another_dirty_declaration_changes() {
     let service = test_backend_service();
     let dir = tempdir().expect("tempdir");
@@ -5486,6 +5624,7 @@ async fn completion_overlay_cache_rejects_late_old_universe_and_engine_publicati
             include_table: None,
             go_import_table: None,
             indexed_files: None,
+            include_path_index: None,
             project_context: None,
             call_read_handle: None,
             workspace_semantics: empty_workspace_semantics(&root),
@@ -5522,6 +5661,117 @@ async fn completion_overlay_cache_rejects_late_old_universe_and_engine_publicati
             .is_none(),
         "a builder captured before engine publication must not repopulate the old engine key"
     );
+}
+
+#[tokio::test]
+async fn overlay_caches_reject_snapshots_with_pending_external_path_probes() {
+    let external = tempdir().expect("external include root");
+    std::fs::write(external.path().join("api.h"), "int external_api(void);\n")
+        .expect("external header");
+    let parsed = crate::parser::parse_with_handle(
+        std::path::Path::new("main.c"),
+        "#include <api.h>\nint main(void) { return 0; }\n",
+        None,
+        crate::parser::ParseFacts::HOVER_SEMANTICS,
+    );
+    let mut pending = crate::candidate_service::CandidateOverlaySnapshot::new(
+        1,
+        vec![crate::candidate_service::FileCandidateOverlay::from_index(
+            "main.c".into(),
+            &parsed,
+        )],
+    );
+    pending.refresh_reach_graph(
+        Some(Arc::new(crate::reachability::ReachGraph::new(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ))),
+        Some(Arc::new(crate::candidate_service::IncludePathIndex::build(
+            [("main.c".to_string(), true)],
+        ))),
+        &[crate::pathing::normalize_abs_path(external.path())],
+    );
+    assert!(
+        !pending.path_view_cacheable(),
+        "the first request must not wait for the filesystem probe"
+    );
+    let pending = Arc::new(pending);
+
+    let cache = super::CacheLedger::default();
+    let root = tempdir().expect("workspace root").path().to_path_buf();
+    let engine_epoch = super::state::EngineEpoch::published(1);
+    let generation = crate::call_model::SemanticGeneration(1);
+    let universe = crate::candidate_service::RecallUniverseId::for_test(9);
+    let (_, completion_revision) = cache
+        .completion_overlay(&root, engine_epoch, generation, 1, universe)
+        .await;
+    cache
+        .publish_completion_overlay(super::workspace::CompletionOverlayPublication {
+            root: root.clone(),
+            engine_epoch,
+            semantic_generation: generation,
+            overlay_epoch: 1,
+            universe,
+            expected_cache_revision: completion_revision,
+            snapshot: pending.clone(),
+        })
+        .await;
+    assert!(
+        cache
+            .completion_overlay(&root, engine_epoch, generation, 1, universe)
+            .await
+            .0
+            .is_none(),
+        "completion cache must rebuild after a pending background probe"
+    );
+
+    let (_, candidate_revision) = cache.candidate_overlay(&root, generation, 1).await;
+    cache
+        .publish_candidate_overlay(root.clone(), generation, 1, candidate_revision, pending)
+        .await;
+    assert!(
+        cache
+            .candidate_overlay(&root, generation, 1)
+            .await
+            .0
+            .is_none(),
+        "semantic candidate cache must rebuild after a pending background probe"
+    );
+}
+
+#[tokio::test]
+async fn completion_overlay_cache_metrics_measure_real_hits_and_misses() {
+    let cache = super::CacheLedger::default();
+    let root = tempdir().expect("workspace root").path().to_path_buf();
+    let engine_epoch = super::state::EngineEpoch::published(1);
+    let generation = crate::call_model::SemanticGeneration(1);
+    let universe = crate::candidate_service::RecallUniverseId::for_test(11);
+    cache.reset_completion_overlay_cache_metrics_for_test();
+
+    let (_, revision) = cache
+        .completion_overlay(&root, engine_epoch, generation, 1, universe)
+        .await;
+    cache
+        .publish_completion_overlay(super::workspace::CompletionOverlayPublication {
+            root: root.clone(),
+            engine_epoch,
+            semantic_generation: generation,
+            overlay_epoch: 1,
+            universe,
+            expected_cache_revision: revision,
+            snapshot: Arc::new(crate::candidate_service::CandidateOverlaySnapshot::new(
+                1,
+                Vec::new(),
+            )),
+        })
+        .await;
+    assert!(cache
+        .completion_overlay(&root, engine_epoch, generation, 2, universe)
+        .await
+        .0
+        .is_some());
+    assert_eq!(cache.completion_overlay_cache_metrics_for_test(), (1, 1));
 }
 
 #[tokio::test]
@@ -5798,6 +6048,7 @@ async fn did_close_prevents_a_late_external_authorization_cache_write() {
             include_table: None,
             go_import_table: None,
             indexed_files: None,
+            include_path_index: None,
             project_context: None,
             call_read_handle: None,
             workspace_semantics: semantics.clone(),
@@ -6601,6 +6852,7 @@ async fn candidate_overlay_does_not_adopt_a_new_graph_after_request_publication(
             include_table: None,
             go_import_table: None,
             indexed_files: None,
+            include_path_index: None,
             project_context: None,
             call_read_handle: None,
             workspace_semantics: empty_workspace_semantics(&root),
@@ -6633,6 +6885,7 @@ async fn candidate_overlay_does_not_adopt_a_new_graph_after_request_publication(
             include_table: None,
             go_import_table: None,
             indexed_files: None,
+            include_path_index: None,
             project_context: None,
             call_read_handle: None,
             workspace_semantics: old.workspace_semantics.clone(),
@@ -6672,6 +6925,7 @@ async fn candidate_overlay_cache_rejects_a_late_build_after_publication() {
             include_table: None,
             go_import_table: None,
             indexed_files: None,
+            include_path_index: None,
             project_context: None,
             call_read_handle: None,
             workspace_semantics: empty_workspace_semantics(&root),
@@ -6722,6 +6976,7 @@ async fn indexed_completion_resolve_rejects_cross_generation_context_before_over
             include_table: None,
             go_import_table: None,
             indexed_files: None,
+            include_path_index: None,
             project_context: None,
             call_read_handle: None,
             workspace_semantics: empty_workspace_semantics(&root),
@@ -6806,6 +7061,7 @@ async fn reach_scope_uses_captured_request_context_graph() {
             include_table: None,
             go_import_table: None,
             indexed_files: None,
+            include_path_index: None,
             project_context: None,
             call_read_handle: None,
             workspace_semantics: empty_workspace_semantics(&root),
@@ -7095,6 +7351,7 @@ async fn member_completion_resolve_allows_go_module_owner_and_rejects_sibling() 
             include_table: None,
             go_import_table: None,
             indexed_files: None,
+            include_path_index: None,
             project_context: None,
             call_read_handle: None,
             workspace_semantics,
@@ -7230,6 +7487,7 @@ async fn member_completion_resolve_uses_alias_identity_language_override() {
             include_table: None,
             go_import_table: None,
             indexed_files: None,
+            include_path_index: None,
             project_context: None,
             call_read_handle: None,
             workspace_semantics,
@@ -8813,10 +9071,13 @@ async fn cancelled_request_cannot_repopulate_a_memo_after_waiting_for_its_lock()
             .record_completion_memo_if_current(
                 &request,
                 waiting_uri,
-                "tar".to_string(),
-                7,
-                vec![vec![1, 2, 3]],
-                vec![true],
+                super::state::CompletionMemo {
+                    prefix: "tar".to_string(),
+                    generation: 7,
+                    pools: vec![vec![1, 2, 3]],
+                    pool_complete: vec![true],
+                },
+                true,
             )
             .await;
         let publishable = request.finish();
@@ -8839,6 +9100,37 @@ async fn cancelled_request_cannot_repopulate_a_memo_after_waiting_for_its_lock()
         "didChange/didClose must not be followed by stale memo resurrection"
     );
     assert!(latest.finish());
+}
+
+#[tokio::test]
+async fn probe_dependent_completion_clears_prior_narrowing_memo() {
+    let runtime = super::completion_runtime::CompletionRuntime::with_permits_for_test(1);
+    let cache = super::CacheLedger::default();
+    let uri = Url::parse("file:///workspace/target.c").expect("target uri");
+    cache
+        .record_completion_memo(uri.clone(), "ta".into(), 6, vec![vec![1, 2]])
+        .await;
+    let request = runtime.begin(uri.clone());
+
+    let committed = cache
+        .record_completion_memo_if_current(
+            &request,
+            uri.clone(),
+            super::state::CompletionMemo {
+                prefix: "tar".into(),
+                generation: 7,
+                pools: vec![vec![1, 2, 3]],
+                pool_complete: vec![true],
+            },
+            false,
+        )
+        .await;
+
+    assert!(committed, "the request is still current");
+    assert!(
+        cache.completion_memo_for_test(&uri).await.is_none(),
+        "a probe-dependent ranking must not be reused after its path epoch changes"
+    );
 }
 
 #[test]

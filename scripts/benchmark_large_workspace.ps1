@@ -127,6 +127,7 @@ function Convert-WhitelistedMetrics([string[]]$Lines) {
         reach_graph_ms = $true
         completion_lsp_replay_declarations = $true
         completion_lsp_replay_requests = $true
+        completion_lsp_replay_forced_include_miss_requests = $true
         completion_lsp_replay_p50_us = $true
         completion_lsp_replay_p95_us = $true
         completion_lsp_replay_max_us = $true
@@ -629,15 +630,16 @@ if ($completionReplayResults.Count -gt 0) {
     $markdown.Add('')
     $markdown.Add('## Production LSP completion replay gate')
     $markdown.Add('')
-    $markdown.Add('The ignored release test hydrates a complete U-Boot engine snapshot, applies dirty-buffer edits, and calls the production `LanguageServer::completion` entry point. P95 must remain at or below 50 ms; recall must stay within 16,384 inspected entries and perform zero declaration-payload SQL reads.')
+    $markdown.Add('The ignored release test hydrates a complete U-Boot engine snapshot, alternates dirty `#include` projections so every sampled request misses the completion overlay universe cache, and calls the production `LanguageServer::completion` entry point. P95 must remain at or below 50 ms; recall must stay within 16,384 inspected entries and perform zero declaration-payload SQL reads.')
     $markdown.Add('')
-    $markdown.Add('| Run | Declarations | Requests | P50 us | P95 us | Max us | Limit us | Context p95 ms | Overlay p95 ms | Worker p95 ms | Indexed min | Active min | Budget min/max | Truncated | Inspected min/max | Source probes/attempts/init max | Fuzzy name/decl probes max | SQL reads |')
-    $markdown.Add('|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|')
+    $markdown.Add('| Run | Declarations | Requests | Forced include misses | P50 us | P95 us | Max us | Limit us | Context p95 ms | Overlay p95 ms | Worker p95 ms | Indexed min | Active min | Budget min/max | Truncated | Inspected min/max | Source probes/attempts/init max | Fuzzy name/decl probes max | SQL reads |')
+    $markdown.Add('|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|')
     foreach ($result in $completionReplayResults) {
         $metrics = $result.metrics
         $markdown.Add(
             "| $($result.run) | $($metrics.completion_lsp_replay_declarations) | " +
             "$($metrics.completion_lsp_replay_requests) | " +
+            "$($metrics.completion_lsp_replay_forced_include_miss_requests) | " +
             "$($metrics.completion_lsp_replay_p50_us) | " +
             "$($metrics.completion_lsp_replay_p95_us) | " +
             "$($metrics.completion_lsp_replay_max_us) | " +

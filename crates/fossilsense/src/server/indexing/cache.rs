@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use tower_lsp::lsp_types::MessageType;
 use tower_lsp::Client;
 
+use crate::candidate_service::IncludePathIndex;
 use crate::pathing;
 use crate::progress::DegradedCapabilities;
 use crate::reachability::ReachGraph;
@@ -207,6 +208,27 @@ fn build_indexed_file_list_from_db(db_path: &Path, root: &Path) -> Result<Vec<(S
         .collect())
 }
 
+async fn rebuild_include_path_index(root: PathBuf) -> Result<Arc<IncludePathIndex>> {
+    let built = tokio::task::spawn_blocking(move || -> Result<IncludePathIndex> {
+        let db_path = pathing::default_index_path(&root)?;
+        build_include_path_index_from_db(&db_path)
+    })
+    .await;
+
+    match built {
+        Ok(Ok(index)) => Ok(Arc::new(index)),
+        Ok(Err(err)) => Err(err),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn build_include_path_index_from_db(db_path: &Path) -> Result<IncludePathIndex> {
+    let store = IndexStore::open_readonly(db_path)?;
+    Ok(IncludePathIndex::build(
+        store.include_table_view().include_resolution_paths()?,
+    ))
+}
+
 async fn update_indexed_file_list(
     previous: Option<Arc<Vec<(String, PathBuf)>>>,
     root: PathBuf,
@@ -279,6 +301,7 @@ impl CacheLedger {
             let reach_graph = Arc::new(build_reach_graph_from_db(&db_path)?);
             let include_table = Arc::new(build_include_table_from_db(&db_path)?);
             let indexed_files = Arc::new(build_indexed_file_list_from_db(&db_path, &build_root)?);
+            let include_path_index = Arc::new(build_include_path_index_from_db(&db_path)?);
             let call_read_handle = Arc::new(crate::call_service::CallReadHandle::at_generation(
                 db_path,
                 semantic_generation,
@@ -302,6 +325,7 @@ impl CacheLedger {
                 include_table: Some(include_table),
                 go_import_table: Some(go_import_table),
                 indexed_files: Some(indexed_files),
+                include_path_index: Some(include_path_index),
                 project_context: Some(project_context),
                 call_read_handle: Some(call_read_handle),
                 workspace_semantics,
@@ -417,6 +441,18 @@ impl CacheLedger {
                 None
             }
         };
+        let include_path_index = match rebuild_include_path_index(root.clone()).await {
+            Ok(index) => Some(index),
+            Err(err) => {
+                degraded.reference_file_list = true;
+                let error = format!("include path index: {err:#}");
+                reference_file_list_error = Some(match reference_file_list_error.take() {
+                    Some(previous) => format!("{previous}; {error}"),
+                    None => error,
+                });
+                None
+            }
+        };
         let reference_file_count = indexed_files.as_ref().map_or(0, |files| files.len());
         let reach_graph_ms = rg_started.elapsed().as_millis();
         let observed_generation = load_semantic_generation(root.clone()).await?;
@@ -437,6 +473,7 @@ impl CacheLedger {
             include_table,
             go_import_table,
             indexed_files,
+            include_path_index,
             project_context,
             call_read_handle: Some(call_read_handle),
             workspace_semantics,
@@ -593,6 +630,18 @@ impl CacheLedger {
                 None
             }
         };
+        let include_path_index = match rebuild_include_path_index(root.clone()).await {
+            Ok(index) => Some(index),
+            Err(err) => {
+                degraded.reference_file_list = true;
+                let error = format!("include path index: {err:#}");
+                reference_file_list_error = Some(match reference_file_list_error.take() {
+                    Some(previous) => format!("{previous}; {error}"),
+                    None => error,
+                });
+                None
+            }
+        };
         let reference_file_count = indexed_files.as_ref().map_or(0, |files| files.len());
         let reach_graph_ms = rg_started.elapsed().as_millis();
         let observed_generation = load_semantic_generation(root.clone()).await?;
@@ -613,6 +662,7 @@ impl CacheLedger {
             include_table,
             go_import_table,
             indexed_files,
+            include_path_index,
             project_context,
             call_read_handle: Some(call_read_handle),
             workspace_semantics,
@@ -717,6 +767,7 @@ impl CacheLedger {
             include_table: current.include_table.clone(),
             go_import_table: current.go_import_table.clone(),
             indexed_files: current.indexed_files.clone(),
+            include_path_index: current.include_path_index.clone(),
             project_context: current.project_context.clone(),
             call_read_handle: current.call_read_handle.clone(),
             workspace_semantics: current.workspace_semantics.clone(),
@@ -769,6 +820,7 @@ impl CacheLedger {
             include_table: previous.include_table.clone(),
             go_import_table: previous.go_import_table.clone(),
             indexed_files: previous.indexed_files.clone(),
+            include_path_index: previous.include_path_index.clone(),
             project_context,
             call_read_handle: previous.call_read_handle.clone(),
             workspace_semantics: previous.workspace_semantics.clone(),
@@ -790,7 +842,8 @@ mod memory_tests {
 
     use super::declaration_models::build_declaration_index_from_db;
     use super::{
-        build_include_table_from_db, build_indexed_file_list_from_db, build_reach_graph_from_db,
+        build_include_path_index_from_db, build_include_table_from_db,
+        build_indexed_file_list_from_db, build_reach_graph_from_db,
     };
     use crate::call_model::SemanticGeneration;
     use crate::call_service::CallReadHandle;
@@ -822,6 +875,7 @@ mod memory_tests {
         reach_graph: ReachGraph,
         include_table: IncludeCompletionTable,
         indexed_files: Vec<(String, PathBuf)>,
+        include_path_index: crate::candidate_service::IncludePathIndex,
         project_context: ProjectContextIndex,
         call_read_handle: CallReadHandle,
     }
@@ -838,6 +892,7 @@ mod memory_tests {
             let reach_graph = build_reach_graph_from_db(db_path)?;
             let include_table = build_include_table_from_db(db_path)?;
             let indexed_files = build_indexed_file_list_from_db(db_path, root)?;
+            let include_path_index = build_include_path_index_from_db(db_path)?;
             let store = IndexStore::open_readonly(db_path)?;
             let guard = store.begin_semantic_read(None)?;
             let semantic_generation = SemanticGeneration(guard.generation());
@@ -849,6 +904,7 @@ mod memory_tests {
                 reach_graph,
                 include_table,
                 indexed_files,
+                include_path_index,
                 project_context,
                 call_read_handle,
             })
@@ -860,6 +916,7 @@ mod memory_tests {
                 &self.reach_graph,
                 &self.include_table,
                 &self.indexed_files,
+                &self.include_path_index,
                 &self.project_context,
                 &self.call_read_handle,
             ));

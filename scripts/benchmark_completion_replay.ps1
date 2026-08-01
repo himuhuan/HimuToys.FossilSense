@@ -25,6 +25,7 @@ $allowedMetrics = [System.Collections.Generic.HashSet[string]]::new(
 @(
     'completion_lsp_replay_declarations',
     'completion_lsp_replay_requests',
+    'completion_lsp_replay_forced_include_miss_requests',
     'completion_lsp_replay_p50_us',
     'completion_lsp_replay_p95_us',
     'completion_lsp_replay_max_us',

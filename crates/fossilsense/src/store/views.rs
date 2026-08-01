@@ -294,6 +294,17 @@ impl<'a> IncludeTableStoreView<'a> {
         collect_rows(rows)
     }
 
+    /// Every active path needed by request-local include resolution. Workspace
+    /// paths participate in suffix fallback; external paths are exact-only.
+    pub fn include_resolution_paths(&self) -> Result<Vec<(String, bool)>> {
+        let mut stmt = self
+            .store
+            .conn
+            .prepare("SELECT path, source = 'workspace' FROM files ORDER BY path")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        collect_rows(rows)
+    }
+
     pub fn workspace_file_paths(&self) -> Result<Vec<String>> {
         self.workspace_paths()
             .map(|rows| rows.into_iter().map(|row| row.path).collect())
