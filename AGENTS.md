@@ -1,77 +1,221 @@
 # AGENTS.md
 
+## 汇报和输出时的语气（强制要求）
+
+1. **禁止** 中英文黑话密度过高，让一句话承载太多概念
+
+反例
+> production ordinary completion 的冷召回已经从全量 O(D) 扫描改为受 16,384 硬预算约束的 compact posting traversal……
+
+正确示范
+> 用户日常输入触发的真实补全流程，不再遍历项目中的全部代码名称，而是最多检查 16,384 个候选。技术实现称为 bounded recall。
+
+2. **禁止** 把研发过程写成了产品结论，将主次倒置。
+
+用户不需要理解“active delta 为什么会被 stale base rows 饿死”
+而是关心：“曾存在特定情况下漏掉正确补全候选的风险；已通过专项测试修复，当前未发现发布阻断问题。”
+
+3. 数据很多，必须使用表格体现数据对应的产品含义
+
+以下是一个很好的示例：
+
+| 用户关注点        |            优化前 |          当前结果 | 产品结论                |
+| ------------ | -------------: | ------------: | ------------------- |
+| 补全等待时间       |    P95 约 84 ms | P95 23.284 ms | 服务端达到发布门槛           |
+| 单次搜索规模       | 最多检查 654,890 项 | 固定检查 16,384 项 | 项目扩大后延迟不再线性增长       |
+| 双代内存         |              — |    494.07 MiB | 通过 512 MiB 门槛，但余量较小 |
+| VS Code 界面卡顿 |          未完整测量 |          仍未覆盖 | 不能宣称彻底解决所有输入卡顿      |
+
+4. **不要** 把已完成、历史问题和未来计划混在一起
+
+最终汇报时，强制拆成三个明显区域：
+- 本版本已经完成
+- 本版本未覆盖但不阻断发布
+- 后续规划
+
 ## 工作方式
 
-FossilSense 的实现事实只来自**当前源码、测试、清单和脚本**。文档只能帮助定位，不能证明功能已经存在。
+FossilSense 当前实际具备哪些能力，只能以**当前源码、自动化测试、配置清单和构建脚本**为准。文档只能用于帮助找到相关代码，不能仅凭文档内容判断某项功能已经完成。
 
-处理任何问题前必须主动阅读相关源码：
+处理任何问题前，必须主动阅读相关源码：
 
-1. 使用 `rg` / `rg --files` 找到入口、调用链、配置和测试。
-2. 阅读实际实现，再形成判断或修改方案。
-3. 命令、版本和打包行为必须从 `Cargo.toml`、`package.json`、`build.ps1` 和 `scripts/` 核对。
-4. 文档与实现冲突时，以源码和测试为准，并同步修正文档。
+1. 使用 `rg` / `rg --files` 搜索功能入口、代码调用关系、配置文件和测试用例。
+2. 阅读真实实现后，再判断问题原因或制定修改方案。
+3. 命令、版本号和打包流程必须从 `Cargo.toml`、`package.json`、`build.ps1` 和 `scripts/` 中核对。
+4. 如果文档描述与实际代码不一致，以源码和测试结果为准，同时修正文档。
 
-不要从历史计划、评审稿、交付报告或 AI 会话记录推断当前架构。仓库不保存这些中间过程文档，也不要新建 research、plan、report、delivery note、实现总结或提示词副本。`docs/` 只允许保存可复现的性能测试方法和结果。
+不要根据历史计划、评审稿、交付报告或 AI 会话记录推测当前架构。仓库不会保存这些开发过程中的中间文档，也不要新建 research、plan、report、delivery note、实现总结或提示词副本。`docs/` 目录只允许保存能够重复执行的性能测试方法和测试结果。
 
 ## 项目定位
 
-FossilSense `1.5.1` 是一个面向大型 Windows C/C++ 与 Go 工作区的 VS Code 代码导航与分析工具。它把“缺少可靠编译环境”视为正常场景：用户不需要先准备 `compile_commands.json`、clangd、gopls、ctags、Go 或完整构建链。Go 后端以实验能力提供，遵守与 C/C++ 相同的候选式语义、容错与有界查询原则。
+FossilSense `1.5.1` 是一个面向大型 Windows C/C++ 和 Go 代码仓库的 VS Code 代码导航与分析工具。
+
+它把“用户没有完整、可靠的编译环境”视为常见情况。用户不需要提前准备：
+
+* `compile_commands.json`：记录 C/C++ 文件具体编译参数的配置文件。
+* clangd：C/C++ 语言分析服务。
+* gopls：Go 官方语言分析服务。
+* ctags：代码符号索引工具。
+* Go 或完整的项目构建工具链。
+
+Go 后端目前属于实验能力。它遵守与 C/C++ 相同的原则：返回可能正确的候选结果，允许部分信息缺失，并限制单次查询的工作量，避免大型仓库查询失控。
 
 核心原则：
 
-- **候选不是绑定**：跳转、补全、引用、Hover 和调用关系是 best-effort 结果，不得伪装成编译器级精确语义。
-- **容错优先**：语法错误、宏、缺失 include 和不完整配置应触发明确降级或 fallback，不应让服务崩溃。
-- **大仓库优先**：查询必须有界，热路径避免磁盘 IO 和全库复制，后台发布不能阻塞旧快照继续服务。
-- **开箱即用**：对外 VSIX 必须包含 Rust 原生二进制，不依赖用户额外安装工具链。
-- **不确定性可见**：结果需要保留 confidence、reason、ambiguity、coverage 或 truncation 等证据。
+* **候选不是确定绑定**：代码跳转、自动补全、引用查找、悬停信息和调用关系属于“根据现有信息尽力给出”的结果，不能包装成编译器级别的唯一准确答案。
+* **容错优先**：遇到语法错误、宏、缺失的 `include` 文件或不完整配置时，应明确降低分析精度或切换到备用分析方式，不能导致服务崩溃。
+* **大仓库优先**：每次查询处理的数据量必须有上限；高频查询路径应避免访问磁盘或复制整个仓库的数据；后台生成新索引时，旧索引仍应继续响应用户请求。
+* **开箱即用**：对外发布的 VSIX 安装包必须包含 Rust 编写的本地可执行程序，不能要求用户额外安装开发工具链。
+* **不确定性可见**：结果中需要保留可信度、判断原因、是否存在多个可能答案、数据覆盖情况以及结果是否被截断等信息。
 
-当前明确不做完整 C++ 语义绑定，包括继承、模板、重载决议、宏展开、访问控制和表达式类型推断；Go 侧同样不做接口动态派发、泛型实例化、嵌入成员提升、方法集证明或表达式类型推断。遇到 unsupported 形态时保守返回候选或降级，不猜测唯一答案。
+当前明确不实现完整的 C++ 编译器级语义分析，包括继承关系推导、模板实例化、重载选择、宏展开、访问权限判断和表达式类型推断。
+
+Go 侧同样不实现接口运行时动态派发、泛型实例化、嵌入字段或方法的自动提升、完整方法集合证明以及表达式类型推断。
+
+遇到暂不支持的代码形式时，应保守地返回多个候选结果，或者降低分析能力，不能在证据不足时猜测唯一答案。
 
 ## 源码入口
 
 ```text
 VS Code 扩展  extensions/vscode/src
-        │ LSP over stdio
+        │ 通过标准输入输出运行 LSP 通信
         ▼
 Rust 引擎      crates/fossilsense/src
 ```
 
-优先从这些入口继续向下读，不要依赖静态模块说明：
+优先从以下入口继续阅读实际实现，不要只依赖静态模块说明：
 
-- `crates/fossilsense/src/main.rs`：CLI 的 `scan`、`index`、`query`、`lsp` 入口。
-- `crates/fossilsense/src/server.rs` 与 `server/`：LSP 生命周期和协议适配。
-- `crates/fossilsense/src/indexer.rs` 与 `indexer/`：扫描、解析、索引和发布。
-- `crates/fossilsense/src/parser.rs` 与 `parser/`：C/C++ 与 Go 容错事实提取。
-- `crates/fossilsense/src/query.rs`、`query/`、`resolver.rs`：候选查询和排序。
-- `crates/fossilsense/src/store.rs` 与 `store/`：SQLite schema、读视图和写入。
-- `extensions/vscode/package.json`：客户可见命令、配置、版本和打包入口。
-- `scripts/`：CI、架构约束、发布验证和性能基准。
+* `crates/fossilsense/src/main.rs`：命令行中的 `scan`、`index`、`query`、`lsp` 功能入口。
+* `crates/fossilsense/src/server.rs` 与 `server/`：语言服务的启动、关闭、请求处理和 LSP 协议适配。
+* `crates/fossilsense/src/indexer.rs` 与 `indexer/`：扫描代码、解析文件、建立索引以及发布新索引版本。
+* `crates/fossilsense/src/parser.rs` 与 `parser/`：从不完整或存在错误的 C/C++、Go 代码中提取可用信息。
+* `crates/fossilsense/src/query.rs`、`query/`、`resolver.rs`：查找候选结果并根据证据排序。
+* `crates/fossilsense/src/store.rs` 与 `store/`：SQLite 数据结构、读取接口和写入逻辑。
+* `extensions/vscode/package.json`：用户能够看到的命令、配置项、版本号和打包入口。
+* `scripts/`：持续集成检查、架构约束、发布验证和性能测试脚本。
 
-新增能力先搜索现有模型和服务，优先复用已有语义事实、resolver、candidate service、read view 和 request snapshot。不要仅凭文档名称创建平行的 `smart` / `semantic` 模型。
+新增能力时，先搜索已有的数据模型和服务，优先复用现有的代码语义信息、候选结果排序器、候选查询服务、数据库读取视图和请求快照。
+
+不要仅根据文档名称，再创建一套平行的 `smart` 或 `semantic` 模型，避免系统中同时存在两套用途相近但规则不同的数据体系。
 
 ## 符号事实与查询架构
 
-符号链路保持单向：parser 从容错语法树和词法 fallback 提取声明事实，indexer 把带稳定 declaration ID、role、range、signature、linkage、guard 和 revision 的事实写入 SQLite；store 的 typed read view 是持久化语义边界；`CandidateQueryService` 在同一 semantic generation 内合并这些事实、include reachability、项目证据和未保存文档 overlay；server 最后才转换成 LSP 类型。Go 同链路由 package/import 图提供可达性证据：同 package 文件共享可见性，`go.mod`、`go.work`、工作区 `vendor` 和用户明示的外部模块根提供有界依赖证据；Go 事实携带 package identity 和 build guard，与 C/C++ 属于不同语义家族，同名符号不跨语言混入普通查询。
+符号处理流程必须保持单向，避免不同模块互相绕过或重复维护语义。
 
-普通补全列表因为每次键入都会触发，单独使用常驻的 compact `NameTable` 做有界召回。它只保存 name、kind、role、path、scope 信号和 canonical declaration ID，不复制完整 declaration payload，也不能在列表热路径读取 SQLite。这个分支是性能索引，不是第二套语义模型：completion resolve 必须携带 ID 和原始 name 回到 `CandidateQueryService`；Hover、Definition、Declaration、Find All、Signature Help 和 workspace symbol 的最终展示同样按 ID 水合 typed `DeclarationReadRow`。因此补全详情与导航共享 role、range、signature、linkage、guard 和 overlay 规则；禁止重新引入常驻 `DeclarationCoreRow`、`core_by_id` 或从轻量召回项直接构造最终语义结果。
+具体流程如下：
 
-`semanticIndex.memoryBudgetMB` 是 declaration semantic index 的总目标：先扣除不可回收的 compact recall bytes，余量才给 canonical payload cache；`0` 仍保留 recall core。进程 runtime、reach graph、include table、文件表、项目上下文和原子发布时的双代快照不在这个局部预算里，必须由大型仓库进程门禁覆盖。
+parser 从允许存在错误的语法树和基于文本规则的备用解析中提取声明信息。
 
-完整重建目标在构建期间不得被请求读取，可以使用 in-memory rollback journal、exclusive connection 和一次性 bulk cache；成功前必须执行 SQLite quick/foreign-key check，再发布或返回。普通增量写仍使用 WAL + `synchronous=NORMAL`，不能把 full-build 的 disposable 假设带入在线数据库。
+indexer 将这些信息写入 SQLite。写入内容包括：
+
+* 稳定的声明 ID；
+* 声明的作用，例如定义、声明或引用；
+* 所在代码范围；
+* 函数或符号签名；
+* 链接范围；
+* 条件编译信息；
+* 数据版本号。
+
+store 提供带明确字段类型的读取接口。这个接口是持久化数据与上层业务逻辑之间的边界。
+
+`CandidateQueryService` 在同一个索引版本中整合以下信息：
+
+* 已持久化的声明信息；
+* `include` 文件之间是否可达；
+* 项目结构相关证据；
+* 用户尚未保存到磁盘的编辑器文档内容。
+
+server 最后才把内部结果转换成 LSP 协议格式。也就是说，协议格式转换只应发生在最外层，不能渗透到解析、存储和查询模块中。
+
+Go 使用同一套总体流程，但通过 package 和 import 关系判断符号是否可见。
+
+其中：
+
+* 同一个 package 下的文件可以共享可见符号；
+* `go.mod`、`go.work`、工作区中的 `vendor` 目录，以及用户明确配置的外部模块目录，可以作为依赖关系证据；
+* 依赖搜索范围必须有明确上限，不能无限扫描外部目录；
+* Go 符号会记录 package 身份和构建条件；
+* Go 与 C/C++ 属于不同的语言体系，即使符号名称相同，普通查询时也不能混在一起。
+
+普通自动补全列表会在用户每次输入字符时触发，因此需要单独使用常驻内存中的精简 `NameTable`，快速找出一批可能匹配的名称。
+
+`NameTable` 只保存：
+
+* 名称；
+* 符号类型；
+* 声明的作用；
+* 文件路径；
+* 作用域提示；
+* 标准声明 ID。
+
+它不会复制完整的声明信息，也不能在自动补全列表的高频处理路径中读取 SQLite。
+
+这个分支只是为了提升查询性能，并不是第二套语义数据模型。
+
+自动补全需要显示详细信息时，必须携带声明 ID 和原始名称，重新回到 `CandidateQueryService` 获取完整信息。
+
+悬停信息、定义跳转、声明跳转、查找全部引用、参数提示和工作区符号的最终展示，也必须通过 ID 加载带明确字段类型的 `DeclarationReadRow`。
+
+这样可以保证自动补全详情与代码导航共用以下规则：
+
+* 声明作用；
+* 代码范围；
+* 符号签名；
+* 链接范围；
+* 条件编译信息；
+* 未保存文档的处理规则。
+
+禁止重新引入常驻内存的完整 `DeclarationCoreRow`、`core_by_id` 映射，也禁止直接使用精简召回结果拼装最终展示内容。否则会造成内存重复、信息不一致，或者让性能索引逐渐变成第二套语义系统。
+
+`semanticIndex.memoryBudgetMB` 表示声明语义索引希望控制的总内存目标。
+
+计算方式为：
+
+1. 先扣除无法动态释放的精简召回数据所占内存；
+2. 剩余空间再分配给完整声明信息缓存。
+
+当该配置为 `0` 时，仍然需要保留最基本的召回数据，否则普通自动补全无法工作。
+
+以下内存不属于这个局部预算：
+
+* 程序运行时自身占用；
+* 文件可达关系图；
+* `include` 关系表；
+* 文件信息表；
+* 项目上下文；
+* 发布新索引时，新旧两代索引同时存在产生的峰值内存。
+
+这些内存必须通过大型仓库整体进程性能门禁进行控制。
+
+执行完整索引重建时，尚未完成的目标数据库不能被用户请求读取。
+
+构建期间可以使用：
+
+* 仅存在于内存中的事务回滚记录；
+* 独占数据库连接；
+* 仅用于本次批量构建的一次性缓存。
+
+完整构建成功前，必须执行 SQLite 快速完整性检查和外键检查。检查通过后才能发布新索引或向调用方返回成功。
+
+普通的增量更新仍然使用 WAL 模式和 `synchronous=NORMAL`。
+
+WAL 表示数据库写入时先记录修改日志，使读取和写入可以较好地并行。
+
+不能把“完整重建数据库可以随时丢弃”的假设用于正在为用户提供服务的在线数据库。
 
 ## 修改守则
 
-- 修改前先读实现和相邻测试；修改后添加能覆盖失败模式的测试。
-- parser、store、query、server 与扩展之间保持现有依赖方向，协议转换留在边界。
-- SQLite 查询必须窄且有界；不能把全库事实复制到请求内存中。
-- open document、索引 generation 和 runtime snapshot 不能混代；发布失败不能暴露半更新状态。
-- 排序证据不能偷偷变成 hard filter。无法证明唯一时必须保留歧义或 fallback。
-- 新依赖需要说明运行时、许可证、平台和 VSIX 自包含影响。
-- 用户可见行为变化需要同步根 `README.md` 和 `extensions/vscode/README.md`，但不要写施工过程。
+* 修改前先阅读真实实现和相邻测试；修改后添加能够覆盖本次失败场景的测试。
+* parser、store、query、server 与扩展之间必须保持现有依赖方向；协议格式转换只能放在系统边界。
+* SQLite 查询必须只读取必要字段，并限制返回数量；不能把整个数据库中的符号信息复制到单次请求内存中。
+* 用户正在编辑的文档、索引版本和程序运行时快照不能混用不同版本；新索引发布失败时，不能让用户看到只更新了一部分的数据。
+* 排序依据只能影响候选结果的先后顺序，不能在没有明确设计的情况下偷偷变成强制过滤条件。无法证明唯一答案时，必须保留多个可能结果或使用降级方案。
+* 引入新依赖时，需要说明它对运行时、许可证、支持平台以及 VSIX 是否仍然能够独立运行的影响。
+* 用户可见行为发生变化时，需要同步修改根目录 `README.md` 和 `extensions/vscode/README.md`，但不要记录开发过程。
 
 ## 功能验证
 
-日常修复和小功能应先使用 `samples/mini-c` 或其他小型代码库快速验证：
+日常问题修复和小功能开发，应优先使用 `samples/mini-c` 或其他小型代码库进行快速验证：
 
 ```powershell
 cargo test -p fossilsense
@@ -82,7 +226,7 @@ Set-Location extensions/vscode
 pnpm run test
 ```
 
-完整仓库门禁：
+完整仓库级检查：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify.ps1 -SkipInstall
@@ -90,41 +234,92 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify.ps1 -SkipInst
 
 ### 大型代码库性能硬门禁
 
-mini-c 只适合快速功能验证。以下情况必须使用 **U-Boot 或 Wine** 至少一个大型代码库执行 release full-index 性能测试：
+`mini-c` 只适合快速验证功能是否基本正确。
 
-- 对外发版本。
-- 重大功能新增或调整。
-- 架构、索引、存储、解析、查询、并发或发布流程调整。
+出现以下情况时，必须选择 **U-Boot 或 Wine** 中至少一个大型代码库，执行 release 模式下的完整索引性能测试：
 
-样本放在本地 `samples/u-boot` 或 `samples/wine`，不提交仓库。先构建 release，再运行对应 case：
+* 对外发布新版本；
+* 新增或调整重大功能；
+* 修改架构、索引、存储、解析、查询、并发或索引发布流程。
+
+测试样本放在本地 `samples/u-boot` 或 `samples/wine`，不能提交到仓库。
+
+先构建 release 版本，再运行对应测试：
 
 ```powershell
 cargo build --release -p fossilsense
 cargo test --release -p fossilsense --bin fossilsense --no-run
 
-# 二选一；发布前可同时运行
+# 二选一；发布前可以两个都运行
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark_large_workspace.ps1 `
   -Repeats 1 -IncludeFullIndex -CaseFilter u-boot-full-index -TimeoutSeconds 120
 
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark_large_workspace.ps1 `
   -Repeats 1 -IncludeFullIndex -CaseFilter wine-full-index -TimeoutSeconds 120
 
-# declaration read model、补全、查询或发布架构变化还必须运行 U-Boot 内存门禁
+# 如果修改了声明读取模型、自动补全、查询或发布架构，还必须运行 U-Boot 内存检查
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark_large_workspace.ps1 `
   -Repeats 1 -IncludeFullIndex -IncludeEngineHydration -IncludeCompletionReplay `
   -CaseFilter u-boot-full-index,u-boot-engine-hydration,u-boot-completion-replay `
   -TimeoutSeconds 120
 ```
 
-`120s` 是硬门禁，不是观察值。任一必测 full-index case 的进程耗时或输出 `elapsed_ms` **高于 120,000 ms，即判定此次功能失败**；不能用平均值、机器波动或“小样本已经通过”放行。报告同时保留样本版本、机器信息、命令、`elapsed_ms`、`write_ms`、峰值内存和数据库大小。详细复现方法见 `docs/benchmark/`。
+`120s` 是必须满足的上线标准，不是供观察参考的普通性能数据。
 
-U-Boot engine hydration case 还必须包含至少 500,000 个声明和 10,000 个文件；完整单代读模型不超过 384 MiB，旧快照存活时旁路构建第二代的绝对峰值不超过 512 MiB。Windows 判断 Private Bytes，Linux/macOS 判断 RSS；任一断言失败都不能放行。
+任意一个必须执行的完整索引测试中，只要程序实际运行时间或输出的 `elapsed_ms` 高于 `120,000 ms`，就判定本次功能验证失败。
 
-自动补全相关变化还必须通过生产 LSP replay：64 个请求的 P95 不超过 50,000 us，每请求检查 `1..=16,384` 个 recall entry，candidate budget 必须为 16,384，declaration payload SQLite 读取为 0；每个请求还必须实际返回 indexed candidate、看到至少 500,000 个 active declaration，并在大表上明确标记 truncated。索引门禁放宽不能用于放宽这些补全硬门禁。
+不能因为以下理由放行：
+
+* 多次运行后的平均值低于标准；
+* 认为机器性能存在波动；
+* 小型样本测试已经通过。
+
+性能报告需要同时保留：
+
+* 样本代码版本；
+* 测试机器信息；
+* 执行命令；
+* `elapsed_ms`，即总耗时；
+* `write_ms`，即数据库写入耗时；
+* 峰值内存；
+* 数据库文件大小。
+
+详细复现方法见 `docs/benchmark/`。
+
+U-Boot engine hydration 测试用于检查引擎把大型索引加载到可查询状态时的内存使用。
+
+该测试还必须满足：
+
+* 至少包含 500,000 个声明；
+* 至少包含 10,000 个文件；
+* 单个完整索引版本的读取模型不超过 384 MiB；
+* 旧索引仍在服务用户时，在旁边构建第二代索引产生的绝对峰值不超过 512 MiB。
+
+Windows 使用 Private Bytes 判断进程实际占用的私有内存，Linux/macOS 使用 RSS 判断常驻物理内存。
+
+任意一项断言失败，都不能发布。
+
+自动补全相关变化还必须通过真实生产 LSP 请求回放测试：
+
+* 共执行 64 个自动补全请求；
+* 95% 的请求耗时不能超过 50,000 微秒，即 50 毫秒；
+* 每个请求检查的召回条目数量必须在 `1..=16,384` 之间；
+* 候选结果处理上限必须为 16,384；
+* 自动补全列表阶段读取完整声明信息的 SQLite 次数必须为 0；
+* 每个请求必须实际返回来自索引的候选结果；
+* 测试时必须能够看到至少 500,000 个当前有效声明；
+* 在大型候选表上，如果结果未全部处理，必须明确标记为 `truncated`，让调用方知道结果已被截断。
+
+即使完整索引性能标准有所调整，也不能借此放宽这些自动补全性能标准。
 
 ## 编译
 
-环境：Windows PowerShell、stable Rust、Node.js 22、pnpm 10。
+环境要求：
+
+* Windows PowerShell；
+* stable Rust，即 Rust 当前稳定版本；
+* Node.js 22；
+* pnpm 10。
 
 Rust：
 
@@ -135,6 +330,13 @@ cargo fmt --all -- --check
 cargo clippy -p fossilsense --all-targets -- -D warnings
 ```
 
+其中：
+
+* `cargo build`：编译 Rust 项目；
+* `cargo test`：运行 Rust 测试；
+* `cargo fmt --check`：检查代码格式是否符合统一规范；
+* `cargo clippy`：执行 Rust 静态检查，`-D warnings` 表示任何警告都按失败处理。
+
 VS Code 扩展：
 
 ```powershell
@@ -144,15 +346,25 @@ pnpm run compile
 pnpm run test
 ```
 
+其中 `--frozen-lockfile` 表示必须严格按照锁定的依赖版本安装，不允许安装过程自动修改依赖版本。
+
 ## 打包与发布
 
-仓库根目录的一键入口会安装依赖、运行 Rust/扩展测试、创建自包含 VSIX 并执行发布验证：
+仓库根目录的一键构建入口会完成以下工作：
+
+* 安装依赖；
+* 运行 Rust 测试；
+* 运行 VS Code 扩展测试；
+* 创建不依赖用户本地工具链的 VSIX 安装包；
+* 执行发布前验证。
+
+命令如下：
 
 ```powershell
 .\build.ps1
 ```
 
-仅手动打包时：
+仅需要手动打包时：
 
 ```powershell
 Set-Location extensions/vscode
@@ -168,69 +380,156 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify_release_harde
 dist/fossilsense-vscode-<version>_BUILD<YYYYMMDD_HHMMSS>.vsix
 ```
 
-`pnpm run package` 会构建 release Rust 二进制、打包扩展、生成 `release-build.json` 输入指纹并把二进制放入 VSIX。打包后若 Rust、扩展或打包关键输入发生变化，旧 VSIX 必须作废并重新生成。
+`pnpm run package` 会：
 
-发布完成时直接在提交、PR 或发布页记录最终 VSIX 文件名、VSIX SHA-256、release-input SHA-256、source commit、验证结果、能力边界和大型仓库性能数据；不要为这些信息新增仓库内过程文档。
+1. 构建 release 模式的 Rust 可执行程序；
+2. 打包 VS Code 扩展；
+3. 生成 `release-build.json`，记录本次发布所使用关键输入文件的指纹；
+4. 将 Rust 可执行程序放入 VSIX 安装包。
+
+打包完成后，如果 Rust 源码、扩展源码或打包关键输入发生变化，之前生成的 VSIX 必须视为失效，并重新生成。
+
+发布完成时，直接在提交记录、PR 或发布页面记录：
+
+* 最终 VSIX 文件名；
+* VSIX 文件的 SHA-256 校验值，用于确认安装包内容未被替换；
+* release-input SHA-256，用于确认本次打包输入；
+* 对应源码提交；
+* 验证结果；
+* 当前能力边界；
+* 大型仓库性能数据。
+
+不要为了记录这些信息，在仓库中新增开发过程文档。
 
 ## 文档边界
 
-仓库长期维护的 Markdown 仅包括：
+仓库长期维护的 Markdown 文件只包括：
 
-- `AGENTS.md`（本文件）：基本工程守则、验证、编译和打包方法，不超过 500 行；`CLAUDE.md` 仅保留指向本文件的链接。
-- 根 `README.md`：面向客户的产品介绍、安装和使用。
-- `extensions/vscode/README.md`：VSIX Marketplace 内容。
-- `docs/benchmark/`：可复现的性能测试方法与结果。
+* `AGENTS.md`，即本文件：记录基本工程规则、验证方式、编译方式和打包方式，总长度不能超过 500 行；`CLAUDE.md` 只保留一个指向本文件的链接。
+* 根目录 `README.md`：面向客户的产品介绍、安装方法和使用说明。
+* `extensions/vscode/README.md`：VS Code Marketplace 中展示的扩展介绍。
+* `docs/benchmark/`：能够重复执行的性能测试方法和测试结果。
 
-完成任务前再次检查：实现是否与测试一致、README 是否只描述真实能力、是否误加中间文档，以及重大变更是否通过大型仓库 `120s` 门禁。
+完成任务前需要再次检查：
+
+* 实际实现是否与自动化测试一致；
+* README 是否只描述已经真实存在的能力；
+* 是否错误新增了开发过程中的中间文档；
+* 重大变更是否通过大型仓库 `120s` 性能门禁。
 
 ## 工作流程与指南（必做）
 
-你的工作流程可以大概分为:
-1. 新增模块/重构（明确指令）：发出 explorer 并行探索 -> 主代理获取关键信息后修改 -> 委托 test-executor 执行 -> （可能出现问题）主代理修复 -> 交付 reviewer 审查
-2. 修复用户提出的问题：直接用主代理修改，无需委托 test-executor 或者 reviewer，也不需要提交或者走测试编译流程，只需要告知用户完成即可
-3. 用户“许愿”或者希望添加功能（模糊指令）：发出 explorer 并行探索 -> 主代理加载 `himu-planner` skill， 获取关键信息后与用户多轮交互确定方案，最后给出技术指导和实现建议与边界（可交付第一类实现）
-4. 用户直接指令调整当前仓库、基础设施、codex 配置等等：直接执行即可
+工作流程大致分为以下四类。
 
-你应该在会话开始时就提出你对整体工作流应用的概览。例如：
+### 1. 明确要求新增模块或进行重构
 
-```
-你提到的场景显然符合新增模块情况。我首先将分发子代理 A, B 分别用于探索 xxx, yyy 模块。之后我将独立修改代码，最后交付 reviewer 做独立审查。
+首先派出 explorer 探索代理，并行了解相关代码区域。
+
+主代理获得关键信息后，亲自修改代码。
+
+完成修改后，委托 test-executor 测试代理执行验证。
+
+如果测试发现问题，由主代理继续修复。
+
+最后交给 reviewer 审查代理进行独立复核。
+
+### 2. 修复用户明确提出的问题
+
+由主代理直接修改。
+
+不需要委托 test-executor 或 reviewer，也不需要提交代码或执行完整测试、编译流程。
+
+完成后只需要告知用户已经处理完成。
+
+### 3. 用户提出想法或模糊的新功能需求
+
+先派出 explorer 探索代理，并行了解相关实现和现状。
+
+随后由主代理加载 `himu-planner` 规划能力，根据探索结果与用户进行多轮沟通，明确需求方案。
+
+最终给出技术指导、实现建议和能力边界。
+
+方案明确后，可以进一步转为第一类流程进行实际开发。
+
+### 4. 用户直接要求调整当前仓库、基础设施或 Codex 配置
+
+由主代理直接执行。
+
+会话开始时，应先说明本次任务准备采用哪种工作流程。例如：
+
+```text
+你提到的场景属于新增模块。我会先派出子代理 A、B，分别探索 xxx 和 yyy 模块。获取关键信息后，我会直接修改代码，最后交给 reviewer 做独立审查。
 ```
 
 仅在以下情况使用子代理：
 
-* 探索大量文件或目录；
-* 并行运行多个独立检查；
-* 分析大型日志、测试输出或搜索结果；
-* 独立复核重要结论。
+* 需要探索大量文件或目录；
+* 需要并行运行多个相互独立的检查；
+* 需要分析大型日志、测试输出或搜索结果；
+* 需要独立复核重要结论。
 
-主代理应直接处理：
+以下工作应由主代理直接处理：
 
-* 已知位置的小文件或单一事实核查；
-* 即将修改的具体代码；
-* 架构、设计、需求、交接等基础文档；
-* 委派成本不低于直接执行的任务。
+* 已经知道具体位置的小文件修改或单一事实核查；
+* 即将实际修改的具体代码；
+* 架构、设计、需求和交接等基础文档；
+* 派出子代理的沟通和等待成本不低于主代理直接完成的任务。
 
-每项委派任务须自包含，并要求子代理返回 `file:line` 引用、符号名与关键证据。设置 `fork_turns = "none"`，避免复制主会话历史。
+每项交给子代理的任务必须包含完整上下文，并要求子代理返回：
+
+* `file:line` 形式的文件与行号；
+* 相关代码符号名称；
+* 支撑结论的关键证据。
+
+设置 `fork_turns = "none"`，避免将主会话历史复制给子代理。
 
 ### 派发 explorer
-派发探索子代理的策略是“积极但是不激进”，你派发子代理的数量可以尽可能高效一些：
-- 你更加偏向于以独立编译整体（子项目）当作探索对象，而非细小的子模块或流程
-- 一般而言，你派发探索子代理的个数不得超过3个。对于有明确指向的（例如 “前端”、“GUI”、“核心”）派发一个探索子代理即可
 
-需要多项独立探索时并行派发。主代理**必须等待子代理完成或者超时，不得并行读取**.
+派出探索子代理时，应保持“积极但不过度”的原则。
 
-主代理负责汇总结果、抽查关键证据、修改代码并完成最终验证。子代理不得再派生子代理。
+* 更适合按照能够独立编译或独立运行的完整子项目划分探索任务，而不是把任务拆成很多过小的代码模块。
+* 一般情况下，explorer 数量不能超过 3 个。
+* 如果用户已经明确指定某一个区域，例如“前端”“GUI”或“核心引擎”，只派出一个对应的 explorer 即可。
+
+存在多个互不依赖的探索任务时，可以并行派出。
+
+派出后，主代理必须等待子代理完成或超时，不能在子代理探索期间同时自行阅读相同代码区域。
+
+主代理负责：
+
+* 汇总子代理结果；
+* 抽查关键证据；
+* 修改代码；
+* 完成最终验证。
+
+子代理不能继续派生新的子代理。
 
 ## TDD 规范
 
-你在执行任何编码、修复BUG 任务的时候必须遵守此规范，也即，你必须补充单元测试后才能开始编码。
-特别的：
-1. 如果是新增模块，你必须先考虑“期望结果”测试用例的编写，以及边界条件不清楚时立即询问用户。
-2. 如果是修复BUG，如果效果已经确定，那么先考虑“当前BUG必然触发失败”测试用例的编写，转PASS后才可以认为任务结束
+执行任何编码或问题修复任务时，都必须遵守测试驱动开发规范，也就是先通过测试明确期望行为，再编写或修改实现。
+
+特别要求如下。
+
+### 1. 新增模块
+
+必须先考虑如何编写能够证明“期望结果已经实现”的测试用例。
+
+如果功能边界或异常情况不明确，应立即向用户确认。
+
+### 2. 修复问题
+
+如果正确效果已经明确，应先编写一个能够稳定复现当前问题、并且在修复前必然失败的测试。
+
+完成代码修改后，该测试必须由失败转为通过，才能认为问题已经解决。
 
 ## 询问与回答技巧
 
-如果你发现你可用工具里有结构化询问用户的工具，那么通常应该倾向于用“选择”的形式来询问用户
+如果当前可用工具中存在结构化询问用户的能力，通常应优先采用可选择的形式提问，降低用户补充信息的成本。
 
-你要详尽但是不能啰嗦的解释各种概念与澄清事实。不要套用生硬的比喻，从专业角度解析。**尽量使用自然语言长段落组织内容，不要使用 Markdown 代码围栏（```）来包裹结论，不要列过多 bullet list 来确定要点和边界**。偏好简洁、重点明确的讲解，使用表格帮助对比和总结。
+回答时需要充分解释相关概念和事实，但不要重复或堆砌内容。
+
+不要使用生硬、不准确的比喻，应从专业产品和工程角度说明问题。
+
+尽量使用自然、完整的段落组织内容，不要使用 Markdown 代码围栏包裹结论，也不要用大量项目符号机械罗列要点和边界。
+
+整体表达应简洁、重点明确；需要对比多个概念、方案或限制时，可以使用表格进行总结。
