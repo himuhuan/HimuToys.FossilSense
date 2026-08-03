@@ -1,7 +1,6 @@
-// Version 28 stores the logical canonical signature as a tagged relation to
-// the display signature: NULL means absent, 0x00 means equal, and 0x01 prefixes
-// an explicit UTF-8 override. Typed read views still expose the original value.
-pub(crate) const SCHEMA_VERSION: i64 = 28;
+// Version 29 adds declaration-ID keyed protobuf-c source associations without
+// placing proto declarations in the ordinary symbol tables.
+pub(crate) const SCHEMA_VERSION: i64 = 29;
 
 pub(crate) const DROP_DATA_TABLES_SQL: &str = "
     DROP TABLE IF EXISTS pending_file_revisions;
@@ -9,6 +8,7 @@ pub(crate) const DROP_DATA_TABLES_SQL: &str = "
     DROP TABLE IF EXISTS active_file_revisions;
     DROP TABLE IF EXISTS symbol_facts;
     DROP TABLE IF EXISTS fallback_completion_facts;
+    DROP TABLE IF EXISTS protobuf_c_sources;
     DROP TABLE IF EXISTS declaration_facts;
     DROP TABLE IF EXISTS import_facts;
     DROP TABLE IF EXISTS package_facts;
@@ -155,6 +155,25 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
         backing_start_byte INTEGER,
         backing_end_byte INTEGER
     );
+
+    CREATE TABLE IF NOT EXISTS protobuf_c_sources (
+        declaration_id INTEGER NOT NULL REFERENCES declaration_facts(id) ON DELETE CASCADE,
+        proto_path TEXT NOT NULL,
+        proto_name TEXT NOT NULL,
+        c_name TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('message', 'enum')),
+        start_byte INTEGER NOT NULL CHECK(start_byte >= 0),
+        end_byte INTEGER NOT NULL CHECK(end_byte >= start_byte),
+        start_line INTEGER NOT NULL CHECK(start_line >= 0),
+        start_col INTEGER NOT NULL CHECK(start_col >= 0),
+        end_line INTEGER NOT NULL CHECK(end_line >= start_line),
+        end_col INTEGER NOT NULL CHECK(end_col >= 0),
+        match_kind TEXT NOT NULL CHECK(match_kind IN ('relative_path', 'same_basename')),
+        source_truncated INTEGER NOT NULL CHECK(source_truncated IN (0, 1)),
+        PRIMARY KEY (
+            declaration_id, proto_path, start_byte, end_byte, proto_name, match_kind
+        )
+    ) WITHOUT ROWID;
 
     CREATE TABLE IF NOT EXISTS package_facts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,

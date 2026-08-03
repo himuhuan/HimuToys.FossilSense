@@ -36,6 +36,8 @@ fn test_backend_service() -> LspService<super::Backend> {
         external_include_dir_cache: Arc::new(StdMutex::new(HashMap::new())),
         include_paths: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         go_module_paths: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+        protobuf_c_enabled: Arc::new(tokio::sync::Mutex::new(None)),
+        protobuf_c_proto_paths: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         completion_enabled: AtomicBool::new(true),
         strict_prefix_ranking: AtomicBool::new(true),
         semantic_coloring_enabled: AtomicBool::new(true),
@@ -2961,6 +2963,59 @@ async fn hover_and_definition_hydrate_the_same_declaration() {
 }
 
 #[tokio::test]
+async fn protobuf_c_hover_appends_proto_source_without_changing_definition_target() {
+    let (dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[
+            (
+                "fossilsense.json",
+                r#"{"protobufC":{"enabled":true,"protoPaths":["proto"]}}"#,
+            ),
+            ("wrapper.h", "#include \"messages/system_cfg.pb-c.h\"\n"),
+            (
+                "messages/system_cfg.pb-c.h",
+                "typedef struct Demo__Outer Demo__Outer;\n",
+            ),
+            (
+                "proto/messages/system_cfg.proto",
+                "package demo;\nmessage Outer {}\n",
+            ),
+        ],
+        "main.c",
+        "#include \"wrapper.h\"\nDemo__Ou/*cursor*/ter *value;\n",
+    )
+    .await;
+
+    let hover = service
+        .inner()
+        .hover(hover_params(uri.clone(), line, character))
+        .await
+        .expect("hover request")
+        .expect("hover response");
+    let hover = hover_text(hover.contents);
+    assert!(hover.contains("proto 来源"), "{hover}");
+    assert!(
+        hover.contains("proto/messages/system_cfg.proto:2"),
+        "{hover}"
+    );
+    assert!(hover.contains("相对路径"), "{hover}");
+    assert!(hover.contains("demo.Outer"), "{hover}");
+
+    let definition = service
+        .inner()
+        .goto_definition(goto_definition_params(uri, line, character))
+        .await
+        .expect("definition request")
+        .expect("definition response");
+    let locations = definition_locations(definition);
+    assert!(!locations.is_empty());
+    let generated_uri =
+        Url::from_file_path(dir.path().join("messages/system_cfg.pb-c.h")).expect("generated uri");
+    assert!(locations
+        .iter()
+        .all(|location| location.uri == generated_uri));
+}
+
+#[tokio::test]
 async fn suppressed_same_name_candidates_stay_visible_as_evidence_and_escape_hatch() {
     let (dir, service, uri, line, character) = indexed_backend_with_open_doc(
         &[
@@ -5017,6 +5072,32 @@ async fn initialize_captures_client_go_module_paths() {
     assert_eq!(
         *service.inner().go_module_paths.lock().await,
         vec!["C:/deps/device".to_string(), "/opt/go/device".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn initialize_captures_optional_protobuf_c_editor_configuration() {
+    let service = test_backend_service();
+    service
+        .inner()
+        .initialize(InitializeParams {
+            initialization_options: Some(serde_json::json!({
+                "fossilsense": {
+                    "protobufC": {
+                        "enabled": true,
+                        "protoPaths": ["C:\\shared\\proto", "/opt/proto"]
+                    }
+                }
+            })),
+            ..Default::default()
+        })
+        .await
+        .expect("initialize");
+
+    assert_eq!(*service.inner().protobuf_c_enabled.lock().await, Some(true));
+    assert_eq!(
+        *service.inner().protobuf_c_proto_paths.lock().await,
+        vec!["C:/shared/proto".to_string(), "/opt/proto".to_string()]
     );
 }
 

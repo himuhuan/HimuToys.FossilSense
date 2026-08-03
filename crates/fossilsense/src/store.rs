@@ -15,10 +15,13 @@ mod generation_lease;
 mod generations;
 mod go_package_graph;
 mod includes;
+mod protobuf_c;
 mod queries;
 mod schema;
 pub mod views;
 mod writes;
+
+pub(crate) use protobuf_c::GeneratedDeclarationRow;
 
 pub(crate) use generation_lease::{
     GenerationCleanupLease, GenerationPublicationLease, GenerationReadLease,
@@ -201,6 +204,26 @@ pub struct IncludeGraphUpdate {
     pub go_open_packages: Vec<(String, String)>,
     pub go_importable_packages: Vec<(String, String)>,
     pub clear_all_go_packages: bool,
+    /// When present, atomically replaces every generated-declaration to proto
+    /// association in the same transaction that publishes this generation.
+    pub protobuf_c_sources: Option<Vec<ProtobufCSourceAssociation>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtobufCSourceAssociation {
+    pub declaration_id: i64,
+    pub proto_path: String,
+    pub proto_name: String,
+    pub c_name: String,
+    pub kind: String,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub start_line: u32,
+    pub start_col: u32,
+    pub end_line: u32,
+    pub end_col: u32,
+    pub match_kind: String,
+    pub source_truncated: bool,
 }
 
 pub struct SemanticReadGuard<'a> {
@@ -967,6 +990,10 @@ impl IndexStore {
 
     pub fn call_fact_view(&self) -> views::CallFactStoreView<'_> {
         views::CallFactStoreView::new(self)
+    }
+
+    pub fn protobuf_c_source_view(&self) -> views::ProtobufCSourceStoreView<'_> {
+        views::ProtobufCSourceStoreView::new(self)
     }
 }
 

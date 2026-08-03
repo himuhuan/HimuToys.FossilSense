@@ -207,6 +207,33 @@ pub fn navigation_presentations(
 }
 
 impl CandidateQueryService<'_> {
+    pub fn protobuf_c_sources_for_set(
+        &self,
+        set: &CandidateSet<ResolvedDeclarationCandidate>,
+    ) -> Result<(Vec<crate::store::views::ProtobufCSourceReadRow>, bool)> {
+        debug_assert!(
+            self.exact_name_limit <= crate::store::views::MAX_PROTOBUF_C_SOURCE_DECLARATION_IDS,
+            "protobuf-c source lookup must cover the semantic candidate window"
+        );
+        let Some(handle) = self.handle else {
+            return Ok((Vec::new(), false));
+        };
+        let declaration_ids: Vec<_> = focused_candidates(set)
+            .into_iter()
+            .filter_map(|candidate| candidate.persistent_id)
+            .take(crate::store::views::MAX_PROTOBUF_C_SOURCE_DECLARATION_IDS + 1)
+            .collect();
+        if declaration_ids.is_empty() {
+            return Ok((Vec::new(), false));
+        }
+        handle.read(|store| {
+            store.protobuf_c_source_view().sources_for_declaration_ids(
+                &declaration_ids,
+                crate::store::views::MAX_PROTOBUF_C_SOURCE_QUERY_LIMIT,
+            )
+        })
+    }
+
     pub fn semantic_candidates(
         &self,
         name: &str,

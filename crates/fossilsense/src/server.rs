@@ -88,7 +88,8 @@ use options::{
     member_completion_is_incomplete, parse_completion_history_mode, parse_completion_mode,
     parse_completion_prefix_ranking, parse_debug_candidate_reasons, parse_debug_perf_logs,
     parse_go_module_paths, parse_include_paths, parse_include_scoping_enabled,
-    parse_initial_project_context_selection, parse_semantic_coloring_mode,
+    parse_initial_project_context_selection, parse_protobuf_c_enabled,
+    parse_protobuf_c_proto_paths, parse_semantic_coloring_mode,
     parse_semantic_index_memory_budget_mb, signature_help_options,
 };
 use workspace::{
@@ -140,6 +141,8 @@ pub async fn run_stdio() -> Result<()> {
         external_include_dir_cache: Arc::new(StdMutex::new(HashMap::new())),
         include_paths: Arc::new(Mutex::new(Vec::new())),
         go_module_paths: Arc::new(Mutex::new(Vec::new())),
+        protobuf_c_enabled: Arc::new(Mutex::new(None)),
+        protobuf_c_proto_paths: Arc::new(Mutex::new(Vec::new())),
         completion_enabled: AtomicBool::new(true),
         strict_prefix_ranking: AtomicBool::new(true),
         semantic_coloring_enabled: AtomicBool::new(true),
@@ -179,6 +182,10 @@ struct Backend {
     /// Explicit external Go module roots forwarded from the client. Each root
     /// remains subject to the indexer's independent file/byte caps.
     go_module_paths: Arc<Mutex<Vec<String>>>,
+    /// Optional editor override; `None` inherits `fossilsense.json`.
+    protobuf_c_enabled: Arc<Mutex<Option<bool>>>,
+    /// Absolute editor-provided proto roots.
+    protobuf_c_proto_paths: Arc<Mutex<Vec<String>>>,
     /// Whether completion is enabled (based on initializationOptions).
     completion_enabled: AtomicBool,
     /// Whether ordinary identifier completion guards exact/literal-prefix

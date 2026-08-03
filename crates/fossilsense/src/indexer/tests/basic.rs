@@ -4,6 +4,80 @@ use crate::store::test_support::{
 };
 
 #[test]
+fn protobuf_c_configuration_merges_project_and_editor_paths() {
+    let ws = tempdir().expect("workspace");
+    let project_proto = ws.path().join("proto");
+    fs::create_dir_all(&project_proto).expect("project proto");
+    let external = tempdir().expect("external proto");
+    fs::write(
+        ws.path().join("fossilsense.json"),
+        r#"{"protobufC":{"enabled":true,"protoPaths":["proto"]}}"#,
+    )
+    .expect("config");
+
+    let external_path = crate::pathing::normalize_abs_path(external.path());
+    let prepared = crate::indexer::prepare_index_configuration(
+        ws.path(),
+        &[],
+        &[],
+        None,
+        std::slice::from_ref(&external_path),
+    )
+    .expect("prepare");
+
+    assert!(prepared.protobuf_c_enabled);
+    assert_eq!(prepared.proto_roots.len(), 2);
+    let canonical_external = external.path().canonicalize().expect("canonical external");
+    let canonical_project = project_proto
+        .canonicalize()
+        .expect("canonical project proto");
+    assert!(prepared
+        .proto_roots
+        .iter()
+        .any(|root| root == &canonical_external));
+    assert!(prepared
+        .proto_roots
+        .iter()
+        .any(|root| root == &canonical_project));
+}
+
+#[test]
+fn explicit_editor_disable_avoids_proto_path_validation() {
+    let ws = tempdir().expect("workspace");
+    fs::write(
+        ws.path().join("fossilsense.json"),
+        r#"{"protobufC":{"enabled":true,"protoPaths":["missing-proto"]}}"#,
+    )
+    .expect("config");
+
+    let prepared =
+        crate::indexer::prepare_index_configuration(ws.path(), &[], &[], Some(false), &[])
+            .expect("prepare disabled");
+
+    assert!(!prepared.protobuf_c_enabled);
+    assert!(prepared.proto_roots.is_empty());
+    assert!(!prepared
+        .issues
+        .iter()
+        .any(|issue| issue.message.contains("protobufC")));
+}
+
+#[test]
+fn enabled_protobuf_c_without_paths_reports_inactive_reason() {
+    let ws = tempdir().expect("workspace");
+    let prepared =
+        crate::indexer::prepare_index_configuration(ws.path(), &[], &[], Some(true), &[])
+            .expect("prepare enabled");
+
+    assert!(prepared.protobuf_c_enabled);
+    assert!(prepared.proto_roots.is_empty());
+    assert!(prepared
+        .issues
+        .iter()
+        .any(|issue| issue.message.contains("no valid proto directories")));
+}
+
+#[test]
 fn indexes_mini_workspace_and_skips_unchanged_files() {
     let dir = tempdir().expect("tempdir");
     fs::create_dir_all(dir.path().join("src")).expect("src");
@@ -627,6 +701,513 @@ fn missing_include_path_is_not_fatal() {
     )
     .expect("index should still succeed");
     assert_eq!(stats.total_files, 1);
+}
+
+#[test]
+fn protobuf_c_sources_require_an_include_edge_and_store_nested_declaration_lines() {
+    let workspace = tempdir().expect("workspace");
+    fs::create_dir_all(workspace.path().join("src")).expect("src");
+    fs::create_dir_all(workspace.path().join("proto/messages")).expect("proto");
+    let include = tempdir().expect("generated include");
+    fs::create_dir_all(include.path().join("messages")).expect("messages");
+
+    fs::write(
+        workspace.path().join("src/main.c"),
+        "#include <wrapper.h>\nDemo__Outer__Inner *value;\n",
+    )
+    .expect("main");
+    fs::write(
+        include.path().join("wrapper.h"),
+        "#include <messages/system_cfg.pb-c.h>\n",
+    )
+    .expect("wrapper");
+    fs::write(
+        include.path().join("messages/system_cfg.pb-c.h"),
+        "typedef struct Demo__Outer Demo__Outer;\n\
+         typedef struct Demo__Outer__Inner Demo__Outer__Inner;\n\
+         typedef enum _Demo__Mode { DEMO__MODE__UNKNOWN = 0 } Demo__Mode;\n",
+    )
+    .expect("generated header");
+    fs::write(
+        include.path().join("messages/unused.pb-c.h"),
+        "typedef struct Demo__Unused Demo__Unused;\n",
+    )
+    .expect("unused generated header");
+    fs::write(
+        workspace.path().join("proto/messages/system_cfg.proto"),
+        "package demo;\nmessage Outer {\n  message Inner {}\n}\nenum Mode { UNKNOWN = 0; }\n",
+    )
+    .expect("proto");
+    fs::write(
+        workspace.path().join("proto/messages/unused.proto"),
+        "package demo;\nmessage Unused {}\n",
+    )
+    .expect("unused proto");
+    fs::write(
+        workspace.path().join("fossilsense.json"),
+        serde_json::json!({
+            "includePaths": [crate::pathing::normalize_abs_path(include.path())],
+            "protobufC": { "enabled": true, "protoPaths": ["proto"] }
+        })
+        .to_string(),
+    )
+    .expect("config");
+
+    let db = workspace.path().join("index.sqlite");
+    index_workspace(
+        workspace.path(),
+        IndexOptions {
+            db_path: Some(db.clone()),
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("index");
+
+    let store = IndexStore::open_readonly(&db).expect("store");
+    let nested_ids: Vec<_> = store
+        .declarations_by_name("Demo__Outer__Inner")
+        .expect("nested declarations")
+        .into_iter()
+        .map(|row| row.id)
+        .collect();
+    assert!(!nested_ids.is_empty(), "generated nested type is indexed");
+    let (sources, truncated) = store
+        .protobuf_c_source_view()
+        .sources_for_declaration_ids(&nested_ids, 64)
+        .expect("proto sources");
+    assert!(!truncated);
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0].proto_name, "demo.Outer.Inner");
+    assert_eq!(sources[0].c_name, "Demo__Outer__Inner");
+    assert_eq!(sources[0].kind, "message");
+    assert_eq!(sources[0].start_line, 2);
+    assert_eq!(sources[0].match_kind, "relative_path");
+
+    let unused_ids: Vec<_> = store
+        .declarations_by_name("Demo__Unused")
+        .expect("unused declarations")
+        .into_iter()
+        .map(|row| row.id)
+        .collect();
+    assert!(
+        !unused_ids.is_empty(),
+        "unreferenced generated header is still indexed"
+    );
+    let (unused_sources, _) = store
+        .protobuf_c_source_view()
+        .sources_for_declaration_ids(&unused_ids, 64)
+        .expect("unused proto sources");
+    assert!(
+        unused_sources.is_empty(),
+        "a generated header without an incoming include edge must not be associated"
+    );
+}
+
+#[test]
+fn protobuf_c_relative_match_uses_the_parsed_include_target_for_workspace_headers() {
+    let workspace = tempdir().expect("workspace");
+    fs::create_dir_all(workspace.path().join("src")).expect("src");
+    fs::create_dir_all(workspace.path().join("include/messages")).expect("generated include");
+    fs::create_dir_all(workspace.path().join("common/messages")).expect("proto root");
+    fs::write(
+        workspace.path().join("src/main.c"),
+        "#include \"../include/wrapper.h\"\nDemo__Device *device;\n",
+    )
+    .expect("main");
+    fs::write(
+        workspace.path().join("include/wrapper.h"),
+        "#include \"messages/device.pb-c.h\"\n",
+    )
+    .expect("wrapper");
+    fs::write(
+        workspace.path().join("include/messages/device.pb-c.h"),
+        "typedef struct Demo__Device Demo__Device;\n",
+    )
+    .expect("generated header");
+    fs::write(
+        workspace.path().join("common/messages/device.proto"),
+        "package demo;\nmessage Device {}\n",
+    )
+    .expect("proto");
+    fs::write(
+        workspace.path().join("fossilsense.json"),
+        r#"{"protobufC":{"enabled":true,"protoPaths":["common"]}}"#,
+    )
+    .expect("config");
+
+    let db = workspace.path().join("index.sqlite");
+    index_workspace(
+        workspace.path(),
+        IndexOptions {
+            db_path: Some(db.clone()),
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("index");
+
+    let store = IndexStore::open_readonly(&db).expect("store");
+    let ids: Vec<_> = store
+        .declarations_by_name("Demo__Device")
+        .expect("generated type")
+        .into_iter()
+        .map(|row| row.id)
+        .collect();
+    let (sources, truncated) = store
+        .protobuf_c_source_view()
+        .sources_for_declaration_ids(&ids, 64)
+        .expect("sources");
+    assert!(!truncated);
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0].match_kind, "relative_path");
+}
+
+#[test]
+fn protobuf_c_same_basename_include_edges_keep_strong_paths_on_their_own_headers() {
+    let workspace = tempdir().expect("workspace");
+    for directory in ["include/a", "include/b", "proto/a", "proto/b"] {
+        fs::create_dir_all(workspace.path().join(directory)).expect("directory");
+    }
+    fs::write(
+        workspace.path().join("main.c"),
+        "#include \"include/wrapper.h\"\nDemo__Device *device;\n",
+    )
+    .expect("main");
+    fs::write(
+        workspace.path().join("include/wrapper.h"),
+        "#include \"a/device.pb-c.h\"\n#include \"b/device.pb-c.h\"\n",
+    )
+    .expect("wrapper");
+    for directory in ["a", "b"] {
+        fs::write(
+            workspace
+                .path()
+                .join(format!("include/{directory}/device.pb-c.h")),
+            "typedef struct Demo__Device Demo__Device;\n",
+        )
+        .expect("generated header");
+        fs::write(
+            workspace
+                .path()
+                .join(format!("proto/{directory}/device.proto")),
+            "package demo;\nmessage Device {}\n",
+        )
+        .expect("proto");
+    }
+    fs::write(
+        workspace.path().join("fossilsense.json"),
+        r#"{"protobufC":{"enabled":true,"protoPaths":["proto"]}}"#,
+    )
+    .expect("config");
+
+    let db = workspace.path().join("index.sqlite");
+    index_workspace(
+        workspace.path(),
+        IndexOptions {
+            db_path: Some(db.clone()),
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("index");
+
+    let store = IndexStore::open_readonly(&db).expect("store");
+    let declarations = store
+        .declarations_by_name("Demo__Device")
+        .expect("generated types");
+    for directory in ["a", "b"] {
+        let ids: Vec<_> = declarations
+            .iter()
+            .filter(|row| row.fact.path == format!("include/{directory}/device.pb-c.h"))
+            .map(|row| row.id)
+            .collect();
+        assert!(!ids.is_empty(), "generated declaration for {directory}");
+        let (sources, truncated) = store
+            .protobuf_c_source_view()
+            .sources_for_declaration_ids(&ids, 64)
+            .expect("sources");
+        assert!(!truncated);
+        assert_eq!(sources.len(), 1, "sources for header {directory}");
+        assert!(
+            sources[0]
+                .proto_path
+                .replace('\\', "/")
+                .ends_with(&format!("/proto/{directory}/device.proto")),
+            "header {directory} received the wrong strong source: {:?}",
+            sources
+        );
+        assert_eq!(sources[0].match_kind, "relative_path");
+    }
+}
+
+#[test]
+fn protobuf_c_same_basename_candidates_are_stable_and_explicitly_truncated() {
+    let workspace = tempdir().expect("workspace");
+    fs::create_dir_all(workspace.path().join("generated")).expect("generated");
+    fs::create_dir_all(workspace.path().join("proto")).expect("proto root");
+    fs::write(
+        workspace.path().join("main.c"),
+        "#include \"generated/system_cfg.pb-c.h\"\nDemo__Item *item;\n",
+    )
+    .expect("main");
+    fs::write(
+        workspace.path().join("generated/system_cfg.pb-c.h"),
+        "typedef struct Demo__Item Demo__Item;\n",
+    )
+    .expect("generated header");
+    for index in 0..65 {
+        let directory = workspace.path().join(format!("proto/candidate_{index:02}"));
+        fs::create_dir_all(&directory).expect("candidate directory");
+        fs::write(
+            directory.join("system_cfg.proto"),
+            "package demo;\nmessage Item {}\n",
+        )
+        .expect("proto candidate");
+    }
+    fs::write(
+        workspace.path().join("fossilsense.json"),
+        r#"{"protobufC":{"enabled":true,"protoPaths":["proto"]}}"#,
+    )
+    .expect("config");
+
+    let db = workspace.path().join("index.sqlite");
+    index_workspace(
+        workspace.path(),
+        IndexOptions {
+            db_path: Some(db.clone()),
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("index");
+    let store = IndexStore::open_readonly(&db).expect("store");
+    let ids: Vec<_> = store
+        .declarations_by_name("Demo__Item")
+        .expect("generated type")
+        .into_iter()
+        .map(|row| row.id)
+        .collect();
+    let (sources, truncated) = store
+        .protobuf_c_source_view()
+        .sources_for_declaration_ids(&ids, 64)
+        .expect("sources");
+
+    assert!(truncated);
+    assert_eq!(sources.len(), 64);
+    assert!(sources
+        .iter()
+        .all(|source| source.match_kind == "same_basename"));
+    assert!(sources.windows(2).all(|pair| {
+        pair[0].proto_path.to_ascii_lowercase() <= pair[1].proto_path.to_ascii_lowercase()
+    }));
+}
+
+#[test]
+fn protobuf_c_repeated_declarations_are_bounded_before_association_publication() {
+    let workspace = tempdir().expect("workspace");
+    fs::create_dir_all(workspace.path().join("generated")).expect("generated");
+    fs::create_dir_all(workspace.path().join("proto")).expect("proto");
+    fs::write(
+        workspace.path().join("main.c"),
+        "#include \"generated/device.pb-c.h\"\nDemo__Device *device;\n",
+    )
+    .expect("main");
+    fs::write(
+        workspace.path().join("generated/device.pb-c.h"),
+        "typedef struct Demo__Device Demo__Device;\n",
+    )
+    .expect("generated header");
+    let proto = "package demo;\n".to_string() + &"message Device {}\n".repeat(100);
+    fs::write(workspace.path().join("proto/device.proto"), proto).expect("proto");
+    fs::write(
+        workspace.path().join("fossilsense.json"),
+        r#"{"protobufC":{"enabled":true,"protoPaths":["proto"]}}"#,
+    )
+    .expect("config");
+
+    let db = workspace.path().join("index.sqlite");
+    index_workspace(
+        workspace.path(),
+        IndexOptions {
+            db_path: Some(db.clone()),
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("index");
+    let store = IndexStore::open_readonly(&db).expect("store");
+    let ids: Vec<_> = store
+        .declarations_by_name("Demo__Device")
+        .expect("generated type")
+        .into_iter()
+        .map(|row| row.id)
+        .collect();
+    let (sources, truncated) = store
+        .protobuf_c_source_view()
+        .sources_for_declaration_ids(&ids, 64)
+        .expect("sources");
+
+    assert!(truncated);
+    assert_eq!(sources.len(), 64);
+}
+
+#[test]
+fn protobuf_c_source_changes_become_visible_on_the_next_reindex() {
+    let workspace = tempdir().expect("workspace");
+    fs::create_dir_all(workspace.path().join("generated")).expect("generated");
+    fs::create_dir_all(workspace.path().join("proto")).expect("proto");
+    fs::write(
+        workspace.path().join("main.c"),
+        "#include \"generated/device.pb-c.h\"\nDemo__Device *device;\n",
+    )
+    .expect("main");
+    fs::write(
+        workspace.path().join("generated/device.pb-c.h"),
+        "typedef struct Demo__Device Demo__Device;\n",
+    )
+    .expect("generated header");
+    let proto = workspace.path().join("proto/device.proto");
+    fs::write(&proto, "package demo;\nmessage Device {}\n").expect("proto");
+    fs::write(
+        workspace.path().join("fossilsense.json"),
+        r#"{"protobufC":{"enabled":true,"protoPaths":["proto"]}}"#,
+    )
+    .expect("config");
+
+    let db = workspace.path().join("index.sqlite");
+    let first = index_workspace(
+        workspace.path(),
+        IndexOptions {
+            db_path: Some(db.clone()),
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("first index");
+    let declaration_ids = {
+        let store = IndexStore::open_readonly(&db).expect("store");
+        let ids: Vec<_> = store
+            .declarations_by_name("Demo__Device")
+            .expect("generated type")
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        let (sources, _) = store
+            .protobuf_c_source_view()
+            .sources_for_declaration_ids(&ids, 64)
+            .expect("first sources");
+        assert_eq!(sources[0].start_line, 1);
+        ids
+    };
+
+    fs::write(
+        &proto,
+        "// generated source note\npackage demo;\n\nmessage Device {}\n",
+    )
+    .expect("updated proto");
+    let second = index_workspace(
+        workspace.path(),
+        IndexOptions {
+            db_path: Some(db.clone()),
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("second index");
+    assert!(second.semantic_generation > first.semantic_generation);
+
+    let store = IndexStore::open_readonly(&db).expect("updated store");
+    let updated_ids: Vec<_> = store
+        .declarations_by_name("Demo__Device")
+        .expect("stable generated type")
+        .into_iter()
+        .map(|row| row.id)
+        .collect();
+    assert_eq!(updated_ids, declaration_ids);
+    let (sources, truncated) = store
+        .protobuf_c_source_view()
+        .sources_for_declaration_ids(&updated_ids, 64)
+        .expect("updated sources");
+    assert!(!truncated);
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0].start_line, 3);
+}
+
+#[test]
+fn protobuf_c_over_cap_root_is_reported_and_other_roots_continue() {
+    let workspace = tempdir().expect("workspace");
+    fs::create_dir_all(workspace.path().join("generated")).expect("generated");
+    fs::create_dir_all(workspace.path().join("proto-over-cap")).expect("over cap root");
+    fs::create_dir_all(workspace.path().join("proto-valid")).expect("valid root");
+    fs::write(
+        workspace.path().join("main.c"),
+        "#include \"generated/device.pb-c.h\"\nDemo__Device *device;\n",
+    )
+    .expect("main");
+    fs::write(
+        workspace.path().join("generated/device.pb-c.h"),
+        "typedef struct Demo__Device Demo__Device;\n",
+    )
+    .expect("generated header");
+    fs::write(
+        workspace.path().join("proto-over-cap/device.proto"),
+        "package demo; message Device {}\n",
+    )
+    .expect("over-cap proto");
+    fs::write(
+        workspace.path().join("proto-over-cap/extra.txt"),
+        "counts toward the per-root scan cap\n",
+    )
+    .expect("extra file");
+    fs::write(
+        workspace.path().join("proto-valid/device.proto"),
+        "package demo;\nmessage Device {}\n",
+    )
+    .expect("valid proto");
+    fs::write(
+        workspace.path().join("fossilsense.json"),
+        r#"{"protobufC":{"enabled":true,"protoPaths":["proto-over-cap","proto-valid"]}}"#,
+    )
+    .expect("config");
+
+    let db = workspace.path().join("index.sqlite");
+    let mut messages = Vec::new();
+    index_workspace(
+        workspace.path(),
+        IndexOptions {
+            db_path: Some(db.clone()),
+            force: true,
+            external_max_files: Some(1),
+            ..Default::default()
+        },
+        |status| messages.extend(status.message),
+    )
+    .expect("index");
+
+    assert!(messages
+        .iter()
+        .any(|message| { message.contains("exceeds cap") && message.contains("proto-over-cap") }));
+    let store = IndexStore::open_readonly(&db).expect("store");
+    let ids: Vec<_> = store
+        .declarations_by_name("Demo__Device")
+        .expect("generated type")
+        .into_iter()
+        .map(|row| row.id)
+        .collect();
+    let (sources, truncated) = store
+        .protobuf_c_source_view()
+        .sources_for_declaration_ids(&ids, 64)
+        .expect("sources");
+    assert!(!truncated);
+    assert_eq!(sources.len(), 1);
+    assert!(sources[0].proto_path.contains("proto-valid"));
 }
 
 #[test]

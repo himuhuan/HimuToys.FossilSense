@@ -2,7 +2,7 @@
   "name": "fossilsense-vscode",
   "displayName": "FossilSense",
   "description": "FossilSense C/C++ and Go best-effort semantics: stable navigation, role-aware candidates, bounded reachability evidence, Hover, completion, references, and call relations.",
-  "version": "1.5.1",
+  "version": "1.5.2",
   "private": true,
   "license": "UNLICENSED",
   "publisher": "himutoys",
@@ -254,6 +254,19 @@
           },
           "default": [],
           "markdownDescription": "Explicit external Go module directories to index without invoking the Go toolchain. Each root is scanned with independent file/byte caps and merged with `goModulePaths` from `fossilsense.json`. A root should contain `go.mod`; without module metadata, declarations remain bounded but import-path evidence may be incomplete. FossilSense never discovers or scans GOPATH or the machine module cache automatically. Missing, overlapping, or over-budget roots are skipped with visible degraded-status evidence."
+        },
+        "fossilsense.protobufC.enabled": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Opt in to protobuf-c generated-type source tracing. When enabled with at least one valid proto directory, C/C++ type Hover may show matching `message` or `enum` declarations from `.proto` files. This does not add proto language support or change Go to Definition. An explicitly configured editor value overrides `protobufC.enabled` in `fossilsense.json`."
+        },
+        "fossilsense.protobufC.protoPaths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "markdownDescription": "Absolute directories containing source `.proto` files for optional protobuf-c tracing. Entries are merged with workspace-relative or absolute `protobufC.protoPaths` from `fossilsense.json`, normalized, de-duplicated, and scanned only while protobuf-c tracing is enabled. Invalid or over-budget directories and proto files above the bounded extraction limits are skipped with a visible status warning."
         },
         "fossilsense.debug.candidateReasons": {
           "type": "boolean",

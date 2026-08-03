@@ -1,8 +1,8 @@
 # FossilSense for VS Code
 
-FossilSense gives large, difficult-to-build C, C++, and Go workspaces useful navigation without requiring a complete compiler setup. The `1.5.1` VSIX is self-contained: open a workspace and let the bundled native engine build its local index. Go support is experimental and does not require the Go toolchain or gopls.
+FossilSense gives large, difficult-to-build C, C++, and Go workspaces useful navigation without requiring a complete compiler setup. The `1.5.2` VSIX is self-contained: open a workspace and let the bundled native engine build its local index. Go support is experimental and does not require the Go toolchain or gopls.
 
-Version 1.5.1 begins interactive-completion latency hardening with latest-request-wins admission: a newer document revision supersedes queued ordinary-completion work, and an in-progress compact-name recall cooperatively stops instead of publishing a stale partial list or memo pool.
+Version 1.5.2 adds opt-in protobuf-c source tracing. After it is enabled and the index is rebuilt, Hover for a generated C/C++ type can list matching source `.proto` declarations without changing Go to Definition or adding `.proto` language support.
 
 It is designed for firmware, embedded systems, drivers, kernels, legacy code, vendored SDKs, and repositories where `compile_commands.json` is missing or unreliable.
 
@@ -15,6 +15,7 @@ It is designed for firmware, embedded systems, drivers, kernels, legacy code, ve
 - Best-effort references grouped as definition, declaration, call, read, write, or type use.
 - Function Hover and Signature Help with arity-aware candidates and rendered comments.
 - Full bounded `struct`, `class`, and `union` Hover; unique `typedef` chains can show `aka`.
+- Optional protobuf-c generated-type Hover sources, including the proto file, declaration line, match evidence, and visible ambiguity or truncation.
 - One-hop incoming and outgoing call relations for direct C/C++ and Go calls, including call sites and evidence.
 - Limited semantic coloring for macros, types, enum constants, parameters, and local variables.
 - Unsaved open-document declarations included in candidate results.
@@ -35,7 +36,7 @@ C++ record methods intentionally participate in ordinary identifier recall as fu
 
 ## Install and start
 
-Install `fossilsense-vscode-1.5.1_BUILD*.vsix` with:
+Install `fossilsense-vscode-1.5.2_BUILD*.vsix` with:
 
 ```text
 Extensions -> ... -> Install from VSIX
@@ -61,7 +62,7 @@ If an active clangd, Microsoft C/C++, ccls, or Go extension matches a source lan
 
 ## Workspace scope
 
-An optional `fossilsense.json` at the workspace root controls source scope, external headers, and explicit external Go modules:
+An optional `fossilsense.json` at the workspace root controls source scope, external headers, explicit external Go modules, and opt-in protobuf-c source tracing:
 
 ```json
 {
@@ -70,6 +71,10 @@ An optional `fossilsense.json` at the workspace root controls source scope, exte
   "extensions": ["c", "h", "cpp", "hpp", "go"],
   "includePaths": ["C:/toolchain/include"],
   "goModulePaths": ["D:/shared/device-module"],
+  "protobufC": {
+    "enabled": true,
+    "protoPaths": ["proto", "D:/shared/protocols"]
+  },
   "languageOverrides": [
     { "glob": "legacy-c/**/*.h", "language": "c" },
     { "glob": "generated/cpp/**/*.h", "language": "cpp" },
@@ -78,7 +83,7 @@ An optional `fossilsense.json` at the workspace root controls source scope, exte
 }
 ```
 
-All fields are optional. `.c` defaults to C; `.h`, `.inl`, and the standard C++ source/header extensions default to C++; `.go` defaults to Go. `languageOverrides` accepts `c`, `cpp`, or `go`, matches case-insensitively over normalized `/` paths, and applies the last matching rule. `goModulePaths` contains explicit absolute module roots and never triggers automatic GOPATH or machine module-cache discovery. Every root is independently file/byte capped; a root should contain `go.mod` for complete module import-path evidence. Invalid entries and rules are skipped with a visible warning without discarding other configuration fields.
+All fields are optional. `.c` defaults to C; `.h`, `.inl`, and the standard C++ source/header extensions default to C++; `.go` defaults to Go. `languageOverrides` accepts `c`, `cpp`, or `go`, matches case-insensitively over normalized `/` paths, and applies the last matching rule. `goModulePaths` contains explicit absolute module roots and never triggers automatic GOPATH or machine module-cache discovery. `protobufC.enabled` defaults to `false`; project proto paths may be workspace-relative or absolute. Only generated `*.pb-c.h` files present in the parsed include graph are traced. Every external root is independently file/byte capped; each proto source extraction is also capped at 16 MiB and a fixed token budget. Invalid or over-budget inputs are skipped with a visible warning without discarding other configuration fields.
 
 ## Main settings
 
@@ -86,6 +91,8 @@ All fields are optional. `.c` defaults to C; `.h`, `.inl`, and the standard C++ 
 - `fossilsense.serverPath`: use a custom engine binary instead of the bundled one.
 - `fossilsense.includePaths`: add absolute external header directories.
 - `fossilsense.goModulePaths`: add explicit external Go module roots; these merge with `fossilsense.json` and use the same bounded scanning rules.
+- `fossilsense.protobufC.enabled`: explicitly enable or disable protobuf-c source tracing. An explicitly configured editor value overrides the project value; otherwise the setting inherits `fossilsense.json`.
+- `fossilsense.protobufC.protoPaths`: add absolute proto source directories. They merge with project proto paths, then normalize and de-duplicate.
 - `fossilsense.completion.mode`: enable or disable identifier, include/import, and member completion.
 - `fossilsense.completion.prefixRanking`: `strict` prefers exact names and literal prefixes; `scopeFirst` gives scope evidence priority.
 - `fossilsense.completionHistory.mode`: enable or disable local accepted-completion history.
@@ -102,6 +109,8 @@ All fields are optional. `.c` defaults to C; `.h`, `.inl`, and the standard C++ 
 FossilSense is a best-effort navigation engine, not a compiler model. It does not support full C++ inheritance, template instantiation, overload resolution, macro expansion, access control, namespace binding, or complex expression type inference.
 
 The Go backend does not perform interface dynamic dispatch, generic instantiation, embedded-member promotion, method-set proof, or expression type inference. Selectors, same-name methods, function values, and indirect calls remain multiple candidates or fallback when evidence is incomplete. FossilSense does not invoke the Go toolchain. Build expressions and GOOS/GOARCH filename suffixes are visible guard/ranking/coverage evidence, but there is no active target selection. `import "C"` exposes an unsupported-language boundary and does not infer Go/C bindings.
+
+Protobuf-c tracing recognizes only proto `package`, top-level or nested `message`, and `enum` declarations, and preserves multiple plausible sources. It does not analyze fields, enum values, `service`, `oneof`, `map`, options, imports, or generated functions. It does not watch proto roots or use unsaved proto text; rebuild the index after proto changes. Go to Definition continues to target the generated C/C++ declaration.
 
 Declarations, Hover, navigation, coloring, document symbols, and call relations accept AST facts only. If tree-sitter still produces a usable tree with syntax errors, FossilSense keeps the Partial AST path instead of switching the whole document to lexical declaration scanning. A name that exists only inside an unsupported `ERROR` region may temporarily be absent from declarations, navigation, coloring, and completion until the edit forms a recognizable declaration. Lexical fallback is reserved for a hard AST failure and contributes only isolated, lowest-priority, non-navigable completion hints.
 

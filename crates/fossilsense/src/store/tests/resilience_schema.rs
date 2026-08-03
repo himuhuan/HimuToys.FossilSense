@@ -309,7 +309,7 @@ fn opening_schema_27_rebuilds_with_tagged_logical_signatures() {
             |row| row.get(0),
         )
         .expect("schema version");
-    assert_eq!(version, "28");
+    assert_eq!(version, crate::store::schema::SCHEMA_VERSION.to_string());
 
     let declaration_count: i64 = store
         .conn

@@ -17,6 +17,8 @@ import {
   includePathsFromConfig,
   includeScopingModeFromConfig,
   perfLogsFromConfig,
+  protobufCEnabledOverrideFromConfig,
+  protobufCProtoPathsFromConfig,
   projectContextModeFromConfig,
   resolveServerPath,
   resourceMonitorEnabledFromConfig,
@@ -174,6 +176,8 @@ export function activate(context: vscode.ExtensionContext): void {
         client &&
         (event.affectsConfiguration('fossilsense.includePaths') ||
           event.affectsConfiguration('fossilsense.goModulePaths') ||
+          event.affectsConfiguration('fossilsense.protobufC.enabled') ||
+          event.affectsConfiguration('fossilsense.protobufC.protoPaths') ||
           event.affectsConfiguration('fossilsense.completion.mode') ||
           event.affectsConfiguration('fossilsense.completion.prefixRanking') ||
           event.affectsConfiguration('fossilsense.completionHistory.mode') ||
@@ -311,6 +315,10 @@ async function startServer(context: vscode.ExtensionContext): Promise<void> {
         },
         includePaths: includePathsFromConfig(),
         goModulePaths: goModulePathsFromConfig(),
+        protobufC: {
+          enabled: protobufCEnabledOverrideFromConfig(),
+          protoPaths: protobufCProtoPathsFromConfig(),
+        },
         debug: {
           candidateReasons: debugCandidateReasonsFromConfig(),
           perfLogs: perfLogsFromConfig(),

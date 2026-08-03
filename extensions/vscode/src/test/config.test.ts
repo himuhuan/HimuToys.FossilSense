@@ -5,6 +5,7 @@ import {
   normalizeBoolean,
   normalizeCompletionPrefixRanking,
   normalizeExternalPathList,
+  resolveExplicitBooleanOverride,
   normalizeIncludeScopingMode,
   normalizeOnOffAuto,
   normalizeProjectContextMode,
@@ -37,9 +38,22 @@ assert.strictEqual(normalizeBoolean('unexpected'), true);
 assert.strictEqual(normalizeBoolean(0), true);
 assert.deepStrictEqual(
   normalizeExternalPathList([' C:\\deps\\device ', '', 7, '/opt/go/device', 'C:\\deps\\device']),
-  ['C:\\deps\\device', '/opt/go/device'],
+  ['C:/deps/device', '/opt/go/device'],
 );
 assert.deepStrictEqual(normalizeExternalPathList('C:\\deps'), []);
+assert.deepStrictEqual(normalizeExternalPathList(['/', 'C:/', 'C:\\']), ['/', 'C:/']);
+assert.strictEqual(
+  resolveExplicitBooleanOverride(false, { defaultValue: false }),
+  undefined,
+);
+assert.strictEqual(
+  resolveExplicitBooleanOverride(true, { defaultValue: false, globalValue: true }),
+  true,
+);
+assert.strictEqual(
+  resolveExplicitBooleanOverride(false, { defaultValue: false, workspaceValue: false }),
+  false,
+);
 
 const packageJson = JSON.parse(
   fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8'),
@@ -65,3 +79,22 @@ const goModulePaths =
   packageJson.contributes.configuration.properties['fossilsense.goModulePaths'];
 assert.strictEqual(goModulePaths.type, 'array');
 assert.deepStrictEqual(goModulePaths.default, []);
+
+const protobufCEnabled =
+  packageJson.contributes.configuration.properties['fossilsense.protobufC.enabled'];
+assert.strictEqual(protobufCEnabled.type, 'boolean');
+assert.strictEqual(protobufCEnabled.default, false);
+
+const protobufCProtoPaths =
+  packageJson.contributes.configuration.properties['fossilsense.protobufC.protoPaths'];
+assert.strictEqual(protobufCProtoPaths.type, 'array');
+assert.deepStrictEqual(protobufCProtoPaths.default, []);
+
+const extensionSource = fs.readFileSync(
+  path.resolve(__dirname, '..', '..', 'src', 'extension.ts'),
+  'utf8',
+);
+assert.ok(extensionSource.includes('protobufCEnabledOverrideFromConfig()'));
+assert.ok(extensionSource.includes('protobufCProtoPathsFromConfig()'));
+assert.ok(extensionSource.includes("affectsConfiguration('fossilsense.protobufC.enabled')"));
+assert.ok(extensionSource.includes("affectsConfiguration('fossilsense.protobufC.protoPaths')"));

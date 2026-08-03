@@ -48,7 +48,7 @@ FossilSense 当前实际具备哪些能力，只能以**当前源码、自动化
 
 ## 项目定位
 
-FossilSense `1.5.1` 是一个面向大型 Windows C/C++ 和 Go 代码仓库的 VS Code 代码导航与分析工具。
+FossilSense `1.5.2` 是一个面向大型 Windows C/C++ 和 Go 代码仓库的 VS Code 代码导航与分析工具。
 
 它把“用户没有完整、可靠的编译环境”视为常见情况。用户不需要提前准备：
 
@@ -268,21 +268,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark_large_work
 
 任意一个必须执行的完整索引测试中，只要程序实际运行时间或输出的 `elapsed_ms` 高于 `120,000 ms`，就判定本次功能验证失败。
 
-不能因为以下理由放行：
+不能因为多次运行后的平均值低于标准、认为机器性能存在波动或小型样本测试已经通过而放行。
 
-* 多次运行后的平均值低于标准；
-* 认为机器性能存在波动；
-* 小型样本测试已经通过。
-
-性能报告需要同时保留：
-
-* 样本代码版本；
-* 测试机器信息；
-* 执行命令；
-* `elapsed_ms`，即总耗时；
-* `write_ms`，即数据库写入耗时；
-* 峰值内存；
-* 数据库文件大小。
+性能报告需要同时保留样本代码版本、测试机器信息、执行命令、`elapsed_ms`、`write_ms`、峰值内存和数据库文件大小。
 
 详细复现方法见 `docs/benchmark/`。
 
@@ -330,12 +318,7 @@ cargo fmt --all -- --check
 cargo clippy -p fossilsense --all-targets -- -D warnings
 ```
 
-其中：
-
-* `cargo build`：编译 Rust 项目；
-* `cargo test`：运行 Rust 测试；
-* `cargo fmt --check`：检查代码格式是否符合统一规范；
-* `cargo clippy`：执行 Rust 静态检查，`-D warnings` 表示任何警告都按失败处理。
+上述命令依次负责编译、测试、格式检查和静态检查；`-D warnings` 表示任何警告都按失败处理。
 
 VS Code 扩展：
 
@@ -350,13 +333,7 @@ pnpm run test
 
 ## 打包与发布
 
-仓库根目录的一键构建入口会完成以下工作：
-
-* 安装依赖；
-* 运行 Rust 测试；
-* 运行 VS Code 扩展测试；
-* 创建不依赖用户本地工具链的 VSIX 安装包；
-* 执行发布前验证。
+仓库根目录的一键构建入口会安装依赖，运行 Rust 与扩展测试，创建不依赖用户本地工具链的 VSIX，并执行发布前验证。
 
 命令如下：
 
@@ -380,24 +357,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify_release_harde
 dist/fossilsense-vscode-<version>_BUILD<YYYYMMDD_HHMMSS>.vsix
 ```
 
-`pnpm run package` 会：
-
-1. 构建 release 模式的 Rust 可执行程序；
-2. 打包 VS Code 扩展；
-3. 生成 `release-build.json`，记录本次发布所使用关键输入文件的指纹；
-4. 将 Rust 可执行程序放入 VSIX 安装包。
+`pnpm run package` 会构建 release 模式的 Rust 可执行程序、打包扩展、生成记录关键输入指纹的 `release-build.json`，并将可执行程序放入 VSIX。
 
 打包完成后，如果 Rust 源码、扩展源码或打包关键输入发生变化，之前生成的 VSIX 必须视为失效，并重新生成。
 
-发布完成时，直接在提交记录、PR 或发布页面记录：
-
-* 最终 VSIX 文件名；
-* VSIX 文件的 SHA-256 校验值，用于确认安装包内容未被替换；
-* release-input SHA-256，用于确认本次打包输入；
-* 对应源码提交；
-* 验证结果；
-* 当前能力边界；
-* 大型仓库性能数据。
+发布完成时，直接在提交记录、PR 或发布页面记录最终 VSIX 文件名及 SHA-256、release-input SHA-256、对应源码提交、验证结果、当前能力边界和大型仓库性能数据。
 
 不要为了记录这些信息，在仓库中新增开发过程文档。
 

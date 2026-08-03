@@ -142,6 +142,8 @@ impl PublishedWorkspaceSemantics {
             language_resolver: LanguageResolver::from_workspace_config(&workspace, &config),
             include_roots: Vec::new(),
             go_module_roots: Vec::new(),
+            protobuf_c_enabled: false,
+            proto_roots: Vec::new(),
             issues: Vec::new(),
         });
         Self {
@@ -195,6 +197,8 @@ impl PublishedWorkspaceSemantics {
             workspace_root,
             client_include_paths,
             client_go_module_paths,
+            None,
+            &[],
         )
         .map(|configuration| Self::from_index_configuration(workspace_root, &configuration))
         .unwrap_or_else(|_| Self::empty(workspace_root))
@@ -210,6 +214,10 @@ impl PublishedWorkspaceSemantics {
         uri_to_path(uri)
             .map(|path| self.language_for_path(&path))
             .unwrap_or_else(|| SourceLanguage::default_for_path(Path::new(uri.path())))
+    }
+
+    pub(in crate::server) fn protobuf_c_enabled(&self) -> bool {
+        self.index_configuration.protobuf_c_enabled
     }
 
     pub(in crate::server) fn index_configuration_snapshot(
@@ -389,7 +397,13 @@ async fn run_workspace_semantics_bootstrap(
     let go_module_paths = go_module_paths.lock().await.clone();
     let prepare_root = root.clone();
     let prepared = tokio::task::spawn_blocking(move || {
-        crate::indexer::prepare_index_configuration(&prepare_root, &include_paths, &go_module_paths)
+        crate::indexer::prepare_index_configuration(
+            &prepare_root,
+            &include_paths,
+            &go_module_paths,
+            None,
+            &[],
+        )
     })
     .await;
     let configuration = match prepared {

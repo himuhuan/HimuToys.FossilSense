@@ -2,7 +2,7 @@
 
 FossilSense 是一款面向大型、难以构建的 C/C++ 与 Go 仓库的 VS Code 代码导航工具。它不要求 `compile_commands.json`，也不需要额外安装 clangd、gopls、ctags、Go 或 Rust 工具链。安装一个自包含 VSIX，打开工作区后即可建立索引。
 
-当前版本：`1.5.1`。Go 后端继续以实验能力提供，并遵守与 C/C++ 相同的候选式语义、容错与有界查询原则。普通补全的交互路径开始采用 latest-request-wins：文档出现新 revision 时，旧的排队请求会被淘汰，正在进行的紧凑名称召回会协作停止，避免 stale 工作继续挤占前台 CPU。
+当前版本：`1.5.2`。本版本新增默认关闭的 protobuf-c 来源追溯：启用并重新建立索引后，C/C++ 生成类型的悬停信息可以列出匹配的原始 `.proto` 声明。它不会改变“转到定义”的目标，也不会把 `.proto` 注册成新的受支持语言。Go 后端继续以实验能力提供。
 
 ## 什么时候适合使用
 
@@ -16,7 +16,7 @@ FossilSense 主要解决一种很实际的问题：代码就在眼前，但完�
 
 1. 在 VS Code 中打开 `Extensions`。
 2. 选择右上角 `... -> Install from VSIX`。
-3. 选择 `fossilsense-vscode-1.5.1_BUILD*.vsix`。
+3. 选择 `fossilsense-vscode-1.5.2_BUILD*.vsix`。
 4. 打开 C/C++ 或 Go 工作区，等待状态栏进入 `ready`。
 
 默认无需配置。FossilSense 会扫描常见 C/C++ 与 `.go` 文件，并把索引保存在用户缓存目录，不会在源码仓库中生成数据库。
@@ -29,7 +29,7 @@ FossilSense 主要解决一种很实际的问题：代码就在眼前，但完�
 - **显式候选审阅**：**Find All Possible Definitions / Declarations** 展示默认跳转压制前的有界 variants，并附带 role、scope、linkage、guard、pairing 与 coverage 证据。
 - **持续补全**：普通标识符、C/C++ include 路径、Go import 路径、当前函数参数与局部变量，以及有限的成员候选。
 - **引用查找**：全词搜索后按定义、声明、调用、读、写和类型等语法角色分组。
-- **Hover 与 Signature Help**：展示函数签名、注释和参数个数兼容候选；Record Hover 可展示完整的 `struct` / `class` / `union` 声明，唯一 `typedef` 链可显示 `aka`。
+- **Hover 与 Signature Help**：展示函数签名、注释和参数个数兼容候选；Record Hover 可展示完整的 `struct` / `class` / `union` 声明，唯一 `typedef` 链可显示 `aka`。可选的 protobuf-c 来源追溯会在生成类型悬停下方列出匹配的 proto 文件、声明行和匹配依据。
 - **调用关系**：查看 C/C++ 与 Go 直接调用的一跳 incoming / outgoing 关系、调用点和候选证据。
 - **未保存编辑感知**：当前工作区打开但尚未保存的结构化声明可以参与候选结果。
 - **有限语义着色**：重点区分宏、类型、枚举量、参数和局部变量，避免大面积误着色。
@@ -65,7 +65,7 @@ C++ 记录类型中的方法名会作为 function-kind 名称进入普通标识�
 
 ## 可选配置
 
-在工作区根目录创建 `fossilsense.json`，可以限制扫描范围，或加入外部头文件与 Go 模块目录：
+在工作区根目录创建 `fossilsense.json`，可以限制扫描范围，加入外部头文件与 Go 模块目录，或选择启用 protobuf-c 来源追溯：
 
 ```json
 {
@@ -74,6 +74,10 @@ C++ 记录类型中的方法名会作为 function-kind 名称进入普通标识�
   "extensions": ["c", "h", "cpp", "hpp", "go"],
   "includePaths": ["C:/toolchain/include"],
   "goModulePaths": ["D:/shared/device-module"],
+  "protobufC": {
+    "enabled": true,
+    "protoPaths": ["proto", "D:/shared/protocols"]
+  },
   "languageOverrides": [
     { "glob": "legacy-c/**/*.h", "language": "c" },
     { "glob": "generated/cpp/**/*.h", "language": "cpp" },
@@ -86,6 +90,7 @@ C++ 记录类型中的方法名会作为 function-kind 名称进入普通标识�
 - `extensions` 控制识别的源码扩展名。
 - `includePaths` 指向工作区外的 SDK 或工具链头文件目录，必须使用绝对路径。
 - `goModulePaths` 指向明示的外部 Go module 根。每个根独立受文件数和字节数上限约束；不会自动扫描 GOPATH 或本机 module cache。根目录应包含 `go.mod`，否则仍可有界索引声明，但 module import path 证据可能不完整。
+- `protobufC.enabled` 默认是 `false`。启用后，`protobufC.protoPaths` 可以使用相对工作区路径或绝对路径；只有实际出现在 include 关系中的 `*.pb-c.h` 才会尝试关联。无效或超过单目录扫描上限的路径会跳过，其他有效路径继续工作。单个 proto 文件的声明提取上限为 16 MiB，并另有固定的词法单元预算；触顶时会显示状态提示，不会继续无界增长内存。
 - `languageOverrides` 接受 `c` / `cpp` / `go`。匹配不区分大小写；工作区文件按规范化的 `/` 相对路径匹配，外部文件按规范化绝对路径匹配；多条规则命中时最后一条生效。无效规则会产生 warning，但不会丢弃其他有效配置。
 
 语言默认值为：`.c` 使用 C；`.h/.inl/.cpp/.hpp/.cc/.hh/.cxx/.hxx` 使用 C++；`.go` 使用 Go；配置额外加入的未知扩展名仍按 C 处理。磁盘索引和未保存文档使用同一个语言判定器，不读取编辑器 `languageId` 作为另一套事实来源。
@@ -97,6 +102,8 @@ VS Code 设置中常用的选项：
 - `fossilsense.mode`：`auto`、`on` 或 `off`。
 - `fossilsense.includePaths`：额外的外部头文件目录。
 - `fossilsense.goModulePaths`：额外的明示外部 Go module 根；与 `fossilsense.json` 合并并使用相同的有界扫描规则。
+- `fossilsense.protobufC.enabled`：显式启用或关闭 protobuf-c 来源追溯。编辑器中显式设置的值优先于项目配置；未显式设置时继承 `fossilsense.json`。
+- `fossilsense.protobufC.protoPaths`：额外的 proto 绝对目录；与项目配置合并、规范化并去重。
 - `fossilsense.completion.prefixRanking`：默认 `strict`，优先精确名和字面前缀；`scopeFirst` 更重视作用域证据。
 - `fossilsense.projectContext.mode`：自动项目证据、歧义时询问或关闭。
 - `fossilsense.semanticColoring.mode`：启用或关闭 FossilSense 着色。
@@ -109,6 +116,8 @@ VS Code 设置中常用的选项：
 FossilSense 不支持完整的 C++ 继承、模板、重载决议、宏展开、访问控制、命名空间绑定或复杂表达式类型推断。成员调用、函数指针和 callable object 也不会被伪装成已经精确绑定的自由函数关系。
 
 Go 后端不执行接口动态派发、泛型实例化、嵌入成员提升、方法集证明或表达式类型推断。selector、同名方法、函数值和间接调用在证据不足时保留多个候选或 fallback。FossilSense 不调用 Go 工具链；build constraint 与文件名中的 GOOS/GOARCH 只作为可见 guard 和排序/coverage 证据，当前没有 active target 选择。`import "C"` 会显示 unsupported language boundary，但不会推断 Go/C 跨语言绑定。
+
+protobuf-c 来源追溯只识别 proto 的 `package`、顶层或嵌套 `message` 和 `enum` 声明，并保留多个合理候选。它不分析字段、枚举成员、`service`、`oneof`、`map`、选项、导入关系或生成函数；不监听 proto 目录，也不读取未保存的 proto 内容。proto 修改后需要重新建立索引。“转到定义”仍指向生成的 C/C++ 声明。
 
 声明、Hover、跳转、着色、文档符号和调用关系只接受 AST 事实。轻量扫描始终只负责 `#include`；只有 AST 完全不可用时才产生隔离、最低优先级且不可跳转的补全提示。这类提示不进入声明表、语义候选服务或文档解析。
 

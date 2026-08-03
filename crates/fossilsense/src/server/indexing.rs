@@ -124,6 +124,14 @@ struct IndexWorkspaceState {
     roots: Arc<tokio::sync::Mutex<Vec<PathBuf>>>,
 }
 
+#[derive(Clone)]
+struct IndexClientConfiguration {
+    include_paths: Vec<String>,
+    go_module_paths: Vec<String>,
+    protobuf_c_enabled: Option<bool>,
+    protobuf_c_proto_paths: Vec<String>,
+}
+
 enum IndexStatusNotification {}
 
 impl Notification for IndexStatusNotification {
@@ -197,8 +205,12 @@ impl Backend {
             documents: self.session.documents.clone(),
             roots: self.workspace_roots.clone(),
         };
-        let include_paths = self.include_paths.lock().await.clone();
-        let go_module_paths = self.go_module_paths.lock().await.clone();
+        let configuration = IndexClientConfiguration {
+            include_paths: self.include_paths.lock().await.clone(),
+            go_module_paths: self.go_module_paths.lock().await.clone(),
+            protobuf_c_enabled: *self.protobuf_c_enabled.lock().await,
+            protobuf_c_proto_paths: self.protobuf_c_proto_paths.lock().await.clone(),
+        };
         let client = self.client.clone();
         let index_schedule = self.index_schedule.clone();
         let cache = self.session.cache.clone();
@@ -218,8 +230,7 @@ impl Backend {
             run_scheduled_indexes(
                 client,
                 workspace_state,
-                include_paths,
-                go_module_paths,
+                configuration,
                 cache,
                 index_schedule,
                 perf_logging_enabled,
@@ -256,8 +267,12 @@ impl Backend {
             documents: self.session.documents.clone(),
             roots: self.workspace_roots.clone(),
         };
-        let include_paths = self.include_paths.lock().await.clone();
-        let go_module_paths = self.go_module_paths.lock().await.clone();
+        let configuration = IndexClientConfiguration {
+            include_paths: self.include_paths.lock().await.clone(),
+            go_module_paths: self.go_module_paths.lock().await.clone(),
+            protobuf_c_enabled: *self.protobuf_c_enabled.lock().await,
+            protobuf_c_proto_paths: self.protobuf_c_proto_paths.lock().await.clone(),
+        };
         let client = self.client.clone();
         let index_schedule = self.index_schedule.clone();
         let cache = self.session.cache.clone();
@@ -284,8 +299,7 @@ impl Backend {
             run_scheduled_indexes(
                 client,
                 workspace_state,
-                include_paths,
-                go_module_paths,
+                configuration,
                 cache,
                 index_schedule,
                 perf_logging_enabled,
@@ -298,8 +312,7 @@ impl Backend {
 async fn run_scheduled_indexes(
     client: Client,
     workspace_state: IndexWorkspaceState,
-    include_paths: Vec<String>,
-    go_module_paths: Vec<String>,
+    configuration: IndexClientConfiguration,
     cache: CacheLedger,
     index_schedule: IndexSchedule,
     perf_logging_enabled: bool,
@@ -331,8 +344,7 @@ async fn run_scheduled_indexes(
                 index_roots(
                     client.clone(),
                     roots,
-                    include_paths.clone(),
-                    go_module_paths.clone(),
+                    configuration.clone(),
                     cache.clone(),
                     workspace_state.clone(),
                     force,
@@ -342,8 +354,7 @@ async fn run_scheduled_indexes(
                 if !changes.is_empty() {
                     index_dirty_roots(
                         client.clone(),
-                        include_paths.clone(),
-                        go_module_paths.clone(),
+                        configuration.clone(),
                         cache.clone(),
                         workspace_state.clone(),
                         changes,
@@ -355,8 +366,7 @@ async fn run_scheduled_indexes(
             ScheduledIndex::Dirty(changes) if !changes.is_empty() => {
                 index_dirty_roots(
                     client.clone(),
-                    include_paths.clone(),
-                    go_module_paths.clone(),
+                    configuration.clone(),
                     cache.clone(),
                     workspace_state.clone(),
                     changes,
@@ -384,12 +394,10 @@ async fn run_scheduled_indexes(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn index_roots(
     client: Client,
     roots: Vec<PathBuf>,
-    include_paths: Vec<String>,
-    go_module_paths: Vec<String>,
+    configuration: IndexClientConfiguration,
     cache: CacheLedger,
     workspace_state: IndexWorkspaceState,
     force: bool,
@@ -413,13 +421,19 @@ async fn index_roots(
 
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let index_root = root.clone();
-        let include_paths_for_index = include_paths.clone();
-        let go_module_paths_for_index = go_module_paths.clone();
+        let IndexClientConfiguration {
+            include_paths: include_paths_for_index,
+            go_module_paths: go_module_paths_for_index,
+            protobuf_c_enabled: protobuf_c_enabled_for_index,
+            protobuf_c_proto_paths: protobuf_c_proto_paths_for_index,
+        } = configuration.clone();
         let result = tokio::task::spawn_blocking(move || {
             let prepared = indexer::prepare_index_configuration(
                 &index_root,
                 &include_paths_for_index,
                 &go_module_paths_for_index,
+                protobuf_c_enabled_for_index,
+                &protobuf_c_proto_paths_for_index,
             )?;
             let stats = indexer::index_workspace(
                 &index_root,
@@ -428,6 +442,8 @@ async fn index_roots(
                     force,
                     include_paths: include_paths_for_index,
                     go_module_paths: go_module_paths_for_index,
+                    protobuf_c_enabled: protobuf_c_enabled_for_index,
+                    protobuf_c_proto_paths: protobuf_c_proto_paths_for_index,
                     prepared_configuration: Some(prepared.clone()),
                     ..Default::default()
                 },
@@ -610,8 +626,7 @@ async fn index_roots(
 
 async fn index_dirty_roots(
     client: Client,
-    include_paths: Vec<String>,
-    go_module_paths: Vec<String>,
+    configuration: IndexClientConfiguration,
     cache: CacheLedger,
     workspace_state: IndexWorkspaceState,
     changes: Vec<RootDirtyChange>,
@@ -652,8 +667,7 @@ async fn index_dirty_roots(
             index_roots(
                 client.clone(),
                 vec![root],
-                include_paths.clone(),
-                go_module_paths.clone(),
+                configuration.clone(),
                 cache.clone(),
                 workspace_state.clone(),
                 false,
@@ -684,8 +698,12 @@ async fn index_dirty_roots(
 
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let index_root = root.clone();
-        let include_paths_for_index = include_paths.clone();
-        let go_module_paths_for_index = go_module_paths.clone();
+        let IndexClientConfiguration {
+            include_paths: include_paths_for_index,
+            go_module_paths: go_module_paths_for_index,
+            protobuf_c_enabled: protobuf_c_enabled_for_index,
+            protobuf_c_proto_paths: protobuf_c_proto_paths_for_index,
+        } = configuration.clone();
         let workspace_semantics_for_index = workspace_semantics.clone();
         let dirty_changes: Vec<indexer::DirtyFileChange> =
             changes.into_iter().map(|change| change.change).collect();
@@ -699,6 +717,8 @@ async fn index_dirty_roots(
                     force: false,
                     include_paths: include_paths_for_index,
                     go_module_paths: go_module_paths_for_index,
+                    protobuf_c_enabled: protobuf_c_enabled_for_index,
+                    protobuf_c_proto_paths: protobuf_c_proto_paths_for_index,
                     prepared_configuration: Some(prepared.clone()),
                     ..Default::default()
                 },
@@ -878,8 +898,12 @@ impl Backend {
     pub(super) async fn run_dirty_index_for_test(&self, changes: Vec<RootDirtyChange>) {
         index_dirty_roots(
             self.client.clone(),
-            self.include_paths.lock().await.clone(),
-            self.go_module_paths.lock().await.clone(),
+            IndexClientConfiguration {
+                include_paths: self.include_paths.lock().await.clone(),
+                go_module_paths: self.go_module_paths.lock().await.clone(),
+                protobuf_c_enabled: *self.protobuf_c_enabled.lock().await,
+                protobuf_c_proto_paths: self.protobuf_c_proto_paths.lock().await.clone(),
+            },
             self.session.cache.clone(),
             IndexWorkspaceState {
                 documents: self.session.documents.clone(),

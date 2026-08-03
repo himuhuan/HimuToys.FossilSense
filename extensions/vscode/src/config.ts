@@ -34,12 +34,41 @@ export function normalizeExternalPathList(value: unknown): string[] {
   if (!Array.isArray(value)) {
     return [];
   }
-  return [
-    ...new Set(
-      value
-        .filter((entry): entry is string => typeof entry === 'string')
-        .map((entry) => entry.trim())
-        .filter((entry) => entry.length > 0),
-    ),
+  const seen = new Set<string>();
+  const normalized: string[] = [];
+  for (const entry of value.filter((item): item is string => typeof item === 'string')) {
+    const normalizedSeparators = entry.trim().replace(/\\/g, '/');
+    const path =
+      normalizedSeparators === '/' || /^[A-Za-z]:\/$/.test(normalizedSeparators)
+        ? normalizedSeparators
+        : normalizedSeparators.replace(/\/+$/, '');
+    if (path.length === 0) continue;
+    const key = path.toLocaleLowerCase('en-US');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    normalized.push(path);
+  }
+  return normalized;
+}
+
+type InspectedBoolean = Readonly<Record<string, unknown>> | undefined;
+
+/**
+ * Return the effective editor value only when a user/workspace scope actually
+ * set it. The configuration schema default must not mask fossilsense.json.
+ */
+export function resolveExplicitBooleanOverride(
+  effectiveValue: boolean,
+  inspected: InspectedBoolean,
+): boolean | undefined {
+  if (!inspected) return undefined;
+  const explicitKeys = [
+    'globalValue',
+    'workspaceValue',
+    'workspaceFolderValue',
+    'globalLanguageValue',
+    'workspaceLanguageValue',
+    'workspaceFolderLanguageValue',
   ];
+  return explicitKeys.some((key) => inspected[key] !== undefined) ? effectiveValue : undefined;
 }

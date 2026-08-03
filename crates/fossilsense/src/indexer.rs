@@ -5,7 +5,8 @@ use std::time::Instant;
 use anyhow::Result;
 
 use crate::config::{
-    resolve_go_module_roots, resolve_include_roots, ConfigIssue, LanguageResolver, WorkspaceConfig,
+    resolve_go_module_roots, resolve_include_roots, resolve_proto_roots, ConfigIssue,
+    LanguageResolver, WorkspaceConfig,
 };
 use crate::pathing::{
     canonical_workspace, default_index_directory, default_index_path, default_index_staging_path,
@@ -19,6 +20,7 @@ mod go_packages;
 mod include_edges;
 mod parse_pipeline;
 mod progress_limiter;
+mod protobuf_c;
 
 use candidates::{
     candidate_for_path, canonicalize_existing_prefix, discover_candidates,
@@ -29,6 +31,7 @@ use go_packages::build_go_package_graph;
 use include_edges::{build_include_edges, sql_affected_include_edge_sources};
 use parse_pipeline::{parse_and_write_changed, parse_thread_count, ParsePipelineConfig};
 use progress_limiter::ProgressLimiter;
+use protobuf_c::{build_protobuf_c_sources, ProtoScanLimits};
 
 #[derive(Debug, Clone, Default)]
 pub struct IndexOptions {
@@ -40,6 +43,12 @@ pub struct IndexOptions {
     /// Explicit external Go module roots forwarded from the LSP client,
     /// merged with `fossilsense.json`'s `goModulePaths`.
     pub go_module_paths: Vec<String>,
+    /// Explicit editor override for protobuf-c tracing. `None` inherits the
+    /// project value instead of letting the editor schema default mask it.
+    pub protobuf_c_enabled: Option<bool>,
+    /// Absolute proto roots forwarded by the editor and merged with project
+    /// `protobufC.protoPaths`.
+    pub protobuf_c_proto_paths: Vec<String>,
     /// Override the per-root external file-count cap (defaults to ~20k).
     pub external_max_files: Option<usize>,
     /// Override the per-root external byte cap (defaults to ~512 MB).
@@ -59,6 +68,8 @@ pub struct IndexConfigurationSnapshot {
     pub language_resolver: LanguageResolver,
     pub include_roots: Vec<PathBuf>,
     pub go_module_roots: Vec<PathBuf>,
+    pub protobuf_c_enabled: bool,
+    pub proto_roots: Vec<PathBuf>,
     pub issues: Vec<ConfigIssue>,
 }
 
@@ -66,6 +77,8 @@ pub fn prepare_index_configuration(
     workspace: impl AsRef<Path>,
     client_include_paths: &[String],
     client_go_module_paths: &[String],
+    client_protobuf_c_enabled: Option<bool>,
+    client_proto_paths: &[String],
 ) -> Result<IndexConfigurationSnapshot> {
     let workspace = canonical_workspace(workspace)?;
     let (config, config_issue) = WorkspaceConfig::load(&workspace);
@@ -77,10 +90,27 @@ pub fn prepare_index_configuration(
     let (go_module_roots, mut go_module_issues) = resolve_go_module_roots(&go_module_entries);
     let (go_module_roots, overlap_issues) = external_go_module_roots(&workspace, go_module_roots);
     go_module_issues.extend(overlap_issues);
+    let protobuf_c_enabled = client_protobuf_c_enabled.unwrap_or(config.protobuf_c.enabled);
+    let (proto_roots, mut proto_issues) = if protobuf_c_enabled {
+        resolve_proto_roots(
+            &workspace,
+            &config.protobuf_c.proto_paths,
+            client_proto_paths,
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    if protobuf_c_enabled && proto_roots.is_empty() {
+        proto_issues.push(ConfigIssue {
+            message: "protobuf-c source tracing is inactive: no valid proto directories"
+                .to_string(),
+        });
+    }
     let mut issues = Vec::new();
     issues.extend(config_issue);
     issues.extend(include_issues);
     issues.extend(go_module_issues);
+    issues.extend(proto_issues);
     let language_resolver = LanguageResolver::from_workspace_config(&workspace, &config);
     Ok(IndexConfigurationSnapshot {
         workspace,
@@ -88,6 +118,8 @@ pub fn prepare_index_configuration(
         language_resolver,
         include_roots,
         go_module_roots,
+        protobuf_c_enabled,
+        proto_roots,
         issues,
     })
 }
@@ -195,6 +227,8 @@ pub fn index_workspace(
             &workspace,
             &options.include_paths,
             &options.go_module_paths,
+            options.protobuf_c_enabled,
+            &options.protobuf_c_proto_paths,
         )?,
     };
     anyhow::ensure!(
@@ -206,6 +240,8 @@ pub fn index_workspace(
         language_resolver,
         include_roots,
         go_module_roots,
+        protobuf_c_enabled,
+        proto_roots,
         issues: configuration_issues,
         ..
     } = prepared;
@@ -331,6 +367,30 @@ pub fn index_workspace(
     include_graph.go_open_packages = go_package_graph.open_packages;
     include_graph.go_importable_packages = go_package_graph.importable_packages;
     include_graph.clear_all_go_packages = true;
+    let (protobuf_c_sources, protobuf_c_issues) = if protobuf_c_enabled {
+        build_protobuf_c_sources(
+            &store,
+            build,
+            &workspace,
+            &include_roots,
+            &proto_roots,
+            &include_graph,
+            ProtoScanLimits {
+                max_files,
+                max_bytes,
+            },
+        )?
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    include_graph.protobuf_c_sources = Some(protobuf_c_sources);
+    for issue in protobuf_c_issues {
+        progress(IndexStatus::indexing_with_message(
+            workspace_display.clone(),
+            &stats,
+            issue.message,
+        ));
+    }
     let commit = store.commit_index_build(build, &include_graph)?;
     stats.semantic_generation = commit.generation;
     stats.maintenance_warning = commit.cleanup_warning;
@@ -452,6 +512,8 @@ pub fn index_dirty_files(
             &workspace,
             &options.include_paths,
             &options.go_module_paths,
+            options.protobuf_c_enabled,
+            &options.protobuf_c_proto_paths,
         )?,
     };
     anyhow::ensure!(
@@ -463,8 +525,10 @@ pub fn index_dirty_files(
         language_resolver,
         include_roots,
         go_module_roots,
+        protobuf_c_enabled,
+        proto_roots,
         issues: configuration_issues,
-        ..
+        workspace: _,
     } = prepared;
     for issue in configuration_issues {
         progress(IndexStatus::indexing_with_message(
@@ -562,6 +626,36 @@ pub fn index_dirty_files(
     include_graph.go_open_packages = go_package_graph.open_packages;
     include_graph.go_importable_packages = go_package_graph.importable_packages;
     include_graph.clear_all_go_packages = true;
+    let max_files = options
+        .external_max_files
+        .unwrap_or(DEFAULT_EXTERNAL_MAX_FILES);
+    let max_bytes = options
+        .external_max_bytes
+        .unwrap_or(DEFAULT_EXTERNAL_MAX_BYTES);
+    let (protobuf_c_sources, protobuf_c_issues) = if protobuf_c_enabled {
+        build_protobuf_c_sources(
+            &store,
+            build,
+            &workspace,
+            &include_roots,
+            &proto_roots,
+            &include_graph,
+            ProtoScanLimits {
+                max_files,
+                max_bytes,
+            },
+        )?
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    include_graph.protobuf_c_sources = Some(protobuf_c_sources);
+    for issue in protobuf_c_issues {
+        progress(IndexStatus::indexing_with_message(
+            workspace_display.clone(),
+            &stats,
+            issue.message,
+        ));
+    }
     let commit = store.commit_index_build(build, &include_graph)?;
     stats.semantic_generation = commit.generation;
     stats.maintenance_warning = commit.cleanup_warning;

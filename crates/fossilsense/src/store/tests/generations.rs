@@ -1,5 +1,7 @@
 use super::*;
-use crate::store::{FileIndexPayload, FileIndexUpdate, IncludeGraphUpdate};
+use crate::store::{
+    FileIndexPayload, FileIndexUpdate, IncludeGraphUpdate, ProtobufCSourceAssociation,
+};
 
 fn fingerprint(path: &str, source: &str, revision: i64) -> FileFingerprint {
     FileFingerprint {
@@ -45,6 +47,104 @@ fn staged_file_revision_is_invisible_until_manifest_flip() {
     assert!(published.cleanup_warning.is_none());
     assert!(store.declarations_by_name("old_name").unwrap().is_empty());
     assert!(store.declarations_by_name("new_name").unwrap().len() == 1);
+}
+
+#[test]
+fn failed_protobuf_c_association_publish_preserves_the_active_generation() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("index.sqlite");
+    let mut store = IndexStore::open(&db, dir.path()).unwrap();
+    upsert_source(
+        &mut store,
+        "device.pb-c.h",
+        "typedef struct Demo__Device Demo__Device;\n",
+    );
+    let declaration_id = store
+        .declarations_by_name("Demo__Device")
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("generated declaration")
+        .id;
+
+    let build = store.begin_index_build(false).unwrap();
+    let graph = IncludeGraphUpdate {
+        protobuf_c_sources: Some(vec![protobuf_c_source(declaration_id, "old.proto")]),
+        ..Default::default()
+    };
+    let published = store.commit_index_build(build, &graph).unwrap();
+    assert_eq!(published.generation, 2);
+
+    let failed_build = store.begin_index_build(false).unwrap();
+    let invalid_graph = IncludeGraphUpdate {
+        protobuf_c_sources: Some(vec![protobuf_c_source(i64::MAX, "new.proto")]),
+        ..Default::default()
+    };
+    store
+        .commit_index_build(failed_build, &invalid_graph)
+        .expect_err("invalid association must reject the publication");
+
+    assert_eq!(store.semantic_generation().unwrap(), 2);
+    let (sources, truncated) = store
+        .protobuf_c_source_view()
+        .sources_for_declaration_ids(&[declaration_id], 64)
+        .unwrap();
+    assert!(!truncated);
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0].proto_path, "old.proto");
+}
+
+#[test]
+fn protobuf_c_source_query_covers_the_full_semantic_candidate_budget() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("index.sqlite");
+    let mut store = IndexStore::open(&db, dir.path()).unwrap();
+    let source = "typedef struct Demo__Device Demo__Device;\n".repeat(129);
+    upsert_source(&mut store, "device.pb-c.h", &source);
+    let declaration_ids: Vec<_> = store
+        .declarations_by_name("Demo__Device")
+        .unwrap()
+        .into_iter()
+        .map(|row| row.id)
+        .take(129)
+        .collect();
+    assert_eq!(declaration_ids.len(), 129);
+
+    let build = store.begin_index_build(false).unwrap();
+    let graph = IncludeGraphUpdate {
+        protobuf_c_sources: Some(vec![protobuf_c_source(
+            declaration_ids[128],
+            "candidate-129.proto",
+        )]),
+        ..Default::default()
+    };
+    store.commit_index_build(build, &graph).unwrap();
+
+    let (sources, truncated) = store
+        .protobuf_c_source_view()
+        .sources_for_declaration_ids(&declaration_ids, 64)
+        .unwrap();
+    assert!(!truncated);
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0].proto_path, "candidate-129.proto");
+}
+
+fn protobuf_c_source(declaration_id: i64, proto_path: &str) -> ProtobufCSourceAssociation {
+    ProtobufCSourceAssociation {
+        declaration_id,
+        proto_path: proto_path.to_string(),
+        proto_name: "demo.Device".to_string(),
+        c_name: "Demo__Device".to_string(),
+        kind: "message".to_string(),
+        start_byte: 14,
+        end_byte: 31,
+        start_line: 0,
+        start_col: 14,
+        end_line: 0,
+        end_col: 31,
+        match_kind: "relative_path".to_string(),
+        source_truncated: false,
+    }
 }
 
 #[test]

@@ -122,6 +122,47 @@ pub(super) fn parse_go_module_paths(params: &InitializeParams) -> Vec<String> {
     parse_external_paths(params, "goModulePaths")
 }
 
+/// `None` means the editor did not explicitly set the opt-in and the project
+/// configuration remains authoritative.
+pub(super) fn parse_protobuf_c_enabled(params: &InitializeParams) -> Option<bool> {
+    params
+        .initialization_options
+        .as_ref()
+        .and_then(|options| options.as_object())
+        .and_then(|object| object.get("fossilsense"))
+        .and_then(|value| value.as_object())
+        .and_then(|object| object.get("protobufC"))
+        .and_then(|value| value.as_object())
+        .and_then(|object| object.get("enabled"))
+        .and_then(|value| value.as_bool())
+}
+
+pub(super) fn parse_protobuf_c_proto_paths(params: &InitializeParams) -> Vec<String> {
+    let Some(protobuf_c) = params
+        .initialization_options
+        .as_ref()
+        .and_then(|options| options.as_object())
+        .and_then(|object| object.get("fossilsense"))
+        .and_then(|value| value.as_object())
+        .and_then(|object| object.get("protobufC"))
+        .and_then(|value| value.as_object())
+    else {
+        return Vec::new();
+    };
+    protobuf_c
+        .get("protoPaths")
+        .and_then(|value| value.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str())
+                .map(|value| value.trim().replace('\\', "/"))
+                .filter(|value| !value.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn parse_external_paths(params: &InitializeParams, field: &str) -> Vec<String> {
     let Some(opts) = &params.initialization_options else {
         return Vec::new();
@@ -533,6 +574,35 @@ mod tests {
             vec!["C:/deps/device".to_string(), "/opt/go/device".to_string()]
         );
         assert!(parse_go_module_paths(&InitializeParams::default()).is_empty());
+    }
+
+    #[test]
+    fn parse_protobuf_c_options_preserves_explicit_enabled_override() {
+        let enabled = InitializeParams {
+            initialization_options: Some(serde_json::json!({
+                "fossilsense": {
+                    "protobufC": {
+                        "enabled": false,
+                        "protoPaths": ["C:\\shared\\proto", "", 7, "/opt/proto"]
+                    }
+                }
+            })),
+            ..Default::default()
+        };
+        assert_eq!(parse_protobuf_c_enabled(&enabled), Some(false));
+        assert_eq!(
+            parse_protobuf_c_proto_paths(&enabled),
+            vec!["C:/shared/proto".to_string(), "/opt/proto".to_string()]
+        );
+
+        let inherited = InitializeParams {
+            initialization_options: Some(serde_json::json!({
+                "fossilsense": { "protobufC": { "protoPaths": [] } }
+            })),
+            ..Default::default()
+        };
+        assert_eq!(parse_protobuf_c_enabled(&inherited), None);
+        assert!(parse_protobuf_c_proto_paths(&InitializeParams::default()).is_empty());
     }
 
     #[test]

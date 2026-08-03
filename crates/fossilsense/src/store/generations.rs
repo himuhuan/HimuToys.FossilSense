@@ -310,6 +310,33 @@ impl IndexStore {
              )",
             [],
         )?;
+        if let Some(protobuf_c_sources) = &include_graph.protobuf_c_sources {
+            tx.execute("DELETE FROM protobuf_c_sources", [])?;
+            let mut insert = tx.prepare(
+                "INSERT INTO protobuf_c_sources (
+                    declaration_id, proto_path, proto_name, c_name, kind,
+                    start_byte, end_byte, start_line, start_col, end_line, end_col,
+                    match_kind, source_truncated
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            )?;
+            for source in protobuf_c_sources {
+                insert.execute(rusqlite::params![
+                    source.declaration_id,
+                    source.proto_path,
+                    source.proto_name,
+                    source.c_name,
+                    source.kind,
+                    source.start_byte as i64,
+                    source.end_byte as i64,
+                    source.start_line as i64,
+                    source.start_col as i64,
+                    source.end_line as i64,
+                    source.end_col as i64,
+                    source.match_kind,
+                    i64::from(source.source_truncated),
+                ])?;
+            }
+        }
         tx.execute(
             "INSERT INTO meta (key, value) VALUES ('semantic_generation', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -548,6 +575,19 @@ impl IndexStore {
                        )",
                 [],
             )?;
+            tx.execute(
+                "DELETE FROM protobuf_c_sources
+                 WHERE declaration_id IN (
+                     SELECT id FROM declaration_facts
+                     WHERE revision_id IN (
+                               SELECT revision_id FROM cleanup_obsolete_revisions
+                           )
+                        OR file_id IN (
+                               SELECT file_id FROM cleanup_orphan_files
+                           )
+                 )",
+                [],
+            )?;
 
             for table in [
                 "fallback_completion_facts",
@@ -680,6 +720,19 @@ impl IndexStore {
                     "scoped cleanup left {table} attached to a deleted parent"
                 );
             }
+            let dangling_proto_source: bool = tx.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM protobuf_c_sources s
+                     LEFT JOIN declaration_facts d ON d.id = s.declaration_id
+                     WHERE d.id IS NULL
+                 )",
+                [],
+                |row| row.get(0),
+            )?;
+            anyhow::ensure!(
+                !dangling_proto_source,
+                "scoped cleanup left protobuf-c sources without declarations"
+            );
             let dangling_relation: bool = tx.query_row(
                 "SELECT
                      EXISTS(

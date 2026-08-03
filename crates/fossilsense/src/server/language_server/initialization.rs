@@ -9,6 +9,8 @@ impl Backend {
         *self.workspace_roots.lock().await = roots;
         *self.include_paths.lock().await = parse_include_paths(&params);
         *self.go_module_paths.lock().await = parse_go_module_paths(&params);
+        *self.protobuf_c_enabled.lock().await = parse_protobuf_c_enabled(&params);
+        *self.protobuf_c_proto_paths.lock().await = parse_protobuf_c_proto_paths(&params);
         self.session
             .cache
             .set_semantic_index_memory_budget_mb(parse_semantic_index_memory_budget_mb(&params));

@@ -477,6 +477,8 @@ fn normalize_include_path_keeps_absolute_and_switches_separators() {
         normalize_include_path_entry("/usr/include/".into()),
         "/usr/include"
     );
+    assert_eq!(normalize_include_path_entry("/".into()), "/");
+    assert_eq!(normalize_include_path_entry("C:\\".into()), "C:/");
 }
 
 #[test]
@@ -564,4 +566,63 @@ fn resolve_include_roots_flags_relative_and_duplicate_entries() {
     assert!(issues
         .iter()
         .any(|issue| issue.message.contains("not absolute")));
+}
+
+// ---- protobuf-c source tracing ----
+
+#[test]
+fn protobuf_c_defaults_to_disabled_without_paths() {
+    let dir = tempdir().expect("tempdir");
+    let (config, issue) = WorkspaceConfig::load(dir.path());
+
+    assert!(!config.protobuf_c.enabled);
+    assert!(config.protobuf_c.proto_paths.is_empty());
+    assert!(issue.is_none());
+}
+
+#[test]
+fn protobuf_c_project_config_preserves_relative_and_absolute_paths() {
+    let dir = tempdir().expect("tempdir");
+    fs::write(
+        dir.path().join("fossilsense.json"),
+        r#"{
+            "protobufC": {
+                "enabled": true,
+                "protoPaths": ["proto", "C:\\shared\\proto\\", "proto/"]
+            }
+        }"#,
+    )
+    .expect("write config");
+
+    let (config, issue) = WorkspaceConfig::load(dir.path());
+
+    assert!(config.protobuf_c.enabled);
+    assert_eq!(
+        config.protobuf_c.proto_paths,
+        vec!["proto".to_string(), "C:/shared/proto".to_string()]
+    );
+    assert!(issue
+        .expect("duplicate path issue")
+        .message
+        .contains("protobufC.protoPaths"));
+}
+
+#[test]
+fn malformed_protobuf_c_field_is_ignored_without_losing_other_config() {
+    let dir = tempdir().expect("tempdir");
+    fs::write(
+        dir.path().join("fossilsense.json"),
+        r#"{"include":["src"],"protobufC":"not-an-object"}"#,
+    )
+    .expect("write config");
+
+    let (config, issue) = WorkspaceConfig::load(dir.path());
+
+    assert_eq!(config.include, vec!["src"]);
+    assert!(!config.protobuf_c.enabled);
+    assert!(config.protobuf_c.proto_paths.is_empty());
+    assert!(issue
+        .expect("protobuf config issue")
+        .message
+        .contains("protobufC must be an object"));
 }

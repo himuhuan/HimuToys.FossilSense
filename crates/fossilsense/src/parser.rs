@@ -35,12 +35,14 @@ mod callables;
 mod declarations;
 mod go;
 mod lexical;
+mod protobuf_c;
 
 use ast::collect_ast_index;
 pub use ast::infer_receiver_record;
 #[cfg(test)]
 use lexical::compact_whitespace;
 use lexical::{extract_fallback_completions, scan_includes};
+pub(crate) use protobuf_c::{extract_protobuf_c_declarations, ProtobufCDeclaration};
 
 struct BackendAstProduct {
     ast: ast::AstIndex,

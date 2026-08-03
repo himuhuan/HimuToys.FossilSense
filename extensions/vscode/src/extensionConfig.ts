@@ -8,6 +8,7 @@ import {
   normalizeIncludeScopingMode,
   normalizeOnOffAuto,
   normalizeProjectContextMode,
+  resolveExplicitBooleanOverride,
 } from './config';
 import { resolveServerPathFromCandidates } from './serverPath';
 import {
@@ -37,6 +38,18 @@ export function includePathsFromConfig(): string[] {
 export function goModulePathsFromConfig(): string[] {
   return normalizeExternalPathList(
     vscode.workspace.getConfiguration('fossilsense').get<unknown>('goModulePaths', []),
+  );
+}
+
+export function protobufCEnabledOverrideFromConfig(): boolean | undefined {
+  const config = vscode.workspace.getConfiguration('fossilsense');
+  const effective = config.get<boolean>('protobufC.enabled', false);
+  return resolveExplicitBooleanOverride(effective, config.inspect('protobufC.enabled'));
+}
+
+export function protobufCProtoPathsFromConfig(): string[] {
+  return normalizeExternalPathList(
+    vscode.workspace.getConfiguration('fossilsense').get<unknown>('protobufC.protoPaths', []),
   );
 }
 

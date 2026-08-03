@@ -8,6 +8,7 @@ mod declarations;
 mod go_package_graph;
 mod member;
 mod package_imports;
+mod protobuf_c;
 
 #[allow(unused_imports)]
 pub use call_facts::{CallCoverageRow, CallFactStoreView, CallSiteRow, CallableAnchorRow};
@@ -24,6 +25,11 @@ pub use go_package_graph::{
 pub use member::{MemberReadRow, MemberStoreView, RecordReadRow, TypeAliasReadRow};
 #[allow(unused_imports)]
 pub use package_imports::{ImportReadRow, PackageImportStoreView, PackageReadRow};
+#[allow(unused_imports)]
+pub use protobuf_c::{
+    ProtobufCSourceReadRow, ProtobufCSourceStoreView, MAX_PROTOBUF_C_SOURCE_DECLARATION_IDS,
+    MAX_PROTOBUF_C_SOURCE_QUERY_LIMIT,
+};
 
 use super::IndexStore;
 

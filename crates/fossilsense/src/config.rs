@@ -193,6 +193,16 @@ pub struct ConfigIssue {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProtobufCConfig {
+    /// Project-level opt-in. An explicit editor value is applied later when
+    /// one exact index configuration snapshot is prepared.
+    pub enabled: bool,
+    /// Project entries remain relative to the workspace until preparation so
+    /// `fossilsense.json` can be moved with the repository.
+    pub proto_paths: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceConfig {
     pub include: Vec<String>,
@@ -206,6 +216,8 @@ pub struct WorkspaceConfig {
     /// Explicit external Go module directories. They are independently capped
     /// and never inferred from the machine's GOPATH or module cache.
     pub go_module_paths: Vec<String>,
+    /// Optional protobuf-c generated-type source tracing configuration.
+    pub protobuf_c: ProtobufCConfig,
     pub language_overrides: Vec<LanguageOverride>,
 
     /// Precomputed lookup structures derived from include/exclude/extensions
@@ -347,6 +359,7 @@ impl Default for WorkspaceConfig {
                 .collect(),
             include_paths: Vec::new(),
             go_module_paths: Vec::new(),
+            protobuf_c: ProtobufCConfig::default(),
             language_overrides: Vec::new(),
             matchers: PrecomputedMatchers::default(),
         }
@@ -365,6 +378,8 @@ struct RawConfig {
     include_paths: Option<Vec<String>>,
     #[serde(default, rename = "goModulePaths")]
     go_module_paths: Option<Vec<String>>,
+    #[serde(default, rename = "protobufC")]
+    protobuf_c: Option<Value>,
     #[serde(default, rename = "languageOverrides")]
     language_overrides: Option<Value>,
 }
@@ -430,6 +445,53 @@ impl WorkspaceConfig {
             );
             config.go_module_paths = deduped;
             issues.extend(duplicate_issues);
+        }
+
+        if let Some(protobuf_c) = raw.protobuf_c {
+            match protobuf_c {
+                Value::Object(mut object) => {
+                    if let Some(enabled) = object.remove("enabled") {
+                        match enabled.as_bool() {
+                            Some(enabled) => config.protobuf_c.enabled = enabled,
+                            None => issues.push(ConfigIssue {
+                                message: "protobufC.enabled must be a boolean; using false"
+                                    .to_string(),
+                            }),
+                        }
+                    }
+                    if let Some(proto_paths) = object.remove("protoPaths") {
+                        match proto_paths.as_array() {
+                            Some(entries) => {
+                                let normalized = entries.iter().filter_map(|entry| {
+                                    if let Some(entry) = entry.as_str() {
+                                        Some(normalize_include_path_entry(entry.to_string()))
+                                    } else {
+                                        issues.push(ConfigIssue {
+                                            message: "protobufC.protoPaths entry must be a string; skipping"
+                                                .to_string(),
+                                        });
+                                        None
+                                    }
+                                });
+                                let (paths, duplicate_issues) =
+                                    dedupe_external_paths_with_issues(
+                                        normalized,
+                                        "protobufC.protoPaths",
+                                    );
+                                config.protobuf_c.proto_paths = paths;
+                                issues.extend(duplicate_issues);
+                            }
+                            None => issues.push(ConfigIssue {
+                                message: "protobufC.protoPaths must be an array; ignoring only that field"
+                                    .to_string(),
+                            }),
+                        }
+                    }
+                }
+                _ => issues.push(ConfigIssue {
+                    message: "protobufC must be an object; ignoring only that field".to_string(),
+                }),
+            }
         }
 
         if let Some(overrides) = raw.language_overrides {
@@ -699,10 +761,15 @@ fn normalize_extension_entry(ext: String) -> String {
 /// paths, unlike workspace-relative `include`/`exclude` entries).
 fn normalize_include_path_entry(entry: String) -> String {
     let mut s = entry.trim().replace('\\', "/");
-    while s.len() > 1 && s.ends_with('/') {
+    while s.len() > 1 && s.ends_with('/') && !is_windows_drive_root(&s) {
         s.pop();
     }
     s
+}
+
+fn is_windows_drive_root(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() == 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/'
 }
 
 fn normalize_language_override_glob(entry: String) -> String {
@@ -770,6 +837,81 @@ pub fn resolve_include_roots(entries: &[String]) -> (Vec<PathBuf>, Vec<ConfigIss
 
 pub fn resolve_go_module_roots(entries: &[String]) -> (Vec<PathBuf>, Vec<ConfigIssue>) {
     resolve_external_roots(entries, "goModulePaths")
+}
+
+/// Resolve project and editor protobuf source roots. Project entries may be
+/// workspace-relative; editor entries must be absolute because they do not
+/// have a stable per-workspace base in multi-root VS Code sessions.
+pub fn resolve_proto_roots(
+    workspace: &Path,
+    project_entries: &[String],
+    editor_entries: &[String],
+) -> (Vec<PathBuf>, Vec<ConfigIssue>) {
+    let mut candidates = Vec::new();
+    for entry in project_entries {
+        let path = PathBuf::from(entry);
+        candidates.push(if path.is_absolute() {
+            (path, entry.clone())
+        } else {
+            (workspace.join(path), entry.clone())
+        });
+    }
+    for entry in editor_entries {
+        let path = PathBuf::from(entry);
+        if !path.is_absolute() {
+            candidates.push((PathBuf::new(), entry.clone()));
+        } else {
+            candidates.push((path, entry.clone()));
+        }
+    }
+
+    let mut roots = Vec::new();
+    let mut seen = HashSet::new();
+    let mut issues = Vec::new();
+    for (path, original) in candidates {
+        if path.as_os_str().is_empty() {
+            issues.push(ConfigIssue {
+                message: format!(
+                    "protobufC.protoPaths editor entry is not absolute, skipping: {original}"
+                ),
+            });
+            continue;
+        }
+        match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.is_dir() => {
+                let canonical = path.canonicalize().unwrap_or(path);
+                let key = canonical
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .to_ascii_lowercase();
+                if seen.insert(key) {
+                    roots.push(canonical);
+                } else {
+                    issues.push(ConfigIssue {
+                        message: format!(
+                            "protobufC.protoPaths entry is a duplicate, skipping: {original}"
+                        ),
+                    });
+                }
+            }
+            Ok(_) => issues.push(ConfigIssue {
+                message: format!(
+                    "protobufC.protoPaths entry is not a directory, skipping: {original}"
+                ),
+            }),
+            Err(_) => issues.push(ConfigIssue {
+                message: format!(
+                    "protobufC.protoPaths entry not found or inaccessible, skipping: {original}"
+                ),
+            }),
+        }
+    }
+    roots.sort_by_key(|path| {
+        path.to_string_lossy()
+            .replace('\\', "/")
+            .to_ascii_lowercase()
+    });
+    (roots, issues)
 }
 
 fn resolve_external_roots(

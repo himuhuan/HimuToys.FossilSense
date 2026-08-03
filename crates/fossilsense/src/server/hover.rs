@@ -142,6 +142,7 @@ impl Backend {
             .map(|(_, reach)| reach);
         let mut reach_us = reach_started.elapsed().as_micros();
         let project_context = context.engine.project_context.clone();
+        let protobuf_c_enabled = context.engine.workspace_semantics.protobuf_c_enabled();
         let semantic_generation = context.engine.semantic_generation;
         let call_read_handle = context.engine.call_read_handle.clone();
         let declaration_index = context.engine.declaration_index.clone();
@@ -194,6 +195,18 @@ impl Backend {
                     .sum();
                 let callable_fingerprints =
                     crate::candidate_service::focused_callable_fingerprints(&semantic_set);
+                let protobuf_c_sources = if protobuf_c_enabled
+                    && crate::candidate_service::focused_has_kind(&semantic_set, |kind| {
+                        matches!(
+                            kind,
+                            crate::semantic_model::SemanticDeclarationKind::Type
+                                | crate::semantic_model::SemanticDeclarationKind::Alias
+                        )
+                    }) {
+                    service.protobuf_c_sources_for_set(&semantic_set)?
+                } else {
+                    (Vec::new(), false)
+                };
                 let callable_set = if callable_fingerprints.is_empty() {
                     None
                 } else {
@@ -271,7 +284,16 @@ impl Backend {
                         perf.hydration_us = hydration_started.elapsed().as_micros();
                         perf.hydration_count = hydration.count;
                         perf.hydration_bytes = hydration.bytes;
-                        return Ok((with_candidate_set_evidence(markdown, &semantic_set), perf));
+                        let markdown = with_candidate_set_evidence(markdown, &semantic_set);
+                        return Ok((
+                            append_protobuf_c_sources(
+                                markdown,
+                                &root,
+                                &protobuf_c_sources.0,
+                                protobuf_c_sources.1,
+                            ),
+                            perf,
+                        ));
                     }
                 }
                 if let Some(callable_set) =
@@ -344,7 +366,16 @@ impl Backend {
                 perf.hydration_us = hydration_started.elapsed().as_micros();
                 perf.hydration_count = hydration.count;
                 perf.hydration_bytes = hydration.bytes;
-                Ok((with_candidate_set_evidence(markdown, &semantic_set), perf))
+                let markdown = with_candidate_set_evidence(markdown, &semantic_set);
+                Ok((
+                    append_protobuf_c_sources(
+                        markdown,
+                        &root,
+                        &protobuf_c_sources.0,
+                        protobuf_c_sources.1,
+                    ),
+                    perf,
+                ))
             },
         )
         .await;
@@ -471,6 +502,61 @@ fn with_candidate_set_evidence(
         set.disposition.as_str(),
         notes.join(" | ")
     ))
+}
+
+fn append_protobuf_c_sources(
+    markdown: Option<String>,
+    workspace_root: &Path,
+    sources: &[crate::store::views::ProtobufCSourceReadRow],
+    truncated: bool,
+) -> Option<String> {
+    let mut markdown = markdown?;
+    if sources.is_empty() {
+        if truncated {
+            markdown.push_str(
+                "\n\n---\n\n**proto 来源**\n\n结果已截断，可能来源未保留在本次受限查询中。\n",
+            );
+        }
+        return Some(markdown);
+    }
+
+    markdown.push_str("\n\n---\n\n**proto 来源**\n\n");
+    if sources.len() > 1 || truncated {
+        markdown.push_str("存在多个可能来源；FossilSense 保留全部受限查询范围内的合理候选。\n\n");
+    }
+    for source in sources {
+        let path = Path::new(&source.proto_path);
+        let display_path = pathing::relative_slash_path(workspace_root, path)
+            .unwrap_or_else(|_| source.proto_path.clone());
+        let display_line = source.start_line.saturating_add(1);
+        let mut uri = tower_lsp::lsp_types::Url::from_file_path(path).ok();
+        if let Some(uri) = uri.as_mut() {
+            uri.set_fragment(Some(&format!("L{display_line}")));
+        }
+        let label = escape_markdown_link_label(&format!("{display_path}:{display_line}"));
+        let location = uri.map_or_else(|| format!("`{label}`"), |uri| format!("[{label}]({uri})"));
+        let evidence = if source.match_kind == "relative_path" {
+            "相对路径匹配"
+        } else {
+            "同名文件匹配（较低可信度）"
+        };
+        markdown.push_str(&format!(
+            "- {location} — {} `{}`；匹配依据：{evidence}\n",
+            source.kind,
+            sanitize_inline(&source.proto_name),
+        ));
+    }
+    if truncated {
+        markdown.push_str("\n结果已截断，可能仍有其他 proto 来源。\n");
+    }
+    Some(markdown)
+}
+
+fn escape_markdown_link_label(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('[', "\\[")
+        .replace(']', "\\]")
 }
 
 fn hover_markdown_for_type_candidates(
@@ -970,6 +1056,64 @@ fn hover_markdown_for_candidates_with_project(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protobuf_c_hover_keeps_external_sources_clickable_and_marks_uncertainty() {
+        let workspace = unique_temp_root("proto-hover-workspace");
+        let external = unique_temp_root("proto-hover-external");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::create_dir_all(&external).expect("external");
+        let proto = external.join("device.proto");
+        std::fs::write(&proto, "package demo; message Device {}\n").expect("proto");
+        let proto_path = crate::pathing::normalize_abs_path(&proto);
+        let source = crate::store::views::ProtobufCSourceReadRow {
+            proto_path: proto_path.clone(),
+            proto_name: "demo.Device".to_string(),
+            c_name: "Demo__Device".to_string(),
+            kind: "message".to_string(),
+            start_byte: 14,
+            end_byte: 31,
+            start_line: 0,
+            start_col: 14,
+            end_line: 0,
+            end_col: 31,
+            match_kind: "same_basename".to_string(),
+        };
+
+        let markdown = append_protobuf_c_sources(
+            Some("generated declaration".to_string()),
+            &workspace,
+            std::slice::from_ref(&source),
+            true,
+        )
+        .expect("markdown");
+        let mut expected_uri =
+            tower_lsp::lsp_types::Url::from_file_path(&proto).expect("proto uri");
+        expected_uri.set_fragment(Some("L1"));
+
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&external);
+        assert!(markdown.contains(&proto_path), "{markdown}");
+        assert!(markdown.contains(expected_uri.as_str()), "{markdown}");
+        assert!(markdown.contains("多个可能来源"), "{markdown}");
+        assert!(markdown.contains("较低可信度"), "{markdown}");
+        assert!(markdown.contains("结果已截断"), "{markdown}");
+    }
+
+    #[test]
+    fn protobuf_c_hover_reports_truncation_even_when_no_source_row_was_retained() {
+        let markdown = append_protobuf_c_sources(
+            Some("generated declaration".to_string()),
+            Path::new("F:/repo"),
+            &[],
+            true,
+        )
+        .expect("markdown");
+
+        assert!(markdown.contains("proto 来源"), "{markdown}");
+        assert!(markdown.contains("结果已截断"), "{markdown}");
+        assert!(markdown.contains("可能来源"), "{markdown}");
+    }
 
     fn candidate(path: &str, line: u32, signature: &str) -> query::RankedHoverCandidate {
         candidate_named("foo", path, line, signature)
