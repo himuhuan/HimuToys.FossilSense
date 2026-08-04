@@ -12,3 +12,7 @@ extensions/vscode/bin/
 *.log
 openspec/
 .himuworks/
+.agents/
+.codex/
+CLAUDE.md
+AGENTS.md
