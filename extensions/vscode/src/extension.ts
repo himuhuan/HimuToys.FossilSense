@@ -354,7 +354,7 @@ async function startServer(context: vscode.ExtensionContext): Promise<void> {
     if (!resourceMonitorEnabledFromConfig()) {
       return;
     }
-    setResourceStatus(usage.memoryBytes, usage.indexDiskBytes);
+    setResourceStatus(usage);
   });
 
   try {
@@ -710,8 +710,10 @@ function setProjectContextStatus(status: ProjectContextStatus | undefined): void
   projectContextStatusBar.command = SELECT_PROJECT_CONTEXT_COMMAND;
 }
 
-function setResourceStatus(memoryBytes: number, diskBytes: number): void {
-  resourceStatusBar.text = resourceUsageStatusText(memoryBytes, diskBytes);
-  resourceStatusBar.tooltip = resourceUsageTooltip(memoryBytes, diskBytes);
+function setResourceStatus(usage: ResourceUsage): void {
+  resourceStatusBar.text = resourceUsageStatusText(usage.memoryBytes, usage.indexDiskBytes);
+  const tooltip = new vscode.MarkdownString(resourceUsageTooltip(usage));
+  tooltip.supportHtml = false;
+  resourceStatusBar.tooltip = tooltip;
   resourceStatusBar.show();
 }

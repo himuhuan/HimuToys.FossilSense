@@ -20,6 +20,7 @@ mod cache;
 mod watch;
 
 pub(super) use cache::ready_cache_message;
+pub(crate) use cache::{hydrate_memory_report, snapshot_memory_report_from_parts};
 #[cfg(test)]
 pub(super) use cache::{rebuild_include_table, rebuild_indexed_file_list};
 pub(super) use watch::watched_change_in_scope;

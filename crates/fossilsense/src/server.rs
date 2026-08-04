@@ -72,6 +72,7 @@ use include_completion::{
     location_at_file_start, resolve_include_paths, CurrentIncludeEvidence, ExternalIncludeDirCache,
     IncludeCompletionTable,
 };
+pub(crate) use indexing::hydrate_memory_report;
 #[cfg(test)]
 use indexing::{
     ready_cache_message, rebuild_include_table, rebuild_indexed_file_list, RootDirtyChange,

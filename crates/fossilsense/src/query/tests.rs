@@ -875,6 +875,49 @@ fn bounded_completion_recall_matches_full_scan_across_match_tiers() {
 }
 
 #[test]
+fn accounted_segment_split_tracks_base_and_delta_segments() {
+    use crate::semantic_model::{SemanticDeclarationKind, SemanticDeclarationRole};
+    use crate::store::views::DeclarationNameRow;
+
+    fn row(id: i64, name: &str, path: &str) -> DeclarationNameRow {
+        DeclarationNameRow {
+            id,
+            name: name.into(),
+            declaration_kind: SemanticDeclarationKind::Function,
+            role: SemanticDeclarationRole::Definition,
+            path: path.into(),
+            external: false,
+            directly_included: false,
+            semantic_family: SemanticFamily::CFamily,
+        }
+    }
+
+    let table = NameTable::build_from_declaration_name_rows_with_project_context(
+        vec![row(1, "alpha_main", "src/main.c")],
+        None,
+    );
+    let (base, deltas, delta_count) = table.accounted_segment_split();
+    assert!(base > 0);
+    assert_eq!(deltas, 0);
+    assert_eq!(delta_count, 0);
+    assert!(table.accounted_bytes() >= base);
+
+    let updated = table.with_updated_declaration_name_rows_with_project_context(
+        &std::collections::HashSet::from(["src/main.c".to_string()]),
+        vec![
+            row(1, "alpha_main", "src/main.c"),
+            row(2, "alpha_util", "src/main.c"),
+        ],
+        None,
+    );
+    let (updated_base, updated_deltas, updated_delta_count) = updated.accounted_segment_split();
+    assert_eq!(updated_base, base);
+    assert!(updated_deltas > 0);
+    assert_eq!(updated_delta_count, 1);
+    assert!(updated.accounted_bytes() >= updated_base.saturating_add(updated_deltas));
+}
+
+#[test]
 fn bounded_completion_recall_filters_semantic_family_before_spending_budget() {
     use crate::semantic_model::{SemanticDeclarationKind, SemanticDeclarationRole};
     use crate::store::views::DeclarationNameRow;

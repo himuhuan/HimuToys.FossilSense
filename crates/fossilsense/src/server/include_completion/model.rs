@@ -1,8 +1,10 @@
 use std::collections::{HashMap, HashSet};
+use std::mem::size_of;
 
 use tower_lsp::lsp_types::CompletionItem;
 
 use crate::includes;
+use crate::memory_report::{hash_table_bytes, vec_bytes};
 use crate::store::views::{IncludeCompletionPathRow, IncludeEdgeRow};
 
 use super::{
@@ -85,6 +87,50 @@ impl IncludeCompletionTable {
 
     pub(in crate::server) fn len(&self) -> usize {
         self.workspace_paths.len()
+    }
+
+    /// Structure-level estimate of the bytes this table holds, for memory
+    /// observability. Not an allocator promise; the process-level gates stay
+    /// authoritative.
+    pub(in crate::server) fn accounted_bytes(&self) -> usize {
+        let mut bytes = size_of::<Self>();
+        bytes = bytes.saturating_add(vec_bytes::<String>(self.workspace_paths.capacity()));
+        for path in &self.workspace_paths {
+            bytes = bytes.saturating_add(path.len());
+        }
+        bytes = bytes.saturating_add(hash_table_bytes::<String, usize>(
+            self.basename_counts.capacity(),
+        ));
+        for name in self.basename_counts.keys() {
+            bytes = bytes.saturating_add(name.len());
+        }
+        bytes = bytes.saturating_add(hash_table_bytes::<String, HashSet<String>>(
+            self.incoming_by_src_dir.capacity(),
+        ));
+        for (dir, targets) in &self.incoming_by_src_dir {
+            bytes = bytes
+                .saturating_add(dir.len())
+                .saturating_add(hash_table_bytes::<String, ()>(targets.capacity()));
+            for target in targets {
+                bytes = bytes.saturating_add(target.len());
+            }
+        }
+        bytes = bytes.saturating_add(hash_table_bytes::<String, Vec<IndexedIncludeCandidate>>(
+            self.candidates_by_dir.capacity(),
+        ));
+        for (dir, candidates) in &self.candidates_by_dir {
+            bytes =
+                bytes
+                    .saturating_add(dir.len())
+                    .saturating_add(vec_bytes::<IndexedIncludeCandidate>(candidates.capacity()));
+            for candidate in candidates {
+                bytes = bytes
+                    .saturating_add(candidate.name.len())
+                    .saturating_add(candidate.name_lower.len())
+                    .saturating_add(candidate.rel_path.len());
+            }
+        }
+        bytes
     }
 
     #[cfg(test)]
@@ -263,5 +309,34 @@ impl CurrentIncludeEvidence {
             }
         }
         evidence
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accounted_bytes_grows_with_paths_and_edges() {
+        let empty = IncludeCompletionTable::default();
+        let baseline = empty.accounted_bytes();
+
+        let table = IncludeCompletionTable::build_with_edges(
+            vec![
+                "include/alpha.h".to_string(),
+                "include/detail/beta.h".to_string(),
+                "src/main.c".to_string(),
+            ],
+            vec![
+                ("src/main.c".to_string(), "include/alpha.h".to_string()),
+                (
+                    "include/alpha.h".to_string(),
+                    "include/detail/beta.h".to_string(),
+                ),
+            ],
+        );
+
+        assert_eq!(table.len(), 3);
+        assert!(table.accounted_bytes() > baseline);
     }
 }

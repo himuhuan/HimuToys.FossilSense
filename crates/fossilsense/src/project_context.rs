@@ -5,12 +5,14 @@
 //! models are built; request-time lookup is entirely in memory.
 
 use std::collections::BTreeMap;
+use std::mem::size_of;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::config::WorkspaceConfig;
+use crate::memory_report::vec_bytes;
 use crate::pathing::{relative_slash_path, workspace_hash};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -102,6 +104,27 @@ impl ProjectContextIndex {
             .filter(|project| path_is_at_or_under(&normalized, &project.key.project_path))
             .max_by_key(|project| path_depth(&project.key.project_path))
             .map(|project| project.key.clone())
+    }
+
+    /// Structure-level estimate of the bytes this index holds, for memory
+    /// observability. Not an allocator promise; the process-level gates stay
+    /// authoritative.
+    pub fn accounted_bytes(&self) -> usize {
+        let mut bytes = size_of::<Self>()
+            .saturating_add(self.workspace_root_id.len())
+            .saturating_add(self.workspace_name.len())
+            .saturating_add(vec_bytes::<ProjectContext>(self.projects.capacity()));
+        for project in &self.projects {
+            bytes = bytes
+                .saturating_add(project.key.workspace_root_id.len())
+                .saturating_add(project.key.project_path.len())
+                .saturating_add(project.workspace_name.len())
+                .saturating_add(vec_bytes::<String>(project.marker_files.capacity()));
+            for marker in &project.marker_files {
+                bytes = bytes.saturating_add(marker.len());
+            }
+        }
+        bytes
     }
 }
 
@@ -247,6 +270,27 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn accounted_bytes_grows_with_projects() {
+        let empty = ProjectContextIndex::default();
+        let baseline = empty.accounted_bytes();
+
+        let index = ProjectContextIndex::new(
+            "root-1".into(),
+            "demo".into(),
+            vec![ProjectContext {
+                key: ProjectKey {
+                    workspace_root_id: "root-1".into(),
+                    project_path: "apps/demo".into(),
+                },
+                workspace_name: "demo".into(),
+                marker_files: vec!["apps/demo/Makefile".into()],
+            }],
+        );
+
+        assert!(index.accounted_bytes() > baseline);
+    }
 
     #[test]
     fn marker_policy_covers_main_build_files_and_rejects_fragments() {

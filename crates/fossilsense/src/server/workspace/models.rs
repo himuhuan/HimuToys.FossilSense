@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use tokio::sync::Mutex;
 use tower_lsp::lsp_types::Url;
@@ -13,10 +13,16 @@ use crate::call_model::SemanticGeneration;
 use crate::call_service::CallReadHandle;
 use crate::candidate_service::{CandidateOverlaySnapshot, IncludePathIndex, RecallUniverseId};
 use crate::declaration_index::SemanticDeclarationIndex;
+use crate::memory_report::{DeclarationCacheSample, SnapshotMemoryReport};
 use crate::project_context::ProjectContextIndex;
 use crate::query::NameTable;
 use crate::reachability::ReachGraph;
 use crate::references;
+
+/// Per-(root, epoch) memoized static memory reports, shared with the
+/// resource-monitor blocking thread.
+type SnapshotMemoryReports =
+    Arc<StdMutex<HashMap<(PathBuf, state::EngineEpoch), Arc<SnapshotMemoryReport>>>>;
 
 #[derive(Clone)]
 pub(in crate::server) struct CacheLedger {
@@ -28,6 +34,10 @@ pub(in crate::server) struct CacheLedger {
     pub(in crate::server) completion_memo: Arc<Mutex<HashMap<Url, state::CompletionMemo>>>,
     pub(super) candidate_overlays: Arc<Mutex<CandidateOverlayCache>>,
     pub(super) semantic_index_memory_budget_bytes: Arc<AtomicU64>,
+    /// Per-(root, epoch) static memory reports. Entries are computed lazily on
+    /// the resource-monitor thread and pruned as soon as a newer generation is
+    /// published for the same root, so the map never outlives its snapshot.
+    pub(in crate::server) snapshot_memory_reports: SnapshotMemoryReports,
     #[cfg(test)]
     pub(super) completion_overlay_cache_hits: Arc<AtomicU64>,
     #[cfg(test)]
@@ -128,6 +138,7 @@ impl Default for CacheLedger {
             completion_memo: Arc::new(Mutex::new(HashMap::new())),
             candidate_overlays: Arc::new(Mutex::new(CandidateOverlayCache::default())),
             semantic_index_memory_budget_bytes: Arc::new(AtomicU64::new(256 * 1024 * 1024)),
+            snapshot_memory_reports: Arc::new(StdMutex::new(HashMap::new())),
             #[cfg(test)]
             completion_overlay_cache_hits: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
@@ -148,6 +159,67 @@ impl CacheLedger {
                 .load(Ordering::Acquire),
         )
         .unwrap_or(usize::MAX)
+    }
+
+    /// Static per-generation reports plus live payload-cache samples for the
+    /// given published snapshots. Missing static reports are computed once and
+    /// memoized per (root, epoch); stale generations are pruned. Runs on the
+    /// resource-monitor blocking thread, not on request paths.
+    pub(in crate::server) fn memory_observation(
+        &self,
+        snapshots: &[Arc<EngineSnapshot>],
+    ) -> (Vec<SnapshotMemoryReport>, Vec<DeclarationCacheSample>) {
+        let mut memo = self
+            .snapshot_memory_reports
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current: std::collections::HashSet<(PathBuf, state::EngineEpoch)> = snapshots
+            .iter()
+            .map(|snapshot| (snapshot.root.clone(), snapshot.epoch))
+            .collect();
+        memo.retain(|key, _| current.contains(key));
+
+        let mut statics = Vec::with_capacity(snapshots.len());
+        let mut caches = Vec::new();
+        for snapshot in snapshots {
+            let key = (snapshot.root.clone(), snapshot.epoch);
+            let report = memo.entry(key).or_insert_with(|| {
+                Arc::new(crate::server::indexing::snapshot_memory_report_from_parts(
+                    snapshot.declaration_index.as_deref(),
+                    &snapshot.fallback_completion_table,
+                    snapshot.reach_graph.as_deref(),
+                    snapshot.include_table.as_deref(),
+                    snapshot.go_import_table.as_deref(),
+                    snapshot
+                        .indexed_files
+                        .as_ref()
+                        .map(|files| files.as_slice()),
+                    snapshot.project_context.as_deref(),
+                ))
+            });
+            statics.push((**report).clone());
+            if let Some(index) = &snapshot.declaration_index {
+                caches.push(DeclarationCacheSample {
+                    stats: index.payload_cache_stats(),
+                    budget_bytes: index.payload_budget_bytes(),
+                });
+            }
+        }
+        (statics, caches)
+    }
+
+    /// Bytes of unsaved source text held by cached candidate overlay
+    /// snapshots, for memory observability.
+    pub(in crate::server) async fn overlay_memory_bytes(&self) -> usize {
+        let overlays = self.candidate_overlays.lock().await;
+        let mut bytes = 0usize;
+        for snapshot in overlays.entries.values() {
+            bytes = bytes.saturating_add(snapshot.source_text_bytes());
+        }
+        for entry in overlays.completion_entries.values() {
+            bytes = bytes.saturating_add(entry.snapshot.source_text_bytes());
+        }
+        bytes
     }
 }
 

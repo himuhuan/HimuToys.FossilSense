@@ -1063,6 +1063,14 @@ impl CandidateOverlaySnapshot {
         snapshot
     }
 
+    /// Total bytes of unsaved source text this overlay snapshot holds, for
+    /// memory observability.
+    pub(crate) fn source_text_bytes(&self) -> usize {
+        self.source_by_path
+            .values()
+            .fold(0usize, |bytes, text| bytes.saturating_add(text.len()))
+    }
+
     /// Build the immutable request-local include graph for every shadowed
     /// document. Durable out-edges for those paths are replaced, never mutated
     /// in place; unresolved/ambiguous live includes open the affected scope.

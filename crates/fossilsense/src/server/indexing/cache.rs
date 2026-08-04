@@ -1,15 +1,25 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use tower_lsp::lsp_types::MessageType;
 use tower_lsp::Client;
 
 use crate::candidate_service::IncludePathIndex;
+use crate::completion::ordinary_service::FallbackCompletionNameTable;
+use crate::config::WorkspaceConfig;
+use crate::declaration_index::SemanticDeclarationIndex;
+use crate::memory_report::{
+    DeclarationCacheSample, HydratedMemoryReport, MemoryReport, OpenDocumentsMemoryReport,
+    SnapshotMemoryReport,
+};
 use crate::pathing;
 use crate::progress::DegradedCapabilities;
+use crate::project_context::{self, ProjectContextIndex};
 use crate::reachability::ReachGraph;
+use crate::resource::current_process_memory_bytes;
 use crate::server::workspace::EngineSnapshot;
 use crate::server::{
     CacheLedger, CachePublishReport, GoImportCompletionTable, IncludeCompletionTable,
@@ -17,11 +27,10 @@ use crate::server::{
 use crate::store::IndexStore;
 
 mod declaration_models;
-#[cfg(test)]
-use declaration_models::build_declaration_index_from_db;
 use declaration_models::{
-    capture_call_read_handle, load_semantic_generation, rebuild_declaration_index,
-    rebuild_fallback_completion_table, rebuild_project_context, update_declaration_index_paths,
+    build_declaration_index_from_db, capture_call_read_handle, load_semantic_generation,
+    rebuild_declaration_index, rebuild_fallback_completion_table, rebuild_project_context,
+    update_declaration_index_paths,
 };
 mod message;
 pub(in crate::server) use message::ready_cache_message;
@@ -227,6 +236,141 @@ fn build_include_path_index_from_db(db_path: &Path) -> Result<IncludePathIndex> 
     Ok(IncludePathIndex::build(
         store.include_table_view().include_resolution_paths()?,
     ))
+}
+
+/// Static per-generation memory report assembled from engine-snapshot parts.
+/// Shared by the resource monitor (once per published generation) and the
+/// headless `fossilsense memory` CLI. Values are structure-level estimates;
+/// the process-level gates stay authoritative.
+pub(crate) fn snapshot_memory_report_from_parts(
+    declaration_index: Option<&SemanticDeclarationIndex>,
+    fallback_table: &FallbackCompletionNameTable,
+    reach_graph: Option<&ReachGraph>,
+    include_table: Option<&IncludeCompletionTable>,
+    go_import_table: Option<&GoImportCompletionTable>,
+    indexed_files: Option<&[(String, PathBuf)]>,
+    project_context: Option<&ProjectContextIndex>,
+) -> SnapshotMemoryReport {
+    let mut report = SnapshotMemoryReport {
+        fallback_table_bytes: fallback_table.accounted_bytes(),
+        ..SnapshotMemoryReport::default()
+    };
+    if let Some(index) = declaration_index {
+        let (base, deltas, delta_count) = index.name_table().accounted_segment_split();
+        report.name_table_bytes = index.accounted_core_bytes();
+        report.name_entry_count = index.len();
+        report.base_segment_bytes = base;
+        report.delta_segments_bytes = deltas;
+        report.delta_segment_count = delta_count;
+    }
+    if let Some(graph) = reach_graph {
+        report.reach_graph_bytes = graph.accounted_bytes();
+        report.include_edge_count = graph.include_edge_count();
+    }
+    if let Some(table) = include_table {
+        report.include_table_bytes = table.accounted_bytes();
+    }
+    if let Some(table) = go_import_table {
+        report.go_import_table_bytes = table.accounted_bytes();
+    }
+    if let Some(files) = indexed_files {
+        report.file_count = files.len();
+        let mut bytes = crate::memory_report::vec_bytes::<(String, PathBuf)>(files.len());
+        for (relative, absolute) in files {
+            bytes = bytes
+                .saturating_add(relative.len())
+                .saturating_add(absolute.as_os_str().len());
+        }
+        report.indexed_files_bytes = bytes;
+    }
+    if let Some(context) = project_context {
+        report.project_context_bytes = context.accounted_bytes();
+    }
+    report
+}
+
+/// Hydrate the memory-dominant components of the read model the LSP server
+/// publishes from an existing index and measure their memory footprint.
+/// Backs the headless `fossilsense memory` CLI: synchronous, and on large
+/// workspaces takes seconds plus hundreds of MiB by design. The include path
+/// index and call read handles are not hydrated; like on the live server
+/// they stay inside `process.other_bytes`, keeping the CLI and server
+/// category accounting consistent.
+pub(crate) fn hydrate_memory_report(
+    root: &Path,
+    db_path: Option<PathBuf>,
+    total_budget_bytes: usize,
+) -> Result<HydratedMemoryReport> {
+    let db_path = match db_path {
+        Some(path) => path,
+        None => pathing::default_index_path(root)?,
+    };
+    let memory_before = current_process_memory_bytes();
+    let started = Instant::now();
+    let (config, _) = WorkspaceConfig::load(root);
+    let project_context = project_context::discover_project_contexts(root, &config)?;
+    let declarations =
+        build_declaration_index_from_db(&db_path, Some(&project_context), total_budget_bytes)?;
+    let fallback_table = {
+        let store = IndexStore::open_readonly(&db_path)?;
+        FallbackCompletionNameTable::build(store.fallback_completion_view().all()?)
+    };
+    let go_import_table = {
+        let store = IndexStore::open_readonly(&db_path)?;
+        GoImportCompletionTable::build(store.go_package_graph_view().importable_packages()?)
+    };
+    let reach_graph = build_reach_graph_from_db(&db_path)?;
+    let include_table = build_include_table_from_db(&db_path)?;
+    let indexed_files = build_indexed_file_list_from_db(&db_path, root)?;
+    let hydration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let memory_after = current_process_memory_bytes();
+
+    let snapshot = snapshot_memory_report_from_parts(
+        Some(&declarations),
+        &fallback_table,
+        Some(&reach_graph),
+        Some(&include_table),
+        Some(&go_import_table),
+        Some(&indexed_files),
+        Some(&project_context),
+    );
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let report = MemoryReport::assemble(
+        std::slice::from_ref(&snapshot),
+        &[DeclarationCacheSample {
+            stats: declarations.payload_cache_stats(),
+            budget_bytes: declarations.payload_budget_bytes(),
+        }],
+        OpenDocumentsMemoryReport::default(),
+        memory_after,
+        index_db_disk_bytes(&db_path),
+        timestamp,
+    );
+    Ok(HydratedMemoryReport {
+        declarations: declarations.len(),
+        files: indexed_files.len(),
+        hydration_ms,
+        memory_before_bytes: memory_before,
+        memory_after_bytes: memory_after,
+        hydration_delta_bytes: memory_after.saturating_sub(memory_before),
+        report,
+    })
+}
+
+/// SQLite index file size including WAL/SHM sidecars when present.
+fn index_db_disk_bytes(db_path: &Path) -> u64 {
+    let mut total = 0u64;
+    for suffix in ["", "-wal", "-shm"] {
+        let mut name = db_path.as_os_str().to_os_string();
+        name.push(suffix);
+        if let Ok(metadata) = std::fs::metadata(&name) {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    total
 }
 
 async fn update_indexed_file_list(

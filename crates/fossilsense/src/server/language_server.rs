@@ -19,6 +19,7 @@ impl LanguageServer for Backend {
         super::resource_monitor::spawn_resource_usage_reporter(
             self.client.clone(),
             self.workspace_roots.clone(),
+            self.session.clone(),
             self.resource_monitor_shutdown.clone(),
         );
     }

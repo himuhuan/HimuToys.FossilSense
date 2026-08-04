@@ -164,6 +164,17 @@ impl DocumentStore {
         self.clear_live_state(&uri).await;
     }
 
+    /// `(document_count, text_bytes)` over all open documents, for memory
+    /// observability.
+    pub(super) async fn memory_stats(&self) -> (usize, usize) {
+        let documents = self.open_docs.lock().await;
+        let count = documents.len();
+        let bytes = documents.values().fold(0usize, |bytes, document| {
+            bytes.saturating_add(document.text.len())
+        });
+        (count, bytes)
+    }
+
     pub(super) async fn apply_document_changes(
         &self,
         uri: &Url,

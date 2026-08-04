@@ -221,6 +221,7 @@ WAL 表示数据库写入时先记录修改日志，使读取和写入可以较�
 cargo test -p fossilsense
 cargo run -p fossilsense -- scan samples/mini-c
 cargo run -p fossilsense -- index samples/mini-c --db target/mini.sqlite --force
+cargo run -p fossilsense -- memory samples/mini-c --db target/mini.sqlite # 内存分类统计；--json 输出完整报告
 
 Set-Location extensions/vscode
 pnpm run test

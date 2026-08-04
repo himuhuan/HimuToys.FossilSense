@@ -11,6 +11,7 @@ mod declaration_index;
 mod includes;
 mod indexer;
 mod language_builtins;
+mod memory_report;
 mod model;
 mod parser;
 mod pathing;
@@ -55,7 +56,75 @@ mod cli_tests {
     use clap::{error::ErrorKind, CommandFactory, Parser};
     use tempfile::tempdir;
 
-    use super::{query_semantic_family, Cli};
+    use super::{memory_report_lines, query_semantic_family, Cli};
+
+    #[test]
+    fn memory_report_lines_cover_every_category_key() {
+        let report = crate::memory_report::MemoryReport::assemble(
+            &[crate::memory_report::SnapshotMemoryReport {
+                name_table_bytes: 1_000,
+                name_entry_count: 7,
+                base_segment_bytes: 800,
+                delta_segments_bytes: 100,
+                delta_segment_count: 1,
+                fallback_table_bytes: 50,
+                reach_graph_bytes: 300,
+                include_edge_count: 3,
+                include_table_bytes: 80,
+                go_import_table_bytes: 20,
+                indexed_files_bytes: 60,
+                file_count: 2,
+                project_context_bytes: 10,
+            }],
+            &[],
+            crate::memory_report::OpenDocumentsMemoryReport::default(),
+            10_000,
+            99,
+            42,
+        );
+        let hydrated = crate::memory_report::HydratedMemoryReport {
+            report,
+            declarations: 7,
+            files: 2,
+            hydration_ms: 5,
+            memory_before_bytes: 9_000,
+            memory_after_bytes: 10_000,
+            hydration_delta_bytes: 1_000,
+        };
+
+        let text = memory_report_lines(&hydrated).join("\n");
+        for key in [
+            "declarations: 7",
+            "files: 2",
+            "hydration_ms: 5",
+            "hydration_delta_bytes: 1000",
+            "process_total_bytes: 10000",
+            "process_attributed_bytes:",
+            "process_other_bytes:",
+            "name_index_bytes: 1050",
+            "name_index_entries: 7",
+            "name_index_base_segment_bytes: 800",
+            "name_index_delta_segments_bytes: 100",
+            "name_index_delta_segments: 1",
+            "fallback_table_bytes: 50",
+            "declaration_cache_bytes:",
+            "declaration_cache_budget_bytes:",
+            "declaration_cache_hits:",
+            "declaration_cache_misses:",
+            "declaration_cache_evictions:",
+            "declaration_cache_sql_reads:",
+            "file_relations_bytes: 470",
+            "reach_graph_bytes: 300",
+            "include_edges: 3",
+            "include_table_bytes: 80",
+            "go_import_table_bytes: 20",
+            "indexed_files_bytes: 60",
+            "project_context_bytes: 10",
+            "index_disk_bytes: 99",
+        ] {
+            assert!(text.contains(key), "memory text output must contain {key}");
+        }
+    }
 
     #[test]
     fn version_flag_reports_the_crate_version() {
@@ -123,6 +192,22 @@ enum Command {
     Query {
         #[command(subcommand)]
         kind: QueryCommand,
+    },
+    /// Hydrate an existing index and report estimated memory usage by
+    /// category (no editor or VSIX needed).
+    Memory {
+        /// Workspace root whose index to analyze.
+        workspace: PathBuf,
+        /// Override the SQLite index path (defaults to the cache location).
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// Total semantic-index memory budget in MiB for the hydrated model
+        /// (matches the server's default configuration).
+        #[arg(long, default_value_t = 256)]
+        budget_mb: u64,
+        /// Emit the full report as JSON instead of text.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -266,7 +351,119 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Query { kind } => run_query(kind),
+        Command::Memory {
+            workspace,
+            db,
+            budget_mb,
+            json,
+        } => {
+            let db_path = resolve_db_path(db, &workspace)?;
+            let budget_bytes =
+                usize::try_from(budget_mb.saturating_mul(1024 * 1024)).unwrap_or(usize::MAX);
+            let hydrated = server::hydrate_memory_report(&workspace, Some(db_path), budget_bytes)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&hydrated)?);
+            } else {
+                for line in memory_report_lines(&hydrated) {
+                    println!("{line}");
+                }
+            }
+            Ok(())
+        }
     }
+}
+
+/// Flat `key: value` rendering of a hydrated memory report, matching the
+/// output style of the `index` and `query` commands. The JSON form carries
+/// the same data with full nesting.
+fn memory_report_lines(hydrated: &memory_report::HydratedMemoryReport) -> Vec<String> {
+    let report = &hydrated.report;
+    let mut lines = vec![
+        "FossilSense memory".to_string(),
+        format!("declarations: {}", hydrated.declarations),
+        format!("files: {}", hydrated.files),
+        format!("hydration_ms: {}", hydrated.hydration_ms),
+        format!("memory_before_bytes: {}", hydrated.memory_before_bytes),
+        format!("memory_after_bytes: {}", hydrated.memory_after_bytes),
+        format!("hydration_delta_bytes: {}", hydrated.hydration_delta_bytes),
+        format!("process_total_bytes: {}", report.process.total_bytes),
+        format!(
+            "process_attributed_bytes: {}",
+            report.process.attributed_bytes
+        ),
+        format!("process_other_bytes: {}", report.process.other_bytes),
+        format!("name_index_bytes: {}", report.name_index.bytes),
+        format!("name_index_entries: {}", report.name_index.entry_count),
+        format!(
+            "name_index_base_segment_bytes: {}",
+            report.name_index.base_segment_bytes
+        ),
+        format!(
+            "name_index_delta_segments_bytes: {}",
+            report.name_index.delta_segments_bytes
+        ),
+        format!(
+            "name_index_delta_segments: {}",
+            report.name_index.delta_segment_count
+        ),
+        format!(
+            "fallback_table_bytes: {}",
+            report.name_index.fallback_table_bytes
+        ),
+        format!(
+            "declaration_cache_bytes: {}",
+            report.declaration_cache.bytes
+        ),
+        format!(
+            "declaration_cache_entries: {}",
+            report.declaration_cache.entry_count
+        ),
+        format!(
+            "declaration_cache_budget_bytes: {}",
+            report.declaration_cache.budget_bytes
+        ),
+        format!("declaration_cache_hits: {}", report.declaration_cache.hits),
+        format!(
+            "declaration_cache_misses: {}",
+            report.declaration_cache.misses
+        ),
+        format!(
+            "declaration_cache_evictions: {}",
+            report.declaration_cache.evictions
+        ),
+        format!(
+            "declaration_cache_sql_reads: {}",
+            report.declaration_cache.sql_reads
+        ),
+        format!("file_relations_bytes: {}", report.file_relations.bytes),
+        format!(
+            "reach_graph_bytes: {}",
+            report.file_relations.reach_graph_bytes
+        ),
+        format!(
+            "include_edges: {}",
+            report.file_relations.include_edge_count
+        ),
+        format!(
+            "include_table_bytes: {}",
+            report.file_relations.include_table_bytes
+        ),
+        format!(
+            "go_import_table_bytes: {}",
+            report.file_relations.go_import_table_bytes
+        ),
+        format!(
+            "indexed_files_bytes: {}",
+            report.file_relations.indexed_files_bytes
+        ),
+        format!(
+            "project_context_bytes: {}",
+            report.file_relations.project_context_bytes
+        ),
+        format!("index_disk_bytes: {}", report.index_disk_bytes),
+    ];
+    lines.push(format!("timestamp: {}", report.timestamp));
+    lines
 }
 
 fn run_query(kind: QueryCommand) -> Result<()> {

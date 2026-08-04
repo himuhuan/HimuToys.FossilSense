@@ -100,7 +100,7 @@ All fields are optional. `.c` defaults to C; `.h`, `.inl`, and the standard C++ 
 - `fossilsense.semanticColoring.mode`: enable or disable FossilSense semantic coloring.
 - `fossilsense.includeScoping.mode`: narrow coloring and completion using the current file's resolved `#include` graph. `auto` (default) accepts exact reachable definitions, direct external headers, and bounded heuristic include targets while excluding unrelated whole-workspace definitions when the scope is open; `off` reverts to whole-index behavior.
 - `fossilsense.references.showRanges`: show line suffixes in grouped reference rows.
-- `fossilsense.resourceMonitor.enabled`: show a status bar item with the server's process memory and the on-disk size of its index cache. On by default; updates every 5 seconds while the server is running. Turning it off only hides the item.
+- `fossilsense.resourceMonitor.enabled`: show a status bar item with the server's process memory and the on-disk size of its index cache. On by default; updates every 2 seconds while the server is running. Hover the item for a per-category memory breakdown (name index, declaration cache, file relations, open documents, and more). Turning it off only hides the item.
 - `fossilsense.semanticIndex.memoryBudgetMB`: total target for the declaration semantic index. The always-resident compact completion recall index is charged first; the remainder caches canonical declaration payloads shared by completion resolve, Hover, and navigation. `0` retains recall and loads selected facts from the local database on demand.
 - `fossilsense.debug.candidateReasons`: log definition-candidate scope, confidence, and reason.
 

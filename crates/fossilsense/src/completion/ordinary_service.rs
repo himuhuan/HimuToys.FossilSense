@@ -1,7 +1,9 @@
 use std::collections::HashSet;
+use std::mem::size_of;
 use std::sync::Arc;
 
 use crate::completion_history::CompletionHistorySnapshot;
+use crate::memory_report::{hash_table_bytes, vec_bytes};
 use crate::model;
 use crate::parser::{FactAvailability, FactGroup, FileSemanticIndex};
 use crate::project_context::ProjectKey;
@@ -219,6 +221,40 @@ impl FallbackCompletionNameTable {
                 .collect::<Vec<_>>()
                 .into(),
         }
+    }
+
+    /// Structure-level estimate of the bytes this table holds, for memory
+    /// observability. Not an allocator promise; the process-level gates stay
+    /// authoritative.
+    pub(crate) fn accounted_bytes(&self) -> usize {
+        fn indexed_entries_bytes(entries: &[IndexedFallbackCompletionName]) -> usize {
+            let mut bytes = vec_bytes::<IndexedFallbackCompletionName>(entries.len());
+            for entry in entries {
+                bytes = bytes
+                    .saturating_add(entry.value.name.len())
+                    .saturating_add(entry.value.detail.as_deref().map_or(0, str::len))
+                    .saturating_add(entry.value.path.len())
+                    .saturating_add(entry.lower.len());
+            }
+            bytes
+        }
+
+        let mut bytes = size_of::<Self>()
+            .saturating_add(indexed_entries_bytes(&self.entries))
+            .saturating_add(indexed_entries_bytes(&self.overlay_entries))
+            .saturating_add(hash_table_bytes::<u32, Vec<usize>>(
+                self.match_index.capacity(),
+            ));
+        for positions in self.match_index.values() {
+            bytes = bytes.saturating_add(vec_bytes::<usize>(positions.capacity()));
+        }
+        bytes = bytes.saturating_add(hash_table_bytes::<String, ()>(
+            self.shadowed_paths.capacity(),
+        ));
+        for path in self.shadowed_paths.iter() {
+            bytes = bytes.saturating_add(path.len());
+        }
+        bytes
     }
 }
 
@@ -859,6 +895,29 @@ mod tests {
             .map(|ch| ch.len_utf16() as u32)
             .sum();
         (text, line, character)
+    }
+
+    #[test]
+    fn fallback_table_accounted_bytes_grows_with_entries() {
+        let empty = FallbackCompletionNameTable::default();
+        let baseline = empty.accounted_bytes();
+
+        let table = FallbackCompletionNameTable::from_entries(vec![
+            FallbackCompletionName {
+                name: "alpha_render".into(),
+                kind_hint: crate::semantic_model::CompletionKindHint::Function,
+                detail: Some("void alpha_render(void)".into()),
+                path: "src/alpha.c".into(),
+            },
+            FallbackCompletionName {
+                name: "ALPHA_FLAG".into(),
+                kind_hint: crate::semantic_model::CompletionKindHint::Macro,
+                detail: None,
+                path: "include/alpha.h".into(),
+            },
+        ]);
+
+        assert!(table.accounted_bytes() > baseline);
     }
 
     fn indexed_duplicate_winner(rows: Vec<DeclarationNameRow>) -> (i64, parser::SymbolRole) {

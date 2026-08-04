@@ -131,6 +131,18 @@ impl NameTable {
             .saturating_add(string_set_bytes(&reach.heuristic_files))
     }
 
+    /// `(base_bytes, delta_bytes, delta_segment_count)` split of the
+    /// per-segment accounted bytes, for memory observability. Path overrides,
+    /// active-path lists, and the reach cache live outside the segments and
+    /// remain part of `accounted_bytes` only.
+    pub(crate) fn accounted_segment_split(&self) -> (usize, usize, usize) {
+        let base = self.base.accounted_bytes();
+        let deltas = self.deltas.iter().fold(0usize, |bytes, segment| {
+            bytes.saturating_add(segment.accounted_bytes())
+        });
+        (base, deltas, self.deltas.len())
+    }
+
     #[allow(dead_code)]
     pub fn with_updated_paths(
         &self,

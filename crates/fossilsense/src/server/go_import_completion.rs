@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::mem::size_of;
 use std::ops::Range as IndexRange;
 
 use tower_lsp::lsp_types::{
@@ -6,6 +7,7 @@ use tower_lsp::lsp_types::{
     Position, Range, TextEdit,
 };
 
+use crate::memory_report::vec_bytes;
 use crate::store::views::GoImportablePackageRow;
 
 const GO_IMPORT_COMPLETION_LIMIT: usize = 100;
@@ -73,6 +75,24 @@ impl GoImportCompletionTable {
         let end = start
             + self.entries[start..].partition_point(|entry| entry.import_path.starts_with(prefix));
         start..end
+    }
+
+    /// Structure-level estimate of the bytes this table holds, for memory
+    /// observability. Not an allocator promise; the process-level gates stay
+    /// authoritative.
+    pub(super) fn accounted_bytes(&self) -> usize {
+        let mut bytes = size_of::<Self>().saturating_add(vec_bytes::<GoImportCompletionEntry>(
+            self.entries.capacity(),
+        ));
+        for entry in &self.entries {
+            bytes = bytes
+                .saturating_add(entry.import_path.len())
+                .saturating_add(vec_bytes::<String>(entry.package_keys.capacity()));
+            for package_key in &entry.package_keys {
+                bytes = bytes.saturating_add(package_key.len());
+            }
+        }
+        bytes
     }
 
     pub(super) fn complete(
@@ -451,6 +471,19 @@ mod tests {
             package_key: package_key.into(),
             import_path: import_path.into(),
         }
+    }
+
+    #[test]
+    fn accounted_bytes_grows_with_entries() {
+        let empty = GoImportCompletionTable::default();
+        let baseline = empty.accounted_bytes();
+
+        let table = GoImportCompletionTable::build(vec![
+            import_row("device#device", "example.com/device"),
+            import_row("bo#bo", "example.com/bo"),
+        ]);
+
+        assert!(table.accounted_bytes() > baseline);
     }
 
     #[test]

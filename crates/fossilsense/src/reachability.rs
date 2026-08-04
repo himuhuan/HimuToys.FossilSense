@@ -9,10 +9,12 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::mem::size_of;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crate::includes::ResolutionKind;
+use crate::memory_report::{hash_table_bytes, vec_bytes};
 use crate::store::views::{
     GoOpenPackageRow, GoPackageEdgeRow, GoPackageFileRow, GoPackageResolution, IncludeEdgeRow,
     OpenIncludeRow,
@@ -100,6 +102,75 @@ struct ReachGraphOverlay {
     affected_packages: HashSet<String>,
     open_packages: HashMap<String, OpenReason>,
     direct_external_source_counts: HashMap<String, usize>,
+}
+
+impl ReachGraphOverlay {
+    fn accounted_bytes(&self) -> usize {
+        let mut bytes = size_of::<Self>();
+        bytes = bytes.saturating_add(string_set_bytes(&self.sources));
+        bytes = bytes.saturating_add(edge_map_bytes(&self.edges));
+        bytes = bytes.saturating_add(open_map_bytes(&self.open));
+        bytes = bytes.saturating_add(hash_table_bytes::<String, Option<String>>(
+            self.package_by_file.capacity(),
+        ));
+        for (file, package) in &self.package_by_file {
+            bytes = bytes
+                .saturating_add(file.len())
+                .saturating_add(package.as_deref().map_or(0, str::len));
+        }
+        bytes = bytes.saturating_add(string_set_bytes(&self.affected_packages));
+        bytes = bytes.saturating_add(open_map_bytes(&self.open_packages));
+        bytes = bytes.saturating_add(hash_table_bytes::<String, usize>(
+            self.direct_external_source_counts.capacity(),
+        ));
+        for target in self.direct_external_source_counts.keys() {
+            bytes = bytes.saturating_add(target.len());
+        }
+        bytes
+    }
+}
+
+fn string_set_bytes(values: &HashSet<String>) -> usize {
+    let mut bytes = hash_table_bytes::<String, ()>(values.capacity());
+    for value in values {
+        bytes = bytes.saturating_add(value.len());
+    }
+    bytes
+}
+
+fn string_map_bytes(values: &HashMap<String, String>) -> usize {
+    let mut bytes = hash_table_bytes::<String, String>(values.capacity());
+    for (key, value) in values {
+        bytes = bytes.saturating_add(key.len()).saturating_add(value.len());
+    }
+    bytes
+}
+
+fn open_map_bytes(values: &HashMap<String, OpenReason>) -> usize {
+    let mut bytes = hash_table_bytes::<String, OpenReason>(values.capacity());
+    for key in values.keys() {
+        bytes = bytes.saturating_add(key.len());
+    }
+    bytes
+}
+
+fn edge_map_bytes(values: &HashMap<String, Vec<ReachEdge>>) -> usize {
+    let mut bytes = hash_table_bytes::<String, Vec<ReachEdge>>(values.capacity());
+    for (source, edges) in values {
+        bytes = bytes
+            .saturating_add(source.len())
+            .saturating_add(vec_bytes::<ReachEdge>(edges.capacity()));
+        for edge in edges {
+            bytes = bytes.saturating_add(edge.target.len());
+        }
+    }
+    bytes
+}
+
+fn scope_accounted_bytes(scope: &ReachScope) -> usize {
+    size_of::<ReachScope>()
+        .saturating_add(string_set_bytes(&scope.files))
+        .saturating_add(string_set_bytes(&scope.heuristic_files))
 }
 
 fn is_strong_resolution(resolution: ResolutionKind) -> bool {
@@ -323,6 +394,72 @@ impl ReachGraph {
             .map(|row| (row.package_key, row.reason))
             .collect();
         graph
+    }
+
+    /// Number of file-to-file include edges held by this generation (overlay
+    /// sources included). Feeds memory observability reports.
+    pub fn include_edge_count(&self) -> usize {
+        let base: usize = self.edges.values().map(Vec::len).sum();
+        let overlay: usize = self
+            .overlay
+            .as_ref()
+            .map_or(0, |overlay| overlay.edges.values().map(Vec::len).sum());
+        base.saturating_add(overlay)
+    }
+
+    /// Structure-level estimate of the bytes this graph generation holds, in
+    /// the same spirit as `NameTable::accounted_bytes`. A layered `base` graph
+    /// is *not* counted here: it belongs to the older generation and is
+    /// attributed there, which keeps side-by-side publication from
+    /// double-counting. Estimates feed memory observability only; the
+    /// process-level gates stay authoritative.
+    pub fn accounted_bytes(&self) -> usize {
+        let mut bytes = size_of::<Self>();
+        bytes = bytes.saturating_add(edge_map_bytes(&self.edges));
+        bytes = bytes.saturating_add(open_map_bytes(&self.open));
+        bytes = bytes.saturating_add(string_map_bytes(&self.package_by_file));
+        bytes = bytes.saturating_add(hash_table_bytes::<String, Vec<String>>(
+            self.files_by_package.capacity(),
+        ));
+        for (package, files) in &self.files_by_package {
+            bytes = bytes
+                .saturating_add(package.len())
+                .saturating_add(vec_bytes::<String>(files.capacity()));
+            for file in files {
+                bytes = bytes.saturating_add(file.len());
+            }
+        }
+        bytes = bytes.saturating_add(hash_table_bytes::<String, Vec<PackageReachEdge>>(
+            self.package_edges.capacity(),
+        ));
+        for (package, edges) in &self.package_edges {
+            bytes = bytes
+                .saturating_add(package.len())
+                .saturating_add(vec_bytes::<PackageReachEdge>(edges.capacity()));
+            for edge in edges {
+                bytes = bytes.saturating_add(edge.target.len());
+            }
+        }
+        bytes = bytes.saturating_add(open_map_bytes(&self.open_packages));
+        bytes = bytes.saturating_add(hash_table_bytes::<String, usize>(
+            self.direct_external_source_counts.capacity(),
+        ));
+        for target in self.direct_external_source_counts.keys() {
+            bytes = bytes.saturating_add(target.len());
+        }
+        if let Some(overlay) = &self.overlay {
+            bytes = bytes.saturating_add(overlay.accounted_bytes());
+        }
+        let cache = self.cache.lock().unwrap();
+        bytes = bytes.saturating_add(hash_table_bytes::<String, Arc<ReachScope>>(
+            cache.capacity(),
+        ));
+        for (start, scope) in cache.iter() {
+            bytes = bytes
+                .saturating_add(start.len())
+                .saturating_add(scope_accounted_bytes(scope));
+        }
+        bytes
     }
 
     /// Replace the out-edges and open flags for the given source paths, clearing
@@ -984,6 +1121,38 @@ mod tests {
 
     fn set(values: &[&str]) -> HashSet<String> {
         values.iter().map(|v| v.to_string()).collect()
+    }
+
+    #[test]
+    fn accounted_bytes_grows_with_edges_and_open_nodes() {
+        let empty = ReachGraph::new_with_kinds(vec![], vec![], vec![]);
+        let baseline = empty.accounted_bytes();
+        assert_eq!(empty.include_edge_count(), 0);
+
+        let graph = ReachGraph::new_with_kinds(
+            vec![
+                (
+                    "src/main.c".into(),
+                    "include/alpha.h".into(),
+                    ResolutionKind::WorkspaceExact,
+                ),
+                (
+                    "src/main.c".into(),
+                    "include/beta.h".into(),
+                    ResolutionKind::WorkspaceExact,
+                ),
+                (
+                    "include/alpha.h".into(),
+                    "include/detail/gamma.h".into(),
+                    ResolutionKind::WorkspaceExact,
+                ),
+            ],
+            vec!["src/main.c".into()],
+            vec!["include/alpha.h".into()],
+        );
+
+        assert_eq!(graph.include_edge_count(), 3);
+        assert!(graph.accounted_bytes() > baseline);
     }
 
     fn absolute_test_path(name: &str) -> String {
