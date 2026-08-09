@@ -41,12 +41,102 @@ pub struct ProcessMemoryReport {
     pub other_bytes: u64,
 }
 
+/// Mutually exclusive structural estimates for the resident NameTable. Their
+/// sum explains the name-index core only; Private Bytes/RSS remains the
+/// process-level source of truth.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NameIndexMemoryComponents {
+    pub bytes: u64,
+    pub declaration_entry_bytes: u64,
+    pub name_record_bytes: u64,
+    pub original_name_bytes: u64,
+    pub lowercase_name_bytes: u64,
+    pub shared_name_bytes: u64,
+    pub path_metadata_bytes: u64,
+    pub project_metadata_bytes: u64,
+    pub sorting_index_bytes: u64,
+    pub short_prefix_posting_bytes: u64,
+    pub fuzzy_posting_bytes: u64,
+    pub prefix_path_posting_bytes: u64,
+    pub path_posting_bytes: u64,
+    pub project_posting_bytes: u64,
+    pub fixed_overhead_bytes: u64,
+}
+
+impl NameIndexMemoryComponents {
+    fn recompute_bytes(&mut self) {
+        self.bytes = self
+            .declaration_entry_bytes
+            .saturating_add(self.name_record_bytes)
+            .saturating_add(self.original_name_bytes)
+            .saturating_add(self.lowercase_name_bytes)
+            .saturating_add(self.shared_name_bytes)
+            .saturating_add(self.path_metadata_bytes)
+            .saturating_add(self.project_metadata_bytes)
+            .saturating_add(self.sorting_index_bytes)
+            .saturating_add(self.short_prefix_posting_bytes)
+            .saturating_add(self.fuzzy_posting_bytes)
+            .saturating_add(self.prefix_path_posting_bytes)
+            .saturating_add(self.path_posting_bytes)
+            .saturating_add(self.project_posting_bytes)
+            .saturating_add(self.fixed_overhead_bytes);
+    }
+
+    fn saturating_add_assign(&mut self, other: &Self) {
+        self.declaration_entry_bytes = self
+            .declaration_entry_bytes
+            .saturating_add(other.declaration_entry_bytes);
+        self.name_record_bytes = self
+            .name_record_bytes
+            .saturating_add(other.name_record_bytes);
+        self.original_name_bytes = self
+            .original_name_bytes
+            .saturating_add(other.original_name_bytes);
+        self.lowercase_name_bytes = self
+            .lowercase_name_bytes
+            .saturating_add(other.lowercase_name_bytes);
+        self.shared_name_bytes = self
+            .shared_name_bytes
+            .saturating_add(other.shared_name_bytes);
+        self.path_metadata_bytes = self
+            .path_metadata_bytes
+            .saturating_add(other.path_metadata_bytes);
+        self.project_metadata_bytes = self
+            .project_metadata_bytes
+            .saturating_add(other.project_metadata_bytes);
+        self.sorting_index_bytes = self
+            .sorting_index_bytes
+            .saturating_add(other.sorting_index_bytes);
+        self.short_prefix_posting_bytes = self
+            .short_prefix_posting_bytes
+            .saturating_add(other.short_prefix_posting_bytes);
+        self.fuzzy_posting_bytes = self
+            .fuzzy_posting_bytes
+            .saturating_add(other.fuzzy_posting_bytes);
+        self.prefix_path_posting_bytes = self
+            .prefix_path_posting_bytes
+            .saturating_add(other.prefix_path_posting_bytes);
+        self.path_posting_bytes = self
+            .path_posting_bytes
+            .saturating_add(other.path_posting_bytes);
+        self.project_posting_bytes = self
+            .project_posting_bytes
+            .saturating_add(other.project_posting_bytes);
+        self.fixed_overhead_bytes = self
+            .fixed_overhead_bytes
+            .saturating_add(other.fixed_overhead_bytes);
+    }
+}
+
 /// The always-resident compact recall table behind ordinary completion.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NameIndexMemoryReport {
     pub bytes: u64,
     pub entry_count: u64,
+    #[serde(default)]
+    pub components: NameIndexMemoryComponents,
     pub base_segment_bytes: u64,
     pub delta_segments_bytes: u64,
     pub delta_segment_count: u64,
@@ -118,6 +208,7 @@ pub struct MemoryReport {
 pub struct SnapshotMemoryReport {
     pub name_table_bytes: usize,
     pub name_entry_count: usize,
+    pub name_index_components: NameIndexMemoryComponents,
     pub base_segment_bytes: usize,
     pub delta_segments_bytes: usize,
     pub delta_segment_count: usize,
@@ -163,11 +254,13 @@ impl MemoryReport {
         let mut name_index = NameIndexMemoryReport::default();
         let mut file_relations = FileRelationsMemoryReport::default();
         for snapshot in snapshots {
-            name_index.bytes = name_index.bytes.saturating_add(
-                snapshot
-                    .name_table_bytes
-                    .saturating_add(snapshot.fallback_table_bytes) as u64,
-            );
+            let mut components = snapshot.name_index_components.clone();
+            if components.bytes == 0 && snapshot.name_table_bytes > 0 {
+                components.fixed_overhead_bytes =
+                    u64::try_from(snapshot.name_table_bytes).unwrap_or(u64::MAX);
+            }
+            components.recompute_bytes();
+            name_index.components.saturating_add_assign(&components);
             name_index.entry_count = name_index
                 .entry_count
                 .saturating_add(snapshot.name_entry_count as u64);
@@ -206,6 +299,11 @@ impl MemoryReport {
                 .project_context_bytes
                 .saturating_add(snapshot.project_context_bytes as u64);
         }
+        name_index.components.recompute_bytes();
+        name_index.bytes = name_index
+            .components
+            .bytes
+            .saturating_add(name_index.fallback_table_bytes);
         file_relations.bytes = file_relations
             .reach_graph_bytes
             .saturating_add(file_relations.include_table_bytes)
@@ -265,6 +363,7 @@ mod tests {
         SnapshotMemoryReport {
             name_table_bytes: 1_000,
             name_entry_count: 42,
+            name_index_components: NameIndexMemoryComponents::default(),
             base_segment_bytes: 700,
             delta_segments_bytes: 100,
             delta_segment_count: 2,
@@ -291,6 +390,7 @@ mod tests {
                     evictions: 1,
                     bytes: 400,
                     entries: 11,
+                    ..DeclarationPayloadCacheStats::default()
                 },
                 budget_bytes: 8_000,
             }],
@@ -329,6 +429,46 @@ mod tests {
         assert_eq!(report.process.other_bytes, 10_000 - expected_attributed);
         assert_eq!(report.index_disk_bytes, 777);
         assert_eq!(report.timestamp, 1_234_567);
+    }
+
+    #[test]
+    fn assemble_keeps_name_components_separate_from_fallback_and_saturates_each_field() {
+        let report = MemoryReport::assemble(
+            &[sample_snapshot(), sample_snapshot()],
+            &[],
+            OpenDocumentsMemoryReport::default(),
+            100_000,
+            0,
+            0,
+        );
+
+        assert_eq!(report.name_index.components.bytes, 2_000);
+        assert_eq!(report.name_index.bytes, 2_100);
+        assert_eq!(
+            report.name_index.bytes,
+            report
+                .name_index
+                .components
+                .bytes
+                .saturating_add(report.name_index.fallback_table_bytes),
+        );
+
+        let saturated = SnapshotMemoryReport {
+            name_table_bytes: usize::MAX,
+            fallback_table_bytes: usize::MAX,
+            ..SnapshotMemoryReport::default()
+        };
+        let report = MemoryReport::assemble(
+            &[saturated.clone(), saturated],
+            &[],
+            OpenDocumentsMemoryReport::default(),
+            u64::MAX,
+            0,
+            0,
+        );
+        assert_eq!(report.name_index.components.bytes, u64::MAX);
+        assert_eq!(report.name_index.bytes, u64::MAX);
+        assert_eq!(report.process.other_bytes, 0);
     }
 
     #[test]
@@ -376,6 +516,10 @@ mod tests {
             "\"attributedBytes\"",
             "\"otherBytes\"",
             "\"nameIndex\"",
+            "\"components\"",
+            "\"declarationEntryBytes\"",
+            "\"sharedNameBytes\"",
+            "\"fixedOverheadBytes\"",
             "\"baseSegmentBytes\"",
             "\"deltaSegmentCount\"",
             "\"fallbackTableBytes\"",

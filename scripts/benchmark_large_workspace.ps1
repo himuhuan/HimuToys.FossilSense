@@ -30,6 +30,60 @@ function Resolve-FullPath([string]$Path) {
     return [System.IO.Path]::GetFullPath($Path)
 }
 
+function Get-SampleRevision([string]$Workspace) {
+    try {
+        $revision = @(& git -C $Workspace rev-parse HEAD 2>$null | Select-Object -First 1)
+        if ($LASTEXITCODE -eq 0 -and $revision.Count -eq 1 -and
+            $revision[0] -match '^[0-9a-f]{40}$') {
+            return $revision[0]
+        }
+    } catch {
+        # A benchmark fixture need not be a Git checkout. Preserve that fact in
+        # the report instead of making the measurement unusable.
+    }
+    return 'unavailable'
+}
+
+function Get-DatabaseSizeBytes([string]$Database) {
+    if ([string]::IsNullOrWhiteSpace($Database)) {
+        return 0L
+    }
+    $total = 0L
+    foreach ($suffix in @('', '-wal', '-shm')) {
+        $path = "$Database$suffix"
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
+            $total = $total + [long](Get-Item -LiteralPath $path).Length
+        }
+    }
+    return $total
+}
+
+function Get-BenchmarkMachine {
+    $machine = [ordered]@{
+        os_version = [System.Environment]::OSVersion.VersionString
+        processor_count = [System.Environment]::ProcessorCount
+        processor_name = 'unavailable'
+        physical_memory_bytes = 0L
+    }
+    try {
+        $computer = Get-CimInstance Win32_ComputerSystem
+        $machine.physical_memory_bytes = [long]$computer.TotalPhysicalMemory
+    } catch {
+        # The process/Rust metrics remain valid if a restricted Windows session
+        # cannot expose hardware metadata.
+    }
+    try {
+        $processor = Get-CimInstance Win32_Processor | Select-Object -First 1
+        if ($null -ne $processor -and -not [string]::IsNullOrWhiteSpace($processor.Name)) {
+            $machine.processor_name = $processor.Name.Trim()
+        }
+    } catch {
+        # Keep the explicit unavailable value in the JSON rather than dropping
+        # the field expected by result consumers.
+    }
+    return $machine
+}
+
 function Quote-ProcessArgument([string]$Value) {
     return '"' + $Value.Replace('\', '\').Replace('"', '\"') + '"'
 }
@@ -206,6 +260,50 @@ function Convert-WhitelistedMetrics([string[]]$Lines) {
         engine_hydration_peak_private_bytes = $true
         engine_hydration_first_build_ms = $true
         engine_hydration_second_build_ms = $true
+        engine_hydration_first_name_strings_bytes = $true
+        engine_hydration_first_name_paths_projects_bytes = $true
+        engine_hydration_first_name_postings_bytes = $true
+        engine_hydration_first_name_fixed_bytes = $true
+        engine_hydration_second_name_strings_bytes = $true
+        engine_hydration_second_name_paths_projects_bytes = $true
+        engine_hydration_second_name_postings_bytes = $true
+        engine_hydration_second_name_fixed_bytes = $true
+        engine_hydration_first_file_relations_bytes = $true
+        engine_hydration_second_file_relations_bytes = $true
+        engine_hydration_second_generation_incremental_bytes = $true
+        warm_publication_declarations = $true
+        warm_publication_files = $true
+        warm_publication_payload_budget_bytes = $true
+        warm_publication_effective_budget_before_bytes = $true
+        warm_publication_effective_budget_after_bytes = $true
+        warm_publication_target_bytes = $true
+        warm_publication_cache_bytes = $true
+        warm_publication_cache_entries = $true
+        warm_publication_cache_hits = $true
+        warm_publication_cache_misses = $true
+        warm_publication_cache_sql_reads = $true
+        warm_publication_cache_evictions = $true
+        warm_publication_shrink_entries = $true
+        warm_publication_shrink_bytes = $true
+        warm_publication_single_private_bytes = $true
+        warm_publication_single_peak_private_bytes = $true
+        warm_publication_peak_private_bytes = $true
+        warm_publication_two_generation_private_bytes = $true
+        warm_publication_second_generation_incremental_bytes = $true
+        warm_publication_first_build_ms = $true
+        warm_publication_second_build_ms = $true
+        warm_publication_first_name_strings_bytes = $true
+        warm_publication_first_name_paths_projects_bytes = $true
+        warm_publication_first_name_postings_bytes = $true
+        warm_publication_first_name_fixed_bytes = $true
+        warm_publication_second_name_strings_bytes = $true
+        warm_publication_second_name_paths_projects_bytes = $true
+        warm_publication_second_name_postings_bytes = $true
+        warm_publication_second_name_fixed_bytes = $true
+        warm_publication_first_file_relations_bytes = $true
+        warm_publication_second_file_relations_bytes = $true
+        warm_publication_old_epoch_consistent = $true
+        warm_publication_old_generation_consistent = $true
     }
     $metrics = [ordered]@{}
     foreach ($line in $Lines) {
@@ -451,6 +549,11 @@ foreach ($case in $cases) {
         $sample = Invoke-SampledProcess -FilePath $case.Executable -ArgumentList $case.Arguments `
             -Timeout $caseTimeoutSeconds
         $metrics = Convert-WhitelistedMetrics $sample.Stdout
+        $database = if ([string]::IsNullOrWhiteSpace($case.Database)) {
+            $case.ResetDatabase
+        } else {
+            $case.Database
+        }
         if ($case.Id -like '*-full-index') {
             if (-not $metrics.Contains('elapsed_ms')) {
                 throw "$($case.Id) emitted no engine elapsed_ms for the full-index gate"
@@ -470,6 +573,10 @@ foreach ($case in $cases) {
         $results.Add([pscustomobject]@{
             case_id = $case.Id
             run = $run
+            workspace = (Resolve-FullPath $case.Workspace)
+            sample_revision = (Get-SampleRevision $case.Workspace)
+            database_path = if ([string]::IsNullOrWhiteSpace($database)) { $null } else { Resolve-FullPath $database }
+            database_size_bytes = (Get-DatabaseSizeBytes $database)
             outer_process_metrics_comparable = $outerMetricsComparable
             elapsed_ms = if ($outerMetricsComparable) { $sample.ElapsedMs } else { $null }
             peak_working_set_bytes = if ($outerMetricsComparable) {
@@ -506,7 +613,9 @@ try {
 $report = [ordered]@{
     schema_version = 1
     measured_at = (Get-Date).ToUniversalTime().ToString('o')
+    command_line = [System.Environment]::CommandLine
     binary_version = $binaryVersion
+    machine = Get-BenchmarkMachine
     sample_interval_ms = 20
     results = $results
 }
@@ -620,6 +729,76 @@ if ($engineHydrationResults.Count -gt 0) {
             "$([Math]::Round($metrics.engine_hydration_peak_private_bytes / 1MB, 2)) | " +
             "$($metrics.engine_hydration_first_build_ms) | " +
             "$($metrics.engine_hydration_second_build_ms) |"
+        )
+    }
+    $markdown.Add('')
+    $markdown.Add('### Cold generation component estimates')
+    $markdown.Add('')
+    $markdown.Add('| Run | First name strings MiB | First name paths/projects MiB | First name postings MiB | First name fixed MiB | First file relations MiB | Second name strings MiB | Second name paths/projects MiB | Second name postings MiB | Second name fixed MiB | Second file relations MiB | Second-generation increment MiB |')
+    $markdown.Add('|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|')
+    foreach ($result in $engineHydrationResults) {
+        $metrics = $result.metrics
+        $markdown.Add(
+            "| $($result.run) | " +
+            "$([Math]::Round($metrics.engine_hydration_first_name_strings_bytes / 1MB, 2)) | " +
+            "$([Math]::Round($metrics.engine_hydration_first_name_paths_projects_bytes / 1MB, 2)) | " +
+            "$([Math]::Round($metrics.engine_hydration_first_name_postings_bytes / 1MB, 2)) | " +
+            "$([Math]::Round($metrics.engine_hydration_first_name_fixed_bytes / 1MB, 2)) | " +
+            "$([Math]::Round($metrics.engine_hydration_first_file_relations_bytes / 1MB, 2)) | " +
+            "$([Math]::Round($metrics.engine_hydration_second_name_strings_bytes / 1MB, 2)) | " +
+            "$([Math]::Round($metrics.engine_hydration_second_name_paths_projects_bytes / 1MB, 2)) | " +
+            "$([Math]::Round($metrics.engine_hydration_second_name_postings_bytes / 1MB, 2)) | " +
+            "$([Math]::Round($metrics.engine_hydration_second_name_fixed_bytes / 1MB, 2)) | " +
+            "$([Math]::Round($metrics.engine_hydration_second_file_relations_bytes / 1MB, 2)) | " +
+            "$([Math]::Round($metrics.engine_hydration_second_generation_incremental_bytes / 1MB, 2)) |"
+        )
+    }
+    $markdown.Add('')
+    $markdown.Add('### Warm old-generation full publication')
+    $markdown.Add('')
+    $markdown.Add('This scenario first warms the old declaration-details cache to at least 75% of its available budget, then publishes a replacement through the production publication ordering. The 384 MiB warm single-generation and 512 MiB publication-peak limits remain mandatory.')
+    $markdown.Add('')
+    $markdown.Add('| Run | Warm MiB | Warm peak MiB | Publication peak MiB | Cache budget MiB | Effective before/after MiB | Target MiB | Cache MiB | Hits/misses/evictions/SQL | Shrink MiB | Shrink entries | First build ms | Second build ms | Old epoch/generation |')
+    $markdown.Add('|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|')
+    foreach ($result in $engineHydrationResults) {
+        $metrics = $result.metrics
+        $markdown.Add(
+            "| $($result.run) | " +
+            "$([Math]::Round($metrics.warm_publication_single_private_bytes / 1MB, 2)) | " +
+            "$([Math]::Round($metrics.warm_publication_single_peak_private_bytes / 1MB, 2)) | " +
+            "$([Math]::Round($metrics.warm_publication_peak_private_bytes / 1MB, 2)) | " +
+            "$([Math]::Round($metrics.warm_publication_payload_budget_bytes / 1MB, 2)) | " +
+            "$([Math]::Round($metrics.warm_publication_effective_budget_before_bytes / 1MB, 2))/$([Math]::Round($metrics.warm_publication_effective_budget_after_bytes / 1MB, 2)) | " +
+            "$([Math]::Round($metrics.warm_publication_target_bytes / 1MB, 2)) | " +
+            "$([Math]::Round($metrics.warm_publication_cache_bytes / 1MB, 2)) | " +
+            "$($metrics.warm_publication_cache_hits)/$($metrics.warm_publication_cache_misses)/$($metrics.warm_publication_cache_evictions)/$($metrics.warm_publication_cache_sql_reads) | " +
+            "$([Math]::Round($metrics.warm_publication_shrink_bytes / 1MB, 2)) | " +
+            "$($metrics.warm_publication_shrink_entries) | " +
+            "$($metrics.warm_publication_first_build_ms) | " +
+            "$($metrics.warm_publication_second_build_ms) | " +
+            "$($metrics.warm_publication_old_epoch_consistent)/$($metrics.warm_publication_old_generation_consistent) |"
+        )
+    }
+    $markdown.Add('')
+    $markdown.Add('### Warm generation component estimates')
+    $markdown.Add('')
+    $markdown.Add('| Run | First name strings MiB | First name paths/projects MiB | First name postings MiB | First name fixed MiB | First file relations MiB | Second name strings MiB | Second name paths/projects MiB | Second name postings MiB | Second name fixed MiB | Second file relations MiB | Second-generation increment MiB |')
+    $markdown.Add('|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|')
+    foreach ($result in $engineHydrationResults) {
+        $metrics = $result.metrics
+        $markdown.Add(
+            "| $($result.run) | " +
+            "$([Math]::Round($metrics.warm_publication_first_name_strings_bytes / 1MB, 2)) | " +
+            "$([Math]::Round($metrics.warm_publication_first_name_paths_projects_bytes / 1MB, 2)) | " +
+            "$([Math]::Round($metrics.warm_publication_first_name_postings_bytes / 1MB, 2)) | " +
+            "$([Math]::Round($metrics.warm_publication_first_name_fixed_bytes / 1MB, 2)) | " +
+            "$([Math]::Round($metrics.warm_publication_first_file_relations_bytes / 1MB, 2)) | " +
+            "$([Math]::Round($metrics.warm_publication_second_name_strings_bytes / 1MB, 2)) | " +
+            "$([Math]::Round($metrics.warm_publication_second_name_paths_projects_bytes / 1MB, 2)) | " +
+            "$([Math]::Round($metrics.warm_publication_second_name_postings_bytes / 1MB, 2)) | " +
+            "$([Math]::Round($metrics.warm_publication_second_name_fixed_bytes / 1MB, 2)) | " +
+            "$([Math]::Round($metrics.warm_publication_second_file_relations_bytes / 1MB, 2)) | " +
+            "$([Math]::Round($metrics.warm_publication_second_generation_incremental_bytes / 1MB, 2)) |"
         )
     }
 }

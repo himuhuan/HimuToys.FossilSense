@@ -918,6 +918,126 @@ fn accounted_segment_split_tracks_base_and_delta_segments() {
 }
 
 #[test]
+fn name_table_memory_breakdown_is_complete_across_base_deltas_and_path_state() {
+    use crate::semantic_model::{SemanticDeclarationKind, SemanticDeclarationRole};
+    use crate::store::views::DeclarationNameRow;
+
+    fn row(id: i64, name: &str, path: &str) -> DeclarationNameRow {
+        DeclarationNameRow {
+            id,
+            name: name.into(),
+            declaration_kind: SemanticDeclarationKind::Function,
+            role: SemanticDeclarationRole::Definition,
+            path: path.into(),
+            external: false,
+            directly_included: false,
+            semantic_family: SemanticFamily::CFamily,
+        }
+    }
+
+    let base = NameTable::build_from_declaration_name_rows_with_project_context(
+        vec![row(1, "alpha_main", "src/main.c")],
+        None,
+    );
+    let base_breakdown = base.memory_breakdown();
+    assert_eq!(base_breakdown.components.bytes(), base.accounted_bytes());
+    assert_eq!(
+        base_breakdown.base_segment_bytes,
+        base.base.accounted_bytes()
+    );
+    assert_eq!(base_breakdown.delta_segment_bytes, 0);
+    assert_eq!(base_breakdown.delta_segment_count, 0);
+
+    let first_delta = base.with_updated_declaration_name_rows_with_project_context(
+        &std::collections::HashSet::from(["src/main.c".to_string()]),
+        vec![
+            row(1, "alpha_main", "src/main.c"),
+            row(2, "alpha_util", "src/main.c"),
+        ],
+        None,
+    );
+    let updated = first_delta.with_updated_declaration_name_rows_with_project_context(
+        &std::collections::HashSet::from(["include/api.h".to_string()]),
+        vec![row(3, "api_entry", "include/api.h")],
+        None,
+    );
+    let breakdown = updated.memory_breakdown();
+
+    assert_eq!(breakdown.components.bytes(), updated.accounted_bytes());
+    assert_eq!(
+        breakdown.base_segment_bytes,
+        base_breakdown.base_segment_bytes
+    );
+    assert!(breakdown.delta_segment_bytes > 0);
+    assert_eq!(breakdown.delta_segment_count, 2);
+    assert!(breakdown.components.path_metadata_bytes > 0);
+    assert!(breakdown.components.fixed_overhead_bytes > 0);
+}
+
+#[test]
+fn name_table_memory_breakdown_counts_shared_name_arc_once() {
+    let mut table = NameTable::build(vec![(1, "same_name".to_string(), false)]);
+    let segment = Arc::get_mut(&mut table.base).expect("new table owns its base segment");
+    let shared = segment.names[0].original.clone();
+    segment.names[0].lower = shared;
+
+    let breakdown = table.memory_breakdown();
+
+    assert_eq!(breakdown.components.original_name_bytes, 0);
+    assert_eq!(breakdown.components.lowercase_name_bytes, 0);
+    assert!(breakdown.components.shared_name_bytes > 0);
+    assert_eq!(breakdown.components.bytes(), table.accounted_bytes());
+}
+
+#[test]
+fn name_table_memory_breakdown_does_not_recount_delta_path_arc_from_override() {
+    use crate::semantic_model::{SemanticDeclarationKind, SemanticDeclarationRole};
+    use crate::store::views::DeclarationNameRow;
+
+    let row = |id, name: &str, path: &str| DeclarationNameRow {
+        id,
+        name: name.to_string(),
+        declaration_kind: SemanticDeclarationKind::Function,
+        role: SemanticDeclarationRole::Definition,
+        semantic_family: SemanticFamily::CFamily,
+        path: path.to_string(),
+        external: false,
+        directly_included: false,
+    };
+    let base = NameTable::build_from_declaration_name_rows_with_project_context(
+        vec![row(1, "base_symbol", "src/base.c")],
+        None,
+    );
+    let mut updated = base.with_updated_declaration_name_rows_with_project_context(
+        &std::collections::HashSet::from(["src/fresh.c".to_string()]),
+        vec![row(2, "fresh_symbol", "src/fresh.c")],
+        None,
+    );
+    let segment_path = updated.deltas[0].paths[0].clone();
+    let override_path = updated
+        .path_overrides
+        .keys()
+        .next()
+        .expect("fresh path override")
+        .clone();
+    let active_path = updated.active_delta_paths[0][0].clone();
+    assert!(Arc::ptr_eq(&segment_path, &override_path));
+    assert!(Arc::ptr_eq(&segment_path, &active_path));
+
+    let with_override = updated.memory_breakdown();
+    Arc::get_mut(&mut updated.path_overrides)
+        .expect("test table exclusively owns its override map")
+        .clear();
+    let without_override = updated.memory_breakdown();
+
+    assert_eq!(
+        with_override.components.path_metadata_bytes,
+        without_override.components.path_metadata_bytes,
+        "the map bucket already accounts for its Arc value; removing an override that shares a segment path must not remove the path allocation again"
+    );
+}
+
+#[test]
 fn bounded_completion_recall_filters_semantic_family_before_spending_budget() {
     use crate::semantic_model::{SemanticDeclarationKind, SemanticDeclarationRole};
     use crate::store::views::DeclarationNameRow;

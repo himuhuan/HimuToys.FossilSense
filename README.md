@@ -108,7 +108,7 @@ VS Code 设置中常用的选项：
 - `fossilsense.projectContext.mode`：自动项目证据、歧义时询问或关闭。
 - `fossilsense.semanticColoring.mode`：启用或关闭 FossilSense 着色。
 - `fossilsense.includeScoping.mode`：限制 `#include` 可达性范围。`auto` 时着色与补全只接受当前文件 include 图可达的定义、直接外部头和有界启发式 include 目标，排除无关的全库定义；`off` 回到全库行为。
-- `fossilsense.resourceMonitor.enabled`：在状态栏显示 FossilSense 进程内存和索引数据库磁盘占用，默认开启，每 2 秒刷新；悬停可查看按代码名称索引、声明详情缓存、文件关系图、打开文档等大类划分的内存明细。关闭仅隐藏状态栏，不影响服务行为。
+- `fossilsense.resourceMonitor.enabled`：在状态栏显示 FossilSense 进程内存和索引数据库磁盘占用，默认开启，每 2 秒刷新；悬停可查看代码名称索引、声明详情缓存、文件关系图、打开文档等大类。名称索引还会归并显示名称字符串、路径/项目、召回 posting 和固定开销。它们是结构估算，用于解释趋势；Windows Private Bytes 或 Linux/macOS RSS 才是发布门禁依据。旧服务器未提供细分字段时，扩展继续显示原有摘要。关闭仅隐藏状态栏，不影响服务行为。
 - `fossilsense.semanticIndex.memoryBudgetMB`：声明语义索引的总内存目标。常驻的紧凑补全召回索引先占用预算，剩余部分缓存 Hover、跳转和补全详情共享的声明 payload；设为 `0` 仍保留召回索引，并按需从本地数据库读取选中的事实。
 
 ## 能力边界

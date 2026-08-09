@@ -400,6 +400,91 @@ struct NameSegment {
     by_project: HashMap<ProjectKey, CompactProjectPostings>,
 }
 
+/// Mutually exclusive structural estimates for one immutable name segment.
+/// These values explain the compact completion index; they are not an
+/// allocator-level accounting of the whole process.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct NameSegmentMemoryBreakdown {
+    pub(crate) declaration_entry_bytes: usize,
+    pub(crate) name_record_bytes: usize,
+    pub(crate) original_name_bytes: usize,
+    pub(crate) lowercase_name_bytes: usize,
+    pub(crate) shared_name_bytes: usize,
+    pub(crate) path_metadata_bytes: usize,
+    pub(crate) project_metadata_bytes: usize,
+    pub(crate) sorting_index_bytes: usize,
+    pub(crate) short_prefix_posting_bytes: usize,
+    pub(crate) fuzzy_posting_bytes: usize,
+    pub(crate) prefix_path_posting_bytes: usize,
+    pub(crate) path_posting_bytes: usize,
+    pub(crate) project_posting_bytes: usize,
+    pub(crate) fixed_overhead_bytes: usize,
+}
+
+impl NameSegmentMemoryBreakdown {
+    pub(crate) fn bytes(&self) -> usize {
+        self.declaration_entry_bytes
+            .saturating_add(self.name_record_bytes)
+            .saturating_add(self.original_name_bytes)
+            .saturating_add(self.lowercase_name_bytes)
+            .saturating_add(self.shared_name_bytes)
+            .saturating_add(self.path_metadata_bytes)
+            .saturating_add(self.project_metadata_bytes)
+            .saturating_add(self.sorting_index_bytes)
+            .saturating_add(self.short_prefix_posting_bytes)
+            .saturating_add(self.fuzzy_posting_bytes)
+            .saturating_add(self.prefix_path_posting_bytes)
+            .saturating_add(self.path_posting_bytes)
+            .saturating_add(self.project_posting_bytes)
+            .saturating_add(self.fixed_overhead_bytes)
+    }
+
+    pub(crate) fn add_assign(&mut self, other: Self) {
+        self.declaration_entry_bytes = self
+            .declaration_entry_bytes
+            .saturating_add(other.declaration_entry_bytes);
+        self.name_record_bytes = self
+            .name_record_bytes
+            .saturating_add(other.name_record_bytes);
+        self.original_name_bytes = self
+            .original_name_bytes
+            .saturating_add(other.original_name_bytes);
+        self.lowercase_name_bytes = self
+            .lowercase_name_bytes
+            .saturating_add(other.lowercase_name_bytes);
+        self.shared_name_bytes = self
+            .shared_name_bytes
+            .saturating_add(other.shared_name_bytes);
+        self.path_metadata_bytes = self
+            .path_metadata_bytes
+            .saturating_add(other.path_metadata_bytes);
+        self.project_metadata_bytes = self
+            .project_metadata_bytes
+            .saturating_add(other.project_metadata_bytes);
+        self.sorting_index_bytes = self
+            .sorting_index_bytes
+            .saturating_add(other.sorting_index_bytes);
+        self.short_prefix_posting_bytes = self
+            .short_prefix_posting_bytes
+            .saturating_add(other.short_prefix_posting_bytes);
+        self.fuzzy_posting_bytes = self
+            .fuzzy_posting_bytes
+            .saturating_add(other.fuzzy_posting_bytes);
+        self.prefix_path_posting_bytes = self
+            .prefix_path_posting_bytes
+            .saturating_add(other.prefix_path_posting_bytes);
+        self.path_posting_bytes = self
+            .path_posting_bytes
+            .saturating_add(other.path_posting_bytes);
+        self.project_posting_bytes = self
+            .project_posting_bytes
+            .saturating_add(other.project_posting_bytes);
+        self.fixed_overhead_bytes = self
+            .fixed_overhead_bytes
+            .saturating_add(other.fixed_overhead_bytes);
+    }
+}
+
 struct CompactProjectPostings {
     project_id: u32,
     by_family: [Vec<u32>; 2],
@@ -1257,39 +1342,127 @@ impl NameSegment {
             .map(|id| self.paths[*id as usize].clone())
     }
 
+    #[allow(dead_code)]
     fn accounted_bytes(&self) -> usize {
+        self.memory_breakdown().bytes()
+    }
+
+    fn memory_breakdown(&self) -> NameSegmentMemoryBreakdown {
         let arc_header = size_of::<usize>().saturating_mul(2);
-        let names = self.names.iter().fold(0usize, |bytes, name| {
-            bytes
-                .saturating_add(name.original.len())
-                .saturating_add(arc_header)
-                .saturating_add(name.lower.len())
-                .saturating_add(arc_header)
-        });
-        let paths = self.paths.iter().fold(0usize, |bytes, path| {
-            bytes.saturating_add(path.len()).saturating_add(arc_header)
-        });
-        let projects = self.projects.iter().fold(0usize, |bytes, project| {
-            bytes
-                .saturating_add(project.workspace_root_id.len())
-                .saturating_add(project.project_path.len())
-        });
-        let by_project = self
-            .by_project
-            .iter()
-            .fold(0usize, |bytes, (key, postings)| {
-                bytes
-                    .saturating_add(key.workspace_root_id.len())
-                    .saturating_add(key.project_path.len())
-                    .saturating_add(
-                        postings
-                            .by_family
-                            .iter()
-                            .map(|family| family.capacity().saturating_mul(size_of::<u32>()))
-                            .sum::<usize>(),
-                    )
-            });
-        let short_prefix_heads =
+        let mut breakdown = NameSegmentMemoryBreakdown {
+            declaration_entry_bytes: self
+                .entries
+                .capacity()
+                .saturating_mul(size_of::<CompactNameEntry>()),
+            name_record_bytes: self
+                .names
+                .capacity()
+                .saturating_mul(size_of::<NameString>()),
+            path_metadata_bytes: self
+                .paths
+                .capacity()
+                .saturating_mul(size_of::<Arc<str>>())
+                .saturating_add(hash_table_bytes::<Arc<str>, u32>(self.path_ids.capacity()))
+                .saturating_add(
+                    self.path_counts
+                        .capacity()
+                        .saturating_mul(size_of::<usize>()),
+                )
+                .saturating_add(
+                    self.path_is_external
+                        .capacity()
+                        .saturating_mul(size_of::<bool>()),
+                )
+                .saturating_add(
+                    self.sole_path_by_name
+                        .capacity()
+                        .saturating_mul(size_of::<u32>()),
+                ),
+            project_metadata_bytes: self
+                .projects
+                .capacity()
+                .saturating_mul(size_of::<ProjectKey>())
+                .saturating_add(hash_table_bytes::<ProjectKey, CompactProjectPostings>(
+                    self.by_project.capacity(),
+                )),
+            sorting_index_bytes: self
+                .sorted_by_family
+                .iter()
+                .map(|indices| indices.capacity().saturating_mul(size_of::<usize>()))
+                .sum::<usize>(),
+            fixed_overhead_bytes: size_of::<Self>(),
+            ..NameSegmentMemoryBreakdown::default()
+        };
+
+        // Normal production names own one Arc each. Avoid allocating a
+        // workspace-sized temporary map while building a report just to prove
+        // that common case. Only candidate shared Arcs need pointer tracking.
+        let mut shared_name_allocations = HashMap::<usize, (usize, usize, bool, bool)>::new();
+        for name in &self.names {
+            for (value, is_original) in [(&name.original, true), (&name.lower, false)] {
+                if Arc::strong_count(value) == 1 {
+                    if is_original {
+                        breakdown.original_name_bytes = breakdown
+                            .original_name_bytes
+                            .saturating_add(value.len().saturating_add(arc_header));
+                    } else {
+                        breakdown.lowercase_name_bytes = breakdown
+                            .lowercase_name_bytes
+                            .saturating_add(value.len().saturating_add(arc_header));
+                    }
+                } else {
+                    let pointer = Arc::as_ptr(value) as *const () as usize;
+                    let allocation = shared_name_allocations.entry(pointer).or_insert_with(|| {
+                        (value.len().saturating_add(arc_header), 0, false, false)
+                    });
+                    allocation.1 = allocation.1.saturating_add(1);
+                    if is_original {
+                        allocation.2 = true;
+                    } else {
+                        allocation.3 = true;
+                    }
+                }
+            }
+        }
+        for (_, (bytes, references, used_as_original, used_as_lowercase)) in shared_name_allocations
+        {
+            if references > 1 {
+                breakdown.shared_name_bytes = breakdown.shared_name_bytes.saturating_add(bytes);
+            } else if used_as_original {
+                breakdown.original_name_bytes = breakdown.original_name_bytes.saturating_add(bytes);
+            } else if used_as_lowercase {
+                breakdown.lowercase_name_bytes =
+                    breakdown.lowercase_name_bytes.saturating_add(bytes);
+            }
+        }
+
+        breakdown.path_metadata_bytes = breakdown.path_metadata_bytes.saturating_add(
+            self.paths.iter().fold(0usize, |bytes, path| {
+                bytes.saturating_add(path.len()).saturating_add(arc_header)
+            }),
+        );
+        breakdown.project_metadata_bytes =
+            breakdown
+                .project_metadata_bytes
+                .saturating_add(self.projects.iter().fold(0usize, |bytes, project| {
+                    bytes
+                        .saturating_add(project.workspace_root_id.len())
+                        .saturating_add(project.project_path.len())
+                }));
+        for (key, postings) in &self.by_project {
+            breakdown.project_metadata_bytes = breakdown
+                .project_metadata_bytes
+                .saturating_add(key.workspace_root_id.len())
+                .saturating_add(key.project_path.len());
+            breakdown.project_posting_bytes = breakdown.project_posting_bytes.saturating_add(
+                postings
+                    .by_family
+                    .iter()
+                    .map(|family| family.capacity().saturating_mul(size_of::<u32>()))
+                    .sum::<usize>(),
+            );
+        }
+        breakdown.short_prefix_posting_bytes =
             self.short_prefix_heads_by_family
                 .iter()
                 .fold(0usize, |bytes, family_heads| {
@@ -1300,75 +1473,25 @@ impl NameSegment {
                                 .saturating_add(indices.capacity().saturating_mul(size_of::<u32>()))
                         }))
                 });
-        let fuzzy_postings = self
+        breakdown.fuzzy_posting_bytes = self
             .fuzzy_postings_by_family
             .iter()
             .fold(0usize, |bytes, postings| {
                 bytes.saturating_add(postings.accounted_bytes())
             });
-        let prefix_paths = self
+        breakdown.prefix_path_posting_bytes = self
             .prefix_paths_by_family
             .iter()
             .fold(0usize, |bytes, postings| {
                 bytes.saturating_add(postings.accounted_bytes())
             });
-        let path_postings = self
+        breakdown.path_posting_bytes = self
             .path_postings_by_family
             .iter()
             .fold(0usize, |bytes, postings| {
                 bytes.saturating_add(postings.accounted_bytes())
             });
-
-        size_of::<Self>()
-            .saturating_add(
-                self.entries
-                    .capacity()
-                    .saturating_mul(size_of::<CompactNameEntry>()),
-            )
-            .saturating_add(
-                self.names
-                    .capacity()
-                    .saturating_mul(size_of::<NameString>()),
-            )
-            .saturating_add(names)
-            .saturating_add(self.paths.capacity().saturating_mul(size_of::<Arc<str>>()))
-            .saturating_add(paths)
-            .saturating_add(hash_table_bytes::<Arc<str>, u32>(self.path_ids.capacity()))
-            .saturating_add(
-                self.path_counts
-                    .capacity()
-                    .saturating_mul(size_of::<usize>()),
-            )
-            .saturating_add(
-                self.path_is_external
-                    .capacity()
-                    .saturating_mul(size_of::<bool>()),
-            )
-            .saturating_add(
-                self.projects
-                    .capacity()
-                    .saturating_mul(size_of::<ProjectKey>()),
-            )
-            .saturating_add(projects)
-            .saturating_add(
-                self.sorted_by_family
-                    .iter()
-                    .map(|indices| indices.capacity().saturating_mul(size_of::<usize>()))
-                    .sum::<usize>(),
-            )
-            .saturating_add(hash_table_bytes::<ProjectKey, CompactProjectPostings>(
-                self.by_project.capacity(),
-            ))
-            .saturating_add(by_project)
-            .saturating_add(short_prefix_heads)
-            .saturating_add(fuzzy_postings)
-            .saturating_add(
-                self.sole_path_by_name
-                    .capacity()
-                    .saturating_mul(size_of::<u32>()),
-            )
-            .saturating_add(prefix_paths)
-            .saturating_add(path_postings)
+        breakdown
     }
 }
 

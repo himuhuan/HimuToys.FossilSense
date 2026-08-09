@@ -16,6 +16,10 @@ pub struct DeclarationPayloadCacheStats {
     pub evictions: u64,
     pub bytes: usize,
     pub entries: usize,
+    pub configured_budget_bytes: usize,
+    pub effective_budget_bytes: usize,
+    pub publication_shrink_entries: usize,
+    pub publication_shrink_bytes: usize,
 }
 
 struct CachedPayload {
@@ -28,22 +32,32 @@ struct DeclarationPayloadCacheState {
     entries: HashMap<i64, CachedPayload>,
     bytes: usize,
     clock: u64,
+    effective_budget_bytes: usize,
     stats: DeclarationPayloadCacheStats,
 }
 
 struct DeclarationPayloadCache {
-    budget_bytes: usize,
+    configured_budget_bytes: usize,
     state: Mutex<DeclarationPayloadCacheState>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DeclarationPayloadCacheShrink {
+    pub(crate) configured_budget_bytes: usize,
+    pub(crate) effective_budget_before_bytes: usize,
+    pub(crate) removed_entries: usize,
+    pub(crate) removed_bytes: usize,
 }
 
 impl DeclarationPayloadCache {
     fn new(budget_bytes: usize) -> Self {
         Self {
-            budget_bytes,
+            configured_budget_bytes: budget_bytes,
             state: Mutex::new(DeclarationPayloadCacheState {
                 entries: HashMap::new(),
                 bytes: 0,
                 clock: 0,
+                effective_budget_bytes: budget_bytes,
                 stats: DeclarationPayloadCacheStats::default(),
             }),
         }
@@ -79,15 +93,16 @@ impl DeclarationPayloadCache {
     fn insert(&self, row: DeclarationReadRow) -> Arc<DeclarationReadRow> {
         let row = Arc::new(row);
         let bytes = declaration_payload_bytes(&row);
-        if self.budget_bytes == 0 || bytes > self.budget_bytes {
-            return row;
-        }
         let mut state = self
             .state
             .lock()
             .expect("declaration payload cache poisoned");
+        let effective_budget_bytes = state.effective_budget_bytes;
+        if effective_budget_bytes == 0 || bytes > effective_budget_bytes {
+            return row;
+        }
         state.clock = state.clock.wrapping_add(1).max(1);
-        while state.bytes.saturating_add(bytes) > self.budget_bytes {
+        while state.bytes.saturating_add(bytes) > effective_budget_bytes {
             let Some((&victim, _)) = state
                 .entries
                 .iter()
@@ -115,6 +130,60 @@ impl DeclarationPayloadCache {
         row
     }
 
+    fn configured_budget_bytes(&self) -> usize {
+        self.configured_budget_bytes
+    }
+
+    fn effective_budget_bytes(&self) -> usize {
+        self.state
+            .lock()
+            .expect("declaration payload cache poisoned")
+            .effective_budget_bytes
+    }
+
+    /// Clear the replaceable cache by swapping its map while locked and
+    /// releasing the old rows after unlocking. Readers that already own an
+    /// `Arc<DeclarationReadRow>` remain valid.
+    fn suspend_for_full_publication(&self) -> DeclarationPayloadCacheShrink {
+        let (removed, shrink) = {
+            let mut state = self
+                .state
+                .lock()
+                .expect("declaration payload cache poisoned");
+            let effective_budget_before_bytes = state.effective_budget_bytes;
+            state.effective_budget_bytes = 0;
+            let removed = std::mem::take(&mut state.entries);
+            let removed_entries = removed.len();
+            let removed_bytes = std::mem::take(&mut state.bytes);
+            state.stats.publication_shrink_entries = state
+                .stats
+                .publication_shrink_entries
+                .saturating_add(removed_entries);
+            state.stats.publication_shrink_bytes = state
+                .stats
+                .publication_shrink_bytes
+                .saturating_add(removed_bytes);
+            (
+                removed,
+                DeclarationPayloadCacheShrink {
+                    configured_budget_bytes: self.configured_budget_bytes,
+                    effective_budget_before_bytes,
+                    removed_entries,
+                    removed_bytes,
+                },
+            )
+        };
+        drop(removed);
+        shrink
+    }
+
+    fn restore_configured_budget(&self) {
+        self.state
+            .lock()
+            .expect("declaration payload cache poisoned")
+            .effective_budget_bytes = self.configured_budget_bytes;
+    }
+
     fn stats(&self) -> DeclarationPayloadCacheStats {
         let state = self
             .state
@@ -123,7 +192,36 @@ impl DeclarationPayloadCache {
         DeclarationPayloadCacheStats {
             bytes: state.bytes,
             entries: state.entries.len(),
+            configured_budget_bytes: self.configured_budget_bytes,
+            effective_budget_bytes: state.effective_budget_bytes,
             ..state.stats
+        }
+    }
+}
+
+/// Owns the temporary cache suspension used only while a complete replacement
+/// snapshot is built. Dropping without `commit` restores the prior generation's
+/// configured budget; a successful publication deliberately leaves it cold.
+pub(crate) struct DeclarationPayloadCachePublicationLease {
+    cache: Arc<DeclarationPayloadCache>,
+    shrink: DeclarationPayloadCacheShrink,
+    committed: bool,
+}
+
+impl DeclarationPayloadCachePublicationLease {
+    pub(crate) fn shrink(&self) -> DeclarationPayloadCacheShrink {
+        self.shrink
+    }
+
+    pub(crate) fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for DeclarationPayloadCachePublicationLease {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.cache.restore_configured_budget();
         }
     }
 }
@@ -178,7 +276,22 @@ impl SemanticDeclarationIndex {
     }
 
     pub fn payload_budget_bytes(&self) -> usize {
-        self.payloads.budget_bytes
+        self.payloads.configured_budget_bytes()
+    }
+
+    pub(crate) fn effective_payload_budget_bytes(&self) -> usize {
+        self.payloads.effective_budget_bytes()
+    }
+
+    pub(crate) fn suspend_payload_cache_for_full_publication(
+        &self,
+    ) -> DeclarationPayloadCachePublicationLease {
+        let shrink = self.payloads.suspend_for_full_publication();
+        DeclarationPayloadCachePublicationLease {
+            cache: self.payloads.clone(),
+            shrink,
+            committed: false,
+        }
     }
 
     pub fn total_budget_bytes(&self) -> usize {
@@ -284,10 +397,15 @@ fn declaration_payload_bytes(row: &DeclarationReadRow) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use crate::semantic_model::{SemanticDeclarationKind, SemanticDeclarationRole};
-    use crate::store::views::DeclarationNameRow;
+    use crate::call_model::{LinkageDomain, SourcePosition, SourceRange};
+    use crate::semantic_model::{
+        DeclarationBacking, DeclarationFact, DeclarationIdentity, DeclarationLocator,
+        LanguageFidelity, LogicalEntityKey, SemanticDeclarationKind, SemanticDeclarationRole,
+        SemanticFactFidelity, SemanticFactProvenance, SemanticLanguage,
+    };
+    use crate::store::views::{DeclarationNameRow, DeclarationReadRow};
 
-    use super::SemanticDeclarationIndex;
+    use super::{declaration_payload_bytes, DeclarationPayloadCache, SemanticDeclarationIndex};
 
     fn row(id: i64, name: &str, path: &str) -> DeclarationNameRow {
         DeclarationNameRow {
@@ -300,6 +418,131 @@ mod tests {
             external: false,
             directly_included: false,
         }
+    }
+
+    fn source_range() -> SourceRange {
+        SourceRange {
+            start: SourcePosition {
+                line: 0,
+                character: 0,
+            },
+            end: SourcePosition {
+                line: 0,
+                character: 0,
+            },
+            start_byte: 0,
+            end_byte: 0,
+        }
+    }
+
+    fn read_row(id: i64) -> DeclarationReadRow {
+        let range = source_range();
+        let name = format!("cached_{id}");
+        DeclarationReadRow {
+            id,
+            fact: DeclarationFact {
+                identity: DeclarationIdentity {
+                    locator: DeclarationLocator {
+                        workspace_id: "workspace".into(),
+                        path: "src/cache.c".into(),
+                        range,
+                        fingerprint: format!("fingerprint-{id}"),
+                    },
+                    logical_key: LogicalEntityKey {
+                        qualified_name: name.clone(),
+                        declaration_kind: SemanticDeclarationKind::Function,
+                        owner: None,
+                        canonical_signature: None,
+                        linkage_domain: "external".into(),
+                        guard_fingerprint: None,
+                    },
+                    language: SemanticLanguage::C,
+                    language_fidelity: LanguageFidelity::Explicit,
+                    provenance: SemanticFactProvenance::Ast,
+                    fact_fidelity: SemanticFactFidelity::Authoritative,
+                    role: SemanticDeclarationRole::Definition,
+                },
+                name: name.clone(),
+                qualified_name: name,
+                declaration_kind: SemanticDeclarationKind::Function,
+                role: SemanticDeclarationRole::Definition,
+                path: "src/cache.c".into(),
+                name_range: range,
+                declaration_range: range,
+                canonical_signature: None,
+                declarator_shape: None,
+                has_initializer: None,
+                owner: None,
+                linkage: LinkageDomain::External,
+                guard: None,
+                backing: DeclarationBacking::None,
+            },
+            logical_key_digest: vec![id as u8],
+            backing_kind: "none".into(),
+            backing_id: None,
+            external: false,
+            directly_included: false,
+            revision_id: 1,
+            revision_size: 0,
+            revision_mtime_ns: 0,
+            revision_hash: "revision".into(),
+        }
+    }
+
+    #[test]
+    fn publication_shrink_releases_cache_entries_keeps_held_rows_alive_and_blocks_recache() {
+        let input = read_row(1);
+        let cache =
+            DeclarationPayloadCache::new(declaration_payload_bytes(&input).saturating_mul(2));
+        let held = cache.insert(input);
+        let before = cache.stats();
+        assert_eq!(before.entries, 1);
+        assert!(before.bytes > 0);
+
+        let shrink = cache.suspend_for_full_publication();
+        let after = cache.stats();
+        assert_eq!(after.entries, 0);
+        assert_eq!(after.bytes, 0);
+        assert_eq!(after.effective_budget_bytes, 0);
+        assert_eq!(shrink.removed_entries, 1);
+        assert_eq!(shrink.removed_bytes, before.bytes);
+        assert_eq!(held.id, 1, "request-held Arc must survive cache shrink");
+        assert!(cache.get(1).is_none(), "shrink removes the resident entry");
+
+        let reread = cache.insert(read_row(1));
+        assert_eq!(reread.id, 1, "a miss still returns the typed row");
+        assert_eq!(cache.stats().entries, 0, "disabled cache must not refill");
+    }
+
+    #[test]
+    fn publication_cache_lease_restores_on_drop_and_stays_disabled_after_commit() {
+        let names = crate::query::NameTable::build_from_declaration_name_rows_with_project_context(
+            vec![row(1, "lease_test", "lease.c")],
+            None,
+        );
+        let core = names.accounted_bytes();
+        let index = SemanticDeclarationIndex::build(names, core.saturating_add(4_096));
+        let configured = index.payload_budget_bytes();
+        assert!(configured > 0);
+
+        {
+            let _lease = index.suspend_payload_cache_for_full_publication();
+            assert_eq!(index.effective_payload_budget_bytes(), 0);
+        }
+        assert_eq!(
+            index.effective_payload_budget_bytes(),
+            configured,
+            "a failed or cancelled replacement build restores the old cache budget",
+        );
+
+        let mut lease = index.suspend_payload_cache_for_full_publication();
+        lease.commit();
+        drop(lease);
+        assert_eq!(
+            index.effective_payload_budget_bytes(),
+            0,
+            "a successful full publication keeps its replaced cache disabled",
+        );
     }
 
     #[test]

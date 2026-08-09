@@ -693,6 +693,24 @@ impl CacheLedger {
         &self,
         snapshot: EngineSnapshot,
     ) -> Arc<EngineSnapshot> {
+        self.publish_engine_snapshot_with_after_swap(snapshot, || {}, std::future::ready(()))
+            .await
+    }
+
+    /// Expose a prepared snapshot, run the non-async post-swap action at the
+    /// exact map linearization point, then complete overlay invalidation. Full
+    /// publications use the action to commit retired-generation cache leases
+    /// before the next cancellation point.
+    pub(in crate::server) async fn publish_engine_snapshot_with_after_swap<F, AfterSwap>(
+        &self,
+        snapshot: EngineSnapshot,
+        after_snapshot_swap: F,
+        after_swap: AfterSwap,
+    ) -> Arc<EngineSnapshot>
+    where
+        F: FnOnce(),
+        AfterSwap: std::future::Future<Output = ()>,
+    {
         let snapshot = Arc::new(snapshot);
         // Invalidate on both sides of the engine-map swap. A builder captured
         // in either half of this publication window receives a stale cache
@@ -705,6 +723,11 @@ impl CacheLedger {
             .lock()
             .await
             .insert(snapshot.root.clone(), snapshot.clone());
+        // This has no await between the map swap and commit. If cancellation
+        // happens after the new snapshot becomes visible, the old generation
+        // remains permanently cache-disabled.
+        after_snapshot_swap();
+        after_swap.await;
         {
             let mut overlays = self.candidate_overlays.lock().await;
             invalidate_candidate_overlay_root(&mut overlays, &snapshot.root);

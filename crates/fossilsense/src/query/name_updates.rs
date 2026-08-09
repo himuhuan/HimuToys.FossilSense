@@ -15,6 +15,17 @@ fn string_set_bytes(values: &HashSet<String>) -> usize {
     )
 }
 
+/// Structural accounting for one published [`NameTable`]. The base/delta
+/// fields are an overlapping generation view; only `components` contributes
+/// to the core byte total.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct NameTableMemoryBreakdown {
+    pub(crate) components: NameSegmentMemoryBreakdown,
+    pub(crate) base_segment_bytes: usize,
+    pub(crate) delta_segment_bytes: usize,
+    pub(crate) delta_segment_count: usize,
+}
+
 fn project_family_counts_for_path(
     segment: &NameSegment,
     path: &str,
@@ -60,87 +71,107 @@ fn adjust_project_family_counts(
 
 impl NameTable {
     pub(crate) fn accounted_bytes(&self) -> usize {
-        let arc_header = size_of::<usize>().saturating_mul(2);
-        let delta_segments = self.deltas.iter().fold(0usize, |bytes, segment| {
-            bytes.saturating_add(segment.accounted_bytes())
-        });
-        let path_overrides = self.path_overrides.iter().fold(0usize, |bytes, (path, _)| {
-            bytes.saturating_add(path.len()).saturating_add(arc_header)
-        });
-        let active_base_paths = arc_header.saturating_add(
-            self.active_base_paths
-                .capacity()
-                .saturating_mul(size_of::<Arc<str>>()),
-        );
-        let active_delta_paths = self.active_delta_paths.iter().fold(0usize, |bytes, paths| {
-            bytes
-                .saturating_add(arc_header)
-                .saturating_add(size_of::<Vec<Arc<str>>>())
-                .saturating_add(paths.capacity().saturating_mul(size_of::<Arc<str>>()))
-        });
-        let active_project_family_counts =
-            self.active_project_family_counts
-                .iter()
-                .fold(0usize, |bytes, (key, _)| {
-                    bytes
-                        .saturating_add(key.workspace_root_id.len())
-                        .saturating_add(key.project_path.len())
-                });
-        let direct_overrides = self
-            .direct_include_overrides
-            .keys()
-            .fold(0usize, |bytes, path| bytes.saturating_add(path.len()));
-        let reach = self.all_workspace_reach.as_ref();
+        self.memory_breakdown().components.bytes()
+    }
 
-        size_of::<Self>()
+    pub(crate) fn memory_breakdown(&self) -> NameTableMemoryBreakdown {
+        let arc_header = size_of::<usize>().saturating_mul(2);
+        let mut components = self.base.memory_breakdown();
+        let base_segment_bytes = components.bytes();
+        let mut delta_segment_bytes = 0usize;
+        for segment in self.deltas.iter() {
+            let segment = segment.memory_breakdown();
+            delta_segment_bytes = delta_segment_bytes.saturating_add(segment.bytes());
+            components.add_assign(segment);
+        }
+
+        components.fixed_overhead_bytes = components
+            .fixed_overhead_bytes
+            .saturating_add(size_of::<Self>())
             .saturating_add(arc_header)
-            .saturating_add(self.base.accounted_bytes())
             .saturating_add(
                 self.deltas
                     .capacity()
                     .saturating_mul(size_of::<Arc<NameSegment>>()),
             )
-            .saturating_add(delta_segments)
-            .saturating_add(hash_table_bytes::<Arc<str>, Option<usize>>(
-                self.path_overrides.capacity(),
-            ))
-            .saturating_add(path_overrides)
-            .saturating_add(active_base_paths)
             .saturating_add(
                 self.active_delta_paths
                     .capacity()
                     .saturating_mul(size_of::<Arc<Vec<Arc<str>>>>()),
             )
-            .saturating_add(active_delta_paths)
-            .saturating_add(hash_table_bytes::<ProjectKey, [usize; 2]>(
-                self.active_project_family_counts.capacity(),
-            ))
-            .saturating_add(active_project_family_counts)
+            .saturating_add(self.active_delta_paths.iter().fold(0usize, |bytes, _| {
+                bytes.saturating_add(size_of::<Vec<Arc<str>>>())
+            }))
             .saturating_add(
                 self.delta_offsets
                     .capacity()
                     .saturating_mul(size_of::<usize>()),
             )
+            .saturating_add(arc_header)
+            .saturating_add(size_of::<ReachScope>());
+        components.path_metadata_bytes = components
+            .path_metadata_bytes
+            .saturating_add(hash_table_bytes::<Arc<str>, Option<usize>>(
+                self.path_overrides.capacity(),
+            ))
+            .saturating_add(arc_header)
+            .saturating_add(
+                self.active_base_paths
+                    .capacity()
+                    .saturating_mul(size_of::<Arc<str>>()),
+            )
+            .saturating_add(self.active_delta_paths.iter().fold(0usize, |bytes, paths| {
+                bytes
+                    .saturating_add(arc_header)
+                    .saturating_add(paths.capacity().saturating_mul(size_of::<Arc<str>>()))
+            }))
             .saturating_add(hash_table_bytes::<String, bool>(
                 self.direct_include_overrides.capacity(),
             ))
-            .saturating_add(direct_overrides)
-            .saturating_add(arc_header)
-            .saturating_add(size_of::<ReachScope>())
+            .saturating_add(
+                self.direct_include_overrides
+                    .keys()
+                    .fold(0usize, |bytes, path| bytes.saturating_add(path.len())),
+            );
+        components.project_metadata_bytes = components
+            .project_metadata_bytes
+            .saturating_add(hash_table_bytes::<ProjectKey, [usize; 2]>(
+                self.active_project_family_counts.capacity(),
+            ))
+            .saturating_add(self.active_project_family_counts.iter().fold(
+                0usize,
+                |bytes, (key, _)| {
+                    bytes
+                        .saturating_add(key.workspace_root_id.len())
+                        .saturating_add(key.project_path.len())
+                },
+            ));
+        let reach = self.all_workspace_reach.as_ref();
+        components.path_metadata_bytes = components
+            .path_metadata_bytes
             .saturating_add(string_set_bytes(&reach.files))
-            .saturating_add(string_set_bytes(&reach.heuristic_files))
+            .saturating_add(string_set_bytes(&reach.heuristic_files));
+
+        NameTableMemoryBreakdown {
+            components,
+            base_segment_bytes,
+            delta_segment_bytes,
+            delta_segment_count: self.deltas.len(),
+        }
     }
 
     /// `(base_bytes, delta_bytes, delta_segment_count)` split of the
     /// per-segment accounted bytes, for memory observability. Path overrides,
     /// active-path lists, and the reach cache live outside the segments and
     /// remain part of `accounted_bytes` only.
+    #[allow(dead_code)]
     pub(crate) fn accounted_segment_split(&self) -> (usize, usize, usize) {
-        let base = self.base.accounted_bytes();
-        let deltas = self.deltas.iter().fold(0usize, |bytes, segment| {
-            bytes.saturating_add(segment.accounted_bytes())
-        });
-        (base, deltas, self.deltas.len())
+        let breakdown = self.memory_breakdown();
+        (
+            breakdown.base_segment_bytes,
+            breakdown.delta_segment_bytes,
+            breakdown.delta_segment_count,
+        )
     }
 
     #[allow(dead_code)]

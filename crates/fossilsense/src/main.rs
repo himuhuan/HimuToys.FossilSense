@@ -64,6 +64,7 @@ mod cli_tests {
             &[crate::memory_report::SnapshotMemoryReport {
                 name_table_bytes: 1_000,
                 name_entry_count: 7,
+                name_index_components: crate::memory_report::NameIndexMemoryComponents::default(),
                 base_segment_bytes: 800,
                 delta_segments_bytes: 100,
                 delta_segment_count: 1,
@@ -102,6 +103,10 @@ mod cli_tests {
             "process_attributed_bytes:",
             "process_other_bytes:",
             "name_index_bytes: 1050",
+            "name_index_component_bytes: 1000",
+            "name_index_declaration_entry_bytes:",
+            "name_index_shared_name_bytes:",
+            "name_index_fixed_overhead_bytes:",
             "name_index_entries: 7",
             "name_index_base_segment_bytes: 800",
             "name_index_delta_segments_bytes: 100",
@@ -124,6 +129,17 @@ mod cli_tests {
         ] {
             assert!(text.contains(key), "memory text output must contain {key}");
         }
+
+        let json = serde_json::to_value(&hydrated).expect("serialize memory JSON");
+        let name_index = &json["report"]["nameIndex"];
+        assert_eq!(name_index["bytes"], 1_050);
+        assert_eq!(name_index["components"]["bytes"], 1_000);
+        assert_eq!(name_index["fallbackTableBytes"], 50);
+        assert_eq!(
+            name_index["bytes"],
+            name_index["components"]["bytes"].as_u64().unwrap()
+                + name_index["fallbackTableBytes"].as_u64().unwrap(),
+        );
     }
 
     #[test]
@@ -393,6 +409,66 @@ fn memory_report_lines(hydrated: &memory_report::HydratedMemoryReport) -> Vec<St
         ),
         format!("process_other_bytes: {}", report.process.other_bytes),
         format!("name_index_bytes: {}", report.name_index.bytes),
+        format!(
+            "name_index_component_bytes: {}",
+            report.name_index.components.bytes
+        ),
+        format!(
+            "name_index_declaration_entry_bytes: {}",
+            report.name_index.components.declaration_entry_bytes
+        ),
+        format!(
+            "name_index_name_record_bytes: {}",
+            report.name_index.components.name_record_bytes
+        ),
+        format!(
+            "name_index_original_name_bytes: {}",
+            report.name_index.components.original_name_bytes
+        ),
+        format!(
+            "name_index_lowercase_name_bytes: {}",
+            report.name_index.components.lowercase_name_bytes
+        ),
+        format!(
+            "name_index_shared_name_bytes: {}",
+            report.name_index.components.shared_name_bytes
+        ),
+        format!(
+            "name_index_path_metadata_bytes: {}",
+            report.name_index.components.path_metadata_bytes
+        ),
+        format!(
+            "name_index_project_metadata_bytes: {}",
+            report.name_index.components.project_metadata_bytes
+        ),
+        format!(
+            "name_index_sorting_index_bytes: {}",
+            report.name_index.components.sorting_index_bytes
+        ),
+        format!(
+            "name_index_short_prefix_posting_bytes: {}",
+            report.name_index.components.short_prefix_posting_bytes
+        ),
+        format!(
+            "name_index_fuzzy_posting_bytes: {}",
+            report.name_index.components.fuzzy_posting_bytes
+        ),
+        format!(
+            "name_index_prefix_path_posting_bytes: {}",
+            report.name_index.components.prefix_path_posting_bytes
+        ),
+        format!(
+            "name_index_path_posting_bytes: {}",
+            report.name_index.components.path_posting_bytes
+        ),
+        format!(
+            "name_index_project_posting_bytes: {}",
+            report.name_index.components.project_posting_bytes
+        ),
+        format!(
+            "name_index_fixed_overhead_bytes: {}",
+            report.name_index.components.fixed_overhead_bytes
+        ),
         format!("name_index_entries: {}", report.name_index.entry_count),
         format!(
             "name_index_base_segment_bytes: {}",

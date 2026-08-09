@@ -10,10 +10,13 @@ use tower_lsp::Client;
 use crate::candidate_service::IncludePathIndex;
 use crate::completion::ordinary_service::FallbackCompletionNameTable;
 use crate::config::WorkspaceConfig;
-use crate::declaration_index::SemanticDeclarationIndex;
+use crate::declaration_index::{
+    DeclarationPayloadCachePublicationLease, DeclarationPayloadCacheShrink,
+    SemanticDeclarationIndex,
+};
 use crate::memory_report::{
-    DeclarationCacheSample, HydratedMemoryReport, MemoryReport, OpenDocumentsMemoryReport,
-    SnapshotMemoryReport,
+    DeclarationCacheSample, HydratedMemoryReport, MemoryReport, NameIndexMemoryComponents,
+    OpenDocumentsMemoryReport, SnapshotMemoryReport,
 };
 use crate::pathing;
 use crate::progress::DegradedCapabilities;
@@ -256,12 +259,31 @@ pub(crate) fn snapshot_memory_report_from_parts(
         ..SnapshotMemoryReport::default()
     };
     if let Some(index) = declaration_index {
-        let (base, deltas, delta_count) = index.name_table().accounted_segment_split();
-        report.name_table_bytes = index.accounted_core_bytes();
+        let breakdown = index.name_table().memory_breakdown();
+        let components = breakdown.components;
+        let to_u64 = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
+        report.name_table_bytes = components.bytes();
         report.name_entry_count = index.len();
-        report.base_segment_bytes = base;
-        report.delta_segments_bytes = deltas;
-        report.delta_segment_count = delta_count;
+        report.name_index_components = NameIndexMemoryComponents {
+            bytes: to_u64(components.bytes()),
+            declaration_entry_bytes: to_u64(components.declaration_entry_bytes),
+            name_record_bytes: to_u64(components.name_record_bytes),
+            original_name_bytes: to_u64(components.original_name_bytes),
+            lowercase_name_bytes: to_u64(components.lowercase_name_bytes),
+            shared_name_bytes: to_u64(components.shared_name_bytes),
+            path_metadata_bytes: to_u64(components.path_metadata_bytes),
+            project_metadata_bytes: to_u64(components.project_metadata_bytes),
+            sorting_index_bytes: to_u64(components.sorting_index_bytes),
+            short_prefix_posting_bytes: to_u64(components.short_prefix_posting_bytes),
+            fuzzy_posting_bytes: to_u64(components.fuzzy_posting_bytes),
+            prefix_path_posting_bytes: to_u64(components.prefix_path_posting_bytes),
+            path_posting_bytes: to_u64(components.path_posting_bytes),
+            project_posting_bytes: to_u64(components.project_posting_bytes),
+            fixed_overhead_bytes: to_u64(components.fixed_overhead_bytes),
+        };
+        report.base_segment_bytes = breakdown.base_segment_bytes;
+        report.delta_segments_bytes = breakdown.delta_segment_bytes;
+        report.delta_segment_count = breakdown.delta_segment_count;
     }
     if let Some(graph) = reach_graph {
         report.reach_graph_bytes = graph.accounted_bytes();
@@ -405,7 +427,81 @@ async fn update_indexed_file_list(
     Ok(Arc::new(files))
 }
 
+/// State shared by runtime and benchmark full publications. It is created only
+/// while `publish_gate` is held, before the replacement snapshot begins to
+/// build. If any later step returns early, its payload-cache lease restores the
+/// old generation's effective budget on drop.
+struct FullPublicationState {
+    old_payload_cache: Option<DeclarationPayloadCachePublicationLease>,
+    effective_budget_after_shrink_bytes: Option<usize>,
+}
+
+impl FullPublicationState {
+    fn shrink(&self) -> Option<DeclarationPayloadCacheShrink> {
+        self.old_payload_cache
+            .as_ref()
+            .map(DeclarationPayloadCachePublicationLease::shrink)
+    }
+
+    fn commit(&mut self) {
+        if let Some(lease) = &mut self.old_payload_cache {
+            lease.commit();
+        }
+    }
+
+    fn effective_budget_after_shrink_bytes(&self) -> Option<usize> {
+        self.effective_budget_after_shrink_bytes
+    }
+}
+
 impl CacheLedger {
+    /// Begin the common complete-publication lifecycle. Callers must already
+    /// own `publish_gate`; the old snapshot remains published and readable.
+    async fn begin_full_publication_under_gate(&self, root: &PathBuf) -> FullPublicationState {
+        let previous = self.current_engine_snapshot(root).await;
+        let (old_payload_cache, effective_budget_after_shrink_bytes) = previous
+            .and_then(|snapshot| snapshot.declaration_index.clone())
+            .map(|index| {
+                let lease = index.suspend_payload_cache_for_full_publication();
+                let effective_budget_after_shrink_bytes = index.effective_payload_budget_bytes();
+                (Some(lease), Some(effective_budget_after_shrink_bytes))
+            })
+            .unwrap_or((None, None));
+        FullPublicationState {
+            old_payload_cache,
+            effective_budget_after_shrink_bytes,
+        }
+    }
+
+    /// Atomically expose a fully built replacement snapshot and permanently
+    /// keep the old generation's replaceable payload cache disabled.
+    async fn finish_full_publication_under_gate(
+        &self,
+        publication: &mut FullPublicationState,
+        snapshot: EngineSnapshot,
+    ) -> Arc<EngineSnapshot> {
+        self.publish_engine_snapshot_with_after_swap(
+            snapshot,
+            || publication.commit(),
+            std::future::ready(()),
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    async fn finish_full_publication_under_gate_with_after_swap_for_test<AfterSwap>(
+        &self,
+        mut publication: FullPublicationState,
+        snapshot: EngineSnapshot,
+        after_swap: AfterSwap,
+    ) -> Arc<EngineSnapshot>
+    where
+        AfterSwap: std::future::Future<Output = ()>,
+    {
+        self.publish_engine_snapshot_with_after_swap(snapshot, || publication.commit(), after_swap)
+            .await
+    }
+
     /// Hydrate the same immutable read-model components as a full publication,
     /// but from an explicit benchmark database. This deliberately exists only
     /// for production-path LSP tests: normal runtime publication must keep using
@@ -416,6 +512,8 @@ impl CacheLedger {
         root: PathBuf,
         db_path: PathBuf,
     ) -> Result<Arc<EngineSnapshot>> {
+        let _publish_guard = self.publish_gate.lock().await;
+        let mut publication = self.begin_full_publication_under_gate(&root).await;
         let total_budget_bytes = self.semantic_index_memory_budget_bytes();
         let epoch = self.allocate_engine_epoch();
         let build_root = root.clone();
@@ -478,7 +576,9 @@ impl CacheLedger {
         })
         .await??;
 
-        Ok(self.publish_engine_snapshot(snapshot).await)
+        Ok(self
+            .finish_full_publication_under_gate(&mut publication, snapshot)
+            .await)
     }
 
     #[cfg(test)]
@@ -518,6 +618,7 @@ impl CacheLedger {
         root: PathBuf,
         workspace_semantics: Arc<super::super::workspace_config::PublishedWorkspaceSemantics>,
     ) -> Result<CachePublishReport> {
+        let mut publication = self.begin_full_publication_under_gate(&root).await;
         let semantic_generation = load_semantic_generation(root.clone()).await?;
 
         let nt_started = tokio::time::Instant::now();
@@ -606,23 +707,41 @@ impl CacheLedger {
         );
 
         let epoch = self.allocate_engine_epoch();
-        self.publish_engine_snapshot(EngineSnapshot {
-            root,
-            epoch,
-            semantic_generation,
-            declaration_index: Some(declaration_index.clone()),
-            name_table: Some(declaration_index.name_table_arc()),
-            fallback_completion_table,
-            reach_graph,
-            include_table,
-            go_import_table,
-            indexed_files,
-            include_path_index,
-            project_context,
-            call_read_handle: Some(call_read_handle),
-            workspace_semantics,
-            degraded: degraded.clone(),
-        })
+        if let Some(shrink) = publication.shrink() {
+            client
+                .log_message(
+                    MessageType::LOG,
+                    format!(
+                        "full publication payload cache shrink: configured_budget_bytes={}, effective_budget_before_bytes={}, effective_budget_after_bytes={}, removed_entries={}, removed_bytes={}",
+                        shrink.configured_budget_bytes,
+                        shrink.effective_budget_before_bytes,
+                        publication.effective_budget_after_shrink_bytes().unwrap_or(0),
+                        shrink.removed_entries,
+                        shrink.removed_bytes,
+                    ),
+                )
+                .await;
+        }
+        self.finish_full_publication_under_gate(
+            &mut publication,
+            EngineSnapshot {
+                root,
+                epoch,
+                semantic_generation,
+                declaration_index: Some(declaration_index.clone()),
+                name_table: Some(declaration_index.name_table_arc()),
+                fallback_completion_table,
+                reach_graph,
+                include_table,
+                go_import_table,
+                indexed_files,
+                include_path_index,
+                project_context,
+                call_read_handle: Some(call_read_handle),
+                workspace_semantics,
+                degraded: degraded.clone(),
+            },
+        )
         .await;
         self.invalidate_after_index_change().await;
 
@@ -979,6 +1098,7 @@ impl CacheLedger {
 
 #[cfg(test)]
 mod memory_tests {
+    use std::mem::size_of;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
@@ -987,7 +1107,7 @@ mod memory_tests {
     use super::declaration_models::build_declaration_index_from_db;
     use super::{
         build_include_path_index_from_db, build_include_table_from_db,
-        build_indexed_file_list_from_db, build_reach_graph_from_db,
+        build_indexed_file_list_from_db, build_reach_graph_from_db, CacheLedger,
     };
     use crate::call_model::SemanticGeneration;
     use crate::call_service::CallReadHandle;
@@ -998,6 +1118,8 @@ mod memory_tests {
     use crate::resource::current_process_memory_bytes;
     use crate::server::IncludeCompletionTable;
     use crate::store::IndexStore;
+    use tempfile::tempdir;
+    use tokio::sync::Notify;
 
     const MIB: u64 = 1024 * 1024;
     const SEMANTIC_INDEX_TOTAL_BUDGET_BYTES: usize = 256 * 1024 * 1024;
@@ -1067,6 +1189,66 @@ mod memory_tests {
         }
     }
 
+    fn name_index_memory_groups(index: &SemanticDeclarationIndex) -> (usize, usize, usize, usize) {
+        let components = index.name_table().memory_breakdown().components;
+        let strings = components
+            .original_name_bytes
+            .saturating_add(components.lowercase_name_bytes)
+            .saturating_add(components.shared_name_bytes);
+        let paths_and_projects = components
+            .path_metadata_bytes
+            .saturating_add(components.project_metadata_bytes);
+        let postings = components
+            .short_prefix_posting_bytes
+            .saturating_add(components.fuzzy_posting_bytes)
+            .saturating_add(components.prefix_path_posting_bytes)
+            .saturating_add(components.path_posting_bytes)
+            .saturating_add(components.project_posting_bytes);
+        let fixed = components
+            .declaration_entry_bytes
+            .saturating_add(components.name_record_bytes)
+            .saturating_add(components.sorting_index_bytes)
+            .saturating_add(components.fixed_overhead_bytes);
+        (strings, paths_and_projects, postings, fixed)
+    }
+
+    fn file_relation_bytes(
+        reach_graph: &ReachGraph,
+        include_table: &IncludeCompletionTable,
+        indexed_files: &[(String, PathBuf)],
+        indexed_file_capacity: usize,
+    ) -> usize {
+        reach_graph
+            .accounted_bytes()
+            .saturating_add(include_table.accounted_bytes())
+            .saturating_add(indexed_file_capacity.saturating_mul(size_of::<(String, PathBuf)>()))
+            .saturating_add(
+                indexed_files
+                    .iter()
+                    .fold(0usize, |bytes, (path, absolute)| {
+                        bytes
+                            .saturating_add(path.len())
+                            .saturating_add(absolute.as_os_str().len())
+                    }),
+            )
+    }
+
+    fn snapshot_file_relation_bytes(snapshot: &crate::server::workspace::EngineSnapshot) -> usize {
+        match (
+            snapshot.reach_graph.as_deref(),
+            snapshot.include_table.as_deref(),
+            snapshot.indexed_files.as_deref(),
+        ) {
+            (Some(reach_graph), Some(include_table), Some(indexed_files)) => file_relation_bytes(
+                reach_graph,
+                include_table,
+                indexed_files,
+                indexed_files.capacity(),
+            ),
+            _ => 0,
+        }
+    }
+
     struct PeakMemorySampler {
         peak: Arc<AtomicU64>,
         stop: Arc<AtomicBool>,
@@ -1117,6 +1299,96 @@ mod memory_tests {
                 let _ = thread.join();
             }
         }
+    }
+
+    fn snapshot_with_index(
+        ledger: &CacheLedger,
+        root: PathBuf,
+        declaration_index: Arc<SemanticDeclarationIndex>,
+    ) -> crate::server::workspace::EngineSnapshot {
+        crate::server::workspace::EngineSnapshot {
+            root: root.clone(),
+            epoch: ledger.allocate_engine_epoch(),
+            semantic_generation: SemanticGeneration::MISSING,
+            name_table: Some(declaration_index.name_table_arc()),
+            declaration_index: Some(declaration_index),
+            fallback_completion_table: Arc::new(
+                crate::completion::ordinary_service::FallbackCompletionNameTable::default(),
+            ),
+            reach_graph: None,
+            include_table: None,
+            go_import_table: None,
+            indexed_files: None,
+            include_path_index: None,
+            project_context: None,
+            call_read_handle: None,
+            workspace_semantics: Arc::new(
+                crate::server::workspace_config::PublishedWorkspaceSemantics::empty(&root),
+            ),
+            degraded: crate::progress::DegradedCapabilities::default(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_after_snapshot_swap_keeps_old_payload_cache_disabled() {
+        let workspace = tempdir().expect("workspace");
+        let root = workspace.path().to_path_buf();
+        let ledger = Arc::new(CacheLedger::default());
+        let old_index = Arc::new(SemanticDeclarationIndex::build(
+            crate::query::NameTable::build(vec![(1, "old_symbol".to_string(), false)]),
+            8 * 1024 * 1024,
+        ));
+        ledger
+            .publish_engine_snapshot(snapshot_with_index(
+                &ledger,
+                root.clone(),
+                old_index.clone(),
+            ))
+            .await;
+        let _publish_guard = ledger.publish_gate.lock().await;
+        let publication = ledger.begin_full_publication_under_gate(&root).await;
+        assert_eq!(old_index.effective_payload_budget_bytes(), 0);
+
+        let new_index = Arc::new(SemanticDeclarationIndex::build(
+            crate::query::NameTable::build(vec![(2, "new_symbol".to_string(), false)]),
+            8 * 1024 * 1024,
+        ));
+        let new_epoch = ledger.allocate_engine_epoch();
+        let mut replacement = snapshot_with_index(&ledger, root.clone(), new_index);
+        replacement.epoch = new_epoch;
+        let swapped = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        let task_ledger = ledger.clone();
+        let task_swapped = swapped.clone();
+        let task_resume = resume.clone();
+        let publish = tokio::spawn(async move {
+            task_ledger
+                .finish_full_publication_under_gate_with_after_swap_for_test(
+                    publication,
+                    replacement,
+                    async move {
+                        task_swapped.notify_one();
+                        task_resume.notified().await;
+                    },
+                )
+                .await
+        });
+
+        swapped.notified().await;
+        let current = ledger
+            .current_engine_snapshot(&root)
+            .await
+            .expect("replacement snapshot is visible");
+        assert_eq!(current.epoch, new_epoch);
+        assert_eq!(old_index.effective_payload_budget_bytes(), 0);
+
+        publish.abort();
+        assert!(matches!(publish.await, Err(error) if error.is_cancelled()));
+        assert_eq!(
+            old_index.effective_payload_budget_bytes(),
+            0,
+            "a cancellation after the snapshot swap must not revive the retired cache"
+        );
     }
 
     #[test]
@@ -1180,6 +1452,22 @@ mod memory_tests {
         let second_build_ms = second_started.elapsed().as_millis();
         let two_generation_private_bytes = current_process_memory_bytes();
         let peak_private_bytes = sampler.finish();
+        let (first_name_strings, first_name_paths, first_name_postings, first_name_fixed) =
+            name_index_memory_groups(&first.declarations);
+        let (second_name_strings, second_name_paths, second_name_postings, second_name_fixed) =
+            name_index_memory_groups(&second.declarations);
+        let first_file_relations_bytes = file_relation_bytes(
+            &first.reach_graph,
+            &first.include_table,
+            &first.indexed_files,
+            first.indexed_files.capacity(),
+        );
+        let second_file_relations_bytes = file_relation_bytes(
+            &second.reach_graph,
+            &second.include_table,
+            &second.indexed_files,
+            second.indexed_files.capacity(),
+        );
 
         println!(
             "engine_hydration_declarations: {}",
@@ -1199,6 +1487,20 @@ mod memory_tests {
         println!("engine_hydration_peak_private_bytes: {peak_private_bytes}");
         println!("engine_hydration_first_build_ms: {first_build_ms}");
         println!("engine_hydration_second_build_ms: {second_build_ms}");
+        println!("engine_hydration_first_name_strings_bytes: {first_name_strings}");
+        println!("engine_hydration_first_name_paths_projects_bytes: {first_name_paths}");
+        println!("engine_hydration_first_name_postings_bytes: {first_name_postings}");
+        println!("engine_hydration_first_name_fixed_bytes: {first_name_fixed}");
+        println!("engine_hydration_second_name_strings_bytes: {second_name_strings}");
+        println!("engine_hydration_second_name_paths_projects_bytes: {second_name_paths}");
+        println!("engine_hydration_second_name_postings_bytes: {second_name_postings}");
+        println!("engine_hydration_second_name_fixed_bytes: {second_name_fixed}");
+        println!("engine_hydration_first_file_relations_bytes: {first_file_relations_bytes}");
+        println!("engine_hydration_second_file_relations_bytes: {second_file_relations_bytes}");
+        println!(
+            "engine_hydration_second_generation_incremental_bytes: {}",
+            two_generation_private_bytes.saturating_sub(single_generation_private_bytes)
+        );
 
         assert!(
             peak_private_bytes <= SIDE_BY_SIDE_PEAK_PRIVATE_LIMIT_BYTES,
@@ -1206,5 +1508,230 @@ mod memory_tests {
             peak_private_bytes / MIB,
             SIDE_BY_SIDE_PEAK_PRIVATE_LIMIT_BYTES / MIB
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "U-Boot warm old-generation publication memory gate; set FOSSILSENSE_BENCH_DB and FOSSILSENSE_BENCH_ROOT"]
+    async fn uboot_warm_generation_publication_stays_below_private_memory_gate() {
+        require_release_memory_gate();
+        let db_path = std::env::var_os("FOSSILSENSE_BENCH_DB")
+            .map(PathBuf::from)
+            .expect("set FOSSILSENSE_BENCH_DB to a current-schema U-Boot database");
+        let root = std::env::var_os("FOSSILSENSE_BENCH_ROOT")
+            .map(PathBuf::from)
+            .expect("set FOSSILSENSE_BENCH_ROOT to the indexed U-Boot checkout");
+        assert!(db_path.is_file(), "benchmark database does not exist");
+        assert!(root.is_dir(), "benchmark workspace does not exist");
+        assert!(
+            current_process_memory_bytes() > 0,
+            "process private/RSS memory collection is unavailable"
+        );
+
+        let ledger = CacheLedger::default();
+        let first_started = Instant::now();
+        let first_snapshot = ledger
+            .publish_full_index_from_db_for_test(root.clone(), db_path.clone())
+            .await
+            .expect("publish first U-Boot engine snapshot");
+        let first_build_ms = first_started.elapsed().as_millis();
+        let old_request = ledger
+            .request_context(root.clone(), Default::default())
+            .await;
+        let old_snapshot = old_request.engine.clone();
+        assert_eq!(old_snapshot.epoch, first_snapshot.epoch);
+        let old_index = old_snapshot
+            .declaration_index
+            .clone()
+            .expect("first declaration index");
+        let old_handle = old_snapshot
+            .call_read_handle
+            .clone()
+            .expect("first call read handle");
+        assert!(
+            old_index.len() >= MINIMUM_UBOOT_DECLARATIONS,
+            "memory gate requires a full U-Boot declaration set"
+        );
+        assert!(
+            old_snapshot
+                .indexed_files
+                .as_ref()
+                .is_some_and(|files| files.len() >= MINIMUM_UBOOT_FILES),
+            "memory gate requires a full U-Boot file set"
+        );
+
+        let budget = old_index.payload_budget_bytes();
+        assert!(
+            budget > 0,
+            "warm publication requires a payload cache budget"
+        );
+        let warm_target_bytes = budget.saturating_mul(75) / 100;
+        let sampler = PeakMemorySampler::start();
+        let mut batch = Vec::with_capacity(512);
+        let mut ids_seen = 0usize;
+        let mut first_warmed_id = None;
+        let store = IndexStore::open_readonly(&db_path).expect("open U-Boot name stream");
+        store
+            .declaration_view()
+            .visit_name_rows(|row| {
+                if old_index.payload_cache_stats().bytes >= warm_target_bytes {
+                    return Ok(());
+                }
+                if first_warmed_id.is_none() {
+                    first_warmed_id = Some(row.id);
+                }
+                batch.push(row.id);
+                ids_seen = ids_seen.saturating_add(1);
+                if batch.len() == batch.capacity() {
+                    old_index
+                        .payloads_by_ids(&old_handle, &batch)
+                        .expect("warm cached declaration batch");
+                    batch.clear();
+                }
+                Ok(())
+            })
+            .expect("stream stable declaration IDs");
+        if !batch.is_empty() && old_index.payload_cache_stats().bytes < warm_target_bytes {
+            old_index
+                .payloads_by_ids(&old_handle, &batch)
+                .expect("warm final declaration batch");
+        }
+        let preheat_stats = old_index.payload_cache_stats();
+        assert!(
+            preheat_stats.bytes >= warm_target_bytes,
+            "sample exhausted before warming cache: budget={}, target={}, bytes={}, entries={}, ids_seen={}",
+            budget,
+            warm_target_bytes,
+            preheat_stats.bytes,
+            preheat_stats.entries,
+            ids_seen,
+        );
+        assert!(preheat_stats.misses > 0 && preheat_stats.sql_reads > 0);
+        let warm_private_bytes = current_process_memory_bytes();
+        let warm_peak_private_bytes = sampler.peak_bytes().max(warm_private_bytes);
+        assert!(
+            warm_private_bytes <= SINGLE_GENERATION_PRIVATE_LIMIT_BYTES,
+            "warm single generation uses {} MiB; limit is {} MiB",
+            warm_private_bytes / MIB,
+            SINGLE_GENERATION_PRIVATE_LIMIT_BYTES / MIB,
+        );
+        assert!(
+            warm_peak_private_bytes <= SINGLE_GENERATION_PRIVATE_LIMIT_BYTES,
+            "warming one generation peaks at {} MiB; limit is {} MiB",
+            warm_peak_private_bytes / MIB,
+            SINGLE_GENERATION_PRIVATE_LIMIT_BYTES / MIB,
+        );
+
+        // Deterministic warm-cache witness: the first streamed ID was inserted
+        // with the opening batch, and warming stops at 75% of the budget so no
+        // eviction can have removed it. Searching by name would depend on the
+        // sample's declaration ordering instead of on the warmed set.
+        let stable_id = first_warmed_id.expect("warm cache holds at least one declaration");
+        let before = old_index
+            .payloads_by_ids(&old_handle, &[stable_id])
+            .expect("read old declaration before publication");
+        let warm_stats = old_index.payload_cache_stats();
+        assert!(
+            warm_stats.hits > 0,
+            "the captured old request must use its warm cache"
+        );
+        let old_epoch = old_snapshot.epoch;
+        let old_generation = old_snapshot.semantic_generation;
+        let second_started = Instant::now();
+        let new_snapshot = ledger
+            .publish_full_index_from_db_for_test(root.clone(), db_path.clone())
+            .await
+            .expect("publish replacement U-Boot engine snapshot");
+        let second_build_ms = second_started.elapsed().as_millis();
+        let publish_peak_private_bytes = sampler.finish();
+        let two_generation_private_bytes = current_process_memory_bytes();
+        let shrink_stats = old_index.payload_cache_stats();
+        let after = old_index
+            .payloads_by_ids(&old_handle, &[stable_id])
+            .expect("old request reads captured generation after publication");
+        let current_request = ledger
+            .request_context(root.clone(), Default::default())
+            .await;
+        let new_index = new_snapshot
+            .declaration_index
+            .as_deref()
+            .expect("replacement declaration index");
+        let (first_name_strings, first_name_paths, first_name_postings, first_name_fixed) =
+            name_index_memory_groups(&old_index);
+        let (second_name_strings, second_name_paths, second_name_postings, second_name_fixed) =
+            name_index_memory_groups(new_index);
+        let first_file_relations_bytes = snapshot_file_relation_bytes(&old_snapshot);
+        let second_file_relations_bytes = snapshot_file_relation_bytes(&new_snapshot);
+
+        assert_ne!(new_snapshot.epoch, old_epoch);
+        assert_eq!(current_request.engine.epoch, new_snapshot.epoch);
+        assert_eq!(old_snapshot.epoch, old_epoch);
+        assert_eq!(old_snapshot.semantic_generation, old_generation);
+        assert_eq!(old_handle.generation, old_generation);
+        assert_eq!(before, after, "old request must keep declaration facts");
+        assert_eq!(shrink_stats.effective_budget_bytes, 0);
+        assert_eq!(warm_stats.effective_budget_bytes, budget);
+        assert!(shrink_stats.publication_shrink_bytes >= warm_stats.bytes);
+        assert!(shrink_stats.publication_shrink_entries >= warm_stats.entries);
+        assert!(
+            publish_peak_private_bytes <= SIDE_BY_SIDE_PEAK_PRIVATE_LIMIT_BYTES,
+            "warm full publication peaks at {} MiB; hard limit is {} MiB",
+            publish_peak_private_bytes / MIB,
+            SIDE_BY_SIDE_PEAK_PRIVATE_LIMIT_BYTES / MIB,
+        );
+
+        println!("warm_publication_declarations: {}", old_index.len());
+        println!(
+            "warm_publication_files: {}",
+            old_snapshot
+                .indexed_files
+                .as_ref()
+                .map_or(0, |files| files.len())
+        );
+        println!("warm_publication_payload_budget_bytes: {budget}");
+        println!(
+            "warm_publication_effective_budget_before_bytes: {}",
+            warm_stats.effective_budget_bytes
+        );
+        println!(
+            "warm_publication_effective_budget_after_bytes: {}",
+            shrink_stats.effective_budget_bytes
+        );
+        println!("warm_publication_target_bytes: {warm_target_bytes}");
+        println!("warm_publication_cache_bytes: {}", warm_stats.bytes);
+        println!("warm_publication_cache_entries: {}", warm_stats.entries);
+        println!("warm_publication_cache_hits: {}", warm_stats.hits);
+        println!("warm_publication_cache_misses: {}", warm_stats.misses);
+        println!("warm_publication_cache_sql_reads: {}", warm_stats.sql_reads);
+        println!("warm_publication_cache_evictions: {}", warm_stats.evictions);
+        println!(
+            "warm_publication_shrink_entries: {}",
+            shrink_stats.publication_shrink_entries
+        );
+        println!(
+            "warm_publication_shrink_bytes: {}",
+            shrink_stats.publication_shrink_bytes
+        );
+        println!("warm_publication_single_private_bytes: {warm_private_bytes}");
+        println!("warm_publication_single_peak_private_bytes: {warm_peak_private_bytes}");
+        println!("warm_publication_peak_private_bytes: {publish_peak_private_bytes}");
+        println!("warm_publication_two_generation_private_bytes: {two_generation_private_bytes}");
+        println!(
+            "warm_publication_second_generation_incremental_bytes: {}",
+            two_generation_private_bytes.saturating_sub(warm_private_bytes)
+        );
+        println!("warm_publication_first_build_ms: {first_build_ms}");
+        println!("warm_publication_second_build_ms: {second_build_ms}");
+        println!("warm_publication_first_name_strings_bytes: {first_name_strings}");
+        println!("warm_publication_first_name_paths_projects_bytes: {first_name_paths}");
+        println!("warm_publication_first_name_postings_bytes: {first_name_postings}");
+        println!("warm_publication_first_name_fixed_bytes: {first_name_fixed}");
+        println!("warm_publication_second_name_strings_bytes: {second_name_strings}");
+        println!("warm_publication_second_name_paths_projects_bytes: {second_name_paths}");
+        println!("warm_publication_second_name_postings_bytes: {second_name_postings}");
+        println!("warm_publication_second_name_fixed_bytes: {second_name_fixed}");
+        println!("warm_publication_first_file_relations_bytes: {first_file_relations_bytes}");
+        println!("warm_publication_second_file_relations_bytes: {second_file_relations_bytes}");
+        println!("warm_publication_old_epoch_consistent: 1");
+        println!("warm_publication_old_generation_consistent: 1");
     }
 }

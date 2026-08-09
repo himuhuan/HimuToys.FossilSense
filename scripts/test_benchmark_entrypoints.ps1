@@ -37,6 +37,34 @@ if ($benchmarkSource -notmatch 'Assert-FullIndexPerformanceGate' -or
     $benchmarkSource -notmatch '\[Math\]::Min\(\$TimeoutSeconds, 120\)') {
     throw 'The large-workspace runner does not enforce the full-index gate and timeout internally.'
 }
+$metricWhitelist = [regex]::Match(
+    $benchmarkSource,
+    '(?ms)^function Convert-WhitelistedMetrics(?:\([^)]*\))?\s*\{.*?^\s*\$metrics = \[ordered\]@\{'
+)
+if (-not $metricWhitelist.Success) {
+    throw 'The large-workspace runner has no readable metric whitelist.'
+}
+foreach ($metricName in @(
+    'engine_hydration_first_name_strings_bytes',
+    'engine_hydration_second_generation_incremental_bytes',
+    'warm_publication_single_private_bytes',
+    'warm_publication_single_peak_private_bytes',
+    'warm_publication_peak_private_bytes',
+    'warm_publication_cache_evictions',
+    'warm_publication_effective_budget_before_bytes',
+    'warm_publication_effective_budget_after_bytes',
+    'warm_publication_shrink_bytes',
+    'warm_publication_first_name_strings_bytes',
+    'warm_publication_second_name_strings_bytes',
+    'warm_publication_first_file_relations_bytes',
+    'warm_publication_second_file_relations_bytes',
+    'warm_publication_second_generation_incremental_bytes',
+    'warm_publication_old_generation_consistent'
+)) {
+    if ($metricWhitelist.Value -notmatch [regex]::Escape($metricName)) {
+        throw "The large-workspace runner drops the required engine metric: $metricName"
+    }
+}
 
 $defaultCases = @(
     & powershell -NoProfile -ExecutionPolicy Bypass -File $benchmarkScript -ListCases 2>&1 |
@@ -91,6 +119,8 @@ if (-not (Test-Path -LiteralPath $engineHarness -PathType Leaf)) {
 $engineHarnessSource = Get-Content -Raw -LiteralPath $engineHarness
 if ($engineHarnessSource -notmatch 'cargo test' -or
     $engineHarnessSource -notmatch 'uboot_engine_hydration_stays_below_private_memory_gate' -or
+    $engineHarnessSource -notmatch 'uboot_warm_generation_publication_stays_below_private_memory_gate' -or
+    $engineHarnessSource -notmatch 'warm_publication_shrink_bytes' -or
     $engineHarnessSource -notmatch 'FOSSILSENSE_BENCH_DB' -or
     $engineHarnessSource -notmatch 'FOSSILSENSE_BENCH_ROOT') {
     throw 'The engine hydration harness does not execute the release U-Boot memory gate.'
@@ -202,6 +232,14 @@ try {
         $result.metrics.candidate_query_truncated -ne 1 -or
         $result.metrics.coverage_truncated -ne 1) {
         throw 'Real semantic aggregate metrics were not preserved in the JSON report.'
+    }
+    if ([string]::IsNullOrWhiteSpace($report.command_line) -or
+        [string]::IsNullOrWhiteSpace($report.machine.os_version) -or
+        $report.machine.processor_count -le 0 -or
+        [string]::IsNullOrWhiteSpace($result.workspace) -or
+        [string]::IsNullOrWhiteSpace($result.sample_revision) -or
+        $result.database_size_bytes -lt 0) {
+        throw 'Benchmark JSON is missing the command, machine, sample revision, or database-size evidence required for reproduction.'
     }
     if ($result.outer_process_metrics_comparable -ne $false -or
         $null -ne $result.elapsed_ms -or

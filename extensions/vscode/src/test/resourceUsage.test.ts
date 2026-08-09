@@ -53,6 +53,23 @@ const memory: MemoryReport = {
   nameIndex: {
     bytes: 128 * MB,
     entryCount: 654321,
+    components: {
+      bytes: 126 * MB,
+      declarationEntryBytes: 24 * MB,
+      nameRecordBytes: 8 * MB,
+      originalNameBytes: 32 * MB,
+      lowercaseNameBytes: 32 * MB,
+      sharedNameBytes: 0,
+      pathMetadataBytes: 12 * MB,
+      projectMetadataBytes: 2 * MB,
+      sortingIndexBytes: 4 * MB,
+      shortPrefixPostingBytes: 2 * MB,
+      fuzzyPostingBytes: 4 * MB,
+      prefixPathPostingBytes: 2 * MB,
+      pathPostingBytes: 2 * MB,
+      projectPostingBytes: 1 * MB,
+      fixedOverheadBytes: 1 * MB,
+    },
     baseSegmentBytes: 100 * MB,
     deltaSegmentsBytes: 28 * MB,
     deltaSegmentCount: 3,
@@ -109,6 +126,11 @@ assert.ok(
     '- Name index: 654,321 entries · base 100MB · deltas 28MB (3) · fallback 2.0MB',
   ),
 );
+assert.ok(tooltip.includes('- Name strings: 64MB'));
+assert.ok(tooltip.includes('- Name paths and projects: 14MB'));
+assert.ok(tooltip.includes('- Name recall postings: 11MB'));
+assert.ok(tooltip.includes('- Name index fixed overhead: 37MB'));
+assert.match(tooltip, /structure estimates; Private Bytes\/RSS remains authoritative/);
 assert.ok(
   tooltip.includes(
     '- Declaration cache: 12,345 entries, budget 128MB · hits 1,234 · misses 56 · evictions 7 · SQL reads 8',
@@ -121,3 +143,41 @@ assert.ok(
 );
 assert.ok(tooltip.includes('- Open documents: 4 files · overlay 512KB'));
 assert.match(tooltip, /currently published index generation/);
+
+const legacyComponentsTooltip = resourceUsageTooltip({
+  memoryBytes: 512 * MB,
+  indexDiskBytes: 42 * MB,
+  memory: {
+    ...memory,
+    nameIndex: {
+      ...memory.nameIndex,
+      components: undefined,
+    },
+  },
+  timestamp: 0,
+});
+assert.ok(
+  legacyComponentsTooltip.includes(
+    '- Name index: 654,321 entries · base 100MB · deltas 28MB (3) · fallback 2.0MB',
+  ),
+);
+assert.ok(!legacyComponentsTooltip.includes('Name strings:'));
+
+const invalidComponentsTooltip = resourceUsageTooltip({
+  memoryBytes: 512 * MB,
+  indexDiskBytes: 42 * MB,
+  memory: {
+    ...memory,
+    nameIndex: {
+      ...memory.nameIndex,
+      components: {
+        ...memory.nameIndex.components!,
+        bytes: Number.NaN,
+        originalNameBytes: Number.POSITIVE_INFINITY,
+      },
+    },
+  },
+  timestamp: 0,
+});
+assert.ok(!invalidComponentsTooltip.includes('NaN'));
+assert.ok(!invalidComponentsTooltip.includes('Infinity'));

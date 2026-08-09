@@ -3813,6 +3813,30 @@ async fn cache_ledger_publishes_full_and_dirty_read_models_with_generations() {
     assert!(full_context.engine.project_context.is_some());
     assert_ne!(full_context.engine.epoch.as_u64(), 0);
     assert_eq!(full_context.engine.semantic_generation.0, 1);
+    let full_index = full_context
+        .engine
+        .declaration_index
+        .clone()
+        .expect("full declaration index");
+    let full_handle = full_context
+        .engine
+        .call_read_handle
+        .clone()
+        .expect("full read handle");
+    let alpha_id = full_context
+        .engine
+        .name_table
+        .as_ref()
+        .expect("full name table")
+        .search_ranked("alpha_symbol", 1)[0]
+        .id;
+    let warmed = full_index
+        .payloads_by_ids(&full_handle, &[alpha_id])
+        .expect("warm full payload cache");
+    assert_eq!(warmed.len(), 1);
+    let warm_cache = full_index.payload_cache_stats();
+    assert_eq!(warm_cache.entries, 1);
+    assert!(warm_cache.effective_budget_bytes > 0);
 
     write_workspace_file(
         root.path(),
@@ -3861,6 +3885,108 @@ async fn cache_ledger_publishes_full_and_dirty_read_models_with_generations() {
             .len(),
         2
     );
+    assert_eq!(
+        full_index.effective_payload_budget_bytes(),
+        full_index.payload_budget_bytes(),
+        "dirty publication must not suspend the prior immutable cache",
+    );
+    assert_eq!(full_index.payload_cache_stats().entries, warm_cache.entries);
+    let sql_reads_before = full_index.payload_cache_stats().sql_reads;
+    let warmed_after_dirty = full_index
+        .payloads_by_ids(&full_handle, &[alpha_id])
+        .expect("old request remains readable after dirty publication");
+    assert_eq!(warmed_after_dirty[0].fact.name, "alpha_symbol");
+    assert_eq!(full_index.payload_cache_stats().sql_reads, sql_reads_before);
+}
+
+#[tokio::test]
+async fn full_publication_shrinks_old_cache_without_changing_captured_request_generation() {
+    let root = tempdir().expect("root");
+    let root_path = root.path().to_path_buf();
+    write_workspace_file(root.path(), "src/main.c", "int alpha_generation_one;\n");
+    crate::indexer::index_workspace(
+        root.path(),
+        crate::indexer::IndexOptions {
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("generation one index");
+
+    let service = test_backend_service();
+    service
+        .inner()
+        .session
+        .cache
+        .publish_full_index(&service.inner().client, root_path.clone())
+        .await
+        .expect("publish generation one");
+    let old_context = service
+        .inner()
+        .request_context_for_root(root_path.clone())
+        .await;
+    let old_epoch = old_context.engine.epoch;
+    let old_generation = old_context.engine.semantic_generation;
+    let old_index = old_context
+        .engine
+        .declaration_index
+        .clone()
+        .expect("old declaration index");
+    let old_handle = old_context
+        .engine
+        .call_read_handle
+        .clone()
+        .expect("old call read handle");
+    let old_id = old_context
+        .engine
+        .name_table
+        .as_ref()
+        .expect("old name table")
+        .search_ranked("alpha_generation_one", 1)[0]
+        .id;
+    let before = old_index
+        .payloads_by_ids(&old_handle, &[old_id])
+        .expect("warm old generation");
+    assert_eq!(before[0].fact.name, "alpha_generation_one");
+    assert_eq!(old_index.payload_cache_stats().entries, 1);
+
+    write_workspace_file(root.path(), "src/main.c", "int beta_generation_two;\n");
+    crate::indexer::index_workspace(
+        root.path(),
+        crate::indexer::IndexOptions {
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("generation two index");
+    let new_report = service
+        .inner()
+        .session
+        .cache
+        .publish_full_index(&service.inner().client, root_path.clone())
+        .await
+        .expect("publish generation two");
+    let new_context = service.inner().request_context_for_root(root_path).await;
+
+    assert_ne!(new_context.engine.epoch, old_epoch);
+    assert_ne!(new_report.semantic_generation, old_generation);
+    assert_eq!(old_context.engine.epoch, old_epoch);
+    assert_eq!(old_context.engine.semantic_generation, old_generation);
+    assert_eq!(old_handle.generation, old_generation);
+    let shrink = old_index.payload_cache_stats();
+    assert_eq!(shrink.entries, 0);
+    assert_eq!(shrink.bytes, 0);
+    assert_eq!(shrink.effective_budget_bytes, 0);
+    assert_eq!(shrink.publication_shrink_entries, 1);
+    assert!(shrink.publication_shrink_bytes > 0);
+
+    let after = old_index
+        .payloads_by_ids(&old_handle, &[old_id])
+        .expect("old request reads its captured generation after publication");
+    assert_eq!(after[0].fact.name, "alpha_generation_one");
+    assert_eq!(old_index.payload_cache_stats().entries, 0);
 }
 
 #[tokio::test]

@@ -14,10 +14,29 @@ export interface ProcessMemoryReport {
 export interface NameIndexMemoryReport {
   bytes: number;
   entryCount: number;
+  components?: NameIndexMemoryComponents;
   baseSegmentBytes: number;
   deltaSegmentsBytes: number;
   deltaSegmentCount: number;
   fallbackTableBytes: number;
+}
+
+export interface NameIndexMemoryComponents {
+  bytes: number;
+  declarationEntryBytes: number;
+  nameRecordBytes: number;
+  originalNameBytes: number;
+  lowercaseNameBytes: number;
+  sharedNameBytes: number;
+  pathMetadataBytes: number;
+  projectMetadataBytes: number;
+  sortingIndexBytes: number;
+  shortPrefixPostingBytes: number;
+  fuzzyPostingBytes: number;
+  prefixPathPostingBytes: number;
+  pathPostingBytes: number;
+  projectPostingBytes: number;
+  fixedOverheadBytes: number;
 }
 
 export interface DeclarationCacheMemoryReport {
@@ -108,6 +127,31 @@ function shareOfTotal(bytes: number, totalBytes: number): string {
   return `${Math.round((bytes / totalBytes) * 100)}%`;
 }
 
+function hasUsableNameIndexComponents(
+  components: NameIndexMemoryComponents | undefined,
+): components is NameIndexMemoryComponents {
+  if (!components) {
+    return false;
+  }
+  return [
+    components.bytes,
+    components.declarationEntryBytes,
+    components.nameRecordBytes,
+    components.originalNameBytes,
+    components.lowercaseNameBytes,
+    components.sharedNameBytes,
+    components.pathMetadataBytes,
+    components.projectMetadataBytes,
+    components.sortingIndexBytes,
+    components.shortPrefixPostingBytes,
+    components.fuzzyPostingBytes,
+    components.prefixPathPostingBytes,
+    components.pathPostingBytes,
+    components.projectPostingBytes,
+    components.fixedOverheadBytes,
+  ].every((value) => Number.isFinite(value) && value >= 0);
+}
+
 /**
  * Markdown source for the status bar hover. `extension.ts` wraps it in a
  * `vscode.MarkdownString`; this module stays free of the `vscode` import so
@@ -143,8 +187,34 @@ export function resourceUsageTooltip(usage: ResourceUsage): string {
     `- Declaration cache: ${formatCount(memory.declarationCache.entryCount)} entries, budget ${formatBytes(memory.declarationCache.budgetBytes)} · hits ${formatCount(memory.declarationCache.hits)} · misses ${formatCount(memory.declarationCache.misses)} · evictions ${formatCount(memory.declarationCache.evictions)} · SQL reads ${formatCount(memory.declarationCache.sqlReads)}`,
     `- File relations: ${formatCount(memory.fileRelations.fileCount)} files · ${formatCount(memory.fileRelations.includeEdgeCount)} include edges · reach ${formatBytes(memory.fileRelations.reachGraphBytes)} · include ${formatBytes(memory.fileRelations.includeTableBytes)} · go imports ${formatBytes(memory.fileRelations.goImportTableBytes)} · file list ${formatBytes(memory.fileRelations.indexedFilesBytes)} · projects ${formatBytes(memory.fileRelations.projectContextBytes)}`,
     `- Open documents: ${formatCount(memory.openDocuments.documentCount)} files · overlay ${formatBytes(memory.openDocuments.overlayBytes)}`,
+  ];
+  const components = memory.nameIndex.components;
+  if (hasUsableNameIndexComponents(components)) {
+    const nameStrings =
+      components.originalNameBytes + components.lowercaseNameBytes + components.sharedNameBytes;
+    const pathsAndProjects = components.pathMetadataBytes + components.projectMetadataBytes;
+    const recallPostings =
+      components.shortPrefixPostingBytes +
+      components.fuzzyPostingBytes +
+      components.prefixPathPostingBytes +
+      components.pathPostingBytes +
+      components.projectPostingBytes;
+    const fixedOverhead =
+      components.declarationEntryBytes +
+      components.nameRecordBytes +
+      components.sortingIndexBytes +
+      components.fixedOverheadBytes;
+    lines.push(
+      `- Name strings: ${formatBytes(nameStrings)}`,
+      `- Name paths and projects: ${formatBytes(pathsAndProjects)}`,
+      `- Name recall postings: ${formatBytes(recallPostings)}`,
+      `- Name index fixed overhead: ${formatBytes(fixedOverhead)}`,
+      'Name-index components are structure estimates; Private Bytes/RSS remains authoritative for process memory.',
+    );
+  }
+  lines.push(
     '',
     'Itemized categories cover the currently published index generation of each workspace; older generations held by in-flight requests are part of "Other".',
-  ];
+  );
   return lines.join('\n');
 }
