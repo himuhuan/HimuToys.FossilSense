@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use super::*;
 
 pub(super) struct NormalizedCallTarget<'tree> {
@@ -308,12 +310,12 @@ pub(super) fn canonical_callable_signature(
     let raw_prefix = source
         .get(declaration.start_byte()..name_node.start_byte())
         .unwrap_or_default();
-    let raw_prefix = if is_cpp {
-        strip_trailing_cpp_owner_qualification(raw_prefix)
+    let identity_prefix = if is_cpp {
+        Cow::Borrowed(strip_trailing_cpp_owner_qualification(raw_prefix))
     } else {
-        raw_prefix
+        c_prefix_without_standalone_weak_attribute(declaration, name_node, source, raw_prefix)
     };
-    let prefix = raw_prefix
+    let prefix = identity_prefix
         .split_whitespace()
         .filter(|token| *token != "extern")
         .collect::<Vec<_>>()
@@ -338,6 +340,55 @@ pub(super) fn canonical_callable_signature(
         ""
     };
     canonical_full_signature(&format!("{prefix} {name}{parameter_shape}{trailing}"))
+}
+
+fn c_prefix_without_standalone_weak_attribute<'a>(
+    declaration: tree_sitter::Node<'_>,
+    name_node: tree_sitter::Node<'_>,
+    source: &'a str,
+    raw_prefix: &'a str,
+) -> Cow<'a, str> {
+    let prefix_start = declaration.start_byte();
+    let prefix_end = name_node.start_byte();
+    let mut removals = Vec::new();
+    let mut stack = vec![declaration];
+    while let Some(node) = stack.pop() {
+        if node.start_byte() >= prefix_end {
+            continue;
+        }
+        if node.kind() == "attribute_specifier" && node.end_byte() <= prefix_end {
+            let attribute = canonical_full_signature(text(node, source).unwrap_or_default());
+            if matches!(
+                attribute.as_str(),
+                "__attribute__((weak))"
+                    | "__attribute((weak))"
+                    | "__attribute__((__weak__))"
+                    | "__attribute((__weak__))"
+            ) {
+                removals.push((
+                    node.start_byte().saturating_sub(prefix_start),
+                    node.end_byte().saturating_sub(prefix_start),
+                ));
+                continue;
+            }
+        }
+        stack.extend(
+            named_children(node)
+                .into_iter()
+                .filter(|child| child.start_byte() < prefix_end),
+        );
+    }
+    if removals.is_empty() {
+        return Cow::Borrowed(raw_prefix);
+    }
+    removals.sort_unstable_by_key(|range| std::cmp::Reverse(range.0));
+    let mut prefix = raw_prefix.to_string();
+    for (start, end) in removals {
+        if start <= end && end <= prefix.len() {
+            prefix.replace_range(start..end, "");
+        }
+    }
+    Cow::Owned(prefix)
 }
 
 pub(super) fn parameter_shape_without_names(

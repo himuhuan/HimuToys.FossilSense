@@ -3032,6 +3032,49 @@ fn c_callable_identity_ignores_parameter_names_extern_body_and_whitespace() {
 }
 
 #[test]
+fn c_callable_identity_ignores_gnu_weak_attribute_placement() {
+    let leading = parse(
+        Path::new("leading.c"),
+        "__attribute__((weak)) void hook(void);\n",
+    )
+    .callable_anchors
+    .into_iter()
+    .find(|anchor| anchor.name == "hook")
+    .expect("leading weak declaration");
+    let infix = parse(
+        Path::new("infix.c"),
+        "void __attribute__((weak)) hook(void);\n",
+    )
+    .callable_anchors
+    .into_iter()
+    .find(|anchor| anchor.name == "hook")
+    .expect("infix weak declaration");
+    let definition = parse(Path::new("hook.c"), "void hook(void) {}\n")
+        .callable_anchors
+        .into_iter()
+        .find(|anchor| anchor.name == "hook")
+        .expect("definition");
+    let abi = parse(
+        Path::new("abi.c"),
+        "void __attribute__((ms_abi)) hook(void);\n",
+    )
+    .callable_anchors
+    .into_iter()
+    .find(|anchor| anchor.name == "hook")
+    .expect("ABI declaration");
+
+    assert_eq!(leading.canonical_signature, definition.canonical_signature);
+    assert_eq!(infix.canonical_signature, definition.canonical_signature);
+    assert_eq!(leading.entity_key, definition.entity_key);
+    assert_eq!(infix.entity_key, definition.entity_key);
+    assert_ne!(abi.canonical_signature, definition.canonical_signature);
+    assert_ne!(abi.entity_key, definition.entity_key);
+    assert!(abi.canonical_signature.contains("ms_abi"));
+    assert!(leading.presentation_signature.contains("__attribute__"));
+    assert!(infix.presentation_signature.contains("__attribute__"));
+}
+
+#[test]
 fn c_callable_identity_still_rejects_incompatible_parameter_types() {
     let int_anchor = parse(Path::new("api_decl.c"), "extern int lookup(int value);\n")
         .callable_anchors
