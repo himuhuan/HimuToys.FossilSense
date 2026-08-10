@@ -130,7 +130,29 @@ pub(super) fn split_top_level_declarators(chars: &[char]) -> Vec<Vec<char>> {
     let mut i = 0usize;
     let mut paren = 0usize;
     let mut bracket = 0usize;
+    let mut brace = 0usize;
+    let mut in_block_comment = false;
     while i < chars.len() {
+        if in_block_comment {
+            if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                in_block_comment = false;
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if chars[i] == '/' && chars.get(i + 1) == Some(&'/') {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+            in_block_comment = true;
+            i += 2;
+            continue;
+        }
         match chars[i] {
             '"' | '\'' => i = skip_quoted_chars(chars, i),
             '(' => {
@@ -149,7 +171,15 @@ pub(super) fn split_top_level_declarators(chars: &[char]) -> Vec<Vec<char>> {
                 bracket = bracket.saturating_sub(1);
                 i += 1;
             }
-            ',' if paren == 0 && bracket == 0 => {
+            '{' => {
+                brace += 1;
+                i += 1;
+            }
+            '}' => {
+                brace = brace.saturating_sub(1);
+                i += 1;
+            }
+            ',' if paren == 0 && bracket == 0 && brace == 0 => {
                 parts.push(chars[start..i].to_vec());
                 start = i + 1;
                 i += 1;
@@ -165,6 +195,9 @@ pub(super) fn split_top_level_declarators(chars: &[char]) -> Vec<Vec<char>> {
 
 pub(super) fn declarator_alias_name(segment: &[char]) -> Option<String> {
     let mut chars = strip_known_attributes(segment);
+    if let Some(initializer) = top_level_initializer(&chars) {
+        chars.truncate(initializer);
+    }
     trim_char_vec(&mut chars);
 
     loop {
@@ -193,6 +226,66 @@ pub(super) fn declarator_alias_name(segment: &[char]) -> Option<String> {
         .filter(|ident| !TYPEDEF_DECLARATOR_SKIP_WORDS.contains(ident))
         .last()
         .map(str::to_string)
+}
+
+fn top_level_initializer(chars: &[char]) -> Option<usize> {
+    let mut i = 0usize;
+    let mut paren = 0usize;
+    let mut bracket = 0usize;
+    let mut brace = 0usize;
+    let mut in_block_comment = false;
+    while i < chars.len() {
+        if in_block_comment {
+            if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                in_block_comment = false;
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if chars[i] == '/' && chars.get(i + 1) == Some(&'/') {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+            in_block_comment = true;
+            i += 2;
+            continue;
+        }
+        match chars[i] {
+            '"' | '\'' => i = skip_quoted_chars(chars, i),
+            '(' => {
+                paren += 1;
+                i += 1;
+            }
+            ')' => {
+                paren = paren.saturating_sub(1);
+                i += 1;
+            }
+            '[' => {
+                bracket += 1;
+                i += 1;
+            }
+            ']' => {
+                bracket = bracket.saturating_sub(1);
+                i += 1;
+            }
+            '{' => {
+                brace += 1;
+                i += 1;
+            }
+            '}' => {
+                brace = brace.saturating_sub(1);
+                i += 1;
+            }
+            '=' if paren == 0 && bracket == 0 && brace == 0 => return Some(i),
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 pub(super) fn strip_known_attributes(chars: &[char]) -> Vec<char> {

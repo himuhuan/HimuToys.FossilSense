@@ -76,7 +76,6 @@ fn extract_fallback_declarations_raw(
     is_cpp: bool,
 ) -> Vec<RawDeclaration> {
     let mut symbols = Vec::new();
-    let mut guard_stack = Vec::new();
     let mut brace_depth = 0isize;
     let mut brace_state = BraceScanState::default();
     let mut statement = PendingStatement::default();
@@ -97,13 +96,7 @@ fn extract_fallback_declarations_raw(
         };
 
         if directive_start {
-            if let Some(symbol) = capture_macro(
-                &line,
-                line_index,
-                line_starts,
-                source,
-                current_guard(&guard_stack),
-            ) {
+            if let Some(symbol) = capture_macro(&line, line_index, line_starts, source) {
                 symbols.push(symbol);
             }
         }
@@ -115,7 +108,6 @@ fn extract_fallback_declarations_raw(
                     &statement,
                     line_starts,
                     source,
-                    current_guard(&guard_stack),
                     is_cpp,
                 ));
                 statement.clear();
@@ -124,9 +116,6 @@ fn extract_fallback_declarations_raw(
             statement.clear();
         }
 
-        if directive_start {
-            update_guard_stack(trimmed, &mut guard_stack);
-        }
         brace_depth += line_brace_delta;
         if brace_depth < 0 {
             brace_depth = 0;
@@ -193,7 +182,6 @@ fn capture_macro(
     line_index: usize,
     line_starts: &[usize],
     source: &str,
-    guard: Option<String>,
 ) -> Option<RawDeclaration> {
     let captures = macro_regex().captures(line.trim())?;
     let name = captures.get(1)?.as_str();
@@ -206,7 +194,6 @@ fn capture_macro(
         line_starts,
         source,
         line.trim().to_string(),
-        guard,
     ))
 }
 
@@ -214,7 +201,6 @@ fn capture_statement_symbols(
     statement: &PendingStatement,
     line_starts: &[usize],
     source: &str,
-    guard: Option<String>,
     is_cpp: bool,
 ) -> Vec<RawDeclaration> {
     // All regex classification must see code only. In particular, flattening a
@@ -226,36 +212,25 @@ fn capture_statement_symbols(
     let compact = compact_whitespace(&code_only);
     let mut symbols = Vec::new();
 
-    if let Some(symbol) = capture_function(statement, &compact, line_starts, source, guard.clone())
-    {
+    if let Some(symbol) = capture_function(statement, &compact, line_starts, source) {
         symbols.push(symbol);
         return symbols;
     }
 
-    symbols.extend(capture_typedefs(
-        statement,
-        &compact,
-        line_starts,
-        source,
-        guard.clone(),
-    ));
+    symbols.extend(capture_typedefs(statement, &compact, line_starts, source));
 
-    symbols.extend(capture_tag_types(
-        statement,
-        &compact,
-        line_starts,
-        source,
-        guard.clone(),
-    ));
+    symbols.extend(capture_tag_types(statement, &compact, line_starts, source));
 
     // Enum constants are extracted from the AST (`collect_enum_constants`), which
     // handles multi-line enums the line-based pass cannot.
 
-    if let Some(symbol) =
-        capture_global_variable(statement, &compact, line_starts, source, guard, is_cpp)
-    {
-        symbols.push(symbol);
-    }
+    symbols.extend(capture_global_variables(
+        statement,
+        &compact,
+        line_starts,
+        source,
+        is_cpp,
+    ));
 
     symbols
 }
@@ -357,7 +332,6 @@ fn capture_function(
     compact: &str,
     line_starts: &[usize],
     source: &str,
-    guard: Option<String>,
 ) -> Option<RawDeclaration> {
     let captures = function_regex().captures(compact)?;
     let name = captures.get(1)?.as_str();
@@ -384,7 +358,6 @@ fn capture_function(
         line_starts,
         source,
         trim_open_brace(compact).to_string(),
-        guard,
     ))
 }
 
@@ -393,7 +366,6 @@ fn capture_typedefs(
     compact: &str,
     line_starts: &[usize],
     source: &str,
-    guard: Option<String>,
 ) -> Vec<RawDeclaration> {
     if !compact.starts_with("typedef ") && compact != "typedef" {
         return Vec::new();
@@ -422,7 +394,6 @@ fn capture_typedefs(
                 line_starts,
                 source,
                 compact.to_string(),
-                guard.clone(),
             )
         })
         .collect()
@@ -433,7 +404,6 @@ fn capture_tag_types(
     compact: &str,
     line_starts: &[usize],
     source: &str,
-    guard: Option<String>,
 ) -> Vec<RawDeclaration> {
     tag_type_regex()
         .captures_iter(compact)
@@ -448,20 +418,18 @@ fn capture_tag_types(
                 line_starts,
                 source,
                 compact.to_string(),
-                guard.clone(),
             )
         })
         .collect()
 }
 
-fn capture_global_variable(
+fn capture_global_variables(
     statement: &PendingStatement,
     compact: &str,
     line_starts: &[usize],
     source: &str,
-    guard: Option<String>,
     is_cpp: bool,
-) -> Option<RawDeclaration> {
+) -> Vec<RawDeclaration> {
     if compact.contains('(')
         || compact.starts_with("typedef ")
         || compact.starts_with("struct ")
@@ -469,32 +437,61 @@ fn capture_global_variable(
         || compact.starts_with("enum ")
         || !compact.ends_with(';')
     {
-        return None;
+        return Vec::new();
     }
 
-    let captures = global_var_regex().captures(compact)?;
-    let name_match = captures.get(1)?;
-    let name = name_match.as_str();
-    let role = classify_global_object_role(compact, name_match, is_cpp);
-    Some(make_symbol(
-        name,
-        SymbolKind::GlobalVariable,
-        role,
-        statement.start_line,
-        statement.end_line,
-        line_starts,
-        source,
-        compact.to_string(),
-        guard,
-    ))
+    if is_cpp {
+        let Some(captures) = global_var_regex().captures(compact) else {
+            return Vec::new();
+        };
+        let Some(name_match) = captures.get(1) else {
+            return Vec::new();
+        };
+        return vec![make_symbol(
+            name_match.as_str(),
+            SymbolKind::GlobalVariable,
+            classify_global_object_role(
+                &compact[name_match.end()..],
+                true,
+                contains_identifier(compact, "extern"),
+            ),
+            statement.start_line,
+            statement.end_line,
+            line_starts,
+            source,
+            compact.to_string(),
+        )];
+    }
+
+    let chars: Vec<_> = compact.trim_end_matches(';').chars().collect();
+    let has_extern = contains_identifier(compact, "extern");
+    split_top_level_declarators(&chars)
+        .into_iter()
+        .filter_map(|segment| {
+            let name = declarator_alias_name(&segment)?;
+            if crate::language_builtins::is_language_keyword(&name) {
+                return None;
+            }
+            let mut declarator: String = segment.iter().collect();
+            declarator.push(';');
+            Some(make_symbol(
+                &name,
+                SymbolKind::GlobalVariable,
+                classify_global_object_role(&declarator, false, has_extern),
+                statement.start_line,
+                statement.end_line,
+                line_starts,
+                source,
+                declarator,
+            ))
+        })
+        .collect()
 }
 
-fn classify_global_object_role(compact: &str, name: regex::Match<'_>, is_cpp: bool) -> SymbolRole {
-    match declarator_has_initializer(&compact[name.end()..]) {
+fn classify_global_object_role(declarator: &str, is_cpp: bool, has_extern: bool) -> SymbolRole {
+    match declarator_has_initializer(declarator) {
         Some(true) => SymbolRole::Definition,
-        Some(false) if contains_identifier(&compact[..name.start()], "extern") => {
-            SymbolRole::Declaration
-        }
+        Some(false) if has_extern => SymbolRole::Declaration,
         // C++ has no tentative-definition category: a namespace-scope object
         // declaration without `extern` is a full definition.
         Some(false) if is_cpp => SymbolRole::Definition,
@@ -549,7 +546,6 @@ pub(super) fn make_symbol(
     line_starts: &[usize],
     source: &str,
     signature: String,
-    guard: Option<String>,
 ) -> RawDeclaration {
     let start_byte = line_starts.get(start_line).copied().unwrap_or(0);
     let end_byte = line_end_byte(source, line_starts, end_line);
@@ -565,32 +561,9 @@ pub(super) fn make_symbol(
         end_col: end_byte.saturating_sub(line_starts.get(end_line).copied().unwrap_or(end_byte)),
         signature,
         tag_kind: None,
-        guard,
+        guard: None,
         container: None,
         incomplete: false,
-    }
-}
-
-fn update_guard_stack(trimmed: &str, guard_stack: &mut Vec<String>) {
-    if trimmed.starts_with("#if ")
-        || trimmed.starts_with("#ifdef ")
-        || trimmed.starts_with("#ifndef ")
-    {
-        guard_stack.push(trimmed.to_string());
-    } else if trimmed.starts_with("#elif ") || trimmed.starts_with("#else") {
-        if let Some(last) = guard_stack.last_mut() {
-            *last = trimmed.to_string();
-        }
-    } else if trimmed.starts_with("#endif") {
-        guard_stack.pop();
-    }
-}
-
-fn current_guard(guard_stack: &[String]) -> Option<String> {
-    if guard_stack.is_empty() {
-        None
-    } else {
-        Some(guard_stack.join(" && "))
     }
 }
 
@@ -760,7 +733,11 @@ fn skip_quoted_bytes(bytes: &[u8], quote_start: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_symbols_and_includes, mask_comments_and_literals, scan_includes};
+    use super::{
+        extract_fallback_completions, extract_symbols_and_includes, mask_comments_and_literals,
+        record_typedef_aliases, scan_includes, SymbolKind, SymbolRole,
+    };
+    use crate::config::SourceLanguage;
 
     #[test]
     fn include_scan_ignores_directives_inside_multiline_block_comments() {
@@ -811,5 +788,102 @@ mod tests {
         assert_eq!(names, vec!["AVTextWriter", "AVTextWriter"]);
         assert!(!names.contains(&"const"));
         assert!(!names.contains(&"of"));
+    }
+
+    #[test]
+    fn lexical_fallback_collects_each_global_declarator_with_its_role() {
+        let source = "int first = 1, *second, values[4];\n\
+                      extern int imported, *shared;\n\
+                      int points[2] = {1, 2}, total;\n\
+                      int matrix[N == M], count;\n";
+        let mut line_starts = vec![0];
+        line_starts.extend(
+            source
+                .match_indices('\n')
+                .map(|(index, _)| index + 1)
+                .filter(|index| *index < source.len()),
+        );
+
+        let (symbols, _) = extract_symbols_and_includes(source, &line_starts, false);
+        let globals: Vec<_> = symbols
+            .iter()
+            .filter(|symbol| symbol.kind == SymbolKind::GlobalVariable)
+            .map(|symbol| (symbol.name.as_str(), symbol.role))
+            .collect();
+
+        assert_eq!(
+            globals,
+            vec![
+                ("first", SymbolRole::Definition),
+                ("second", SymbolRole::TentativeDefinition),
+                ("values", SymbolRole::TentativeDefinition),
+                ("imported", SymbolRole::Declaration),
+                ("shared", SymbolRole::Declaration),
+                ("points", SymbolRole::Definition),
+                ("total", SymbolRole::TentativeDefinition),
+                ("matrix", SymbolRole::TentativeDefinition),
+                ("count", SymbolRole::TentativeDefinition),
+            ]
+        );
+        assert_eq!(
+            record_typedef_aliases("typedef struct { int value; } Rows[N == M];"),
+            vec!["Rows"]
+        );
+        assert_eq!(
+            record_typedef_aliases("typedef struct { int value; } First /* { */, Second;"),
+            vec!["First", "Second"]
+        );
+    }
+
+    #[test]
+    fn c_multi_declarator_fallback_does_not_expand_cpp_grammar() {
+        let source = "std::pair<Key, Value> first, second;\n\
+                      Widget first{other}, second;\n";
+        let mut line_starts = vec![0];
+        line_starts.extend(
+            source
+                .match_indices('\n')
+                .map(|(index, _)| index + 1)
+                .filter(|index| *index < source.len()),
+        );
+
+        let (symbols, _) = extract_symbols_and_includes(source, &line_starts, true);
+        let names: Vec<_> = symbols
+            .iter()
+            .filter(|symbol| symbol.kind == SymbolKind::GlobalVariable)
+            .map(|symbol| symbol.name.as_str())
+            .collect();
+
+        assert_eq!(names, vec!["second", "second"]);
+    }
+
+    #[test]
+    fn c_multi_declarator_fallback_detail_bytes_stay_linear() {
+        let names = (0..2_048)
+            .map(|index| format!("value_{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let condition = (0..512)
+            .map(|index| format!("FEATURE_{index}"))
+            .collect::<Vec<_>>()
+            .join(" || ");
+        let source = format!("#if {condition}\nint {names};\n#endif\n");
+
+        let completions = extract_fallback_completions(&source, SourceLanguage::C);
+        let detail_bytes: usize = completions
+            .iter()
+            .filter_map(|completion| completion.detail.as_ref())
+            .map(String::len)
+            .sum();
+
+        assert_eq!(completions.len(), 2_048);
+        assert!(detail_bytes <= source.len() + completions.len());
+
+        let line_starts = super::super::line_starts(&source);
+        let (raw, _) = extract_symbols_and_includes(&source, &line_starts, false);
+        assert!(raw
+            .iter()
+            .filter(|symbol| symbol.kind == SymbolKind::GlobalVariable)
+            .all(|symbol| symbol.guard.is_none()));
     }
 }
