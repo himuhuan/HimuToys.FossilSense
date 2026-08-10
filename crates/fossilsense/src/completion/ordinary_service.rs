@@ -9,7 +9,7 @@ use crate::parser::{FactAvailability, FactGroup, FileSemanticIndex};
 use crate::project_context::ProjectKey;
 use crate::query::{self, NameTable};
 use crate::resolver;
-use crate::semantic_model::{CompletionKindHint, SemanticFamily};
+use crate::semantic_model::{CompletionKindHint, SemanticFamily, SemanticLanguage};
 use crate::store::views::FallbackCompletionRow;
 
 use super::{
@@ -573,31 +573,48 @@ fn complete_ordinary_identifier_inner(
         return Err(cancelled_completion(recall_started, recall_channels));
     }
 
-    let local_binding_hits = input
+    let local_bindings = input
         .parsed_document
         .as_ref()
         .map(|index| {
             let request_facts = index.request_facts();
-            let local_bindings = match index.fact_availability(FactGroup::LocalBindings) {
+            match index.fact_availability(FactGroup::LocalBindings) {
                 FactAvailability::Available => request_facts.local_bindings,
                 FactAvailability::NotRequested | FactAvailability::Unavailable(_) => &[],
-            };
-            query::local_completion_candidates(
-                local_bindings,
-                &input.text,
-                input.line,
-                input.character,
-                &input.prefix,
-                input.limit,
-            )
+            }
         })
         .unwrap_or_default();
+    let cursor_byte =
+        query::byte_offset_at(&input.text, input.line, input.character).min(input.text.len());
+    let scope_c_local_text = input
+        .parsed_document
+        .as_ref()
+        .is_some_and(|index| index.language == SemanticLanguage::C);
+    let mut out_of_scope_local_names: HashSet<&str> = local_bindings
+        .iter()
+        .filter(|_| scope_c_local_text)
+        .map(|binding| binding.name.as_str())
+        .collect();
+    for binding in local_bindings
+        .iter()
+        .filter(|binding| query::local_binding_visible_for_completion(binding, cursor_byte))
+    {
+        out_of_scope_local_names.remove(binding.name.as_str());
+    }
+    let local_binding_hits = query::local_completion_candidates(
+        local_bindings,
+        &input.text,
+        input.line,
+        input.character,
+        &input.prefix,
+        input.limit,
+    );
     candidates.extend(completion_items_for_local_bindings(
         local_binding_hits,
         &input.text,
     ));
 
-    let current_file_overlay_hits = input
+    let mut current_file_overlay_hits = input
         .parsed_document
         .as_ref()
         .map(|index| {
@@ -611,6 +628,8 @@ fn complete_ordinary_identifier_inner(
             )
         })
         .unwrap_or_default();
+    current_file_overlay_hits
+        .retain(|hit| hit.semantic || !out_of_scope_local_names.contains(hit.name.as_str()));
     let current_file_text_overlay_names: HashSet<String> = current_file_overlay_hits
         .iter()
         .filter(|hit| !hit.semantic || hit.detail.as_deref() == Some("text"))
@@ -720,6 +739,9 @@ fn complete_ordinary_identifier_inner(
         }
         if !exact_indexed.is_empty() {
             candidates.extend(exact_indexed);
+            continue;
+        }
+        if out_of_scope_local_names.contains(word.as_str()) {
             continue;
         }
         if current_file_text_overlay_names.contains(word.as_str()) {
@@ -1648,6 +1670,56 @@ mod tests {
             .position(|label| *label == "size_t")
             .expect("language builtin type completion");
         assert!(signal_index < size_index);
+    }
+
+    #[test]
+    fn service_filters_out_of_scope_c_enum_text_but_keeps_global_declaration() {
+        let (text, line, character) = text_and_position(
+            "int STATE_SHARED;\n\
+             void first(void) {\n\
+                 {\n\
+                     enum InnerState { STATE_HIDDEN, STATE_SHARED };\n\
+                     int value = STATE_HIDDEN + STATE_SHARED;\n\
+                 }\n\
+             }\n\
+             void second(void) {\n\
+                 STATE/*cursor*/\n\
+             }\n",
+        );
+        let parsed = Arc::new(parser::parse(&PathBuf::from("src/main.c"), &text));
+        let local_words = Arc::new(crate::completion_words::extract_words(&text));
+
+        let output = complete_ordinary_identifier(OrdinaryCompletionInput {
+            prefix: "STATE".to_string(),
+            text: text.into(),
+            line,
+            character,
+            parsed_document: Some(parsed),
+            local_words,
+            tables: vec![OrdinaryCompletionNameTable {
+                table: Arc::new(NameTable::build_with_paths(Vec::new())),
+                overlay_handles: HashMap::new(),
+                fallback_table: Arc::new(FallbackCompletionNameTable::default()),
+            }],
+            scope: None,
+            active_project_context: None,
+            prior_pools: vec![None],
+            intent: CompletionIntent::default(),
+            history_enabled: false,
+            history: CompletionHistorySnapshot::default(),
+            prefix_bucket: "state".to_string(),
+            prefix_ranking: CompletionPrefixRanking::Strict,
+            limit: COMPLETION_LIMIT,
+            locality_bonus: COMPLETION_LOCALITY_BONUS,
+        });
+
+        assert!(output.items.iter().all(|item| item.label != "STATE_HIDDEN"));
+        let shared = output
+            .items
+            .iter()
+            .find(|item| item.label == "STATE_SHARED")
+            .expect("file-scope declaration remains visible");
+        assert_eq!(shared.kind, OrdinaryCompletionKind::Variable);
     }
 
     #[test]

@@ -1269,6 +1269,42 @@ fn local_bindings_are_empty_without_function_definition() {
     assert!(index.local_bindings.is_empty());
 }
 
+#[test]
+fn c_function_local_enum_constants_are_request_local_only() {
+    let source = "enum PublicState { PUBLIC_READY };\n\
+                  void run(void) {\n\
+                      enum LocalState { LOCAL_READY };\n\
+                      { enum InnerState { INNER_READY }; }\n\
+                  }\n";
+
+    let indexed = parse_with_handle(Path::new("scope.c"), source, None, ParseFacts::INDEX);
+    assert!(indexed
+        .declarations
+        .iter()
+        .any(|declaration| declaration.name == "PUBLIC_READY"));
+    assert!(indexed.declarations.iter().all(|declaration| {
+        !matches!(declaration.name.as_str(), "LOCAL_READY" | "INNER_READY")
+    }));
+    assert!(indexed.local_bindings.is_empty());
+
+    let live = parse_with_handle(Path::new("scope.c"), source, None, ParseFacts::COMPLETION);
+    assert!(live.declarations.iter().all(|declaration| {
+        !matches!(declaration.name.as_str(), "LOCAL_READY" | "INNER_READY")
+    }));
+    for name in ["LOCAL_READY", "INNER_READY"] {
+        let binding = live
+            .local_bindings
+            .iter()
+            .find(|binding| binding.name == name)
+            .unwrap_or_else(|| panic!("missing request-local enum constant {name}"));
+        assert_eq!(binding.kind, super::LocalBindingKind::LocalConstant);
+    }
+    assert!(live
+        .local_bindings
+        .iter()
+        .all(|binding| binding.name != "PUBLIC_READY"));
+}
+
 fn occurrence_lines(occurrences: &[Occurrence], name: &str) -> Vec<u32> {
     occurrences
         .iter()

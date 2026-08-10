@@ -86,6 +86,7 @@ pub fn infer_receiver_record(
 pub(super) fn collect_function_local_bindings(
     function: tree_sitter::Node<'_>,
     source: &str,
+    language: SourceLanguage,
     out: &mut Vec<LocalBinding>,
 ) {
     let Some(body) = function.child_by_field_name("body") else {
@@ -104,7 +105,14 @@ pub(super) fn collect_function_local_bindings(
         );
     }
 
-    collect_local_variable_bindings(body, source, function_start_byte, function_end_byte, out);
+    collect_body_bindings(
+        body,
+        source,
+        language,
+        function_start_byte,
+        function_end_byte,
+        out,
+    );
 }
 
 pub(super) fn collect_parameter_bindings(
@@ -137,15 +145,19 @@ pub(super) fn collect_parameter_bindings(
     }
 }
 
-pub(super) fn collect_local_variable_bindings(
+pub(super) fn collect_body_bindings(
     body: tree_sitter::Node<'_>,
     source: &str,
+    language: SourceLanguage,
     function_start_byte: usize,
     function_end_byte: usize,
     out: &mut Vec<LocalBinding>,
 ) {
     let mut stack = vec![body];
     while let Some(node) = stack.pop() {
+        if node.kind() == "function_definition" {
+            continue;
+        }
         if node.kind() == "declaration" {
             let (scope_start_byte, scope_end_byte) =
                 nearest_compound_scope(node, function_start_byte, function_end_byte);
@@ -159,7 +171,28 @@ pub(super) fn collect_local_variable_bindings(
                 scope_end_byte,
                 out,
             );
-            continue;
+            if language != SourceLanguage::C {
+                continue;
+            }
+        } else if language == SourceLanguage::C && node.kind() == "enumerator" {
+            let Some(name_node) = node.child_by_field_name("name") else {
+                continue;
+            };
+            let Some(name) = node_text(name_node, source) else {
+                continue;
+            };
+            let (scope_start_byte, scope_end_byte) =
+                nearest_compound_scope(node, function_start_byte, function_end_byte);
+            out.push(LocalBinding {
+                name: name.to_string(),
+                kind: LocalBindingKind::LocalConstant,
+                type_text: None,
+                decl_start_byte: name_node.start_byte(),
+                function_start_byte,
+                function_end_byte,
+                scope_start_byte,
+                scope_end_byte,
+            });
         }
 
         let mut cursor = node.walk();

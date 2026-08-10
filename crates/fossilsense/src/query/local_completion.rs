@@ -27,13 +27,7 @@ pub fn local_completion_candidates(
     let byte_offset = byte_offset_at(text, line, character).min(text.len());
     let mut hits: Vec<LocalCompletionCandidate> = bindings
         .iter()
-        .filter(|binding| {
-            binding.function_start_byte < byte_offset
-                && byte_offset <= binding.function_end_byte
-                && binding.scope_start_byte < byte_offset
-                && byte_offset <= binding.scope_end_byte
-                && binding.decl_start_byte < byte_offset
-        })
+        .filter(|binding| local_binding_visible_for_completion(binding, byte_offset))
         .filter_map(|binding| {
             let base_match = completion_word_score(prefix, &binding.name, 0)?;
             Some(LocalCompletionCandidate {
@@ -71,14 +65,21 @@ pub fn visible_local_binding<'a>(
         .filter(|binding| {
             let at_declaration = binding.decl_start_byte <= byte_offset
                 && byte_offset <= binding.decl_start_byte.saturating_add(binding.name.len());
-            let visible_use = binding.function_start_byte < byte_offset
-                && byte_offset <= binding.function_end_byte
-                && binding.scope_start_byte < byte_offset
-                && byte_offset <= binding.scope_end_byte
-                && binding.decl_start_byte < byte_offset;
-            binding.name == name && (at_declaration || visible_use)
+            binding.name == name
+                && (at_declaration || local_binding_visible_for_completion(binding, byte_offset))
         })
         .max_by_key(|binding| binding.decl_start_byte)
+}
+
+pub(crate) fn local_binding_visible_for_completion(
+    binding: &LocalBinding,
+    byte_offset: usize,
+) -> bool {
+    binding.function_start_byte < byte_offset
+        && byte_offset <= binding.function_end_byte
+        && binding.scope_start_byte < byte_offset
+        && byte_offset <= binding.scope_end_byte
+        && binding.decl_start_byte < byte_offset
 }
 
 fn local_binding_detail(binding: &LocalBinding) -> String {
@@ -294,5 +295,37 @@ mod tests {
 
         assert!(inside.iter().any(|candidate| candidate.name == "index"));
         assert!(outside.iter().all(|candidate| candidate.name != "index"));
+    }
+
+    #[test]
+    fn parsed_c_enum_constants_follow_block_and_function_scope() {
+        let text = "enum PublicState { PUBLIC_READY };\n\
+                    void first(void) {\n\
+                        enum LocalState { LOCAL_READY };\n\
+                        {\n\
+                            enum InnerState { INNER_READY };\n\
+                            int inner_use = INNER_READY;\n\
+                        }\n\
+                        int local_use = LOCAL_READY;\n\
+                    }\n\
+                    void second(void) {\n\
+                        int wrong = LOCAL_READY;\n\
+                    }\n";
+        let parsed = crate::parser::parse(std::path::Path::new("scope.c"), text);
+        let inner_use = text.find("= INNER_READY").expect("inner use") + 2;
+        let after_inner = text.find("int local_use").expect("after inner block");
+        let local_use = text.find("= LOCAL_READY").expect("local use") + 2;
+        let other_function_use = text.rfind("LOCAL_READY").expect("other function use");
+
+        assert!(visible_local_binding(&parsed.local_bindings, "INNER_READY", inner_use).is_some());
+        assert!(
+            visible_local_binding(&parsed.local_bindings, "INNER_READY", after_inner).is_none()
+        );
+        assert!(visible_local_binding(&parsed.local_bindings, "LOCAL_READY", local_use).is_some());
+        assert!(
+            visible_local_binding(&parsed.local_bindings, "LOCAL_READY", other_function_use,)
+                .is_none()
+        );
+        assert!(visible_local_binding(&parsed.local_bindings, "PUBLIC_READY", local_use).is_none());
     }
 }

@@ -49,6 +49,7 @@ pub use hover::{
     comment_documentation_for_candidate_symbol, hover_markdown_for_candidate, RankedHoverCandidate,
     HOVER_CANDIDATE_LIMIT,
 };
+pub(crate) use local_completion::local_binding_visible_for_completion;
 pub use local_completion::{
     local_completion_candidates, visible_local_binding, LocalCompletionCandidate,
 };

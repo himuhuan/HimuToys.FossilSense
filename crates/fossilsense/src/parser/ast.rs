@@ -134,7 +134,7 @@ pub(super) fn collect_ast_index(
         }
 
         if facts.contains(ParseFacts::LOCAL_DECLS) && node.kind() == "function_definition" {
-            collect_function_local_bindings(node, source, &mut out.local_bindings);
+            collect_function_local_bindings(node, source, language, &mut out.local_bindings);
         }
 
         if facts.contains(ParseFacts::FIELDS)
@@ -282,7 +282,10 @@ pub(super) fn collect_ast_index(
                     }
                 }
             }
-        } else if node.kind() == "enumerator" {
+        } else if facts.contains(ParseFacts::DECLARATIONS)
+            && node.kind() == "enumerator"
+            && !(language == SourceLanguage::C && is_within_function_body(node))
+        {
             let id = node.child_by_field_name("name").unwrap_or(node);
             if let Some(symbol) = symbol_from_name_node(
                 id,
@@ -441,4 +444,17 @@ fn is_c_file_scope_tag_declaration(node: tree_sitter::Node<'_>) -> bool {
         && node.parent().is_some_and(|parent| {
             parent.kind() == "translation_unit" || parent.kind().starts_with("preproc_")
         })
+}
+
+fn is_within_function_body(node: tree_sitter::Node<'_>) -> bool {
+    let mut parent = node.parent();
+    while let Some(ancestor) = parent {
+        if ancestor.kind() == "function_definition" {
+            return ancestor.child_by_field_name("body").is_some_and(|body| {
+                body.start_byte() <= node.start_byte() && node.end_byte() <= body.end_byte()
+            });
+        }
+        parent = ancestor.parent();
+    }
+    false
 }

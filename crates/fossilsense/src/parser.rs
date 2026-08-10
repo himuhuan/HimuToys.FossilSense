@@ -152,7 +152,7 @@ bitflags::bitflags! {
         const FIELDS        = 1 << 4;
         /// `typedef` type aliases (AST DFS).
         const ALIASES       = 1 << 5;
-        /// Record-typed local/parameter declarations (AST DFS).
+        /// Request-time local/parameter declarations and lexical bindings (AST DFS).
         const LOCAL_DECLS   = 1 << 6;
         /// Callable anchors and call-expression facts for relation queries.
         const CALL_RELATIONS = 1 << 7;
@@ -234,7 +234,7 @@ pub struct FileSemanticIndex {
     /// Record-typed local/parameter declarations for positional receiver
     /// inference (AST-derived). Request-time data; not persisted.
     pub local_declarations: Vec<LocalDeclaration>,
-    /// Current-function parameters and local variables for request-time
+    /// Current-function parameters, locals, constants, and types for request-time
     /// identifier completion (AST-derived). Request-time data; not persisted.
     pub local_bindings: Vec<LocalBinding>,
     pub diagnostics: ParseDiagnostics,
