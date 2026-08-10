@@ -153,11 +153,12 @@ impl<'a> NameIndexBuilder<'a> {
         }
         let id = u32::try_from(self.names.len()).expect("name arena exceeds u32 IDs");
         let original = Arc::<str>::from(name);
-        let lower = Arc::<str>::from(
-            known_lower
-                .map(str::to_owned)
-                .unwrap_or_else(|| name.to_ascii_lowercase()),
-        );
+        let lower = match known_lower {
+            Some(lower) if lower == name => original.clone(),
+            Some(lower) => Arc::<str>::from(lower),
+            None if !name.bytes().any(|byte| byte.is_ascii_uppercase()) => original.clone(),
+            None => Arc::<str>::from(name.to_ascii_lowercase()),
+        };
         self.name_ids.insert(original.clone(), id);
         self.names.push(NameString { original, lower });
         id

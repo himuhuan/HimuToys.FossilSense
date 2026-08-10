@@ -976,10 +976,12 @@ fn name_table_memory_breakdown_is_complete_across_base_deltas_and_path_state() {
 
 #[test]
 fn name_table_memory_breakdown_counts_shared_name_arc_once() {
-    let mut table = NameTable::build(vec![(1, "same_name".to_string(), false)]);
-    let segment = Arc::get_mut(&mut table.base).expect("new table owns its base segment");
-    let shared = segment.names[0].original.clone();
-    segment.names[0].lower = shared;
+    let table = NameTable::build(vec![(1, "same_name".to_string(), false)]);
+
+    assert!(Arc::ptr_eq(
+        &table.base.names[0].original,
+        &table.base.names[0].lower
+    ));
 
     let breakdown = table.memory_breakdown();
 
@@ -987,6 +989,44 @@ fn name_table_memory_breakdown_counts_shared_name_arc_once() {
     assert_eq!(breakdown.components.lowercase_name_bytes, 0);
     assert!(breakdown.components.shared_name_bytes > 0);
     assert_eq!(breakdown.components.bytes(), table.accounted_bytes());
+
+    let mixed = NameTable::build(vec![(2, "MixedName".to_string(), false)]);
+    assert!(!Arc::ptr_eq(
+        &mixed.base.names[0].original,
+        &mixed.base.names[0].lower
+    ));
+    assert_eq!(&*mixed.base.names[0].lower, "mixedname");
+}
+
+#[test]
+fn streamed_names_share_only_when_ascii_lowering_is_unchanged() {
+    use crate::semantic_model::{SemanticDeclarationKind, SemanticDeclarationRole};
+    use crate::store::views::DeclarationNameRef;
+
+    let mut builder = name_index_builder::NameIndexBuilder::new(None);
+    for (id, name) in [(1, "Éname"), (2, "ÉName")] {
+        builder.push_declaration(DeclarationNameRef {
+            id,
+            name,
+            declaration_kind: SemanticDeclarationKind::Function,
+            role: SemanticDeclarationRole::Definition,
+            semantic_family: SemanticFamily::CFamily,
+            path: "src/main.c",
+            external: false,
+            directly_included: false,
+        });
+    }
+    let table = builder.finish();
+
+    assert!(Arc::ptr_eq(
+        &table.base.names[0].original,
+        &table.base.names[0].lower
+    ));
+    assert!(!Arc::ptr_eq(
+        &table.base.names[1].original,
+        &table.base.names[1].lower
+    ));
+    assert_eq!(&*table.base.names[1].lower, "Éname");
 }
 
 #[test]
