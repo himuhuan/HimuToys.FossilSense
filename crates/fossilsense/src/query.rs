@@ -374,7 +374,7 @@ struct NameSegment {
     /// Entry indices sorted by `(lowercased name, original name)`, partitioned
     /// by semantic family. Every entry occurs in exactly one partition, so
     /// family isolation does not duplicate the resident per-declaration index.
-    sorted_by_family: [Vec<usize>; 2],
+    sorted_by_family: [Vec<u32>; 2],
     /// One-byte normalized head postings for single-character completion.
     /// Each declaration occurs in at most one bucket as a compact `u32` local
     /// index; buckets are ordered by the static portion of completion ranking.
@@ -529,10 +529,10 @@ struct CompactPathPostings {
 }
 
 impl CompactPathPostings {
-    fn build(entries: &[CompactNameEntry], sorted_indices: &[usize], path_count: usize) -> Self {
+    fn build(entries: &[CompactNameEntry], sorted_indices: &[u32], path_count: usize) -> Self {
         let mut counts = vec![0u32; path_count];
         for &index in sorted_indices {
-            let path = entries[index].path_id as usize;
+            let path = entries[index as usize].path_id as usize;
             counts[path] = counts[path]
                 .checked_add(1)
                 .expect("path posting length exceeds u32");
@@ -552,9 +552,9 @@ impl CompactPathPostings {
         let mut positions = offsets[..path_count].to_vec();
         let mut indices = vec![0u32; sorted_indices.len()];
         for &index in sorted_indices {
-            let path = entries[index].path_id as usize;
+            let path = entries[index as usize].path_id as usize;
             let position = positions[path] as usize;
-            indices[position] = u32::try_from(index).expect("name segment exceeds u32 indices");
+            indices[position] = index;
             positions[path] += 1;
         }
         Self { offsets, indices }
@@ -949,7 +949,7 @@ fn static_segment_entry_order(
 /// Entry indices sorted by `(lowercased name, original name)` for prefix search,
 /// partitioned by semantic family so unrelated languages cannot consume a
 /// bounded request's candidate budget.
-fn sorted_indices_by_family(entries: &[CompactNameEntry], names: &[NameString]) -> [Vec<usize>; 2] {
+fn sorted_indices_by_family(entries: &[CompactNameEntry], names: &[NameString]) -> [Vec<u32>; 2] {
     let mut name_order: Vec<u32> = (0..names.len())
         .map(|index| u32::try_from(index).expect("name arena exceeds u32 IDs"))
         .collect();
@@ -972,15 +972,17 @@ fn sorted_indices_by_family(entries: &[CompactNameEntry], names: &[NameString]) 
             .checked_add(counts[name_id as usize])
             .expect("name index exceeds u32 entry positions");
     }
-    let mut sorted = vec![0_usize; entries.len()];
+    let mut sorted = vec![0_u32; entries.len()];
     for (index, entry) in entries.iter().enumerate() {
         let cursor = &mut cursors[entry.name_id as usize];
-        sorted[*cursor as usize] = index;
+        sorted[*cursor as usize] =
+            u32::try_from(index).expect("name segment exceeds u32 entry indices");
         *cursor += 1;
     }
     let mut by_family = [Vec::new(), Vec::new()];
     for index in sorted {
-        by_family[semantic_family_slot(entries[index].flags.semantic_family())].push(index);
+        by_family[semantic_family_slot(entries[index as usize].flags.semantic_family())]
+            .push(index);
     }
     by_family
 }
@@ -1199,12 +1201,17 @@ impl NameTable {
     ) {
         for &family_slot in semantic_family_slots(semantic_family) {
             let sorted = &segment.sorted_by_family[family_slot];
-            let start = sorted.partition_point(|&index| segment.entry(index).lower < needle_lower);
+            let start =
+                sorted.partition_point(|&index| segment.entry(index as usize).lower < needle_lower);
             for &local in &sorted[start..] {
-                if !segment.entry(local).lower.starts_with(needle_lower) {
+                if !segment
+                    .entry(local as usize)
+                    .lower
+                    .starts_with(needle_lower)
+                {
                     break;
                 }
-                let index = offset + local;
+                let index = offset + local as usize;
                 if self.is_active_index(index) {
                     output.push(index);
                 }
@@ -1281,7 +1288,7 @@ impl NameSegment {
         let mut by_project: HashMap<ProjectKey, CompactProjectPostings> = HashMap::new();
         for (family_slot, sorted) in sorted_by_family.iter().enumerate() {
             for &index in sorted {
-                let entry = entries[index];
+                let entry = entries[index as usize];
                 if entry.project_id != NO_PROJECT_ID {
                     let postings = by_project
                         .entry(projects[entry.project_id as usize].clone())
@@ -1290,8 +1297,7 @@ impl NameSegment {
                             by_family: std::array::from_fn(|_| Vec::new()),
                         });
                     debug_assert_eq!(postings.project_id, entry.project_id);
-                    postings.by_family[family_slot]
-                        .push(u32::try_from(index).expect("name segment exceeds u32 indices"));
+                    postings.by_family[family_slot].push(index);
                 }
             }
         }
@@ -1389,7 +1395,7 @@ impl NameSegment {
             sorting_index_bytes: self
                 .sorted_by_family
                 .iter()
-                .map(|indices| indices.capacity().saturating_mul(size_of::<usize>()))
+                .map(|indices| indices.capacity().saturating_mul(size_of::<u32>()))
                 .sum::<usize>(),
             fixed_overhead_bytes: size_of::<Self>(),
             ..NameSegmentMemoryBreakdown::default()

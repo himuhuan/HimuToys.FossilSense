@@ -990,6 +990,30 @@ fn name_table_memory_breakdown_counts_shared_name_arc_once() {
 }
 
 #[test]
+fn name_table_sorting_indices_use_compact_u32_slots() {
+    let table = NameTable::build(vec![
+        (1, "alpha".to_string(), false),
+        (2, "beta".to_string(), false),
+    ]);
+    let indices = &table.base.sorted_by_family[0];
+
+    assert!(!indices.is_empty());
+    assert_eq!(
+        std::mem::size_of_val(&indices[0]),
+        std::mem::size_of::<u32>()
+    );
+    assert_eq!(
+        table.memory_breakdown().components.sorting_index_bytes,
+        table
+            .base
+            .sorted_by_family
+            .iter()
+            .map(|indices| indices.capacity() * std::mem::size_of::<u32>())
+            .sum::<usize>()
+    );
+}
+
+#[test]
 fn name_table_memory_breakdown_does_not_recount_delta_path_arc_from_override() {
     use crate::semantic_model::{SemanticDeclarationKind, SemanticDeclarationRole};
     use crate::store::views::DeclarationNameRow;

@@ -612,7 +612,7 @@ impl NameTable {
                         for &local in
                             self.segment_entries_for_name(segment_slot, family_slot, name_id)
                         {
-                            let index = offset + local;
+                            let index = offset + local as usize;
                             if sole_path == MULTI_PATH_ID {
                                 if declaration_probes >= probe_limit {
                                     return (output, true);
@@ -1075,7 +1075,11 @@ impl NameTable {
         let Some(&local) = segment.sorted_by_family[family_slot].get(sorted_position) else {
             return;
         };
-        if !segment.entry(local).lower.starts_with(needle_lower) {
+        if !segment
+            .entry(local as usize)
+            .lower
+            .starts_with(needle_lower)
+        {
             return;
         }
         heap.push(PrefixHeapEntry {
@@ -1083,7 +1087,7 @@ impl NameTable {
             segment_slot,
             family_slot,
             sorted_position,
-            index: offset + local,
+            index: offset + local as usize,
         });
     }
 
@@ -1107,8 +1111,8 @@ impl NameTable {
             let (segment, _) = self.segment_with_offset(segment_slot);
             for &family_slot in semantic_family_slots(semantic_family) {
                 let sorted = &segment.sorted_by_family[family_slot];
-                let start =
-                    sorted.partition_point(|&index| segment.entry(index).lower < needle_lower);
+                let start = sorted
+                    .partition_point(|&index| segment.entry(index as usize).lower < needle_lower);
                 self.push_prefix_cursor(&mut heap, segment_slot, family_slot, start, needle_lower);
             }
         }
@@ -1272,12 +1276,12 @@ impl NameTable {
         segment_slot: usize,
         family_slot: usize,
         name_id: u32,
-    ) -> &[usize] {
+    ) -> &[u32] {
         let (segment, _) = self.segment_with_offset(segment_slot);
         let target = &segment.names[name_id as usize];
         let sorted = &segment.sorted_by_family[family_slot];
-        let compare = |local: usize| {
-            let entry = segment.entries[local];
+        let compare = |local: u32| {
+            let entry = segment.entries[local as usize];
             let name = &segment.names[entry.name_id as usize];
             name.lower
                 .cmp(&target.lower)
@@ -1360,7 +1364,7 @@ impl NameTable {
                     metrics.entries_inspected += 1;
                     metrics.fuzzy_entries_inspected += 1;
                     metrics.fuzzy_posting_entries_inspected += 1;
-                    let index = offset + local;
+                    let index = offset + local as usize;
                     if self.is_active_index(index) {
                         output.push(index);
                     }
@@ -2135,7 +2139,7 @@ impl NameTable {
             let (segment, offset) = self.segment_with_offset(segment_slot);
             let indices = &segment.sorted_by_family[family_slot];
             if ordinal < indices.len() {
-                return Some(offset + indices[ordinal]);
+                return Some(offset + indices[ordinal] as usize);
             }
             ordinal -= indices.len();
         }
