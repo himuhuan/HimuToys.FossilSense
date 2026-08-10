@@ -47,6 +47,7 @@ pub(super) fn symbol_from_name_node(
                 .utf8_text(source.as_bytes())
                 .unwrap_or(name),
         ),
+        tag_kind: None,
         guard: None,
         container: None,
         incomplete: contains_error_or_missing(declaration_node)

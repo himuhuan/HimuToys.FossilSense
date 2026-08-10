@@ -564,6 +564,7 @@ pub(super) fn make_symbol(
         end_line,
         end_col: end_byte.saturating_sub(line_starts.get(end_line).copied().unwrap_or(end_byte)),
         signature,
+        tag_kind: None,
         guard,
         container: None,
         incomplete: false,

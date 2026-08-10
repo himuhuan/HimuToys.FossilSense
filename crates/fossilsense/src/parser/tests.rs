@@ -2634,6 +2634,116 @@ fn canonical_declarations_preserve_c_tag_and_object_namespaces() {
 }
 
 #[test]
+fn c_file_scope_tag_forward_declarations_are_canonical_without_fake_records() {
+    use crate::semantic_model::{DeclarationBacking, SemanticDeclarationKind};
+
+    let source = r#"struct Node;
+typedef struct Node Node;
+struct /* implementation */ Node { struct Node *next; };
+union Payload;
+enum Mode;
+typedef enum Mode { Fast } Mode;
+struct Used *head;
+void f(void) { struct Local; }
+"#;
+    let index = parse(std::path::Path::new("forward.c"), source);
+
+    let forward = index
+        .declarations
+        .iter()
+        .find(|declaration| {
+            declaration.name == "Node"
+                && declaration.declaration_kind == SemanticDeclarationKind::Type
+                && declaration.role == SemanticDeclarationRole::Declaration
+        })
+        .expect("file-scope struct tag forward declaration");
+    assert!(matches!(
+        forward.backing,
+        DeclarationBacking::SourceRange { .. }
+    ));
+    assert_eq!(
+        &source[forward.name_range.start_byte..forward.name_range.end_byte],
+        "Node"
+    );
+    let definition = index
+        .declarations
+        .iter()
+        .find(|declaration| {
+            declaration.name == "Node"
+                && declaration.declaration_kind == SemanticDeclarationKind::Type
+                && declaration.role == SemanticDeclarationRole::Definition
+                && matches!(declaration.backing, DeclarationBacking::Record { .. })
+        })
+        .expect("file-scope struct tag definition");
+    assert_eq!(
+        forward.identity.logical_key,
+        definition.identity.logical_key
+    );
+    assert!(index.declarations.iter().any(|declaration| {
+        declaration.name == "Node"
+            && declaration.declaration_kind == SemanticDeclarationKind::Alias
+            && declaration.role == SemanticDeclarationRole::Definition
+    }));
+    for kind in [
+        SemanticDeclarationKind::Type,
+        SemanticDeclarationKind::Alias,
+    ] {
+        assert!(index.declarations.iter().any(|declaration| {
+            declaration.name == "Mode"
+                && declaration.declaration_kind == kind
+                && declaration.role == SemanticDeclarationRole::Definition
+        }));
+    }
+    let mode_declaration = index
+        .declarations
+        .iter()
+        .find(|declaration| {
+            declaration.name == "Mode"
+                && declaration.declaration_kind == SemanticDeclarationKind::Type
+                && declaration.role == SemanticDeclarationRole::Declaration
+        })
+        .expect("enum tag declaration");
+    let mode_definition = index
+        .declarations
+        .iter()
+        .find(|declaration| {
+            declaration.name == "Mode"
+                && declaration.declaration_kind == SemanticDeclarationKind::Type
+                && declaration.role == SemanticDeclarationRole::Definition
+        })
+        .expect("enum tag definition");
+    assert_eq!(
+        mode_declaration.identity.logical_key,
+        mode_definition.identity.logical_key
+    );
+    for name in ["Payload", "Mode"] {
+        assert!(index.declarations.iter().any(|declaration| {
+            declaration.name == name
+                && declaration.declaration_kind == SemanticDeclarationKind::Type
+                && declaration.role == SemanticDeclarationRole::Declaration
+        }));
+    }
+    for name in ["Used", "Local"] {
+        assert!(!index.declarations.iter().any(|declaration| {
+            declaration.name == name
+                && declaration.declaration_kind == SemanticDeclarationKind::Type
+        }));
+    }
+    assert_eq!(
+        index
+            .records
+            .iter()
+            .filter(|record| record.display_name == "Node")
+            .count(),
+        1
+    );
+    assert!(index
+        .records
+        .iter()
+        .all(|record| !matches!(record.display_name.as_str(), "Payload" | "Mode")));
+}
+
+#[test]
 fn record_declaration_uses_exact_tag_name_range() {
     use crate::semantic_model::SemanticDeclarationKind;
 

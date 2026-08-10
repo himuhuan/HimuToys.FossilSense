@@ -42,7 +42,7 @@ Go 查询使用 package/import 图而不是套用 `#include`。同 package 文�
 
 ## 符号从哪里来，为什么补全分两段
 
-FossilSense 的 parser 会从 C/C++ 与 Go 源码的容错 tree-sitter 语法树中提取声明；局部语法错误仍使用 AST，只有 parser 无法形成任何可用结构时才启用保守、补全专用的词法 fallback。索引器把名称、声明/定义角色、位置、签名、链接属性或 package identity、条件 guard 和文件 revision 等 typed facts 写入本地 SQLite。Hover、跳转、Signature Help、Find All 和 workspace symbol 都通过同一个候选服务读取这些事实，并叠加 include/package 可达性、项目范围和当前未保存文档，因此它们不会各自维护一套“符号真相”。
+FossilSense 的 parser 会从 C/C++ 与 Go 源码的容错 tree-sitter 语法树中提取声明；局部语法错误仍使用 AST，只有 parser 无法形成任何可用结构时才启用保守、补全专用的词法 fallback。对明确按 C 解析的文件，文件级 `struct`、`union` 和 `enum` 前置声明会作为声明事实保存，并与后续完整定义分别用于 Declaration 和 Definition；普通类型使用和函数内局部 tag 不会因此提升到全局。索引器把名称、声明/定义角色、位置、签名、链接属性或 package identity、条件 guard 和文件 revision 等 typed facts 写入本地 SQLite。Hover、跳转、Signature Help、Find All 和 workspace symbol 都通过同一个候选服务读取这些事实，并叠加 include/package 可达性、项目范围和当前未保存文档，因此它们不会各自维护一套“符号真相”。
 
 普通补全列表必须跟随每次键入即时响应，所以它先走一条只包含名称、种类、路径、作用域信号和稳定 declaration ID 的紧凑内存索引；这一步只负责快速召回，不加载全库的完整声明。选中候选、解析补全详情时，会带着同一个 ID 回到上述候选服务，水合与 Hover/跳转相同的声明事实。分开的只是高频召回路径，不是语义规则：补全详情中的签名、角色、位置和注释仍以统一事实与当前未保存内容为准。
 

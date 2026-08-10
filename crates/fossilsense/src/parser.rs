@@ -25,6 +25,7 @@ struct RawDeclaration {
     end_line: usize,
     end_col: usize,
     signature: String,
+    tag_kind: Option<&'static str>,
     guard: Option<String>,
     container: Option<String>,
     incomplete: bool,

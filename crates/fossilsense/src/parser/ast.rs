@@ -148,17 +148,32 @@ pub(super) fn collect_ast_index(
                 node.kind(),
                 "struct_specifier" | "union_specifier" | "enum_specifier" | "class_specifier"
             )
-            && node.child_by_field_name("body").is_some()
         {
-            if let Some(name) = node.child_by_field_name("name") {
-                if let Some(symbol) = symbol_from_name_node(
-                    name,
-                    SymbolKind::Type,
-                    SymbolRole::Definition,
-                    node,
-                    source,
-                    line_starts,
-                ) {
+            let body = node.child_by_field_name("body");
+            let role = if body.is_some() {
+                Some(SymbolRole::Definition)
+            } else if language == SourceLanguage::C && is_c_file_scope_tag_declaration(node) {
+                Some(SymbolRole::Declaration)
+            } else {
+                None
+            };
+            if let (Some(role), Some(name)) = (role, node.child_by_field_name("name")) {
+                if let Some(mut symbol) =
+                    symbol_from_name_node(name, SymbolKind::Type, role, node, source, line_starts)
+                {
+                    if language == SourceLanguage::C {
+                        symbol.tag_kind = match node.kind() {
+                            "struct_specifier" => Some("struct"),
+                            "union_specifier" => Some("union"),
+                            "enum_specifier" => Some("enum"),
+                            _ => None,
+                        };
+                        if let Some(signature) =
+                            body.and_then(|body| source.get(node.start_byte()..body.start_byte()))
+                        {
+                            symbol.signature = compact_whitespace(signature);
+                        }
+                    }
                     out.type_symbols.push(symbol);
                 }
             }
@@ -419,4 +434,11 @@ pub(super) fn collect_ast_index(
         }
     }
     out
+}
+
+fn is_c_file_scope_tag_declaration(node: tree_sitter::Node<'_>) -> bool {
+    is_namespace_or_file_scope_declaration(node)
+        && node.parent().is_some_and(|parent| {
+            parent.kind() == "translation_unit" || parent.kind().starts_with("preproc_")
+        })
 }

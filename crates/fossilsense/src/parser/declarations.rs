@@ -48,6 +48,8 @@ pub(super) fn canonical_declarations(
             (
                 fact.name.clone(),
                 lexical_suppression_kind(fact.declaration_kind),
+                fact.name_range.start_byte,
+                fact.name_range.end_byte,
             )
         })
         .collect();
@@ -58,8 +60,13 @@ pub(super) fn canonical_declarations(
             .chain(inputs.enum_constants)
             .filter_map(|symbol| {
                 let kind = declaration_kind(symbol.kind)?;
-                (!canonical.contains(&(symbol.name.clone(), lexical_suppression_kind(kind))))
-                    .then(|| ast_symbol_declaration(path, language, symbol, kind))
+                (!canonical.contains(&(
+                    symbol.name.clone(),
+                    lexical_suppression_kind(kind),
+                    symbol.start_byte,
+                    symbol.end_byte,
+                )))
+                .then(|| ast_symbol_declaration(path, language, symbol, kind))
             }),
     );
     declarations.sort_by(|left, right| {
@@ -151,7 +158,7 @@ fn record_declaration(
     } else {
         SemanticFactFidelity::Incomplete
     };
-    Some(fact(
+    let mut declaration = fact(
         path,
         language,
         name.clone(),
@@ -171,7 +178,20 @@ fn record_declaration(
         DeclarationBacking::Record {
             record_key: record.record_key.clone(),
         },
-    ))
+    );
+    if language == SourceLanguage::C {
+        if let Some(tag_name) = record.tag_name.as_deref() {
+            let tag_kind = match record.kind {
+                crate::semantic_model::RecordKind::Struct => "struct",
+                crate::semantic_model::RecordKind::Union => "union",
+                crate::semantic_model::RecordKind::Class => "class",
+                crate::semantic_model::RecordKind::Interface => "interface",
+            };
+            declaration.identity.logical_key.canonical_signature =
+                Some(c_tag_logical_signature(tag_kind, tag_name));
+        }
+    }
+    Some(declaration)
 }
 
 fn alias_declaration(
@@ -255,6 +275,11 @@ fn ast_symbol_declaration(
         |owner| format!("{owner}::{}", symbol.name),
     );
     let guard_fingerprint = symbol.guard.as_ref().map(|guard| digest(guard));
+    let linkage = if language == SourceLanguage::C && kind == SemanticDeclarationKind::Type {
+        LinkageDomain::External
+    } else {
+        LinkageDomain::Unknown
+    };
     let fingerprint = digest(&format!(
         "symbol|{}|{}|{}|{}|{:?}",
         path_text(path),
@@ -263,7 +288,7 @@ fn ast_symbol_declaration(
         symbol.end_byte,
         symbol.kind
     ));
-    fact(
+    let mut declaration = fact(
         path,
         language,
         symbol.name.clone(),
@@ -274,7 +299,7 @@ fn ast_symbol_declaration(
         range,
         (!symbol.signature.is_empty()).then(|| symbol.signature.clone()),
         owner,
-        LinkageDomain::Unknown,
+        linkage,
         symbol.guard.clone(),
         SemanticFactProvenance::Ast,
         if symbol.incomplete || symbol.role == SymbolRole::UnknownDeclarationOrDefinition {
@@ -285,7 +310,14 @@ fn ast_symbol_declaration(
         fingerprint,
         guard_fingerprint,
         DeclarationBacking::SourceRange { range },
-    )
+    );
+    if language == SourceLanguage::C {
+        if let Some(tag_kind) = symbol.tag_kind {
+            declaration.identity.logical_key.canonical_signature =
+                Some(c_tag_logical_signature(tag_kind, &symbol.name));
+        }
+    }
+    declaration
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -402,4 +434,8 @@ fn linkage_key(language: SourceLanguage, linkage: &LinkageDomain) -> String {
 
 fn digest(value: &str) -> String {
     blake3::hash(value.as_bytes()).to_hex()[..24].to_string()
+}
+
+fn c_tag_logical_signature(tag_kind: &str, name: &str) -> String {
+    format!("{tag_kind}:{name}")
 }

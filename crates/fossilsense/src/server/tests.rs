@@ -2779,6 +2779,82 @@ async fn declaration_and_definition_keep_stable_operation_semantics() {
 }
 
 #[tokio::test]
+async fn c_tag_navigation_distinguishes_forward_declaration_and_definition() {
+    let (dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[
+            ("decl.c", "struct Node;\n"),
+            ("api.c", "struct Node { int value; };\n"),
+        ],
+        "main.c",
+        "struct Node/*cursor*/ *node;\n",
+    )
+    .await;
+    let declaration_uri = Url::from_file_path(dir.path().join("decl.c")).expect("declaration uri");
+    let source_uri = Url::from_file_path(dir.path().join("api.c")).expect("source uri");
+
+    let declaration = service
+        .inner()
+        .goto_declaration(goto_definition_params(uri.clone(), line, character))
+        .await
+        .expect("tag declaration request")
+        .expect("tag declaration response");
+    assert_eq!(definition_locations(declaration)[0].uri, declaration_uri);
+
+    let definition = service
+        .inner()
+        .goto_definition(goto_definition_params(uri, line, character))
+        .await
+        .expect("tag definition request")
+        .expect("tag definition response");
+    assert_eq!(definition_locations(definition)[0].uri, source_uri);
+}
+
+#[tokio::test]
+async fn c_enum_navigation_groups_forward_tag_typedef_and_definition() {
+    let (dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[
+            ("decl.c", "enum Mode;\n"),
+            ("api.c", "typedef enum Mode { Fast } Mode;\n"),
+        ],
+        "main.c",
+        "enum Mode/*cursor*/ *mode;\n",
+    )
+    .await;
+    let declaration_uri = Url::from_file_path(dir.path().join("decl.c")).expect("declaration uri");
+    let definition_uri = Url::from_file_path(dir.path().join("api.c")).expect("definition uri");
+
+    let declaration = service
+        .inner()
+        .goto_declaration(goto_definition_params(uri.clone(), line, character))
+        .await
+        .expect("enum declaration request")
+        .expect("enum declaration response");
+    let declaration_locations = definition_locations(declaration);
+    assert!(declaration_locations
+        .iter()
+        .any(|location| location.uri == declaration_uri));
+    assert!(declaration_locations.iter().all(|location| {
+        location.uri != definition_uri
+            || location.range.start.character != "typedef enum ".encode_utf16().count() as u32
+    }));
+
+    let definition = service
+        .inner()
+        .goto_definition(goto_definition_params(uri, line, character))
+        .await
+        .expect("enum definition request")
+        .expect("enum definition response");
+    let definition_locations = definition_locations(definition);
+    assert!(definition_locations
+        .iter()
+        .any(|location| location.uri == definition_uri
+            && location.range.start.character == "typedef enum ".encode_utf16().count() as u32));
+    assert!(definition_locations
+        .iter()
+        .all(|location| location.uri != declaration_uri));
+}
+
+#[tokio::test]
 async fn local_binding_navigation_dominates_workspace_same_name_candidates() {
     let (_dir, service, uri, line, character) = indexed_backend_with_open_doc(
         &[("other.c", "int value(void) { return 1; }\n")],
