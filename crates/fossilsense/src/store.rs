@@ -16,6 +16,7 @@ mod generations;
 mod go_package_graph;
 mod includes;
 mod protobuf_c;
+#[cfg(test)]
 mod queries;
 mod schema;
 pub mod views;

@@ -362,6 +362,7 @@ fn classify_candidate_disposition<T>(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 pub struct RecordCandidate {
     pub id: i64,
     pub display_name: String,

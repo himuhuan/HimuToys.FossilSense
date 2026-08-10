@@ -1,4 +1,3 @@
-#[cfg(test)]
 use std::collections::HashMap;
 
 use anyhow::Result;
@@ -11,7 +10,6 @@ impl IndexStore {
     /// Degraded member-completion fallback used when receiver inference fails.
     ///
     /// Compatibility wrapper around [`crate::store::views::MemberStoreView`].
-    #[allow(dead_code)]
     pub fn fallback_field_candidates(
         &self,
         prefix: &str,
@@ -25,7 +23,6 @@ impl IndexStore {
     /// Scoped record/alias candidate lookup.
     ///
     /// Compatibility wrapper around [`crate::store::views::MemberStoreView`].
-    #[allow(dead_code)]
     pub fn resolve_record_candidates(
         &self,
         names: &[&str],
@@ -34,7 +31,6 @@ impl IndexStore {
         self.member_view().resolve_record_candidates(names, ctx)
     }
 
-    #[allow(dead_code)]
     pub fn members_for_records(
         &self,
         record_ids: &[i64],
@@ -45,7 +41,6 @@ impl IndexStore {
             .members_for_records(record_ids, prefix, ctx)
     }
 
-    #[allow(dead_code)]
     pub fn fallback_member_candidates(
         &self,
         prefix: &str,
@@ -56,7 +51,6 @@ impl IndexStore {
             .fallback_member_candidates(prefix, limit, ctx)
     }
 
-    #[allow(dead_code)]
     pub fn fields_for_records(&self, record_ids: &[i64]) -> Result<Vec<String>> {
         let mut names: Vec<String> = self
             .members_for_records(record_ids, None, None)?
@@ -74,7 +68,6 @@ impl IndexStore {
     /// Returns `name -> (kind string -> definition count)`. Production coloring
     /// resolves kinds from the in-memory `NameTable`; this SQL form is retained
     /// only as the parity oracle for that path's tests.
-    #[cfg(test)]
     pub fn declaration_kind_counts_by_names(
         &self,
         names: &[&str],

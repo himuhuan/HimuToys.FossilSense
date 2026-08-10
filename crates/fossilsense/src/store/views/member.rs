@@ -1,15 +1,23 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(test)]
+use std::collections::HashSet;
 
-use anyhow::{Context, Result};
+#[cfg(test)]
+use anyhow::Context;
+use anyhow::Result;
 use rusqlite::types::{Type, Value};
 use rusqlite::OptionalExtension;
 
 use crate::call_model::{SourcePosition, SourceRange};
-use crate::model::{MemberCandidate, RecordCandidate, ScopeTier};
+use crate::model::MemberCandidate;
+#[cfg(test)]
+use crate::model::{RecordCandidate, ScopeTier};
 use crate::resolver::{self, ResolveContext};
 use crate::semantic_model::{AliasTargetFidelity, DeclaratorShape, RecordRangeFidelity};
 
-use crate::store::{record_kind_from_str, IndexStore};
+#[cfg(test)]
+use crate::store::record_kind_from_str;
+use crate::store::IndexStore;
 
 const MEMBER_FALLBACK_SCAN_LIMIT: usize = 8_192;
 
@@ -95,6 +103,7 @@ pub struct TypeAliasReadRow {
     pub declaration_hash: [u8; 32],
 }
 
+#[cfg(test)]
 impl RecordReadRow {
     fn into_candidate(self, ctx: Option<&ResolveContext<'_>>) -> RecordCandidate {
         let tier = resolver::scope_tier(&self.path, self.external, self.directly_included, ctx);
@@ -181,6 +190,7 @@ impl<'a> MemberStoreView<'a> {
         Self { store }
     }
 
+    #[cfg(test)]
     pub fn resolve_record_candidates(
         &self,
         names: &[&str],
@@ -297,6 +307,7 @@ impl<'a> MemberStoreView<'a> {
         Ok((output, truncated))
     }
 
+    #[cfg(test)]
     pub fn members_for_records(
         &self,
         record_ids: &[i64],
@@ -382,6 +393,7 @@ impl<'a> MemberStoreView<'a> {
         Ok((members, scanned, truncated))
     }
 
+    #[cfg(test)]
     pub fn fallback_member_candidates(
         &self,
         prefix: &str,
@@ -392,6 +404,7 @@ impl<'a> MemberStoreView<'a> {
             .map(|(candidates, _)| candidates)
     }
 
+    #[cfg(test)]
     pub fn fallback_member_candidates_limited(
         &self,
         prefix: &str,
@@ -496,6 +509,7 @@ impl<'a> MemberStoreView<'a> {
         ))
     }
 
+    #[cfg(test)]
     pub fn fallback_field_candidates(
         &self,
         prefix: &str,
@@ -556,6 +570,7 @@ impl<'a> MemberStoreView<'a> {
             .collect())
     }
 
+    #[cfg(test)]
     fn resolve_record_candidates_inner(
         &self,
         names: &[&str],
@@ -669,6 +684,7 @@ impl<'a> MemberStoreView<'a> {
         Ok(candidates)
     }
 
+    #[cfg(test)]
     fn fetch_record_by_id(
         &self,
         record_id: i64,

@@ -178,3 +178,32 @@ fn completion_recall_core_cannot_grow_into_a_parallel_semantic_model() {
         ],
     );
 }
+
+#[test]
+fn legacy_query_compatibility_module_is_test_only() {
+    let store = read("src/store.rs").replace("\r\n", "\n");
+    assert!(
+        store.contains("#[cfg(test)]\nmod queries;"),
+        "legacy IndexStore query wrappers must not be compiled into the release binary"
+    );
+    assert!(
+        !read("src/store/queries.rs").contains("#[allow(dead_code)]"),
+        "test-only compatibility wrappers must not hide dead production APIs"
+    );
+
+    let model = read("src/model.rs").replace("\r\n", "\n");
+    assert!(model.contains("#[cfg(test)]\npub struct RecordCandidate"));
+
+    let members = read("src/store/views/member.rs").replace("\r\n", "\n");
+    for signature in [
+        "pub fn resolve_record_candidates(",
+        "pub fn members_for_records(",
+        "pub fn fallback_member_candidates(",
+        "pub fn fallback_field_candidates(",
+    ] {
+        assert!(
+            members.contains(&format!("#[cfg(test)]\n    {signature}")),
+            "legacy member query `{signature}` must remain test-only"
+        );
+    }
+}
