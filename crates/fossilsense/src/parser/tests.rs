@@ -939,6 +939,64 @@ fn preprocessor_directives_inside_typedef_struct_body_keep_typedef_statement() {
 }
 
 #[test]
+fn protobuf_c_export_macro_does_not_replace_the_record_name() {
+    let source = r#"#define DEMO_API
+typedef struct Demo__Message Demo__Message;
+typedef struct Demo__Other Demo__Other;
+struct DEMO_API Demo__Message
+{
+    ProtobufCMessage base;
+    int value;
+};
+struct DEMO_API Demo__Other
+{
+    ProtobufCMessage base;
+    int other;
+};
+"#;
+    let index = super::parse_with_language(
+        Path::new("demo.pb-c.h"),
+        source,
+        super::SourceLanguage::C,
+        ParseFacts::ALL,
+    );
+
+    assert_eq!(
+        field_containers(&index, "value"),
+        vec!["Demo__Message".to_string()]
+    );
+    assert_eq!(
+        field_containers(&index, "other"),
+        vec!["Demo__Other".to_string()]
+    );
+    assert!(index
+        .records
+        .iter()
+        .any(|record| record.tag_name.as_deref() == Some("Demo__Message")));
+    assert!(index
+        .records
+        .iter()
+        .any(|record| record.tag_name.as_deref() == Some("Demo__Other")));
+    assert!(index
+        .records
+        .iter()
+        .all(|record| record.tag_name.as_deref() != Some("DEMO_API")));
+    assert!(index.declarations.iter().any(|declaration| {
+        declaration.name == "Demo__Message"
+            && declaration.declaration_kind == SemanticDeclarationKind::Type
+            && declaration.role == SemanticDeclarationRole::Definition
+    }));
+    assert!(index.declarations.iter().any(|declaration| {
+        declaration.name == "DEMO_API"
+            && declaration.declaration_kind == SemanticDeclarationKind::Macro
+    }));
+    assert!(index.declarations.iter().all(|declaration| {
+        declaration.name != "DEMO_API"
+            || declaration.declaration_kind != SemanticDeclarationKind::Type
+    }));
+}
+
+#[test]
 fn multiline_macro_inside_typedef_struct_body_does_not_reset_pending_typedef() {
     let source = r#"typedef struct context {
 #define DECL_FIELD(name)                                                       \

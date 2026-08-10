@@ -131,6 +131,69 @@ fn no_build_guard(_source: &str) -> Option<String> {
     None
 }
 
+fn protobuf_c_record_recovery_source(
+    path: &Path,
+    root: tree_sitter::Node<'_>,
+    source: &str,
+) -> Option<String> {
+    let suffix = ".pb-c.h";
+    let file_name = path.file_name()?.to_str()?;
+    if !file_name
+        .get(file_name.len().saturating_sub(suffix.len())..)
+        .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix))
+    {
+        return None;
+    }
+
+    let mut modifier_ranges = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "function_definition" {
+            let record_type = node.child_by_field_name("type");
+            let declarator = node.child_by_field_name("declarator");
+            let body = node.child_by_field_name("body");
+            if let (Some(record_type), Some(declarator), Some(body)) =
+                (record_type, declarator, body)
+            {
+                let is_record =
+                    matches!(record_type.kind(), "struct_specifier" | "union_specifier")
+                        && record_type.child_by_field_name("body").is_none();
+                let is_bare_name = matches!(declarator.kind(), "identifier" | "type_identifier");
+                let separated_by_whitespace = source
+                    .get(record_type.end_byte()..declarator.start_byte())
+                    .is_some_and(|text| text.chars().all(char::is_whitespace))
+                    && source
+                        .get(declarator.end_byte()..body.start_byte())
+                        .is_some_and(|text| text.chars().all(char::is_whitespace));
+                let followed_by_semicolon = source
+                    .get(node.end_byte()..)
+                    .and_then(|text| text.bytes().find(|byte| !byte.is_ascii_whitespace()))
+                    == Some(b';');
+                if is_record && is_bare_name && separated_by_whitespace && followed_by_semicolon {
+                    if let Some(modifier) = record_type.child_by_field_name("name") {
+                        modifier_ranges.push(modifier.byte_range());
+                    }
+                }
+            }
+        }
+
+        for index in 0..node.named_child_count() {
+            if let Some(child) = node.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    if modifier_ranges.is_empty() {
+        return None;
+    }
+
+    let mut normalized = source.as_bytes().to_vec();
+    for range in modifier_ranges {
+        normalized.get_mut(range)?.fill(b' ');
+    }
+    String::from_utf8(normalized).ok()
+}
+
 bitflags::bitflags! {
     /// Which facts to collect during `parse`. Include scanning always runs;
     /// lexical completion extraction runs only after a hard AST failure.
@@ -685,7 +748,7 @@ fn parse_with_handle_control(
         }
     };
 
-    let parsed_tree = match cancel {
+    let parse_source = |source: &str| match cancel {
         Some(cancel) => active_handle.parse_with_language_cancel(
             language.tree_sitter_language(),
             source,
@@ -693,12 +756,27 @@ fn parse_with_handle_control(
         ),
         None => active_handle.parse_with_language(language.tree_sitter_language(), source, None),
     };
+    let parsed_tree = parse_source(source);
     let tree = match parsed_tree {
         Ok(Some(tree)) => tree,
         Ok(None) if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) => return None,
         Ok(None) | Err(()) => {
             return Some(lexical_fallback(path, source, includes, facts, language));
         }
+    };
+    let tree = if language == SourceLanguage::C {
+        if let Some(normalized) = protobuf_c_record_recovery_source(path, tree.root_node(), source)
+        {
+            match parse_source(&normalized) {
+                Ok(Some(reparsed)) => reparsed,
+                Ok(None) if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) => return None,
+                Ok(None) | Err(()) => tree,
+            }
+        } else {
+            tree
+        }
+    } else {
+        tree
     };
 
     if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
