@@ -48,7 +48,7 @@ FossilSense 当前实际具备哪些能力，只能以**当前源码、自动化
 
 ## 项目定位
 
-FossilSense `1.5.2` 是一个面向大型 Windows C/C++ 和 Go 代码仓库的 VS Code 代码导航与分析工具。
+FossilSense `1.6.0` 是一个面向大型 Windows C/C++ 和 Go 代码仓库的 VS Code 代码导航与分析工具。
 
 它把“用户没有完整、可靠的编译环境”视为常见情况。用户不需要提前准备：
 

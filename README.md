@@ -2,7 +2,7 @@
 
 FossilSense 是一款面向大型、难以构建的 C/C++ 与 Go 仓库的 VS Code 代码导航工具。它不要求 `compile_commands.json`，也不需要额外安装 clangd、gopls、ctags、Go 或 Rust 工具链。安装一个自包含 VSIX，打开工作区后即可建立索引。
 
-当前版本：`1.5.2`。本版本新增默认关闭的 protobuf-c 来源追溯：启用并重新建立索引后，C/C++ 生成类型的悬停信息可以列出匹配的原始 `.proto` 声明。它不会改变“转到定义”的目标，也不会把 `.proto` 注册成新的受支持语言。Go 后端继续以实验能力提供。
+当前版本：`1.6.0`。本版本重点完善纯 C 容错解析：文件级 tag 前置声明可与定义配对，函数内枚举值不再污染工作区索引，GNU weak 函数身份保持一致，protobuf-c 导出宏夹在 `struct` 与类型名之间时仍能恢复真实记录定义，硬解析失败时也会保留能够安全识别的多个全局变量名。普通补全名称索引同时减少了重复整数和小写字符串存储；在同机 U-Boot 门禁中，预热旧索引后的双代峰值由 501.61 MiB 降至 483.08 MiB，64 次真实补全请求 P95 为 25.246 ms。默认关闭的 protobuf-c 来源追溯和实验性 Go 后端继续提供；FossilSense 仍不执行任意宏展开，也不声称具备完整 C++ 编译器语义。
 
 ## 什么时候适合使用
 
@@ -16,7 +16,7 @@ FossilSense 主要解决一种很实际的问题：代码就在眼前，但完�
 
 1. 在 VS Code 中打开 `Extensions`。
 2. 选择右上角 `... -> Install from VSIX`。
-3. 选择 `fossilsense-vscode-1.5.2_BUILD*.vsix`。
+3. 选择 `fossilsense-vscode-1.6.0_BUILD*.vsix`。
 4. 打开 C/C++ 或 Go 工作区，等待状态栏进入 `ready`。
 
 默认无需配置。FossilSense 会扫描常见 C/C++ 与 `.go` 文件，并把索引保存在用户缓存目录，不会在源码仓库中生成数据库。

@@ -22,7 +22,7 @@ assert.ok(!isSupportedLocalDocument('untitled', 'go'));
 const packageJson = JSON.parse(
   fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8'),
 );
-assert.strictEqual(packageJson.version, '1.5.2');
+assert.strictEqual(packageJson.version, '1.6.0');
 assert.ok(packageJson.description.includes('Go'));
 assert.ok(packageJson.activationEvents.includes('onLanguage:go'));
 for (const item of packageJson.contributes.menus['editor/context']) {
