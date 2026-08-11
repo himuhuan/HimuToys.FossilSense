@@ -2,7 +2,7 @@
 
 FossilSense 是一款面向大型、难以构建的 C/C++ 与 Go 仓库的 VS Code 代码导航工具。它不要求 `compile_commands.json`，也不需要额外安装 clangd、gopls、ctags、Go 或 Rust 工具链。安装一个自包含 VSIX，打开工作区后即可建立索引。
 
-当前版本：`1.6.0`。本版本重点完善纯 C 容错解析：文件级 tag 前置声明可与定义配对，函数内枚举值不再污染工作区索引，GNU weak 函数身份保持一致，protobuf-c 导出宏夹在 `struct` 与类型名之间时仍能恢复真实记录定义，硬解析失败时也会保留能够安全识别的多个全局变量名。普通补全名称索引同时减少了重复整数和小写字符串存储；在同机 U-Boot 门禁中，预热旧索引后的双代峰值由 501.61 MiB 降至 483.08 MiB，64 次真实补全请求 P95 为 25.246 ms。默认关闭的 protobuf-c 来源追溯和实验性 Go 后端继续提供；FossilSense 仍不执行任意宏展开，也不声称具备完整 C++ 编译器语义。
+当前版本：`1.6.0`。本版本重点完善纯 C 容错解析：文件级 tag 前置声明可与定义配对，函数内枚举值不再污染工作区索引，GNU weak 函数身份保持一致，protobuf-c 导出宏夹在 `struct` 与类型名之间时仍能恢复真实记录定义，声明边界宏也不再吞掉首个 `typedef`，硬解析失败时也会保留能够安全识别的多个全局变量名。普通补全名称索引同时减少了重复整数和小写字符串存储；在同机 U-Boot 门禁中，预热旧索引后的双代峰值由 501.61 MiB 降至 483.08 MiB，64 次真实补全请求 P95 为 25.246 ms。默认关闭的 protobuf-c 来源追溯和实验性 Go 后端继续提供；FossilSense 仍不执行任意宏展开，也不声称具备完整 C++ 编译器语义。
 
 ## 什么时候适合使用
 
@@ -42,7 +42,7 @@ Go 查询使用 package/import 图而不是套用 `#include`。同 package 文�
 
 ## 符号从哪里来，为什么补全分两段
 
-FossilSense 的 parser 会从 C/C++ 与 Go 源码的容错 tree-sitter 语法树中提取声明；局部语法错误仍使用 AST，只有 parser 无法形成任何可用结构时才启用保守、补全专用的词法 fallback。该降级路径会把能够安全识别的简单 C 全局变量声明中的多个名称分别保留为最低优先级补全提示，但仍不为它们生成可跳转的声明身份。对明确按 C 解析的文件，文件级 `struct`、`union` 和 `enum` 前置声明会作为声明事实保存，并与后续完整定义分别用于 Declaration 和 Definition；普通类型使用和函数内前置 tag 不会被这条规则提升到全局。函数体内定义的 C 枚举值只参与当前文档的局部查询，不写入工作区索引。GNU C 中独立的 `__attribute__((weak))` 不再把同一函数的声明与定义拆成不同身份；展示签名仍保留源码属性，ABI 属性不会被忽略。按 C 解析的 protobuf-c 生成头文件支持位于 `struct` 与真实类型名之间的单 token 导出宏，字段和类型定义不会因此错归到导出宏名下。索引器把名称、声明/定义角色、位置、签名、链接属性或 package identity、条件 guard 和文件 revision 等 typed facts 写入本地 SQLite。Hover、跳转、Signature Help、Find All 和 workspace symbol 都通过同一个候选服务读取这些事实，并叠加 include/package 可达性、项目范围和当前未保存文档，因此它们不会各自维护一套“符号真相”。
+FossilSense 的 parser 会从 C/C++ 与 Go 源码的容错 tree-sitter 语法树中提取声明；局部语法错误仍使用 AST，只有 parser 无法形成任何可用结构时才启用保守、补全专用的词法 fallback。该降级路径会把能够安全识别的简单 C 全局变量声明中的多个名称分别保留为最低优先级补全提示，但仍不为它们生成可跳转的声明身份。对明确按 C 解析的文件，文件级 `struct`、`union` 和 `enum` 前置声明会作为声明事实保存，并与后续完整定义分别用于 Declaration 和 Definition；普通类型使用和函数内前置 tag 不会被这条规则提升到全局。函数体内定义的 C 枚举值只参与当前文档的局部查询，不写入工作区索引。GNU C 中独立的 `__attribute__((weak))` 不再把同一函数的声明与定义拆成不同身份；展示签名仍保留源码属性，ABI 属性不会被忽略。按 C 解析的 protobuf-c 生成头文件支持位于 `struct` 与真实类型名之间的单 token 导出宏，字段和类型定义不会因此错归到导出宏名下；独占一行的 `PROTOBUF_C__BEGIN_DECLS` 和 `PROTOBUF_C__END_DECLS` 也不会干扰紧随其后的首个 `typedef`。索引器把名称、声明/定义角色、位置、签名、链接属性或 package identity、条件 guard 和文件 revision 等 typed facts 写入本地 SQLite。Hover、跳转、Signature Help、Find All 和 workspace symbol 都通过同一个候选服务读取这些事实，并叠加 include/package 可达性、项目范围和当前未保存文档，因此它们不会各自维护一套“符号真相”。
 
 普通补全列表必须跟随每次键入即时响应，所以它先走一条只包含名称、种类、路径、作用域信号和稳定 declaration ID 的紧凑内存索引；这一步只负责快速召回，不加载全库的完整声明。选中候选、解析补全详情时，会带着同一个 ID 回到上述候选服务，水合与 Hover/跳转相同的声明事实。分开的只是高频召回路径，不是语义规则：补全详情中的签名、角色、位置和注释仍以统一事实与当前未保存内容为准。
 

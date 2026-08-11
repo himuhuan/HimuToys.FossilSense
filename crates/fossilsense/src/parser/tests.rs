@@ -997,6 +997,42 @@ struct DEMO_API Demo__Other
 }
 
 #[test]
+fn protobuf_c_begin_decls_does_not_swallow_the_first_typedef() {
+    let source = r#"PROTOBUF_C__BEGIN_DECLS
+
+typedef struct Demo__Person Demo__Person;
+typedef struct Demo__Other Demo__Other;
+PROTOBUF_C__END_DECLS
+"#;
+    let index = super::parse_with_language(
+        Path::new("demo.pb-c.h"),
+        source,
+        super::SourceLanguage::C,
+        ParseFacts::ALL,
+    );
+
+    let person = index
+        .declarations
+        .iter()
+        .find(|declaration| {
+            declaration.name == "Demo__Person"
+                && declaration.declaration_kind == SemanticDeclarationKind::Alias
+        })
+        .expect("the first protobuf-c typedef should remain an alias");
+    assert_eq!(
+        person.canonical_signature.as_deref(),
+        Some("typedef struct Demo__Person Demo__Person;")
+    );
+    assert_eq!(index.parse_outcome, ParseOutcome::Ast);
+    assert!(index.declarations.iter().all(|declaration| {
+        !matches!(
+            declaration.name.as_str(),
+            "PROTOBUF_C__BEGIN_DECLS" | "PROTOBUF_C__END_DECLS"
+        )
+    }));
+}
+
+#[test]
 fn multiline_macro_inside_typedef_struct_body_does_not_reset_pending_typedef() {
     let source = r#"typedef struct context {
 #define DECL_FIELD(name)                                                       \

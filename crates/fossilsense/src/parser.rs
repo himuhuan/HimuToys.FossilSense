@@ -131,7 +131,7 @@ fn no_build_guard(_source: &str) -> Option<String> {
     None
 }
 
-fn protobuf_c_record_recovery_source(
+fn protobuf_c_recovery_source(
     path: &Path,
     root: tree_sitter::Node<'_>,
     source: &str,
@@ -146,6 +146,16 @@ fn protobuf_c_record_recovery_source(
     }
 
     let mut modifier_ranges = Vec::new();
+    let mut line_start = 0;
+    for line in source.split_inclusive('\n') {
+        let marker = line.trim();
+        if matches!(marker, "PROTOBUF_C__BEGIN_DECLS" | "PROTOBUF_C__END_DECLS") {
+            let start = line_start + line.find(marker)?;
+            modifier_ranges.push(start..start + marker.len());
+        }
+        line_start += line.len();
+    }
+
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         if node.kind() == "function_definition" {
@@ -765,8 +775,7 @@ fn parse_with_handle_control(
         }
     };
     let tree = if language == SourceLanguage::C {
-        if let Some(normalized) = protobuf_c_record_recovery_source(path, tree.root_node(), source)
-        {
+        if let Some(normalized) = protobuf_c_recovery_source(path, tree.root_node(), source) {
             match parse_source(&normalized) {
                 Ok(Some(reparsed)) => reparsed,
                 Ok(None) if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) => return None,
