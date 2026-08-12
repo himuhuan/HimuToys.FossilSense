@@ -84,10 +84,21 @@ pub(super) fn collect_object_declarations(
         return;
     }
 
-    let mut cursor = declaration.walk();
-    let declarators: Vec<_> = declaration
-        .children_by_field_name("declarator", &mut cursor)
-        .collect();
+    let declarators: Vec<_> = if declaration.kind() == "ERROR" {
+        let mut cursor = declaration.walk();
+        declaration
+            .named_children(&mut cursor)
+            .filter(|child| {
+                matches!(child.kind(), "array_declarator" | "init_declarator")
+                    && child.start_position().row == declaration.start_position().row
+            })
+            .collect()
+    } else {
+        let mut cursor = declaration.walk();
+        declaration
+            .children_by_field_name("declarator", &mut cursor)
+            .collect()
+    };
     let first_declarator = declarators.first().copied();
     for declarator in declarators {
         let contains_function_declarator =
@@ -203,6 +214,31 @@ pub(super) fn collect_object_declarations(
             backing: DeclarationBacking::SourceRange { range: name_range },
         });
     }
+}
+
+pub(super) fn recoverable_file_scope_object(node: tree_sitter::Node<'_>) -> bool {
+    if node.kind() != "ERROR" {
+        return false;
+    }
+    let mut cursor = node.walk();
+    let children: Vec<_> = node.named_children(&mut cursor).collect();
+    let Some(declarator) = children.iter().position(|child| {
+        matches!(child.kind(), "array_declarator" | "init_declarator")
+            && child.start_position().row == node.start_position().row
+    }) else {
+        return false;
+    };
+    children[..declarator].iter().any(|child| {
+        matches!(
+            child.kind(),
+            "primitive_type"
+                | "type_identifier"
+                | "sized_type_specifier"
+                | "struct_specifier"
+                | "union_specifier"
+                | "enum_specifier"
+        )
+    })
 }
 
 pub(super) fn is_namespace_or_file_scope_declaration(node: tree_sitter::Node<'_>) -> bool {

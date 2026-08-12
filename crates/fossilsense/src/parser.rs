@@ -131,6 +131,243 @@ fn no_build_guard(_source: &str) -> Option<String> {
     None
 }
 
+fn c_family_recovery_source(root: tree_sitter::Node<'_>, source: &str) -> Option<String> {
+    if !root.has_error() && !source.contains("__aligned") {
+        return None;
+    }
+    let mut ranges = alignment_attribute_ranges(source);
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "function_declarator" {
+            if node.parent().is_some_and(|parent| {
+                parent.kind() == "function_declarator" && has_error_ancestor(parent)
+            }) {
+                let parameters = node.child_by_field_name("parameters");
+                let parameter = parameters.and_then(single_named_child);
+                if let Some(parameter) = parameter.filter(|parameter| {
+                    parameter.kind() == "parameter_declaration"
+                        && parameter
+                            .child_by_field_name("declarator")
+                            .is_some_and(|declarator| declarator.kind() == "pointer_declarator")
+                }) {
+                    if let Some(convention) = parameter
+                        .child_by_field_name("type")
+                        .filter(|kind| kind.kind() == "type_identifier")
+                    {
+                        ranges.push(convention.byte_range());
+                    }
+                }
+            }
+        } else if node.kind() == "parenthesized_declarator" {
+            let mut cursor = node.walk();
+            let children: Vec<_> = node.named_children(&mut cursor).collect();
+            if children
+                .iter()
+                .any(|child| child.kind() == "pointer_declarator")
+            {
+                ranges.extend(children.iter().filter_map(|child| {
+                    (child.kind() == "ERROR")
+                        .then(|| single_named_child(*child))
+                        .flatten()
+                        .filter(|modifier| modifier.kind() == "type_identifier")
+                        .map(|modifier| modifier.byte_range())
+                }));
+            }
+        } else if node.kind() == "macro_type_specifier" {
+            let mut cursor = node.walk();
+            for error in node
+                .named_children(&mut cursor)
+                .filter(|child| child.kind() == "ERROR")
+            {
+                let mut cursor = error.walk();
+                ranges.extend(error.named_children(&mut cursor).filter_map(|descriptor| {
+                    (descriptor.kind() == "type_descriptor"
+                        && descriptor
+                            .child_by_field_name("declarator")
+                            .is_some_and(|declarator| {
+                                declarator.kind() == "abstract_pointer_declarator"
+                            }))
+                    .then(|| descriptor.child_by_field_name("type"))
+                    .flatten()
+                    .filter(|modifier| modifier.kind() == "type_identifier")
+                    .map(|modifier| modifier.byte_range())
+                }));
+            }
+        } else if node.kind() == "ERROR"
+            && node
+                .parent()
+                .is_some_and(|parent| parent.kind() == "translation_unit")
+        {
+            let mut cursor = node.walk();
+            let array = node
+                .named_children(&mut cursor)
+                .find_map(|child| match child.kind() {
+                    "array_declarator" => Some(child),
+                    "init_declarator" => child
+                        .child_by_field_name("declarator")
+                        .filter(|declarator| declarator.kind() == "array_declarator"),
+                    _ => None,
+                });
+            if array.is_some_and(|array| {
+                array.start_position().row == node.start_position().row
+                    && source
+                        .get(array.end_byte()..node.end_byte())
+                        .is_some_and(|tail| tail.contains('='))
+            }) {
+                if let Some(scope) = initializer_scope(source, node.start_byte()) {
+                    ranges.extend(preprocessor_line_ranges(source, scope));
+                }
+            }
+        }
+
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    if ranges.is_empty() {
+        return None;
+    }
+
+    let mut normalized = source.as_bytes().to_vec();
+    for range in ranges {
+        normalized.get_mut(range)?.fill(b' ');
+    }
+    String::from_utf8(normalized).ok()
+}
+
+fn alignment_attribute_ranges(source: &str) -> Vec<std::ops::Range<usize>> {
+    let bytes = source.as_bytes();
+    source
+        .match_indices("__aligned")
+        .filter_map(|(start, attribute)| {
+            let end = start + attribute.len();
+            if bytes
+                .get(start.wrapping_sub(1))
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                || bytes
+                    .get(end)
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            {
+                return None;
+            }
+
+            let line_start = source[..start].rfind('\n').map_or(0, |index| index + 1);
+            if source[line_start..start].trim_start().starts_with('#') {
+                return None;
+            }
+
+            let mut index = end;
+            while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+                index += 1;
+            }
+            if bytes.get(index) != Some(&b'(') {
+                return None;
+            }
+
+            let mut depth = 0usize;
+            while index < bytes.len() {
+                match bytes[index] {
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            return Some(start..index + 1);
+                        }
+                    }
+                    _ => {}
+                }
+                index += 1;
+            }
+            None
+        })
+        .collect()
+}
+
+fn single_named_child(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
+    (node.named_child_count() == 1)
+        .then(|| node.named_child(0))
+        .flatten()
+}
+
+fn has_error_ancestor(mut node: tree_sitter::Node<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        if parent.is_error() || parent.is_missing() {
+            return true;
+        }
+        node = parent;
+    }
+    false
+}
+
+fn preprocessor_line_ranges(
+    source: &str,
+    scope: std::ops::Range<usize>,
+) -> Vec<std::ops::Range<usize>> {
+    let Some(text) = source.get(scope.clone()) else {
+        return Vec::new();
+    };
+    let mut ranges = Vec::new();
+    let mut offset = scope.start;
+    for line in text.split_inclusive('\n') {
+        if line.trim_start().starts_with('#') {
+            ranges.push(offset..offset + line.trim_end_matches('\n').len());
+        }
+        offset += line.len();
+    }
+    ranges
+}
+
+fn initializer_scope(source: &str, start: usize) -> Option<std::ops::Range<usize>> {
+    let bytes = source.as_bytes();
+    let equals = start + source.get(start..)?.find('=')?;
+    let open = equals + source.get(equals..)?.find('{')?;
+    let mut depth = 0usize;
+    let mut index = open;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                index += 2;
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index += 2;
+                while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
+                {
+                    index += 1;
+                }
+                index = (index + 2).min(bytes.len());
+            }
+            quote @ (b'"' | b'\'') => {
+                index += 1;
+                while index < bytes.len() {
+                    if bytes[index] == b'\\' {
+                        index = (index + 2).min(bytes.len());
+                    } else if bytes[index] == quote {
+                        index += 1;
+                        break;
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+            b'{' => {
+                depth += 1;
+                index += 1;
+            }
+            b'}' => {
+                depth = depth.saturating_sub(1);
+                index += 1;
+                if depth == 0 {
+                    return Some(start..index);
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    None
+}
+
 fn protobuf_c_recovery_source(
     path: &Path,
     root: tree_sitter::Node<'_>,
@@ -780,6 +1017,19 @@ fn parse_with_handle_control(
                 Ok(Some(reparsed)) => reparsed,
                 Ok(None) if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) => return None,
                 Ok(None) | Err(()) => tree,
+            }
+        } else {
+            tree
+        }
+    } else {
+        tree
+    };
+    let tree = if language != SourceLanguage::Go {
+        if let Some(normalized) = c_family_recovery_source(tree.root_node(), source) {
+            drop(tree);
+            match parse_source(&normalized) {
+                Ok(Some(reparsed)) => reparsed,
+                Ok(None) | Err(()) => return None,
             }
         } else {
             tree

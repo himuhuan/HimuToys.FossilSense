@@ -1570,6 +1570,148 @@ fn usable_ast_keeps_top_level_macro_invocation_out_of_function_declarations() {
 }
 
 #[test]
+fn c_trailing_alignment_attribute_keeps_the_declared_object_name() {
+    let c_source = "static struct scsi_cmd usb_ccb __aligned(ARCH_DMA_MINALIGN);\n\
+static struct bootloader_message bcb __aligned(ARCH_DMA_MINALIGN) = { { 0 } };\n\
+static int save(void) { env_t __aligned(8) env_new; return sizeof(env_new); }\n";
+    let header_source = "struct aspeed_hace_ctx { unsigned char digest[64]; } __aligned((8));\n\
+struct packed_record { unsigned value; } __packed __aligned(4);\n\
+struct aligned_fields { char tx[8] __aligned(8); };\n";
+    let c_index = parse(Path::new("aligned.c"), c_source);
+    let header_index = parse(Path::new("aligned.h"), header_source);
+
+    for name in ["usb_ccb", "bcb"] {
+        assert!(
+            c_index.declarations.iter().any(|declaration| {
+                declaration.name == name
+                    && declaration.declaration_kind == SemanticDeclarationKind::Object
+            }),
+            "missing object {name}: {:#?}",
+            c_index.declarations
+        );
+    }
+    for index in [&c_index, &header_index] {
+        assert!(
+            index.declarations.iter().all(|declaration| {
+                declaration.name != "__aligned"
+                    || declaration.declaration_kind == SemanticDeclarationKind::Macro
+            }),
+            "declarations: {:#?}",
+            index.declarations
+        );
+    }
+    assert!(c_index
+        .declarations
+        .iter()
+        .any(|declaration| declaration.name == "save"));
+    assert!(header_index
+        .members
+        .iter()
+        .any(|member| member.name == "tx"));
+}
+
+#[test]
+fn c_conditional_macro_initializer_keeps_the_array_definition() {
+    let source = "const struct flash_info spi_nor_ids[] = {\n\
+#ifdef CONFIG_SPI_FLASH_ATMEL\n\
+    { INFO(\"at26df321\", 0x1f4700, 0, 64 * 1024, 64, SECT_4K) },\n\
+#endif\n\
+#ifdef CONFIG_SPI_FRAM_FUJITSU\n\
+    {\n\
+        INFO_NAME(\"mb85rs256ty\")\n\
+        .id = {0x04, 0x7f, 0x25},\n\
+        .flags = SPI_NOR_NO_ERASE,\n\
+    },\n\
+#endif\n\
+#ifdef CONFIG_SPI_FLASH_GIGADEVICE\n\
+    {\n\
+        INFO(\"gd25q16\", 0xc84015, 0, 64 * 1024, 32,\n\
+            SECT_4K | SPI_NOR_DUAL_READ | SPI_NOR_QUAD_READ)\n\
+    },\n\
+    {\n\
+        INFO(\"gd25q32\", 0xc84016, 0, 64 * 1024, 64,\n\
+            SECT_4K | SPI_NOR_DUAL_READ | SPI_NOR_QUAD_READ)\n\
+    },\n\
+#endif\n\
+};\n";
+    let index = parse(Path::new("spi-nor-ids.c"), source);
+
+    assert!(
+        index.declarations.iter().any(|declaration| {
+            declaration.name == "spi_nor_ids"
+                && declaration.declaration_kind == SemanticDeclarationKind::Object
+                && declaration.role == SemanticDeclarationRole::Definition
+        }),
+        "declarations: {:#?}",
+        index.declarations
+    );
+}
+
+#[test]
+fn c_calling_convention_macros_keep_function_pointer_names() {
+    let header = "typedef void (CALLBACK *MFPERIODICCALLBACK)(IUnknown *context);\n";
+    let source = "static HRESULT (WINAPI *pMFAllocateSerialWorkQueue)(DWORD queue, DWORD *serial_queue);\n\
+static HRESULT (WINAPI *pMFAddPeriodicCallback)(MFPERIODICCALLBACK callback, IUnknown *context, DWORD *key);\n\
+static HRESULT (WINAPI *pMFRemovePeriodicCallback)(DWORD key);\n";
+    let header_index = parse(Path::new("callbacks.h"), header);
+    let source_index = parse(Path::new("callbacks.c"), source);
+
+    assert!(header_index
+        .aliases
+        .iter()
+        .any(|alias| alias.alias == "MFPERIODICCALLBACK"));
+    for name in [
+        "pMFAllocateSerialWorkQueue",
+        "pMFAddPeriodicCallback",
+        "pMFRemovePeriodicCallback",
+    ] {
+        assert!(
+            source_index.declarations.iter().any(|declaration| {
+                declaration.name == name
+                    && declaration.declaration_kind == SemanticDeclarationKind::Object
+            }),
+            "missing function pointer object {name}: {:#?}",
+            source_index.declarations
+        );
+    }
+}
+
+#[test]
+fn c_declaration_style_macro_invocations_do_not_create_functions() {
+    let header = "#if defined(__cplusplus)\n\
+extern \"C\" {\n\
+#endif\n\
+DEFINE_GUID(MF_EVENT_SESSIONCAPS, 0x7e5ebcd0, 0x11b8, 0x4abe, 0xaf, 0xad, 0x10, 0xf6, 0x59, 0x9a, 0x7f, 0x42);\n\
+#if defined(__cplusplus)\n\
+}\n\
+#endif\n";
+    let source = "__ASM_BLOCK_BEGIN(exception_vtables)\n\
+EXCEPTION_VTABLE(exception,\n\
+        VTABLE_ADD_FUNC(MSVCP_exception_vector_dtor)\n\
+        VTABLE_ADD_FUNC(MSVCP_exception_what));\n";
+
+    for index in [
+        parse(Path::new("declaration_macros.h"), header),
+        parse(Path::new("declaration_macros.c"), source),
+    ] {
+        let false_functions: Vec<_> = index
+            .declarations
+            .iter()
+            .filter(|declaration| {
+                matches!(
+                    declaration.name.as_str(),
+                    "DEFINE_GUID" | "EXCEPTION_VTABLE"
+                ) && declaration.declaration_kind == SemanticDeclarationKind::Function
+            })
+            .collect();
+        assert!(
+            false_functions.is_empty(),
+            "false functions: {false_functions:#?}"
+        );
+    }
+}
+
+#[test]
 fn parser_semantic_candidate_fixtures_cover_required_declaration_shapes() {
     let c = include_str!("fixtures/semantic_candidates.c");
     let cpp = include_str!("fixtures/semantic_candidates.cpp");

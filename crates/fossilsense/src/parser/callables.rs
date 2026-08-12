@@ -173,11 +173,26 @@ impl<'a> CallFactCollector<'a> {
         if declarator_is_pointer_like(function_declarator) {
             return None;
         }
+        if role == AnchorRole::Declaration
+            && declaration.child_by_field_name("type").is_none()
+            && (self.error_depth > 0 || contains_error_or_missing(declaration))
+        {
+            return None;
+        }
         let declarator = function_declarator
             .child_by_field_name("declarator")
             .unwrap_or(function_declarator);
         let (name_node, explicit_owner, name) = callable_name(declarator, self.source)?;
         if crate::language_builtins::is_language_keyword(&name) {
+            return None;
+        }
+        if role == AnchorRole::Declaration
+            && macro_like_identifier(&name)
+            && declaration.child_by_field_name("type").is_some_and(|kind| {
+                kind.kind() == "macro_type_specifier"
+                    && kind.end_position().row < name_node.start_position().row
+            })
+        {
             return None;
         }
 
@@ -460,6 +475,11 @@ impl<'a> CallFactCollector<'a> {
             end_byte,
         }
     }
+}
+
+fn macro_like_identifier(name: &str) -> bool {
+    name.bytes()
+        .all(|byte| byte == b'_' || byte.is_ascii_uppercase() || byte.is_ascii_digit())
 }
 
 #[cfg(test)]

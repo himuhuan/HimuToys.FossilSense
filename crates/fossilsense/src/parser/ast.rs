@@ -98,7 +98,7 @@ pub(super) fn collect_ast_index(
         }
         out.parse_error_count += usize::from(node.is_error() || node.is_missing());
         if facts.contains(ParseFacts::DECLARATIONS)
-            && node.kind() == "declaration"
+            && (node.kind() == "declaration" || recoverable_file_scope_object(node))
             && is_namespace_or_file_scope_declaration(node)
         {
             collect_object_declarations(
