@@ -26,6 +26,8 @@ Invoke-Checked cargo @('fmt', '--all', '--', '--check') $RepoRoot
 Invoke-Checked cargo @('clippy', '-p', 'fossilsense', '--all-targets', '--', '-D', 'warnings') $RepoRoot
 Invoke-Checked cargo @('test', '-p', 'fossilsense') $RepoRoot
 Invoke-Checked node @('scripts/test_architecture_fitness.js') $RepoRoot
+Invoke-Checked node @('scripts/test_c_frontend_conformance.mjs') $RepoRoot
+Invoke-Checked node @('scripts/test_c_frontend_clang.mjs') $RepoRoot
 Invoke-Checked node @('scripts/architecture_fitness.js') $RepoRoot
 Invoke-Checked powershell @(
     '-NoProfile',

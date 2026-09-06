@@ -412,6 +412,7 @@ fn protobuf_c_recovery_edits(
     path: &Path,
     root: tree_sitter::Node<'_>,
     source: &str,
+    lexical: &crate::c_lexical::LexicalMap,
 ) -> recovery::EditDiscovery {
     let suffix = ".pb-c.h";
     let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
@@ -439,19 +440,17 @@ fn protobuf_c_recovery_edits(
             if let Some(offset) = line.find(marker) {
                 let start = line_start + offset;
                 let range = start..start + marker.len();
-                let affected_end = if marker == "PROTOBUF_C__BEGIN_DECLS" {
-                    let search_end = start
-                        .saturating_add(recovery::MAX_RECOVERY_REGION_BYTES)
-                        .min(source.len());
-                    let semicolon = source.as_bytes()[range.end..search_end]
-                        .iter()
-                        .position(|byte| *byte == b';');
-                    let Some(semicolon) = semicolon else {
-                        let reason = if search_end < source.len() {
-                            RecoveryFailureReason::RegionBudgetExceeded
-                        } else {
-                            RecoveryFailureReason::UnsafeDeclarationBoundary
-                        };
+                let affected_end = match recovery::following_declaration_end(
+                    source,
+                    lexical,
+                    &range,
+                    marker == "PROTOBUF_C__END_DECLS",
+                ) {
+                    Ok(end) => end,
+                    Err(reason) => {
+                        let search_end = start
+                            .saturating_add(recovery::MAX_RECOVERY_REGION_BYTES)
+                            .min(source.len());
                         failures.push(recovery::DiscoveryFailure::new(
                             start..search_end,
                             RecoveryRule::ProtobufCMarker,
@@ -459,10 +458,7 @@ fn protobuf_c_recovery_edits(
                         ));
                         line_start += line.len();
                         continue;
-                    };
-                    range.end + semicolon + 1
-                } else {
-                    range.end
+                    }
                 };
                 push_bounded_recovery_edit(
                     &mut edits,
@@ -1264,6 +1260,7 @@ fn parse_with_handle_control(
             path,
             tree.root_node(),
             recovery.as_ref().expect("C recovery session").source(),
+            recovery.as_ref().expect("C recovery session").lexical_map(),
         );
         let session = recovery.as_mut().expect("C recovery session");
         session.record_discovery_failures(&discovery.failures);
@@ -1286,6 +1283,24 @@ fn parse_with_handle_control(
                 session.alignment_attribute_edits(tree.root_node()),
             )
         };
+        if language == SourceLanguage::C {
+            let session = recovery.as_ref().expect("C recovery session");
+            // Removing a boundary marker may expose an existing protobuf-c
+            // export shape. Reuse its decoder in the remaining shared reparse;
+            // do not add a third stage or retry already rejected marker edits.
+            let exposed = protobuf_c_recovery_edits(
+                path,
+                tree.root_node(),
+                session.source(),
+                session.lexical_map(),
+            );
+            discovery.edits.extend(
+                exposed
+                    .edits
+                    .into_iter()
+                    .filter(|edit| edit.rule == RecoveryRule::ProtobufCExport),
+            );
+        }
         let session = recovery.as_mut().expect("C-family recovery session");
         session.record_discovery_failures(&discovery.failures);
         tree = apply_recovery_stage(
