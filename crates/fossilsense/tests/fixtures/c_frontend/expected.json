@@ -1,0 +1,1159 @@
+[
+  {
+    "path": "declarators.c",
+    "sourceHash": "fnv1a64:239fe05dc316c996",
+    "observations": [
+      {
+        "name": "first",
+        "kind": "function",
+        "role": "declaration",
+        "owner": null,
+        "scope": "persistent",
+        "namespace": null,
+        "guard": null,
+        "nameRange": {
+          "start": {
+            "line": 1,
+            "character": 4
+          },
+          "end": {
+            "line": 1,
+            "character": 9
+          },
+          "startByte": 15,
+          "endByte": 20
+        },
+        "declarationRange": {
+          "start": {
+            "line": 1,
+            "character": 0
+          },
+          "end": {
+            "line": 1,
+            "character": 35
+          },
+          "startByte": 11,
+          "endByte": 46
+        }
+      },
+      {
+        "name": "second",
+        "kind": "function",
+        "role": "declaration",
+        "owner": null,
+        "scope": "persistent",
+        "namespace": null,
+        "guard": null,
+        "nameRange": {
+          "start": {
+            "line": 1,
+            "character": 17
+          },
+          "end": {
+            "line": 1,
+            "character": 23
+          },
+          "startByte": 28,
+          "endByte": 34
+        },
+        "declarationRange": {
+          "start": {
+            "line": 1,
+            "character": 0
+          },
+          "end": {
+            "line": 1,
+            "character": 35
+          },
+          "startByte": 11,
+          "endByte": 46
+        }
+      },
+      {
+        "name": "a",
+        "kind": "object",
+        "role": "tentative_definition",
+        "owner": null,
+        "scope": "persistent",
+        "namespace": null,
+        "guard": null,
+        "nameRange": {
+          "start": {
+            "line": 2,
+            "character": 4
+          },
+          "end": {
+            "line": 2,
+            "character": 5
+          },
+          "startByte": 51,
+          "endByte": 52
+        },
+        "declarationRange": {
+          "start": {
+            "line": 2,
+            "character": 0
+          },
+          "end": {
+            "line": 2,
+            "character": 13
+          },
+          "startByte": 47,
+          "endByte": 60
+        }
+      },
+      {
+        "name": "b",
+        "kind": "object",
+        "role": "definition",
+        "owner": null,
+        "scope": "persistent",
+        "namespace": null,
+        "guard": null,
+        "nameRange": {
+          "start": {
+            "line": 2,
+            "character": 7
+          },
+          "end": {
+            "line": 2,
+            "character": 8
+          },
+          "startByte": 54,
+          "endByte": 55
+        },
+        "declarationRange": {
+          "start": {
+            "line": 2,
+            "character": 0
+          },
+          "end": {
+            "line": 2,
+            "character": 13
+          },
+          "startByte": 47,
+          "endByte": 60
+        }
+      },
+      {
+        "name": "factory",
+        "kind": "function",
+        "role": "declaration",
+        "owner": null,
+        "scope": "persistent",
+        "namespace": null,
+        "guard": null,
+        "nameRange": {
+          "start": {
+            "line": 3,
+            "character": 6
+          },
+          "end": {
+            "line": 3,
+            "character": 13
+          },
+          "startByte": 67,
+          "endByte": 74
+        },
+        "declarationRange": {
+          "start": {
+            "line": 3,
+            "character": 0
+          },
+          "end": {
+            "line": 3,
+            "character": 38
+          },
+          "startByte": 61,
+          "endByte": 99
+        }
+      },
+      {
+        "name": "cb",
+        "kind": "object",
+        "role": "tentative_definition",
+        "owner": null,
+        "scope": "persistent",
+        "namespace": null,
+        "guard": null,
+        "nameRange": {
+          "start": {
+            "line": 3,
+            "character": 29
+          },
+          "end": {
+            "line": 3,
+            "character": 31
+          },
+          "startByte": 90,
+          "endByte": 92
+        },
+        "declarationRange": {
+          "start": {
+            "line": 3,
+            "character": 0
+          },
+          "end": {
+            "line": 3,
+            "character": 38
+          },
+          "startByte": 61,
+          "endByte": 99
+        }
+      },
+      {
+        "name": "early_cb",
+        "kind": "object",
+        "role": "tentative_definition",
+        "owner": null,
+        "scope": "persistent",
+        "namespace": null,
+        "guard": null,
+        "nameRange": {
+          "start": {
+            "line": 4,
+            "character": 6
+          },
+          "end": {
+            "line": 4,
+            "character": 14
+          },
+          "startByte": 106,
+          "endByte": 114
+        },
+        "declarationRange": {
+          "start": {
+            "line": 4,
+            "character": 0
+          },
+          "end": {
+            "line": 4,
+            "character": 37
+          },
+          "startByte": 100,
+          "endByte": 137
+        }
+      },
+      {
+        "name": "later_fn",
+        "kind": "function",
+        "role": "declaration",
+        "owner": null,
+        "scope": "persistent",
+        "namespace": null,
+        "guard": null,
+        "nameRange": {
+          "start": {
+            "line": 4,
+            "character": 22
+          },
+          "end": {
+            "line": 4,
+            "character": 30
+          },
+          "startByte": 122,
+          "endByte": 130
+        },
+        "declarationRange": {
+          "start": {
+            "line": 4,
+            "character": 0
+          },
+          "end": {
+            "line": 4,
+            "character": 37
+          },
+          "startByte": 100,
+          "endByte": 137
+        }
+      },
+      {
+        "name": "Function",
+        "kind": "alias",
+        "role": "definition",
+        "owner": null,
+        "scope": "persistent",
+        "namespace": null,
+        "guard": null,
+        "nameRange": {
+          "start": {
+            "line": 5,
+            "character": 12
+          },
+          "end": {
+            "line": 5,
+            "character": 20
+          },
+          "startByte": 150,
+          "endByte": 158
+        },
+        "declarationRange": {
+          "start": {
+            "line": 5,
+            "character": 0
+          },
+          "end": {
+            "line": 5,
+            "character": 26
+          },
+          "startByte": 138,
+          "endByte": 164
+        }
+      },
+      {
+        "name": "Callback",
+        "kind": "alias",
+        "role": "definition",
+        "owner": null,
+        "scope": "persistent",
+        "namespace": null,
+        "guard": null,
+        "nameRange": {
+          "start": {
+            "line": 6,
+            "character": 14
+          },
+          "end": {
+            "line": 6,
+            "character": 22
+          },
+          "startByte": 179,
+          "endByte": 187
+        },
+        "declarationRange": {
+          "start": {
+            "line": 6,
+            "character": 0
+          },
+          "end": {
+            "line": 6,
+            "character": 29
+          },
+          "startByte": 165,
+          "endByte": 194
+        }
+      }
+    ],
+    "languageEvidence": {
+      "sourceKind": "extension_default",
+      "fidelity": "inferred",
+      "ambiguous": false
+    },
+    "recoveryRules": [],
+    "coverage": {
+      "state": "complete",
+      "groups": {
+        "declarations": "complete",
+        "records": "complete",
+        "fields": "complete",
+        "members": "complete",
+        "aliases": "complete",
+        "local_bindings": "complete",
+        "call_sites": "complete"
+      },
+      "gaps": [],
+      "truncated": false,
+      "uncoveredRatio": 0.0
+    }
+  },
+  {
+    "path": "records.c",
+    "sourceHash": "fnv1a64:6fafff41b0462ff2",
+    "observations": [
+      {
+        "name": "Packet",
+        "kind": "type",
+        "role": "declaration",
+        "owner": null,
+        "scope": "persistent",
+        "namespace": null,
+        "guard": null,
+        "nameRange": {
+          "start": {
+            "line": 0,
+            "character": 7
+          },
+          "end": {
+            "line": 0,
+            "character": 13
+          },
+          "startByte": 7,
+          "endByte": 13
+        },
+        "declarationRange": {
+          "start": {
+            "line": 0,
+            "character": 7
+          },
+          "end": {
+            "line": 0,
+            "character": 13
+          },
+          "startByte": 7,
+          "endByte": 13
+        }
+      },
+      {
+        "name": "Packet",
+        "kind": "type",
+        "role": "definition",
+        "owner": null,
+        "scope": "persistent",
+        "namespace": null,
+        "guard": null,
+        "nameRange": {
+          "start": {
+            "line": 1,
+            "character": 7
+          },
+          "end": {
+            "line": 1,
+            "character": 13
+          },
+          "startByte": 22,
+          "endByte": 28
+        },
+        "declarationRange": {
+          "start": {
+            "line": 1,
+            "character": 0
+          },
+          "end": {
+            "line": 1,
+            "character": 47
+          },
+          "startByte": 15,
+          "endByte": 62
+        }
+      },
+      {
+        "name": "count",
+        "kind": "field",
+        "role": "definition",
+        "owner": "Packet",
+        "scope": "persistent",
+        "namespace": null,
+        "guard": null,
+        "nameRange": {
+          "start": {
+            "line": 1,
+            "character": 20
+          },
+          "end": {
+            "line": 1,
+            "character": 25
+          },
+          "startByte": 35,
+          "endByte": 40
+        },
+        "declarationRange": null
+      },
+      {
+        "name": "send",
+        "kind": "field",
+        "role": "definition",
+        "owner": "Packet",
+        "scope": "persistent",
+        "namespace": null,
+        "guard": null,
+        "nameRange": {
+          "start": {
+            "line": 1,
+            "character": 33
+          },
+          "end": {
+            "line": 1,
+            "character": 37
+          },
+          "startByte": 48,
+          "endByte": 52
+        },
+        "declarationRange": null
+      },
+      {
+        "name": "PacketAlias",
+        "kind": "alias",
+        "role": "definition",
+        "owner": null,
+        "scope": "persistent",
+        "namespace": null,
+        "guard": null,
+        "nameRange": {
+          "start": {
+            "line": 2,
+            "character": 22
+          },
+          "end": {
+            "line": 2,
+            "character": 33
+          },
+          "startByte": 85,
+          "endByte": 96
+        },
+        "declarationRange": {
+          "start": {
+            "line": 2,
+            "character": 0
+          },
+          "end": {
+            "line": 2,
+            "character": 34
+          },
+          "startByte": 63,
+          "endByte": 97
+        }
+      }
+    ],
+    "languageEvidence": {
+      "sourceKind": "extension_default",
+      "fidelity": "inferred",
+      "ambiguous": false
+    },
+    "recoveryRules": [],
+    "coverage": {
+      "state": "complete",
+      "groups": {
+        "declarations": "complete",
+        "records": "complete",
+        "fields": "complete",
+        "members": "complete",
+        "aliases": "complete",
+        "local_bindings": "complete",
+        "call_sites": "complete"
+      },
+      "gaps": [],
+      "truncated": false,
+      "uncoveredRatio": 0.0
+    }
+  },
+  {
+    "path": "guards.c",
+    "sourceHash": "fnv1a64:a05bcf904a662077",
+    "observations": [
+      {
+        "name": "enabled",
+        "kind": "function",
+        "role": "declaration",
+        "owner": null,
+        "scope": "persistent",
+        "namespace": null,
+        "guard": "#if defined(FEATURE)",
+        "nameRange": {
+          "start": {
+            "line": 1,
+            "character": 4
+          },
+          "end": {
+            "line": 1,
+            "character": 11
+          },
+          "startByte": 25,
+          "endByte": 32
+        },
+        "declarationRange": {
+          "start": {
+            "line": 1,
+            "character": 0
+          },
+          "end": {
+            "line": 1,
+            "character": 18
+          },
+          "startByte": 21,
+          "endByte": 39
+        }
+      },
+      {
+        "name": "disabled",
+        "kind": "function",
+        "role": "declaration",
+        "owner": null,
+        "scope": "persistent",
+        "namespace": null,
+        "guard": "!(#if defined(FEATURE)) && #else",
+        "nameRange": {
+          "start": {
+            "line": 3,
+            "character": 4
+          },
+          "end": {
+            "line": 3,
+            "character": 12
+          },
+          "startByte": 50,
+          "endByte": 58
+        },
+        "declarationRange": {
+          "start": {
+            "line": 3,
+            "character": 0
+          },
+          "end": {
+            "line": 3,
+            "character": 19
+          },
+          "startByte": 46,
+          "endByte": 65
+        }
+      }
+    ],
+    "languageEvidence": {
+      "sourceKind": "extension_default",
+      "fidelity": "inferred",
+      "ambiguous": false
+    },
+    "recoveryRules": [],
+    "coverage": {
+      "state": "complete",
+      "groups": {
+        "declarations": "complete",
+        "records": "complete",
+        "fields": "complete",
+        "members": "complete",
+        "aliases": "complete",
+        "local_bindings": "complete",
+        "call_sites": "complete"
+      },
+      "gaps": [],
+      "truncated": false,
+      "uncoveredRatio": 0.0
+    }
+  },
+  {
+    "path": "local.c",
+    "sourceHash": "fnv1a64:4def40f66bd84fd7",
+    "observations": [
+      {
+        "name": "outside",
+        "kind": "object",
+        "role": "tentative_definition",
+        "owner": null,
+        "scope": "persistent",
+        "namespace": null,
+        "guard": null,
+        "nameRange": {
+          "start": {
+            "line": 0,
+            "character": 4
+          },
+          "end": {
+            "line": 0,
+            "character": 11
+          },
+          "startByte": 4,
+          "endByte": 11
+        },
+        "declarationRange": {
+          "start": {
+            "line": 0,
+            "character": 0
+          },
+          "end": {
+            "line": 0,
+            "character": 12
+          },
+          "startByte": 0,
+          "endByte": 12
+        }
+      },
+      {
+        "name": "work",
+        "kind": "function",
+        "role": "definition",
+        "owner": null,
+        "scope": "persistent",
+        "namespace": null,
+        "guard": null,
+        "nameRange": {
+          "start": {
+            "line": 1,
+            "character": 5
+          },
+          "end": {
+            "line": 1,
+            "character": 9
+          },
+          "startByte": 18,
+          "endByte": 22
+        },
+        "declarationRange": {
+          "start": {
+            "line": 1,
+            "character": 0
+          },
+          "end": {
+            "line": 1,
+            "character": 20
+          },
+          "startByte": 13,
+          "endByte": 33
+        }
+      },
+      {
+        "name": "input",
+        "kind": "parameter",
+        "role": "definition",
+        "owner": "work",
+        "scope": "request_local",
+        "namespace": "ordinary",
+        "guard": null,
+        "nameRange": {
+          "start": {
+            "line": 1,
+            "character": 14
+          },
+          "end": {
+            "line": 1,
+            "character": 19
+          },
+          "startByte": 27,
+          "endByte": 32
+        },
+        "declarationRange": null
+      },
+      {
+        "name": "Local",
+        "kind": "local_type",
+        "role": "definition",
+        "owner": "work",
+        "scope": "request_local",
+        "namespace": "tag",
+        "guard": null,
+        "nameRange": {
+          "start": {
+            "line": 2,
+            "character": 9
+          },
+          "end": {
+            "line": 2,
+            "character": 14
+          },
+          "startByte": 45,
+          "endByte": 50
+        },
+        "declarationRange": null
+      },
+      {
+        "name": "Alias",
+        "kind": "local_type",
+        "role": "definition",
+        "owner": "work",
+        "scope": "request_local",
+        "namespace": "ordinary",
+        "guard": null,
+        "nameRange": {
+          "start": {
+            "line": 3,
+            "character": 14
+          },
+          "end": {
+            "line": 3,
+            "character": 19
+          },
+          "startByte": 82,
+          "endByte": 87
+        },
+        "declarationRange": null
+      },
+      {
+        "name": "local",
+        "kind": "local_variable",
+        "role": "definition",
+        "owner": "work",
+        "scope": "request_local",
+        "namespace": "ordinary",
+        "guard": null,
+        "nameRange": {
+          "start": {
+            "line": 4,
+            "character": 6
+          },
+          "end": {
+            "line": 4,
+            "character": 11
+          },
+          "startByte": 95,
+          "endByte": 100
+        },
+        "declarationRange": null
+      }
+    ],
+    "languageEvidence": {
+      "sourceKind": "extension_default",
+      "fidelity": "inferred",
+      "ambiguous": false
+    },
+    "recoveryRules": [],
+    "coverage": {
+      "state": "partial",
+      "groups": {
+        "declarations": "complete",
+        "records": "partial",
+        "fields": "partial",
+        "members": "partial",
+        "aliases": "partial",
+        "local_bindings": "complete",
+        "call_sites": "complete"
+      },
+      "gaps": [
+        {
+          "range": {
+            "start": {
+              "line": 2,
+              "character": 2
+            },
+            "end": {
+              "line": 2,
+              "character": 30
+            },
+            "startByte": 38,
+            "endByte": 66
+          },
+          "groups": [
+            "records",
+            "fields",
+            "members"
+          ],
+          "reason": "unsupported_declarator",
+          "evidence": "scope_not_supported"
+        },
+        {
+          "range": {
+            "start": {
+              "line": 3,
+              "character": 2
+            },
+            "end": {
+              "line": 3,
+              "character": 20
+            },
+            "startByte": 70,
+            "endByte": 88
+          },
+          "groups": [
+            "aliases"
+          ],
+          "reason": "unsupported_declarator",
+          "evidence": "scope_not_supported"
+        }
+      ],
+      "truncated": false,
+      "uncoveredRatio": 0.5822784810126582
+    }
+  },
+  {
+    "path": "decorated.pb-c.h",
+    "sourceHash": "fnv1a64:586f4277a20a50da",
+    "observations": [
+      {
+        "name": "Public",
+        "kind": "type",
+        "role": "definition",
+        "owner": null,
+        "scope": "persistent",
+        "namespace": null,
+        "guard": null,
+        "nameRange": {
+          "start": {
+            "line": 1,
+            "character": 23
+          },
+          "end": {
+            "line": 1,
+            "character": 29
+          },
+          "startByte": 47,
+          "endByte": 53
+        },
+        "declarationRange": {
+          "start": {
+            "line": 1,
+            "character": 0
+          },
+          "end": {
+            "line": 1,
+            "character": 45
+          },
+          "startByte": 24,
+          "endByte": 69
+        }
+      },
+      {
+        "name": "field",
+        "kind": "field",
+        "role": "definition",
+        "owner": "Public",
+        "scope": "persistent",
+        "namespace": null,
+        "guard": null,
+        "nameRange": {
+          "start": {
+            "line": 1,
+            "character": 36
+          },
+          "end": {
+            "line": 1,
+            "character": 41
+          },
+          "startByte": 60,
+          "endByte": 65
+        },
+        "declarationRange": null
+      },
+      {
+        "name": "aligned",
+        "kind": "object",
+        "role": "tentative_definition",
+        "owner": null,
+        "scope": "persistent",
+        "namespace": null,
+        "guard": null,
+        "nameRange": {
+          "start": {
+            "line": 3,
+            "character": 4
+          },
+          "end": {
+            "line": 3,
+            "character": 11
+          },
+          "startByte": 96,
+          "endByte": 103
+        },
+        "declarationRange": {
+          "start": {
+            "line": 3,
+            "character": 0
+          },
+          "end": {
+            "line": 3,
+            "character": 25
+          },
+          "startByte": 92,
+          "endByte": 117
+        }
+      }
+    ],
+    "languageEvidence": {
+      "sourceKind": "known_generated",
+      "fidelity": "inferred",
+      "ambiguous": false
+    },
+    "recoveryRules": [
+      "AlignmentAttribute",
+      "ProtobufCExport",
+      "ProtobufCMarker"
+    ],
+    "coverage": {
+      "state": "complete",
+      "groups": {
+        "declarations": "complete",
+        "records": "complete",
+        "fields": "complete",
+        "members": "complete",
+        "aliases": "complete",
+        "local_bindings": "complete",
+        "call_sites": "complete"
+      },
+      "gaps": [],
+      "truncated": false,
+      "uncoveredRatio": 0.0
+    }
+  },
+  {
+    "path": "unknown_macro.c",
+    "sourceHash": "fnv1a64:61fad18125cf5cae",
+    "observations": [
+      {
+        "name": "healthy",
+        "kind": "object",
+        "role": "tentative_definition",
+        "owner": null,
+        "scope": "persistent",
+        "namespace": null,
+        "guard": null,
+        "nameRange": {
+          "start": {
+            "line": 1,
+            "character": 4
+          },
+          "end": {
+            "line": 1,
+            "character": 11
+          },
+          "startByte": 26,
+          "endByte": 33
+        },
+        "declarationRange": {
+          "start": {
+            "line": 1,
+            "character": 0
+          },
+          "end": {
+            "line": 1,
+            "character": 12
+          },
+          "startByte": 22,
+          "endByte": 34
+        }
+      }
+    ],
+    "languageEvidence": {
+      "sourceKind": "extension_default",
+      "fidelity": "inferred",
+      "ambiguous": false
+    },
+    "recoveryRules": [],
+    "coverage": {
+      "state": "partial",
+      "groups": {
+        "declarations": "partial",
+        "records": "complete",
+        "fields": "complete",
+        "members": "complete",
+        "aliases": "complete",
+        "local_bindings": "complete",
+        "call_sites": "complete"
+      },
+      "gaps": [
+        {
+          "range": {
+            "start": {
+              "line": 0,
+              "character": 0
+            },
+            "end": {
+              "line": 0,
+              "character": 21
+            },
+            "startByte": 0,
+            "endByte": 21
+          },
+          "groups": [
+            "declarations",
+            "callable_anchors"
+          ],
+          "reason": "unknown_macro",
+          "evidence": "macro_invocation"
+        }
+      ],
+      "truncated": false,
+      "uncoveredRatio": 0.6363636363636364
+    }
+  },
+  {
+    "path": "shared.h",
+    "sourceHash": "fnv1a64:ea05821b49e14aa0",
+    "observations": [
+      {
+        "name": "header_api",
+        "kind": "function",
+        "role": "declaration",
+        "owner": null,
+        "scope": "persistent",
+        "namespace": null,
+        "guard": null,
+        "nameRange": {
+          "start": {
+            "line": 0,
+            "character": 4
+          },
+          "end": {
+            "line": 0,
+            "character": 14
+          },
+          "startByte": 4,
+          "endByte": 14
+        },
+        "declarationRange": {
+          "start": {
+            "line": 0,
+            "character": 0
+          },
+          "end": {
+            "line": 0,
+            "character": 21
+          },
+          "startByte": 0,
+          "endByte": 21
+        }
+      }
+    ],
+    "languageEvidence": {
+      "sourceKind": "extension_default",
+      "fidelity": "heuristic",
+      "ambiguous": true
+    },
+    "recoveryRules": [],
+    "coverage": {
+      "state": "partial",
+      "groups": {
+        "declarations": "partial",
+        "records": "partial",
+        "fields": "partial",
+        "members": "partial",
+        "aliases": "partial",
+        "local_bindings": "partial",
+        "call_sites": "partial"
+      },
+      "gaps": [
+        {
+          "range": {
+            "start": {
+              "line": 0,
+              "character": 0
+            },
+            "end": {
+              "line": 1,
+              "character": 0
+            },
+            "startByte": 0,
+            "endByte": 22
+          },
+          "groups": [
+            "declarations",
+            "occurrences",
+            "records",
+            "fields",
+            "members",
+            "aliases",
+            "local_declarations",
+            "local_bindings",
+            "callable_anchors",
+            "call_sites"
+          ],
+          "reason": "language_ambiguity",
+          "evidence": "language_selection"
+        }
+      ],
+      "truncated": false,
+      "uncoveredRatio": 1.0
+    }
+  },
+  {
+    "path": "empty.c",
+    "sourceHash": "fnv1a64:3e46aa63ce4bd237",
+    "observations": [],
+    "languageEvidence": {
+      "sourceKind": "extension_default",
+      "fidelity": "inferred",
+      "ambiguous": false
+    },
+    "recoveryRules": [],
+    "coverage": {
+      "state": "complete",
+      "groups": {
+        "declarations": "complete",
+        "records": "complete",
+        "fields": "complete",
+        "members": "complete",
+        "aliases": "complete",
+        "local_bindings": "complete",
+        "call_sites": "complete"
+      },
+      "gaps": [],
+      "truncated": false,
+      "uncoveredRatio": null
+    }
+  }
+]

@@ -23,3 +23,44 @@ jobs:
       - name: Verify
         shell: pwsh
         run: ./scripts/verify.ps1
+
+  c-frontend-conformance:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install the pinned Clang oracle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $manifest = Get-Content -Raw -LiteralPath crates/fossilsense/tests/fixtures/c_frontend/manifest.json | ConvertFrom-Json
+          $installer = Join-Path $env:RUNNER_TEMP 'fossilsense-llvm-installer.exe'
+          $llvmRoot = Join-Path $env:RUNNER_TEMP 'fossilsense-llvm'
+          Invoke-WebRequest -Uri $manifest.installerUrl -OutFile $installer
+          if ((Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash -ne $manifest.installerSha256) {
+            throw 'Pinned LLVM installer SHA-256 mismatch.'
+          }
+          $installed = Start-Process -FilePath $installer -ArgumentList @('/S', "/D=$llvmRoot") -WindowStyle Hidden -Wait -PassThru
+          if ($installed.ExitCode -ne 0) { throw 'Pinned LLVM installation failed.' }
+          $clangPath = Join-Path $llvmRoot 'bin/clang.exe'
+          if (-not (Test-Path -LiteralPath $clangPath -PathType Leaf)) { throw 'Pinned Clang is missing.' }
+          "FOSSILSENSE_CLANG=$clangPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Check comparator failure detection
+        shell: pwsh
+        run: |
+          node scripts/test_c_frontend_conformance.mjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node scripts/test_c_frontend_clang.mjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Compare complete source declarations
+        shell: pwsh
+        run: node scripts/verify_c_frontend_conformance.mjs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: c-frontend-conformance
+          path: target/c-frontend-conformance

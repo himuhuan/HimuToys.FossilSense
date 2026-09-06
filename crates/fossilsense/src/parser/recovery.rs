@@ -11,6 +11,64 @@ pub(super) const MAX_RECOVERY_EDITS: usize = 256;
 pub(super) const MAX_RECOVERY_REGION_BYTES: usize = 64 * 1024;
 pub(super) const MAX_RECOVERY_PAREN_DEPTH: usize = 64;
 
+/// A marker can be parsed as the prefix of the following declaration. Its
+/// health-check region must include that whole declaration, not the first
+/// field's semicolon or a semicolon inside a comment/string.
+pub(super) fn following_declaration_end(
+    source: &str,
+    lexical: &LexicalMap,
+    marker: &Range<usize>,
+    allow_empty: bool,
+) -> Result<usize, RecoveryFailureReason> {
+    let bytes = source.as_bytes();
+    let limit = marker
+        .start
+        .saturating_add(MAX_RECOVERY_REGION_BYTES)
+        .min(bytes.len());
+    let (mut parentheses, mut brackets, mut braces) = (0usize, 0usize, 0usize);
+    let (mut seen, mut assignment, mut function_body) = (false, false, false);
+    let mut previous = 0;
+    for (index, &byte) in bytes.iter().enumerate().take(limit).skip(marker.end) {
+        if !lexical.code[index] || byte.is_ascii_whitespace() {
+            continue;
+        }
+        seen = true;
+        match byte {
+            b'(' => parentheses += 1,
+            b')' if parentheses > 0 => parentheses -= 1,
+            b'[' => brackets += 1,
+            b']' if brackets > 0 => brackets -= 1,
+            b'{' => {
+                if braces == 0 {
+                    function_body = previous == b')' && !assignment;
+                }
+                braces += 1;
+            }
+            b'}' if braces > 0 => {
+                braces -= 1;
+                if braces == 0 && function_body {
+                    return Ok(index + 1);
+                }
+            }
+            b')' | b']' | b'}' => return Err(RecoveryFailureReason::UnsafeDeclarationBoundary),
+            b'=' if parentheses == 0 && braces == 0 && brackets == 0 => assignment = true,
+            b';' if parentheses == 0 && braces == 0 && brackets == 0 => return Ok(index + 1),
+            _ => {}
+        }
+        if parentheses + braces + brackets > MAX_RECOVERY_PAREN_DEPTH {
+            return Err(RecoveryFailureReason::ParenthesisDepthExceeded);
+        }
+        previous = byte;
+    }
+    if limit < source.len() {
+        Err(RecoveryFailureReason::RegionBudgetExceeded)
+    } else if !seen && allow_empty {
+        Ok(marker.end)
+    } else {
+        Err(RecoveryFailureReason::UnsafeDeclarationBoundary)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryRule {
     ProtobufCMarker,

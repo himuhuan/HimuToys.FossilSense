@@ -1,0 +1,164 @@
+{
+  "formatVersion": 1,
+  "standard": "c11",
+  "target": "x86_64-pc-windows-msvc",
+  "clangVersion": "22.1.3",
+  "installerUrl": "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.3/LLVM-22.1.3-win64.exe",
+  "installerSha256": "72ca54c3b7940615776d8994c0b918a1d8c4981bdcf13b439eaa86a1bd477001",
+  "stub": "stubs/contracts.h",
+  "requestLocalPolicy": "function_definitions_only; local record members are unsupported_region",
+  "files": [
+    {
+      "path": "declarators.c",
+      "selection": "default",
+      "oracle": "clang",
+      "observationScopes": [
+        "persistent"
+      ],
+      "clangConfigurations": [
+        {
+          "id": "default",
+          "args": [],
+          "activeGuards": [
+            null
+          ]
+        }
+      ]
+    },
+    {
+      "path": "records.c",
+      "selection": "default",
+      "oracle": "clang",
+      "observationScopes": [
+        "persistent"
+      ],
+      "clangConfigurations": [
+        {
+          "id": "default",
+          "args": [],
+          "activeGuards": [
+            null
+          ]
+        }
+      ]
+    },
+    {
+      "path": "guards.c",
+      "selection": "default",
+      "oracle": "clang",
+      "observationScopes": [
+        "persistent"
+      ],
+      "clangConfigurations": [
+        {
+          "id": "feature-on",
+          "args": [
+            "-DFEATURE=1"
+          ],
+          "activeGuards": [
+            null,
+            "#if defined(FEATURE)"
+          ]
+        },
+        {
+          "id": "feature-off",
+          "args": [
+            "-UFEATURE"
+          ],
+          "activeGuards": [
+            null,
+            "!(#if defined(FEATURE)) && #else"
+          ]
+        }
+      ]
+    },
+    {
+      "path": "local.c",
+      "selection": "default",
+      "oracle": "clang",
+      "observationScopes": [
+        "persistent",
+        "request_local",
+        "unsupported_region"
+      ],
+      "clangConfigurations": [
+        {
+          "id": "default",
+          "args": [],
+          "activeGuards": [
+            null
+          ]
+        }
+      ]
+    },
+    {
+      "path": "decorated.pb-c.h",
+      "selection": "default",
+      "oracle": "clang",
+      "observationScopes": [
+        "persistent"
+      ],
+      "clangConfigurations": [
+        {
+          "id": "default",
+          "args": [],
+          "activeGuards": [
+            null
+          ]
+        }
+      ]
+    },
+    {
+      "path": "unknown_macro.c",
+      "selection": "default",
+      "oracle": "manual",
+      "observationScopes": [
+        "persistent"
+      ],
+      "clangConfigurations": [
+        {
+          "id": "default",
+          "args": [],
+          "activeGuards": [
+            null
+          ]
+        }
+      ]
+    },
+    {
+      "path": "shared.h",
+      "selection": "default",
+      "oracle": "manual",
+      "observationScopes": [
+        "persistent"
+      ],
+      "clangConfigurations": [
+        {
+          "id": "default",
+          "args": [],
+          "activeGuards": [
+            null
+          ]
+        }
+      ]
+    },
+    {
+      "path": "empty.c",
+      "selection": "default",
+      "oracle": "clang",
+      "observationScopes": [
+        "persistent"
+      ],
+      "clangConfigurations": [
+        {
+          "id": "default",
+          "args": [],
+          "activeGuards": [
+            null
+          ]
+        }
+      ]
+    }
+  ],
+  "rangeContract": "Full declaration statements include semicolons; function definitions use the signature before the body; forward tags use their name range; fields and request-local bindings have nameRange only."
+}

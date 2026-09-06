@@ -1,5 +1,6 @@
 use std::path::Path;
 
+mod conformance;
 mod coverage;
 
 use super::{
@@ -1932,6 +1933,7 @@ fn oversized_recovery_regions_stop_at_sixty_four_kibibytes() {
         Path::new("oversized.pb-c.h"),
         tree.root_node(),
         &protobuf_source,
+        &crate::c_lexical::LexicalMap::new(&protobuf_source, false),
     );
     assert!(discovery.edits.is_empty());
     assert!(discovery
