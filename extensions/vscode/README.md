@@ -1,8 +1,10 @@
 # FossilSense for VS Code
 
-FossilSense gives large, difficult-to-build C, C++, and Go workspaces useful navigation without requiring a complete compiler setup. The `1.6.0` VSIX is self-contained: open a workspace and let the bundled native engine build its local index. Go support is experimental and does not require the Go toolchain or gopls.
+FossilSense gives large, difficult-to-build C, C++, and Go workspaces useful navigation without requiring a complete compiler setup. The `1.7.0` VSIX is self-contained: open a workspace and let the bundled native engine build its local index. Go support is experimental and does not require the Go toolchain or gopls.
 
-Version 1.6.0 improves tolerant C parsing: file-scope tag declarations pair with definitions, function-local enum values stay out of the workspace index, standalone GNU weak attributes no longer split one function identity, protobuf-c export and declaration-boundary macros are recovered without swallowing the first `typedef`, and the hard-failure fallback preserves safely recognized multiple global names. Trailing alignment attributes, function-pointer calling conventions, and conditional array initializers keep their real declaration names. Alignment recovery now targets only known decoration syntax in code; matching text in comments, strings, character literals, C++ raw strings, and continued preprocessor lines is left untouched. Declaration-style macro calls no longer appear as functions. A smaller completion name index reduced the warmed two-generation U-Boot gate from 501.61 MiB to 483.02 MiB on the same machine; 64 production LSP completion requests measured 28.823 ms at P95. Opt-in protobuf-c source tracing remains available. FossilSense still does not expand arbitrary macros or claim complete C++ compiler semantics.
+Version 1.7.0 unifies tolerant C declaration discovery. Multiple declarators, function pointers, typedefs, conditional branches, and local scopes retain consistent identities and original positions. Header language selection uses configuration and source evidence. Healthy declarations remain available when other regions are only partially understood, with partial or unknown coverage made visible.
+
+The new read-only `query explain` command separates disk observations, stale indexes, bounded recall, and navigation omissions. Reviewed C fixtures and an independent Clang oracle check the supported regression contracts; this development validation adds no Clang requirement for users. Opt-in protobuf-c source tracing remains available. FossilSense does not expand arbitrary macros or claim complete C++ compiler semantics.
 
 It is designed for firmware, embedded systems, drivers, kernels, legacy code, vendored SDKs, and repositories where `compile_commands.json` is missing or unreliable.
 
@@ -24,7 +26,7 @@ FossilSense ranks evidence from the current file, reachable includes, direct ext
 
 Go uses package/import reachability instead of pretending that imports are C includes. Same-package files, `go.mod`, `go.work`, workspace `vendor`, and explicitly configured external module roots provide bounded evidence. Unresolved imports, build constraints, target filename suffixes, and cgo boundaries keep coverage open or lower confidence instead of silently dropping other candidates. C/C++ and Go use separate semantic families, so same-name declarations do not leak across ordinary queries.
 
-Version 1.5.0 routes Go document/workspace symbols, Declaration/Definition, Find All, ordinary/local/member/import completion, Hover, References, Signature Help, Semantic Tokens, and Call Hierarchy through the same candidate service and typed read model used by C/C++. The engine persists Go package, import, build guard, declaration, method, field, local-binding, and direct-call facts while retaining best-effort candidate semantics.
+The experimental Go backend routes Go document/workspace symbols, Declaration/Definition, Find All, ordinary/local/member/import completion, Hover, References, Signature Help, Semantic Tokens, and Call Hierarchy through the same candidate service and typed read model used by C/C++. The engine persists Go package, import, build guard, declaration, method, field, local-binding, and direct-call facts while retaining best-effort candidate semantics.
 
 ## Where symbols come from
 
@@ -38,7 +40,7 @@ C++ record methods intentionally participate in ordinary identifier recall as fu
 
 ## Install and start
 
-Install `fossilsense-vscode-1.6.0_BUILD*.vsix` with:
+Install `fossilsense-vscode-1.7.0_BUILD*.vsix` with:
 
 ```text
 Extensions -> ... -> Install from VSIX
