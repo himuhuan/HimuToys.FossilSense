@@ -281,11 +281,7 @@ impl<'a> CandidateQueryService<'a> {
             scope_open: source_paths
                 .iter()
                 .any(|path| source_reach.get(path).is_none_or(|scope| scope.open)),
-            incomplete_reason: if self.overlays.has_incomplete_facts() {
-                Some(crate::query::CandidateIncompleteReason::Cancelled)
-            } else {
-                None
-            },
+            incomplete_reason: self.overlays.incomplete_facts_reason(),
         };
         let mut visible_internal_paths = self
             .current_reach

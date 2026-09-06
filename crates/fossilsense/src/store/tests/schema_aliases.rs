@@ -2,6 +2,42 @@ use super::*;
 use crate::semantic_model::{AliasTargetFidelity, DeclaratorShape, RecordRangeFidelity};
 
 #[test]
+fn declaration_coverage_gaps_survive_revision_reload() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("index.sqlite");
+    let mut store = IndexStore::open(&db, dir.path()).unwrap();
+    upsert_source(
+        &mut store,
+        "partial.c",
+        "DECLARE_HANDLER(net);\nint healthy;\n",
+    );
+    drop(store);
+    let reader = IndexStore::open_readonly(&db).unwrap();
+    let gaps: i64 = reader.conn.query_row(
+        "SELECT count(*) FROM declaration_coverage_gaps g JOIN active_file_revisions a ON a.revision_id = g.revision_id",
+        [], |row| row.get(0)).expect("coverage survives alongside the active revision");
+    assert!(gaps > 0);
+    assert_eq!(
+        reader
+            .declaration_view()
+            .by_name_limited("healthy", 8)
+            .unwrap()
+            .0
+            .len(),
+        1
+    );
+    assert!(
+        reader
+            .declaration_view()
+            .by_name_limited("net", 8)
+            .unwrap()
+            .0
+            .is_empty(),
+        "macro arguments are not declared names"
+    );
+}
+
+#[test]
 fn language_evidence_is_revision_metadata_and_rolls_back_with_facts() {
     let dir = tempdir().unwrap();
     let db = dir.path().join("index.sqlite");
@@ -517,4 +553,177 @@ fn alias_target_kind_filters_same_tag_records() {
         .fields_for_records(&[candidates[0].id])
         .expect("fields");
     assert_eq!(fields, vec!["union_field".to_string()]);
+}
+
+#[test]
+fn declaration_coverage_typed_revision_transaction_and_cleanup() {
+    use crate::semantic_model::{CoverageReason, FactCoverage, FactGroup};
+    let dir = tempdir().unwrap();
+    let mut store = IndexStore::open(&dir.path().join("index.sqlite"), dir.path()).unwrap();
+    upsert_source(
+        &mut store,
+        "partial.c",
+        "DECLARE(first);\nDECLARE(second);\nint healthy;\n",
+    );
+    let before = store
+        .coverage_view()
+        .for_path("partial.c")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        before.summary.fact_coverage(FactGroup::Declarations),
+        FactCoverage::Partial
+    );
+    let all = store
+        .coverage_view()
+        .gaps_for_revision(before.revision_id, 1024)
+        .unwrap();
+    assert!(all
+        .0
+        .iter()
+        .any(|gap| gap.reason == CoverageReason::UnknownMacro));
+    let limited = store
+        .coverage_view()
+        .gaps_for_revision(before.revision_id, 1)
+        .unwrap();
+    assert_eq!(limited.0.len(), 1);
+    assert!(limited.1);
+    assert!(store
+        .coverage_view()
+        .for_paths(&vec!["partial.c".into(); 513])
+        .is_err());
+    store.conn.execute_batch("CREATE TRIGGER reject_coverage BEFORE INSERT ON declaration_coverage_gaps BEGIN SELECT RAISE(ABORT, 'injected coverage failure'); END;").unwrap();
+    let source = "DECLARE(third);\nint replacement;\n";
+    let parsed = parse(std::path::Path::new("partial.c"), source);
+    let fp = FileFingerprint {
+        path: "partial.c".into(),
+        extension: "c".into(),
+        size: source.len() as u64,
+        mtime_ns: 2,
+        hash: "replacement".into(),
+    };
+    assert!(store.upsert_file_index(&fp, &parsed).is_err());
+    assert_eq!(
+        store
+            .coverage_view()
+            .for_path("partial.c")
+            .unwrap()
+            .unwrap(),
+        before
+    );
+    assert_eq!(
+        store
+            .coverage_view()
+            .gaps_for_revision(before.revision_id, 1024)
+            .unwrap(),
+        all
+    );
+    assert!(store
+        .declaration_view()
+        .by_name_limited("replacement", 8)
+        .unwrap()
+        .0
+        .is_empty());
+    store
+        .conn
+        .execute_batch("DROP TRIGGER reject_coverage")
+        .unwrap();
+    store.conn.execute_batch("CREATE TRIGGER reject_declaration BEFORE INSERT ON declaration_facts BEGIN SELECT RAISE(ABORT, 'injected later declaration failure'); END;").unwrap();
+    assert!(store.upsert_file_index(&fp, &parsed).is_err());
+    assert_eq!(
+        store
+            .coverage_view()
+            .for_path("partial.c")
+            .unwrap()
+            .unwrap(),
+        before
+    );
+    assert_eq!(
+        store
+            .coverage_view()
+            .gaps_for_revision(before.revision_id, 1024)
+            .unwrap(),
+        all
+    );
+    store
+        .conn
+        .execute_batch("DROP TRIGGER reject_declaration")
+        .unwrap();
+    upsert_source(&mut store, "partial.c", "int healthy;\n");
+    assert_eq!(
+        store
+            .coverage_view()
+            .for_path("partial.c")
+            .unwrap()
+            .unwrap()
+            .summary
+            .fact_coverage(FactGroup::Declarations),
+        FactCoverage::Complete
+    );
+    assert!(
+        store
+            .coverage_view()
+            .gaps_for_revision(before.revision_id, 1024)
+            .unwrap()
+            .0
+            .is_empty(),
+        "inactive revisions must also remove coverage details during bulk cleanup"
+    );
+    let orphaned: i64 = store.conn.query_row("SELECT COUNT(*) FROM declaration_coverage_gaps g LEFT JOIN file_revisions r ON g.revision_id=r.id WHERE r.id IS NULL", [], |row| row.get(0)).unwrap();
+    assert_eq!(orphaned, 0);
+    store
+        .conn
+        .execute("UPDATE file_revisions SET coverage_summary=NULL", [])
+        .unwrap();
+    assert_eq!(
+        store
+            .coverage_view()
+            .for_path("partial.c")
+            .unwrap()
+            .unwrap()
+            .summary
+            .fact_coverage(FactGroup::Declarations),
+        FactCoverage::Unknown
+    );
+}
+
+#[test]
+fn declaration_coverage_partial_ast_roundtrips_exact_summary_and_gaps() {
+    use crate::semantic_model::{FactCoverage, FactGroup, ParseOutcome};
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("index.sqlite");
+    let source = "int healthy;\nint broken = ;\n";
+    let parsed = parse(std::path::Path::new("partial.c"), source);
+    assert_eq!(parsed.parse_outcome, ParseOutcome::PartialAst);
+    assert_eq!(
+        parsed.fact_coverage(FactGroup::Declarations),
+        FactCoverage::Partial
+    );
+    let mut store = IndexStore::open(&db, dir.path()).unwrap();
+    upsert_source(&mut store, "partial.c", source);
+    drop(store);
+    let store = IndexStore::open_readonly(&db).unwrap();
+    let row = store
+        .coverage_view()
+        .for_path("partial.c")
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.summary, parsed.diagnostics.coverage.summary);
+    assert_eq!(
+        store
+            .coverage_view()
+            .gaps_for_revision(row.revision_id, 1024)
+            .unwrap()
+            .0,
+        parsed.diagnostics.coverage.gaps
+    );
+    assert_eq!(
+        store
+            .declaration_view()
+            .by_name_limited("healthy", 8)
+            .unwrap()
+            .0
+            .len(),
+        1
+    );
 }

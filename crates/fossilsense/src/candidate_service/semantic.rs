@@ -388,6 +388,8 @@ impl CandidateQueryService<'_> {
             candidates.truncate(self.exact_name_limit);
             truncated = true;
         }
+        let (declaration_state, declaration_reasons) =
+            self.declaration_coverage_for_candidates(&candidates)?;
         Ok(build_set(
             candidates,
             intent,
@@ -395,8 +397,11 @@ impl CandidateQueryService<'_> {
                 scanned,
                 truncated,
                 scope_open: self.current_reach.as_ref().is_some_and(|reach| reach.open),
-                facts_incomplete: self.overlays.has_incomplete_facts(),
+                facts_incomplete: declaration_state
+                    != crate::semantic_model::FactCoverage::Complete,
                 generation_mismatch: false,
+                declaration_state,
+                declaration_reasons,
             },
         ))
     }

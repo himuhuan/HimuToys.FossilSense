@@ -37,6 +37,7 @@ use crate::semantic_model::{
 };
 
 mod callable_queries;
+mod coverage;
 mod semantic;
 mod type_queries;
 pub use callable_queries::CandidateQueryService;
@@ -77,7 +78,7 @@ struct CompletionRecallFileProjection<'a> {
     declarations: &'a [DeclarationFact],
     includes: &'a [Include],
     fallback_completions: &'a [FallbackCompletionFact],
-    facts_complete: bool,
+    facts_available: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -98,7 +99,9 @@ pub struct FileCandidateOverlay {
     /// False when any semantic fact group needed by the candidate facade is
     /// unavailable. This includes cancelled parses and lexical fallback: an
     /// empty vector is not evidence that the dirty file contains no facts.
-    pub facts_complete: bool,
+    /// Collection availability only. Missing coverage never erases healthy facts.
+    pub facts_available: bool,
+    pub declaration_coverage: Option<crate::semantic_model::DeclarationCoverageSummary>,
 }
 
 impl FileCandidateOverlay {
@@ -128,7 +131,8 @@ impl FileCandidateOverlay {
             includes: Vec::new(),
             fallback_completions: Vec::new(),
             text: None,
-            facts_complete: true,
+            facts_available: true,
+            declaration_coverage: None,
         }
     }
 
@@ -163,7 +167,8 @@ impl FileCandidateOverlay {
         overlay
             .fallback_completions
             .clone_from(&index.fallback_completions);
-        overlay.facts_complete = [
+        overlay.facts_available = [
+            FactGroup::Declarations,
             FactGroup::CallableAnchors,
             FactGroup::CallSites,
             FactGroup::Records,
@@ -172,6 +177,7 @@ impl FileCandidateOverlay {
         ]
         .into_iter()
         .all(|group| index.fact_availability(group) == FactAvailability::Available);
+        overlay.declaration_coverage = Some(index.diagnostics.coverage.summary);
         overlay
     }
 
@@ -216,9 +222,9 @@ impl FileCandidateOverlay {
                 .clone_from(&index.fallback_completions);
         }
         overlay.includes.clone_from(&index.includes);
-        // Include scanning is available even on lexical fallback. A cancelled
-        // parse is represented by `completion_tombstone_for_family` instead.
-        overlay.facts_complete = true;
+        overlay.facts_available =
+            index.fact_availability(FactGroup::Declarations) == FactAvailability::Available;
+        overlay.declaration_coverage = Some(index.diagnostics.coverage.summary);
         overlay
     }
 
@@ -228,14 +234,14 @@ impl FileCandidateOverlay {
     ) -> Self {
         let mut overlay = Self::new(path, Vec::new(), Vec::new());
         overlay.semantic_family = semantic_family;
-        overlay.facts_complete = false;
+        overlay.facts_available = false;
         overlay
     }
 
     pub fn tombstone(path: String, text: Arc<str>) -> Self {
         let mut overlay = Self::new(path, Vec::new(), Vec::new());
         overlay.text = Some(text);
-        overlay.facts_complete = false;
+        overlay.facts_available = false;
         overlay
     }
 
@@ -261,7 +267,7 @@ pub(crate) fn completion_recall_universe_id(files: &[FileCandidateOverlay]) -> R
             declarations: &file.declarations,
             includes: &file.includes,
             fallback_completions: &file.fallback_completions,
-            facts_complete: file.facts_complete,
+            facts_available: file.facts_available,
         })
         .collect();
     projections.sort_by(|left, right| {
@@ -838,7 +844,9 @@ pub struct CandidateOverlaySnapshot {
     source_by_path: HashMap<String, Arc<str>>,
     includes_by_path: HashMap<String, Vec<Include>>,
     fallback_completions: Vec<OverlayFallbackCompletionFact>,
-    incomplete_paths: HashSet<String>,
+    unavailable_paths: HashSet<String>,
+    declaration_coverage_by_path:
+        HashMap<String, crate::semantic_model::DeclarationCoverageSummary>,
     include_path_view: Option<Arc<IncludePathView>>,
     effective_reach_graph: Option<Arc<ReachGraph>>,
     /// Only external paths whose workspace-wide first-layer status differs
@@ -874,8 +882,13 @@ impl CandidateOverlaySnapshot {
             if let Some(text) = file.text.clone() {
                 snapshot.source_by_path.insert(file.path.clone(), text);
             }
-            if !file.facts_complete {
-                snapshot.incomplete_paths.insert(file.path.clone());
+            if !file.facts_available {
+                snapshot.unavailable_paths.insert(file.path.clone());
+            }
+            if let Some(coverage) = file.declaration_coverage {
+                snapshot
+                    .declaration_coverage_by_path
+                    .insert(file.path.clone(), coverage);
             }
             snapshot
                 .includes_by_path
@@ -1091,7 +1104,7 @@ impl CandidateOverlaySnapshot {
         let mut edges = Vec::new();
         let mut open = Vec::new();
         for source in &sources {
-            if self.incomplete_paths.contains(source) {
+            if self.unavailable_paths.contains(source) {
                 open.push((
                     source.clone(),
                     crate::reachability::OpenReason::UnresolvedInclude,
@@ -1197,7 +1210,8 @@ impl CandidateOverlaySnapshot {
                 includes: Vec::new(),
                 fallback_completions: Vec::new(),
                 text: self.source_by_path.get(&path).cloned(),
-                facts_complete: !self.incomplete_paths.contains(&path),
+                facts_available: !self.unavailable_paths.contains(&path),
+                declaration_coverage: self.declaration_coverage_by_path.get(&path).copied(),
                 path,
             })
             .collect()
@@ -1215,8 +1229,20 @@ impl CandidateOverlaySnapshot {
         self.semantic_family_by_path.get(path).copied()
     }
 
-    pub fn has_incomplete_facts(&self) -> bool {
-        !self.incomplete_paths.is_empty()
+    pub fn has_unavailable_facts(&self) -> bool {
+        !self.unavailable_paths.is_empty()
+    }
+
+    pub fn declaration_coverage_for_path(
+        &self,
+        path: &str,
+    ) -> Option<crate::semantic_model::DeclarationCoverageSummary> {
+        self.declaration_coverage_by_path.get(path).copied()
+    }
+
+    pub fn incomplete_facts_reason(&self) -> Option<crate::query::CandidateIncompleteReason> {
+        self.has_unavailable_facts()
+            .then_some(crate::query::CandidateIncompleteReason::Cancelled)
     }
 
     /// Sparse request-local replacement for durable first-layer external
@@ -1818,6 +1844,98 @@ mod tests {
     }
 
     #[test]
+    fn declaration_coverage_unknown_macro_preserves_facts_but_not_completeness() {
+        let parsed = parse_with_handle(
+            Path::new("partial.c"),
+            "DECLARE_HANDLER(net);\nint healthy(void);\n",
+            None,
+            ParseFacts::ALL,
+        );
+        assert_eq!(
+            parsed.fact_availability(FactGroup::Declarations),
+            FactAvailability::Available
+        );
+        assert!(parsed
+            .declarations
+            .iter()
+            .any(|fact| fact.name == "healthy"));
+        let overlay = FileCandidateOverlay::from_index("partial.c".into(), &parsed);
+        assert!(
+            overlay.facts_available,
+            "healthy facts remain available beside an unknown macro"
+        );
+        let completion =
+            FileCandidateOverlay::from_completion_index("partial.c".into(), &parsed, true);
+        assert!(
+            completion.facts_available,
+            "ordinary completion retains healthy facts"
+        );
+        assert_eq!(
+            completion
+                .declaration_coverage
+                .unwrap()
+                .fact_coverage(FactGroup::Declarations),
+            crate::semantic_model::FactCoverage::Partial,
+            "the compact completion summary must retain incomplete coverage"
+        );
+        let snapshot = CandidateOverlaySnapshot::new(1, vec![overlay]);
+        let set = CandidateQueryService::new(None, &snapshot, "partial.c", None, None)
+            .semantic_candidates("healthy", SemanticIntent::Neutral)
+            .unwrap();
+        assert!(
+            !set.all.is_empty(),
+            "healthy declarations must remain available"
+        );
+        assert!(set.coverage.facts_incomplete);
+    }
+
+    #[test]
+    fn declaration_coverage_absent_overlay_metadata_stays_unknown() {
+        let snapshot = CandidateOverlaySnapshot::new(
+            1,
+            vec![FileCandidateOverlay::new(
+                "unknown.c".into(),
+                Vec::new(),
+                Vec::new(),
+            )],
+        );
+        let set = CandidateQueryService::new(None, &snapshot, "unknown.c", None, None)
+            .semantic_candidates("name", SemanticIntent::Neutral)
+            .unwrap();
+        assert_eq!(
+            set.coverage.declaration_state,
+            crate::semantic_model::FactCoverage::Unknown
+        );
+        assert!(set.coverage.facts_incomplete);
+    }
+
+    #[test]
+    fn declaration_coverage_unrelated_partial_document_does_not_taint_healthy_query() {
+        let make = |path: &str, source: &str| {
+            FileCandidateOverlay::from_index(
+                path.into(),
+                &parse_with_handle(Path::new(path), source, None, ParseFacts::ALL),
+            )
+        };
+        let snapshot = CandidateOverlaySnapshot::new(
+            1,
+            vec![
+                make("healthy.c", "int healthy;\n"),
+                make("unrelated.c", "DECLARE(other);\n"),
+            ],
+        );
+        let set = CandidateQueryService::new(None, &snapshot, "healthy.c", None, None)
+            .semantic_candidates("healthy", SemanticIntent::Neutral)
+            .unwrap();
+        assert!(!set.all.is_empty());
+        assert!(!set.coverage.facts_incomplete);
+        assert_eq!(
+            set.coverage.declaration_state,
+            crate::semantic_model::FactCoverage::Complete
+        );
+    }
+
+    #[test]
     fn lexical_fallback_overlay_is_not_complete_semantic_evidence() {
         let mut parsed = parse_with_handle(
             Path::new("fallback.h"),
@@ -1851,9 +1969,9 @@ mod tests {
         parsed.records.clear();
         parsed.aliases.clear();
         let overlay = FileCandidateOverlay::from_index("fallback.h".into(), &parsed);
-        assert!(!overlay.facts_complete);
+        assert!(!overlay.facts_available);
         let snapshot = CandidateOverlaySnapshot::new(1, vec![overlay]);
-        assert!(snapshot.has_incomplete_facts());
+        assert!(snapshot.has_unavailable_facts());
         assert_eq!(snapshot.fallback_completion_facts().len(), 1);
         let candidates = CandidateQueryService::new(None, &snapshot, "fallback.h", None, None)
             .callable_candidates("api", None)

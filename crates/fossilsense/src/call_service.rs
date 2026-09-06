@@ -719,7 +719,7 @@ fn append_anchors_bounded(
 fn overlays_incomplete(overlays: &[FileCallOverlay], semantic_family: SemanticFamily) -> bool {
     overlays
         .iter()
-        .any(|overlay| overlay.semantic_family == semantic_family && !overlay.facts_complete)
+        .any(|overlay| overlay.semantic_family == semantic_family && !overlay.facts_available)
 }
 
 fn overlay_for<'a>(overlays: &'a [FileCallOverlay], path: &str) -> Option<&'a FileCallOverlay> {

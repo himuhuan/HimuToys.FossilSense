@@ -250,13 +250,23 @@ pub struct SharedCandidateCoverage {
     pub scope_open: bool,
     pub facts_incomplete: bool,
     pub generation_mismatch: bool,
+    pub declaration_state: crate::semantic_model::FactCoverage,
+    pub declaration_reasons: u8,
 }
 
 impl SharedCandidateCoverage {
+    pub fn declaration_reason_labels(&self) -> Vec<&'static str> {
+        crate::semantic_model::CoverageReason::ALL
+            .into_iter()
+            .filter(|reason| self.declaration_reasons & (1 << *reason as u8) != 0)
+            .map(crate::semantic_model::CoverageReason::as_str)
+            .collect()
+    }
     #[allow(dead_code)]
     pub fn complete(scanned: usize) -> Self {
         Self {
             scanned,
+            declaration_state: crate::semantic_model::FactCoverage::Complete,
             ..Self::default()
         }
     }

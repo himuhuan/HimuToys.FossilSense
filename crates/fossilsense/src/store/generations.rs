@@ -589,6 +589,15 @@ impl IndexStore {
                 [],
             )?;
 
+            // Bulk cleanup temporarily disables foreign keys; mirror the
+            // revision cascade for bounded declaration-coverage details too.
+            tx.execute(
+                "DELETE FROM declaration_coverage_gaps WHERE revision_id IN (
+                SELECT revision_id FROM cleanup_obsolete_revisions
+            )",
+                [],
+            )?;
+
             for table in [
                 "fallback_completion_facts",
                 "declaration_facts",

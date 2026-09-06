@@ -4,6 +4,7 @@ use crate::includes::ResolutionKind;
 use crate::reachability::OpenReason;
 
 mod call_facts;
+mod coverage;
 mod declarations;
 mod go_package_graph;
 mod member;
@@ -12,6 +13,8 @@ mod protobuf_c;
 
 #[allow(unused_imports)]
 pub use call_facts::{CallCoverageRow, CallFactStoreView, CallSiteRow, CallableAnchorRow};
+#[allow(unused_imports)]
+pub use coverage::{DeclarationCoverageStoreView, FileCoverageReadRow};
 #[allow(unused_imports)]
 pub use declarations::{
     DeclarationNameRef, DeclarationNameRow, DeclarationReadRow, DeclarationStoreView,

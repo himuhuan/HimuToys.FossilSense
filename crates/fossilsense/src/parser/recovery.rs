@@ -36,7 +36,7 @@ pub enum RecoveryFailureReason {
 }
 
 impl RecoveryFailureReason {
-    fn is_budget(self) -> bool {
+    pub(super) fn is_budget(self) -> bool {
         matches!(
             self,
             Self::EditBudgetExceeded
@@ -266,6 +266,13 @@ impl<'source> RecoverySession<'source> {
 
     pub(super) fn applied_edits(&self) -> &[ProposedEdit] {
         &self.applied
+    }
+
+    pub(super) fn lexical_map(&self) -> &LexicalMap {
+        &self.lexical
+    }
+    pub(super) fn diagnostics(&self) -> &[RecoveryDiagnostic] {
+        &self.diagnostics
     }
 
     #[cfg(test)]

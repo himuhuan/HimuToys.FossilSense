@@ -17,6 +17,21 @@ pub(super) struct PossibleTargetsResponse {
     name: String,
     items: Vec<PossibleTargetItem>,
     coverage: PossibleTargetsCoverage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_file_coverage: Option<CurrentFileCoverage>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CurrentFileCoverage {
+    source: &'static str,
+    document_version: i32,
+    content_hash: String,
+    summary: crate::semantic_model::DeclarationCoverageSummary,
+    gaps: Vec<crate::semantic_model::CoverageGap>,
+    uncovered_ratio: Option<f64>,
+    declaration_state: crate::semantic_model::FactCoverage,
+    truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -55,6 +70,8 @@ struct PossibleTargetsCoverage {
     open: bool,
     open_reason: Option<String>,
     incomplete_reason: Option<String>,
+    declaration_state: crate::semantic_model::FactCoverage,
+    declaration_reasons: Vec<String>,
     /// Set-level uncertainty verdict of the shared candidate set
     /// (`exact` / `preferred` / `ambiguous` / `fallback`).
     disposition: String,
@@ -78,7 +95,7 @@ impl Backend {
             .capture_request_snapshot(Some(&uri))
             .await;
         let overlay_epoch = documents.overlay_epoch;
-        let (_version, text) = self
+        let (version, text) = self
             .document_snapshot_from_request(&uri, &documents)
             .await?;
         let line_text = text.lines().nth(line as usize).unwrap_or_default();
@@ -193,6 +210,32 @@ impl Backend {
             )
             .await;
 
+        let include_coverage_details = arg
+            .get("includeCoverageDetails")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let coverage_parse = if include_coverage_details {
+            match current_abs.as_deref() {
+                Some(path) => {
+                    self.get_or_parse_document_with_selection(
+                        &uri,
+                        path,
+                        version,
+                        &text,
+                        parser::ParseFacts::HOVER_SEMANTICS,
+                        context
+                            .engine
+                            .workspace_semantics
+                            .selection_for_uri(&uri, &text),
+                    )
+                    .await
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+
         let result = tokio::task::spawn_blocking(move || -> Result<PossibleTargetsResponse> {
             let service = CandidateQueryService::new_with_declarations_for_family(
                 call_read_handle.as_deref(),
@@ -212,6 +255,57 @@ impl Backend {
                     crate::candidate_service::SemanticIntent::Neutral
                 },
             )?;
+            let current_file_coverage = if include_coverage_details {
+                let hash = blake3::hash(text.as_bytes()).to_hex().to_string();
+                let saved = match call_read_handle.as_deref() {
+                    Some(handle) => handle.read(|store| {
+                        let Some(row) = store.coverage_view().for_path(&current_path)? else {
+                            return Ok(None);
+                        };
+                        if row.content_hash != hash || overlay.shadows(&current_path) {
+                            return Ok(None);
+                        }
+                        let (gaps, truncated) = store
+                            .coverage_view()
+                            .gaps_for_revision(row.revision_id, 64)?;
+                        Ok(Some(CurrentFileCoverage {
+                            source: "indexed",
+                            document_version: version,
+                            content_hash: hash.clone(),
+                            summary: row.summary,
+                            uncovered_ratio: row.summary.uncovered_ratio(),
+                            declaration_state: row
+                                .summary
+                                .fact_coverage(parser::FactGroup::Declarations),
+                            gaps,
+                            truncated: truncated || row.summary.truncated,
+                        }))
+                    })?,
+                    None => None,
+                };
+                saved.or_else(|| {
+                    coverage_parse.as_ref().map(|parsed| CurrentFileCoverage {
+                        source: "current_document",
+                        document_version: version,
+                        content_hash: hash,
+                        summary: parsed.diagnostics.coverage.summary,
+                        uncovered_ratio: parsed.diagnostics.coverage.summary.uncovered_ratio(),
+                        declaration_state: parsed.fact_coverage(parser::FactGroup::Declarations),
+                        gaps: parsed
+                            .diagnostics
+                            .coverage
+                            .gaps
+                            .iter()
+                            .take(64)
+                            .cloned()
+                            .collect(),
+                        truncated: parsed.diagnostics.coverage.summary.truncated
+                            || parsed.diagnostics.coverage.gaps.len() > 64,
+                    })
+                })
+            } else {
+                None
+            };
             let allowed = crate::candidate_service::focused_callable_fingerprints(&semantic_set);
             if !allowed.is_empty() {
                 let callable_set = service.callable_candidates(&word, call_context)?;
@@ -244,6 +338,7 @@ impl Backend {
                     name: word,
                     items,
                     coverage,
+                    current_file_coverage,
                 });
             }
 
@@ -265,6 +360,7 @@ impl Backend {
                 name: word,
                 items,
                 coverage,
+                current_file_coverage,
             })
         })
         .await;
@@ -322,12 +418,15 @@ fn proven_local_response(
             open: false,
             open_reason: None,
             incomplete_reason: None,
+            declaration_state: crate::semantic_model::FactCoverage::Complete,
+            declaration_reasons: Vec::new(),
             disposition: crate::model::CandidateDisposition::Exact.as_str().into(),
             alternative_count: 0,
             semantic_generation,
             overlay_epoch,
             resolver_version: query::CALLABLE_CANDIDATE_RESOLVER_VERSION,
         },
+        current_file_coverage: None,
     }
 }
 
@@ -479,6 +578,13 @@ fn semantic_coverage(
             .coverage
             .facts_incomplete
             .then(|| "facts_unavailable".into()),
+        declaration_state: set.coverage.declaration_state,
+        declaration_reasons: set
+            .coverage
+            .declaration_reason_labels()
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
         disposition: set.disposition.as_str().into(),
         alternative_count: set.alternative_count,
         semantic_generation,
