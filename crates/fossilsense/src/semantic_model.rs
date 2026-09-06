@@ -9,7 +9,7 @@ use crate::call_model::SourceRange;
 /// This is deliberately independent from the SQLite schema version: changing
 /// how a fact is derived must invalidate persisted rows even when their SQL
 /// column layout happens to stay compatible.
-pub const PARSER_FACT_VERSION: i64 = 15;
+pub const PARSER_FACT_VERSION: i64 = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -117,6 +117,30 @@ pub enum LanguageFidelity {
     Inferred,
     Heuristic,
     Unknown,
+}
+
+pub const LANGUAGE_SELECTION_RULE_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LanguageSourceKind {
+    ExplicitApi,
+    ExplicitOverride,
+    KnownGenerated,
+    ExtensionDefault,
+}
+
+/// Compact file-revision provenance. This describes the grammar input, not
+/// proof that a declaration is complete or a unique semantic binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LanguageEvidence {
+    pub source_kind: LanguageSourceKind,
+    pub fidelity: LanguageFidelity,
+    pub ambiguous: bool,
+    pub rule_version: u32,
+    pub configuration_key: u64,
+    pub probe_limit_reached: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -431,6 +455,7 @@ pub struct Occurrence {
 #[allow(dead_code)]
 pub struct PersistentFacts<'a> {
     pub language: SemanticLanguage,
+    pub language_evidence: LanguageEvidence,
     pub parse_outcome: ParseOutcome,
     pub includes: &'a [Include],
     pub package: Option<&'a PackageFact>,

@@ -264,10 +264,12 @@ impl Backend {
                         {
                             continue;
                         }
-                        let parsed = crate::parser::parse_with_language(
+                        let selection =
+                            language_resolver.selection_for_source(&owner_language_path, &source);
+                        let parsed = crate::parser::parse_thread_local_with_selection(
                             Path::new(&owner_path),
                             &source,
-                            owner_language,
+                            selection,
                             crate::parser::ParseFacts::ALL,
                         );
                         let member = parsed.members.iter().find(|member| {

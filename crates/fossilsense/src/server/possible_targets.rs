@@ -97,7 +97,11 @@ impl Backend {
             .and_then(|path| pathing::relative_slash_path(&root, path).ok())
             .unwrap_or_default();
         let context = self.request_context_for_root(root.clone()).await;
-        let source_language = context.engine.workspace_semantics.language_for_uri(&uri);
+        let source_language = context
+            .engine
+            .workspace_semantics
+            .selection_for_uri(&uri, &text)
+            .language;
         let semantic_family = source_language.semantic_family();
         let semantic_generation = context.engine.semantic_generation.0;
         let cursor = crate::call_model::SourcePosition { line, character };

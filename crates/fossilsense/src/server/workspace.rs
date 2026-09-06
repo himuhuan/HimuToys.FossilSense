@@ -14,7 +14,7 @@ use crate::call_model::SemanticGeneration;
 use crate::candidate_service::IncludePathIndex;
 use crate::candidate_service::{CandidateOverlaySnapshot, RecallUniverseId};
 use crate::completion_words;
-use crate::config::SourceLanguage;
+use crate::config::LanguageSelection;
 use crate::parser::{FileSemanticIndex, ParseFacts};
 use crate::pathing;
 #[cfg(test)]
@@ -36,7 +36,7 @@ pub(super) use models::{
 pub(super) use session::WorkspaceSession;
 
 type LiveParseCache =
-    Arc<RwLock<HashMap<Url, (i32, SourceLanguage, ParseFacts, Arc<FileSemanticIndex>)>>>;
+    Arc<RwLock<HashMap<Url, (i32, LanguageSelection, ParseFacts, Arc<FileSemanticIndex>)>>>;
 type ExternalOverlayParseCache =
     Arc<Mutex<HashMap<ExternalOverlayParseKey, Arc<FileSemanticIndex>>>>;
 type LiveParseGates = Arc<Mutex<HashMap<Url, Arc<Mutex<()>>>>>;
@@ -57,7 +57,7 @@ pub(super) struct CompletionOverlayPublication {
 struct ExternalOverlayParseKey {
     uri: Url,
     version: i32,
-    language: SourceLanguage,
+    language: LanguageSelection,
     identity_path: String,
 }
 
@@ -404,7 +404,7 @@ impl DocumentStore {
         &self,
         uri: &Url,
         version: i32,
-        language: SourceLanguage,
+        language: LanguageSelection,
         facts: ParseFacts,
     ) -> Option<Arc<FileSemanticIndex>> {
         let cache = self.live_parse_cache.read().await;
@@ -422,7 +422,7 @@ impl DocumentStore {
         &self,
         uri: &Url,
         version: i32,
-        language: SourceLanguage,
+        language: LanguageSelection,
         identity_path: &str,
     ) -> Option<Arc<FileSemanticIndex>> {
         self.external_overlay_parse_cache
@@ -441,7 +441,7 @@ impl DocumentStore {
         &self,
         uri: &Url,
         version: i32,
-        language: SourceLanguage,
+        language: LanguageSelection,
     ) -> ParseFacts {
         self.live_parse_cache
             .read()
@@ -479,7 +479,7 @@ impl DocumentStore {
         &self,
         uri: Url,
         version: i32,
-        language: SourceLanguage,
+        language: LanguageSelection,
         facts: ParseFacts,
         parsed: Arc<FileSemanticIndex>,
     ) {
@@ -503,7 +503,7 @@ impl DocumentStore {
         &self,
         uri: Url,
         version: i32,
-        language: SourceLanguage,
+        language: LanguageSelection,
         identity_path: String,
         parsed: Arc<FileSemanticIndex>,
     ) {
@@ -583,11 +583,15 @@ impl DocumentStore {
         version: i32,
         parsed: Arc<FileSemanticIndex>,
     ) {
-        let language = uri
+        let source_language = uri
             .to_file_path()
             .ok()
-            .map(|path| SourceLanguage::default_for_path(&path))
-            .unwrap_or(SourceLanguage::C);
+            .map(|path| crate::config::SourceLanguage::default_for_path(&path))
+            .unwrap_or(crate::config::SourceLanguage::C);
+        let language = LanguageSelection {
+            language: source_language,
+            evidence: parsed.language_evidence,
+        };
         self.store_live_parse(uri, version, language, ParseFacts::ALL, parsed)
             .await;
     }

@@ -1,3 +1,4 @@
+mod c_lexical;
 mod call_catalog;
 mod call_model;
 mod call_service;

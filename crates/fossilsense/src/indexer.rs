@@ -318,14 +318,14 @@ pub fn index_workspace(
         let unchanged = stored_files
             .get(&candidate.fingerprint.path)
             .is_some_and(|stored| {
-                let expected_language = language_resolver
-                    .language_for_path(&candidate.absolute_path)
-                    .semantic_language();
                 candidate.fingerprint.mtime_ns != 0
                     && stored.size == candidate.fingerprint.size
                     && stored.mtime_ns == candidate.fingerprint.mtime_ns
-                    && stored.language_code
-                        == crate::store::semantic_language_storage_code(expected_language)
+                    && stored.language_evidence.is_some_and(|evidence| {
+                        evidence.configuration_key == language_resolver.configuration_key()
+                            && evidence.rule_version
+                                == crate::semantic_model::LANGUAGE_SELECTION_RULE_VERSION
+                    })
             });
 
         if unchanged && !options.force {

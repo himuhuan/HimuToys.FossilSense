@@ -3326,7 +3326,7 @@ int caller(void) { return helper(7); }
     );
     assert_eq!(
         helper_fact.identity.language_fidelity,
-        crate::semantic_model::LanguageFidelity::Explicit
+        crate::semantic_model::LanguageFidelity::Inferred
     );
     assert_eq!(
         helper_fact.identity.provenance,

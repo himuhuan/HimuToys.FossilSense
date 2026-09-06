@@ -5,7 +5,10 @@ use serde::Deserialize;
 use serde_json::Value;
 
 pub use crate::semantic_model::SemanticFamily;
-use crate::semantic_model::SemanticLanguage;
+use crate::semantic_model::{
+    LanguageEvidence, LanguageFidelity, LanguageSourceKind, SemanticLanguage,
+    LANGUAGE_SELECTION_RULE_VERSION,
+};
 
 mod matching;
 use matching::{language_override_glob_matches, path_matches_glob_entry};
@@ -150,14 +153,104 @@ pub struct LanguageOverride {
 pub struct LanguageResolver {
     workspace_root: Option<PathBuf>,
     overrides: Vec<LanguageOverride>,
+    configuration_key: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LanguageSelection {
+    pub language: SourceLanguage,
+    pub evidence: LanguageEvidence,
+}
+
+impl LanguageSelection {
+    pub fn semantic_family(self) -> SemanticFamily {
+        self.language.semantic_family()
+    }
+    pub fn explicit(language: SourceLanguage) -> Self {
+        Self {
+            language,
+            evidence: LanguageEvidence {
+                source_kind: LanguageSourceKind::ExplicitApi,
+                fidelity: LanguageFidelity::Explicit,
+                ambiguous: false,
+                rule_version: LANGUAGE_SELECTION_RULE_VERSION,
+                configuration_key: 0,
+                probe_limit_reached: false,
+            },
+        }
+    }
+
+    pub fn default_for_source(path: &Path, source: &str) -> Self {
+        LanguageResolver::new(None, Vec::new()).selection_for_source(path, source)
+    }
+}
+
+impl From<SourceLanguage> for LanguageSelection {
+    fn from(language: SourceLanguage) -> Self {
+        Self::explicit(language)
+    }
 }
 
 impl LanguageResolver {
     pub fn new(workspace_root: Option<&Path>, overrides: Vec<LanguageOverride>) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&LANGUAGE_SELECTION_RULE_VERSION.to_le_bytes());
+        for rule in &overrides {
+            hasher.update(&(rule.glob.len() as u64).to_le_bytes());
+            hasher.update(rule.glob.as_bytes());
+            hasher.update(rule.language.backend().config_name.as_bytes());
+        }
+        let configuration_key =
+            u64::from_le_bytes(hasher.finalize().as_bytes()[..8].try_into().unwrap());
         Self {
             workspace_root: workspace_root.map(Path::to_path_buf),
             overrides,
+            configuration_key,
         }
+    }
+
+    pub fn configuration_key(&self) -> u64 {
+        self.configuration_key
+    }
+
+    pub fn selection_for_source(&self, path: &Path, source: &str) -> LanguageSelection {
+        let mut selection = LanguageSelection::explicit(self.language_for_path(path));
+        selection.evidence.configuration_key = self.configuration_key;
+        if self.overridden_language_for_path(path).is_some() {
+            selection.evidence.source_kind = LanguageSourceKind::ExplicitOverride;
+            return selection;
+        }
+        selection.evidence.source_kind = LanguageSourceKind::ExtensionDefault;
+        let extension = normalized_extension(path).unwrap_or_default();
+        selection.evidence.ambiguous =
+            extension.eq_ignore_ascii_case("h") || extension.eq_ignore_ascii_case("inl");
+        selection.evidence.fidelity = if selection.evidence.ambiguous {
+            LanguageFidelity::Heuristic
+        } else {
+            LanguageFidelity::Inferred
+        };
+        if path
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .ends_with(".pb-c.h")
+        {
+            const PROBE_BYTES: usize = 64 * 1024;
+            let mut end = source.len().min(PROBE_BYTES);
+            while !source.is_char_boundary(end) {
+                end -= 1;
+            }
+            selection.evidence.probe_limit_reached = source.len() > end;
+            if crate::c_lexical::LexicalMap::new(&source[..end], true)
+                .contains_identifier(source, "PROTOBUF_C__BEGIN_DECLS")
+            {
+                selection.language = SourceLanguage::C;
+                selection.evidence.source_kind = LanguageSourceKind::KnownGenerated;
+                selection.evidence.fidelity = LanguageFidelity::Inferred;
+                selection.evidence.ambiguous = false;
+                selection.evidence.probe_limit_reached = false;
+            }
+        }
+        selection
     }
 
     pub fn from_workspace_config(workspace_root: &Path, config: &WorkspaceConfig) -> Self {

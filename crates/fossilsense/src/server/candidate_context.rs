@@ -61,7 +61,7 @@ impl Backend {
                 let is_current = uri == current_uri;
                 let is_external = !pathing::path_is_within(&root_for_paths, &path);
                 let overlay_targets = if !is_external {
-                    let language = language_resolver.language_for_path(&path);
+                    let language = language_resolver.selection_for_source(&path, &snapshot.text);
                     pathing::relative_slash_path(&root_for_paths, &path)
                         .ok()
                         .map(|path| vec![(path, Some(language))])
@@ -73,8 +73,10 @@ impl Backend {
                                 .identities
                                 .into_iter()
                                 .filter_map(|identity| {
-                                    let language = language_resolver
-                                        .language_for_path(Path::new(&identity.identity_path));
+                                    let language = language_resolver.selection_for_source(
+                                        Path::new(&identity.identity_path),
+                                        &snapshot.text,
+                                    );
                                     (!identity.go_only
                                         || language.semantic_family()
                                             == crate::semantic_model::SemanticFamily::Go)
@@ -109,7 +111,7 @@ impl Backend {
                 };
                 let language = language.expect("workspace overlay language");
                 let parsed = self
-                    .get_or_parse_document_with_language(
+                    .get_or_parse_document_with_selection(
                         &uri,
                         &path,
                         snapshot.version,
@@ -373,7 +375,7 @@ impl Backend {
                 };
                 let is_external = !pathing::path_is_within(&root_for_paths, &path);
                 let overlay_targets = if !is_external {
-                    let language = language_resolver.language_for_path(&path);
+                    let language = language_resolver.selection_for_source(&path, &snapshot.text);
                     pathing::relative_slash_path(&root_for_paths, &path)
                         .ok()
                         .map(|path| vec![(path, Some(language))])
@@ -385,8 +387,10 @@ impl Backend {
                                 .identities
                                 .into_iter()
                                 .filter_map(|identity| {
-                                    let language = language_resolver
-                                        .language_for_path(Path::new(&identity.identity_path));
+                                    let language = language_resolver.selection_for_source(
+                                        Path::new(&identity.identity_path),
+                                        &snapshot.text,
+                                    );
                                     (!identity.go_only
                                         || language.semantic_family()
                                             == crate::semantic_model::SemanticFamily::Go)
@@ -414,7 +418,7 @@ impl Backend {
                 };
                 let language = language.expect("workspace overlay language");
                 let parsed = self
-                    .get_or_parse_document_with_language(
+                    .get_or_parse_document_with_selection(
                         &uri,
                         &path,
                         snapshot.version,

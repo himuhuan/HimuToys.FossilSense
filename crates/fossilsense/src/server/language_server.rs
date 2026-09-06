@@ -336,14 +336,19 @@ impl LanguageServer for Backend {
         let source_language = self
             .request_context_for_uri(&uri)
             .await
-            .map(|context| context.engine.workspace_semantics.language_for_uri(&uri))
-            .unwrap_or_else(|| SourceLanguage::default_for_path(&path));
+            .map(|context| {
+                context
+                    .engine
+                    .workspace_semantics
+                    .selection_for_uri(&uri, &text)
+            })
+            .unwrap_or_else(|| crate::config::LanguageSelection::default_for_source(&path, &text));
 
         let started = tokio::time::Instant::now();
         // Live parse served from the in-memory cache (one parse per document
         // version, shared across semantic tokens, completion, and symbols).
         let index = self
-            .get_or_parse_document_with_language(
+            .get_or_parse_document_with_selection(
                 &uri,
                 &path,
                 version,
@@ -420,11 +425,19 @@ impl LanguageServer for Backend {
             Some(root) => Some(self.request_context_for_root(root.clone()).await),
             None => None,
         };
-        let source_language = primary_context
+        let source_selection = primary_context
             .as_ref()
-            .map(|context| context.engine.workspace_semantics.language_for_uri(&uri))
-            .unwrap_or_else(|| SourceLanguage::default_for_path(Path::new(uri.path())));
+            .map(|context| {
+                context
+                    .engine
+                    .workspace_semantics
+                    .selection_for_uri(&uri, &text)
+            })
+            .unwrap_or_else(|| {
+                crate::config::LanguageSelection::default_for_source(Path::new(uri.path()), &text)
+            });
 
+        let source_language = source_selection.language;
         if source_language == SourceLanguage::Go {
             if let Some(import_context) = go_import_completion::go_import_completion_context(
                 &text,
@@ -505,13 +518,13 @@ impl LanguageServer for Backend {
         let parse_started = tokio::time::Instant::now();
         let parsed_document = match uri_to_path(&uri) {
             Some(path) => {
-                self.get_or_parse_document_with_language(
+                self.get_or_parse_document_with_selection(
                     &uri,
                     &path,
                     version,
                     &text,
                     parser::ParseFacts::COMPLETION,
-                    source_language,
+                    source_selection,
                 )
                 .await
             }

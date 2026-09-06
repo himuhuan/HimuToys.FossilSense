@@ -27,7 +27,7 @@ use grep_searcher::sinks::Lossy;
 use grep_searcher::SearcherBuilder;
 use rayon::prelude::*;
 
-use crate::config::{LanguageResolver, SourceLanguage, WorkspaceConfig};
+use crate::config::{LanguageResolver, WorkspaceConfig};
 use crate::parser::{self, SyntacticRole};
 use crate::pathing;
 use crate::semantic_model::SemanticFamily;
@@ -475,12 +475,8 @@ fn search_references_inner_borrowed(
                 let mut occurrence_count = 0usize;
                 if !file_hits.is_empty() {
                     let classify_started = Instant::now();
-                    occurrence_count = classify_file_hits(
-                        path,
-                        language_resolver.language_for_path(path),
-                        &mut file_hits,
-                        cache,
-                    );
+                    occurrence_count =
+                        classify_file_hits(path, language_resolver, &mut file_hits, cache);
                     classify_elapsed = classify_started.elapsed();
                 }
 
@@ -603,11 +599,11 @@ fn search_references_with_shared_files_filtered(
 /// classification failure — useful for profiling per-file occurrence cost.
 fn classify_file_hits(
     abs_path: &Path,
-    language: SourceLanguage,
+    language_resolver: &LanguageResolver,
     file_hits: &mut [ReferenceHit],
     cache: Option<&ReferenceRoleCache>,
 ) -> usize {
-    let Some(roles) = position_roles(abs_path, language, cache) else {
+    let Some(roles) = position_roles(abs_path, language_resolver, cache) else {
         return 0;
     };
     let count = roles.len();
@@ -623,11 +619,19 @@ fn classify_file_hits(
 /// when the file fingerprint is unchanged, otherwise parsed and cached.
 fn position_roles(
     abs_path: &Path,
-    language: SourceLanguage,
+    language_resolver: &LanguageResolver,
     cache: Option<&ReferenceRoleCache>,
 ) -> Option<Arc<HashMap<(u32, u32), SyntacticRole>>> {
     let fingerprint = file_fingerprint(abs_path)?;
-    let key = format!("{}#{language:?}", abs_path.to_string_lossy());
+    // The same bytes may select C through generated-file evidence or C++
+    // through an explicit override. Keep both the captured rule set and its
+    // path match in the key; roots can share the cache with different matches.
+    let key = format!(
+        "{}#{}#{:?}",
+        abs_path.to_string_lossy(),
+        language_resolver.configuration_key(),
+        language_resolver.overridden_language_for_path(abs_path)
+    );
 
     if let Some(cache) = cache {
         if let Some(roles) = cache.get(&key, fingerprint) {
@@ -636,11 +640,11 @@ fn position_roles(
     }
 
     let source = std::fs::read_to_string(abs_path).ok()?;
-    let parsed = parser::parse_with_handle_and_language(
+    let selection = language_resolver.selection_for_source(abs_path, &source);
+    let parsed = parser::parse_thread_local_with_selection(
         abs_path,
         &source,
-        language,
-        None,
+        selection,
         parser::ParseFacts::COLOR_REF,
     );
     let request_facts = parsed.request_facts();

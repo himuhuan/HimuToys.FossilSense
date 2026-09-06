@@ -1621,6 +1621,17 @@ async fn published_language_snapshot_controls_tokens_and_symbols_during_config_r
     let (dir, service, uri, _line, _character) =
         indexed_backend_with_open_doc(&[("fossilsense.json", config)], "legacy/api.h", source)
             .await;
+    let published_selection = service
+        .inner()
+        .request_context_for_root(dir.path().to_path_buf())
+        .await
+        .engine
+        .workspace_semantics
+        .selection_for_uri(&uri, source);
+    assert_eq!(
+        published_selection.language,
+        crate::config::SourceLanguage::Go
+    );
     std::fs::write(dir.path().join("fossilsense.json"), "{}").expect("generation N+1 config");
     service.inner().config_cache.lock().await.remove(dir.path());
     service
@@ -1642,7 +1653,7 @@ async fn published_language_snapshot_controls_tokens_and_symbols_during_config_r
         .cached_live_parse(
             &uri,
             1,
-            crate::config::SourceLanguage::Go,
+            published_selection,
             crate::parser::ParseFacts::COLOR_LIVE,
         )
         .await
@@ -2920,7 +2931,10 @@ async fn hover_agrees_with_navigation_on_local_bindings() {
         .cached_live_parse(
             &uri,
             1,
-            crate::config::SourceLanguage::C,
+            service
+                .inner()
+                .source_selection_for_path(&uri.to_file_path().unwrap(), "")
+                .await,
             crate::parser::ParseFacts::LOCAL_DECLS,
         )
         .await
@@ -2938,7 +2952,10 @@ async fn hover_agrees_with_navigation_on_local_bindings() {
         .cached_live_parse(
             &uri,
             1,
-            crate::config::SourceLanguage::C,
+            service
+                .inner()
+                .source_selection_for_path(&uri.to_file_path().unwrap(), "")
+                .await,
             crate::parser::ParseFacts::LOCAL_DECLS,
         )
         .await
@@ -3760,7 +3777,7 @@ async fn stale_document_work_cannot_overwrite_latest_revision_caches() {
             .cached_live_parse(
                 &uri,
                 2,
-                crate::config::SourceLanguage::C,
+                crate::config::LanguageSelection::default_for_source(&path, "int new_word;\n"),
                 crate::parser::ParseFacts::ALL,
             )
             .await
@@ -4845,6 +4862,160 @@ async fn language_override_watch_reparses_unchanged_open_document_and_overlay() 
     assert_eq!(
         second_overlay.semantic_family_for_path("legacy/api.h"),
         Some(crate::semantic_model::SemanticFamily::Go)
+    );
+}
+
+#[tokio::test]
+async fn language_evidence_server_generated_header_uses_source_and_same_configuration() {
+    let service = test_backend_service();
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let path = root.join("sensor.pb-c.h");
+    let uri = Url::from_file_path(&path).unwrap();
+    let source = "PROTOBUF_C__BEGIN_DECLS\ntypedef struct Sensor Sensor;\nPROTOBUF_C__END_DECLS\n";
+    *service.inner().workspace_roots.lock().await = vec![root.clone()];
+    open_test_document(&service, uri.clone(), 1, source.into()).await;
+    let first = service
+        .inner()
+        .get_or_parse_document(
+            &uri,
+            &path,
+            1,
+            source,
+            crate::parser::ParseFacts::HOVER_SEMANTICS,
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.language, crate::semantic_model::SemanticLanguage::C);
+    assert_eq!(
+        first.language_evidence.source_kind,
+        crate::semantic_model::LanguageSourceKind::KnownGenerated
+    );
+    assert!(first.declarations.iter().any(|fact| fact.name == "Sensor"));
+    fs::write(
+        root.join("fossilsense.json"),
+        r#"{"languageOverrides":[{"glob":"*.h","language":"cpp"}]}"#,
+    )
+    .unwrap();
+    service
+        .inner()
+        .did_change_watched_files(DidChangeWatchedFilesParams {
+            changes: vec![FileEvent {
+                uri: Url::from_file_path(root.join("fossilsense.json")).unwrap(),
+                typ: FileChangeType::CHANGED,
+            }],
+        })
+        .await;
+    let second = service
+        .inner()
+        .get_or_parse_document(
+            &uri,
+            &path,
+            1,
+            source,
+            crate::parser::ParseFacts::HOVER_SEMANTICS,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        second.language,
+        crate::semantic_model::SemanticLanguage::Cpp
+    );
+    assert_eq!(
+        second.language_evidence.source_kind,
+        crate::semantic_model::LanguageSourceKind::ExplicitOverride
+    );
+    assert!(!Arc::ptr_eq(&first, &second));
+}
+
+#[tokio::test]
+async fn language_evidence_live_cache_separates_captured_configs_with_same_grammar() {
+    let service = test_backend_service();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("shared.h");
+    let uri = Url::from_file_path(&path).unwrap();
+    let source = "int visible;";
+    open_test_document(&service, uri.clone(), 1, source.into()).await;
+    let default = crate::config::LanguageSelection::default_for_source(&path, source);
+    let explicit = crate::config::LanguageResolver::new(
+        Some(dir.path()),
+        vec![crate::config::LanguageOverride {
+            glob: "*.h".into(),
+            language: crate::config::SourceLanguage::Cpp,
+        }],
+    )
+    .selection_for_source(&path, source);
+    let a = service
+        .inner()
+        .get_or_parse_document_with_selection(
+            &uri,
+            &path,
+            1,
+            source,
+            crate::parser::ParseFacts::ALL,
+            default,
+        )
+        .await
+        .unwrap();
+    let b = service
+        .inner()
+        .get_or_parse_document_with_selection(
+            &uri,
+            &path,
+            1,
+            source,
+            crate::parser::ParseFacts::ALL,
+            explicit,
+        )
+        .await
+        .unwrap();
+    assert!(!Arc::ptr_eq(&a, &b));
+    assert_eq!(a.language_evidence, default.evidence);
+    assert_eq!(b.language_evidence, explicit.evidence);
+    let c = service
+        .inner()
+        .get_or_parse_document_with_selection(
+            &uri,
+            &path,
+            1,
+            source,
+            crate::parser::ParseFacts::ALL,
+            default,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        c.language_evidence, default.evidence,
+        "an older captured request keeps its own configuration"
+    );
+}
+
+#[tokio::test]
+async fn language_evidence_grouped_references_matches_generated_header_index() {
+    let source =
+        "PROTOBUF_C__BEGIN_DECLS\ntypedef struct Sensor/*cursor*/ Sensor;\nPROTOBUF_C__END_DECLS\n";
+    let (_dir, service, uri, line, character) =
+        indexed_backend_with_open_doc(&[], "sensor.pb-c.h", source).await;
+    let grouped = service
+        .inner()
+        .execute_command(ExecuteCommandParams {
+            command: super::GROUPED_REFERENCES_LSP_COMMAND.into(),
+            arguments: vec![serde_json::json!({"uri": uri, "line": line, "character": character})],
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    let roles: Vec<_> = grouped
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hit| hit["role"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        roles,
+        vec!["type", "type"],
+        "references must use the same C recovery as indexing"
     );
 }
 

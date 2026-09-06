@@ -216,6 +216,17 @@ impl PublishedWorkspaceSemantics {
             .unwrap_or_else(|| SourceLanguage::default_for_path(Path::new(uri.path())))
     }
 
+    pub(in crate::server) fn selection_for_uri(
+        &self,
+        uri: &Url,
+        source: &str,
+    ) -> crate::config::LanguageSelection {
+        let path = uri_to_path(uri).unwrap_or_else(|| PathBuf::from(uri.path()));
+        let identity = self.external_roots.language_identity_for_path(&path);
+        self.language
+            .selection_for_source(identity.as_deref().unwrap_or(&path), source)
+    }
+
     pub(in crate::server) fn protobuf_c_enabled(&self) -> bool {
         self.index_configuration.protobuf_c_enabled
     }
@@ -737,7 +748,11 @@ impl Backend {
     }
 
     #[cfg(test)]
-    pub(in crate::server) async fn source_language_for_path(&self, path: &Path) -> SourceLanguage {
+    pub(in crate::server) async fn source_selection_for_path(
+        &self,
+        path: &Path,
+        source: &str,
+    ) -> crate::config::LanguageSelection {
         let roots = self.workspace_roots.lock().await.clone();
         let containing = roots
             .iter()
@@ -749,20 +764,30 @@ impl Backend {
                 .workspace_root_config(&root)
                 .await
                 .language
-                .language_for_path(path);
+                .selection_for_source(path, source);
         }
 
         for root in roots {
-            if let Some(language) = self
+            if self
                 .workspace_root_config(&root)
                 .await
                 .language
                 .overridden_language_for_path(path)
+                .is_some()
             {
-                return language;
+                return self
+                    .workspace_root_config(&root)
+                    .await
+                    .language
+                    .selection_for_source(path, source);
             }
         }
-        SourceLanguage::default_for_path(path)
+        crate::config::LanguageSelection::default_for_source(path, source)
+    }
+
+    #[cfg(test)]
+    pub(in crate::server) async fn source_language_for_path(&self, path: &Path) -> SourceLanguage {
+        self.source_selection_for_path(path, "").await.language
     }
 
     #[cfg(test)]

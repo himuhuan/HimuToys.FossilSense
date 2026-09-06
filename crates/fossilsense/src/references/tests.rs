@@ -5,6 +5,34 @@ use tempfile::tempdir;
 use super::*;
 
 #[test]
+fn language_evidence_reference_role_cache_tracks_overrides_without_source_changes() {
+    let dir = tempdir().unwrap();
+    fs::write(
+        dir.path().join("sensor.pb-c.h"),
+        "PROTOBUF_C__BEGIN_DECLS\ntypedef struct Sensor Sensor;\nPROTOBUF_C__END_DECLS\n",
+    )
+    .unwrap();
+    let cache = ReferenceRoleCache::new();
+    for (configuration, expected) in [
+        ("{}", SyntacticRole::TypeUse),
+        (
+            r#"{"languageOverrides":[{"glob":"*.h","language":"cpp"}]}"#,
+            SyntacticRole::Read,
+        ),
+        ("{}", SyntacticRole::TypeUse),
+    ] {
+        fs::write(dir.path().join("fossilsense.json"), configuration).unwrap();
+        let (hits, truncated, _) = search_references_cached(dir.path(), "Sensor", &cache).unwrap();
+        assert!(!truncated);
+        assert_eq!(hits.len(), 2);
+        assert!(
+            hits.iter().all(|hit| hit.role == expected),
+            "{configuration}: {hits:?}"
+        );
+    }
+}
+
+#[test]
 fn word_boundary_excludes_substring() {
     let dir = tempdir().expect("tempdir");
     fs::write(dir.path().join("a.c"), "Page PageTable KePage\n").expect("write");

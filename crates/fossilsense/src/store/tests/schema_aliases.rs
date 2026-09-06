@@ -2,6 +2,70 @@ use super::*;
 use crate::semantic_model::{AliasTargetFidelity, DeclaratorShape, RecordRangeFidelity};
 
 #[test]
+fn language_evidence_is_revision_metadata_and_rolls_back_with_facts() {
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("index.sqlite");
+    let mut store = IndexStore::open(&db, dir.path()).unwrap();
+    upsert_source(&mut store, "source.c", "int original;\n");
+    let typed_before = store
+        .stored_file("source.c")
+        .unwrap()
+        .unwrap()
+        .language_evidence
+        .unwrap();
+    assert_eq!(
+        typed_before.source_kind,
+        crate::semantic_model::LanguageSourceKind::ExtensionDefault
+    );
+    assert_eq!(
+        typed_before.fidelity,
+        crate::semantic_model::LanguageFidelity::Inferred
+    );
+    let before: String = store.conn.query_row(
+        "SELECT language_evidence FROM file_revisions r JOIN active_file_revisions a ON r.id=a.revision_id",
+        [], |row| row.get(0)).expect("typed language evidence saved alongside revision");
+    store.conn.execute_batch("CREATE TRIGGER reject_new_declaration BEFORE INSERT ON declaration_facts BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
+    let parsed = parse(std::path::Path::new("source.c"), "int replacement;\n");
+    let fingerprint = FileFingerprint {
+        path: "source.c".into(),
+        extension: "c".into(),
+        size: 17,
+        mtime_ns: 2,
+        hash: "new".into(),
+    };
+    assert!(store.upsert_file_index(&fingerprint, &parsed).is_err());
+    drop(store);
+    let reader = IndexStore::open_readonly(&db).unwrap();
+    let after: String = reader.conn.query_row(
+        "SELECT language_evidence FROM file_revisions r JOIN active_file_revisions a ON r.id=a.revision_id",
+        [], |row| row.get(0)).unwrap();
+    assert_eq!(before, after);
+    assert_eq!(
+        reader
+            .stored_file("source.c")
+            .unwrap()
+            .unwrap()
+            .language_evidence,
+        Some(typed_before)
+    );
+    assert_eq!(
+        reader
+            .declaration_view()
+            .by_name_limited("original", 8)
+            .unwrap()
+            .0
+            .len(),
+        1
+    );
+    assert!(reader
+        .declaration_view()
+        .by_name_limited("replacement", 8)
+        .unwrap()
+        .0
+        .is_empty());
+}
+
+#[test]
 fn test_store_schema_v16() {
     let dir = tempdir().expect("tempdir");
     let db = dir.path().join("index.sqlite");

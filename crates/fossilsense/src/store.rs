@@ -61,6 +61,24 @@ pub struct StoredFile {
     pub mtime_ns: i64,
     pub hash: String,
     pub language_code: i64,
+    pub language_evidence: Option<crate::semantic_model::LanguageEvidence>,
+}
+
+fn read_language_evidence(
+    row: &rusqlite::Row<'_>,
+    column: usize,
+) -> rusqlite::Result<Option<crate::semantic_model::LanguageEvidence>> {
+    row.get::<_, Option<String>>(column)?
+        .map(|json| {
+            serde_json::from_str(&json).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    column,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })
+        })
+        .transpose()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -674,7 +692,7 @@ impl IndexStore {
     pub fn stored_file(&self, path: &str) -> Result<Option<StoredFile>> {
         self.conn
             .query_row(
-                "SELECT f.id, r.size, r.mtime_ns, r.hash, r.language FROM files f
+                "SELECT f.id, r.size, r.mtime_ns, r.hash, r.language, r.language_evidence FROM files f
                  JOIN active_file_revisions a ON a.file_id = f.id
                  JOIN file_revisions r ON r.id = a.revision_id
                  WHERE f.path = ?1",
@@ -686,6 +704,7 @@ impl IndexStore {
                         mtime_ns: row.get(2)?,
                         hash: row.get(3)?,
                         language_code: row.get(4)?,
+                        language_evidence: read_language_evidence(row, 5)?,
                     })
                 },
             )
@@ -702,7 +721,7 @@ impl IndexStore {
         for chunk in paths.chunks(400) {
             let placeholders = vec!["?"; chunk.len()].join(",");
             let sql = format!(
-                "SELECT f.path, f.id, r.size, r.mtime_ns, r.hash, r.language FROM files f
+                "SELECT f.path, f.id, r.size, r.mtime_ns, r.hash, r.language, r.language_evidence FROM files f
                  JOIN active_file_revisions a ON a.file_id = f.id
                  JOIN file_revisions r ON r.id = a.revision_id
                  WHERE f.path IN ({placeholders})"
@@ -719,6 +738,7 @@ impl IndexStore {
                             mtime_ns: row.get(3)?,
                             hash: row.get(4)?,
                             language_code: row.get(5)?,
+                            language_evidence: read_language_evidence(row, 6)?,
                         },
                     ))
                 },
@@ -1245,12 +1265,6 @@ fn ensure_sqlite_sidecars_absent(path: &Path) -> Result<()> {
         }
     }
     Ok(())
-}
-
-pub(crate) fn semantic_language_storage_code(
-    language: crate::semantic_model::SemanticLanguage,
-) -> i64 {
-    writes::semantic_language_code(language)
 }
 
 /// A schema can stay structurally current while the parser fact contract moves
