@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 
@@ -22,6 +23,7 @@ const DEFAULT_CANDIDATE_EXPANSION_LIMIT: usize = 32_768;
 pub struct CallReadHandle {
     db: IndexDbLease,
     pub generation: SemanticGeneration,
+    diagnostic: Option<Arc<Mutex<crate::store::DiagnosticReadSnapshot>>>,
 }
 
 impl CallReadHandle {
@@ -29,6 +31,7 @@ impl CallReadHandle {
         Self {
             db: IndexDbLease::acquire(db_path),
             generation,
+            diagnostic: None,
         }
     }
 
@@ -39,6 +42,7 @@ impl CallReadHandle {
         Ok(Self {
             db: IndexDbLease::acquire_default_generation(db_path)?,
             generation,
+            diagnostic: None,
         })
     }
 
@@ -56,13 +60,34 @@ impl CallReadHandle {
         let guard = store.begin_semantic_read(None)?;
         let generation = SemanticGeneration(guard.generation());
         guard.finish()?;
-        Ok(Self { db, generation })
+        Ok(Self {
+            db,
+            generation,
+            diagnostic: None,
+        })
+    }
+
+    /// CLI-only observation: one owned read transaction spans every candidate
+    /// and presentation read, without acquiring a writable generation lease.
+    pub(crate) fn capture_diagnostic(db_path: PathBuf) -> Result<Self> {
+        let snapshot = crate::store::DiagnosticReadSnapshot::open(&db_path)?;
+        Ok(Self {
+            db: IndexDbLease::acquire(db_path),
+            generation: SemanticGeneration(snapshot.metadata.generation.unwrap_or(0)),
+            diagnostic: Some(Arc::new(Mutex::new(snapshot))),
+        })
     }
 
     /// Run a typed read against the exact semantic generation captured by
     /// this handle. Candidate and relation requests share this boundary so a
     /// publication that happens mid-request cannot mix durable generations.
     pub(crate) fn read<T>(&self, read: impl FnOnce(&IndexStore) -> Result<T>) -> Result<T> {
+        if let Some(snapshot) = &self.diagnostic {
+            let snapshot = snapshot
+                .lock()
+                .map_err(|_| anyhow::anyhow!("diagnostic snapshot lock poisoned"))?;
+            return read(&snapshot.store);
+        }
         let store = IndexStore::open_readonly(self.db.path())?;
         let guard = store.begin_semantic_read(Some(self.generation.0))?;
         let value = read(guard.store())?;
@@ -766,6 +791,67 @@ mod tests {
     use crate::candidate_service::CandidateOverlaySnapshot;
     use crate::indexer::{index_workspace, IndexOptions};
     use std::sync::Arc;
+
+    #[test]
+    fn diagnostic_handle_pins_one_readonly_snapshot_across_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.sqlite");
+        let mut writer = IndexStore::open(&db, dir.path()).unwrap();
+        let publish = |writer: &mut IndexStore, source: &str, revision| {
+            let parsed = crate::parser::parse(std::path::Path::new("main.c"), source);
+            let fp = crate::store::FileFingerprint {
+                path: "main.c".into(),
+                extension: "c".into(),
+                size: source.len() as u64,
+                mtime_ns: revision,
+                hash: blake3::hash(source.as_bytes()).to_hex().to_string(),
+            };
+            writer
+                .apply_file_updates(&[crate::store::FileIndexUpdate {
+                    fingerprint: &fp,
+                    source: crate::store::FileSource::Workspace,
+                    payload: crate::store::FileIndexPayload::Ok(&parsed),
+                }])
+                .unwrap();
+        };
+        publish(&mut writer, "int old_name;", 1);
+        let handle = CallReadHandle::capture_diagnostic(db.clone()).unwrap();
+        let observed_generation = handle.generation;
+        publish(&mut writer, "int new_name;", 2);
+        assert!(writer.semantic_generation().unwrap() > observed_generation.0);
+        let overlays = CandidateOverlaySnapshot::default();
+        let service = crate::candidate_service::CandidateQueryService::new(
+            Some(&handle),
+            &overlays,
+            "main.c",
+            None,
+            None,
+        );
+        let old = service
+            .semantic_candidates(
+                "old_name",
+                crate::candidate_service::SemanticIntent::Neutral,
+            )
+            .unwrap();
+        assert_eq!(
+            crate::candidate_service::navigation_presentations(&old, false, "main.c").len(),
+            1
+        );
+        let new = service
+            .semantic_candidates(
+                "new_name",
+                crate::candidate_service::SemanticIntent::Neutral,
+            )
+            .unwrap();
+        assert!(new.all.is_empty());
+        assert_eq!(
+            handle.read(|s| s.semantic_generation()).unwrap(),
+            observed_generation.0
+        );
+        drop(handle);
+        let fresh = CallReadHandle::capture_diagnostic(db).unwrap();
+        assert!(fresh.generation.0 > observed_generation.0);
+    }
 
     #[test]
     fn lazy_store_query_and_overlay_merge_preserve_expected_relation() {
