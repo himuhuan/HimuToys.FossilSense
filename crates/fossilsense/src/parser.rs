@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use crate::config::{ParserFrontend, SourceLanguage};
 use crate::semantic_model::{
     DeclarationFact, FallbackCompletionFact, ParseOutcome, SemanticDeclarationRole,
-    SemanticLanguage,
+    SemanticFactFidelity, SemanticLanguage,
 };
 
 /// Parser-private staging record used while converting AST nodes or hard-
@@ -37,6 +37,7 @@ mod declarations;
 mod go;
 mod lexical;
 mod protobuf_c;
+mod recovery;
 
 use ast::collect_ast_index;
 pub use ast::infer_receiver_record;
@@ -44,6 +45,13 @@ pub use ast::infer_receiver_record;
 use lexical::compact_whitespace;
 use lexical::{extract_fallback_completions, scan_includes};
 pub(crate) use protobuf_c::{extract_protobuf_c_declarations, ProtobufCDeclaration};
+use recovery::{
+    attach_affected_ranges, healthy_observations_unchanged, ProposedEdit, RecoverySession,
+};
+#[allow(unused_imports)]
+pub use recovery::{
+    RecoveryDiagnostic, RecoveryFailureReason, RecoveryMapping, RecoveryOutcome, RecoveryRule,
+};
 
 struct BackendAstProduct {
     ast: ast::AstIndex,
@@ -131,11 +139,26 @@ fn no_build_guard(_source: &str) -> Option<String> {
     None
 }
 
-fn c_family_recovery_source(root: tree_sitter::Node<'_>, source: &str) -> Option<String> {
+fn c_family_recovery_edits(
+    root: tree_sitter::Node<'_>,
+    source: &str,
+    mut discovery: recovery::EditDiscovery,
+) -> recovery::EditDiscovery {
     if !root.has_error() && !source.contains("__aligned") {
-        return None;
+        return recovery::EditDiscovery {
+            edits: Vec::new(),
+            failures: Vec::new(),
+        };
     }
-    let mut ranges = alignment_attribute_ranges(source);
+    if discovery
+        .failures
+        .iter()
+        .any(|failure| failure.reason == RecoveryFailureReason::EditBudgetExceeded)
+    {
+        attach_affected_ranges(root, &mut discovery.edits);
+        return discovery;
+    }
+    let mut edits = Vec::new();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         if node.kind() == "function_declarator" {
@@ -154,7 +177,13 @@ fn c_family_recovery_source(root: tree_sitter::Node<'_>, source: &str) -> Option
                         .child_by_field_name("type")
                         .filter(|kind| kind.kind() == "type_identifier")
                     {
-                        ranges.push(convention.byte_range());
+                        push_bounded_recovery_edit(
+                            &mut edits,
+                            ProposedEdit::new(
+                                convention.byte_range(),
+                                RecoveryRule::CallingConvention,
+                            ),
+                        );
                     }
                 }
             }
@@ -165,13 +194,17 @@ fn c_family_recovery_source(root: tree_sitter::Node<'_>, source: &str) -> Option
                 .iter()
                 .any(|child| child.kind() == "pointer_declarator")
             {
-                ranges.extend(children.iter().filter_map(|child| {
+                for modifier in children.iter().filter_map(|child| {
                     (child.kind() == "ERROR")
                         .then(|| single_named_child(*child))
                         .flatten()
                         .filter(|modifier| modifier.kind() == "type_identifier")
-                        .map(|modifier| modifier.byte_range())
-                }));
+                }) {
+                    push_bounded_recovery_edit(
+                        &mut edits,
+                        ProposedEdit::new(modifier.byte_range(), RecoveryRule::CallingConvention),
+                    );
+                }
             }
         } else if node.kind() == "macro_type_specifier" {
             let mut cursor = node.walk();
@@ -180,18 +213,22 @@ fn c_family_recovery_source(root: tree_sitter::Node<'_>, source: &str) -> Option
                 .filter(|child| child.kind() == "ERROR")
             {
                 let mut cursor = error.walk();
-                ranges.extend(error.named_children(&mut cursor).filter_map(|descriptor| {
-                    (descriptor.kind() == "type_descriptor"
-                        && descriptor
-                            .child_by_field_name("declarator")
-                            .is_some_and(|declarator| {
-                                declarator.kind() == "abstract_pointer_declarator"
-                            }))
-                    .then(|| descriptor.child_by_field_name("type"))
-                    .flatten()
-                    .filter(|modifier| modifier.kind() == "type_identifier")
-                    .map(|modifier| modifier.byte_range())
-                }));
+                for modifier in
+                    error.named_children(&mut cursor).filter_map(|descriptor| {
+                        (descriptor.kind() == "type_descriptor"
+                            && descriptor.child_by_field_name("declarator").is_some_and(
+                                |declarator| declarator.kind() == "abstract_pointer_declarator",
+                            ))
+                        .then(|| descriptor.child_by_field_name("type"))
+                        .flatten()
+                        .filter(|modifier| modifier.kind() == "type_identifier")
+                    })
+                {
+                    push_bounded_recovery_edit(
+                        &mut edits,
+                        ProposedEdit::new(modifier.byte_range(), RecoveryRule::CallingConvention),
+                    );
+                }
             }
         } else if node.kind() == "ERROR"
             && node
@@ -214,8 +251,29 @@ fn c_family_recovery_source(root: tree_sitter::Node<'_>, source: &str) -> Option
                         .get(array.end_byte()..node.end_byte())
                         .is_some_and(|tail| tail.contains('='))
             }) {
-                if let Some(scope) = initializer_scope(source, node.start_byte()) {
-                    ranges.extend(preprocessor_line_ranges(source, scope));
+                match initializer_scope(source, node.start_byte()) {
+                    Ok(Some(scope)) => {
+                        for range in preprocessor_line_ranges(source, scope.clone()) {
+                            push_bounded_recovery_edit(
+                                &mut edits,
+                                ProposedEdit::with_affected_range(
+                                    range,
+                                    scope.clone(),
+                                    RecoveryRule::ConditionalInitializer,
+                                ),
+                            );
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(reason) => discovery.failures.push(recovery::DiscoveryFailure::new(
+                        node.start_byte()
+                            ..node
+                                .start_byte()
+                                .saturating_add(recovery::MAX_RECOVERY_REGION_BYTES)
+                                .min(source.len()),
+                        RecoveryRule::ConditionalInitializer,
+                        reason,
+                    )),
                 }
             }
         }
@@ -223,63 +281,17 @@ fn c_family_recovery_source(root: tree_sitter::Node<'_>, source: &str) -> Option
         let mut cursor = node.walk();
         stack.extend(node.named_children(&mut cursor));
     }
-    if ranges.is_empty() {
-        return None;
+    for edit in edits {
+        push_bounded_recovery_edit(&mut discovery.edits, edit);
     }
-
-    let mut normalized = source.as_bytes().to_vec();
-    for range in ranges {
-        normalized.get_mut(range)?.fill(b' ');
-    }
-    String::from_utf8(normalized).ok()
+    attach_affected_ranges(root, &mut discovery.edits);
+    discovery
 }
 
-fn alignment_attribute_ranges(source: &str) -> Vec<std::ops::Range<usize>> {
-    let bytes = source.as_bytes();
-    source
-        .match_indices("__aligned")
-        .filter_map(|(start, attribute)| {
-            let end = start + attribute.len();
-            if bytes
-                .get(start.wrapping_sub(1))
-                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-                || bytes
-                    .get(end)
-                    .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-            {
-                return None;
-            }
-
-            let line_start = source[..start].rfind('\n').map_or(0, |index| index + 1);
-            if source[line_start..start].trim_start().starts_with('#') {
-                return None;
-            }
-
-            let mut index = end;
-            while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
-                index += 1;
-            }
-            if bytes.get(index) != Some(&b'(') {
-                return None;
-            }
-
-            let mut depth = 0usize;
-            while index < bytes.len() {
-                match bytes[index] {
-                    b'(' => depth += 1,
-                    b')' => {
-                        depth = depth.saturating_sub(1);
-                        if depth == 0 {
-                            return Some(start..index + 1);
-                        }
-                    }
-                    _ => {}
-                }
-                index += 1;
-            }
-            None
-        })
-        .collect()
+fn push_bounded_recovery_edit(edits: &mut Vec<ProposedEdit>, edit: ProposedEdit) {
+    if edits.len() <= recovery::MAX_RECOVERY_EDITS {
+        edits.push(edit);
+    }
 }
 
 fn single_named_child(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
@@ -316,33 +328,55 @@ fn preprocessor_line_ranges(
     ranges
 }
 
-fn initializer_scope(source: &str, start: usize) -> Option<std::ops::Range<usize>> {
+fn initializer_scope(
+    source: &str,
+    start: usize,
+) -> Result<Option<std::ops::Range<usize>>, RecoveryFailureReason> {
     let bytes = source.as_bytes();
-    let equals = start + source.get(start..)?.find('=')?;
-    let open = equals + source.get(equals..)?.find('{')?;
+    if start > bytes.len() {
+        return Ok(None);
+    }
+    let limit = start
+        .saturating_add(recovery::MAX_RECOVERY_REGION_BYTES)
+        .min(bytes.len());
+    let Some(equals_offset) = bytes[start..limit].iter().position(|byte| *byte == b'=') else {
+        return if limit < bytes.len() {
+            Err(RecoveryFailureReason::RegionBudgetExceeded)
+        } else {
+            Ok(None)
+        };
+    };
+    let equals = start + equals_offset;
+    let Some(open_offset) = bytes[equals..limit].iter().position(|byte| *byte == b'{') else {
+        return if limit < bytes.len() {
+            Err(RecoveryFailureReason::RegionBudgetExceeded)
+        } else {
+            Ok(None)
+        };
+    };
+    let open = equals + open_offset;
     let mut depth = 0usize;
     let mut index = open;
-    while index < bytes.len() {
+    while index < limit {
         match bytes[index] {
             b'/' if bytes.get(index + 1) == Some(&b'/') => {
                 index += 2;
-                while index < bytes.len() && bytes[index] != b'\n' {
+                while index < limit && bytes[index] != b'\n' {
                     index += 1;
                 }
             }
             b'/' if bytes.get(index + 1) == Some(&b'*') => {
                 index += 2;
-                while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
-                {
+                while index + 1 < limit && !(bytes[index] == b'*' && bytes[index + 1] == b'/') {
                     index += 1;
                 }
-                index = (index + 2).min(bytes.len());
+                index = (index + 2).min(limit);
             }
             quote @ (b'"' | b'\'') => {
                 index += 1;
-                while index < bytes.len() {
+                while index < limit {
                     if bytes[index] == b'\\' {
-                        index = (index + 2).min(bytes.len());
+                        index = (index + 2).min(limit);
                     } else if bytes[index] == quote {
                         index += 1;
                         break;
@@ -359,36 +393,84 @@ fn initializer_scope(source: &str, start: usize) -> Option<std::ops::Range<usize
                 depth = depth.saturating_sub(1);
                 index += 1;
                 if depth == 0 {
-                    return Some(start..index);
+                    return Ok(Some(start..index));
                 }
             }
             _ => index += 1,
         }
     }
-    None
+    if limit < bytes.len() {
+        Err(RecoveryFailureReason::RegionBudgetExceeded)
+    } else {
+        Ok(None)
+    }
 }
 
-fn protobuf_c_recovery_source(
+fn protobuf_c_recovery_edits(
     path: &Path,
     root: tree_sitter::Node<'_>,
     source: &str,
-) -> Option<String> {
+) -> recovery::EditDiscovery {
     let suffix = ".pb-c.h";
-    let file_name = path.file_name()?.to_str()?;
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return recovery::EditDiscovery {
+            edits: Vec::new(),
+            failures: Vec::new(),
+        };
+    };
     if !file_name
         .get(file_name.len().saturating_sub(suffix.len())..)
         .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix))
     {
-        return None;
+        return recovery::EditDiscovery {
+            edits: Vec::new(),
+            failures: Vec::new(),
+        };
     }
 
-    let mut modifier_ranges = Vec::new();
+    let mut edits = Vec::new();
+    let mut failures = Vec::new();
     let mut line_start = 0;
     for line in source.split_inclusive('\n') {
         let marker = line.trim();
         if matches!(marker, "PROTOBUF_C__BEGIN_DECLS" | "PROTOBUF_C__END_DECLS") {
-            let start = line_start + line.find(marker)?;
-            modifier_ranges.push(start..start + marker.len());
+            if let Some(offset) = line.find(marker) {
+                let start = line_start + offset;
+                let range = start..start + marker.len();
+                let affected_end = if marker == "PROTOBUF_C__BEGIN_DECLS" {
+                    let search_end = start
+                        .saturating_add(recovery::MAX_RECOVERY_REGION_BYTES)
+                        .min(source.len());
+                    let semicolon = source.as_bytes()[range.end..search_end]
+                        .iter()
+                        .position(|byte| *byte == b';');
+                    let Some(semicolon) = semicolon else {
+                        let reason = if search_end < source.len() {
+                            RecoveryFailureReason::RegionBudgetExceeded
+                        } else {
+                            RecoveryFailureReason::UnsafeDeclarationBoundary
+                        };
+                        failures.push(recovery::DiscoveryFailure::new(
+                            start..search_end,
+                            RecoveryRule::ProtobufCMarker,
+                            reason,
+                        ));
+                        line_start += line.len();
+                        continue;
+                    };
+                    range.end + semicolon + 1
+                } else {
+                    range.end
+                };
+                push_bounded_recovery_edit(
+                    &mut edits,
+                    ProposedEdit::with_affected_range(
+                        range,
+                        start..affected_end,
+                        RecoveryRule::ProtobufCMarker,
+                    ),
+                );
+            }
         }
         line_start += line.len();
     }
@@ -418,7 +500,10 @@ fn protobuf_c_recovery_source(
                     == Some(b';');
                 if is_record && is_bare_name && separated_by_whitespace && followed_by_semicolon {
                     if let Some(modifier) = record_type.child_by_field_name("name") {
-                        modifier_ranges.push(modifier.byte_range());
+                        push_bounded_recovery_edit(
+                            &mut edits,
+                            ProposedEdit::new(modifier.byte_range(), RecoveryRule::ProtobufCExport),
+                        );
                     }
                 }
             }
@@ -430,15 +515,118 @@ fn protobuf_c_recovery_source(
             }
         }
     }
-    if modifier_ranges.is_empty() {
-        return None;
-    }
+    attach_affected_ranges(root, &mut edits);
+    recovery::EditDiscovery { edits, failures }
+}
 
-    let mut normalized = source.as_bytes().to_vec();
-    for range in modifier_ranges {
-        normalized.get_mut(range)?.fill(b' ');
+fn apply_recovery_stage<F>(
+    session: &mut RecoverySession<'_>,
+    tree: tree_sitter::Tree,
+    edits: Vec<ProposedEdit>,
+    original: &str,
+    parse_source: &F,
+    cancel: Option<&AtomicBool>,
+) -> Result<tree_sitter::Tree, ()>
+where
+    F: Fn(&str) -> Result<Option<tree_sitter::Tree>, ()>,
+{
+    if edits.is_empty() {
+        return Ok(tree);
     }
-    String::from_utf8(normalized).ok()
+    let Ok(transaction) = session.prepare(edits) else {
+        return Ok(tree);
+    };
+    let reparsed = match parse_source(transaction.source()) {
+        Ok(Some(reparsed)) => reparsed,
+        Ok(None) if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) => {
+            session.reject(transaction, RecoveryFailureReason::Cancelled);
+            return Err(());
+        }
+        Ok(None) | Err(()) => {
+            session.reject(transaction, RecoveryFailureReason::ParseFailed);
+            return Ok(tree);
+        }
+    };
+    if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        session.reject(transaction, RecoveryFailureReason::Cancelled);
+        return Err(());
+    }
+    let affected: Vec<_> = transaction.affected_ranges().cloned().collect();
+    if !healthy_observations_unchanged(tree.root_node(), reparsed.root_node(), original, &affected)
+    {
+        session.reject(transaction, RecoveryFailureReason::HealthCheckFailed);
+        return Ok(tree);
+    }
+    session.commit(transaction);
+    Ok(reparsed)
+}
+
+fn degrade_recovered_ast_facts(ast: &mut ast::AstIndex, affected: &[std::ops::Range<usize>]) {
+    for declaration in &mut ast.declarations {
+        if byte_range_is_affected(
+            declaration.declaration_range.start_byte,
+            declaration.declaration_range.end_byte,
+            affected,
+        ) {
+            declaration.identity.fact_fidelity = SemanticFactFidelity::LowFidelity;
+        }
+    }
+    for symbol in ast.type_symbols.iter_mut().chain(&mut ast.enum_constants) {
+        if byte_range_is_affected(symbol.start_byte, symbol.end_byte, affected) {
+            symbol.incomplete = true;
+        }
+    }
+    for record in &mut ast.records {
+        if byte_range_is_affected(
+            record.declaration_range.start_byte,
+            record.declaration_range.end_byte,
+            affected,
+        ) {
+            record.range_fidelity = RecordRangeFidelity::Malformed;
+        }
+    }
+    for alias in &mut ast.aliases {
+        if byte_range_is_affected(
+            alias.declaration_range.start_byte,
+            alias.declaration_range.end_byte,
+            affected,
+        ) {
+            alias.target_fidelity = AliasTargetFidelity::Malformed;
+        }
+    }
+    for anchor in &mut ast.callable_anchors {
+        let signature_affected = affected.iter().any(|range| {
+            anchor.declaration_range.start_byte < range.end
+                && range.start < anchor.declaration_range.end_byte
+                && !anchor.body_range.is_some_and(|body| {
+                    body.start_byte <= range.start && range.end <= body.end_byte
+                })
+        });
+        if signature_affected {
+            anchor.syntax_error_overlap = true;
+            anchor.signature_fidelity = crate::call_model::SignatureFidelity::Malformed;
+        }
+    }
+    for call in &mut ast.call_sites {
+        if byte_range_is_affected(
+            call.expression_range.start_byte,
+            call.expression_range.end_byte,
+            affected,
+        ) {
+            call.syntax_error_overlap = true;
+        }
+    }
+    for member in &mut ast.members {
+        if byte_range_is_affected(member.start_byte, member.end_byte, affected) {
+            member.confidence = MemberConfidence::Heuristic;
+        }
+    }
+}
+
+fn byte_range_is_affected(start: usize, end: usize, affected: &[std::ops::Range<usize>]) -> bool {
+    affected
+        .iter()
+        .any(|range| start < range.end && range.start < end)
 }
 
 bitflags::bitflags! {
@@ -619,7 +807,7 @@ pub enum FactSource {
 }
 
 /// Parse-health and provenance for one `FileSemanticIndex`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseDiagnostics {
     /// tree-sitter error/missing node count (0 on the lexical-fallback path).
     pub parse_error_count: usize,
@@ -635,6 +823,11 @@ pub struct ParseDiagnostics {
     /// carry the same values as before; this lets callers distinguish skipped
     /// groups from requested groups that are empty or unavailable.
     pub requested_facts: ParseFacts,
+    /// Accepted and rejected equal-length source recovery edits. Byte ranges
+    /// always refer to the immutable original source.
+    pub recovery: Vec<RecoveryDiagnostic>,
+    /// True when any shared recovery limit stopped additional work.
+    pub recovery_budget_exhausted: bool,
 }
 
 /// A record-typed declaration in a file, used by positional receiver inference.
@@ -1011,38 +1204,72 @@ fn parse_with_handle_control(
             return Some(lexical_fallback(path, source, includes, facts, language));
         }
     };
-    let tree = if language == SourceLanguage::C {
-        if let Some(normalized) = protobuf_c_recovery_source(path, tree.root_node(), source) {
-            match parse_source(&normalized) {
-                Ok(Some(reparsed)) => reparsed,
-                Ok(None) if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) => return None,
-                Ok(None) | Err(()) => tree,
-            }
-        } else {
-            tree
-        }
-    } else {
-        tree
-    };
-    let tree = if language != SourceLanguage::Go {
-        if let Some(normalized) = c_family_recovery_source(tree.root_node(), source) {
-            drop(tree);
-            match parse_source(&normalized) {
-                Ok(Some(reparsed)) => reparsed,
-                Ok(None) | Err(()) => return None,
-            }
-        } else {
-            tree
-        }
-    } else {
-        tree
-    };
+    let mut tree = tree;
+    let mut recovery = (language != SourceLanguage::Go)
+        .then(|| RecoverySession::new(source, language == SourceLanguage::Cpp));
+    if language == SourceLanguage::C {
+        let mut discovery = protobuf_c_recovery_edits(
+            path,
+            tree.root_node(),
+            recovery.as_ref().expect("C recovery session").source(),
+        );
+        let session = recovery.as_mut().expect("C recovery session");
+        session.record_discovery_failures(&discovery.failures);
+        tree = apply_recovery_stage(
+            session,
+            tree,
+            std::mem::take(&mut discovery.edits),
+            source,
+            &parse_source,
+            cancel,
+        )
+        .ok()?;
+    }
+    if language != SourceLanguage::Go {
+        let mut discovery = {
+            let session = recovery.as_ref().expect("C-family recovery session");
+            c_family_recovery_edits(
+                tree.root_node(),
+                session.source(),
+                session.alignment_attribute_edits(tree.root_node()),
+            )
+        };
+        let session = recovery.as_mut().expect("C-family recovery session");
+        session.record_discovery_failures(&discovery.failures);
+        tree = apply_recovery_stage(
+            session,
+            tree,
+            std::mem::take(&mut discovery.edits),
+            source,
+            &parse_source,
+            cancel,
+        )
+        .ok()?;
+    }
 
     if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
         return None;
     }
+    let recovery_affected: Vec<_> = recovery
+        .as_ref()
+        .into_iter()
+        .flat_map(RecoverySession::applied_edits)
+        .map(|edit| edit.affected_range.clone())
+        .collect();
+    let recovered = !recovery_affected.is_empty();
+    let (recovery_diagnostics, recovery_budget_exhausted) = recovery
+        .map(RecoverySession::finish)
+        .unwrap_or_else(|| (Vec::new(), false));
     if ast_is_hard_failure(tree.root_node(), source) {
-        return Some(lexical_fallback(path, source, includes, facts, language));
+        return Some(lexical_fallback_with_recovery(
+            path,
+            source,
+            includes,
+            facts,
+            language,
+            recovery_diagnostics,
+            recovery_budget_exhausted,
+        ));
     }
 
     let BackendAstProduct {
@@ -1058,6 +1285,9 @@ fn parse_with_handle_control(
         facts,
         language,
     );
+    if recovered {
+        degrade_recovered_ast_facts(&mut ast, &recovery_affected);
+    }
     let declarations = if facts.contains(ParseFacts::DECLARATIONS) {
         declarations::canonical_declarations(
             path,
@@ -1087,7 +1317,7 @@ fn parse_with_handle_control(
     if !facts.contains(ParseFacts::CALL_RELATIONS) {
         ast.callable_anchors.clear();
     }
-    let parse_outcome = if ast.parse_error_count == 0 {
+    let parse_outcome = if ast.parse_error_count == 0 && !recovered {
         ParseOutcome::Ast
     } else {
         ParseOutcome::PartialAst
@@ -1117,6 +1347,8 @@ fn parse_with_handle_control(
             lexical_source: FactSource::Lexical,
             ast_source: FactSource::Ast,
             requested_facts: facts,
+            recovery: recovery_diagnostics,
+            recovery_budget_exhausted,
         },
     })
 }
@@ -1161,6 +1393,21 @@ pub fn parse_thread_local_with_language_cancel(
     })
 }
 
+fn lexical_fallback_with_recovery(
+    path: &Path,
+    source: &str,
+    includes: Vec<Include>,
+    facts: ParseFacts,
+    language: SourceLanguage,
+    recovery: Vec<RecoveryDiagnostic>,
+    recovery_budget_exhausted: bool,
+) -> FileSemanticIndex {
+    let mut fallback = lexical_fallback(path, source, includes, facts, language);
+    fallback.diagnostics.recovery = recovery;
+    fallback.diagnostics.recovery_budget_exhausted = recovery_budget_exhausted;
+    fallback
+}
+
 fn lexical_fallback(
     path: &Path,
     source: &str,
@@ -1199,6 +1446,8 @@ fn lexical_fallback(
             lexical_source: FactSource::Lexical,
             ast_source: FactSource::LexicalFallback,
             requested_facts: facts,
+            recovery: Vec::new(),
+            recovery_budget_exhausted: false,
         },
     }
 }

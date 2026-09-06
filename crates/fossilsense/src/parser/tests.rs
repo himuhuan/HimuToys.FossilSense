@@ -6,7 +6,8 @@ use super::{
     ParserHandle, SymbolKind, SyntacticRole,
 };
 use crate::semantic_model::{
-    ParseOutcome, SemanticDeclarationKind, SemanticDeclarationRole, SemanticLanguage,
+    ParseOutcome, SemanticDeclarationKind, SemanticDeclarationRole, SemanticFactFidelity,
+    SemanticLanguage,
 };
 
 #[test]
@@ -963,7 +964,9 @@ struct DEMO_API Demo__Other
 
     assert_eq!(
         field_containers(&index, "value"),
-        vec!["Demo__Message".to_string()]
+        vec!["Demo__Message".to_string()],
+        "diagnostics: {:#?}",
+        index.diagnostics
     );
     assert_eq!(
         field_containers(&index, "other"),
@@ -1023,7 +1026,7 @@ PROTOBUF_C__END_DECLS
         person.canonical_signature.as_deref(),
         Some("typedef struct Demo__Person Demo__Person;")
     );
-    assert_eq!(index.parse_outcome, ParseOutcome::Ast);
+    assert_eq!(index.parse_outcome, ParseOutcome::PartialAst);
     assert!(index.declarations.iter().all(|declaration| {
         !matches!(
             declaration.name.as_str(),
@@ -1596,8 +1599,9 @@ struct aligned_fields { char tx[8] __aligned(8); };\n";
                 declaration.name != "__aligned"
                     || declaration.declaration_kind == SemanticDeclarationKind::Macro
             }),
-            "declarations: {:#?}",
-            index.declarations
+            "declarations: {:#?}; diagnostics: {:#?}",
+            index.declarations,
+            index.diagnostics
         );
     }
     assert!(c_index
@@ -1608,6 +1612,365 @@ struct aligned_fields { char tx[8] __aligned(8); };\n";
         .members
         .iter()
         .any(|member| member.name == "tx"));
+}
+
+#[test]
+fn c_alignment_text_in_comments_does_not_swallow_healthy_objects() {
+    let source = "/* __aligned( */\nint visible;\n/* ) */\nint tail;\n";
+    let index = parse(Path::new("commented-alignment.c"), source);
+
+    let objects: Vec<_> = index
+        .declarations
+        .iter()
+        .filter(|declaration| declaration.declaration_kind == SemanticDeclarationKind::Object)
+        .map(|declaration| (declaration.name.as_str(), declaration.name_range.start_byte))
+        .collect();
+    assert_eq!(
+        objects,
+        vec![
+            ("visible", source.find("visible").expect("visible offset")),
+            ("tail", source.find("tail").expect("tail offset")),
+        ]
+    );
+    assert!(
+        index.diagnostics.recovery.is_empty(),
+        "comment text must not create a recovery edit"
+    );
+}
+
+#[test]
+fn c_alignment_recovery_preserves_multiline_and_literal_boundaries() {
+    let lf = "/* 中文前缀 */\nint before;\nstatic int aligned\n    __aligned(\n        (8)\n    );\nint after;\n";
+    let crlf = lf.replace('\n', "\r\n");
+
+    for source in [lf.to_string(), crlf] {
+        let index = parse(Path::new("multiline-alignment.c"), &source);
+        for name in ["before", "aligned", "after"] {
+            let declaration = index
+                .declarations
+                .iter()
+                .find(|declaration| {
+                    declaration.name == name
+                        && declaration.declaration_kind == SemanticDeclarationKind::Object
+                })
+                .unwrap_or_else(|| panic!("missing object {name}: {:#?}", index.declarations));
+            assert_eq!(
+                declaration.name_range.start_byte,
+                source.find(name).expect("original name offset"),
+                "{name} must keep its original byte range"
+            );
+        }
+    }
+
+    let cpp_source = "const char *escaped = \"\\\"__aligned((99))\\\"\";\n\
+char paren = ')';\n\
+const char *raw = R\"tag(__aligned((32)))tag\";\n\
+// __aligned( \\\n+// )\n\
+#define FAKE_ALIGNMENT __aligned( \\\n+    64)\n\
+int literal_tail;\n";
+    let index = super::parse_with_language(
+        Path::new("literal-alignment.cpp"),
+        cpp_source,
+        super::SourceLanguage::Cpp,
+        ParseFacts::ALL,
+    );
+    for name in ["escaped", "paren", "raw", "literal_tail"] {
+        assert!(
+            index.declarations.iter().any(|declaration| {
+                declaration.name == name
+                    && declaration.declaration_kind == SemanticDeclarationKind::Object
+            }),
+            "missing object {name}: {:#?}",
+            index.declarations
+        );
+    }
+    assert!(
+        index.diagnostics.recovery.is_empty(),
+        "literal, comment, and preprocessor text must not create recovery edits"
+    );
+}
+
+#[test]
+fn protobuf_c_and_alignment_recovery_share_the_same_source() {
+    let source = "PROTOBUF_C__BEGIN_DECLS\n\
+typedef struct Demo__First Demo__First;\n\
+static struct Demo__First value __aligned(8);\n\
+int tail;\n\
+PROTOBUF_C__END_DECLS\n";
+    let index = super::parse_with_language(
+        Path::new("combined.pb-c.h"),
+        source,
+        super::SourceLanguage::C,
+        ParseFacts::ALL,
+    );
+
+    assert!(
+        index.declarations.iter().any(|declaration| {
+            declaration.name == "Demo__First"
+                && declaration.declaration_kind == SemanticDeclarationKind::Alias
+        }),
+        "declarations: {:#?}; diagnostics: {:#?}",
+        index.declarations,
+        index.diagnostics
+    );
+    for name in ["value", "tail"] {
+        assert!(
+            index.declarations.iter().any(|declaration| {
+                declaration.name == name
+                    && declaration.declaration_kind == SemanticDeclarationKind::Object
+            }),
+            "missing object {name}: {:#?}",
+            index.declarations
+        );
+    }
+    for rule in [
+        super::RecoveryRule::ProtobufCMarker,
+        super::RecoveryRule::AlignmentAttribute,
+    ] {
+        assert!(index.diagnostics.recovery.iter().any(|diagnostic| {
+            diagnostic.rule == rule
+                && diagnostic.outcome == super::RecoveryOutcome::Applied
+                && diagnostic.mapping == super::RecoveryMapping::Identity
+        }));
+    }
+    let first = index
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name == "Demo__First")
+        .expect("first typedef declaration");
+    let value = index
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name == "value")
+        .expect("aligned value declaration");
+    let tail = index
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name == "tail")
+        .expect("healthy tail declaration");
+    assert_ne!(
+        first.identity.fact_fidelity,
+        SemanticFactFidelity::Authoritative
+    );
+    assert_ne!(
+        value.identity.fact_fidelity,
+        SemanticFactFidelity::Authoritative
+    );
+    assert_eq!(
+        tail.identity.fact_fidelity,
+        SemanticFactFidelity::Authoritative
+    );
+    assert_eq!(index.parse_outcome, ParseOutcome::PartialAst);
+}
+
+#[test]
+fn c_legal_aligned_function_and_call_are_not_recovery_targets() {
+    let source = "int __aligned(int value);\n\
+int caller(void) { return __aligned(8); }\n\
+int tail;\n";
+    let index = parse(Path::new("aligned-function.c"), source);
+
+    for name in ["__aligned", "caller", "tail"] {
+        assert!(
+            index
+                .declarations
+                .iter()
+                .any(|declaration| declaration.name == name),
+            "missing declaration {name}: {:#?}",
+            index.declarations
+        );
+    }
+    assert!(index
+        .call_sites
+        .iter()
+        .any(|call| call.callee_name.as_deref() == Some("__aligned")));
+    assert!(index.diagnostics.recovery.is_empty());
+
+    let cpp = super::parse_with_language(
+        Path::new("aligned-object.cpp"),
+        "int __aligned(8);\n",
+        super::SourceLanguage::Cpp,
+        ParseFacts::ALL,
+    );
+    assert!(cpp.declarations.iter().any(|declaration| {
+        declaration.name == "__aligned"
+            && declaration.declaration_kind == SemanticDeclarationKind::Object
+    }));
+    assert!(cpp.diagnostics.recovery.is_empty());
+}
+
+#[test]
+fn c_aligned_expression_after_an_unrelated_broken_declaration_is_preserved() {
+    let source = "int helper(void);\n\
+int __aligned(int);\n\
+int f(void) {\n\
+    int broken = ;\n\
+    __aligned(8);\n\
+    return helper();\n\
+}\n";
+    let index = parse(Path::new("broken-before-call.c"), source);
+
+    assert!(index.call_sites.iter().any(|call| {
+        call.callee_name.as_deref() == Some("__aligned") && !call.syntax_error_overlap
+    }));
+    assert!(index.diagnostics.recovery.is_empty());
+}
+
+#[test]
+fn nested_missing_semicolon_does_not_turn_the_next_aligned_call_into_an_attribute() {
+    let source = "int __aligned(int);\n\
+void f(void) {\n\
+    struct S { int field } value;\n\
+    __aligned(8);\n\
+}\n";
+    let index = parse(Path::new("nested-missing-semicolon.c"), source);
+
+    assert!(index
+        .call_sites
+        .iter()
+        .any(|call| call.callee_name.as_deref() == Some("__aligned")));
+    assert!(index.diagnostics.recovery.is_empty());
+}
+
+#[test]
+fn legal_aligned_calls_do_not_exhaust_the_real_attribute_edit_budget() {
+    let mut source = String::from("int __aligned(int);\n");
+    for value in 0..256 {
+        source.push_str(&format!(
+            "int caller_{value}(void) {{ return __aligned({value}); }}\n"
+        ));
+    }
+    source.push_str("int target __aligned(8);\n");
+    let index = parse(Path::new("aligned-budget.c"), &source);
+
+    assert!(index.declarations.iter().any(|declaration| {
+        declaration.name == "target"
+            && declaration.declaration_kind == SemanticDeclarationKind::Object
+    }));
+    assert!(!index.diagnostics.recovery_budget_exhausted);
+    assert_eq!(
+        index
+            .diagnostics
+            .recovery
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.rule == super::RecoveryRule::AlignmentAttribute
+                    && diagnostic.outcome == super::RecoveryOutcome::Applied
+            })
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn local_alignment_recovery_does_not_degrade_the_function_or_unrelated_call() {
+    let source = "int helper(void);\n\
+int save(void) { int value __aligned(8); return helper(); }\n";
+    let index = parse(Path::new("local-alignment.c"), source);
+
+    let save = index
+        .callable_anchors
+        .iter()
+        .find(|anchor| anchor.name == "save")
+        .expect("save anchor");
+    let helper_call = index
+        .call_sites
+        .iter()
+        .find(|call| call.callee_name.as_deref() == Some("helper"))
+        .expect("helper call");
+    assert!(!save.syntax_error_overlap);
+    assert_eq!(
+        save.signature_fidelity,
+        crate::call_model::SignatureFidelity::AstExact
+    );
+    assert!(!helper_call.syntax_error_overlap);
+    assert_eq!(index.parse_outcome, ParseOutcome::PartialAst);
+}
+
+#[test]
+fn hard_fallback_keeps_recovery_budget_evidence() {
+    let source = format!("__aligned({}", "(".repeat(65));
+    let mut session = super::recovery::RecoverySession::new(&source, false);
+    let discovery = super::recovery::alignment_attribute_edits(&source, false);
+    session.record_discovery_failures(&discovery.failures);
+    let (recovery, recovery_budget_exhausted) = session.finish();
+    let index = super::lexical_fallback_with_recovery(
+        Path::new("fallback-budget.pb-c.h"),
+        &source,
+        super::scan_includes(&source),
+        ParseFacts::ALL,
+        super::SourceLanguage::C,
+        recovery,
+        recovery_budget_exhausted,
+    );
+
+    assert_eq!(index.parse_outcome, ParseOutcome::LexicalFallback);
+    assert!(index.diagnostics.recovery_budget_exhausted);
+    assert!(index.diagnostics.recovery.iter().any(|diagnostic| {
+        diagnostic.outcome
+            == super::RecoveryOutcome::Rejected(
+                super::RecoveryFailureReason::ParenthesisDepthExceeded,
+            )
+    }));
+}
+
+#[test]
+fn oversized_recovery_regions_stop_at_sixty_four_kibibytes() {
+    let protobuf_source = format!("PROTOBUF_C__BEGIN_DECLS\n{};\n", "x".repeat(64 * 1024 + 1));
+    let handle = ParserHandle::new();
+    let tree = handle
+        .parse_with_language(
+            crate::config::SourceLanguage::C.tree_sitter_language(),
+            &protobuf_source,
+            None,
+        )
+        .expect("C grammar")
+        .expect("protobuf tree");
+    let discovery = super::protobuf_c_recovery_edits(
+        Path::new("oversized.pb-c.h"),
+        tree.root_node(),
+        &protobuf_source,
+    );
+    assert!(discovery.edits.is_empty());
+    assert!(discovery
+        .failures
+        .iter()
+        .any(|failure| { failure.reason == super::RecoveryFailureReason::RegionBudgetExceeded }));
+
+    let initializer_source = format!("int values[] = {{{}}};", "0,".repeat(40_000));
+    assert_eq!(
+        super::initializer_scope(&initializer_source, 0),
+        Err(super::RecoveryFailureReason::RegionBudgetExceeded)
+    );
+}
+
+#[test]
+fn c_alignment_recovery_reports_shared_budget_exhaustion() {
+    let mut source = String::new();
+    for index in 0..=256 {
+        source.push_str(&format!("int value_{index} __aligned(8);\n"));
+    }
+    let index = parse(Path::new("alignment-budget.c"), &source);
+
+    assert!(index.diagnostics.recovery_budget_exhausted);
+    assert!(index.diagnostics.recovery.iter().any(|diagnostic| {
+        diagnostic.outcome
+            == super::RecoveryOutcome::Rejected(super::RecoveryFailureReason::EditBudgetExceeded)
+    }));
+}
+
+#[test]
+fn c_alignment_recovery_reports_parenthesis_depth_exhaustion() {
+    let source = format!("int value __aligned({});\nint tail;\n", "(".repeat(65));
+    let index = parse(Path::new("alignment-depth.c"), &source);
+
+    assert!(index.diagnostics.recovery_budget_exhausted);
+    assert!(index.diagnostics.recovery.iter().any(|diagnostic| {
+        diagnostic.outcome
+            == super::RecoveryOutcome::Rejected(
+                super::RecoveryFailureReason::ParenthesisDepthExceeded,
+            )
+    }));
 }
 
 #[test]
@@ -1670,8 +2033,9 @@ static HRESULT (WINAPI *pMFRemovePeriodicCallback)(DWORD key);\n";
                 declaration.name == name
                     && declaration.declaration_kind == SemanticDeclarationKind::Object
             }),
-            "missing function pointer object {name}: {:#?}",
-            source_index.declarations
+            "missing function pointer object {name}: {:#?}; diagnostics: {:#?}",
+            source_index.declarations,
+            source_index.diagnostics
         );
     }
 }
@@ -2083,13 +2447,48 @@ fn cancelled_parse_returns_none_without_synthesizing_fallback() {
     let cancel = std::sync::atomic::AtomicBool::new(true);
     let result = super::parse_with_handle_control(
         Path::new("cancelled.h"),
-        "int should_not_be_cached(void);\n",
+        "int should_not_be_cached(void);\nint aligned __aligned(8);\n",
         crate::config::SourceLanguage::Cpp,
         None,
         ParseFacts::ALL,
         Some(&cancel),
     );
     assert!(result.is_none());
+}
+
+#[test]
+fn cancellation_during_recovery_does_not_commit_the_prepared_edit() {
+    let source = "int value __aligned(8);\n";
+    let handle = ParserHandle::new();
+    let tree = handle
+        .parse_with_language(tree_sitter_c::LANGUAGE.into(), source, None)
+        .expect("C grammar")
+        .expect("initial tree");
+    let mut session = super::recovery::RecoverySession::new(source, false);
+    let mut discovery = session.alignment_attribute_edits(tree.root_node());
+    super::recovery::attach_affected_ranges(tree.root_node(), &mut discovery.edits);
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let parse_source = |_source: &str| {
+        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(None)
+    };
+
+    let result = super::apply_recovery_stage(
+        &mut session,
+        tree,
+        discovery.edits,
+        source,
+        &parse_source,
+        Some(&cancel),
+    );
+    assert!(result.is_err());
+    assert_eq!(session.source(), source);
+    assert!(session.applied_edits().is_empty());
+    let (diagnostics, _) = session.finish();
+    assert!(diagnostics.iter().all(|diagnostic| {
+        diagnostic.outcome
+            == super::RecoveryOutcome::Rejected(super::RecoveryFailureReason::Cancelled)
+    }));
 }
 
 #[test]

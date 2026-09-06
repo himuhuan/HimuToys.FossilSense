@@ -241,6 +241,14 @@ try {
         $result.database_size_bytes -lt 0) {
         throw 'Benchmark JSON is missing the command, machine, sample revision, or database-size evidence required for reproduction.'
     }
+    if (Test-Path -LiteralPath (Join-Path $result.workspace '.git')) {
+        $actualRevision = (& git -C $result.workspace rev-parse HEAD 2>$null |
+            Select-Object -First 1).ToString().Trim()
+        if ($result.sample_revision -notmatch '^[0-9a-f]{40}$' -or
+            $result.sample_revision -ne $actualRevision) {
+            throw 'Benchmark JSON did not preserve the current Git revision of its sample workspace.'
+        }
+    }
     if ($result.outer_process_metrics_comparable -ne $false -or
         $null -ne $result.elapsed_ms -or
         $null -ne $result.peak_working_set_bytes -or

@@ -32,10 +32,10 @@ function Resolve-FullPath([string]$Path) {
 
 function Get-SampleRevision([string]$Workspace) {
     try {
-        $revision = @(& git -C $Workspace rev-parse HEAD 2>$null | Select-Object -First 1)
-        if ($LASTEXITCODE -eq 0 -and $revision.Count -eq 1 -and
-            $revision[0] -match '^[0-9a-f]{40}$') {
-            return $revision[0]
+        $revision = & git -C $Workspace rev-parse HEAD 2>$null | Select-Object -First 1
+        if ($null -ne $revision -and
+            $revision.ToString().Trim() -match '^[0-9a-f]{40}$') {
+            return $revision.ToString().Trim()
         }
     } catch {
         # A benchmark fixture need not be a Git checkout. Preserve that fact in
