@@ -37,9 +37,10 @@ pub(super) fn stage_file_updates(
         let mut revision_stmt = tx.prepare(
             "INSERT INTO file_revisions (
                 file_id, extension, size, mtime_ns, hash, indexed_at, status, error, source,
-                parser_version, language, fact_mask, parse_error_count, fallback_used, build_guard, language_evidence
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                parser_version, language, fact_mask, parse_error_count, fallback_used, build_guard, language_evidence, coverage_summary
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         )?;
+        let mut coverage_stmt = tx.prepare("INSERT INTO declaration_coverage_gaps (revision_id, start_byte, end_byte, payload) VALUES (?1, ?2, ?3, ?4)")?;
         let mut pending_stmt = tx.prepare(
             "INSERT INTO pending_file_revisions (build_id, file_id, revision_id)
              VALUES (?1, ?2, ?3)
@@ -215,6 +216,12 @@ pub(super) fn stage_file_updates(
                 )?),
                 FileIndexPayload::Error(_) => None,
             };
+            let coverage_summary = match update.payload {
+                FileIndexPayload::Ok(index) => Some(serde_json::to_string(
+                    &index.persistent_facts().coverage.summary,
+                )?),
+                FileIndexPayload::Error(_) => None,
+            };
             revision_stmt.execute(params![
                 file_id,
                 fingerprint.extension.as_str(),
@@ -232,6 +239,7 @@ pub(super) fn stage_file_updates(
                 fallback_used,
                 build_guard,
                 language_evidence,
+                coverage_summary,
             ])?;
             let revision_id = tx.last_insert_rowid();
             pending_stmt.execute(params![build.id, file_id, revision_id])?;
@@ -240,6 +248,18 @@ pub(super) fn stage_file_updates(
                 continue;
             };
             let facts = index.persistent_facts();
+            anyhow::ensure!(
+                facts.coverage.gaps.len() <= 1024,
+                "coverage details exceed the file budget"
+            );
+            for gap in &facts.coverage.gaps {
+                coverage_stmt.execute(params![
+                    revision_id,
+                    gap.range.start_byte as i64,
+                    gap.range.end_byte as i64,
+                    serde_json::to_string(gap)?
+                ])?;
+            }
 
             match facts.parse_outcome {
                 ParseOutcome::Ast | ParseOutcome::PartialAst if fallback_used != 0 => {

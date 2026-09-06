@@ -498,6 +498,18 @@ fn with_candidate_set_evidence(
     if set.coverage.truncated {
         notes.push("bounded exact-name recall was truncated; matches may be incomplete".into());
     }
+    if set.coverage.facts_incomplete {
+        let reasons = set.coverage.declaration_reason_labels();
+        notes.push(format!(
+            "declaration coverage {:?}{}",
+            set.coverage.declaration_state,
+            if reasons.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", reasons.join(", "))
+            }
+        ));
+    }
     if notes.is_empty() {
         return Some(markdown);
     }

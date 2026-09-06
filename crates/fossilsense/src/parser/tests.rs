@@ -1,5 +1,7 @@
 use std::path::Path;
 
+mod coverage;
+
 use super::{
     infer_receiver_record, parse, parse_with_handle, FactAvailability, FactGroup,
     FactUnavailableReason, FileSemanticIndex, MemberConfidence, MemberKind, Occurrence, ParseFacts,

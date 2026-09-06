@@ -577,8 +577,8 @@ fn opening_old_schema_and_parser_facts_drops_old_symbol_data_for_current_rebuild
 fn parser_fact_version_mismatch_invalidates_and_rebuilds_current_schema() {
     assert_eq!(
         crate::parser::PARSER_FACT_VERSION,
-        16,
-        "language-selection evidence changes persisted declaration provenance"
+        17,
+        "declaration coverage changes persisted revision facts"
     );
     let dir = tempdir().expect("tempdir");
     let db = dir.path().join("index.sqlite");

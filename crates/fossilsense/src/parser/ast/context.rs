@@ -1,7 +1,7 @@
 use crate::call_model::SourceRange;
 
-pub(super) const MAX_CONDITION_DEPTH: usize = 128;
-pub(super) const MAX_GUARD_BYTES: usize = 8 * 1024;
+pub(in crate::parser) const MAX_CONDITION_DEPTH: usize = 128;
+pub(in crate::parser) const MAX_GUARD_BYTES: usize = 8 * 1024;
 const BUDGET_EXHAUSTED_GUARD: &str = "unknown:budget_exhausted";
 const UNKNOWN_CONDITION_GUARD: &str = "unknown:conditional";
 
@@ -53,14 +53,14 @@ struct GuardFrame {
 /// collectors only project the current owner, local scope, and conditional
 /// evidence; they do not walk ancestors and invent separate scope rules.
 #[derive(Debug, Default)]
-pub(super) struct DeclarationContext {
+pub(in crate::parser) struct DeclarationContext {
     scopes: Vec<ScopeFrame>,
     guards: Vec<GuardFrame>,
     error_depth: usize,
 }
 
 impl DeclarationContext {
-    pub(super) fn enter(
+    pub(in crate::parser) fn enter(
         &mut self,
         node: tree_sitter::Node<'_>,
         source: &str,
@@ -121,7 +121,7 @@ impl DeclarationContext {
         }
     }
 
-    pub(super) fn exit(&mut self, node: tree_sitter::Node<'_>) {
+    pub(in crate::parser) fn exit(&mut self, node: tree_sitter::Node<'_>) {
         if self
             .scopes
             .last()
@@ -141,7 +141,7 @@ impl DeclarationContext {
         }
     }
 
-    pub(super) fn owner(&self) -> Option<String> {
+    pub(in crate::parser) fn owner(&self) -> Option<String> {
         let names = self
             .scopes
             .iter()
@@ -156,7 +156,7 @@ impl DeclarationContext {
         (!names.is_empty()).then(|| names.join("::"))
     }
 
-    pub(super) fn local_scope(
+    pub(in crate::parser) fn local_scope(
         &self,
         node: tree_sitter::Node<'_>,
     ) -> Option<(SourceRange, SourceRange)> {
@@ -181,7 +181,7 @@ impl DeclarationContext {
         Some((function, lexical))
     }
 
-    pub(super) fn guard(&self) -> Option<String> {
+    pub(in crate::parser) fn guard(&self) -> Option<String> {
         if self.guards.is_empty() {
             return None;
         }
@@ -220,7 +220,7 @@ impl DeclarationContext {
     }
 
     #[allow(dead_code)]
-    pub(super) fn has_error_context(&self) -> bool {
+    pub(in crate::parser) fn has_error_context(&self) -> bool {
         self.error_depth > 0
     }
 }

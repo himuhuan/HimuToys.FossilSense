@@ -3148,7 +3148,11 @@ async fn suppressed_same_name_candidates_stay_visible_as_evidence_and_escape_hat
         hover.contains("2 same-name candidate(s) outside the focused result"),
         "suppression must stay visible as hover evidence: {hover}"
     );
-    assert!(hover.contains("matches: exact"), "{hover}");
+    assert!(hover.contains("matches: preferred"), "{hover}");
+    assert!(
+        hover.contains("language_ambiguity"),
+        "shared .h must expose grammar uncertainty: {hover}"
+    );
     assert!(!hover.contains("distant_a.c"), "{hover}");
 
     let response = service
@@ -3165,7 +3169,7 @@ async fn suppressed_same_name_candidates_stay_visible_as_evidence_and_escape_hat
         .await
         .expect("possible targets command")
         .expect("possible targets response");
-    assert_eq!(response["coverage"]["disposition"], "exact");
+    assert_eq!(response["coverage"]["disposition"], "preferred");
     assert_eq!(response["coverage"]["alternativeCount"], 2);
     let items = response["items"].as_array().expect("items");
     let suppressed: Vec<_> = items
@@ -6802,7 +6806,7 @@ async fn candidate_overlay_bounds_alias_parses_but_tombstones_every_identity() {
         "dirty parsing must have a fixed per-document identity bound"
     );
     assert!(
-        overlay.has_incomplete_facts(),
+        overlay.has_unavailable_facts(),
         "unparsed aliases must make coverage explicitly incomplete"
     );
     assert_eq!(
@@ -10451,4 +10455,66 @@ fn query_error_log_line_is_structured_and_single_line() {
         line,
         "FS_QUERY_ERROR kind=query what=grouped_references detail=db failed while reading"
     );
+}
+
+#[tokio::test]
+async fn declaration_coverage_lsp_details_follow_dirty_revision_and_preserve_healthy_facts() {
+    let (_dir, service, uri, line, character) = indexed_backend_with_open_doc(
+        &[],
+        "covered.c",
+        "int healthy;\nint run(void) { return healthy/*cursor*/; }\n",
+    )
+    .await;
+    let before = service
+        .inner()
+        .possible_targets_command(&serde_json::json!({"uri":uri,"line":line,"character":character}))
+        .await
+        .unwrap();
+    assert_eq!(before["coverage"]["declarationState"], "complete");
+    assert!(before.get("currentFileCoverage").is_none());
+    let (dirty, line, character) = text_and_position(
+        "DECLARE(healthy);\nint retained;\nint run(void) { return healthy/*cursor*/; }\n",
+    );
+    let hash = blake3::hash(dirty.as_bytes()).to_hex().to_string();
+    service
+        .inner()
+        .did_change(DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier {
+                uri: uri.clone(),
+                version: 2,
+            },
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: dirty,
+            }],
+        })
+        .await;
+    let after = service.inner().possible_targets_command(&serde_json::json!({"uri":uri,"line":line,"character":character,"includeCoverageDetails":true})).await.unwrap();
+    assert_eq!(
+        after["items"].as_array().unwrap().len(),
+        0,
+        "dirty macro must shadow the old indexed healthy declaration"
+    );
+    assert_eq!(after["coverage"]["declarationState"], "partial");
+    assert!(after["coverage"]["declarationReasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|reason| reason == "unknown_macro"));
+    assert_eq!(after["currentFileCoverage"]["source"], "current_document");
+    assert_eq!(after["currentFileCoverage"]["documentVersion"], 2);
+    assert_eq!(after["currentFileCoverage"]["contentHash"], hash);
+    assert!(after["currentFileCoverage"]["gaps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|gap| gap["reason"] == "unknown_macro" && gap["range"]["startByte"] == 0));
+    let retained = service
+        .inner()
+        .possible_targets_command(&serde_json::json!({"uri":uri,"line":1,"character":5}))
+        .await
+        .unwrap();
+    assert_eq!(retained["items"].as_array().unwrap().len(), 1);
+    assert_eq!(retained["coverage"]["declarationState"], "partial");
 }

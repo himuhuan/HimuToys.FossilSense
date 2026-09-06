@@ -253,11 +253,9 @@ impl CandidateQueryService<'_> {
             scanned,
             truncated,
             scope_open: self.current_reach.as_ref().is_some_and(|scope| scope.open),
-            incomplete_reason: if self.overlays.has_incomplete_facts() {
-                Some(crate::query::CandidateIncompleteReason::Cancelled)
-            } else {
+            incomplete_reason: self.overlays.incomplete_facts_reason().or_else(|| {
                 truncated.then_some(crate::query::CandidateIncompleteReason::CandidateBudget)
-            },
+            }),
         };
         let root_records = record_candidates_exact(
             name,

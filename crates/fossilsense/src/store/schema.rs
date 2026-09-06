@@ -1,5 +1,5 @@
-// Version 31 binds compact language-selection evidence to file revisions.
-pub(crate) const SCHEMA_VERSION: i64 = 31;
+// Version 32 persists bounded declaration coverage with each file revision.
+pub(crate) const SCHEMA_VERSION: i64 = 32;
 
 pub(crate) const DROP_DATA_TABLES_SQL: &str = "
     DROP TABLE IF EXISTS pending_file_revisions;
@@ -9,6 +9,7 @@ pub(crate) const DROP_DATA_TABLES_SQL: &str = "
     DROP TABLE IF EXISTS fallback_completion_facts;
     DROP TABLE IF EXISTS protobuf_c_sources;
     DROP TABLE IF EXISTS declaration_facts;
+    DROP TABLE IF EXISTS declaration_coverage_gaps;
     DROP TABLE IF EXISTS import_facts;
     DROP TABLE IF EXISTS package_facts;
     DROP TABLE IF EXISTS type_alias_facts;
@@ -63,11 +64,22 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
         parser_version INTEGER NOT NULL,
         language INTEGER NOT NULL DEFAULT 2 CHECK(language BETWEEN 0 AND 3),
         language_evidence TEXT,
+        coverage_summary TEXT,
         fact_mask INTEGER NOT NULL DEFAULT 0,
         parse_error_count INTEGER NOT NULL DEFAULT 0,
         fallback_used INTEGER NOT NULL DEFAULT 0 CHECK(fallback_used IN (0, 1)),
         build_guard TEXT
     );
+
+    CREATE TABLE IF NOT EXISTS declaration_coverage_gaps (
+        id INTEGER PRIMARY KEY,
+        revision_id INTEGER NOT NULL REFERENCES file_revisions(id) ON DELETE CASCADE,
+        start_byte INTEGER NOT NULL CHECK(start_byte >= 0),
+        end_byte INTEGER NOT NULL CHECK(end_byte >= start_byte),
+        payload TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_declaration_coverage_revision_range
+        ON declaration_coverage_gaps(revision_id, start_byte, end_byte);
 
     CREATE TABLE IF NOT EXISTS active_file_revisions (
         file_id INTEGER PRIMARY KEY REFERENCES file_entries(id) ON DELETE CASCADE,

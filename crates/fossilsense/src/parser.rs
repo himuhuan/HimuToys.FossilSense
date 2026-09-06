@@ -33,6 +33,7 @@ struct RawDeclaration {
 
 mod ast;
 mod callables;
+mod coverage;
 mod declarations;
 mod declarators;
 mod go;
@@ -756,23 +757,7 @@ pub struct RequestFacts<'a> {
     pub local_bindings: &'a [LocalBinding],
 }
 
-/// Parser fact groups with explicit request/availability state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[allow(dead_code)]
-pub enum FactGroup {
-    Declarations,
-    FallbackCompletions,
-    Includes,
-    Occurrences,
-    Records,
-    Fields,
-    Members,
-    Aliases,
-    LocalDeclarations,
-    LocalBindings,
-    CallableAnchors,
-    CallSites,
-}
+pub use crate::semantic_model::FactGroup;
 
 /// Why a requested fact group is not available.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -830,6 +815,7 @@ pub struct ParseDiagnostics {
     pub recovery: Vec<RecoveryDiagnostic>,
     /// True when any shared recovery limit stopped additional work.
     pub recovery_budget_exhausted: bool,
+    pub coverage: crate::semantic_model::DeclarationCoverage,
 }
 
 /// A record-typed declaration in a file, used by positional receiver inference.
@@ -911,6 +897,7 @@ impl FileSemanticIndex {
         PersistentFacts {
             language: self.language,
             language_evidence: self.language_evidence,
+            coverage: &self.diagnostics.coverage,
             parse_outcome: self.parse_outcome,
             includes: &self.includes,
             package: self.package.as_ref(),
@@ -944,6 +931,14 @@ impl FileSemanticIndex {
     #[allow(dead_code)]
     pub fn fact_availability(&self, group: FactGroup) -> FactAvailability {
         self.diagnostics.fact_availability(group)
+    }
+
+    pub fn fact_coverage(&self, group: FactGroup) -> crate::semantic_model::FactCoverage {
+        if self.fact_availability(group) != FactAvailability::Available {
+            crate::semantic_model::FactCoverage::Unknown
+        } else {
+            self.diagnostics.coverage.summary.fact_coverage(group)
+        }
     }
 
     /// Project coloring definition names from canonical AST declarations.
@@ -1005,24 +1000,7 @@ impl ParseDiagnostics {
     /// required dependency of a requested group.
     #[allow(dead_code)]
     pub fn group_requested(&self, group: FactGroup) -> bool {
-        match group {
-            FactGroup::Includes => true,
-            FactGroup::Declarations => self.requested_facts.contains(ParseFacts::DECLARATIONS),
-            FactGroup::FallbackCompletions => self.fallback_used,
-            FactGroup::Occurrences => self.requested_facts.contains(ParseFacts::OCCURRENCES),
-            FactGroup::Records => self
-                .requested_facts
-                .intersects(ParseFacts::RECORDS | ParseFacts::FIELDS),
-            FactGroup::Fields | FactGroup::Members => {
-                self.requested_facts.contains(ParseFacts::FIELDS)
-            }
-            FactGroup::Aliases => self.requested_facts.contains(ParseFacts::ALIASES),
-            FactGroup::LocalDeclarations | FactGroup::LocalBindings => {
-                self.requested_facts.contains(ParseFacts::LOCAL_DECLS)
-            }
-            FactGroup::CallableAnchors => self.requested_facts.contains(ParseFacts::CALL_RELATIONS),
-            FactGroup::CallSites => self.requested_facts.contains(ParseFacts::CALL_RELATIONS),
-        }
+        coverage::requested_groups(self.requested_facts, self.fallback_used) & group.bit() != 0
     }
 }
 
@@ -1196,6 +1174,9 @@ fn parse_with_selection_control(
     let mut index =
         parse_with_handle_control(path, source, selection.language, handle, facts, cancel)?;
     index.language_evidence = selection.evidence;
+    if selection.evidence.ambiguous {
+        coverage::add_language_ambiguity(&mut index.diagnostics.coverage, source);
+    }
     for declaration in &mut index.declarations {
         declaration.identity.language_fidelity = selection.evidence.fidelity;
     }
@@ -1328,10 +1309,10 @@ fn parse_with_handle_control(
         .map(|edit| edit.affected_range.clone())
         .collect();
     let recovered = !recovery_affected.is_empty();
-    let (recovery_diagnostics, recovery_budget_exhausted) = recovery
-        .map(RecoverySession::finish)
-        .unwrap_or_else(|| (Vec::new(), false));
     if ast_is_hard_failure(tree.root_node(), source) {
+        let (recovery_diagnostics, recovery_budget_exhausted) = recovery
+            .map(RecoverySession::finish)
+            .unwrap_or_else(|| (Vec::new(), false));
         return Some(lexical_fallback_with_recovery(
             path,
             source,
@@ -1359,7 +1340,7 @@ fn parse_with_handle_control(
     if recovered {
         degrade_recovered_ast_facts(&mut ast, &recovery_affected);
     }
-    let declarations = if facts.contains(ParseFacts::DECLARATIONS) {
+    let mut declarations = if facts.contains(ParseFacts::DECLARATIONS) {
         declarations::canonical_declarations(
             path,
             language,
@@ -1376,6 +1357,47 @@ fn parse_with_handle_control(
     } else {
         Vec::new()
     };
+    let audit = if let Some(session) = recovery.as_ref() {
+        coverage::analyze(coverage::CoverageInput {
+            root: tree.root_node(),
+            source,
+            lines: &line_starts,
+            facts,
+            language,
+            declarations: &declarations,
+            aliases: &ast.aliases,
+            lexical: session.lexical_map(),
+            recoveries: session.diagnostics(),
+        })
+    } else {
+        coverage::CoverageAuditResult {
+            coverage: coverage::unknown(source, facts, false),
+            rejected_macro_ranges: Vec::new(),
+        }
+    };
+    let mut declaration_coverage = audit.coverage;
+    let unsupported_macro_ranges = audit.rejected_macro_ranges;
+    declarations.retain(|fact| {
+        !unsupported_macro_ranges.iter().any(|range| {
+            range.start <= fact.name_range.start_byte && fact.name_range.end_byte <= range.end
+        })
+    });
+    let mut rejected_callers = HashSet::new();
+    ast.callable_anchors.retain(|anchor| {
+        let rejected = unsupported_macro_ranges.iter().any(|range| {
+            range.start <= anchor.name_range.start_byte && anchor.name_range.end_byte <= range.end
+        });
+        if rejected {
+            rejected_callers.insert(anchor.entity_key.clone());
+        }
+        !rejected
+    });
+    ast.call_sites
+        .retain(|call| !rejected_callers.contains(&call.caller_entity_key));
+    let (recovery_diagnostics, recovery_budget_exhausted) = recovery
+        .map(RecoverySession::finish)
+        .unwrap_or_else(|| (Vec::new(), false));
+    declaration_coverage.summary.truncated |= recovery_budget_exhausted;
     // Canonical declarations use records, aliases, and callable anchors as
     // private staging evidence. Do not leak those supporting collections into
     // request products unless their own fact groups were requested.
@@ -1421,6 +1443,7 @@ fn parse_with_handle_control(
             requested_facts: facts,
             recovery: recovery_diagnostics,
             recovery_budget_exhausted,
+            coverage: declaration_coverage,
         },
     })
 }
@@ -1490,6 +1513,7 @@ fn lexical_fallback(
             requested_facts: facts,
             recovery: Vec::new(),
             recovery_budget_exhausted: false,
+            coverage: coverage::unknown(source, facts, true),
         },
     }
 }
