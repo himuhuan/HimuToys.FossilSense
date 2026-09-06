@@ -131,11 +131,17 @@ impl Backend {
         let member_reach = reach_info.map(|(_, reach)| (*reach).clone());
         let source_language = primary_context
             .as_ref()
-            .map(|context| context.engine.workspace_semantics.language_for_uri(uri))
+            .map(|context| {
+                context
+                    .engine
+                    .workspace_semantics
+                    .selection_for_uri(uri, text)
+            })
             .unwrap_or_else(|| {
-                crate::config::SourceLanguage::default_for_path(
+                crate::config::LanguageSelection::default_for_source(
                     path.as_deref()
                         .unwrap_or_else(|| std::path::Path::new(uri.path())),
+                    text,
                 )
             });
 
@@ -145,7 +151,7 @@ impl Backend {
         // symbols.
         let cached_index: Option<Arc<FileSemanticIndex>> = match (&receiver, &path) {
             (Some(_), Some(path)) => {
-                self.get_or_parse_document_with_language(
+                self.get_or_parse_document_with_selection(
                     uri,
                     path,
                     version,

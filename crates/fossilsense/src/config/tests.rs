@@ -4,6 +4,82 @@ use tempfile::tempdir;
 
 use super::*;
 
+#[test]
+fn language_evidence_probe_requires_a_whole_code_token_in_budget() {
+    let resolver = LanguageResolver::new(None, vec![]);
+    let marker = "PROTOBUF_C__BEGIN_DECLS";
+    for (path, source) in [
+        ("plain.h", marker.to_string()),
+        ("only.pb-c.h", "int value;".into()),
+        ("comment.pb-c.h", format!("/* {marker} */")),
+        ("line.pb-c.h", format!("// {marker}\n")),
+        ("string.pb-c.h", format!("const char *s = \"{marker}\";")),
+        ("raw.pb-c.h", format!("const char *s = R\"x({marker})x\";")),
+        ("definition.pb-c.h", format!("#define {marker} extern")),
+        ("long.pb-c.h", format!("{}{marker}", " ".repeat(64 * 1024))),
+        (
+            "split.pb-c.h",
+            format!("{}{marker}_TAIL", " ".repeat(64 * 1024 - marker.len())),
+        ),
+        (
+            "unicode.pb-c.h",
+            format!("{}{marker}", "中".repeat(64 * 1024 / 3 + 1)),
+        ),
+    ] {
+        let selection = resolver.selection_for_source(Path::new(path), &source);
+        assert_eq!(selection.language, SourceLanguage::Cpp, "{path}");
+        assert!(selection.evidence.ambiguous, "{path}");
+        assert_eq!(selection.evidence.fidelity, LanguageFidelity::Heuristic);
+    }
+    let selected = resolver.selection_for_source(Path::new("sensor.PB-C.H"), marker);
+    assert_eq!(selected.language, SourceLanguage::C);
+    assert_eq!(
+        selected.evidence.source_kind,
+        LanguageSourceKind::KnownGenerated
+    );
+    assert!(!selected.evidence.ambiguous);
+}
+
+#[test]
+fn language_evidence_last_override_wins_and_explicit_api_stays_explicit() {
+    let resolver = LanguageResolver::new(
+        None,
+        vec![
+            LanguageOverride {
+                glob: "*.h".into(),
+                language: SourceLanguage::C,
+            },
+            LanguageOverride {
+                glob: "*.pb-c.h".into(),
+                language: SourceLanguage::Cpp,
+            },
+        ],
+    );
+    let selected =
+        resolver.selection_for_source(Path::new("sensor.pb-c.h"), "PROTOBUF_C__BEGIN_DECLS");
+    assert_eq!(selected.language, SourceLanguage::Cpp);
+    assert_eq!(
+        selected.evidence.source_kind,
+        LanguageSourceKind::ExplicitOverride
+    );
+    assert_eq!(selected.evidence.fidelity, LanguageFidelity::Explicit);
+    assert!(!selected.evidence.ambiguous);
+    let parsed = crate::parser::parse_with_language(
+        Path::new("sensor.h"),
+        "int value;",
+        SourceLanguage::C,
+        crate::parser::ParseFacts::ALL,
+    );
+    assert_eq!(
+        parsed.language_evidence.source_kind,
+        LanguageSourceKind::ExplicitApi
+    );
+    assert!(parsed
+        .declarations
+        .iter()
+        .all(|fact| fact.identity.language_fidelity == LanguageFidelity::Explicit));
+}
+
 // ---- normalization helpers ----
 
 #[test]

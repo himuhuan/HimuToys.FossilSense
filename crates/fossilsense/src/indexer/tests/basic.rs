@@ -4,6 +4,34 @@ use crate::store::test_support::{
 };
 
 #[test]
+fn language_evidence_override_reindexes_unchanged_source_even_with_same_grammar() {
+    let workspace = tempdir().expect("workspace");
+    fs::write(workspace.path().join("shared.h"), "int visible;\n").unwrap();
+    let db = workspace.path().join("index.sqlite");
+    let options = || IndexOptions {
+        db_path: Some(db.clone()),
+        ..Default::default()
+    };
+    let first = index_workspace(workspace.path(), options(), |_| {}).unwrap();
+    assert_eq!(first.indexed_files, 1);
+    fs::write(
+        workspace.path().join("fossilsense.json"),
+        r#"{"languageOverrides":[{"glob":"*.h","language":"cpp"}]}"#,
+    )
+    .unwrap();
+    let second = index_workspace(workspace.path(), options(), |_| {}).unwrap();
+    assert_eq!(
+        second.indexed_files, 1,
+        "same C++ grammar still changes source evidence"
+    );
+    let third = index_workspace(workspace.path(), options(), |_| {}).unwrap();
+    assert_eq!(
+        third.indexed_files, 0,
+        "unchanged configuration reuses the revision"
+    );
+}
+
+#[test]
 fn protobuf_c_configuration_merges_project_and_editor_paths() {
     let ws = tempdir().expect("workspace");
     let project_proto = ws.path().join("proto");

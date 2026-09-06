@@ -51,7 +51,11 @@ impl Backend {
             .as_deref()
             .and_then(|path| pathing::relative_slash_path(&root, path).ok())
             .unwrap_or_default();
-        let source_language = context.engine.workspace_semantics.language_for_uri(&uri);
+        let selection = context
+            .engine
+            .workspace_semantics
+            .selection_for_uri(&uri, &text);
+        let source_language = selection.language;
         let semantic_family = source_language.semantic_family();
         let cursor_byte =
             query::byte_offset_at(&text, position.position.line, position.position.character);
@@ -108,13 +112,13 @@ impl Backend {
         ) {
             if let Some(current_abs) = current_abs.as_deref() {
                 if let Some(parsed) = self
-                    .get_or_parse_document_with_language(
+                    .get_or_parse_document_with_selection(
                         &uri,
                         current_abs,
                         version,
                         &text,
                         crate::parser::ParseFacts::LOCAL_DECLS,
-                        source_language,
+                        selection,
                     )
                     .await
                 {

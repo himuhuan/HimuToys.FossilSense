@@ -61,10 +61,15 @@ impl Backend {
 
         let source_language = context
             .as_ref()
-            .map(|context| context.engine.workspace_semantics.language_for_uri(uri))
-            .unwrap_or_else(|| crate::config::SourceLanguage::default_for_path(&path));
+            .map(|context| {
+                context
+                    .engine
+                    .workspace_semantics
+                    .selection_for_uri(uri, &text)
+            })
+            .unwrap_or_else(|| crate::config::LanguageSelection::default_for_source(&path, &text));
         let cached = self
-            .get_or_parse_document_with_language(
+            .get_or_parse_document_with_selection(
                 uri,
                 &path,
                 version,

@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-use crate::config::{ParserFrontend, SourceLanguage};
+use crate::config::{LanguageSelection, ParserFrontend, SourceLanguage};
 use crate::semantic_model::{
     DeclarationFact, FallbackCompletionFact, ParseOutcome, SemanticDeclarationRole,
     SemanticFactFidelity, SemanticLanguage,
@@ -714,6 +714,7 @@ bitflags::bitflags! {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileSemanticIndex {
     pub language: SemanticLanguage,
+    pub language_evidence: crate::semantic_model::LanguageEvidence,
     pub includes: Vec<Include>,
     pub package: Option<crate::semantic_model::PackageFact>,
     pub imports: Vec<crate::semantic_model::ImportFact>,
@@ -909,6 +910,7 @@ impl FileSemanticIndex {
     pub fn persistent_facts(&self) -> PersistentFacts<'_> {
         PersistentFacts {
             language: self.language,
+            language_evidence: self.language_evidence,
             parse_outcome: self.parse_outcome,
             includes: &self.includes,
             package: self.package.as_ref(),
@@ -1121,14 +1123,15 @@ impl ParserHandle {
 /// to reuse a handle across files.
 #[cfg(test)]
 pub fn parse(path: &Path, source: &str) -> FileSemanticIndex {
-    parse_with_language(
+    parse_thread_local_with_selection(
         path,
         source,
-        SourceLanguage::default_for_path(path),
+        LanguageSelection::default_for_source(path, source),
         ParseFacts::ALL,
     )
 }
 
+#[cfg(test)]
 pub fn parse_with_language(
     path: &Path,
     source: &str,
@@ -1153,13 +1156,15 @@ pub fn parse_with_handle(
     handle: Option<&ParserHandle>,
     facts: ParseFacts,
 ) -> FileSemanticIndex {
-    parse_with_handle_and_language(
+    parse_with_selection_control(
         path,
         source,
-        SourceLanguage::default_for_path(path),
+        LanguageSelection::default_for_source(path, source),
         handle,
         facts,
+        None,
     )
+    .expect("non-cancelled parse")
 }
 
 pub fn parse_with_handle_and_language(
@@ -1169,8 +1174,64 @@ pub fn parse_with_handle_and_language(
     handle: Option<&ParserHandle>,
     facts: ParseFacts,
 ) -> FileSemanticIndex {
-    parse_with_handle_control(path, source, language, handle, facts, None)
-        .expect("non-cancelled parse always produces a parse product")
+    parse_with_selection_control(
+        path,
+        source,
+        LanguageSelection::explicit(language),
+        handle,
+        facts,
+        None,
+    )
+    .expect("non-cancelled parse always produces a parse product")
+}
+
+fn parse_with_selection_control(
+    path: &Path,
+    source: &str,
+    selection: LanguageSelection,
+    handle: Option<&ParserHandle>,
+    facts: ParseFacts,
+    cancel: Option<&AtomicBool>,
+) -> Option<FileSemanticIndex> {
+    let mut index =
+        parse_with_handle_control(path, source, selection.language, handle, facts, cancel)?;
+    index.language_evidence = selection.evidence;
+    for declaration in &mut index.declarations {
+        declaration.identity.language_fidelity = selection.evidence.fidelity;
+    }
+    Some(index)
+}
+
+/// Reuse one parser per worker while retaining the caller's captured language evidence.
+pub fn parse_thread_local_with_selection(
+    path: &Path,
+    source: &str,
+    selection: LanguageSelection,
+    facts: ParseFacts,
+) -> FileSemanticIndex {
+    TL_PARSER_HANDLE.with(|cell| {
+        parse_with_selection_control(path, source, selection, Some(&*cell.borrow()), facts, None)
+            .expect("non-cancelled parse always produces a parse product")
+    })
+}
+
+pub fn parse_thread_local_with_selection_cancel(
+    path: &Path,
+    source: &str,
+    selection: LanguageSelection,
+    facts: ParseFacts,
+    cancel: &AtomicBool,
+) -> Option<FileSemanticIndex> {
+    TL_PARSER_HANDLE.with(|cell| {
+        parse_with_selection_control(
+            path,
+            source,
+            selection,
+            Some(&*cell.borrow()),
+            facts,
+            Some(cancel),
+        )
+    })
 }
 
 fn parse_with_handle_control(
@@ -1335,6 +1396,7 @@ fn parse_with_handle_control(
 
     Some(FileSemanticIndex {
         language: language.semantic_language(),
+        language_evidence: LanguageSelection::explicit(language).evidence,
         includes,
         package,
         imports,
@@ -1372,37 +1434,6 @@ thread_local! {
     static TL_PARSER_HANDLE: RefCell<ParserHandle> = RefCell::new(ParserHandle::new());
 }
 
-/// Parse `source` using the thread-local [`ParserHandle`] and an explicit
-/// [`ParseFacts`] mask.
-///
-/// Intended for the indexer's Rayon-parallel file-parse loop. Each Rayon worker
-/// thread lazily creates its own `ParserHandle` on first call, then reuses it
-/// for all subsequent files parsed on that thread.
-pub fn parse_thread_local_with_language(
-    path: &Path,
-    source: &str,
-    language: SourceLanguage,
-    facts: ParseFacts,
-) -> FileSemanticIndex {
-    TL_PARSER_HANDLE.with(|cell| {
-        let handle = cell.borrow();
-        parse_with_handle_and_language(path, source, language, Some(&*handle), facts)
-    })
-}
-
-pub fn parse_thread_local_with_language_cancel(
-    path: &Path,
-    source: &str,
-    language: SourceLanguage,
-    facts: ParseFacts,
-    cancel: &AtomicBool,
-) -> Option<FileSemanticIndex> {
-    TL_PARSER_HANDLE.with(|cell| {
-        let handle = cell.borrow();
-        parse_with_handle_control(path, source, language, Some(&*handle), facts, Some(cancel))
-    })
-}
-
 fn lexical_fallback_with_recovery(
     path: &Path,
     source: &str,
@@ -1434,6 +1465,7 @@ fn lexical_fallback(
     };
     FileSemanticIndex {
         language: language.semantic_language(),
+        language_evidence: LanguageSelection::explicit(language).evidence,
         includes,
         package: None,
         imports: Vec::new(),

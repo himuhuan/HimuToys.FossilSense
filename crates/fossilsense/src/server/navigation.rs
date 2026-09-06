@@ -59,7 +59,11 @@ impl Backend {
             .as_deref()
             .and_then(|path| pathing::relative_slash_path(&root, path).ok())
             .unwrap_or_default();
-        let source_language = context.engine.workspace_semantics.language_for_uri(&uri);
+        let source_language = context
+            .engine
+            .workspace_semantics
+            .selection_for_uri(&uri, &text)
+            .language;
         let source_cursor_byte =
             query::byte_offset_at(&text, position.position.line, position.position.character);
 

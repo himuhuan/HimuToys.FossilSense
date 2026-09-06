@@ -10,7 +10,7 @@ use rayon::ThreadPoolBuilder;
 use super::candidates::FileCandidate;
 use super::ProgressLimiter;
 use crate::config::LanguageResolver;
-use crate::parser::{parse_thread_local_with_language, FileSemanticIndex, ParseFacts};
+use crate::parser::{parse_thread_local_with_selection, FileSemanticIndex, ParseFacts};
 use crate::progress::{IndexStats, IndexStatus};
 use crate::store::{FileIndexPayload, FileIndexUpdate, FileSource, IndexBuild, IndexStore};
 
@@ -175,8 +175,9 @@ fn parse_candidate(candidate: FileCandidate, language_resolver: &LanguageResolve
                 fingerprint.hash = blake3::hash(&bytes).to_hex().to_string();
             }
             let source = String::from_utf8_lossy(&bytes);
-            let language = language_resolver.language_for_path(&candidate.absolute_path);
-            let identity_path = if language == crate::config::SourceLanguage::Go {
+            let selection =
+                language_resolver.selection_for_source(&candidate.absolute_path, &source);
+            let identity_path = if selection.language == crate::config::SourceLanguage::Go {
                 std::path::Path::new(&fingerprint.path)
             } else {
                 candidate.absolute_path.as_path()
@@ -186,10 +187,10 @@ fn parse_candidate(candidate: FileCandidate, language_resolver: &LanguageResolve
             // vectors would be cleared before writing anyway).
             // It is infallible for ordinary parse problems (degrades to the
             // isolated completion fallback), so the only error here is the file read.
-            let mut index = parse_thread_local_with_language(
+            let mut index = parse_thread_local_with_selection(
                 identity_path,
                 &source,
-                language,
+                selection,
                 ParseFacts::INDEX,
             );
             if candidate.source == FileSource::External {
@@ -220,6 +221,86 @@ mod tests {
     use crate::call_model::LinkageDomain;
     use crate::config::WorkspaceConfig;
     use crate::store::FileFingerprint;
+
+    fn parse_header_source(
+        path: &str,
+        source: &str,
+        config: &WorkspaceConfig,
+    ) -> FileSemanticIndex {
+        let workspace = tempdir().expect("workspace");
+        let absolute_path = workspace.path().join(path);
+        fs::write(&absolute_path, source).expect("source");
+        let resolver = LanguageResolver::from_workspace_config(workspace.path(), config);
+        parse_candidate(
+            FileCandidate {
+                absolute_path,
+                fingerprint: FileFingerprint {
+                    path: path.into(),
+                    extension: "h".into(),
+                    size: source.len() as u64,
+                    mtime_ns: 1,
+                    hash: String::new(),
+                },
+                source: FileSource::Workspace,
+            },
+            &resolver,
+        )
+        .result
+        .expect("parsed")
+    }
+
+    #[test]
+    fn language_evidence_pipeline_generated_header_enters_c_recovery() {
+        let parsed = parse_header_source(
+            "sensor.pb-c.h",
+            "PROTOBUF_C__BEGIN_DECLS\ntypedef struct Sensor Sensor;\nPROTOBUF_C__END_DECLS\n",
+            &WorkspaceConfig::default(),
+        );
+        assert_eq!(parsed.language, crate::semantic_model::SemanticLanguage::C);
+        let sensor = parsed
+            .declarations
+            .iter()
+            .find(|fact| {
+                fact.name == "Sensor"
+                    && fact.declaration_kind
+                        == crate::semantic_model::SemanticDeclarationKind::Alias
+            })
+            .expect("first typedef survives default pipeline");
+        assert_eq!(
+            sensor.identity.language_fidelity,
+            crate::semantic_model::LanguageFidelity::Inferred
+        );
+        assert!(!parsed.diagnostics.recovery.is_empty());
+    }
+
+    #[test]
+    fn language_evidence_pipeline_defaults_are_not_explicit() {
+        for (path, fidelity) in [
+            ("unit.c", crate::semantic_model::LanguageFidelity::Inferred),
+            (
+                "shared.h",
+                crate::semantic_model::LanguageFidelity::Heuristic,
+            ),
+            (
+                "shared.inl",
+                crate::semantic_model::LanguageFidelity::Heuristic,
+            ),
+            (
+                "unit.cpp",
+                crate::semantic_model::LanguageFidelity::Inferred,
+            ),
+        ] {
+            let parsed = parse_header_source(path, "int visible;\n", &WorkspaceConfig::default());
+            assert!(!parsed.declarations.is_empty());
+            assert!(
+                parsed
+                    .declarations
+                    .iter()
+                    .all(|fact| fact.identity.language_fidelity == fidelity),
+                "{path}"
+            );
+        }
+    }
 
     #[test]
     fn go_parse_pipeline_uses_workspace_relative_identity_path() {

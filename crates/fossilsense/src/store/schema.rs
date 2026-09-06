@@ -1,6 +1,5 @@
-// Version 30 preserves bounded declaration owner/guard context on record,
-// alias, and member facts in addition to canonical declaration rows.
-pub(crate) const SCHEMA_VERSION: i64 = 30;
+// Version 31 binds compact language-selection evidence to file revisions.
+pub(crate) const SCHEMA_VERSION: i64 = 31;
 
 pub(crate) const DROP_DATA_TABLES_SQL: &str = "
     DROP TABLE IF EXISTS pending_file_revisions;
@@ -63,6 +62,7 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
         source TEXT NOT NULL,
         parser_version INTEGER NOT NULL,
         language INTEGER NOT NULL DEFAULT 2 CHECK(language BETWEEN 0 AND 3),
+        language_evidence TEXT,
         fact_mask INTEGER NOT NULL DEFAULT 0,
         parse_error_count INTEGER NOT NULL DEFAULT 0,
         fallback_used INTEGER NOT NULL DEFAULT 0 CHECK(fallback_used IN (0, 1)),

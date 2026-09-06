@@ -85,7 +85,11 @@ An optional `fossilsense.json` at the workspace root controls source scope, exte
 }
 ```
 
-All fields are optional. `.c` defaults to C; `.h`, `.inl`, and the standard C++ source/header extensions default to C++; `.go` defaults to Go. `languageOverrides` accepts `c`, `cpp`, or `go`, matches case-insensitively over normalized `/` paths, and applies the last matching rule. `goModulePaths` contains explicit absolute module roots and never triggers automatic GOPATH or machine module-cache discovery. `protobufC.enabled` defaults to `false`; project proto paths may be workspace-relative or absolute. Only generated `*.pb-c.h` files present in the parsed include graph are traced. Every external root is independently file/byte capped; each proto source extraction is also capped at 16 MiB and a fixed token budget. Invalid or over-budget inputs are skipped with a visible warning without discarding other configuration fields.
+All fields are optional. `.c` defaults to C; `.h`, `.inl`, and the standard C++ source/header extensions default to C++; `.go` defaults to Go. `languageOverrides` accepts `c`, `cpp`, or `go`, matches case-insensitively over normalized `/` paths, and applies the last matching rule. Without an override, a `.pb-c.h` file containing a complete `PROTOBUF_C__BEGIN_DECLS` code token in its first 64 KiB selects C and uses the existing protobuf-c declaration recovery. Comments, strings, and preprocessor directives do not count as evidence. This parsing rule does not require `protobufC.enabled`.
+
+Saved indexes and unsaved documents share the same language selection and retain its source and rule version. Explicit overrides take priority; extension defaults and generated-file recognition remain inferences. Ordinary `.h` and `.inl` files retain the C++ default with an ambiguity flag, so known C directories should use an override. Changing overrides reparses unchanged source files as well. An explicit grammar choice does not imply compiler-level declaration accuracy.
+
+`goModulePaths` contains explicit absolute module roots and never triggers automatic GOPATH or machine module-cache discovery. `protobufC.enabled` defaults to `false`; project proto paths may be workspace-relative or absolute. Only generated `*.pb-c.h` files present in the parsed include graph are traced. Every external root is independently file/byte capped; each proto source extraction is also capped at 16 MiB and a fixed token budget. Invalid or over-budget inputs are skipped with a visible warning without discarding other configuration fields.
 
 ## Main settings
 

@@ -339,8 +339,8 @@ impl Backend {
         text: &str,
         requested_facts: parser::ParseFacts,
     ) -> Option<Arc<FileSemanticIndex>> {
-        let language = self.source_language_for_path(path).await;
-        self.get_or_parse_document_with_language(
+        let language = self.source_selection_for_path(path, text).await;
+        self.get_or_parse_document_with_selection(
             uri,
             path,
             version,
@@ -351,16 +351,16 @@ impl Backend {
         .await
     }
 
-    async fn get_or_parse_document_with_language(
+    async fn get_or_parse_document_with_selection(
         &self,
         uri: &Url,
         path: &Path,
         version: i32,
         text: &str,
         requested_facts: parser::ParseFacts,
-        language: SourceLanguage,
+        language: crate::config::LanguageSelection,
     ) -> Option<Arc<FileSemanticIndex>> {
-        let identity_path = if language == SourceLanguage::Go {
+        let identity_path = if language.language == SourceLanguage::Go {
             self.root_for_uri(uri)
                 .await
                 .and_then(|root| pathing::relative_slash_path(&root, path).ok())
@@ -373,7 +373,7 @@ impl Backend {
             let path_owned = identity_path;
             let text_owned = text.to_string();
             return tokio::task::spawn_blocking(move || {
-                Arc::new(parser::parse_thread_local_with_language(
+                Arc::new(parser::parse_thread_local_with_selection(
                     &path_owned,
                     &text_owned,
                     language,
@@ -431,7 +431,7 @@ impl Backend {
             .await;
         let parse_cancellation = cancellation.clone();
         let index = tokio::task::spawn_blocking(move || {
-            parser::parse_thread_local_with_language_cancel(
+            parser::parse_thread_local_with_selection_cancel(
                 &path_owned,
                 &text_owned,
                 language,
@@ -463,7 +463,7 @@ impl Backend {
         identity_path: &str,
         version: i32,
         text: &str,
-        language: SourceLanguage,
+        language: crate::config::LanguageSelection,
     ) -> Option<Arc<FileSemanticIndex>> {
         if let Some(cached) = self
             .session
@@ -498,7 +498,7 @@ impl Backend {
         let path_owned = PathBuf::from(identity_path);
         let text_owned = text.to_string();
         let parsed = tokio::task::spawn_blocking(move || {
-            parser::parse_thread_local_with_language_cancel(
+            parser::parse_thread_local_with_selection_cancel(
                 &path_owned,
                 &text_owned,
                 language,
