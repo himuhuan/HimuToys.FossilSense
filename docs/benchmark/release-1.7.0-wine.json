@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "measured_at": "2026-09-06T21:43:50.3229906Z",
+  "command_line": "\"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark_large_workspace.ps1 -Repeats 1 -IncludeFullIndex -CaseFilter wine-full-index -TimeoutSeconds 120 -BenchmarkRoot target/verification/release-1.7.0/benchmark",
+  "binary_version": "fossilsense 1.7.0",
+  "machine": {
+    "os_version": "Microsoft Windows NT 10.0.26220.0",
+    "processor_count": 16,
+    "processor_name": "12th Gen Intel(R) Core(TM) i5-12500H",
+    "physical_memory_bytes": 25459482624
+  },
+  "sample_interval_ms": 20,
+  "results": [
+    {
+      "case_id": "wine-full-index",
+      "run": 1,
+      "workspace": "F:\\HimuToys\\HimuToys.FossilSense\\samples\\wine",
+      "sample_revision": "6eb2e4c32cc9e271856146df11ed3a5c2cf29234",
+      "database_path": "F:\\HimuToys\\HimuToys.FossilSense\\target\\verification\\release-1.7.0\\benchmark\\index-wine-rebuild.sqlite",
+      "database_size_bytes": 634953728,
+      "outer_process_metrics_comparable": true,
+      "elapsed_ms": 59852.466,
+      "peak_working_set_bytes": 928292864,
+      "peak_private_bytes": 994824192,
+      "metrics": {
+        "files": 7153,
+        "indexed": 7153,
+        "skipped": 0,
+        "deleted": 0,
+        "callable_anchors": 227480,
+        "call_sites": 1655463,
+        "elapsed_ms": 59654,
+        "discover_ms": 425,
+        "parse_ms": 18986,
+        "write_ms": 17853,
+        "check_ms": 5,
+        "include_edge_ms": 4698,
+        "secondary_index_ms": 10160,
+        "publication_ms": 6809,
+        "name_table_ms": 0,
+        "reach_graph_ms": 0
+      }
+    }
+  ]
+}
