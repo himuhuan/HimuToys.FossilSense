@@ -9,6 +9,7 @@ mod completion_history;
 mod completion_words;
 mod config;
 mod declaration_index;
+mod explain;
 mod includes;
 mod indexer;
 mod language_builtins;
@@ -230,6 +231,22 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum QueryCommand {
+    /// Explain declaration discovery from disk and one read-only index snapshot.
+    Explain {
+        workspace: PathBuf,
+        /// Workspace-relative source path; parent components are rejected.
+        file: PathBuf,
+        name: String,
+        /// 1-based line paired with a 1-based UTF-16 column.
+        #[arg(long, requires = "col", value_parser = clap::value_parser!(u32).range(1..))]
+        line: Option<u32>,
+        #[arg(long, requires = "line", value_parser = clap::value_parser!(u32).range(1..))]
+        col: Option<u32>,
+        #[arg(long)]
+        db: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Fuzzy workspace symbol search over the in-memory name table.
     Symbol {
         /// Workspace root whose index to query.
@@ -545,6 +562,21 @@ fn memory_report_lines(hydrated: &memory_report::HydratedMemoryReport) -> Vec<St
 
 fn run_query(kind: QueryCommand) -> Result<()> {
     match kind {
+        QueryCommand::Explain {
+            workspace,
+            file,
+            name,
+            line,
+            col,
+            db,
+            json,
+        } => match explain::run(workspace, file, name, line, col, db, json) {
+            Err(error) if error.is::<explain::InputError>() => {
+                eprintln!("error: {error}");
+                std::process::exit(2);
+            }
+            result => result,
+        },
         QueryCommand::Symbol {
             workspace,
             text,

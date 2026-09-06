@@ -21,26 +21,13 @@ pub fn scan_workspace(root: impl AsRef<Path>) -> Result<(ScanSummary, Option<Con
 
     let (config, config_issue) = WorkspaceConfig::load(&root);
 
-    let walk_config = config.clone();
-    let filter_root = root.clone();
-
     let mut files = Vec::new();
     let mut extension_counts = BTreeMap::new();
 
     // Walk with the same `ignore`-based semantics as the indexer and reference
     // search (respects `.gitignore` + scope config) so all three paths agree
     // on the file set.
-    let walker = ignore::WalkBuilder::new(&root)
-        .hidden(false)
-        .parents(true)
-        .git_ignore(true)
-        .git_global(true)
-        .filter_entry(move |entry| {
-            let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
-            let rel = relative_slash_path(&filter_root, entry.path()).unwrap_or_default();
-            walk_config.keep_during_walk(&rel, is_dir)
-        })
-        .build();
+    let walker = workspace_walk_builder(&root, &config).build();
 
     for entry in walker {
         let entry =
@@ -75,13 +62,122 @@ pub fn scan_workspace(root: impl AsRef<Path>) -> Result<(ScanSummary, Option<Con
     ))
 }
 
+fn workspace_walk_builder(root: &Path, config: &WorkspaceConfig) -> ignore::WalkBuilder {
+    let walk_config = config.clone();
+    let filter_root = root.to_path_buf();
+    let mut builder = ignore::WalkBuilder::new(root);
+    builder
+        .hidden(false)
+        .parents(true)
+        .git_ignore(true)
+        .git_global(true)
+        .filter_entry(move |entry| {
+            let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
+            let rel = relative_slash_path(&filter_root, entry.path()).unwrap_or_default();
+            walk_config.keep_during_walk(&rel, is_dir)
+        });
+    builder
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct FileInclusion {
+    pub included: bool,
+    pub inspected: usize,
+    pub truncated: bool,
+}
+
+/// Reuse the scanner's ignore/config matcher, visiting only the target's
+/// ancestor directories. The public visitor can stop and prune before any
+/// unrelated subtree is enumerated; explicit file roots would bypass ignores.
+pub(crate) fn file_inclusion(
+    root: &Path,
+    target: &Path,
+    config: &WorkspaceConfig,
+    limit: usize,
+) -> Result<FileInclusion> {
+    let rel = relative_slash_path(root, target)?;
+    if !config.is_in_scope(&rel) {
+        return Ok(FileInclusion::default());
+    }
+    let state = std::sync::Mutex::new((FileInclusion::default(), None));
+    workspace_walk_builder(root, config)
+        .threads(1)
+        .build_parallel()
+        .run(|| {
+            Box::new(|entry| {
+                let mut state = state.lock().expect("single scanner visitor");
+                if state.0.inspected >= limit {
+                    state.0.truncated = true;
+                    return ignore::WalkState::Quit;
+                }
+                state.0.inspected += 1;
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        state.1 = Some(error);
+                        return ignore::WalkState::Quit;
+                    }
+                };
+                if entry.file_type().is_some_and(|kind| kind.is_dir()) {
+                    return if crate::pathing::path_is_within(entry.path(), target) {
+                        ignore::WalkState::Continue
+                    } else {
+                        ignore::WalkState::Skip
+                    };
+                }
+                if entry.file_type().is_some_and(|kind| kind.is_file())
+                    && crate::pathing::path_is_within(entry.path(), target)
+                    && crate::pathing::path_is_within(target, entry.path())
+                {
+                    state.0.included = true;
+                    return ignore::WalkState::Quit;
+                }
+                ignore::WalkState::Continue
+            })
+        });
+    let (result, error) = state.into_inner().expect("single scanner visitor");
+    if let Some(error) = error {
+        return Err(error.into());
+    }
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::PathBuf;
 
     use tempfile::tempdir;
 
     use super::scan_workspace;
+
+    #[test]
+    fn single_file_inclusion_matches_real_scan_rules_and_honors_visit_limit() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        fs::create_dir(dir.path().join("nested")).unwrap();
+        fs::write(dir.path().join(".gitignore"), "ignored.c\n").unwrap();
+        fs::write(dir.path().join("nested/.ignore"), "hidden.c\n").unwrap();
+        for file in ["main.c", "ignored.c", "nested/good.c", "nested/hidden.c"] {
+            fs::write(dir.path().join(file), "int value;\n").unwrap();
+        }
+        let root = dir.path().canonicalize().unwrap();
+        let (config, _) = crate::config::WorkspaceConfig::load(&root);
+        let (scan, _) = scan_workspace(&root).unwrap();
+        for file in ["main.c", "ignored.c", "nested/good.c", "nested/hidden.c"] {
+            let actual = super::file_inclusion(&root, &root.join(file), &config, 128).unwrap();
+            assert_eq!(
+                actual.included,
+                scan.files.contains(&PathBuf::from(file)),
+                "{file}"
+            );
+            assert!(!actual.truncated);
+        }
+        let bounded =
+            super::file_inclusion(&root, &root.join("nested/good.c"), &config, 0).unwrap();
+        assert!(bounded.truncated);
+        assert_eq!(bounded.inspected, 0);
+    }
 
     #[test]
     fn scans_cpp_like_files_and_skips_default_excludes() {

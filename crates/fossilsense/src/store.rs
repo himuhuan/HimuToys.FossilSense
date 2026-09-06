@@ -11,6 +11,8 @@ use crate::semantic_model::{
     PARSER_FACT_VERSION,
 };
 
+mod diagnostic;
+pub(crate) use diagnostic::{DiagnosticIndexMetadata, DiagnosticReadSnapshot};
 mod generation_lease;
 mod generations;
 mod go_package_graph;
