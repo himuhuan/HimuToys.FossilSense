@@ -2246,6 +2246,257 @@ int guarded(void);
 }
 
 #[test]
+fn c_declaration_kinds_share_one_preprocessor_guard() {
+    let source = r#"#if FEATURE_ENABLED
+int guarded_object;
+#define GUARDED_MACRO 1
+struct GuardedRecord { int guarded_member; };
+typedef struct GuardedRecord GuardedAlias;
+enum GuardedEnum { GUARDED_ENUM_VALUE };
+int guarded_function(void);
+#endif
+"#;
+
+    let index = parse(Path::new("guarded.c"), source);
+    for name in [
+        "guarded_object",
+        "GUARDED_MACRO",
+        "GuardedRecord",
+        "GuardedAlias",
+        "GuardedEnum",
+        "GUARDED_ENUM_VALUE",
+        "guarded_function",
+    ] {
+        let declaration = index
+            .declarations
+            .iter()
+            .find(|declaration| declaration.name == name)
+            .unwrap_or_else(|| panic!("missing guarded declaration {name}"));
+        assert_eq!(
+            declaration.guard.as_deref(),
+            Some("#if FEATURE_ENABLED"),
+            "guard mismatch for {name}"
+        );
+    }
+
+    let record = index
+        .records
+        .iter()
+        .find(|record| record.display_name == "GuardedRecord")
+        .expect("guarded record fact");
+    assert_eq!(record.guard.as_deref(), Some("#if FEATURE_ENABLED"));
+    let alias = index
+        .aliases
+        .iter()
+        .find(|alias| alias.alias == "GuardedAlias")
+        .expect("guarded alias fact");
+    assert_eq!(alias.guard.as_deref(), Some("#if FEATURE_ENABLED"));
+    let member = index
+        .members
+        .iter()
+        .find(|member| member.name == "guarded_member")
+        .expect("guarded member fact");
+    assert_eq!(member.guard.as_deref(), Some("#if FEATURE_ENABLED"));
+}
+
+#[test]
+fn c_elif_else_and_nested_guards_keep_branch_exclusion_evidence() {
+    let source = r#"#if FEATURE_A
+int selected;
+#elif FEATURE_B
+int selected;
+#else
+#if FEATURE_C
+int selected;
+#endif
+#endif
+"#;
+
+    let index = parse(Path::new("branches.c"), source);
+    let selected = index
+        .declarations
+        .iter()
+        .filter(|declaration| declaration.name == "selected")
+        .collect::<Vec<_>>();
+    assert_eq!(selected.len(), 3);
+    assert_eq!(selected[0].guard.as_deref(), Some("#if FEATURE_A"));
+    let elif_guard = selected[1].guard.as_deref().expect("elif guard");
+    assert!(elif_guard.contains("#elif FEATURE_B"));
+    assert!(elif_guard.contains("!(#if FEATURE_A)"));
+    let nested_else_guard = selected[2].guard.as_deref().expect("nested else guard");
+    assert!(nested_else_guard.contains("#else"));
+    assert!(nested_else_guard.contains("!(#if FEATURE_A)"));
+    assert!(nested_else_guard.contains("!(#elif FEATURE_B)"));
+    assert!(nested_else_guard.contains("#if FEATURE_C"));
+    assert_ne!(selected[0].identity.locator, selected[1].identity.locator);
+    assert_ne!(selected[1].identity.locator, selected[2].identity.locator);
+}
+
+#[test]
+fn c_inner_else_excludes_only_its_own_branch_chain() {
+    let source = r#"#if OUTER
+#if INNER
+int nested_choice;
+#else
+int nested_choice;
+#endif
+#endif
+"#;
+    let index = parse(Path::new("nested-else.c"), source);
+    let choices = index
+        .declarations
+        .iter()
+        .filter(|declaration| declaration.name == "nested_choice")
+        .collect::<Vec<_>>();
+    assert_eq!(choices.len(), 2);
+    let else_guard = choices[1].guard.as_deref().expect("inner else guard");
+    assert!(else_guard.contains("#if OUTER"));
+    assert!(else_guard.contains("!(#if INNER)"));
+    assert!(else_guard.contains("#else"));
+    assert!(!else_guard.contains("!(#if OUTER)"));
+}
+
+#[test]
+fn c_preprocessor_guard_depth_and_size_are_bounded() {
+    let mut deep = String::new();
+    for index in 0..129 {
+        deep.push_str(&format!("#if DEPTH_{index}\n"));
+    }
+    deep.push_str("int deep_guarded;\n");
+    for _ in 0..129 {
+        deep.push_str("#endif\n");
+    }
+    let deep_index = parse(Path::new("deep.c"), &deep);
+    let deep_guard = deep_index
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name == "deep_guarded")
+        .and_then(|declaration| declaration.guard.as_deref())
+        .expect("bounded deep guard");
+    assert!(deep_guard.contains("unknown:budget_exhausted"));
+    assert!(deep_guard.len() <= 8 * 1024);
+
+    let long_condition = "X".repeat(9 * 1024);
+    let long_source = format!("#if {long_condition}\nint long_guarded;\n#endif\n");
+    let long_index = parse(Path::new("long.c"), &long_source);
+    let long_guard = long_index
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name == "long_guarded")
+        .and_then(|declaration| declaration.guard.as_deref())
+        .expect("bounded long guard");
+    assert_eq!(long_guard, "unknown:budget_exhausted");
+}
+
+#[test]
+fn c_local_types_stay_request_local_without_hiding_valid_file_types_or_macros() {
+    let source = r#"struct Shared { int file_member; };
+struct Outer { struct Nested { int nested_member; } nested; };
+void run(void) {
+    struct Shared { int local_shadow_member; };
+    struct Local { int local_member; };
+    typedef int LocalT;
+#define FUNCTION_TEXT_MACRO 1
+}
+"#;
+
+    let indexed = parse_with_handle(Path::new("scope.c"), source, None, ParseFacts::INDEX);
+    assert_eq!(
+        indexed
+            .records
+            .iter()
+            .filter(|record| record.display_name == "Shared")
+            .count(),
+        1
+    );
+    assert!(indexed
+        .records
+        .iter()
+        .all(|record| record.display_name != "Local"));
+    assert!(indexed.aliases.iter().all(|alias| alias.alias != "LocalT"));
+    assert!(indexed
+        .members
+        .iter()
+        .all(|member| { !matches!(member.name.as_str(), "local_shadow_member" | "local_member") }));
+    let nested = indexed
+        .records
+        .iter()
+        .find(|record| record.display_name == "Nested")
+        .expect("valid nested record");
+    assert_eq!(nested.owner.as_deref(), Some("Outer"));
+    assert!(indexed
+        .members
+        .iter()
+        .any(|member| member.name == "nested_member"));
+    let macro_fact = indexed
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name == "FUNCTION_TEXT_MACRO")
+        .expect("function-text macro remains a preprocessing fact");
+    assert_eq!(macro_fact.owner, None);
+
+    let live = parse_with_handle(Path::new("scope.c"), source, None, ParseFacts::COMPLETION);
+    for (name, namespace) in [
+        ("Shared", super::LocalBindingNamespace::Tag),
+        ("Local", super::LocalBindingNamespace::Tag),
+        ("LocalT", super::LocalBindingNamespace::Ordinary),
+    ] {
+        let local_type = live
+            .local_bindings
+            .iter()
+            .find(|binding| {
+                binding.name == name && binding.kind == super::LocalBindingKind::LocalType
+            })
+            .unwrap_or_else(|| panic!("missing request-local type {name}"));
+        assert_eq!(local_type.namespace, namespace);
+        assert!(local_type.scope_start_byte <= local_type.decl_start_byte);
+        assert!(local_type.decl_start_byte < local_type.scope_end_byte);
+    }
+}
+
+#[test]
+fn c_anonymous_local_enum_constants_remain_request_local() {
+    let source = "void run(void) { enum { READY }; int value = READY; }\n";
+    let live = parse_with_handle(
+        Path::new("anonymous-enum.c"),
+        source,
+        None,
+        ParseFacts::COMPLETION,
+    );
+
+    let ready = live
+        .local_bindings
+        .iter()
+        .find(|binding| binding.name == "READY")
+        .expect("anonymous local enum constant");
+    assert_eq!(ready.kind, super::LocalBindingKind::LocalConstant);
+    assert_eq!(ready.namespace, super::LocalBindingNamespace::Ordinary);
+    assert!(live
+        .declarations
+        .iter()
+        .all(|declaration| declaration.name != "READY"));
+}
+
+#[test]
+fn c_function_signature_record_definition_is_not_treated_as_body_local() {
+    let source = "struct SignatureType { int value; } make_value(void) {\n    struct BodyLocal { int hidden; };\n    return (struct SignatureType){0};\n}\n";
+    let index = parse(Path::new("signature-scope.c"), source);
+
+    assert!(index
+        .records
+        .iter()
+        .any(|record| record.display_name == "SignatureType"));
+    assert!(index
+        .declarations
+        .iter()
+        .any(|declaration| declaration.name == "SignatureType"));
+    assert!(index
+        .records
+        .iter()
+        .all(|record| record.display_name != "BodyLocal"));
+}
+
+#[test]
 fn parse_reports_ast_provenance_on_clean_file() {
     // A syntactically valid file has canonical AST declarations and no lexical
     // completion fallback.

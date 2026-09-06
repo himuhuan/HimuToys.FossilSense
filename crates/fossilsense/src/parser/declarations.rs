@@ -158,23 +158,28 @@ fn record_declaration(
     } else {
         SemanticFactFidelity::Incomplete
     };
+    let qualified_name = record
+        .owner
+        .as_ref()
+        .map_or_else(|| name.clone(), |owner| format!("{owner}::{name}"));
+    let guard_fingerprint = record.guard.as_ref().map(|guard| digest(guard));
     let mut declaration = fact(
         path,
         language,
         name.clone(),
-        name,
+        qualified_name,
         SemanticDeclarationKind::Type,
         SemanticDeclarationRole::Definition,
         record.name_range,
         record.declaration_range,
         Some(record.signature.clone()),
-        None,
+        record.owner.clone(),
         LinkageDomain::External,
-        None,
+        record.guard.clone(),
         SemanticFactProvenance::Ast,
         fidelity,
         digest(&format!("record|{}|{}", path_text(path), record.record_key)),
-        None,
+        guard_fingerprint,
         DeclarationBacking::Record {
             record_key: record.record_key.clone(),
         },
@@ -217,11 +222,16 @@ fn alias_declaration(
         crate::semantic_model::AliasTargetFidelity::Heuristic => SemanticFactFidelity::LowFidelity,
         crate::semantic_model::AliasTargetFidelity::Malformed => SemanticFactFidelity::Incomplete,
     };
+    let qualified_name = alias.owner.as_ref().map_or_else(
+        || alias.alias.clone(),
+        |owner| format!("{owner}::{}", alias.alias),
+    );
+    let guard_fingerprint = alias.guard.as_ref().map(|guard| digest(guard));
     fact(
         path,
         language,
         alias.alias.clone(),
-        alias.alias.clone(),
+        qualified_name,
         SemanticDeclarationKind::Alias,
         SemanticDeclarationRole::Definition,
         name_range,
@@ -232,13 +242,13 @@ fn alias_declaration(
             .filter(|signature| !signature.is_empty())
             .map(str::to_string)
             .or_else(|| Some(alias.underlying_spelling.clone())),
-        None,
+        alias.owner.clone(),
         LinkageDomain::External,
-        None,
+        alias.guard.clone(),
         SemanticFactProvenance::Ast,
         fidelity,
         alias.fingerprint.clone(),
-        None,
+        guard_fingerprint,
         DeclarationBacking::TypeAlias {
             fingerprint: alias.fingerprint.clone(),
         },

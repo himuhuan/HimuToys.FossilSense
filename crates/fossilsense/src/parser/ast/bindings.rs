@@ -174,6 +174,48 @@ pub(super) fn collect_body_bindings(
             if language != SourceLanguage::C {
                 continue;
             }
+        } else if language == SourceLanguage::C && node.kind() == "type_definition" {
+            let (scope_start_byte, scope_end_byte) =
+                nearest_compound_scope(node, function_start_byte, function_end_byte);
+            push_binding_declarators(
+                node,
+                source,
+                LocalBindingKind::LocalType,
+                function_start_byte,
+                function_end_byte,
+                scope_start_byte,
+                scope_end_byte,
+                out,
+            );
+        } else if language == SourceLanguage::C
+            && matches!(
+                node.kind(),
+                "struct_specifier" | "union_specifier" | "enum_specifier"
+            )
+            && node.child_by_field_name("body").is_some()
+        {
+            if let Some((name_node, name)) = node
+                .child_by_field_name("name")
+                .and_then(|name_node| node_text(name_node, source).map(|name| (name_node, name)))
+            {
+                let (scope_start_byte, scope_end_byte) =
+                    nearest_compound_scope(node, function_start_byte, function_end_byte);
+                let type_text = source
+                    .get(node.start_byte()..node.child_by_field_name("body").unwrap().start_byte())
+                    .map(compact_whitespace)
+                    .filter(|text| !text.is_empty());
+                out.push(LocalBinding {
+                    name: name.to_string(),
+                    kind: LocalBindingKind::LocalType,
+                    namespace: super::super::LocalBindingNamespace::Tag,
+                    type_text,
+                    decl_start_byte: name_node.start_byte(),
+                    function_start_byte,
+                    function_end_byte,
+                    scope_start_byte,
+                    scope_end_byte,
+                });
+            }
         } else if language == SourceLanguage::C && node.kind() == "enumerator" {
             let Some(name_node) = node.child_by_field_name("name") else {
                 continue;
@@ -186,6 +228,7 @@ pub(super) fn collect_body_bindings(
             out.push(LocalBinding {
                 name: name.to_string(),
                 kind: LocalBindingKind::LocalConstant,
+                namespace: super::super::LocalBindingNamespace::Ordinary,
                 type_text: None,
                 decl_start_byte: name_node.start_byte(),
                 function_start_byte,
@@ -220,6 +263,7 @@ pub(super) fn push_binding_declarators(
             out.push(LocalBinding {
                 name: name.to_string(),
                 kind,
+                namespace: super::super::LocalBindingNamespace::Ordinary,
                 type_text: type_text.clone(),
                 decl_start_byte: id_node.start_byte(),
                 function_start_byte,

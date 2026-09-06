@@ -491,6 +491,8 @@ fn collect_type_spec(
                 AliasTargetFidelity::AstExact
             },
             fingerprint: fingerprint.clone(),
+            owner: None,
+            guard: guard.map(str::to_string),
         });
         DeclarationBacking::TypeAlias { fingerprint }
     } else {
@@ -569,6 +571,8 @@ fn record_fact(
                 .get(declaration.start_byte()..declaration.end_byte())
                 .unwrap_or_default(),
         ),
+        owner: None,
+        guard: None,
     }
 }
 
@@ -608,6 +612,7 @@ fn collect_interface_members(
                     .get(child.start_byte()..child.end_byte())
                     .unwrap_or_default(),
             ),
+            guard: None,
         });
     }
 }
@@ -675,6 +680,7 @@ fn collect_struct_members(
                 end_line: name_range.end.line as usize,
                 end_col: name_range.end.character as usize,
                 signature,
+                guard: None,
             });
         }
     }
@@ -747,6 +753,7 @@ fn method_member(owner: &str, package_key: &str, anchor: &CallableAnchor) -> Mem
         end_line: anchor.name_range.end.line as usize,
         end_col: anchor.name_range.end.character as usize,
         signature: anchor.presentation_signature.clone(),
+        guard: anchor.guard.clone(),
     }
 }
 
@@ -1092,6 +1099,7 @@ fn collect_local_binding(
         bindings.push(LocalBinding {
             name: name.to_string(),
             kind,
+            namespace: super::LocalBindingNamespace::Ordinary,
             type_text: type_text.clone(),
             decl_start_byte: name_node.start_byte(),
             function_start_byte: scope.body_range.start_byte,

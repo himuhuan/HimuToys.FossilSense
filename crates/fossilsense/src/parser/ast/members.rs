@@ -107,6 +107,7 @@ pub(super) fn collect_body_members(
                 .collect()
         };
         for (_decl, id_node, name, kind, signature) in candidates {
+            let member_guard = super::context::guard_for_node(id_node, source);
             let mut type_name = (kind == MemberKind::Field)
                 .then(|| member_type_name.clone())
                 .flatten();
@@ -120,6 +121,8 @@ pub(super) fn collect_body_members(
                         type_node,
                         &nested_record_key,
                         &nested_display_name,
+                        Some(record_display_name.to_string()),
+                        member_guard.clone(),
                         source,
                         line_starts,
                     );
@@ -174,6 +177,7 @@ pub(super) fn collect_body_members(
                 MemberConfidence::InBody,
                 type_name,
                 signature.clone(),
+                member_guard,
                 source,
                 line_starts,
             );
@@ -273,6 +277,7 @@ pub(super) fn collect_out_of_class_method_member(
         MemberConfidence::OutOfClassOwner,
         None,
         signature,
+        super::context::guard_for_node(node, source),
         source,
         line_starts,
     );
@@ -313,11 +318,14 @@ pub(super) fn anonymous_record_type_node(type_node: tree_sitter::Node<'_>) -> bo
         && type_node.child_by_field_name("name").is_none()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn push_synthetic_nested_record(
     records: &mut Vec<RecordDef>,
     type_node: tree_sitter::Node<'_>,
     record_key: &str,
     display_name: &str,
+    owner: Option<String>,
+    guard: Option<String>,
     source: &str,
     line_starts: &[usize],
 ) {
@@ -374,6 +382,8 @@ pub(super) fn push_synthetic_nested_record(
         },
         confidence: RecordConfidence::Heuristic,
         signature,
+        owner,
+        guard,
     });
 }
 
@@ -396,6 +406,7 @@ pub(super) fn push_member(
     confidence: MemberConfidence,
     type_name: Option<String>,
     signature: String,
+    guard: Option<String>,
     source: &str,
     line_starts: &[usize],
 ) {
@@ -408,6 +419,7 @@ pub(super) fn push_member(
         confidence,
         type_name,
         signature,
+        guard,
         source,
         line_starts,
     );
@@ -423,6 +435,7 @@ pub(super) fn push_member_at_byte(
     confidence: MemberConfidence,
     type_name: Option<String>,
     signature: String,
+    guard: Option<String>,
     source: &str,
     line_starts: &[usize],
 ) {
@@ -444,6 +457,7 @@ pub(super) fn push_member_at_byte(
         end_line,
         end_col: byte_to_utf16_col(source, end_line_byte, end_byte),
         signature,
+        guard,
     });
 }
 

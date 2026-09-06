@@ -219,7 +219,9 @@ fn local_kind_for_occurrence(
     local_bindings
         .iter()
         .filter(|binding| {
-            binding.name == occ.name && local_binding_visible_at_occurrence(binding, occ.start_byte)
+            binding.name == occ.name
+                && binding.namespace == crate::parser::LocalBindingNamespace::Ordinary
+                && local_binding_visible_at_occurrence(binding, occ.start_byte)
         })
         .max_by_key(|binding| binding.decl_start_byte)
         .map(|binding| match binding.kind {

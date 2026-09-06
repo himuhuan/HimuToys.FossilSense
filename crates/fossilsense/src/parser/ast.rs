@@ -12,12 +12,14 @@ use crate::call_model::{SourcePosition, SourceRange};
 use crate::config::SourceLanguage;
 mod aliases;
 mod bindings;
+pub(super) mod context;
 mod members;
 mod objects;
 
 use aliases::*;
 pub use bindings::infer_receiver_record;
 use bindings::{collect_function_local_bindings, occurrence_at, symbol_from_name_node};
+use context::DeclarationContext;
 use members::*;
 use objects::*;
 
@@ -84,6 +86,7 @@ pub(super) fn collect_ast_index(
             )
         });
     let mut stack = vec![Visit::Enter(root)];
+    let mut declaration_context = DeclarationContext::default();
     while let Some(visit) = stack.pop() {
         let node = match visit {
             Visit::Enter(node) => node,
@@ -91,6 +94,7 @@ pub(super) fn collect_ast_index(
                 if let Some(collector) = call_collector.as_mut() {
                     collector.exit(node);
                 }
+                declaration_context.exit(node);
                 continue;
             }
         };
@@ -108,6 +112,8 @@ pub(super) fn collect_ast_index(
                 source,
                 line_starts,
                 language,
+                declaration_context.owner(),
+                declaration_context.guard(),
                 &mut out.declarations,
             );
         }
@@ -120,6 +126,7 @@ pub(super) fn collect_ast_index(
                 source,
                 line_starts,
                 language,
+                declaration_context.guard(),
                 &mut out.declarations,
             );
         }
@@ -149,6 +156,7 @@ pub(super) fn collect_ast_index(
                 node.kind(),
                 "struct_specifier" | "union_specifier" | "enum_specifier" | "class_specifier"
             )
+            && !(language == SourceLanguage::C && declaration_context.local_scope(node).is_some())
         {
             let body = node.child_by_field_name("body");
             let role = if body.is_some() {
@@ -175,6 +183,8 @@ pub(super) fn collect_ast_index(
                             symbol.signature = compact_whitespace(signature);
                         }
                     }
+                    symbol.guard = declaration_context.guard();
+                    symbol.container = declaration_context.owner();
                     out.type_symbols.push(symbol);
                 }
             }
@@ -187,6 +197,7 @@ pub(super) fn collect_ast_index(
                 node.kind(),
                 "struct_specifier" | "union_specifier" | "class_specifier"
             )
+            && !(language == SourceLanguage::C && declaration_context.local_scope(node).is_some())
         {
             if let Some(body) = node.child_by_field_name("body") {
                 let name_node = node.child_by_field_name("name");
@@ -267,6 +278,8 @@ pub(super) fn collect_ast_index(
                         range_fidelity,
                         confidence,
                         signature,
+                        owner: declaration_context.owner(),
+                        guard: declaration_context.guard(),
                     });
 
                     if facts.contains(ParseFacts::FIELDS) {
@@ -286,10 +299,10 @@ pub(super) fn collect_ast_index(
             }
         } else if facts.contains(ParseFacts::DECLARATIONS)
             && node.kind() == "enumerator"
-            && !(language == SourceLanguage::C && is_within_function_body(node))
+            && !(language == SourceLanguage::C && declaration_context.local_scope(node).is_some())
         {
             let id = node.child_by_field_name("name").unwrap_or(node);
-            if let Some(symbol) = symbol_from_name_node(
+            if let Some(mut symbol) = symbol_from_name_node(
                 id,
                 SymbolKind::EnumConstant,
                 SymbolRole::Definition,
@@ -297,10 +310,13 @@ pub(super) fn collect_ast_index(
                 source,
                 line_starts,
             ) {
+                symbol.guard = declaration_context.guard();
+                symbol.container = declaration_context.owner();
                 out.enum_constants.push(symbol);
             }
         } else if facts.intersects(ParseFacts::DECLARATIONS | ParseFacts::ALIASES)
             && node.kind() == "type_definition"
+            && !(language == SourceLanguage::C && declaration_context.local_scope(node).is_some())
         {
             if let Some(type_node) = node.child_by_field_name("type") {
                 if let Some(target) = get_alias_target(type_node, source) {
@@ -414,6 +430,8 @@ pub(super) fn collect_ast_index(
                                 declarator_shape,
                                 target_fidelity,
                                 fingerprint,
+                                owner: declaration_context.owner(),
+                                guard: declaration_context.guard(),
                             });
                         }
                     }
@@ -428,6 +446,8 @@ pub(super) fn collect_ast_index(
                 source,
                 line_starts,
                 facts,
+                declaration_context.owner(),
+                declaration_context.guard(),
                 &mut out.type_symbols,
                 &mut out.aliases,
             );
@@ -453,9 +473,8 @@ pub(super) fn collect_ast_index(
                 }
             }
         }
-        if call_collector.is_some() {
-            stack.push(Visit::Exit(node));
-        }
+        declaration_context.enter(node, source, line_starts);
+        stack.push(Visit::Exit(node));
         let mut cursor = node.walk();
         let children: Vec<_> = node.children(&mut cursor).collect();
         for child in children.into_iter().rev() {
@@ -477,17 +496,4 @@ fn is_c_file_scope_tag_declaration(node: tree_sitter::Node<'_>) -> bool {
         && node.parent().is_some_and(|parent| {
             parent.kind() == "translation_unit" || parent.kind().starts_with("preproc_")
         })
-}
-
-fn is_within_function_body(node: tree_sitter::Node<'_>) -> bool {
-    let mut parent = node.parent();
-    while let Some(ancestor) = parent {
-        if ancestor.kind() == "function_definition" {
-            return ancestor.child_by_field_name("body").is_some_and(|body| {
-                body.start_byte() <= node.start_byte() && node.end_byte() <= body.end_byte()
-            });
-        }
-        parent = ancestor.parent();
-    }
-    false
 }

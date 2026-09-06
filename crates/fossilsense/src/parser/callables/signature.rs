@@ -590,24 +590,7 @@ pub(super) fn digest(value: &str) -> String {
 }
 
 pub(super) fn preprocessor_guard(node: tree_sitter::Node<'_>, source: &str) -> Option<String> {
-    let mut guards = Vec::new();
-    let mut parent = node.parent();
-    while let Some(ancestor) = parent {
-        if matches!(
-            ancestor.kind(),
-            "preproc_if" | "preproc_ifdef" | "preproc_ifndef" | "preproc_elif"
-        ) {
-            let line_end = source[ancestor.start_byte()..]
-                .find('\n')
-                .map_or(ancestor.end_byte(), |offset| ancestor.start_byte() + offset);
-            if let Some(line) = source.get(ancestor.start_byte()..line_end) {
-                guards.push(line.trim().to_string());
-            }
-        }
-        parent = ancestor.parent();
-    }
-    guards.reverse();
-    (!guards.is_empty()).then(|| guards.join("\n"))
+    crate::parser::ast::context::guard_for_node(node, source)
 }
 
 pub(super) fn utf16_col(source: &str, line_starts: &[usize], row: usize, byte: usize) -> u32 {

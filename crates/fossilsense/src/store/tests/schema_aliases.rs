@@ -37,6 +37,8 @@ fn test_store_schema_v16() {
     assert!(record_columns.contains(&"declaration_start_byte".to_string()));
     assert!(record_columns.contains(&"range_fidelity".to_string()));
     assert!(record_columns.contains(&"declaration_hash".to_string()));
+    assert!(record_columns.contains(&"owner".to_string()));
+    assert!(record_columns.contains(&"guard".to_string()));
 
     let alias_columns: Vec<String> = reader
         .conn
@@ -52,6 +54,18 @@ fn test_store_schema_v16() {
     assert!(alias_columns.contains(&"target_fidelity".to_string()));
     assert!(alias_columns.contains(&"fingerprint".to_string()));
     assert!(alias_columns.contains(&"declaration_hash".to_string()));
+    assert!(alias_columns.contains(&"owner".to_string()));
+    assert!(alias_columns.contains(&"guard".to_string()));
+
+    let member_columns: Vec<String> = reader
+        .conn
+        .prepare("PRAGMA table_info(member_facts)")
+        .unwrap()
+        .query_map([], |row| row.get(1))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert!(member_columns.contains(&"guard".to_string()));
 
     let alias_indexes: Vec<String> = reader
         .conn
@@ -99,6 +113,95 @@ fn test_store_schema_v16() {
         .resolve_record_candidates(&["Foo"], None)
         .expect("records");
     assert!(records_after.is_empty());
+}
+
+#[test]
+fn c_declaration_context_roundtrips_through_typed_store_rows() {
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+    let mut store = IndexStore::open(&db, dir.path()).expect("store");
+    let source = "#if ENABLED\nstruct Outer { struct Nested { int value; } nested; };\ntypedef struct Outer OuterAlias;\n#endif\n";
+    upsert_source(&mut store, "guarded.h", source);
+
+    let reader = IndexStore::open_readonly(&db).expect("readonly");
+    for name in ["Outer", "Nested", "OuterAlias"] {
+        let (rows, truncated) = reader
+            .declaration_view()
+            .by_name_limited(name, 8)
+            .expect("declaration rows");
+        assert!(!truncated);
+        let row = rows.first().unwrap_or_else(|| panic!("missing {name}"));
+        assert_eq!(row.fact.guard.as_deref(), Some("#if ENABLED"));
+    }
+
+    let (records, truncated) = reader
+        .member_view()
+        .record_rows_by_name_limited("Nested", 8)
+        .expect("record rows");
+    assert!(!truncated);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].owner.as_deref(), Some("Outer"));
+    assert_eq!(records[0].guard.as_deref(), Some("#if ENABLED"));
+
+    let (aliases, truncated) = reader
+        .member_view()
+        .alias_rows_by_name_limited("OuterAlias", 8)
+        .expect("alias rows");
+    assert!(!truncated);
+    assert_eq!(aliases.len(), 1);
+    assert_eq!(aliases[0].owner, None);
+    assert_eq!(aliases[0].guard.as_deref(), Some("#if ENABLED"));
+
+    let member_guard: Option<String> = reader
+        .conn
+        .query_row(
+            "SELECT guard FROM member_facts WHERE name = 'value'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("member guard");
+    assert_eq!(member_guard.as_deref(), Some("#if ENABLED"));
+
+    let overlay = parse(std::path::Path::new("guarded.h"), source);
+    for name in ["Outer", "Nested", "OuterAlias"] {
+        let overlay_fact = overlay
+            .declarations
+            .iter()
+            .find(|fact| fact.name == name)
+            .unwrap_or_else(|| panic!("missing overlay {name}"));
+        let (stored, _) = reader
+            .declaration_view()
+            .by_name_limited(name, 8)
+            .expect("stored declaration");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].fact.owner, overlay_fact.owner);
+        assert_eq!(stored[0].fact.guard, overlay_fact.guard);
+    }
+
+    drop(reader);
+    let reparsed = parse(std::path::Path::new("guarded.h"), source);
+    store
+        .upsert_file_index_with_source(
+            &FileFingerprint {
+                path: "guarded.h".to_string(),
+                extension: "h".to_string(),
+                size: source.len() as u64,
+                mtime_ns: 2,
+                hash: "guarded-v2".to_string(),
+            },
+            &reparsed,
+            FileSource::Workspace,
+        )
+        .expect("publish replacement revision");
+    let reader = IndexStore::open_readonly(&db).expect("readonly after replacement");
+    let (rows, truncated) = reader
+        .declaration_view()
+        .by_name_limited("Outer", 8)
+        .expect("active replacement rows");
+    assert!(!truncated);
+    assert_eq!(rows.len(), 1, "old and new revisions must not mix");
+    assert_eq!(rows[0].revision_hash, "guarded-v2");
+    assert_eq!(rows[0].fact.guard.as_deref(), Some("#if ENABLED"));
 }
 
 #[test]

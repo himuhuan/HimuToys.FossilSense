@@ -1,11 +1,14 @@
 use super::*;
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn collect_cpp_alias_declaration(
     node: tree_sitter::Node<'_>,
     path: &Path,
     source: &str,
     line_starts: &[usize],
     facts: ParseFacts,
+    owner: Option<String>,
+    guard: Option<String>,
     type_symbols: &mut Vec<super::super::RawDeclaration>,
     aliases: &mut Vec<TypeAlias>,
 ) {
@@ -20,7 +23,7 @@ pub(super) fn collect_cpp_alias_declaration(
     };
 
     if facts.contains(ParseFacts::DECLARATIONS) {
-        if let Some(symbol) = symbol_from_name_node(
+        if let Some(mut symbol) = symbol_from_name_node(
             name_node,
             SymbolKind::Type,
             SymbolRole::Definition,
@@ -28,6 +31,8 @@ pub(super) fn collect_cpp_alias_declaration(
             source,
             line_starts,
         ) {
+            symbol.container = owner.clone();
+            symbol.guard = guard.clone();
             type_symbols.push(symbol);
         }
     }
@@ -92,6 +97,8 @@ pub(super) fn collect_cpp_alias_declaration(
         declarator_shape,
         target_fidelity,
         fingerprint,
+        owner,
+        guard,
     });
 }
 

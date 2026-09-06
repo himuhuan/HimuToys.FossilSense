@@ -1,6 +1,6 @@
-// Version 29 adds declaration-ID keyed protobuf-c source associations without
-// placing proto declarations in the ordinary symbol tables.
-pub(crate) const SCHEMA_VERSION: i64 = 29;
+// Version 30 preserves bounded declaration owner/guard context on record,
+// alias, and member facts in addition to canonical declaration rows.
+pub(crate) const SCHEMA_VERSION: i64 = 30;
 
 pub(crate) const DROP_DATA_TABLES_SQL: &str = "
     DROP TABLE IF EXISTS pending_file_revisions;
@@ -279,7 +279,9 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
         signature TEXT NOT NULL,
         confidence TEXT NOT NULL,
         declaration_hash BLOB NOT NULL
-            CHECK(typeof(declaration_hash) = 'blob' AND length(declaration_hash) = 32)
+            CHECK(typeof(declaration_hash) = 'blob' AND length(declaration_hash) = 32),
+        owner TEXT,
+        guard TEXT
     );
 
     CREATE TABLE IF NOT EXISTS member_facts (
@@ -298,7 +300,8 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
         end_line INTEGER NOT NULL,
         end_col INTEGER NOT NULL,
         signature TEXT NOT NULL,
-        type_name TEXT
+        type_name TEXT,
+        guard TEXT
     );
 
     CREATE TABLE IF NOT EXISTS type_alias_facts (
@@ -327,7 +330,9 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
         target_kind TEXT,
         confidence TEXT NOT NULL,
         declaration_hash BLOB NOT NULL
-            CHECK(typeof(declaration_hash) = 'blob' AND length(declaration_hash) = 32)
+            CHECK(typeof(declaration_hash) = 'blob' AND length(declaration_hash) = 32),
+        owner TEXT,
+        guard TEXT
     );
 
     CREATE TABLE IF NOT EXISTS call_strings (

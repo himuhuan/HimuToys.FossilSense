@@ -7,6 +7,7 @@ pub(super) fn collect_macro_declaration(
     source: &str,
     line_starts: &[usize],
     language: SourceLanguage,
+    guard: Option<String>,
     declarations: &mut Vec<DeclarationFact>,
 ) {
     let Some(name_node) = node.child_by_field_name("name") else {
@@ -19,6 +20,7 @@ pub(super) fn collect_macro_declaration(
     let name_range = source_range(name_node, source, line_starts);
     let declaration_range = source_range(node, source, line_starts);
     let signature = node_text(node, source).map(compact_whitespace);
+    let guard_fingerprint = guard.as_ref().map(|guard| digest(guard));
     let fingerprint = digest(&format!(
         "macro|{}|{}|{}|{}",
         path_text,
@@ -40,7 +42,7 @@ pub(super) fn collect_macro_declaration(
                 owner: None,
                 canonical_signature: signature.clone(),
                 linkage_domain: "external".to_string(),
-                guard_fingerprint: None,
+                guard_fingerprint,
             },
             language: match language {
                 SourceLanguage::C => SemanticLanguage::C,
@@ -68,17 +70,20 @@ pub(super) fn collect_macro_declaration(
         has_initializer: None,
         owner: None,
         linkage: crate::call_model::LinkageDomain::External,
-        guard: None,
+        guard,
         backing: DeclarationBacking::SourceRange { range: name_range },
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn collect_object_declarations(
     declaration: tree_sitter::Node<'_>,
     path: &Path,
     source: &str,
     line_starts: &[usize],
     language: SourceLanguage,
+    owner: Option<String>,
+    guard: Option<String>,
     declarations: &mut Vec<DeclarationFact>,
 ) {
     if node_has_storage_class(declaration, source, "typedef") {
@@ -156,7 +161,6 @@ pub(super) fn collect_object_declarations(
             continue;
         }
 
-        let owner = namespace_owner(declaration, source);
         let qualified_name = owner
             .as_ref()
             .map_or_else(|| name.to_string(), |owner| format!("{owner}::{name}"));
@@ -203,7 +207,7 @@ pub(super) fn collect_object_declarations(
             owner: owner.clone(),
             canonical_signature: Some(signature.clone()),
             linkage_domain,
-            guard_fingerprint: None,
+            guard_fingerprint: guard.as_ref().map(|guard| digest(guard)),
         };
         let fingerprint = digest(&format!(
             "object|{}|{}|{}|{}|{}",
@@ -243,9 +247,9 @@ pub(super) fn collect_object_declarations(
             canonical_signature: Some(signature),
             declarator_shape: Some(shape),
             has_initializer: Some(has_initializer),
-            owner,
+            owner: owner.clone(),
             linkage,
-            guard: None,
+            guard: guard.clone(),
             backing: DeclarationBacking::SourceRange { range: name_range },
         });
     }
@@ -375,25 +379,4 @@ pub(super) fn strip_object_storage_specifiers(prefix: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-pub(super) fn namespace_owner(node: tree_sitter::Node<'_>, source: &str) -> Option<String> {
-    let mut names = Vec::new();
-    let mut parent = node.parent();
-    while let Some(ancestor) = parent {
-        if ancestor.kind() == "namespace_definition" {
-            let name = ancestor
-                .child_by_field_name("name")
-                .and_then(|name| node_text(name, source))
-                .unwrap_or("<anonymous>");
-            names.push(name.to_string());
-        }
-        parent = ancestor.parent();
-    }
-    if names.is_empty() {
-        None
-    } else {
-        names.reverse();
-        Some(names.join("::"))
-    }
 }

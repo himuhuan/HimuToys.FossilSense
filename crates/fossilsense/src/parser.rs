@@ -849,10 +849,19 @@ pub enum LocalBindingKind {
     LocalType,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalBindingNamespace {
+    /// Parameters, variables, enum constants, and typedef names.
+    Ordinary,
+    /// C struct/union/enum tags, which do not shadow ordinary identifiers.
+    Tag,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalBinding {
     pub name: String,
     pub kind: LocalBindingKind,
+    pub namespace: LocalBindingNamespace,
     pub type_text: Option<String>,
     pub decl_start_byte: usize,
     pub function_start_byte: usize,

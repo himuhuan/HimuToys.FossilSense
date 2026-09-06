@@ -9,7 +9,7 @@ use crate::call_model::SourceRange;
 /// This is deliberately independent from the SQLite schema version: changing
 /// how a fact is derived must invalidate persisted rows even when their SQL
 /// column layout happens to stay compatible.
-pub const PARSER_FACT_VERSION: i64 = 14;
+pub const PARSER_FACT_VERSION: i64 = 15;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -241,6 +241,10 @@ pub struct RecordDef {
     pub range_fidelity: RecordRangeFidelity,
     pub confidence: RecordConfidence,
     pub signature: String,
+    /// Qualified namespace/record owner. File-scope C records have no owner.
+    pub owner: Option<String>,
+    /// Bounded, unevaluated preprocessor condition evidence.
+    pub guard: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -304,6 +308,9 @@ pub struct MemberDef {
     pub end_line: usize,
     pub end_col: usize,
     pub signature: String,
+    /// Bounded, unevaluated preprocessor condition evidence inherited from
+    /// the owning record and any member-local conditional branch.
+    pub guard: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -356,6 +363,10 @@ pub struct TypeAlias {
     pub target_fidelity: AliasTargetFidelity,
     /// Stable 96-bit hexadecimal digest scoped to this individual declarator.
     pub fingerprint: String,
+    /// Qualified namespace/record owner. File-scope C aliases have no owner.
+    pub owner: Option<String>,
+    /// Bounded, unevaluated preprocessor condition evidence.
+    pub guard: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

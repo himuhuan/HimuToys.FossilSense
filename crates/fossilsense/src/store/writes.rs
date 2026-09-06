@@ -100,19 +100,19 @@ pub(super) fn stage_file_updates(
                     body_end_line, body_end_col,
                     declaration_start_byte, declaration_end_byte, declaration_start_line,
                     declaration_start_col, declaration_end_line, declaration_end_col,
-                    range_fidelity, signature, confidence, declaration_hash
+                    range_fidelity, signature, confidence, declaration_hash, owner, guard
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
                            ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23,
-                           ?24, ?25, ?26, ?27, ?28, ?29)",
+                           ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)",
         )?;
         let mut member_stmt = tx.prepare(
             "INSERT INTO member_facts (
                     revision_id, file_id, record_id, record_key,
                     name, kind, confidence, start_byte, end_byte,
-                    start_line, start_col, end_line, end_col, signature, type_name
+                    start_line, start_col, end_line, end_col, signature, type_name, guard
                  ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                    ?11, ?12, ?13, ?14, ?15
+                    ?11, ?12, ?13, ?14, ?15, ?16
                  )",
         )?;
         let mut alias_stmt = tx.prepare(
@@ -121,9 +121,11 @@ pub(super) fn stage_file_updates(
                     declaration_start_byte, declaration_end_byte, declaration_start_line,
                     declaration_start_col, declaration_end_line, declaration_end_col,
                     underlying_spelling, declarator_shape, target_fidelity, fingerprint,
-                    target_record_id, target_name, target_kind, confidence, declaration_hash
+                    target_record_id, target_name, target_kind, confidence, declaration_hash,
+                    owner, guard
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                           ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+                           ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
+                           ?25, ?26)",
         )?;
         let mut callable_stmt = tx.prepare(
             "INSERT INTO callable_anchor_facts (
@@ -366,6 +368,8 @@ pub(super) fn stage_file_updates(
                     record.signature.as_str(),
                     record_confidence_to_str(record.confidence),
                     record.declaration_hash.as_slice(),
+                    record.owner.as_deref(),
+                    record.guard.as_deref(),
                 ])?;
                 let record_id = tx.last_insert_rowid();
                 record_key_to_id.insert(record.record_key.clone(), record_id);
@@ -411,6 +415,7 @@ pub(super) fn stage_file_updates(
                     member.end_col as i64,
                     member.signature.as_str(),
                     member.type_name.as_deref(),
+                    member.guard.as_deref(),
                 ])?;
             }
 
@@ -454,6 +459,8 @@ pub(super) fn stage_file_updates(
                     target_kind,
                     confidence,
                     alias.declaration_hash.as_slice(),
+                    alias.owner.as_deref(),
+                    alias.guard.as_deref(),
                 ])?;
                 alias_fingerprint_to_id.insert(alias.fingerprint.clone(), tx.last_insert_rowid());
             }

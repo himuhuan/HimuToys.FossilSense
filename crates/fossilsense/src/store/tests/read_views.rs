@@ -140,6 +140,39 @@ fn c_multi_declarators_round_trip_as_distinct_declaration_rows() {
 }
 
 #[test]
+fn unknown_c_preprocessor_branches_remain_distinct_candidates() {
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+    let mut store = IndexStore::open(&db, dir.path()).expect("store");
+    upsert_source(
+        &mut store,
+        "branches.c",
+        "#if FEATURE_A\nint selected;\n#elif FEATURE_B\nint selected;\n#else\nint selected;\n#endif\n",
+    );
+
+    let reader = IndexStore::open_readonly(&db).expect("readonly");
+    let (rows, truncated) = reader
+        .declaration_view()
+        .by_name_limited("selected", 8)
+        .expect("branch candidates");
+    assert!(!truncated);
+    assert_eq!(
+        rows.len(),
+        3,
+        "unevaluated conditions must not hard-filter candidates"
+    );
+    let guards = rows
+        .iter()
+        .map(|row| row.fact.guard.as_deref().expect("branch guard"))
+        .collect::<Vec<_>>();
+    assert!(guards.contains(&"#if FEATURE_A"));
+    assert!(guards.iter().any(|guard| guard.contains("#elif FEATURE_B")));
+    assert!(guards.iter().any(|guard| guard.contains("#else")));
+    assert_ne!(rows[0].fact.identity.locator, rows[1].fact.identity.locator);
+    assert_ne!(rows[1].fact.identity.locator, rows[2].fact.identity.locator);
+}
+
+#[test]
 fn declaration_storage_compacts_fingerprints_and_backing_kind_without_changing_views() {
     let dir = tempdir().expect("tempdir");
     let db = dir.path().join("index.sqlite");

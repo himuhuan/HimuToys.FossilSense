@@ -27,6 +27,7 @@ pub fn local_completion_candidates(
     let byte_offset = byte_offset_at(text, line, character).min(text.len());
     let mut hits: Vec<LocalCompletionCandidate> = bindings
         .iter()
+        .filter(|binding| binding.namespace == crate::parser::LocalBindingNamespace::Ordinary)
         .filter(|binding| local_binding_visible_for_completion(binding, byte_offset))
         .filter_map(|binding| {
             let base_match = completion_word_score(prefix, &binding.name, 0)?;
@@ -66,6 +67,7 @@ pub fn visible_local_binding<'a>(
             let at_declaration = binding.decl_start_byte <= byte_offset
                 && byte_offset <= binding.decl_start_byte.saturating_add(binding.name.len());
             binding.name == name
+                && binding.namespace == crate::parser::LocalBindingNamespace::Ordinary
                 && (at_declaration || local_binding_visible_for_completion(binding, byte_offset))
         })
         .max_by_key(|binding| binding.decl_start_byte)
@@ -115,6 +117,7 @@ mod tests {
         LocalBinding {
             name: name.to_string(),
             kind,
+            namespace: crate::parser::LocalBindingNamespace::Ordinary,
             type_text: Some("int".to_string()),
             decl_start_byte,
             function_start_byte,
@@ -196,6 +199,42 @@ mod tests {
     }
 
     #[test]
+    fn c_local_tag_does_not_shadow_the_ordinary_identifier_namespace() {
+        let text = "int State;\nvoid run(void) { struct State { int value; }; State = 1; }\n";
+        let parsed = crate::parser::parse_with_language(
+            std::path::Path::new("tag-scope.c"),
+            text,
+            crate::config::SourceLanguage::C,
+            crate::parser::ParseFacts::ALL,
+        );
+        let use_offset = text.rfind("State =").expect("ordinary use");
+        let use_character = text
+            .lines()
+            .nth(1)
+            .and_then(|line| line.rfind("State ="))
+            .expect("ordinary use character") as u32;
+        let tag = parsed
+            .local_bindings
+            .iter()
+            .find(|binding| {
+                binding.name == "State"
+                    && binding.namespace == crate::parser::LocalBindingNamespace::Tag
+            })
+            .expect("local tag evidence");
+        assert_eq!(tag.kind, LocalBindingKind::LocalType);
+        assert!(visible_local_binding(&parsed.local_bindings, "State", use_offset).is_none());
+        assert!(local_completion_candidates(
+            &parsed.local_bindings,
+            text,
+            1,
+            use_character + 3,
+            "Sta",
+            10
+        )
+        .is_empty());
+    }
+
+    #[test]
     fn local_completion_preserves_short_prefix_noise_gate() {
         let text = "void f(void) {\n    int Foobar;\n    int FooBar;\n    ba\n}\n";
         let bindings = vec![
@@ -228,6 +267,7 @@ mod tests {
             LocalBinding {
                 name: "value".to_string(),
                 kind: LocalBindingKind::Parameter,
+                namespace: crate::parser::LocalBindingNamespace::Ordinary,
                 type_text: Some("int".to_string()),
                 decl_start_byte: text.find("value").unwrap(),
                 function_start_byte: 0,
@@ -238,6 +278,7 @@ mod tests {
             LocalBinding {
                 name: "value".to_string(),
                 kind: LocalBindingKind::LocalVariable,
+                namespace: crate::parser::LocalBindingNamespace::Ordinary,
                 type_text: Some("long".to_string()),
                 decl_start_byte: text.rfind("value").unwrap(),
                 function_start_byte: 0,

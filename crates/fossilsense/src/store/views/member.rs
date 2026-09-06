@@ -30,7 +30,8 @@ const RECORD_READ_SELECT: &str = "SELECT r.id, r.display_name, r.tag_name, r.typ
             r.declaration_start_line, r.declaration_start_col,
             r.declaration_end_line, r.declaration_end_col,
             r.range_fidelity, r.confidence, r.signature,
-            rev.id, rev.size, rev.mtime_ns, rev.hash, r.declaration_hash
+            rev.id, rev.size, rev.mtime_ns, rev.hash, r.declaration_hash,
+            r.owner, r.guard
      FROM record_defs r
      JOIN files f ON f.id = r.file_id
      JOIN active_file_revisions active
@@ -44,7 +45,8 @@ const ALIAS_READ_SELECT: &str = "SELECT a.id, a.alias, f.path, rev.source, f.dir
             a.declaration_end_line, a.declaration_end_col,
             a.underlying_spelling, a.declarator_shape, a.target_fidelity,
             lower(hex(a.fingerprint)), a.target_record_id, a.target_name, a.target_kind,
-            a.confidence, rev.id, rev.size, rev.mtime_ns, rev.hash, a.declaration_hash
+            a.confidence, rev.id, rev.size, rev.mtime_ns, rev.hash, a.declaration_hash,
+            a.owner, a.guard
      FROM type_aliases a
      JOIN files f ON f.id = a.file_id
      JOIN active_file_revisions active
@@ -77,6 +79,8 @@ pub struct RecordReadRow {
     pub revision_mtime_ns: i64,
     pub revision_hash: String,
     pub declaration_hash: [u8; 32],
+    pub owner: Option<String>,
+    pub guard: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +105,8 @@ pub struct TypeAliasReadRow {
     pub revision_mtime_ns: i64,
     pub revision_hash: String,
     pub declaration_hash: [u8; 32],
+    pub owner: Option<String>,
+    pub guard: Option<String>,
 }
 
 #[cfg(test)]
@@ -145,6 +151,7 @@ pub struct MemberReadRow {
     pub start_col: u32,
     pub end_line: u32,
     pub end_col: u32,
+    pub guard: Option<String>,
 }
 
 impl MemberReadRow {
@@ -348,7 +355,7 @@ impl<'a> MemberStoreView<'a> {
                  FROM record_defs
                  WHERE id IN ({placeholders})
              )
-             SELECT m.id, m.name, m.kind, m.signature, m.confidence, m.type_name, f.path, f.source, f.directly_included, rev.hash, m.start_byte, m.end_byte, m.start_line, m.start_col, m.end_line, m.end_col \
+             SELECT m.id, m.name, m.kind, m.signature, m.confidence, m.type_name, f.path, f.source, f.directly_included, rev.hash, m.start_byte, m.end_byte, m.start_line, m.start_col, m.end_line, m.end_col, m.guard \
              FROM members m \
              JOIN files f ON f.id = m.file_id \
              JOIN file_revisions rev ON rev.id = m.revision_id \
@@ -440,7 +447,7 @@ impl<'a> MemberStoreView<'a> {
             |family| semantic_family_sql_predicate(family, "rev.language"),
         );
         let sql = format!(
-            "SELECT m.id, m.name, m.kind, m.signature, m.confidence, m.type_name, f.path, f.source, f.directly_included, rev.hash, m.start_byte, m.end_byte, m.start_line, m.start_col, m.end_line, m.end_col \
+            "SELECT m.id, m.name, m.kind, m.signature, m.confidence, m.type_name, f.path, f.source, f.directly_included, rev.hash, m.start_byte, m.end_byte, m.start_line, m.start_col, m.end_line, m.end_col, m.guard \
              FROM members m \
              JOIN files f ON f.id = m.file_id \
              JOIN file_revisions rev ON rev.id = m.revision_id \
@@ -759,6 +766,8 @@ fn record_read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RecordReadRow> {
         revision_mtime_ns: row.get(31)?,
         revision_hash: row.get(32)?,
         declaration_hash: digest_32(row, 33)?,
+        owner: row.get(34)?,
+        guard: row.get(35)?,
     })
 }
 
@@ -797,6 +806,8 @@ fn type_alias_read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TypeAliasRea
         revision_mtime_ns: row.get(27)?,
         revision_hash: row.get(28)?,
         declaration_hash: digest_32(row, 29)?,
+        owner: row.get(30)?,
+        guard: row.get(31)?,
     })
 }
 
@@ -852,6 +863,7 @@ fn member_read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemberReadRow> {
         start_col: row.get::<_, i64>(13)? as u32,
         end_line: row.get::<_, i64>(14)? as u32,
         end_col: row.get::<_, i64>(15)? as u32,
+        guard: row.get(16)?,
     })
 }
 

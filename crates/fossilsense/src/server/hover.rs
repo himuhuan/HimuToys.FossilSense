@@ -1157,6 +1157,7 @@ mod tests {
         let binding = crate::parser::LocalBinding {
             name: "values".into(),
             kind: crate::parser::LocalBindingKind::LocalVariable,
+            namespace: crate::parser::LocalBindingNamespace::Ordinary,
             type_text: Some("std::vector<int> &".into()),
             decl_start_byte: declaration_byte,
             function_start_byte: 0,
