@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
+use super::declarators::{decode_direct_declarators, DeclaredEntityKind};
 use crate::call_model::{
     AnchorRole, CallForm, CallSiteFact, CallableAnchor, CallableKind, FactProvenance,
     LinkageDomain, OwnerKindHint, SignatureFidelity, SignatureShape, SourcePosition, SourceRange,
@@ -119,25 +120,21 @@ impl<'a> CallFactCollector<'a> {
             }
             "lambda_expression" => self.scopes.push(ScopeFrame::Lambda { node_id: node.id() }),
             "function_definition" => {
-                let anchor = self.callable_anchor(node, AnchorRole::Definition);
-                let entity_key = anchor.as_ref().map(|anchor| anchor.entity_key.clone());
-                if let Some(anchor) = anchor {
-                    self.anchors.push(anchor);
-                }
+                let anchors = self.callable_anchors(node, AnchorRole::Definition);
+                let entity_key = anchors.first().map(|anchor| anchor.entity_key.clone());
+                self.anchors.extend(anchors);
                 self.scopes.push(ScopeFrame::Callable {
                     node_id: node.id(),
                     entity_key,
                 });
             }
             "declaration" if self.current_callable().is_none() => {
-                if let Some(anchor) = self.callable_anchor(node, AnchorRole::Declaration) {
-                    self.anchors.push(anchor);
-                }
+                let anchors = self.callable_anchors(node, AnchorRole::Declaration);
+                self.anchors.extend(anchors);
             }
             "field_declaration" if self.current_callable().is_none() => {
-                if let Some(anchor) = self.callable_anchor(node, AnchorRole::Declaration) {
-                    self.anchors.push(anchor);
-                }
+                let anchors = self.callable_anchors(node, AnchorRole::Declaration);
+                self.anchors.extend(anchors);
             }
             "call_expression" if self.collect_call_sites => self.collect_call_site(node),
             _ => {}
@@ -164,7 +161,52 @@ impl<'a> CallFactCollector<'a> {
         }
     }
 
-    fn callable_anchor(
+    fn callable_anchors(
+        &self,
+        declaration: tree_sitter::Node<'_>,
+        role: AnchorRole,
+    ) -> Vec<CallableAnchor> {
+        if self.is_cpp {
+            return self
+                .legacy_callable_anchor(declaration, role)
+                .into_iter()
+                .collect();
+        }
+        let decoded = decode_direct_declarators(declaration, self.source, false);
+        let _has_decode_failures = decoded.has_failures();
+        let prefix = self
+            .source
+            .get(decoded.common_prefix_range.clone())
+            .unwrap_or_default();
+        decoded
+            .entities
+            .iter()
+            .filter(|entity| entity.kind == DeclaredEntityKind::Function)
+            .filter_map(|entity| {
+                let function_declarator = entity.function_node()?;
+                let presentation_signature = decoded.presentation_signature(entity, self.source);
+                let canonical_signature = canonical_c_entity_signature(
+                    declaration,
+                    entity.core_declarator(),
+                    entity.name_node,
+                    self.source,
+                    prefix,
+                );
+                self.build_callable_anchor(
+                    declaration,
+                    role,
+                    function_declarator,
+                    entity.name_node,
+                    None,
+                    entity.name.clone(),
+                    Some(presentation_signature),
+                    Some(canonical_signature),
+                )
+            })
+            .collect()
+    }
+
+    fn legacy_callable_anchor(
         &self,
         declaration: tree_sitter::Node<'_>,
         role: AnchorRole,
@@ -173,16 +215,40 @@ impl<'a> CallFactCollector<'a> {
         if declarator_is_pointer_like(function_declarator) {
             return None;
         }
+        let declarator = function_declarator
+            .child_by_field_name("declarator")
+            .unwrap_or(function_declarator);
+        let (name_node, explicit_owner, name) = callable_name(declarator, self.source)?;
+        self.build_callable_anchor(
+            declaration,
+            role,
+            function_declarator,
+            name_node,
+            explicit_owner,
+            name,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_callable_anchor(
+        &self,
+        declaration: tree_sitter::Node<'_>,
+        role: AnchorRole,
+        function_declarator: tree_sitter::Node<'_>,
+        name_node: tree_sitter::Node<'_>,
+        explicit_owner: Option<String>,
+        name: String,
+        presentation_signature: Option<String>,
+        canonical_signature: Option<String>,
+    ) -> Option<CallableAnchor> {
         if role == AnchorRole::Declaration
             && declaration.child_by_field_name("type").is_none()
             && (self.error_depth > 0 || contains_error_or_missing(declaration))
         {
             return None;
         }
-        let declarator = function_declarator
-            .child_by_field_name("declarator")
-            .unwrap_or(function_declarator);
-        let (name_node, explicit_owner, name) = callable_name(declarator, self.source)?;
         if crate::language_builtins::is_language_keyword(&name) {
             return None;
         }
@@ -226,21 +292,23 @@ impl<'a> CallFactCollector<'a> {
             })
             .unwrap_or_else(|| declaration.end_byte());
         let declaration_range = self.source_range_bytes(declaration.start_byte(), declaration_end);
-        let presentation_signature = self
-            .source
-            .get(declaration_range.start_byte..declaration_range.end_byte)
-            .unwrap_or(&name)
-            .trim()
-            .to_string();
-        let canonical_signature = canonical_callable_signature(
-            declaration,
-            function_declarator,
-            name_node,
-            &name,
-            self.source,
-            self.is_cpp,
-            &presentation_signature,
-        );
+        let presentation_signature = presentation_signature.unwrap_or_else(|| {
+            self.source
+                .get(declaration_range.start_byte..declaration_range.end_byte)
+                .unwrap_or(&name)
+                .trim()
+                .to_string()
+        });
+        let canonical_signature = canonical_signature.unwrap_or_else(|| {
+            canonical_callable_signature(
+                declaration,
+                function_declarator,
+                name_node,
+                &name,
+                self.source,
+                self.is_cpp,
+            )
+        });
         let syntax_error_overlap = self.error_depth > 0 || contains_error_or_missing(declaration);
         let signature_fidelity = if syntax_error_overlap {
             SignatureFidelity::Malformed

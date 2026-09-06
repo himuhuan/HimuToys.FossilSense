@@ -2760,6 +2760,267 @@ int caller(void) { return helper(7); }
 }
 
 #[test]
+fn c_direct_declarators_produce_exact_function_and_object_sets() {
+    let source = r#"
+int f(void), g(int);
+int f2(void), (*cb)(int);
+int (*cb2)(int), g2(void);
+int (*factory(void))(int);
+"#;
+    let index = parse(Path::new("src/declarators.c"), source);
+    let expected_names = ["cb", "cb2", "f", "f2", "factory", "g", "g2"];
+
+    let mut actual: Vec<_> = index
+        .declarations
+        .iter()
+        .filter(|fact| expected_names.contains(&fact.name.as_str()))
+        .map(|fact| (fact.name.as_str(), fact.declaration_kind))
+        .collect();
+    actual.sort_unstable_by_key(|(name, _)| *name);
+    assert_eq!(
+        actual,
+        vec![
+            ("cb", SemanticDeclarationKind::Object),
+            ("cb2", SemanticDeclarationKind::Object),
+            ("f", SemanticDeclarationKind::Function),
+            ("f2", SemanticDeclarationKind::Function),
+            ("factory", SemanticDeclarationKind::Function),
+            ("g", SemanticDeclarationKind::Function),
+            ("g2", SemanticDeclarationKind::Function),
+        ]
+    );
+
+    let mut anchor_names: Vec<_> = index
+        .callable_anchors
+        .iter()
+        .filter(|anchor| expected_names.contains(&anchor.name.as_str()))
+        .map(|anchor| anchor.name.as_str())
+        .collect();
+    anchor_names.sort_unstable();
+    assert_eq!(anchor_names, vec!["f", "f2", "factory", "g", "g2"]);
+
+    for fact in index
+        .declarations
+        .iter()
+        .filter(|fact| expected_names.contains(&fact.name.as_str()))
+    {
+        assert_eq!(
+            source.get(fact.name_range.start_byte..fact.name_range.end_byte),
+            Some(fact.name.as_str()),
+            "{} must retain its exact identifier range",
+            fact.name
+        );
+    }
+
+    let presentations: Vec<_> = index
+        .callable_anchors
+        .iter()
+        .filter(|anchor| matches!(anchor.name.as_str(), "f" | "g"))
+        .map(|anchor| (anchor.name.as_str(), anchor.presentation_signature.as_str()))
+        .collect();
+    assert_eq!(
+        presentations,
+        vec![("f", "int f(void);"), ("g", "int g(int);")]
+    );
+    let factory = index
+        .callable_anchors
+        .iter()
+        .find(|anchor| anchor.name == "factory")
+        .expect("factory anchor");
+    assert!(factory
+        .canonical_signature
+        .contains("(*factory(void))(int)"));
+}
+
+#[test]
+fn c_declarator_consumers_ignore_nested_names_and_keep_aliases_and_members() {
+    let source = r#"
+typedef int Fn(int), (*FnPtr)(int);
+typedef int *IntItems[3], **IntPtrPtr;
+struct S { int (*handler)(int); int x, y; };
+int *items[3], (*matrix)[3];
+int values[sizeof(limit)], clean = helper(argument);
+int takes(int parameter);
+"#;
+    let index = parse(Path::new("src/declarator_consumers.c"), source);
+
+    let mut aliases: Vec<_> = index
+        .aliases
+        .iter()
+        .map(|alias| alias.alias.as_str())
+        .collect();
+    aliases.sort_unstable();
+    assert_eq!(aliases, vec!["Fn", "FnPtr", "IntItems", "IntPtrPtr"]);
+    assert_ne!(index.aliases[0].fingerprint, index.aliases[1].fingerprint);
+    let fn_alias = index
+        .aliases
+        .iter()
+        .find(|alias| alias.alias == "Fn")
+        .expect("Fn alias");
+    assert!(matches!(
+        fn_alias.declarator_shape,
+        super::DeclaratorShape::Function { .. }
+    ));
+    let fn_ptr_alias = index
+        .aliases
+        .iter()
+        .find(|alias| alias.alias == "FnPtr")
+        .expect("FnPtr alias");
+    assert!(matches!(
+        fn_ptr_alias.declarator_shape,
+        super::DeclaratorShape::FunctionPointer { .. }
+    ));
+    for compound in ["IntItems", "IntPtrPtr"] {
+        let alias = index
+            .aliases
+            .iter()
+            .find(|alias| alias.alias == compound)
+            .unwrap_or_else(|| panic!("missing {compound} alias"));
+        assert_eq!(
+            alias.declarator_shape,
+            super::DeclaratorShape::Unsupported,
+            "a lossy single-layer projection must not produce an incorrect aka spelling"
+        );
+    }
+    for alias in &index.aliases {
+        assert_eq!(
+            source.get(alias.start_byte..alias.end_byte),
+            Some(alias.alias.as_str())
+        );
+    }
+
+    let record = index
+        .records
+        .iter()
+        .find(|record| record.display_name == "S")
+        .expect("record S");
+    let mut members: Vec<_> = index
+        .members
+        .iter()
+        .filter(|member| member.record_key == record.record_key)
+        .map(|member| (member.name.as_str(), member.kind))
+        .collect();
+    members.sort_unstable_by_key(|(name, _)| *name);
+    assert_eq!(
+        members,
+        vec![
+            ("handler", MemberKind::Field),
+            ("x", MemberKind::Field),
+            ("y", MemberKind::Field),
+        ]
+    );
+
+    let expected_objects = ["clean", "items", "matrix", "values"];
+    let mut objects: Vec<_> = index
+        .declarations
+        .iter()
+        .filter(|fact| fact.declaration_kind == SemanticDeclarationKind::Object)
+        .filter(|fact| expected_objects.contains(&fact.name.as_str()))
+        .map(|fact| fact.name.as_str())
+        .collect();
+    objects.sort_unstable();
+    assert_eq!(objects, expected_objects);
+
+    for nested in ["limit", "helper", "argument", "parameter"] {
+        assert!(
+            !index.declarations.iter().any(|fact| fact.name == nested),
+            "nested name {nested} must not become an outer declaration"
+        );
+    }
+    assert!(index
+        .callable_anchors
+        .iter()
+        .all(|anchor| { !matches!(anchor.name.as_str(), "Fn" | "FnPtr" | "handler") }));
+}
+
+#[test]
+fn c_multi_declarator_identity_is_stable_and_keeps_redeclarations() {
+    let source = "int f(void), g(int);\nint f(void);\nint g(int);\n";
+    let first = parse(Path::new("include/redecl.c"), source);
+    let second = parse(Path::new("include/redecl.c"), source);
+
+    fn anchors<'a>(
+        index: &'a super::FileSemanticIndex,
+        name: &str,
+    ) -> Vec<&'a crate::call_model::CallableAnchor> {
+        index
+            .callable_anchors
+            .iter()
+            .filter(|anchor| anchor.name == name)
+            .collect::<Vec<_>>()
+    }
+    let first_f = anchors(&first, "f");
+    let first_g = anchors(&first, "g");
+    let second_f = anchors(&second, "f");
+    let second_g = anchors(&second, "g");
+    assert_eq!(first_f.len(), 2);
+    assert_eq!(first_g.len(), 2);
+    assert_eq!(second_f.len(), 2);
+    assert_eq!(second_g.len(), 2);
+
+    assert_eq!(first_f[0].entity_key, first_f[1].entity_key);
+    assert_eq!(first_g[0].entity_key, first_g[1].entity_key);
+    assert_ne!(first_f[0].entity_key, first_g[0].entity_key);
+    assert_ne!(first_f[0].anchor_fingerprint, first_g[0].anchor_fingerprint);
+    assert_ne!(first_f[0].anchor_fingerprint, first_f[1].anchor_fingerprint);
+
+    let stable_evidence = |index: &super::FileSemanticIndex| {
+        index
+            .callable_anchors
+            .iter()
+            .filter(|anchor| matches!(anchor.name.as_str(), "f" | "g"))
+            .map(|anchor| {
+                (
+                    anchor.name.clone(),
+                    anchor.entity_key.clone(),
+                    anchor.anchor_fingerprint.clone(),
+                    anchor.name_range,
+                    anchor.declaration_range,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(stable_evidence(&first), stable_evidence(&second));
+}
+
+#[test]
+fn c_multi_function_declarations_pair_with_definitions_and_calls() {
+    let source = r#"
+int f(void), g(int);
+int f(void) { return g(1); }
+int g(int value) { return value; }
+int (*callback)(int);
+"#;
+    let index = parse(Path::new("src/pairs.c"), source);
+    for name in ["f", "g"] {
+        let anchors: Vec<_> = index
+            .callable_anchors
+            .iter()
+            .filter(|anchor| anchor.name == name)
+            .collect();
+        assert_eq!(anchors.len(), 2, "{name} declaration and definition");
+        assert_eq!(anchors[0].entity_key, anchors[1].entity_key);
+    }
+    assert!(!index
+        .callable_anchors
+        .iter()
+        .any(|anchor| anchor.name == "callback"));
+    let f_definition = index
+        .callable_anchors
+        .iter()
+        .find(|anchor| {
+            anchor.name == "f" && anchor.role == crate::call_model::AnchorRole::Definition
+        })
+        .expect("f definition");
+    let call = index
+        .call_sites
+        .iter()
+        .find(|call| call.callee_name.as_deref() == Some("g"))
+        .expect("g call");
+    assert_eq!(call.caller_entity_key, f_definition.entity_key);
+}
+
+#[test]
 fn callable_anchors_project_canonical_function_declaration_facts() {
     let source = r#"
 static int helper(int value) { return value; }
@@ -3684,6 +3945,14 @@ fn c_callable_identity_ignores_gnu_weak_attribute_placement() {
     .into_iter()
     .find(|anchor| anchor.name == "hook")
     .expect("infix weak declaration");
+    let trailing = parse(
+        Path::new("trailing.c"),
+        "void hook(void) __attribute__((weak));\n",
+    )
+    .callable_anchors
+    .into_iter()
+    .find(|anchor| anchor.name == "hook")
+    .expect("trailing weak declaration");
     let definition = parse(Path::new("hook.c"), "void hook(void) {}\n")
         .callable_anchors
         .into_iter()
@@ -3700,13 +3969,16 @@ fn c_callable_identity_ignores_gnu_weak_attribute_placement() {
 
     assert_eq!(leading.canonical_signature, definition.canonical_signature);
     assert_eq!(infix.canonical_signature, definition.canonical_signature);
+    assert_eq!(trailing.canonical_signature, definition.canonical_signature);
     assert_eq!(leading.entity_key, definition.entity_key);
     assert_eq!(infix.entity_key, definition.entity_key);
+    assert_eq!(trailing.entity_key, definition.entity_key);
     assert_ne!(abi.canonical_signature, definition.canonical_signature);
     assert_ne!(abi.entity_key, definition.entity_key);
     assert!(abi.canonical_signature.contains("ms_abi"));
     assert!(leading.presentation_signature.contains("__attribute__"));
     assert!(infix.presentation_signature.contains("__attribute__"));
+    assert!(trailing.presentation_signature.contains("__attribute__"));
 }
 
 #[test]

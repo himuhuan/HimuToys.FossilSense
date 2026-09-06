@@ -34,6 +34,7 @@ struct RawDeclaration {
 mod ast;
 mod callables;
 mod declarations;
+mod declarators;
 mod go;
 mod lexical;
 mod protobuf_c;

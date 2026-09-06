@@ -70,7 +70,9 @@ pub(super) fn compose_aka_spelling(
                 spelling.push(']');
                 form = Form::Array;
             }
-            DeclaratorShape::FunctionPointer { .. } | DeclaratorShape::Unsupported => return None,
+            DeclaratorShape::Function { .. }
+            | DeclaratorShape::FunctionPointer { .. }
+            | DeclaratorShape::Unsupported => return None,
         }
     }
     Some(spelling)

@@ -1,4 +1,5 @@
 use super::*;
+use crate::parser::declarators::{decode_direct_declarators, DeclaredEntityKind};
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn collect_body_members(
@@ -6,6 +7,7 @@ pub(super) fn collect_body_members(
     record_key: &str,
     record_display_name: &str,
     source: &str,
+    language: SourceLanguage,
     line_starts: &[usize],
     records: &mut Vec<RecordDef>,
     fields: &mut Vec<FieldDef>,
@@ -19,6 +21,7 @@ pub(super) fn collect_body_members(
                 record_key,
                 record_display_name,
                 source,
+                language,
                 line_starts,
                 records,
                 fields,
@@ -29,12 +32,15 @@ pub(super) fn collect_body_members(
         if child.kind() != "field_declaration" {
             continue;
         }
-        let mut decl_cursor = child.walk();
-        let declarators: Vec<tree_sitter::Node<'_>> = child
-            .children_by_field_name("declarator", &mut decl_cursor)
-            .collect();
-
-        if declarators.is_empty() {
+        let has_declarator = {
+            let mut decl_cursor = child.walk();
+            let present = child
+                .children_by_field_name("declarator", &mut decl_cursor)
+                .next()
+                .is_some();
+            present
+        };
+        if !has_declarator {
             // Anonymous nested struct/union member: flatten its fields up.
             if let Some(type_node) = child.child_by_field_name("type") {
                 if matches!(type_node.kind(), "struct_specifier" | "union_specifier") {
@@ -44,6 +50,7 @@ pub(super) fn collect_body_members(
                             record_key,
                             record_display_name,
                             source,
+                            language,
                             line_starts,
                             records,
                             fields,
@@ -55,86 +62,121 @@ pub(super) fn collect_body_members(
             continue;
         }
 
-        let signature = compact_whitespace(child.utf8_text(source.as_bytes()).unwrap_or_default());
+        let statement_signature =
+            compact_whitespace(child.utf8_text(source.as_bytes()).unwrap_or_default());
         let member_type_name = child
             .child_by_field_name("type")
             .and_then(|type_node| record_type_name(type_node, source));
         let anonymous_record_type = child
             .child_by_field_name("type")
             .filter(|type_node| anonymous_record_type_node(*type_node));
-        for decl in declarators {
-            if let Some((id_node, name)) = declarator_identifier(decl, source) {
-                let kind = method_member_kind(child, decl, source);
-                let mut type_name = (kind == MemberKind::Field)
-                    .then(|| member_type_name.clone())
-                    .flatten();
-                if kind == MemberKind::Field && type_name.is_none() {
-                    if let Some(type_node) = anonymous_record_type {
-                        let nested_display_name = format!("{record_display_name}.{name}");
-                        let nested_record_key =
-                            format!("rec_{}_{}", type_node.start_byte(), id_node.start_byte());
-                        push_synthetic_nested_record(
-                            records,
-                            type_node,
+        let candidates = if language == SourceLanguage::C {
+            let decoded = decode_direct_declarators(child, source, false);
+            let _has_decode_failures = decoded.has_failures();
+            decoded
+                .entities
+                .iter()
+                .map(|entity| {
+                    (
+                        entity.declarator,
+                        entity.name_node,
+                        entity.name.clone(),
+                        if entity.kind == DeclaredEntityKind::Function {
+                            MemberKind::Method
+                        } else {
+                            MemberKind::Field
+                        },
+                        decoded.presentation_signature(entity, source),
+                    )
+                })
+                .collect::<Vec<_>>()
+        } else {
+            let mut decl_cursor = child.walk();
+            child
+                .children_by_field_name("declarator", &mut decl_cursor)
+                .filter_map(|decl| {
+                    let (id_node, name) = declarator_identifier(decl, source)?;
+                    Some((
+                        decl,
+                        id_node,
+                        name.to_string(),
+                        method_member_kind(child, decl, source),
+                        statement_signature.clone(),
+                    ))
+                })
+                .collect()
+        };
+        for (_decl, id_node, name, kind, signature) in candidates {
+            let mut type_name = (kind == MemberKind::Field)
+                .then(|| member_type_name.clone())
+                .flatten();
+            if kind == MemberKind::Field && type_name.is_none() {
+                if let Some(type_node) = anonymous_record_type {
+                    let nested_display_name = format!("{record_display_name}.{name}");
+                    let nested_record_key =
+                        format!("rec_{}_{}", type_node.start_byte(), id_node.start_byte());
+                    push_synthetic_nested_record(
+                        records,
+                        type_node,
+                        &nested_record_key,
+                        &nested_display_name,
+                        source,
+                        line_starts,
+                    );
+                    if let Some(inner) = type_node.child_by_field_name("body") {
+                        collect_body_members(
+                            inner,
                             &nested_record_key,
                             &nested_display_name,
                             source,
+                            language,
                             line_starts,
+                            records,
+                            fields,
+                            members,
                         );
-                        if let Some(inner) = type_node.child_by_field_name("body") {
-                            collect_body_members(
-                                inner,
-                                &nested_record_key,
-                                &nested_display_name,
-                                source,
-                                line_starts,
-                                records,
-                                fields,
-                                members,
-                            );
-                        }
-                        type_name = Some(nested_display_name);
                     }
+                    type_name = Some(nested_display_name);
                 }
-                if kind == MemberKind::Field {
-                    let start_pos = id_node.start_position();
-                    let end_pos = id_node.end_position();
-                    let start_byte = id_node.start_byte();
-                    let end_byte = id_node.end_byte();
-                    let start_line = start_pos.row;
-                    let end_line = end_pos.row;
-
-                    let start_line_byte = line_starts.get(start_line).copied().unwrap_or(0);
-                    let start_col = byte_to_utf16_col(source, start_line_byte, start_byte);
-
-                    let end_line_byte = line_starts.get(end_line).copied().unwrap_or(0);
-                    let end_col = byte_to_utf16_col(source, end_line_byte, end_byte);
-
-                    fields.push(FieldDef {
-                        record_key: record_key.to_string(),
-                        name: name.to_string(),
-                        start_byte,
-                        end_byte,
-                        start_line,
-                        start_col,
-                        end_line,
-                        end_col,
-                        signature: signature.clone(),
-                    });
-                }
-                push_member(
-                    members,
-                    record_key.to_string(),
-                    name.to_string(),
-                    id_node,
-                    kind,
-                    MemberConfidence::InBody,
-                    type_name,
-                    signature.clone(),
-                    source,
-                    line_starts,
-                );
             }
+            if kind == MemberKind::Field {
+                let start_pos = id_node.start_position();
+                let end_pos = id_node.end_position();
+                let start_byte = id_node.start_byte();
+                let end_byte = id_node.end_byte();
+                let start_line = start_pos.row;
+                let end_line = end_pos.row;
+
+                let start_line_byte = line_starts.get(start_line).copied().unwrap_or(0);
+                let start_col = byte_to_utf16_col(source, start_line_byte, start_byte);
+
+                let end_line_byte = line_starts.get(end_line).copied().unwrap_or(0);
+                let end_col = byte_to_utf16_col(source, end_line_byte, end_byte);
+
+                fields.push(FieldDef {
+                    record_key: record_key.to_string(),
+                    name: name.to_string(),
+                    start_byte,
+                    end_byte,
+                    start_line,
+                    start_col,
+                    end_line,
+                    end_col,
+                    signature: signature.clone(),
+                });
+            }
+            push_member(
+                members,
+                record_key.to_string(),
+                name,
+                id_node,
+                kind,
+                MemberConfidence::InBody,
+                type_name,
+                signature.clone(),
+                source,
+                line_starts,
+            );
         }
     }
 }

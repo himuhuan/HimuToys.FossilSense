@@ -94,6 +94,52 @@ fn declaration_view_round_trips_canonical_identity_and_backing() {
 }
 
 #[test]
+fn c_multi_declarators_round_trip_as_distinct_declaration_rows() {
+    use crate::semantic_model::{SemanticDeclarationKind, SemanticDeclarationRole};
+
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("index.sqlite");
+    let mut store = IndexStore::open(&db, dir.path()).expect("store");
+    let source = "int f(void), g(int);\nint f(void);\n";
+    upsert_source(&mut store, "multi.c", source);
+
+    let reader = IndexStore::open_readonly(&db).expect("readonly");
+    let (f_rows, f_truncated) = reader
+        .declaration_view()
+        .by_name_limited("f", 8)
+        .expect("f rows");
+    let (g_rows, g_truncated) = reader
+        .declaration_view()
+        .by_name_limited("g", 8)
+        .expect("g rows");
+    assert!(!f_truncated && !g_truncated);
+    assert_eq!(f_rows.len(), 2, "legal redeclarations remain distinct");
+    assert_eq!(g_rows.len(), 1);
+
+    for row in f_rows.iter().chain(g_rows.iter()) {
+        assert_eq!(row.fact.declaration_kind, SemanticDeclarationKind::Function);
+        assert_eq!(row.fact.role, SemanticDeclarationRole::Declaration);
+        assert_eq!(
+            source.get(row.fact.name_range.start_byte..row.fact.name_range.end_byte),
+            Some(row.fact.name.as_str())
+        );
+        assert!(row.fact.canonical_signature.is_some());
+        assert_eq!(row.backing_kind, "callable_anchor");
+        assert!(row.backing_id.is_some());
+    }
+    assert_ne!(f_rows[0].id, f_rows[1].id);
+    assert_ne!(f_rows[0].id, g_rows[0].id);
+    assert_eq!(
+        f_rows[0].fact.identity.logical_key,
+        f_rows[1].fact.identity.logical_key
+    );
+    assert_ne!(
+        f_rows[0].fact.identity.locator.fingerprint,
+        f_rows[1].fact.identity.locator.fingerprint
+    );
+}
+
+#[test]
 fn declaration_storage_compacts_fingerprints_and_backing_kind_without_changing_views() {
     let dir = tempdir().expect("tempdir");
     let db = dir.path().join("index.sqlite");

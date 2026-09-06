@@ -305,7 +305,6 @@ pub(super) fn canonical_callable_signature(
     name: &str,
     source: &str,
     is_cpp: bool,
-    _presentation: &str,
 ) -> String {
     let raw_prefix = source
         .get(declaration.start_byte()..name_node.start_byte())
@@ -342,6 +341,68 @@ pub(super) fn canonical_callable_signature(
     canonical_full_signature(&format!("{prefix} {name}{parameter_shape}{trailing}"))
 }
 
+pub(super) fn canonical_c_entity_signature(
+    declaration: tree_sitter::Node<'_>,
+    declarator: tree_sitter::Node<'_>,
+    name_node: tree_sitter::Node<'_>,
+    source: &str,
+    common_prefix: &str,
+) -> String {
+    let prefix =
+        c_prefix_without_standalone_weak_attribute(declaration, name_node, source, common_prefix)
+            .split_whitespace()
+            .filter(|token| *token != "extern")
+            .collect::<Vec<_>>()
+            .join(" ");
+    let declarator = c_declarator_without_parameter_names_and_weak_attributes(declarator, source);
+    canonical_full_signature(&format!("{prefix} {declarator}"))
+}
+
+fn c_declarator_without_parameter_names_and_weak_attributes(
+    declarator: tree_sitter::Node<'_>,
+    source: &str,
+) -> String {
+    let mut value = source
+        .get(declarator.byte_range())
+        .unwrap_or_default()
+        .to_string();
+    let mut removals = Vec::new();
+    let mut stack = vec![declarator];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "attribute_specifier" && is_standalone_weak_attribute(node, source) {
+            removals.push((
+                node.start_byte().saturating_sub(declarator.start_byte()),
+                node.end_byte().saturating_sub(declarator.start_byte()),
+            ));
+            continue;
+        }
+        if node.kind().contains("parameter") {
+            if let Some(identifier) = node
+                .child_by_field_name("declarator")
+                .and_then(parameter_declarator_identifier)
+            {
+                removals.push((
+                    identifier
+                        .start_byte()
+                        .saturating_sub(declarator.start_byte()),
+                    identifier
+                        .end_byte()
+                        .saturating_sub(declarator.start_byte()),
+                ));
+            }
+        }
+        stack.extend(named_children(node));
+    }
+    removals.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
+    removals.dedup();
+    for (start, end) in removals {
+        if start <= end && end <= value.len() {
+            value.replace_range(start..end, "");
+        }
+    }
+    value
+}
+
 fn c_prefix_without_standalone_weak_attribute<'a>(
     declaration: tree_sitter::Node<'_>,
     name_node: tree_sitter::Node<'_>,
@@ -356,21 +417,15 @@ fn c_prefix_without_standalone_weak_attribute<'a>(
         if node.start_byte() >= prefix_end {
             continue;
         }
-        if node.kind() == "attribute_specifier" && node.end_byte() <= prefix_end {
-            let attribute = canonical_full_signature(text(node, source).unwrap_or_default());
-            if matches!(
-                attribute.as_str(),
-                "__attribute__((weak))"
-                    | "__attribute((weak))"
-                    | "__attribute__((__weak__))"
-                    | "__attribute((__weak__))"
-            ) {
-                removals.push((
-                    node.start_byte().saturating_sub(prefix_start),
-                    node.end_byte().saturating_sub(prefix_start),
-                ));
-                continue;
-            }
+        if node.kind() == "attribute_specifier"
+            && node.end_byte() <= prefix_end
+            && is_standalone_weak_attribute(node, source)
+        {
+            removals.push((
+                node.start_byte().saturating_sub(prefix_start),
+                node.end_byte().saturating_sub(prefix_start),
+            ));
+            continue;
         }
         stack.extend(
             named_children(node)
@@ -389,6 +444,17 @@ fn c_prefix_without_standalone_weak_attribute<'a>(
         }
     }
     Cow::Owned(prefix)
+}
+
+fn is_standalone_weak_attribute(node: tree_sitter::Node<'_>, source: &str) -> bool {
+    let attribute = canonical_full_signature(text(node, source).unwrap_or_default());
+    matches!(
+        attribute.as_str(),
+        "__attribute__((weak))"
+            | "__attribute((weak))"
+            | "__attribute__((__weak__))"
+            | "__attribute((__weak__))"
+    )
 }
 
 pub(super) fn parameter_shape_without_names(

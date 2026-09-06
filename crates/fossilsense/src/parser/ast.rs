@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use super::declarators::{decode_direct_declarators, DeclaredEntityKind};
 use super::lexical::compact_whitespace;
 use super::{
     AliasTarget, AliasTargetFidelity, DeclaratorShape, FieldDef, LocalBinding, LocalBindingKind,
@@ -274,6 +275,7 @@ pub(super) fn collect_ast_index(
                             &record_key,
                             &display_name,
                             source,
+                            language,
                             line_starts,
                             &mut out.records,
                             &mut out.fields,
@@ -303,15 +305,11 @@ pub(super) fn collect_ast_index(
             if let Some(type_node) = node.child_by_field_name("type") {
                 if let Some(target) = get_alias_target(type_node, source) {
                     let mut cursor = node.walk();
-                    let declarators: Vec<_> = node
+                    let first_declarator = node
                         .children_by_field_name("declarator", &mut cursor)
-                        .collect();
-                    let underlying_spelling = alias_underlying_spelling(
-                        node,
-                        type_node,
-                        declarators.first().copied(),
-                        source,
-                    );
+                        .next();
+                    let underlying_spelling =
+                        alias_underlying_spelling(node, type_node, first_declarator, source);
                     let base_qualifiers = typedef_base_qualifiers(node, source);
                     let declaration_range = source_range(node, source, line_starts);
                     let declaration_hash = source_range_hash(source, declaration_range);
@@ -321,67 +319,102 @@ pub(super) fn collect_ast_index(
                         AliasTargetFidelity::AstExact
                     };
                     let path_text = path.to_string_lossy().replace('\\', "/");
-                    for decl in declarators {
-                        if let Some((alias_node, alias)) =
-                            typedef_declarator_identifier(decl, source)
-                        {
-                            if facts.contains(ParseFacts::DECLARATIONS) {
-                                if let Some(symbol) = symbol_from_name_node(
-                                    alias_node,
-                                    SymbolKind::Type,
-                                    SymbolRole::Definition,
-                                    node,
-                                    source,
-                                    line_starts,
-                                ) {
-                                    out.type_symbols.push(symbol);
-                                }
-                            }
-                            if facts.intersects(ParseFacts::DECLARATIONS | ParseFacts::ALIASES) {
-                                let alias_start = alias_node.start_position();
-                                let alias_end = alias_node.end_position();
-                                let declarator_shape = if target_fidelity
-                                    == AliasTargetFidelity::Malformed
-                                    || contains_error_or_missing(decl)
-                                {
-                                    DeclaratorShape::Unsupported
-                                } else {
-                                    typedef_declarator_shape(decl, source, &base_qualifiers)
+                    let candidates = if language == SourceLanguage::C {
+                        let decoded = decode_direct_declarators(node, source, true);
+                        let _has_decode_failures = decoded.has_failures();
+                        decoded
+                            .entities
+                            .iter()
+                            .filter(|entity| entity.kind == DeclaredEntityKind::Alias)
+                            .map(|entity| {
+                                let shape = match entity.declarator_shape(source) {
+                                    DeclaratorShape::Identity if !base_qualifiers.is_empty() => {
+                                        DeclaratorShape::Qualified {
+                                            qualifiers: base_qualifiers.clone(),
+                                        }
+                                    }
+                                    shape => shape,
                                 };
-                                let fingerprint = digest(&format!(
-                                    "{}|{}|{}|{}|{:?}|{:?}",
-                                    path_text,
-                                    node.start_byte(),
-                                    alias_node.start_byte(),
-                                    alias,
-                                    target,
-                                    declarator_shape
-                                ));
-                                out.aliases.push(TypeAlias {
-                                    alias: alias.to_string(),
-                                    target: target.clone(),
-                                    start_byte: alias_node.start_byte(),
-                                    end_byte: alias_node.end_byte(),
-                                    start_line: alias_start.row,
-                                    start_col: byte_to_utf16_col(
-                                        source,
-                                        line_starts.get(alias_start.row).copied().unwrap_or(0),
-                                        alias_node.start_byte(),
-                                    ),
-                                    end_line: alias_end.row,
-                                    end_col: byte_to_utf16_col(
-                                        source,
-                                        line_starts.get(alias_end.row).copied().unwrap_or(0),
-                                        alias_node.end_byte(),
-                                    ),
-                                    declaration_range,
-                                    declaration_hash,
-                                    underlying_spelling: underlying_spelling.clone(),
-                                    declarator_shape,
-                                    target_fidelity,
-                                    fingerprint,
-                                });
+                                (
+                                    entity.declarator,
+                                    entity.name_node,
+                                    entity.name.clone(),
+                                    shape,
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    } else {
+                        let mut cursor = node.walk();
+                        node.children_by_field_name("declarator", &mut cursor)
+                            .filter_map(|decl| {
+                                let (alias_node, alias) =
+                                    typedef_declarator_identifier(decl, source)?;
+                                Some((
+                                    decl,
+                                    alias_node,
+                                    alias.to_string(),
+                                    typedef_declarator_shape(decl, source, &base_qualifiers),
+                                ))
+                            })
+                            .collect()
+                    };
+                    for (decl, alias_node, alias, decoded_shape) in candidates {
+                        if facts.contains(ParseFacts::DECLARATIONS) {
+                            if let Some(symbol) = symbol_from_name_node(
+                                alias_node,
+                                SymbolKind::Type,
+                                SymbolRole::Definition,
+                                node,
+                                source,
+                                line_starts,
+                            ) {
+                                out.type_symbols.push(symbol);
                             }
+                        }
+                        if facts.intersects(ParseFacts::DECLARATIONS | ParseFacts::ALIASES) {
+                            let alias_start = alias_node.start_position();
+                            let alias_end = alias_node.end_position();
+                            let declarator_shape = if target_fidelity
+                                == AliasTargetFidelity::Malformed
+                                || contains_error_or_missing(decl)
+                            {
+                                DeclaratorShape::Unsupported
+                            } else {
+                                decoded_shape
+                            };
+                            let fingerprint = digest(&format!(
+                                "{}|{}|{}|{}|{:?}|{:?}",
+                                path_text,
+                                node.start_byte(),
+                                alias_node.start_byte(),
+                                alias,
+                                target,
+                                declarator_shape
+                            ));
+                            out.aliases.push(TypeAlias {
+                                alias,
+                                target: target.clone(),
+                                start_byte: alias_node.start_byte(),
+                                end_byte: alias_node.end_byte(),
+                                start_line: alias_start.row,
+                                start_col: byte_to_utf16_col(
+                                    source,
+                                    line_starts.get(alias_start.row).copied().unwrap_or(0),
+                                    alias_node.start_byte(),
+                                ),
+                                end_line: alias_end.row,
+                                end_col: byte_to_utf16_col(
+                                    source,
+                                    line_starts.get(alias_end.row).copied().unwrap_or(0),
+                                    alias_node.end_byte(),
+                                ),
+                                declaration_range,
+                                declaration_hash,
+                                underlying_spelling: underlying_spelling.clone(),
+                                declarator_shape,
+                                target_fidelity,
+                                fingerprint,
+                            });
                         }
                     }
                 }

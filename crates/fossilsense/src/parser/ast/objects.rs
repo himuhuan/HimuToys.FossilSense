@@ -1,4 +1,5 @@
 use super::*;
+use crate::parser::declarators::{decode_direct_declarators, DeclaredEntityKind};
 
 pub(super) fn collect_macro_declaration(
     node: tree_sitter::Node<'_>,
@@ -84,33 +85,74 @@ pub(super) fn collect_object_declarations(
         return;
     }
 
-    let declarators: Vec<_> = if declaration.kind() == "ERROR" {
-        let mut cursor = declaration.walk();
-        declaration
-            .named_children(&mut cursor)
-            .filter(|child| {
-                matches!(child.kind(), "array_declarator" | "init_declarator")
-                    && child.start_position().row == declaration.start_position().row
-            })
-            .collect()
-    } else {
-        let mut cursor = declaration.walk();
-        declaration
-            .children_by_field_name("declarator", &mut cursor)
-            .collect()
-    };
-    let first_declarator = declarators.first().copied();
-    for declarator in declarators {
-        let contains_function_declarator =
-            declarator_contains_kind(declarator, "function_declarator");
-        if contains_function_declarator && !function_declarator_is_pointer_like(declarator) {
-            continue;
-        }
-
-        let Some((name_node, name)) = declarator_identifier(declarator, source) else {
-            continue;
+    let (common_prefix, candidates) =
+        if language == SourceLanguage::C && declaration.kind() != "ERROR" {
+            let decoded = decode_direct_declarators(declaration, source, false);
+            let _has_decode_failures = decoded.has_failures();
+            let prefix = source
+                .get(decoded.common_prefix_range.clone())
+                .unwrap_or_default()
+                .to_string();
+            let candidates: Vec<_> = decoded
+                .entities
+                .iter()
+                .filter(|entity| entity.kind == DeclaredEntityKind::Object)
+                .map(|entity| {
+                    (
+                        entity.declarator,
+                        entity.name_node,
+                        entity.name.clone(),
+                        entity.initializer_range.is_some(),
+                        entity.declarator_shape(source),
+                    )
+                })
+                .collect();
+            (prefix, candidates)
+        } else {
+            let legacy_declarators: Vec<_> = if declaration.kind() == "ERROR" {
+                let mut cursor = declaration.walk();
+                declaration
+                    .named_children(&mut cursor)
+                    .filter(|child| {
+                        matches!(child.kind(), "array_declarator" | "init_declarator")
+                            && child.start_position().row == declaration.start_position().row
+                    })
+                    .collect()
+            } else {
+                let mut cursor = declaration.walk();
+                declaration
+                    .children_by_field_name("declarator", &mut cursor)
+                    .collect()
+            };
+            let prefix_end = legacy_declarators
+                .first()
+                .map(|declarator| declarator.start_byte())
+                .unwrap_or_else(|| declaration.end_byte());
+            let prefix = source
+                .get(declaration.start_byte()..prefix_end)
+                .unwrap_or_default()
+                .to_string();
+            let candidates: Vec<_> = legacy_declarators
+                .into_iter()
+                .filter(|declarator| {
+                    !declarator_contains_kind(*declarator, "function_declarator")
+                        || function_declarator_is_pointer_like(*declarator)
+                })
+                .filter_map(|declarator| {
+                    let (name_node, name) = declarator_identifier(declarator, source)?;
+                    Some((
+                        declarator,
+                        name_node,
+                        name.to_string(),
+                        object_declarator_has_initializer(declarator),
+                        object_declarator_shape(declarator, source),
+                    ))
+                })
+                .collect();
+            (prefix, candidates)
         };
-        if crate::language_builtins::is_language_keyword(name) {
+    for (declarator, name_node, name, has_initializer, shape) in candidates {
+        if crate::language_builtins::is_language_keyword(&name) {
             continue;
         }
 
@@ -118,7 +160,6 @@ pub(super) fn collect_object_declarations(
         let qualified_name = owner
             .as_ref()
             .map_or_else(|| name.to_string(), |owner| format!("{owner}::{name}"));
-        let has_initializer = object_declarator_has_initializer(declarator);
         let is_cpp = language == SourceLanguage::Cpp;
         let role = if has_initializer {
             SemanticDeclarationRole::Definition
@@ -144,13 +185,7 @@ pub(super) fn collect_object_declarations(
         };
         let declaration_range = source_range(declaration, source, line_starts);
         let name_range = source_range(name_node, source, line_starts);
-        let signature = canonical_object_signature(
-            declaration,
-            first_declarator.unwrap_or(declarator),
-            declarator,
-            source,
-        );
-        let shape = object_declarator_shape(declarator, source);
+        let signature = canonical_object_signature(&common_prefix, declarator, source);
         let fact_fidelity = if contains_error_or_missing(declaration) {
             SemanticFactFidelity::Incomplete
         } else {
@@ -319,15 +354,11 @@ pub(super) fn node_has_type_qualifier(
 }
 
 pub(super) fn canonical_object_signature(
-    declaration: tree_sitter::Node<'_>,
-    first_declarator: tree_sitter::Node<'_>,
+    common_prefix: &str,
     declarator: tree_sitter::Node<'_>,
     source: &str,
 ) -> String {
-    let prefix = source
-        .get(declaration.start_byte()..first_declarator.start_byte())
-        .map(strip_object_storage_specifiers)
-        .unwrap_or_default();
+    let prefix = strip_object_storage_specifiers(common_prefix);
     let declarator = unwrap_init_declarator(declarator);
     let declarator_text = declarator.utf8_text(source.as_bytes()).unwrap_or_default();
     compact_whitespace(&format!("{prefix} {declarator_text}"))
