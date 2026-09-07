@@ -43,3 +43,5 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 tempfile = "3.23"
+# Existing LSP dependency, exposed only to route regression requests in tests.
+tower = "0.4"

@@ -14,6 +14,27 @@ if (-not (Test-Path -LiteralPath $gateHelpers -PathType Leaf)) {
 & (Join-Path $PSScriptRoot 'test_benchmark_failure_reporting.ps1')
 if (-not $?) { throw 'Benchmark failure reporting regression failed.' }
 
+$bindingMetrics = [ordered]@{}
+foreach ($name in (Get-BindingReplayMetricNames)) {
+    $bindingMetrics[$name] = if ($name -match '_(requests|correct_targets)$') { 64 } else { 1 }
+}
+$bindingMetrics.binding_replay_declarations = 500000
+$bindingMetrics.binding_replay_files = 10000
+Assert-BindingReplayGate -Metrics $bindingMetrics
+$bindingMetrics.binding_warm_hover_correct_targets = 63
+$bindingRejected = $false
+try { Assert-BindingReplayGate -Metrics $bindingMetrics } catch { $bindingRejected = $true }
+if (-not $bindingRejected) { throw 'Binding replay accepted an incorrect hover target.' }
+$bindingMetrics.binding_warm_hover_correct_targets = 64
+$bindingMetrics.Remove('binding_edited_definition_sqlite_read_sessions')
+$bindingRejected = $false
+try { Assert-BindingReplayGate -Metrics $bindingMetrics } catch { $bindingRejected = $true }
+if (-not $bindingRejected) { throw 'Binding replay accepted missing SQL read-session evidence.' }
+$bindingHarness = Join-Path $PSScriptRoot 'benchmark_binding_replay.ps1'
+if (-not (Test-Path -LiteralPath $bindingHarness -PathType Leaf)) { throw 'Binding replay harness is missing.' }
+$bindingCases = @(& $benchmarkScript -IncludeBindingReplay -CaseFilter 'u-boot-binding-replay' -ListCases)
+if (($bindingCases -join "`n") -notmatch 'u-boot-binding-replay') { throw 'Binding replay case is not registered.' }
+
 Assert-FullIndexPerformanceGate `
     -CaseId 'u-boot-full-index' -OuterElapsedMs 120000 -EngineElapsedMs 120000
 foreach ($invalid in @(
@@ -468,3 +489,5 @@ try {
 }
 
 Write-Host 'Benchmark entry-point tests passed.' -ForegroundColor Green
+
+& (Join-Path $PSScriptRoot "test_replay_process_gate.ps1")

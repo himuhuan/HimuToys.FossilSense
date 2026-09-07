@@ -57,6 +57,7 @@ pub(super) struct CandidateOverlayCache {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) struct CandidateOverlayCacheKey {
+    pub(super) engine_epoch: state::EngineEpoch,
     pub(super) root: PathBuf,
     pub(super) semantic_generation: SemanticGeneration,
     pub(super) overlay_epoch: u64,
@@ -106,7 +107,7 @@ pub(in crate::server) struct EngineSnapshot {
 }
 
 impl EngineSnapshot {
-    pub(super) fn empty(root: PathBuf) -> Self {
+    pub(in crate::server) fn empty(root: PathBuf) -> Self {
         let workspace_semantics =
             Arc::new(super::super::workspace_config::PublishedWorkspaceSemantics::empty(&root));
         Self {

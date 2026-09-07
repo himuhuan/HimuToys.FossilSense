@@ -197,17 +197,8 @@ impl Backend {
         let call_read_handle = context.engine.call_read_handle.clone();
         let declaration_index = context.engine.declaration_index.clone();
         let reach_graph = context.engine.reach_graph.clone();
-        let semantic_epoch = context.engine.semantic_generation;
-        let indexed_files = context.engine.indexed_files.clone();
         let overlay = self
-            .candidate_overlay_snapshot_from_documents(
-                &root,
-                semantic_epoch,
-                reach_graph.as_deref(),
-                indexed_files.as_deref().map(Vec::as_slice),
-                context.engine.workspace_semantics.clone(),
-                documents,
-            )
+            .candidate_overlay_snapshot_from_documents(&root, context.engine.clone(), documents)
             .await;
 
         let include_coverage_details = arg

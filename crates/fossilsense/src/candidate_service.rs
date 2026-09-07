@@ -45,7 +45,7 @@ pub use callable_queries::CandidateQueryService;
 pub use semantic::CandidateHandleLocator;
 pub use semantic::{
     focused_callable_fingerprints, focused_candidates, focused_has_kind, navigation_presentations,
-    CandidateHandle, ResolvedDeclarationCandidate, SemanticIntent,
+    CandidateHandle, LookupPolicy, ResolvedDeclarationCandidate, SemanticIntent,
 };
 #[allow(unused_imports)]
 pub use type_queries::{BoundedMemberCandidates, TypeCandidateBundle, TypeRecordResolution};

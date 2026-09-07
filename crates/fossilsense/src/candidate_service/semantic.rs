@@ -29,6 +29,15 @@ pub enum SemanticIntent {
     Value,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum LookupPolicy<'a> {
+    Exploratory,
+    BoundDomain {
+        domain: crate::parser::LookupDomain,
+        qualifier: Option<&'a str>,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedDeclarationCandidate {
     pub persistent_id: Option<i64>,
@@ -239,6 +248,15 @@ impl CandidateQueryService<'_> {
         name: &str,
         intent: SemanticIntent,
     ) -> Result<CandidateSet<ResolvedDeclarationCandidate>> {
+        self.semantic_candidates_with_policy(name, intent, LookupPolicy::Exploratory)
+    }
+
+    pub fn semantic_candidates_with_policy(
+        &self,
+        name: &str,
+        intent: SemanticIntent,
+        policy: LookupPolicy<'_>,
+    ) -> Result<CandidateSet<ResolvedDeclarationCandidate>> {
         let mut scanned = 0usize;
         let mut truncated = false;
         let mut candidates = Vec::new();
@@ -383,6 +401,12 @@ impl CandidateQueryService<'_> {
             }
         }));
 
+        if let LookupPolicy::BoundDomain { domain, qualifier } = policy {
+            candidates.retain(|candidate| {
+                domain.accepts(candidate.fact.declaration_kind)
+                    && qualifier.is_none_or(|owner| candidate.fact.owner.as_deref() == Some(owner))
+            });
+        }
         candidates.sort_by(candidate_order);
         if candidates.len() > self.exact_name_limit {
             candidates.truncate(self.exact_name_limit);

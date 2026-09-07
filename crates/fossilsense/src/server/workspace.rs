@@ -488,10 +488,10 @@ impl DocumentStore {
         // either the old result lands first and didChange clears it, or the
         // version has advanced and the old result is discarded.
         let open_docs = self.open_docs.lock().await;
-        if open_docs
-            .get(&uri)
-            .is_some_and(|document| document.version == version)
-        {
+        if open_docs.get(&uri).is_some_and(|document| {
+            document.version == version
+                && parsed.source_fingerprint == *blake3::hash(document.text.as_bytes()).as_bytes()
+        }) {
             self.live_parse_cache
                 .write()
                 .await
@@ -508,7 +508,10 @@ impl DocumentStore {
         parsed: Arc<FileSemanticIndex>,
     ) {
         let open_docs = self.open_docs.lock().await;
-        if open_docs.get(&uri).map(|document| document.version) != Some(version) {
+        if !open_docs.get(&uri).is_some_and(|document| {
+            document.version == version
+                && parsed.source_fingerprint == *blake3::hash(document.text.as_bytes()).as_bytes()
+        }) {
             return;
         }
         let key = ExternalOverlayParseKey {
@@ -742,11 +745,23 @@ impl CacheLedger {
         snapshot
     }
 
+    #[cfg(test)]
     pub(super) async fn candidate_overlay(
+        &self,
+        root: &Path,
+        generation: SemanticGeneration,
+        epoch: u64,
+    ) -> (Option<Arc<CandidateOverlaySnapshot>>, u64) {
+        self.candidate_overlay_for_engine(root, generation, epoch, state::EngineEpoch::missing())
+            .await
+    }
+
+    pub(super) async fn candidate_overlay_for_engine(
         &self,
         root: &Path,
         semantic_generation: SemanticGeneration,
         overlay_epoch: u64,
+        engine_epoch: state::EngineEpoch,
     ) -> (Option<Arc<CandidateOverlaySnapshot>>, u64) {
         let overlays = self.candidate_overlays.lock().await;
         let revision = overlays.root_revisions.get(root).copied().unwrap_or(0);
@@ -756,6 +771,7 @@ impl CacheLedger {
                 root: root.to_path_buf(),
                 semantic_generation,
                 overlay_epoch,
+                engine_epoch,
             })
             .filter(|snapshot| snapshot.path_view_cacheable())
             .cloned();
@@ -842,11 +858,32 @@ impl CacheLedger {
     /// Publish one fully-built immutable overlay. A concurrent request may
     /// have won the same key; in that case both callers share the first Arc.
     /// Older epochs are dropped once a newer overlay for the same base lands.
+    #[cfg(test)]
     pub(super) async fn publish_candidate_overlay(
+        &self,
+        root: PathBuf,
+        generation: SemanticGeneration,
+        epoch: u64,
+        revision: u64,
+        overlay: Arc<CandidateOverlaySnapshot>,
+    ) -> Arc<CandidateOverlaySnapshot> {
+        self.publish_candidate_overlay_for_engine(
+            root,
+            generation,
+            epoch,
+            state::EngineEpoch::missing(),
+            revision,
+            overlay,
+        )
+        .await
+    }
+
+    pub(super) async fn publish_candidate_overlay_for_engine(
         &self,
         root: PathBuf,
         semantic_generation: SemanticGeneration,
         overlay_epoch: u64,
+        engine_epoch: state::EngineEpoch,
         expected_cache_revision: u64,
         overlay: Arc<CandidateOverlaySnapshot>,
     ) -> Arc<CandidateOverlaySnapshot> {
@@ -854,6 +891,7 @@ impl CacheLedger {
             root: root.clone(),
             semantic_generation,
             overlay_epoch,
+            engine_epoch,
         };
         let mut cache = self.candidate_overlays.lock().await;
         if cache.root_revisions.get(&root).copied().unwrap_or(0) != expected_cache_revision {
@@ -870,15 +908,23 @@ impl CacheLedger {
             .entries
             .keys()
             .filter(|candidate| {
-                candidate.root == root && candidate.semantic_generation == semantic_generation
+                candidate.root == root
+                    && candidate.semantic_generation == semantic_generation
+                    && candidate.engine_epoch == engine_epoch
             })
             .map(|candidate| candidate.overlay_epoch)
             .max();
+        if cache.entries.keys().any(|candidate| {
+            candidate.root == root && candidate.engine_epoch.as_u64() > engine_epoch.as_u64()
+        }) {
+            return overlay;
+        }
         if newest_epoch.is_none_or(|epoch| overlay_epoch >= epoch) {
             cache.entries.retain(|candidate, _| {
                 candidate.root != root
-                    || candidate.semantic_generation != semantic_generation
-                    || candidate.overlay_epoch > overlay_epoch
+                    || (candidate.engine_epoch == engine_epoch
+                        && candidate.semantic_generation == semantic_generation
+                        && candidate.overlay_epoch > overlay_epoch)
             });
             cache.entries.insert(key, overlay.clone());
         }

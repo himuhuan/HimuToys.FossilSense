@@ -35,6 +35,8 @@ mod ast;
 mod budget;
 mod callables;
 mod coverage;
+mod cursor;
+pub use cursor::{CursorFacts, CursorSyntax, LookupDomain};
 mod declarations;
 mod declarators;
 mod go;
@@ -637,7 +639,7 @@ bitflags::bitflags! {
     /// AST DFS. Skipping a branch returns an empty vector for that field
     /// in `FileSemanticIndex`, keeping the data structure stable.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-    pub struct ParseFacts: u8 {
+    pub struct ParseFacts: u16 {
         /// Canonical AST declaration facts.
         const DECLARATIONS  = 1 << 0;
         /// Include lines (lexical pass, always collected).
@@ -701,6 +703,9 @@ bitflags::bitflags! {
                                | Self::ALIASES.bits()
                                | Self::CALL_RELATIONS.bits();
 
+        /// Compact request-only cursor domains.
+        const CURSOR = 1 << 8;
+
         /// Everything (backward-compatible default).
         const ALL           = !0;
     }
@@ -712,6 +717,9 @@ bitflags::bitflags! {
 /// leaving every semantic vector empty.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileSemanticIndex {
+    /// Identity of the exact input behind every requested fact selection.
+    pub source_fingerprint: [u8; 32],
+    pub cursor: CursorFacts,
     pub language: SemanticLanguage,
     pub language_evidence: crate::semantic_model::LanguageEvidence,
     pub includes: Vec<Include>,
@@ -1064,7 +1072,11 @@ impl ParserHandle {
             state.parser.set_language(&lang).map_err(|_| ())?;
             state.current_lang = Some(lang);
         }
-        Ok(state.parser.parse(source, old_tree))
+        let tree = state.parser.parse(source, old_tree);
+        if tree.is_none() {
+            state.parser.reset();
+        }
+        Ok(tree)
     }
 
     fn parse_with_language_cancel(
@@ -1086,9 +1098,15 @@ impl ParserHandle {
         let mut input = |offset: usize, _| bytes.get(offset..).unwrap_or_default();
         let mut progress = |_: &tree_sitter::ParseState| cancel.load(Ordering::Relaxed);
         let options = tree_sitter::ParseOptions::new().progress_callback(&mut progress);
-        Ok(state
+        let tree = state
             .parser
-            .parse_with_options(&mut input, None, Some(options)))
+            .parse_with_options(&mut input, None, Some(options));
+        // Tree-sitter retains resumable parser state after cancellation. The
+        // next call can belong to a different document on this worker.
+        if tree.is_none() {
+            state.parser.reset();
+        }
+        Ok(tree)
     }
 }
 
@@ -1455,6 +1473,12 @@ fn parse_with_handle_control(
     };
 
     Some(FileSemanticIndex {
+        source_fingerprint: *blake3::hash(source.as_bytes()).as_bytes(),
+        cursor: if facts.contains(ParseFacts::CURSOR) {
+            cursor::collect(tree.root_node(), source)
+        } else {
+            CursorFacts::default()
+        },
         language: language.semantic_language(),
         language_evidence: LanguageSelection::explicit(language).evidence,
         includes,
@@ -1525,6 +1549,11 @@ fn lexical_fallback(
         source_guard
     };
     FileSemanticIndex {
+        source_fingerprint: *blake3::hash(source.as_bytes()).as_bytes(),
+        cursor: CursorFacts {
+            spans: Vec::new(),
+            truncated: true,
+        },
         language: language.semantic_language(),
         language_evidence: LanguageSelection::explicit(language).evidence,
         includes,
@@ -1601,3 +1630,34 @@ fn line_starts(source: &str) -> Vec<usize> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod cancelled_parser_reuse_tests {
+    use super::*;
+    #[test]
+    fn cancelled_parser_does_not_resume_another_source() {
+        let handle = ParserHandle::new();
+        let language: tree_sitter::Language = tree_sitter_c::LANGUAGE.into();
+        let source = (0..20_000)
+            .map(|i| format!("int old_{i};\n"))
+            .collect::<String>();
+        assert!(handle
+            .parse_with_language_cancel(language.clone(), &source, &AtomicBool::new(true))
+            .unwrap()
+            .is_none());
+        let new_source = "int current;\n";
+        let reused = handle
+            .parse_with_language(language.clone(), new_source, None)
+            .unwrap()
+            .unwrap();
+        let reference = ParserHandle::new()
+            .parse_with_language(language, new_source, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reused.root_node().to_sexp(),
+            reference.root_node().to_sexp()
+        );
+        assert_eq!(reused.root_node().end_byte(), new_source.len());
+    }
+}

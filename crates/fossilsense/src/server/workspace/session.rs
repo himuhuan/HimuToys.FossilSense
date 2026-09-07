@@ -10,11 +10,20 @@ use super::{CacheLedger, DocumentStore, RequestContext, RequestSettings};
 pub(in crate::server) struct WorkspaceSession {
     pub(in crate::server) documents: DocumentStore,
     pub(in crate::server) cache: CacheLedger,
+    pub(in crate::server) binding_observations: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::VecDeque<crate::server::query_session::BindingObservation>,
+        >,
+    >,
 }
 
 impl WorkspaceSession {
     pub(in crate::server) fn new(documents: DocumentStore, cache: CacheLedger) -> Self {
-        Self { documents, cache }
+        Self {
+            documents,
+            cache,
+            binding_observations: Default::default(),
+        }
     }
 
     pub(in crate::server) async fn open_document(&self, uri: Url, version: i32, text: String) {

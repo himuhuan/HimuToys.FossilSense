@@ -15,6 +15,8 @@ use crate::store::views::{DeclarationNameRow, DeclarationStoreView};
 
 pub mod callables;
 mod comments;
+mod cursor_binding;
+pub use cursor_binding::{resolve_local_cursor, BindingReason, BindingResolution, LocalBindingRef};
 #[allow(dead_code)]
 mod current_file_overlay;
 mod documentation;
@@ -29,16 +31,16 @@ mod text;
 pub mod type_resolution;
 
 pub(crate) use callables::is_source_path;
-#[cfg(test)]
-pub use callables::CounterpartEvidence;
 pub use callables::{
-    call_declaration_presentations_at, call_definition_presentations, hover_presentations,
+    call_declaration_presentations_at, call_definition_presentations, focused_hover_presentations,
     resolve_callable_candidates, resolve_counterparts, signature_active_index,
     signature_presentations, ArgumentState, CallSiteContext, CallableCandidateMetrics,
     CallableCandidateSet, CallableQueryInput, CandidateCoverage, CandidateIncompleteReason,
     CandidateOrigin, ContextReliability, ResolvedCallableAnchor,
     CALLABLE_CANDIDATE_RESOLVER_VERSION,
 };
+#[cfg(test)]
+pub use callables::{hover_presentations, CounterpartEvidence};
 pub use comments::RenderedSymbolComment;
 
 #[allow(unused_imports)]

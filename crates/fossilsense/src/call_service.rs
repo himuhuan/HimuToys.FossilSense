@@ -87,6 +87,11 @@ impl CallReadHandle {
     /// this handle. Candidate and relation requests share this boundary so a
     /// publication that happens mid-request cannot mix durable generations.
     pub(crate) fn read<T>(&self, read: impl FnOnce(&IndexStore) -> Result<T>) -> Result<T> {
+        REQUEST_READ_SESSIONS.with(|slot| {
+            if let Some(counter) = slot.borrow().as_ref() {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
         if let Some(snapshot) = &self.diagnostic {
             let snapshot = snapshot
                 .lock()
@@ -98,6 +103,34 @@ impl CallReadHandle {
         let value = read(guard.store())?;
         guard.finish()?;
         Ok(value)
+    }
+}
+
+thread_local! {
+    static REQUEST_READ_SESSIONS: std::cell::RefCell<Option<Arc<std::sync::atomic::AtomicUsize>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Counts typed SQLite read sessions on one blocking request thread. A session
+/// may execute several statements; this is deliberately not a SQL statement count.
+pub(crate) struct ReadSessionProbe {
+    previous: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl ReadSessionProbe {
+    pub(crate) fn enter(counter: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        Self {
+            previous: REQUEST_READ_SESSIONS.with(|slot| slot.replace(Some(counter))),
+            _thread_bound: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for ReadSessionProbe {
+    fn drop(&mut self) {
+        REQUEST_READ_SESSIONS.with(|slot| {
+            slot.replace(self.previous.take());
+        });
     }
 }
 

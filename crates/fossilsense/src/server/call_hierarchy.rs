@@ -252,14 +252,7 @@ impl Backend {
     ) -> Option<RelationRequestState> {
         let handle = context.engine.call_read_handle.clone()?;
         let overlay = self
-            .candidate_overlay_snapshot_from_documents(
-                &root,
-                context.engine.semantic_generation,
-                context.engine.reach_graph.as_deref(),
-                context.engine.indexed_files.as_deref().map(Vec::as_slice),
-                context.engine.workspace_semantics.clone(),
-                documents,
-            )
+            .candidate_overlay_snapshot_from_documents(&root, context.engine.clone(), documents)
             .await;
         let overlay_epoch = overlay.epoch;
         let reach_graph = overlay.effective_reach_graph_arc(context.engine.reach_graph.clone());

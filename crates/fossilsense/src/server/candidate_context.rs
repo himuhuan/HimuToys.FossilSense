@@ -110,10 +110,15 @@ impl Backend {
                     continue;
                 };
                 let language = language.expect("workspace overlay language");
+                let identity_path = if language.language == crate::config::SourceLanguage::Go {
+                    PathBuf::from(&overlay_path)
+                } else {
+                    path
+                };
                 let parsed = self
-                    .get_or_parse_document_with_selection(
+                    .get_or_parse_captured_document_with_selection(
                         &uri,
-                        &path,
+                        &identity_path,
                         snapshot.version,
                         &snapshot.text,
                         parser::ParseFacts::COMPLETION,
@@ -275,36 +280,45 @@ impl Backend {
         indexed_workspace_files: Option<&[(String, PathBuf)]>,
     ) -> Arc<CandidateOverlaySnapshot> {
         let documents = self.session.documents.capture_request_snapshot(None).await;
-        let workspace_semantics = match self
+        let published = self
             .session
             .cache
             .current_engine_snapshot(&root.to_path_buf())
             .await
-            .filter(|snapshot| snapshot.semantic_generation == generation)
-        {
-            Some(snapshot) => snapshot.workspace_semantics.clone(),
-            None => {
-                let include_paths = self.include_paths.lock().await.clone();
-                let go_module_paths = self.go_module_paths.lock().await.clone();
-                let mut semantics =
-                    super::workspace_config::PublishedWorkspaceSemantics::load_current(
-                        root,
-                        &include_paths,
-                        &go_module_paths,
-                    );
-                semantics.external_roots = self.authorized_external_source_roots(root).await;
-                Arc::new(semantics)
-            }
+            .filter(|snapshot| snapshot.semantic_generation == generation);
+        let workspace_semantics = if let Some(snapshot) = &published {
+            snapshot.workspace_semantics.clone()
+        } else {
+            let include_paths = self.include_paths.lock().await.clone();
+            let go_module_paths = self.go_module_paths.lock().await.clone();
+            let mut semantics = super::workspace_config::PublishedWorkspaceSemantics::load_current(
+                root,
+                &include_paths,
+                &go_module_paths,
+            );
+            semantics.external_roots = self.authorized_external_source_roots(root).await;
+            Arc::new(semantics)
         };
-        self.candidate_overlay_snapshot_from_documents(
-            root,
-            generation,
-            base_reach_graph,
-            indexed_workspace_files,
-            workspace_semantics,
-            documents,
-        )
-        .await
+        let engine = published
+            .filter(|snapshot| {
+                (match (&snapshot.reach_graph, base_reach_graph) {
+                    (Some(a), Some(b)) => std::ptr::eq(a.as_ref(), b),
+                    (None, None) => true,
+                    _ => false,
+                }) && (match (&snapshot.indexed_files, indexed_workspace_files) {
+                    (Some(a), Some(b)) => std::ptr::eq(a.as_slice(), b),
+                    (None, None) => true,
+                    _ => false,
+                })
+            })
+            .unwrap_or_else(|| {
+                let mut engine = super::workspace::EngineSnapshot::empty(root.to_path_buf());
+                engine.semantic_generation = generation;
+                engine.workspace_semantics = workspace_semantics;
+                Arc::new(engine)
+            });
+        self.candidate_overlay_snapshot_from_documents(root, engine, documents)
+            .await
     }
 
     /// Build an overlay from a caller-owned atomic document capture. This is
@@ -313,52 +327,25 @@ impl Backend {
     pub(super) async fn candidate_overlay_snapshot_from_documents(
         &self,
         root: &Path,
-        generation: SemanticGeneration,
-        base_reach_graph: Option<&crate::reachability::ReachGraph>,
-        indexed_workspace_files: Option<&[(String, PathBuf)]>,
-        workspace_semantics: Arc<super::workspace_config::PublishedWorkspaceSemantics>,
+        engine: Arc<super::workspace::EngineSnapshot>,
         documents: DocumentRequestSnapshot,
     ) -> Arc<CandidateOverlaySnapshot> {
         let root = root.to_path_buf();
         let epoch = documents.overlay_epoch;
+        let generation = engine.semantic_generation;
+        let engine_epoch = engine.epoch;
+        let workspace_semantics = engine.workspace_semantics.clone();
         let (cached, cache_revision) = self
             .session
             .cache
-            .candidate_overlay(&root, generation, epoch)
+            .candidate_overlay_for_engine(&root, generation, epoch, engine_epoch)
             .await;
         if let Some(cached) = cached {
             return cached;
         }
 
-        // Recover owned inputs only when they are the exact objects supplied
-        // by the request's EngineSnapshot. If publication won the race, do not
-        // substitute the newer graph/list into the older request; rebuilding
-        // without that optional evidence is conservative and generation-safe.
-        let published = self.session.cache.current_engine_snapshot(&root).await;
-        let owned_reach_graph = published.as_ref().and_then(|snapshot| {
-            (snapshot.semantic_generation == generation)
-                .then(|| snapshot.reach_graph.clone())
-                .flatten()
-                .filter(|graph| {
-                    base_reach_graph
-                        .is_some_and(|requested| std::ptr::eq(graph.as_ref(), requested))
-                })
-        });
-        let owned_indexed_files = published.as_ref().and_then(|snapshot| {
-            (snapshot.semantic_generation == generation)
-                .then(|| snapshot.indexed_files.clone())
-                .flatten()
-                .filter(|files| {
-                    indexed_workspace_files.is_some_and(|requested| {
-                        std::ptr::eq::<[(String, PathBuf)]>(files.as_slice(), requested)
-                    })
-                })
-        });
-        let owned_include_path_index = published.as_ref().and_then(|snapshot| {
-            (snapshot.semantic_generation == generation && owned_indexed_files.is_some())
-                .then(|| snapshot.include_path_index.clone())
-                .flatten()
-        });
+        let owned_reach_graph = engine.reach_graph.clone();
+        let owned_include_path_index = engine.include_path_index.clone();
 
         let external_roots = workspace_semantics.external_roots.clone();
         let language_resolver = workspace_semantics.language.clone();
@@ -417,10 +404,15 @@ impl Backend {
                     continue;
                 };
                 let language = language.expect("workspace overlay language");
+                let identity_path = if language.language == crate::config::SourceLanguage::Go {
+                    PathBuf::from(&overlay_path)
+                } else {
+                    path
+                };
                 let parsed = self
-                    .get_or_parse_document_with_selection(
+                    .get_or_parse_captured_document_with_selection(
                         &uri,
-                        &path,
+                        &identity_path,
                         snapshot.version,
                         &snapshot.text,
                         parser::ParseFacts::HOVER_SEMANTICS,
@@ -506,7 +498,14 @@ impl Backend {
 
         self.session
             .cache
-            .publish_candidate_overlay(root, generation, epoch, cache_revision, built)
+            .publish_candidate_overlay_for_engine(
+                root,
+                generation,
+                epoch,
+                engine_epoch,
+                cache_revision,
+                built,
+            )
             .await
     }
 }

@@ -13,6 +13,7 @@ param(
     [switch]$IncludeFullIndex,
     [switch]$IncludeEngineHydration,
     [switch]$IncludeCompletionReplay,
+    [switch]$IncludeBindingReplay,
     [switch]$IncludeLspLifecycle,
     [switch]$IncludeV142SemanticCases,
     [string]$V142Harness = '',
@@ -399,6 +400,7 @@ function Convert-WhitelistedMetrics([string[]]$Lines) {
         lsp_lifecycle_rebuild_wall_ms = $true
         lsp_lifecycle_write_ms = $true
     }
+    foreach ($name in (Get-BindingReplayMetricNames)) { $allowed[$name] = $true }
     $metrics = [ordered]@{}
     foreach ($line in $Lines) {
         if ($line -match '^([a-z][a-z0-9_]+):\s+([0-9]+)$' -and $allowed.ContainsKey($Matches[1])) {
@@ -512,6 +514,20 @@ if ($IncludeCompletionReplay) {
             '-Workspace',
             $completionWorkspace
         )
+    }
+}
+
+if ($IncludeBindingReplay) {
+    $bindingWorkspace = Join-Path $repoRoot 'samples\u-boot'
+    $bindingDatabase = Join-Path $benchmarkPath 'index-u-boot-rebuild.sqlite'
+    $cases += [pscustomobject]@{
+        Id = 'u-boot-binding-replay'
+        Executable = 'powershell.exe'
+        Workspace = $bindingWorkspace
+        Database = $bindingDatabase
+        ResetDatabase = $null
+        OuterMetricsComparable = $false
+        Arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $PSScriptRoot 'benchmark_binding_replay.ps1'), '-Database', $bindingDatabase, '-Workspace', $bindingWorkspace)
     }
 }
 
@@ -698,6 +714,9 @@ foreach ($case in $cases) {
         }
         if ($case.Id -like '*-lsp-lifecycle') {
             Assert-LspLifecycleGate -CaseId $case.Id -Metrics $metrics
+        }
+        if ($case.Id -eq 'u-boot-binding-replay') {
+            Assert-BindingReplayGate -Metrics $metrics
         }
         $outerMetricsComparable = if (
             $case.PSObject.Properties.Name -contains 'OuterMetricsComparable'

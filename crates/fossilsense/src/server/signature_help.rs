@@ -53,20 +53,12 @@ impl Backend {
             .reach_scope_from_context(&uri, &context)
             .map(|(_, reach)| reach);
         let mut reach_us = reach_started.elapsed().as_micros();
-        let semantic_generation = context.engine.semantic_generation;
         let call_read_handle = context.engine.call_read_handle.clone();
         let declaration_index = context.engine.declaration_index.clone();
         let reach_graph = context.engine.reach_graph.clone();
         let overlay_started = std::time::Instant::now();
         let overlay = self
-            .candidate_overlay_snapshot_from_documents(
-                &root,
-                semantic_generation,
-                reach_graph.as_deref(),
-                context.engine.indexed_files.as_deref().map(Vec::as_slice),
-                context.engine.workspace_semantics.clone(),
-                documents,
-            )
+            .candidate_overlay_snapshot_from_documents(&root, context.engine.clone(), documents)
             .await;
         reach_us = reach_us.saturating_add(overlay_started.elapsed().as_micros());
         let active_argument = call.active_argument;

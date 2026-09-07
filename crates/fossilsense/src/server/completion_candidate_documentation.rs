@@ -53,7 +53,6 @@ impl Backend {
             .language_for_uri(request_uri)
             .semantic_family();
         let declaration_index = context.engine.declaration_index.clone()?;
-        let generation = context.engine.semantic_generation;
         let (current_rel, current_text) =
             current_document_for_root(Some(request_uri), &root, documents.current.as_ref());
         let reach_scope = self
@@ -63,14 +62,7 @@ impl Backend {
         let call_read_handle = context.engine.call_read_handle.clone();
         let query_index = declaration_index.clone();
         let overlay = self
-            .candidate_overlay_snapshot_from_documents(
-                &root,
-                generation,
-                reach_graph.as_deref(),
-                context.engine.indexed_files.as_deref().map(Vec::as_slice),
-                context.engine.workspace_semantics.clone(),
-                documents,
-            )
+            .candidate_overlay_snapshot_from_documents(&root, context.engine.clone(), documents)
             .await;
         let cache_before = declaration_index.payload_cache_stats();
         let query_started = std::time::Instant::now();
@@ -184,14 +176,7 @@ impl Backend {
         let call_read_handle = context.engine.call_read_handle.clone();
         let declaration_index = context.engine.declaration_index.clone();
         let overlay = self
-            .candidate_overlay_snapshot_from_documents(
-                &root,
-                generation,
-                reach_graph.as_deref(),
-                context.engine.indexed_files.as_deref().map(Vec::as_slice),
-                context.engine.workspace_semantics.clone(),
-                documents,
-            )
+            .candidate_overlay_snapshot_from_documents(&root, context.engine.clone(), documents)
             .await;
         let result = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
             let service =

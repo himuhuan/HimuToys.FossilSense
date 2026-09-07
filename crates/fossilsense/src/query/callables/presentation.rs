@@ -17,6 +17,32 @@ pub fn hover_presentations(groups: &[CallableVariantGroup]) -> Vec<&ResolvedCall
     )
 }
 
+/// Select an already focused callable group before choosing its display anchor.
+/// A header declaration and its source definition have distinct occurrence
+/// fingerprints; filtering the display anchor afterwards can erase the group.
+pub fn focused_hover_presentations<'a>(
+    groups: &'a [CallableVariantGroup],
+    fingerprints: &std::collections::HashSet<&str>,
+) -> Vec<&'a ResolvedCallableAnchor> {
+    sorted_presentations(
+        groups,
+        |group| {
+            if !group
+                .variants()
+                .any(|variant| fingerprints.contains(variant.anchor.anchor_fingerprint.as_str()))
+            {
+                return None;
+            }
+            group
+                .header_declaration
+                .as_ref()
+                .or(group.source_definition.as_ref())
+                .or(group.other_variants.first())
+        },
+        true,
+    )
+}
+
 pub fn signature_presentations(groups: &[CallableVariantGroup]) -> Vec<&ResolvedCallableAnchor> {
     hover_presentations(groups)
 }

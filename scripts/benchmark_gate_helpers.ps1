@@ -18,6 +18,32 @@ function Assert-FullIndexPerformanceGate {
     }
 }
 
+function Get-BindingReplayMetricNames {
+    'binding_replay_declarations'
+    'binding_replay_files'
+    foreach ($phase in @('cold', 'warm', 'edited')) {
+        foreach ($feature in @('hover', 'definition')) {
+            foreach ($metric in @('requests', 'correct_targets', 'p50_us', 'p95_us', 'p99_us', 'sqlite_read_sessions', 'parse_cache_hits', 'capture_p95_us', 'parse_p95_us', 'binding_p95_us', 'overlay_p95_us', 'query_p95_us', 'hydration_p95_us', 'render_p95_us')) {
+                "binding_${phase}_${feature}_${metric}"
+            }
+        }
+    }
+}
+
+function Assert-BindingReplayGate([System.Collections.IDictionary]$Metrics) {
+    foreach ($key in (Get-BindingReplayMetricNames)) {
+        if (-not $Metrics.Contains($key)) { throw "Binding replay missing $key" }
+    }
+    if ($Metrics['binding_replay_declarations'] -lt 500000 -or $Metrics['binding_replay_files'] -lt 10000) { throw 'Binding replay sample is too small' }
+    foreach ($phase in @('cold', 'warm', 'edited')) {
+        foreach ($feature in @('hover', 'definition')) {
+            $prefix = "binding_${phase}_${feature}"
+            if ($Metrics["${prefix}_requests"] -ne 64 -or $Metrics["${prefix}_correct_targets"] -ne 64) { throw "Binding replay incorrect target or request count: $prefix" }
+            if ($Metrics["${prefix}_p50_us"] -gt $Metrics["${prefix}_p95_us"] -or $Metrics["${prefix}_p95_us"] -gt $Metrics["${prefix}_p99_us"]) { throw "Binding replay invalid percentiles: $prefix" }
+        }
+    }
+}
+
 function Assert-LspLifecycleGate {
     [CmdletBinding()]
     param(
@@ -153,5 +179,13 @@ function Assert-LspLifecycleGate {
         if ([long]$Metrics.lsp_lifecycle_peak_process_bytes -gt 536870912) {
             throw "$CaseId exceeded the 512 MiB lifecycle memory gate"
         }
+    }
+}
+
+function Assert-ReplayProcessSuccess {
+    param([int]$ExitCode, [string[]]$Output)
+    $panic = @($Output | Where-Object { $_ -match '(?i)\bpanicked at\b|fatal runtime error|stack overflow' })
+    if ($ExitCode -ne 0 -or $panic.Count -gt 0) {
+        throw "Replay process failed (exit $ExitCode): $(@($Output | Select-Object -Last 35) -join [Environment]::NewLine)"
     }
 }

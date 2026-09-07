@@ -23,14 +23,31 @@ pub(super) const HOVER_SOURCE_FILE_BYTE_LIMIT: u64 = 256 * 1024;
 
 impl Backend {
     pub(super) async fn provide_hover(&self, params: HoverParams) -> LspResult<Option<Hover>> {
+        let mut timer = super::query_session::BindingTimer::new(self, "hover");
+        let result = self.provide_hover_timed(params, &mut timer).await;
+        timer.observation.completed = true;
+        timer.observation.returned = result.as_ref().is_ok_and(Option::is_some);
+        timer.log().await;
+        result
+    }
+
+    async fn provide_hover_timed(
+        &self,
+        params: HoverParams,
+        timer: &mut super::query_session::BindingTimer<'_>,
+    ) -> LspResult<Option<Hover>> {
         let total_started = std::time::Instant::now();
         let position = params.text_document_position_params;
         let uri = position.text_document.uri;
-        let documents = self
-            .session
-            .documents
-            .capture_request_snapshot(Some(&uri))
-            .await;
+        let started = std::time::Instant::now();
+        let session = self.capture_query_session(&uri).await;
+        timer.observation.capture_us = started.elapsed().as_micros();
+        let Some(query_session) = session else {
+            return Ok(None);
+        };
+        let root = query_session.root.clone();
+        let context = query_session.context.clone();
+        let documents = query_session.documents.clone();
         let Some((version, text)) = self.document_snapshot_from_request(&uri, &documents).await
         else {
             return Ok(None);
@@ -42,10 +59,6 @@ impl Backend {
         let Some(word) = query::word_at(line_text, position.position.character) else {
             return Ok(None);
         };
-        let Some(root) = self.root_for_uri(&uri).await else {
-            return Ok(None);
-        };
-        let context = self.request_context_for_root(root.clone()).await;
         let current_abs = uri_to_path(&uri);
         let current_rel = current_abs
             .as_deref()
@@ -64,11 +77,12 @@ impl Backend {
         // navigation's label proof instead of describing workspace symbols
         // that merely share the spelling.
         if super::navigation::label_navigation_syntax_hint(&text, &word, cursor_byte) {
+            let label_started = std::time::Instant::now();
             let label_path = current_rel.clone();
             let label_text = text.clone();
             let label_word = word.clone();
             let label_uri = uri.clone();
-            match tokio::task::spawn_blocking(move || {
+            let label_result = tokio::task::spawn_blocking(move || {
                 super::navigation::label_navigation_location(
                     &label_uri,
                     &label_path,
@@ -78,8 +92,9 @@ impl Backend {
                     source_language,
                 )
             })
-            .await
-            {
+            .await;
+            timer.observation.parse_us += label_started.elapsed().as_micros();
+            match label_result {
                 Ok(super::navigation::LabelNavigation::Found(location)) => {
                     let total_us = total_started.elapsed().as_micros();
                     self.perf_log(|| SemanticRequestPerf::default().log_line("hover", total_us))
@@ -103,43 +118,37 @@ impl Backend {
             }
         }
 
-        // Lexical bindings are proven by C scope rules and dominate every
-        // workspace same-name candidate, exactly as in navigation and possible
-        // targets.
-        if super::navigation::ordinary_identifier_navigation_context(
-            line_text,
-            position.position.character,
-        ) {
-            if let Some(current_abs) = current_abs.as_deref() {
-                if let Some(parsed) = self
-                    .get_or_parse_document_with_selection(
-                        &uri,
-                        current_abs,
-                        version,
-                        &text,
-                        crate::parser::ParseFacts::LOCAL_DECLS,
-                        selection,
-                    )
-                    .await
-                {
-                    if let Some(binding) =
-                        query::visible_local_binding(&parsed.local_bindings, &word, cursor_byte)
-                    {
-                        let total_us = total_started.elapsed().as_micros();
-                        self.perf_log(|| {
-                            SemanticRequestPerf::default().log_line("hover", total_us)
-                        })
-                        .await;
-                        return Ok(Some(markdown_hover(local_binding_hover_markdown(
-                            &current_rel,
-                            &text,
-                            binding,
-                        ))));
-                    }
-                }
+        let started = std::time::Instant::now();
+        let cursor_binding = query_session
+            .bind_cursor(self, &uri, (version, text.clone()), &word, cursor_byte)
+            .await;
+        let binding_parse_us = started.elapsed().as_micros();
+        let Some(cursor_binding) = cursor_binding else {
+            timer.observation.parse_us += binding_parse_us;
+            return Ok(None);
+        };
+        timer.observation.parse_us += cursor_binding.parse_us;
+        timer.observation.binding_us = cursor_binding.binding_us;
+        timer.observation.cache_hit = cursor_binding.cache_hit;
+        let syntax = cursor_binding.syntax;
+        match cursor_binding.resolution {
+            query::BindingResolution::Resolved(local) => {
+                let render_started = std::time::Instant::now();
+                let binding = &cursor_binding.parsed.local_bindings[local.binding_index];
+                let result = Some(markdown_hover(local_binding_hover_markdown(
+                    &current_rel,
+                    &text,
+                    binding,
+                )));
+                timer.observation.render_us = render_started.elapsed().as_micros();
+                return Ok(result);
             }
+            query::BindingResolution::UnresolvedWithinDomain {
+                reason: query::BindingReason::NoLocalBinding,
+                ..
+            } => {}
+            _ => return Ok(None),
         }
-
         let reach_started = std::time::Instant::now();
         let reach_scope = self
             .reach_scope_from_context(&uri, &context)
@@ -147,21 +156,14 @@ impl Backend {
         let mut reach_us = reach_started.elapsed().as_micros();
         let project_context = context.engine.project_context.clone();
         let protobuf_c_enabled = context.engine.workspace_semantics.protobuf_c_enabled();
-        let semantic_generation = context.engine.semantic_generation;
         let call_read_handle = context.engine.call_read_handle.clone();
         let declaration_index = context.engine.declaration_index.clone();
         let reach_graph = context.engine.reach_graph.clone();
         let overlay_started = std::time::Instant::now();
         let overlay = self
-            .candidate_overlay_snapshot_from_documents(
-                &root,
-                semantic_generation,
-                reach_graph.as_deref(),
-                context.engine.indexed_files.as_deref().map(Vec::as_slice),
-                context.engine.workspace_semantics.clone(),
-                documents,
-            )
+            .candidate_overlay_snapshot_from_documents(&root, context.engine.clone(), documents)
             .await;
+        timer.observation.overlay_us = overlay_started.elapsed().as_micros();
         reach_us = reach_us.saturating_add(overlay_started.elapsed().as_micros());
         let source_position = SourcePosition {
             line: position.position.line,
@@ -169,8 +171,10 @@ impl Backend {
         };
         let current_text = text;
 
+        let reads = timer.reads.clone();
         let result = tokio::task::spawn_blocking(
             move || -> Result<(Option<String>, SemanticRequestPerf)> {
+                let _reads = crate::call_service::ReadSessionProbe::enter(reads);
                 let query_started = std::time::Instant::now();
                 let service = CandidateQueryService::new_with_declarations_for_family(
                     call_read_handle.as_deref(),
@@ -184,12 +188,16 @@ impl Backend {
                 let call_context = service.complete_call_context_at(source_position)?;
                 let is_call_site = call_context.is_some();
                 let origin_anchor = service.anchor_at(source_position)?;
-                let semantic_set = service.semantic_candidates(
+                let semantic_set = service.semantic_candidates_with_policy(
                     &word,
                     if is_call_site || origin_anchor.is_some() {
                         crate::candidate_service::SemanticIntent::Call
                     } else {
                         crate::candidate_service::SemanticIntent::Neutral
+                    },
+                    crate::candidate_service::LookupPolicy::BoundDomain {
+                        domain: syntax.domain,
+                        qualifier: syntax.qualifier.as_deref(),
                     },
                 )?;
                 let semantic_count = semantic_set
@@ -221,22 +229,20 @@ impl Backend {
                     .map(SemanticRequestPerf::from_callable_set)
                     .unwrap_or_default();
                 perf.reach_us = reach_us;
-                let hydration_started = std::time::Instant::now();
+
                 let mut hydration = HydrationStats::default();
                 if let Some(callable_set) = callable_set.as_ref().filter(|set| {
                     !set.anchors.is_empty() && (origin_anchor.is_some() || is_call_site)
                 }) {
-                    let presentations: Vec<_> = query::hover_presentations(&callable_set.groups)
-                        .into_iter()
-                        .filter(|candidate| {
-                            callable_fingerprints
-                                .contains(candidate.anchor.anchor_fingerprint.as_str())
-                        })
-                        .collect();
+                    let presentations: Vec<_> = query::focused_hover_presentations(
+                        &callable_set.groups,
+                        &callable_fingerprints,
+                    );
                     let source_paths = presentation_paths(&presentations);
                     let source_revisions = service.source_revisions(&source_paths)?;
                     perf.query_us = query_started.elapsed().as_micros();
                     perf.returned = presentations.len().min(query::HOVER_CANDIDATE_LIMIT);
+                    let render_started = std::time::Instant::now();
                     let markdown = hover_markdown_for_callable_presentations(
                         &root,
                         &current_rel,
@@ -247,7 +253,11 @@ impl Backend {
                         &source_revisions,
                         &mut hydration,
                     );
-                    perf.hydration_us = hydration_started.elapsed().as_micros();
+                    perf.hydration_us = hydration.elapsed_us;
+                    perf.render_us = render_started
+                        .elapsed()
+                        .as_micros()
+                        .saturating_sub(hydration.elapsed_us);
                     perf.hydration_count = hydration.count;
                     perf.hydration_bytes = hydration.bytes;
                     return Ok((with_candidate_set_evidence(markdown, &semantic_set), perf));
@@ -271,6 +281,7 @@ impl Backend {
                         || !type_candidates.records.candidates.is_empty()
                     {
                         perf.query_us = query_started.elapsed().as_micros();
+                        let render_started = std::time::Instant::now();
                         let markdown = hover_markdown_for_type_candidates(
                             &root,
                             &current_rel,
@@ -285,7 +296,11 @@ impl Backend {
                             .len()
                             .saturating_add(type_candidates.records.candidates.len())
                             .min(query::HOVER_CANDIDATE_LIMIT);
-                        perf.hydration_us = hydration_started.elapsed().as_micros();
+                        perf.hydration_us = hydration.elapsed_us;
+                        perf.render_us = render_started
+                            .elapsed()
+                            .as_micros()
+                            .saturating_sub(hydration.elapsed_us);
                         perf.hydration_count = hydration.count;
                         perf.hydration_bytes = hydration.bytes;
                         let markdown = with_candidate_set_evidence(markdown, &semantic_set);
@@ -303,17 +318,15 @@ impl Backend {
                 if let Some(callable_set) =
                     callable_set.as_ref().filter(|set| !set.anchors.is_empty())
                 {
-                    let presentations: Vec<_> = query::hover_presentations(&callable_set.groups)
-                        .into_iter()
-                        .filter(|candidate| {
-                            callable_fingerprints
-                                .contains(candidate.anchor.anchor_fingerprint.as_str())
-                        })
-                        .collect();
+                    let presentations: Vec<_> = query::focused_hover_presentations(
+                        &callable_set.groups,
+                        &callable_fingerprints,
+                    );
                     let source_paths = presentation_paths(&presentations);
                     let source_revisions = service.source_revisions(&source_paths)?;
                     perf.query_us = query_started.elapsed().as_micros();
                     perf.returned = presentations.len().min(query::HOVER_CANDIDATE_LIMIT);
+                    let render_started = std::time::Instant::now();
                     let markdown = hover_markdown_for_callable_presentations(
                         &root,
                         &current_rel,
@@ -324,7 +337,11 @@ impl Backend {
                         &source_revisions,
                         &mut hydration,
                     );
-                    perf.hydration_us = hydration_started.elapsed().as_micros();
+                    perf.hydration_us = hydration.elapsed_us;
+                    perf.render_us = render_started
+                        .elapsed()
+                        .as_micros()
+                        .saturating_sub(hydration.elapsed_us);
                     perf.hydration_count = hydration.count;
                     perf.hydration_bytes = hydration.bytes;
                     return Ok((with_candidate_set_evidence(markdown, &semantic_set), perf));
@@ -356,6 +373,7 @@ impl Backend {
                     .cloned()
                     .collect();
                 perf.returned = candidates.len();
+                let render_started = std::time::Instant::now();
                 let markdown = hover_markdown_for_candidates_with_project(
                     &root,
                     &current_rel,
@@ -367,7 +385,11 @@ impl Backend {
                     &source_revisions,
                     Some(&mut hydration),
                 );
-                perf.hydration_us = hydration_started.elapsed().as_micros();
+                perf.hydration_us = hydration.elapsed_us;
+                perf.render_us = render_started
+                    .elapsed()
+                    .as_micros()
+                    .saturating_sub(hydration.elapsed_us);
                 perf.hydration_count = hydration.count;
                 perf.hydration_bytes = hydration.bytes;
                 let markdown = with_candidate_set_evidence(markdown, &semantic_set);
@@ -389,6 +411,9 @@ impl Backend {
             .ok()
             .and_then(|result| result.as_ref().ok().map(|(_, metrics)| *metrics))
             .unwrap_or_default();
+        timer.observation.query_us = metrics.query_us;
+        timer.observation.hydration_us = metrics.hydration_us;
+        timer.observation.render_us = metrics.render_us;
         self.perf_log(|| metrics.log_line("hover", total_started.elapsed().as_micros()))
             .await;
 
@@ -590,6 +615,7 @@ fn hover_markdown_for_type_candidates(
         .take(query::HOVER_CANDIDATE_LIMIT)
     {
         let alias = &resolution.alias;
+        let source_started = std::time::Instant::now();
         let (declaration, omission) = read_type_excerpt(
             root,
             current_rel,
@@ -603,6 +629,7 @@ fn hover_markdown_for_type_candidates(
             },
         );
         hydration.record(declaration.as_deref());
+        hydration.elapsed_us += source_started.elapsed().as_micros();
         let mut section = String::new();
         section.push_str(&format!("### typedef `{}`\n\n", alias.alias));
         if let Some(comment) = type_candidate_comment(
@@ -702,6 +729,7 @@ fn record_hover_section(
     record: &query::RecordCandidate,
     hydration: &mut HydrationStats,
 ) -> String {
+    let source_started = std::time::Instant::now();
     let (definition, omission) = read_type_excerpt(
         root,
         current_rel,
@@ -715,6 +743,7 @@ fn record_hover_section(
         },
     );
     hydration.record(definition.as_deref());
+    hydration.elapsed_us += source_started.elapsed().as_micros();
     let kind = match record.kind {
         crate::semantic_model::RecordKind::Struct => "struct",
         crate::semantic_model::RecordKind::Union => "union",
@@ -779,6 +808,7 @@ fn type_candidate_comment(
     } else {
         "workspace"
     };
+    let source_started = std::time::Instant::now();
     let source = candidate_source_text_for_path_with_overlay_at_revision(
         root,
         current_rel,
@@ -787,7 +817,9 @@ fn type_candidate_comment(
         candidate_path,
         source_kind,
         revision,
-    )?;
+    );
+    hydration.elapsed_us += source_started.elapsed().as_micros();
+    let source = source?;
     hydration.record(Some(&source));
     let range = crate::model::CandidateRange {
         start_line: name_range.start.line,
@@ -925,6 +957,7 @@ fn hover_markdown_for_callable_presentations(
         } else {
             candidate.anchor.presentation_signature.clone()
         };
+        let source_started = std::time::Instant::now();
         let source = candidate_source_text_for_path_with_overlay_at_revision(
             root,
             current_rel,
@@ -935,6 +968,7 @@ fn hover_markdown_for_callable_presentations(
             revisions.get(&candidate.candidate.path),
         );
         hydration.record(source.as_deref());
+        hydration.elapsed_us += source_started.elapsed().as_micros();
         let comment = source.as_deref().and_then(|source| {
             query::comment_documentation_for_candidate_symbol(
                 source,

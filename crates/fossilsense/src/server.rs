@@ -106,6 +106,7 @@ mod completion_adapter;
 use completion_adapter::{
     apply_final_completion_sort_text, ordinary_completion_item_to_lsp, CompletionDocumentationData,
 };
+mod query_session;
 mod request_metrics;
 use request_metrics::{
     live_parse_cache_log, HydrationStats, LiveParseCacheEvent, SemanticRequestPerf,
@@ -360,7 +361,81 @@ impl Backend {
         requested_facts: parser::ParseFacts,
         language: crate::config::LanguageSelection,
     ) -> Option<Arc<FileSemanticIndex>> {
-        let identity_path = if language.language == SourceLanguage::Go {
+        self.get_or_parse_document_with_selection_observed(
+            uri,
+            path,
+            version,
+            text,
+            requested_facts,
+            language,
+        )
+        .await
+        .map(|(index, _)| index)
+    }
+
+    /// A navigation request owns its captured text even when a newer edit
+    /// cancels live background work. Retry that immutable input only on a
+    /// canceled/missing live result; never substitute the latest document.
+    async fn get_or_parse_captured_document_with_selection_observed(
+        &self,
+        uri: &Url,
+        path: &Path,
+        version: i32,
+        text: &str,
+        facts: parser::ParseFacts,
+        language: crate::config::LanguageSelection,
+    ) -> Option<(Arc<FileSemanticIndex>, LiveParseCacheEvent)> {
+        if let Some(result) = self
+            .get_or_parse_document_with_selection_observed(
+                uri, path, version, text, facts, language,
+            )
+            .await
+        {
+            return Some(result);
+        }
+        let path = path.to_path_buf();
+        let text = text.to_owned();
+        let parsed = tokio::task::spawn_blocking(move || {
+            Arc::new(parser::parse_thread_local_with_selection(
+                &path, &text, language, facts,
+            ))
+        })
+        .await
+        .ok()?;
+        self.session
+            .documents
+            .store_live_parse(uri.clone(), version, language, facts, parsed.clone())
+            .await;
+        Some((parsed, LiveParseCacheEvent::Miss))
+    }
+
+    async fn get_or_parse_captured_document_with_selection(
+        &self,
+        uri: &Url,
+        path: &Path,
+        version: i32,
+        text: &str,
+        facts: parser::ParseFacts,
+        language: crate::config::LanguageSelection,
+    ) -> Option<Arc<FileSemanticIndex>> {
+        self.get_or_parse_captured_document_with_selection_observed(
+            uri, path, version, text, facts, language,
+        )
+        .await
+        .map(|(parsed, _)| parsed)
+    }
+
+    async fn get_or_parse_document_with_selection_observed(
+        &self,
+        uri: &Url,
+        path: &Path,
+        version: i32,
+        text: &str,
+        requested_facts: parser::ParseFacts,
+        language: crate::config::LanguageSelection,
+    ) -> Option<(Arc<FileSemanticIndex>, LiveParseCacheEvent)> {
+        let source_fingerprint = *blake3::hash(text.as_bytes()).as_bytes();
+        let identity_path = if language.language == SourceLanguage::Go && path.is_absolute() {
             self.root_for_uri(uri)
                 .await
                 .and_then(|root| pathing::relative_slash_path(&root, path).ok())
@@ -381,7 +456,8 @@ impl Backend {
                 ))
             })
             .await
-            .ok();
+            .ok()
+            .map(|index| (index, LiveParseCacheEvent::Miss));
         }
 
         // Fast path: cached entry with matching version.
@@ -390,10 +466,11 @@ impl Backend {
             .documents
             .cached_live_parse(uri, version, language, requested_facts)
             .await
+            .filter(|index| index.source_fingerprint == source_fingerprint)
         {
             self.perf_log(|| live_parse_cache_log(LiveParseCacheEvent::Hit).to_string())
                 .await;
-            return Some(cached);
+            return Some((cached, LiveParseCacheEvent::Hit));
         }
 
         // Coalesce concurrent semantic-token/completion/symbol requests for
@@ -407,10 +484,11 @@ impl Backend {
             .documents
             .cached_live_parse(uri, version, language, requested_facts)
             .await
+            .filter(|index| index.source_fingerprint == source_fingerprint)
         {
             self.perf_log(|| live_parse_cache_log(LiveParseCacheEvent::Coalesced).to_string())
                 .await;
-            return Some(cached);
+            return Some((cached, LiveParseCacheEvent::Coalesced));
         }
 
         // Cache miss: parse on the blocking thread-pool and store.
@@ -450,7 +528,7 @@ impl Backend {
             .documents
             .store_live_parse(uri.clone(), version, language, facts, index.clone())
             .await;
-        Some(index)
+        Some((index, LiveParseCacheEvent::Miss))
     }
 
     /// Parse one authorized external-document identity. The identity is part
@@ -465,11 +543,13 @@ impl Backend {
         text: &str,
         language: crate::config::LanguageSelection,
     ) -> Option<Arc<FileSemanticIndex>> {
+        let source_fingerprint = *blake3::hash(text.as_bytes()).as_bytes();
         if let Some(cached) = self
             .session
             .documents
             .cached_external_overlay_parse(uri, version, language, identity_path)
             .await
+            .filter(|index| index.source_fingerprint == source_fingerprint)
         {
             return Some(cached);
         }
@@ -485,6 +565,7 @@ impl Backend {
             .documents
             .cached_external_overlay_parse(uri, version, language, identity_path)
             .await
+            .filter(|index| index.source_fingerprint == source_fingerprint)
         {
             return Some(cached);
         }
@@ -506,12 +587,17 @@ impl Backend {
                 &parse_cancellation,
             )
             .map(Arc::new)
+            .unwrap_or_else(|| {
+                Arc::new(parser::parse_thread_local_with_selection(
+                    &path_owned,
+                    &text_owned,
+                    language,
+                    parser::ParseFacts::HOVER_SEMANTICS,
+                ))
+            })
         })
         .await
-        .ok()??;
-        if cancellation.load(Ordering::Relaxed) {
-            return None;
-        }
+        .ok()?;
 
         self.session
             .documents

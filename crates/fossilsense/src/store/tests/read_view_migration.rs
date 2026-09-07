@@ -103,7 +103,18 @@ fn core_symbol_features_route_through_candidate_sets_and_stable_handles() {
         "src/server/signature_help.rs",
         "src/server/possible_targets.rs",
     ] {
-        assert_present(path, &["semantic_candidates("]);
+        if matches!(path, "src/server/hover.rs" | "src/server/navigation.rs") {
+            assert_present(
+                path,
+                &[
+                    "semantic_candidates_with_policy(",
+                    "LookupPolicy::BoundDomain",
+                    "capture_query_session(",
+                ],
+            );
+        } else {
+            assert_present(path, &["semantic_candidates("]);
+        }
         assert_absent(path, &["non_callable_symbols("]);
     }
     assert_absent(

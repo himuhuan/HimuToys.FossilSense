@@ -93,10 +93,7 @@ impl Backend {
             let overlay = self
                 .candidate_overlay_snapshot_from_documents(
                     root,
-                    context.engine.semantic_generation,
-                    context.engine.reach_graph.as_deref(),
-                    context.engine.indexed_files.as_deref().map(Vec::as_slice),
-                    context.engine.workspace_semantics.clone(),
+                    context.engine.clone(),
                     documents.clone(),
                 )
                 .await;

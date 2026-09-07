@@ -6,7 +6,16 @@ pub(super) trait HeapBytes {
     fn heap_bytes(&self) -> usize;
 }
 macro_rules! scalars { ($($ty:ty),* $(,)?) => { $(impl HeapBytes for $ty { fn heap_bytes(&self) -> usize { 0 } })* }; }
-scalars!(bool, usize, u8, u16, u32, u64, super::ParseFacts);
+scalars!(
+    bool,
+    usize,
+    u8,
+    u16,
+    u32,
+    u64,
+    super::ParseFacts,
+    super::LookupDomain
+);
 impl<T: HeapBytes, const N: usize> HeapBytes for [T; N] {
     fn heap_bytes(&self) -> usize {
         self.iter()
@@ -79,7 +88,9 @@ impl HeapBytes for crate::semantic_model::DeclaratorShape {
         }
     }
 }
-struct_heap!(super::FileSemanticIndex, { language, language_evidence, includes, package, imports, build_guard, declarations, fallback_completions, parse_outcome, occurrences, records, fields, members, aliases, callable_anchors, call_sites, local_declarations, local_bindings, diagnostics });
+struct_heap!(super::FileSemanticIndex, { source_fingerprint, cursor, language, language_evidence, includes, package, imports, build_guard, declarations, fallback_completions, parse_outcome, occurrences, records, fields, members, aliases, callable_anchors, call_sites, local_declarations, local_bindings, diagnostics });
+struct_heap!(super::CursorFacts, { spans, truncated });
+struct_heap!(super::CursorSyntax, { start_byte, end_byte, domain, qualifier, conditional });
 struct_heap!(super::ParseDiagnostics, { parse_error_count, fallback_used, lexical_source, ast_source, requested_facts, recovery, recovery_budget_exhausted, coverage });
 struct_heap!(crate::semantic_model::DeclarationCoverage, { summary, gaps });
 struct_heap!(crate::semantic_model::CoverageGap, { range, groups, reason, evidence, related_declarations, recovery_rules });

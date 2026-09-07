@@ -1,5 +1,8 @@
 #![allow(clippy::field_reassign_with_default)]
 
+mod binding_replay;
+mod cursor_binding;
+
 use super::{
     grouped_reference_items, local_words_for_cache, rebuild_include_table,
     rebuild_indexed_file_list,
@@ -615,6 +618,7 @@ fn text_and_position(marked: &str) -> (String, u32, u32) {
 #[test]
 fn semantic_candidate_perf_log_contains_only_aggregate_contract_fields() {
     let metrics = super::SemanticRequestPerf {
+        render_us: 0,
         candidates: crate::query::CallableCandidateMetrics {
             raw_candidates: 9,
             filtered_candidates: 7,

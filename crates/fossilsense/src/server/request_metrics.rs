@@ -8,6 +8,7 @@ pub(in crate::server) struct SemanticRequestPerf {
     pub(in crate::server) hydration_bytes: usize,
     pub(in crate::server) query_us: u128,
     pub(in crate::server) hydration_us: u128,
+    pub(in crate::server) render_us: u128,
     pub(in crate::server) reach_us: u128,
     pub(in crate::server) coverage_open: bool,
     pub(in crate::server) coverage_truncated: bool,
@@ -110,6 +111,7 @@ fn coverage_reason_code(reason: Option<query::CandidateIncompleteReason>) -> u8 
 pub(in crate::server) struct HydrationStats {
     pub(in crate::server) count: usize,
     pub(in crate::server) bytes: usize,
+    pub(in crate::server) elapsed_us: u128,
 }
 
 impl HydrationStats {

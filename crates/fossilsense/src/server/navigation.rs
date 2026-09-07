@@ -21,15 +21,35 @@ impl Backend {
         params: GotoDefinitionParams,
         operation: NavigationOperation,
     ) -> LspResult<Option<GotoDefinitionResponse>> {
+        let mut timer = query_session::BindingTimer::new(self, operation.label());
+        let result = self
+            .navigate_symbol_timed(params, operation, &mut timer)
+            .await;
+        timer.observation.completed = true;
+        timer.observation.returned = result.as_ref().is_ok_and(Option::is_some);
+        timer.log().await;
+        result
+    }
+
+    async fn navigate_symbol_timed(
+        &self,
+        params: GotoDefinitionParams,
+        operation: NavigationOperation,
+        timer: &mut query_session::BindingTimer<'_>,
+    ) -> LspResult<Option<GotoDefinitionResponse>> {
         let position = params.text_document_position_params;
         let uri = position.text_document.uri;
 
-        let documents = self
-            .session
-            .documents
-            .capture_request_snapshot(Some(&uri))
-            .await;
-        let Some((_version, text)) = self.document_snapshot_from_request(&uri, &documents).await
+        let started = std::time::Instant::now();
+        let session = self.capture_query_session(&uri).await;
+        timer.observation.capture_us = started.elapsed().as_micros();
+        let Some(query_session) = session else {
+            return Ok(None);
+        };
+        let root = query_session.root.clone();
+        let context = query_session.context.clone();
+        let documents = query_session.documents.clone();
+        let Some((version, text)) = self.document_snapshot_from_request(&uri, &documents).await
         else {
             return Ok(None);
         };
@@ -50,10 +70,6 @@ impl Backend {
             return Ok(None);
         }
 
-        let Some(root) = self.root_for_uri(&uri).await else {
-            return Ok(None);
-        };
-        let context = self.request_context_for_root(root.clone()).await;
         let current_abs = uri_to_path(&uri);
         let current_rel = current_abs
             .as_deref()
@@ -73,11 +89,12 @@ impl Backend {
         // context and the enclosing function before a local label can dominate
         // workspace candidates with the same spelling.
         if label_navigation_syntax_hint(&text, &word, source_cursor_byte) {
+            let label_started = std::time::Instant::now();
             let label_uri = uri.clone();
             let label_path = current_rel.clone();
             let label_text = text.clone();
             let label_word = word.clone();
-            match tokio::task::spawn_blocking(move || {
+            let label_result = tokio::task::spawn_blocking(move || {
                 label_navigation_location(
                     &label_uri,
                     &label_path,
@@ -87,8 +104,9 @@ impl Backend {
                     source_language,
                 )
             })
-            .await
-            {
+            .await;
+            timer.observation.parse_us += label_started.elapsed().as_micros();
+            match label_result {
                 Ok(LabelNavigation::Found(location)) => {
                     return Ok(Some(GotoDefinitionResponse::Array(vec![location])));
                 }
@@ -101,28 +119,46 @@ impl Backend {
             }
         }
 
-        // Lexical bindings are proven by C scope rules and dominate every
-        // workspace same-name candidate, regardless of recall completeness.
-        if ordinary_identifier_navigation_context(line_text, position.position.character) {
-            let local_uri = uri.clone();
-            let local_path = current_rel.clone();
-            let local_text = text.clone();
-            let local_word = word.clone();
-            let local_position = position.position;
-            if let Ok(Some(location)) = tokio::task::spawn_blocking(move || {
-                local_binding_location(
-                    &local_uri,
-                    &local_path,
-                    &local_text,
-                    &local_word,
-                    local_position,
-                    source_language,
-                )
-            })
-            .await
-            {
-                return Ok(Some(GotoDefinitionResponse::Array(vec![location])));
+        let started = std::time::Instant::now();
+        let cursor_binding = query_session
+            .bind_cursor(
+                self,
+                &uri,
+                (version, text.clone()),
+                &word,
+                source_cursor_byte,
+            )
+            .await;
+        let binding_parse_us = started.elapsed().as_micros();
+        let Some(cursor_binding) = cursor_binding else {
+            timer.observation.parse_us += binding_parse_us;
+            return Ok(None);
+        };
+        timer.observation.parse_us += cursor_binding.parse_us;
+        timer.observation.binding_us = cursor_binding.binding_us;
+        timer.observation.cache_hit = cursor_binding.cache_hit;
+        let syntax = cursor_binding.syntax;
+        match cursor_binding.resolution {
+            query::BindingResolution::Resolved(local) => {
+                let render_started = std::time::Instant::now();
+                let binding = &cursor_binding.parsed.local_bindings[local.binding_index];
+                let start = source_position_for_byte(&text, binding.decl_start_byte);
+                let end = tower_lsp::lsp_types::Position {
+                    line: start.line,
+                    character: start.character + binding.name.encode_utf16().count() as u32,
+                };
+                let result = Some(GotoDefinitionResponse::Array(vec![Location {
+                    uri,
+                    range: tower_lsp::lsp_types::Range { start, end },
+                }]));
+                timer.observation.render_us = render_started.elapsed().as_micros();
+                return Ok(result);
             }
+            query::BindingResolution::UnresolvedWithinDomain {
+                reason: query::BindingReason::NoLocalBinding,
+                ..
+            } => {}
+            _ => return Ok(None),
         }
         // Reachability scope for candidate tier resolution (Current / Reachable
         // / External / Unknown / Global). A file in the set is proved reachable
@@ -138,21 +174,14 @@ impl Backend {
             .reach_scope_from_context(&uri, &context)
             .map(|(_, reach)| reach);
         let mut reach_us = reach_started.elapsed().as_micros();
-        let semantic_generation = context.engine.semantic_generation;
         let call_read_handle = context.engine.call_read_handle.clone();
         let declaration_index = context.engine.declaration_index.clone();
         let reach_graph = context.engine.reach_graph.clone();
         let overlay_started = std::time::Instant::now();
         let overlay = self
-            .candidate_overlay_snapshot_from_documents(
-                &root,
-                semantic_generation,
-                reach_graph.as_deref(),
-                context.engine.indexed_files.as_deref().map(Vec::as_slice),
-                context.engine.workspace_semantics.clone(),
-                documents,
-            )
+            .candidate_overlay_snapshot_from_documents(&root, context.engine.clone(), documents)
             .await;
+        timer.observation.overlay_us = overlay_started.elapsed().as_micros();
         reach_us = reach_us.saturating_add(overlay_started.elapsed().as_micros());
         let source_position = crate::call_model::SourcePosition {
             line: position.position.line,
@@ -167,8 +196,10 @@ impl Backend {
         let client = self.client.clone();
         let word_for_log = word.clone();
 
+        let reads = timer.reads.clone();
         let result = tokio::task::spawn_blocking(
             move || -> Result<(Vec<Location>, Vec<String>, SemanticRequestPerf)> {
+                let _reads = crate::call_service::ReadSessionProbe::enter(reads);
                 let query_started = std::time::Instant::now();
                 let service =
                     crate::candidate_service::CandidateQueryService::new_with_declarations_for_family(
@@ -181,13 +212,14 @@ impl Backend {
                         semantic_family,
                     );
                 let call_context = service.complete_call_context_at(source_position)?;
-                let semantic_set = service.semantic_candidates(
+                let semantic_set = service.semantic_candidates_with_policy(
                     &word,
                     if call_context.is_some() {
                         crate::candidate_service::SemanticIntent::Call
                     } else {
                         crate::candidate_service::SemanticIntent::Neutral
                     },
+                    crate::candidate_service::LookupPolicy::BoundDomain { domain: syntax.domain, qualifier: syntax.qualifier.as_deref() },
                 )?;
                 let semantic_count = semantic_set
                     .all
@@ -242,11 +274,13 @@ impl Backend {
                     if debug_reasons {
                         debug_lines.insert(0, candidate_set_debug_line(&semantic_set));
                     }
+                    let render_started = std::time::Instant::now();
                     let locations: Vec<Location> = candidates
                         .iter()
                         .filter_map(|candidate| candidate_to_location(&root, candidate))
                         .collect();
                     perf.returned = locations.len();
+                    perf.render_us += render_started.elapsed().as_micros();
                     if !locations.is_empty() {
                         return Ok((locations, debug_lines, perf));
                     }
@@ -263,11 +297,13 @@ impl Backend {
                 if debug_reasons {
                     debug_lines.insert(0, candidate_set_debug_line(&semantic_set));
                 }
+                let render_started = std::time::Instant::now();
                 let locations: Vec<Location> = candidates
                     .iter()
                     .filter_map(|candidate| candidate_to_location(&root, candidate))
                     .collect();
                 perf.returned = locations.len();
+                perf.render_us += render_started.elapsed().as_micros();
                 Ok((locations, debug_lines, perf))
             },
         )
@@ -278,6 +314,9 @@ impl Backend {
             .ok()
             .and_then(|result| result.as_ref().ok().map(|(_, _, metrics)| *metrics))
             .unwrap_or_default();
+        timer.observation.query_us = metrics.query_us;
+        timer.observation.hydration_us = metrics.hydration_us;
+        timer.observation.render_us = metrics.render_us;
         self.perf_log(|| metrics.log_line(operation.label(), total_started.elapsed().as_micros()))
             .await;
 

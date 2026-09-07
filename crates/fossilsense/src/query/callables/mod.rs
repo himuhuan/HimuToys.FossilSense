@@ -24,9 +24,9 @@ pub use counterpart::{resolve_counterparts, CounterpartEvidence};
 #[cfg(test)]
 pub use presentation::anchor_opposite_definition;
 #[cfg(test)]
-pub use presentation::call_declaration_presentations;
+pub use presentation::{call_declaration_presentations, hover_presentations};
 pub use presentation::{
-    call_declaration_presentations_at, call_definition_presentations, hover_presentations,
+    call_declaration_presentations_at, call_definition_presentations, focused_hover_presentations,
     signature_active_index, signature_presentations,
 };
 
