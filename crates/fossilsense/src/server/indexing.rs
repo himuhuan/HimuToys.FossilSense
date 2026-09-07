@@ -712,6 +712,8 @@ async fn index_roots(
                 }
             }
             Ok(Err(err)) => {
+                #[cfg(test)]
+                eprintln!("index failed for {display_root}: {err:#}");
                 client
                     .send_notification::<IndexStatusNotification>(IndexStatus::failed(
                         display_root.clone(),

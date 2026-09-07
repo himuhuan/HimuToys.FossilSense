@@ -4,6 +4,145 @@ use crate::store::test_support::{
 };
 
 #[test]
+fn dense_file_retry_does_not_reparse_successful_neighbors() {
+    let workspace = tempdir().unwrap();
+    for number in 0..127 {
+        fs::write(
+            workspace.path().join(format!("small_{number:03}.c")),
+            format!("int small_{number};\n"),
+        )
+        .unwrap();
+    }
+    let dense: String = (0..3000).map(|i| format!("int dense_{i};\n")).collect();
+    fs::write(workspace.path().join("z_dense.c"), dense).unwrap();
+    let stats = index_workspace(
+        workspace.path(),
+        IndexOptions {
+            force: true,
+            db_path: Some(workspace.path().join("test.sqlite")),
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(stats.indexed_files, 128);
+    assert_eq!(stats.declarations, 3127);
+    assert_eq!(
+        stats.parse_exclusive_files, 1,
+        "only the over-budget file needs exclusive retry"
+    );
+    assert_eq!(
+        stats.parse_attempts, 129,
+        "successful neighbors must not be parsed twice"
+    );
+}
+
+#[test]
+fn failed_exclusive_retry_keeps_old_dirty_generation_after_successful_neighbor() {
+    use crate::build_coordinator::{BuildCoordinator, BuildKind, BuildPolicy};
+    let workspace = tempdir().unwrap();
+    let a = workspace.path().join("a.c");
+    let z = workspace.path().join("z.c");
+    fs::write(&a, "int original_a;\n").unwrap();
+    fs::write(&z, "int original_z;\n").unwrap();
+    let db = workspace.path().join("test.sqlite");
+    let options = IndexOptions {
+        db_path: Some(db.clone()),
+        parse_threads: Some(1),
+        ..Default::default()
+    };
+    let initial = index_workspace(workspace.path(), options.clone(), |_| {}).unwrap();
+    fs::write(&a, "int replacement_a;\n").unwrap();
+    fs::write(
+        &z,
+        (0..20000)
+            .map(|i| format!("int dense_{i};\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    let coordinator = BuildCoordinator::with_policy_and_sampler(BuildPolicy::default(), || 0);
+    let permit = coordinator
+        .try_acquire(workspace.path().into(), BuildKind::DirtyIndex)
+        .unwrap();
+    permit.reserve(8 * 1024 * 1024, 455 * 1024 * 1024).unwrap();
+    let error = crate::indexer::index_dirty_files_with_permit(
+        workspace.path(),
+        vec![
+            DirtyFileChange {
+                absolute_path: a,
+                kind: DirtyFileKind::Upsert,
+            },
+            DirtyFileChange {
+                absolute_path: z,
+                kind: DirtyFileKind::Upsert,
+            },
+        ],
+        options,
+        &permit,
+        |_| {},
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("parser fact capacity"),
+        "{error:#}"
+    );
+    let store = IndexStore::open_readonly(&db).unwrap();
+    assert_eq!(
+        store.semantic_generation().unwrap(),
+        initial.semantic_generation
+    );
+    assert_eq!(store.declarations_by_name("original_a").unwrap().len(), 1);
+    assert_eq!(store.declarations_by_name("original_z").unwrap().len(), 1);
+    assert!(store
+        .declarations_by_name("replacement_a")
+        .unwrap()
+        .is_empty());
+    assert!(store.declarations_by_name("dense_0").unwrap().is_empty());
+    assert_eq!(
+        coordinator.snapshot().active_reserved_bytes,
+        8 * 1024 * 1024
+    );
+    assert_eq!(
+        coordinator.snapshot().active_retained_bytes,
+        455 * 1024 * 1024
+    );
+}
+
+#[test]
+fn full_parse_does_not_overlap_future_read_model_reservation() {
+    use crate::build_coordinator::{BuildCoordinator, BuildKind, BuildPolicy};
+    let workspace = tempdir().unwrap();
+    fs::write(workspace.path().join("main.c"), "int phase_owned;\n").unwrap();
+    let coordinator = BuildCoordinator::with_policy_and_sampler(BuildPolicy::default(), || 0);
+    let permit = coordinator
+        .try_acquire(workspace.path().into(), BuildKind::FullIndex)
+        .unwrap();
+    permit
+        .reserve(256 * 1024 * 1024, 200 * 1024 * 1024)
+        .unwrap();
+    let stats = index_workspace_with_permit(
+        workspace.path(),
+        IndexOptions {
+            db_path: Some(workspace.path().join("test.sqlite")),
+            force: true,
+            ..Default::default()
+        },
+        &permit,
+        |_| {},
+    )
+    .expect("parse and future read-model construction are sequential phases");
+    assert_eq!(stats.indexed_files, 1);
+    assert_eq!(
+        coordinator.snapshot().active_reserved_bytes,
+        256 * 1024 * 1024
+    );
+    assert_eq!(
+        coordinator.snapshot().active_retained_bytes,
+        200 * 1024 * 1024
+    );
+}
+
+#[test]
 fn cancelled_full_build_removes_its_unpublished_staging_database() {
     let workspace = tempdir().expect("workspace");
     fs::write(workspace.path().join("main.c"), "int cancelled_build;\n").expect("source");
@@ -22,6 +161,9 @@ fn cancelled_full_build_removes_its_unpublished_staging_database() {
             crate::build_coordinator::BuildKind::FullIndex,
         )
         .expect("permit");
+    permit
+        .reserve(256 * 1024 * 1024, 200 * 1024 * 1024)
+        .unwrap();
     let cancellation = permit.cancellation();
     let result = index_workspace_with_permit(
         workspace.path(),
@@ -40,6 +182,14 @@ fn cancelled_full_build_removes_its_unpublished_staging_database() {
         .expect_err("cancelled build")
         .to_string()
         .contains("cancelled"));
+    assert_eq!(
+        coordinator.snapshot().active_reserved_bytes,
+        256 * 1024 * 1024
+    );
+    assert_eq!(
+        coordinator.snapshot().active_retained_bytes,
+        200 * 1024 * 1024
+    );
 
     let staging: Vec<_> = fs::read_dir(&cache_dir)
         .into_iter()
@@ -1322,4 +1472,91 @@ fn bounded_parse_write_pipeline_crosses_multiple_batches() {
     assert_eq!(stats.indexed_files, 300);
     assert_eq!(stats.total_files, 300);
     assert_eq!(stats.declarations, 300);
+    assert!(stats.active_parsers_peak <= 2);
+    assert!(stats.parse_reserved_bytes_peak <= 128 * 1024 * 1024);
+    assert!(stats.parse_batch_bytes_peak <= 16 * 1024 * 1024);
+}
+
+#[test]
+fn byte_budget_failure_keeps_entire_dirty_generation_and_can_recover() {
+    let ws = tempdir().unwrap();
+    let a = ws.path().join("a.c");
+    let z = ws.path().join("z.c");
+    fs::write(&a, "int original_a;\n").unwrap();
+    fs::write(&z, "int original_z;\n").unwrap();
+    let db = ws.path().join("index.sqlite");
+    let options = IndexOptions {
+        db_path: Some(db.clone()),
+        parse_threads: Some(1),
+        ..Default::default()
+    };
+    let initial = index_workspace(ws.path(), options.clone(), |_| {}).unwrap();
+    fs::write(&a, "int replacement_a;\n").unwrap();
+    fs::File::create(&z)
+        .unwrap()
+        .set_len(32 * 1024 * 1024)
+        .unwrap();
+    let changes = vec![
+        DirtyFileChange {
+            absolute_path: a,
+            kind: DirtyFileKind::Upsert,
+        },
+        DirtyFileChange {
+            absolute_path: z.clone(),
+            kind: DirtyFileKind::Upsert,
+        },
+    ];
+    let error = index_dirty_files(ws.path(), changes.clone(), options.clone(), |_| {}).unwrap_err();
+    assert!(
+        error.to_string().contains("ResourceBudgetExceeded"),
+        "{error:#}"
+    );
+    {
+        let store = IndexStore::open_readonly(&db).unwrap();
+        assert_eq!(
+            store.semantic_generation().unwrap(),
+            initial.semantic_generation
+        );
+        assert_eq!(store.declarations_by_name("original_a").unwrap().len(), 1);
+        assert_eq!(store.declarations_by_name("original_z").unwrap().len(), 1);
+        assert!(store
+            .declarations_by_name("replacement_a")
+            .unwrap()
+            .is_empty());
+    }
+    fs::write(&z, "int replacement_z;\n").unwrap();
+    index_dirty_files(ws.path(), changes, options, |_| {}).unwrap();
+    let store = IndexStore::open_readonly(&db).unwrap();
+    assert_eq!(
+        store.declarations_by_name("replacement_a").unwrap().len(),
+        1
+    );
+    assert_eq!(
+        store.declarations_by_name("replacement_z").unwrap().len(),
+        1
+    );
+}
+
+#[test]
+fn byte_budget_dense_wave_retries_without_losing_declarations() {
+    let ws = tempdir().unwrap();
+    for file in 0..4 {
+        let source: String = (0..3000)
+            .map(|i| format!("int dense_{file}_{i};\n"))
+            .collect();
+        fs::write(ws.path().join(format!("dense_{file}.c")), source).unwrap();
+    }
+    let stats = index_workspace(
+        ws.path(),
+        IndexOptions {
+            db_path: Some(ws.path().join("index.sqlite")),
+            parse_threads: Some(2),
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(stats.indexed_files, 4);
+    assert_eq!(stats.declarations, 12_000);
+    assert!(stats.parse_fact_bytes_peak < 256 * 1024 * 1024);
 }

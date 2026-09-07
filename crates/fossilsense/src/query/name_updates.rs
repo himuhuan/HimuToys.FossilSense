@@ -70,6 +70,85 @@ fn adjust_project_family_counts(
 }
 
 impl NameTable {
+    /// Small save histories can be consolidated without allocating another
+    /// workspace-sized base. Substantial replacement/deletion still performs
+    /// a full compaction, so inactive base storage cannot grow indefinitely.
+    pub(super) fn can_compact_deltas_only(&self) -> bool {
+        let limit = self.base.entries.len() / 4;
+        !self.deltas.is_empty()
+            && self.slot_len.saturating_sub(self.base.entries.len()) <= limit
+            && self.path_overrides.keys().fold(0usize, |count, path| {
+                count.saturating_add(self.base.path_count(path))
+            }) <= limit
+    }
+
+    pub(crate) fn compaction_temporary_bytes(&self) -> usize {
+        if !self.can_compact_deltas_only() {
+            return self
+                .accounted_bytes()
+                .min(crate::build_coordinator::DEFAULT_TEMPORARY_RESERVATION_BYTES);
+        }
+        // Three simultaneous structural copies cover the builder, finished
+        // postings and cancelable sorting buffers. Immutable base accounting
+        // is cached; it never rebuilds a base-sized temporary hash table here.
+        let delta_bytes = self.deltas.iter().fold(0usize, |total, segment| {
+            total.saturating_add(segment.memory_breakdown().bytes())
+        });
+        let metadata = hash_table_bytes::<Arc<str>, Option<usize>>(self.path_overrides.capacity())
+            .saturating_add(
+                self.path_overrides
+                    .len()
+                    .saturating_mul(size_of::<Arc<str>>()),
+            );
+        delta_bytes
+            .saturating_add(metadata)
+            .saturating_mul(3)
+            .saturating_add(8 * 1024 * 1024)
+    }
+
+    pub(super) fn compact_deltas_with_cancellation(
+        &self,
+        cancellation: &crate::build_coordinator::BuildCancellation,
+    ) -> Option<Self> {
+        let mut builder = name_index_builder::NameIndexBuilder::new(None);
+        for (processed, index) in (self.base.entries.len()..self.slot_len).enumerate() {
+            if cancellation_checkpoint(cancellation, processed) {
+                return None;
+            }
+            if self.is_active_index(index) {
+                builder.push_ref(self.entry(index));
+            }
+        }
+        let merged = builder.finish_with_cancellation(cancellation)?;
+        let segment = merged.base.clone();
+        let fresh_slots = segment.entries.len();
+        let mut overrides = HashMap::new();
+        for (processed, (path, target)) in self.path_overrides.iter().enumerate() {
+            if cancellation_checkpoint(cancellation, processed) {
+                return None;
+            }
+            // Once old delta segments are gone, a deletion only needs to
+            // shadow a base path. New temporary paths leave no history behind.
+            if target.is_some() || self.base.path_ids.contains_key(path) {
+                overrides.insert(path.clone(), target.map(|_| 0));
+            }
+        }
+        let active_paths = merged.active_base_paths.clone();
+        (!cancellation.is_cancelled()).then(|| Self {
+            base: self.base.clone(),
+            deltas: Arc::new(vec![segment]),
+            path_overrides: Arc::new(overrides),
+            active_base_paths: self.active_base_paths.clone(),
+            active_delta_paths: Arc::new(vec![active_paths]),
+            active_project_family_counts: self.active_project_family_counts.clone(),
+            delta_offsets: Arc::new(vec![self.base.entries.len()]),
+            active_len: self.active_len,
+            slot_len: self.base.entries.len().saturating_add(fresh_slots),
+            direct_include_overrides: self.direct_include_overrides.clone(),
+            all_workspace_reach: self.all_workspace_reach.clone(),
+        })
+    }
+
     pub(crate) fn accounted_bytes(&self) -> usize {
         self.memory_breakdown().components.bytes()
     }
@@ -324,7 +403,7 @@ impl NameTable {
         }
     }
 
-    fn with_updated_entries(
+    pub(super) fn with_updated_entries(
         &self,
         paths: &HashSet<String>,
         fresh_entries: impl IntoIterator<Item = NameEntry>,

@@ -113,8 +113,14 @@ Saved indexes and unsaved documents share the same language selection and retain
 
 Full indexing, dirty indexing, read-model construction, name compaction, and project-context refresh share one process-wide heavy-build slot. When admission is temporarily unavailable, the status item shows `waiting for resources`; each workspace retains only its newest deferred target and retries after resources are released. Saved-file changes remain merged for a later dirty pass and can cooperatively cancel stale background name compaction. Removing a workspace or stopping the server cancels waiting and interruptible work. The previous immutable index continues serving Hover, navigation, and completion until a complete replacement passes its final checks and is swapped in one step.
 
+Index parsing uses byte-reserved parallel waves and releases each wave after writing. When available memory decreases, it reduces batch size and parser concurrency, joining the old workers before creating a smaller pool. Only files exceeding their estimated capacity retry exclusively; successful neighboring files are not parsed again. A resource failure or an input revision change aborts the update while the published index remains usable. Background compaction retry delays do not prevent new edits from joining the build queue. Reservations are internal estimates, not a hard cap on total process memory.
+
 Heavy builds share a 256 MiB temporary reservation, use a 512 MiB process-pressure target, and retain 32 MiB for unattributed runtime/query overhead. Reservation is an admission estimate, not an allocator-enforced hard cap. `semanticIndex.memoryBudgetMB` keeps its narrower meaning and does not include runtime overhead, file graphs, open documents, or the process peak while old and new generations coexist. Release gates use Private Bytes on Windows and RSS on Linux/macOS; an unavailable sample is reported explicitly rather than treated as zero.
 - `fossilsense.debug.candidateReasons`: log definition-candidate scope, confidence, and reason.
+
+Some large workspaces may be unable to complete a full rebuild while the previous index remains in service because memory admission is insufficient. The previous index remains queryable after failure, but workspace results can remain at the earlier revision; successful standalone indexing does not establish successful hot rebuilding.
+
+Small name-update histories are consolidated separately while sharing the existing base index; substantial replacements or deletions still require full compaction.
 
 ## Current limitations
 

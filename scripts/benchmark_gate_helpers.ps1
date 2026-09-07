@@ -69,6 +69,7 @@ function Assert-LspLifecycleGate {
         'lsp_lifecycle_final_reserved_bytes',
         'lsp_lifecycle_database_size_bytes',
         'lsp_lifecycle_elapsed_ms',
+        'lsp_lifecycle_rebuild_wall_ms',
         'lsp_lifecycle_write_ms'
     )
     foreach ($name in $required) {
@@ -140,7 +141,8 @@ function Assert-LspLifecycleGate {
     if ([long]$Metrics.lsp_lifecycle_database_size_bytes -le 0) {
         throw "$CaseId did not record a database size"
     }
-    if ([long]$Metrics.lsp_lifecycle_elapsed_ms -gt 120000) {
+    if ([long]$Metrics.lsp_lifecycle_elapsed_ms -gt 120000 -or
+        [long]$Metrics.lsp_lifecycle_rebuild_wall_ms -gt 120000) {
         throw "$CaseId full index elapsed time exceeded the 120,000 ms gate"
     }
     if ($CaseId -eq 'u-boot-lsp-lifecycle') {

@@ -6,6 +6,10 @@ param(
     [int]$Repeats = 2,
     [ValidateRange(5, 3600)]
     [int]$TimeoutSeconds = 600,
+    # Includes cache warmup, a full rebuild, and three dirty/compaction scenarios.
+    # The full rebuild itself still has independent 120,000 ms hard assertions.
+    [ValidateRange(5, 3600)]
+    [int]$LifecycleTimeoutSeconds = 240,
     [switch]$IncludeFullIndex,
     [switch]$IncludeEngineHydration,
     [switch]$IncludeCompletionReplay,
@@ -207,6 +211,19 @@ function Convert-WhitelistedMetrics([string[]]$Lines) {
         elapsed_ms = $true
         discover_ms = $true
         parse_ms = $true
+        parse_reserved_bytes_peak = $true
+        parse_fact_bytes_peak = $true
+        parse_batch_bytes_peak = $true
+        active_parsers_peak = $true
+        parse_input_bytes_reserved_peak = $true
+        parse_workspace_bytes_reserved_peak = $true
+        parse_stack_bytes_reserved = $true
+        parse_writer_updates_bytes_peak = $true
+        parse_exclusive_files = $true
+        parse_fact_budget_retries = $true
+        parse_write_batches = $true
+
+        declarations = $true
         write_ms = $true
         check_ms = $true
         include_edge_ms = $true
@@ -379,6 +396,7 @@ function Convert-WhitelistedMetrics([string[]]$Lines) {
         lsp_lifecycle_final_reserved_bytes = $true
         lsp_lifecycle_database_size_bytes = $true
         lsp_lifecycle_elapsed_ms = $true
+        lsp_lifecycle_rebuild_wall_ms = $true
         lsp_lifecycle_write_ms = $true
     }
     $metrics = [ordered]@{}
@@ -628,6 +646,9 @@ if ($requiresReleaseBinary -and -not (Test-Path -LiteralPath $binaryPath -PathTy
 }
 
 $results = [System.Collections.Generic.List[object]]::new()
+$checkpointPath = Join-Path $benchmarkPath ('large-workspace-partial-' + [guid]::NewGuid().ToString('N') + '.json')
+$checkpointSource = Get-SourceState $repoRoot
+$checkpointMachine = Get-BenchmarkMachine
 foreach ($case in $cases) {
     if (-not (Test-Path -LiteralPath $case.Workspace -PathType Container)) {
         Write-Warning "skipping $($case.Id): sample workspace is unavailable"
@@ -653,6 +674,8 @@ foreach ($case in $cases) {
         Write-Host "benchmark $($case.Id) run $run/$Repeats"
         $caseTimeoutSeconds = if ($case.Id -like '*-full-index') {
             [Math]::Min($TimeoutSeconds, 120)
+        } elseif ($case.Id -like '*-lsp-lifecycle') {
+            $LifecycleTimeoutSeconds
         } else {
             $TimeoutSeconds
         }
@@ -706,6 +729,20 @@ foreach ($case in $cases) {
             }
             metrics = $metrics
         })
+        # Preserve completed evidence even if a later independent gate fails.
+        # This checkpoint never claims that the entire requested run passed.
+        $checkpoint = [ordered]@{
+            schema_version = 1
+            status = 'partial'
+            measured_at = (Get-Date).ToUniversalTime().ToString('o')
+            command_line = [System.Environment]::CommandLine
+            source_revision = $checkpointSource.Revision
+            source_change_fingerprint = $checkpointSource.ChangeFingerprint
+            machine = $checkpointMachine
+            results = $results
+        }
+        $checkpoint | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath "$checkpointPath.tmp" -Encoding UTF8
+        Move-Item -LiteralPath "$checkpointPath.tmp" -Destination $checkpointPath -Force
     }
 }
 

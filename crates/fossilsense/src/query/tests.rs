@@ -3986,3 +3986,266 @@ fn name_table_with_updated_paths_on_empty_set_keeps_all() {
     // The original entry must survive.
     assert_eq!(updated.search_ranked("keep", 10).len(), 1);
 }
+
+#[test]
+fn small_delta_compaction_shares_base_and_preserves_deleted_paths() {
+    let mut table = NameTable::build_with_paths(
+        (0..2048)
+            .map(|id| {
+                (
+                    id,
+                    format!("base_{id:04}"),
+                    false,
+                    format!("src/{id}.c"),
+                    "function".to_string(),
+                    false,
+                )
+            })
+            .collect(),
+    );
+    for revision in 0..64 {
+        table = table.with_updated_paths(
+            &HashSet::from(["src/1.c".to_string()]),
+            vec![(
+                5000 + revision,
+                format!("changed_{revision}"),
+                false,
+                "src/1.c".to_string(),
+                "function".to_string(),
+                false,
+            )],
+        );
+    }
+    table = table.with_updated_paths(&HashSet::from(["src/2.c".to_string()]), Vec::new());
+    assert!(table.needs_compaction());
+    let expected = table.search_ranked("changed", 20);
+    let cancellation = crate::build_coordinator::BuildCancellation::new();
+    let compacted = table
+        .compacted_with_cancellation(&cancellation)
+        .expect("compact small updates");
+    assert!(
+        Arc::ptr_eq(&table.base, &compacted.base),
+        "small updates must not duplicate the entire base"
+    );
+    assert_eq!(compacted.delta_segment_count(), 1);
+    assert!(!compacted.needs_compaction());
+    assert_eq!(compacted.len(), table.len());
+    assert_eq!(compacted.search_ranked("changed", 20), expected);
+    assert!(compacted.search("base_0001", 8).is_empty());
+    assert!(compacted.search("base_0002", 8).is_empty());
+    assert_eq!(compacted.search("base_0003", 8), vec![3]);
+    assert_eq!(
+        table.search_ranked("changed", 20),
+        expected,
+        "old view stays intact"
+    );
+    let cancelled = crate::build_coordinator::BuildCancellation::new();
+    cancelled.cancel_after_checks_for_test(3);
+    assert!(table.compacted_with_cancellation(&cancelled).is_none());
+}
+
+#[test]
+fn small_delta_compaction_preserves_mixed_facts_and_future_updates() {
+    let base = NameTable::build_with_paths(
+        (0..1024)
+            .map(|id| {
+                (
+                    id,
+                    format!("base_{id:04}"),
+                    false,
+                    format!("src/{id}.c"),
+                    "function".to_string(),
+                    false,
+                )
+            })
+            .collect(),
+    );
+    let project = ProjectKey {
+        workspace_root_id: "root".to_string(),
+        project_path: "src".to_string(),
+    };
+    let mut table = base;
+    for revision in 0..64 {
+        let path = format!("src/{}.c", revision % 3);
+        let mut entry = name_entry((
+            2000 + revision,
+            format!("changed_{revision}"),
+            revision % 2 == 0,
+            path.clone(),
+            "function".to_string(),
+            revision % 2 == 0,
+        ));
+        entry.semantic_family = if revision % 2 == 0 {
+            crate::semantic_model::SemanticFamily::Go
+        } else {
+            crate::semantic_model::SemanticFamily::CFamily
+        };
+        entry.project_key = Some(project.clone());
+        table = table.with_updated_entries(&HashSet::from([path]), [entry]);
+    }
+    let all = |table: &NameTable| {
+        let mut rows = table
+            .active_indices()
+            .map(|index| {
+                let row = table.entry(index);
+                (
+                    row.id,
+                    row.name.to_string(),
+                    row.path.to_string(),
+                    format!("{:?}", row.semantic_family),
+                    format!("{:?}", row.project_key),
+                    row.external,
+                    table.directly_included_for(row),
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.sort();
+        rows
+    };
+    let expected = all(&table);
+    let compacted = table
+        .compacted_with_cancellation(&crate::build_coordinator::BuildCancellation::new())
+        .unwrap();
+    assert_eq!(all(&compacted), expected);
+    assert_eq!(
+        compacted.active_project_family_counts,
+        table.active_project_family_counts
+    );
+    assert_eq!(compacted.all_workspace_reach, table.all_workspace_reach);
+    let paths = HashSet::from(["src/1.c".to_string()]);
+    let deleted = compacted.with_updated_paths(&paths, Vec::new());
+    assert!(deleted
+        .active_indices()
+        .all(|index| deleted.entry(index).path != "src/1.c"));
+    let restored = deleted.with_updated_paths(
+        &paths,
+        vec![(
+            9999,
+            "restored".to_string(),
+            false,
+            "src/1.c".to_string(),
+            "function".to_string(),
+            false,
+        )],
+    );
+    assert_eq!(restored.search("restored", 8), vec![9999]);
+    assert_eq!(restored.len(), compacted.len());
+    assert_eq!(all(&table), expected);
+}
+
+#[test]
+fn small_delta_compaction_falls_back_for_large_replacements_and_deletions() {
+    let base = NameTable::build_with_paths(
+        (0..16)
+            .map(|id| {
+                (
+                    id,
+                    format!("base_{id:04}"),
+                    false,
+                    format!("src/{id}.c"),
+                    "function".to_string(),
+                    false,
+                )
+            })
+            .collect(),
+    );
+    let paths = HashSet::from(["src/0.c".to_string()]);
+    let mut updated = base.with_updated_paths(
+        &paths,
+        (0..4)
+            .map(|id| {
+                (
+                    100 + id,
+                    format!("new_{id}"),
+                    false,
+                    "src/0.c".to_string(),
+                    "function".to_string(),
+                    false,
+                )
+            })
+            .collect(),
+    );
+    assert!(
+        updated.can_compact_deltas_only(),
+        "25 percent uses the small path"
+    );
+    updated = updated.with_updated_paths(
+        &paths,
+        vec![(
+            105,
+            "newest".to_string(),
+            false,
+            "src/0.c".to_string(),
+            "function".to_string(),
+            false,
+        )],
+    );
+    assert!(
+        !updated.can_compact_deltas_only(),
+        "more than 25 percent uses full compaction"
+    );
+    let compacted = updated
+        .compacted_with_cancellation(&crate::build_coordinator::BuildCancellation::new())
+        .unwrap();
+    assert!(!Arc::ptr_eq(&updated.base, &compacted.base));
+    let deleted = base.with_updated_paths(
+        &(0..5).map(|id| format!("src/{id}.c")).collect(),
+        Vec::new(),
+    );
+    assert!(
+        !deleted.can_compact_deltas_only(),
+        "large tombstoned bases must also be reclaimed"
+    );
+    let empty = base.with_updated_paths(&paths, Vec::new());
+    let compacted = empty
+        .compacted_with_cancellation(&crate::build_coordinator::BuildCancellation::new())
+        .unwrap();
+    assert_eq!(compacted.len(), 15);
+    assert!(!compacted.needs_compaction());
+    assert!(compacted.search("base_0000", 4).is_empty());
+}
+
+#[test]
+fn small_delta_compaction_discards_obsolete_new_path_tombstones() {
+    let mut table = NameTable::build_with_paths(
+        (0..1024)
+            .map(|id| {
+                (
+                    id,
+                    format!("base_{id:04}"),
+                    false,
+                    format!("src/{id}.c"),
+                    "function".to_string(),
+                    false,
+                )
+            })
+            .collect(),
+    );
+    table = table.with_updated_paths(&HashSet::from(["src/0.c".to_string()]), Vec::new());
+    for round in 0..128 {
+        let path = format!("tmp/{round}.c");
+        let paths = HashSet::from([path.clone()]);
+        table = table.with_updated_paths(
+            &paths,
+            vec![(
+                2000 + round,
+                "temporary".to_string(),
+                false,
+                path,
+                "function".to_string(),
+                false,
+            )],
+        );
+        table = table.with_updated_paths(&paths, Vec::new());
+        table = table
+            .compacted_with_cancellation(&crate::build_coordinator::BuildCancellation::new())
+            .unwrap();
+        assert_eq!(
+            table.path_overrides.len(),
+            1,
+            "only the original base tombstone must remain"
+        );
+        assert!(table.search("base_0000", 4).is_empty());
+        assert!(table.search("temporary", 4).is_empty());
+    }
+}

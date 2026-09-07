@@ -234,7 +234,7 @@ fn external_candidate_for_path(path: &Path) -> Result<FileCandidate> {
     })
 }
 
-fn metadata_mtime_ns(metadata: &fs::Metadata) -> i64 {
+pub(super) fn metadata_mtime_ns(metadata: &fs::Metadata) -> i64 {
     metadata
         .modified()
         .ok()

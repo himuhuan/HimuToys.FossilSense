@@ -85,6 +85,19 @@ impl DegradedCapabilities {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IndexStats {
+    pub parse_attempts: usize,
+    pub parse_input_bytes_reserved_peak: usize,
+    pub parse_workspace_bytes_reserved_peak: usize,
+    pub parse_stack_bytes_reserved: usize,
+    pub parse_writer_updates_bytes_peak: usize,
+    pub parse_exclusive_files: usize,
+    pub parse_fact_budget_retries: usize,
+    pub parse_write_batches: usize,
+
+    pub parse_reserved_bytes_peak: usize,
+    pub parse_fact_bytes_peak: usize,
+    pub parse_batch_bytes_peak: usize,
+    pub active_parsers_peak: usize,
     pub total_files: usize,
     pub processed_files: usize,
     pub indexed_files: usize,

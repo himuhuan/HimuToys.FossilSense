@@ -61,6 +61,13 @@ pub(super) struct CallFactCollector<'a> {
 }
 
 impl<'a> CallFactCollector<'a> {
+    pub(super) fn retained_fact_bytes(&self) -> usize {
+        use super::retained::HeapBytes;
+        self.anchors
+            .heap_bytes()
+            .saturating_add(self.call_sites.heap_bytes())
+    }
+
     pub(super) fn new(
         path: &Path,
         source: &'a str,

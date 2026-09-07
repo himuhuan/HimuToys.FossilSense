@@ -32,6 +32,7 @@ struct RawDeclaration {
 }
 
 mod ast;
+mod budget;
 mod callables;
 mod coverage;
 mod declarations;
@@ -40,6 +41,7 @@ mod go;
 mod lexical;
 mod protobuf_c;
 mod recovery;
+mod retained;
 
 use ast::collect_ast_index;
 pub use ast::infer_receiver_record;
@@ -1211,6 +1213,24 @@ pub fn parse_thread_local_with_selection_cancel(
     })
 }
 
+pub(crate) fn parse_thread_local_with_selection_budget(
+    path: &Path,
+    source: &str,
+    selection: LanguageSelection,
+    facts: ParseFacts,
+    cancel: &AtomicBool,
+    max_fact_bytes: usize,
+) -> Result<Option<FileSemanticIndex>, usize> {
+    budget::with_limit(max_fact_bytes, || {
+        let parsed =
+            parse_thread_local_with_selection_cancel(path, source, selection, facts, cancel);
+        if let Some(index) = &parsed {
+            budget::check(index.retained_bytes());
+        }
+        parsed
+    })
+}
+
 fn parse_with_handle_control(
     path: &Path,
     source: &str,
@@ -1352,6 +1372,9 @@ fn parse_with_handle_control(
         facts,
         language,
     );
+    if budget::exceeded() {
+        return None;
+    }
     if recovered {
         degrade_recovered_ast_facts(&mut ast, &recovery_affected);
     }

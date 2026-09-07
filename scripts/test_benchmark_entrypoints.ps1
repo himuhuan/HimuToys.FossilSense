@@ -11,6 +11,8 @@ if (-not (Test-Path -LiteralPath $gateHelpers -PathType Leaf)) {
     throw 'The benchmark hard-gate helper is missing.'
 }
 . $gateHelpers
+& (Join-Path $PSScriptRoot 'test_benchmark_failure_reporting.ps1')
+if (-not $?) { throw 'Benchmark failure reporting regression failed.' }
 
 Assert-FullIndexPerformanceGate `
     -CaseId 'u-boot-full-index' -OuterElapsedMs 120000 -EngineElapsedMs 120000
@@ -72,9 +74,16 @@ $validLifecycleMetrics = @{
     lsp_lifecycle_final_reserved_bytes = 0
     lsp_lifecycle_database_size_bytes = 1
     lsp_lifecycle_elapsed_ms = 1
+    lsp_lifecycle_rebuild_wall_ms = 1
     lsp_lifecycle_write_ms = 1
 }
 Assert-LspLifecycleGate -CaseId 'u-boot-lsp-lifecycle' -Metrics $validLifecycleMetrics
+
+$overWallMetrics = $validLifecycleMetrics.Clone()
+$overWallMetrics.lsp_lifecycle_rebuild_wall_ms = 120001
+$overWallRejected = $false
+try { Assert-LspLifecycleGate -CaseId 'u-boot-lsp-lifecycle' -Metrics $overWallMetrics } catch { $overWallRejected = $true }
+if (-not $overWallRejected) { throw 'The lifecycle gate accepted a full rebuild wall time above 120,000 ms.' }
 
 $missingLifecycleMetrics = $validLifecycleMetrics.Clone()
 $missingLifecycleMetrics.Remove('lsp_lifecycle_old_epoch_consistent')
@@ -136,6 +145,11 @@ if (-not $metricWhitelist.Success) {
     throw 'The large-workspace runner has no readable metric whitelist.'
 }
 foreach ($metricName in @(
+    'parse_reserved_bytes_peak',
+    'parse_fact_bytes_peak',
+    'parse_batch_bytes_peak',
+    'active_parsers_peak',
+    'declarations',
     'engine_hydration_first_name_strings_bytes',
     'engine_hydration_second_generation_incremental_bytes',
     'warm_publication_single_private_bytes',

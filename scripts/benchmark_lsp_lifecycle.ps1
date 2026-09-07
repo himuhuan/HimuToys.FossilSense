@@ -67,6 +67,7 @@ $allowedMetrics = [System.Collections.Generic.HashSet[string]]::new(
     'lsp_lifecycle_final_reserved_bytes',
     'lsp_lifecycle_database_size_bytes',
     'lsp_lifecycle_elapsed_ms',
+    'lsp_lifecycle_rebuild_wall_ms',
     'lsp_lifecycle_write_ms'
 ) | ForEach-Object { [void]$allowedMetrics.Add($_) }
 

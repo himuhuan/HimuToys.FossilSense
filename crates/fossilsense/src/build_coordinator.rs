@@ -62,6 +62,10 @@ impl Default for BuildCancellation {
 }
 
 impl BuildCancellation {
+    pub(crate) fn flag(&self) -> &AtomicBool {
+        &self.inner.cancelled
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             inner: Arc::new(CancellationInner::default()),
@@ -232,6 +236,44 @@ pub(crate) struct BuildPermit {
     stage: BuildKind,
 }
 
+/// A scoped phase restores its parent's ledger on exit. Restoring an estimate
+/// does not authorize a later allocation: the next phase must re-admit it.
+pub(crate) struct BuildReservationLease {
+    permit: BuildPermit,
+    parent_reserved: usize,
+    parent_retained: usize,
+}
+
+impl BuildReservationLease {
+    pub(crate) fn retain(&self, bytes: usize) -> Result<(), ReservationError> {
+        let policy = self.permit.lease.coordinator.inner.policy;
+        if bytes.saturating_add(self.parent_reserved) > policy.temporary_reservation_bytes {
+            return Err(ReservationError::TemporaryBudgetExceeded);
+        }
+        self.permit.reserve(
+            self.parent_reserved,
+            self.parent_retained.saturating_add(bytes),
+        )
+    }
+}
+
+impl Drop for BuildReservationLease {
+    fn drop(&mut self) {
+        let coordinator = &self.permit.lease.coordinator;
+        let mut state = coordinator.lock_state();
+        if let Some(active) = state
+            .active
+            .as_mut()
+            .filter(|active| active.ticket == self.permit.lease.ticket)
+        {
+            active.reserved_bytes = self.parent_reserved;
+            active.retained_bytes = self.parent_retained;
+        }
+        drop(state);
+        coordinator.inner.notify.notify_waiters();
+    }
+}
+
 impl fmt::Debug for BuildPermit {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -400,6 +442,9 @@ impl BuildCoordinator {
                 state
                     .deferred
                     .get(&root)
+                    // A background compaction's resource backoff must not
+                    // postpone smaller foreground updates before they queue.
+                    .filter(|deferred| deferred.kind == kind)
                     .map(|deferred| deferred.retry_after)
             };
             let Some(retry_after) = retry_after.filter(|retry_after| *retry_after > Instant::now())
@@ -716,6 +761,87 @@ impl BuildCoordinator {
 }
 
 impl BuildPermit {
+    /// Sequential build phases do not allocate their workspaces concurrently.
+    /// Preserve live products while replacing the next phase's estimate.
+    pub(crate) fn reserve_phase(
+        &self,
+        bytes: usize,
+    ) -> Result<BuildReservationLease, ReservationError> {
+        let (parent_reserved, parent_retained) = {
+            let state = self.lease.coordinator.lock_state();
+            let active = state
+                .active
+                .as_ref()
+                .filter(|active| active.ticket == self.lease.ticket)
+                .ok_or(ReservationError::StalePermit)?;
+            (active.reserved_bytes, active.retained_bytes)
+        };
+        self.reserve(bytes, parent_retained)?;
+        Ok(BuildReservationLease {
+            permit: self.clone(),
+            parent_reserved,
+            parent_retained,
+        })
+    }
+
+    /// Negotiate an exclusive phase before it allocates. The returned size is
+    /// the only capacity the caller may grant to its fact collector.
+    pub(crate) fn reserve_scoped_up_to(
+        &self,
+        preferred: usize,
+        minimum: usize,
+    ) -> Result<(BuildReservationLease, usize), ReservationError> {
+        let mut bytes = {
+            let state = self.lease.coordinator.lock_state();
+            let active = state
+                .active
+                .as_ref()
+                .filter(|active| active.ticket == self.lease.ticket)
+                .ok_or(ReservationError::StalePermit)?;
+            preferred.min(
+                self.lease
+                    .coordinator
+                    .inner
+                    .policy
+                    .temporary_reservation_bytes
+                    .saturating_sub(active.reserved_bytes),
+            )
+        };
+        if bytes < minimum {
+            return Err(ReservationError::TemporaryBudgetExceeded);
+        }
+        loop {
+            match self.reserve_scoped(bytes) {
+                Ok(lease) => return Ok((lease, bytes)),
+                Err(ReservationError::ProcessPressure) if bytes > minimum => {
+                    bytes = bytes.saturating_sub(4 * 1024 * 1024).max(minimum);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    pub(crate) fn reserve_scoped(
+        &self,
+        bytes: usize,
+    ) -> Result<BuildReservationLease, ReservationError> {
+        let (parent_reserved, parent_retained) = {
+            let state = self.lease.coordinator.lock_state();
+            let active = state
+                .active
+                .as_ref()
+                .filter(|active| active.ticket == self.lease.ticket)
+                .ok_or(ReservationError::StalePermit)?;
+            (active.reserved_bytes, active.retained_bytes)
+        };
+        self.reserve(parent_reserved.saturating_add(bytes), parent_retained)?;
+        Ok(BuildReservationLease {
+            permit: self.clone(),
+            parent_reserved,
+            parent_retained,
+        })
+    }
+
     pub(crate) fn inherit(&self, kind: BuildKind) -> Self {
         Self {
             lease: self.lease.clone(),

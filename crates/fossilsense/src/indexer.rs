@@ -175,6 +175,8 @@ pub(crate) fn index_workspace_with_permit(
     permit: &crate::build_coordinator::BuildPermit,
     mut progress: impl FnMut(IndexStatus),
 ) -> Result<IndexStats> {
+    let _parse_phase =
+        permit.reserve_phase(crate::build_coordinator::DEFAULT_FIRST_BUILD_RESERVATION_BYTES)?;
     index_workspace_impl(workspace.as_ref(), options, Some(permit), &mut progress)
 }
 
@@ -395,6 +397,7 @@ fn index_workspace_impl(
             parse_threads: parse_thread_count(options.parse_threads),
             language_resolver,
             cancellation: permit.map(crate::build_coordinator::BuildPermit::cancellation),
+            permit: permit.cloned(),
         },
         build,
         &mut store,
@@ -687,6 +690,7 @@ fn index_dirty_files_impl(
             parse_threads: parse_thread_count(options.parse_threads),
             language_resolver,
             cancellation: permit.map(crate::build_coordinator::BuildPermit::cancellation),
+            permit: permit.cloned(),
         },
         build,
         &mut store,

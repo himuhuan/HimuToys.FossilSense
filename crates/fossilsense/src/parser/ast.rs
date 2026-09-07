@@ -87,7 +87,21 @@ pub(super) fn collect_ast_index(
         });
     let mut stack = vec![Visit::Enter(root)];
     let mut declaration_context = DeclarationContext::default();
+    let mut budget_visits = 0usize;
     while let Some(visit) = stack.pop() {
+        budget_visits += 1;
+        if budget_visits.is_multiple_of(1024) && super::budget::active() {
+            use super::retained::HeapBytes;
+            let bytes = out.heap_bytes().saturating_add(
+                call_collector
+                    .as_ref()
+                    .map_or(0, |c| c.retained_fact_bytes()),
+            );
+            if !super::budget::check(bytes) {
+                break;
+            }
+        }
+
         let node = match visit {
             Visit::Enter(node) => node,
             Visit::Exit(node) => {

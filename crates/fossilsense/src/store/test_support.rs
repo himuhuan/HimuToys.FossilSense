@@ -5,6 +5,15 @@ use rusqlite::Connection;
 
 const OLD_REVISION_CLEANUP_GUARD: &str = "reject_old_revision_cleanup";
 
+pub(crate) fn install_file_revision_write_failure(database: &Path) -> Result<()> {
+    Connection::open(database)?
+        .execute_batch(
+            "CREATE TRIGGER reject_test_write BEFORE INSERT ON file_revisions
+         BEGIN SELECT RAISE(ABORT, 'injected writer failure'); END;",
+        )
+        .context("failed to install file-revision writer fault")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ExplicitReplacementState {
     pub trigger_count: i64,

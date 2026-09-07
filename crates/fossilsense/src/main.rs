@@ -370,6 +370,36 @@ async fn main() -> Result<()> {
             println!("elapsed_ms: {}", stats.elapsed_ms);
             println!("discover_ms: {}", stats.discover_ms);
             println!("parse_ms: {}", stats.parse_ms);
+            println!(
+                "parse_reserved_bytes_peak: {}",
+                stats.parse_reserved_bytes_peak
+            );
+            println!("parse_fact_bytes_peak: {}", stats.parse_fact_bytes_peak);
+            println!("parse_batch_bytes_peak: {}", stats.parse_batch_bytes_peak);
+            println!("active_parsers_peak: {}", stats.active_parsers_peak);
+            println!(
+                "parse_input_bytes_reserved_peak: {}",
+                stats.parse_input_bytes_reserved_peak
+            );
+            println!(
+                "parse_workspace_bytes_reserved_peak: {}",
+                stats.parse_workspace_bytes_reserved_peak
+            );
+            println!(
+                "parse_stack_bytes_reserved: {}",
+                stats.parse_stack_bytes_reserved
+            );
+            println!(
+                "parse_writer_updates_bytes_peak: {}",
+                stats.parse_writer_updates_bytes_peak
+            );
+            println!("parse_exclusive_files: {}", stats.parse_exclusive_files);
+            println!(
+                "parse_fact_budget_retries: {}",
+                stats.parse_fact_budget_retries
+            );
+            println!("parse_write_batches: {}", stats.parse_write_batches);
+
             println!("write_ms: {}", stats.write_ms);
             println!("check_ms: {}", stats.check_ms);
             println!("include_edge_ms: {}", stats.include_edge_ms);

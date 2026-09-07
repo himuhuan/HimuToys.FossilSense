@@ -25,14 +25,15 @@ use tower_lsp::lsp_types::{
 use tower_lsp::{LanguageServer as _, LspService};
 
 fn test_backend_service() -> LspService<super::Backend> {
+    test_backend_service_with_cache(super::CacheLedger::default())
+}
+
+fn test_backend_service_with_cache(cache: super::CacheLedger) -> LspService<super::Backend> {
     let (service, _) = LspService::new(|client| super::Backend {
         client,
         workspace_roots: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         index_schedule: Arc::new(tokio::sync::Mutex::new(IndexScheduleState::default())),
-        session: super::WorkspaceSession::new(
-            super::DocumentStore::default(),
-            super::CacheLedger::default(),
-        ),
+        session: super::WorkspaceSession::new(super::DocumentStore::default(), cache),
         external_include_dir_cache: Arc::new(StdMutex::new(HashMap::new())),
         include_paths: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         go_module_paths: Arc::new(tokio::sync::Mutex::new(Vec::new())),
@@ -1029,6 +1030,34 @@ fn build_coordinator_enforces_default_byte_policy_and_reports_unavailable_sampli
 }
 
 #[tokio::test]
+async fn build_coordinator_compaction_backoff_does_not_delay_dirty_admission() {
+    use crate::build_coordinator::{BuildCancellation, BuildCoordinator, BuildKind, BuildPolicy};
+    let coordinator = BuildCoordinator::with_policy_and_sampler(BuildPolicy::default(), || 0);
+    let root = PathBuf::from("background-backoff-root");
+    let background = coordinator
+        .try_acquire(root.clone(), BuildKind::NameCompaction)
+        .unwrap();
+    assert!(background
+        .reserve(256 * 1024 * 1024, 256 * 1024 * 1024)
+        .is_err());
+    drop(background);
+    let dirty = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        coordinator.acquire(root, BuildKind::DirtyIndex, BuildCancellation::new()),
+    )
+    .await
+    .expect("background retry delay must not block admission of a user edit")
+    .unwrap();
+    dirty.reserve(8 * 1024 * 1024, 256 * 1024 * 1024).unwrap();
+    assert_eq!(
+        coordinator.snapshot().active_kind,
+        Some(BuildKind::DirtyIndex)
+    );
+    drop(dirty);
+    assert_eq!(coordinator.snapshot().active_builds, 0);
+}
+
+#[tokio::test]
 async fn build_coordinator_rotates_roots_and_cancellation_wakes_a_waiter() {
     use crate::build_coordinator::{
         AcquireError, BuildCancellation, BuildCoordinator, BuildKind, BuildPolicy,
@@ -1895,7 +1924,7 @@ async fn wait_for_lifecycle_indexing_to_settle(
         }
         assert!(
             started.elapsed() < std::time::Duration::from_secs(120),
-            "{failure_message}"
+            "{failure_message}: schedule_idle={schedule_idle}, coordinator={build:?}"
         );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
@@ -2076,8 +2105,8 @@ async fn benchmark_lsp_index_lifecycle_gate() {
     let mut completion_requests = 0u64;
     let mut completion_candidates_min = usize::MAX;
     let mut completion_sql_reads = 0u64;
-    service.inner().spawn_index_roots(Some(true)).await;
     let rebuild_started = tokio::time::Instant::now();
+    service.inner().spawn_index_roots(Some(true)).await;
     loop {
         let running = {
             let state = service.inner().index_schedule.lock().await;
@@ -2156,6 +2185,11 @@ async fn benchmark_lsp_index_lifecycle_gate() {
         let delay = if completion_requests < 64 { 250 } else { 1_000 };
         tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
     }
+    let rebuild_wall_ms = rebuild_started.elapsed().as_millis();
+    assert!(
+        rebuild_wall_ms <= 120_000,
+        "production full rebuild wall time {rebuild_wall_ms} ms exceeded 120,000 ms"
+    );
     assert!(
         !hover_us.is_empty(),
         "rebuild completed without concurrent requests"
@@ -2310,6 +2344,14 @@ async fn benchmark_lsp_index_lifecycle_gate() {
         .to_string_lossy()
         .replace('\\', "/");
     let probe_uri = Url::from_file_path(&probe.path).expect("lifecycle probe URI");
+    let compaction_ready = Arc::new(tokio::sync::Notify::new());
+    *service
+        .inner()
+        .session
+        .cache
+        .compaction_ready_for_test
+        .lock()
+        .unwrap() = Some(compaction_ready.clone());
     service
         .inner()
         .did_change_watched_files(DidChangeWatchedFilesParams {
@@ -2319,24 +2361,12 @@ async fn benchmark_lsp_index_lifecycle_gate() {
             }],
         })
         .await;
-    let compaction_wait = tokio::time::Instant::now();
-    loop {
-        let schedule_idle = {
-            let state = service.inner().index_schedule.lock().await;
-            !state.running && !state.scheduled && !state.pending_requested
-        };
-        let build = service.inner().session.cache.build_coordinator.snapshot();
-        if schedule_idle
-            && build.active_kind == Some(crate::build_coordinator::BuildKind::NameCompaction)
-        {
-            break;
-        }
-        assert!(
-            compaction_wait.elapsed() < std::time::Duration::from_secs(30),
-            "production watcher update did not start name compaction"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        compaction_ready.notified(),
+    )
+    .await
+    .expect("production watcher update did not build a name compaction");
     let first_dirty = service
         .inner()
         .session
@@ -2366,6 +2396,14 @@ async fn benchmark_lsp_index_lifecycle_gate() {
         .current_engine_snapshot(&root)
         .await
         .expect("updated production dirty snapshot");
+    assert!(
+        !updated_dirty
+            .declaration_index
+            .as_ref()
+            .unwrap()
+            .needs_compaction(),
+        "the current generation must actually finish name compaction"
+    );
     assert!(updated_dirty.semantic_generation.0 > first_dirty_generation.0);
     let updated_dirty_generation = updated_dirty.semantic_generation;
     drop(updated_dirty);
@@ -2544,6 +2582,7 @@ async fn benchmark_lsp_index_lifecycle_gate() {
         "lsp_lifecycle_elapsed_ms: {}",
         full_stats.last_index_elapsed_ms
     );
+    println!("lsp_lifecycle_rebuild_wall_ms: {rebuild_wall_ms}");
     println!("lsp_lifecycle_write_ms: {}", full_stats.last_index_write_ms);
     let _total_lifecycle_ms = lifecycle_started.elapsed().as_millis();
 }
@@ -11734,4 +11773,139 @@ async fn declaration_coverage_lsp_details_follow_dirty_revision_and_preserve_hea
         .unwrap();
     assert_eq!(retained["items"].as_array().unwrap().len(), 1);
     assert_eq!(retained["coverage"]["declarationState"], "partial");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pressure_failed_full_rebuild_keeps_production_queries_and_cleans_staging() {
+    use crate::build_coordinator::{BuildCoordinator, BuildPolicy};
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    write_workspace_file(&root, "api.c", "int stable(void) { return 1; }\n");
+    let (text, line, character) = text_and_position("int g(void) { return stable/*cursor*/(); }\n");
+    write_workspace_file(&root, "caller.c", &text);
+    crate::indexer::index_workspace(
+        &root,
+        crate::indexer::IndexOptions {
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .unwrap();
+    let memory = Arc::new(AtomicU64::new(0));
+    let sampled = memory.clone();
+    let mut cache = super::CacheLedger::default();
+    cache.build_coordinator =
+        BuildCoordinator::with_policy_and_sampler(BuildPolicy::default(), move || {
+            sampled.load(std::sync::atomic::Ordering::SeqCst)
+        });
+    let service = test_backend_service_with_cache(cache);
+    *service.inner().workspace_roots.lock().await = vec![root.clone()];
+    let db = crate::pathing::default_index_path(&root).unwrap();
+    let before = service
+        .inner()
+        .session
+        .cache
+        .publish_full_index_from_db_for_test(root.clone(), db.clone())
+        .await
+        .unwrap();
+    let uri = Url::from_file_path(root.join("caller.c")).unwrap();
+    open_test_document(&service, uri.clone(), 1, text).await;
+    let before_definition = definition_locations(
+        service
+            .inner()
+            .goto_definition(goto_definition_params(uri.clone(), line, character))
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+    assert_eq!(before_definition.len(), 1);
+    assert_eq!(
+        before_definition[0].uri,
+        Url::from_file_path(root.join("api.c")).unwrap()
+    );
+    let before_generation = before.semantic_generation;
+    let before_handle = before.call_read_handle.as_ref().unwrap().clone();
+    let before_database = before_handle.database_path().to_path_buf();
+    let before_rows = before_handle
+        .read(|store| store.declaration_view().by_name_limited("stable", 4))
+        .unwrap();
+    write_workspace_file(
+        &root,
+        "large.c",
+        &format!("/*{}*/\n", "x".repeat(6 * 1024 * 1024)),
+    );
+    memory.store(400 * 1024 * 1024, std::sync::atomic::Ordering::SeqCst);
+    service.inner().spawn_index_roots(Some(true)).await;
+    wait_for_lifecycle_indexing_to_settle(&service, "pressure failure did not settle").await;
+    let after = service
+        .inner()
+        .session
+        .cache
+        .current_engine_snapshot(&root)
+        .await
+        .unwrap();
+    assert_eq!(before.epoch, after.epoch);
+    assert_eq!(before_generation, after.semantic_generation);
+    assert_eq!(
+        after.call_read_handle.as_ref().unwrap().database_path(),
+        before_database
+    );
+    assert_eq!(
+        before_rows,
+        before_handle
+            .read(|store| store.declaration_view().by_name_limited("stable", 4))
+            .unwrap()
+    );
+    let after_definition = definition_locations(
+        service
+            .inner()
+            .goto_definition(goto_definition_params(uri.clone(), line, character))
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+    assert_eq!(before_definition, after_definition);
+    let hover = service
+        .inner()
+        .hover(hover_params(uri.clone(), line, character))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(hover_text(hover.contents).contains("stable"));
+    service.inner().take_completion_perf_for_test();
+    let completion = service
+        .inner()
+        .completion(completion_params(uri, line, character))
+        .await
+        .unwrap();
+    assert!(
+        completion_items(completion.expect("completion remains available"))
+            .iter()
+            .any(|item| item.label == "stable")
+    );
+    assert!(service
+        .inner()
+        .take_completion_perf_for_test()
+        .iter()
+        .any(|(_, metrics)| metrics.recall_channels.indexed_returned > 0));
+    let coordinator = service.inner().session.cache.build_coordinator.snapshot();
+    assert!(coordinator.budget_denial_count > 0);
+    assert_eq!(coordinator.active_builds, 0);
+    assert_eq!(coordinator.active_reserved_bytes, 0);
+    assert!(
+        after
+            .declaration_index
+            .as_ref()
+            .unwrap()
+            .effective_payload_budget_bytes()
+            > 0
+    );
+    assert!(fs::read_dir(db.parent().unwrap())
+        .unwrap()
+        .all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("index-build-")));
 }

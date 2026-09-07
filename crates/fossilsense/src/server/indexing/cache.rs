@@ -707,7 +707,10 @@ impl CacheLedger {
         permit: &crate::build_coordinator::BuildPermit,
     ) -> Result<CachePublishReport> {
         let _read_model_stage = permit.inherit(crate::build_coordinator::BuildKind::ReadModel);
-        permit.check_cancelled()?;
+        permit.reserve(
+            publication.replacement_reservation_bytes(),
+            publication.retained_bytes(),
+        )?;
         let semantic_generation = load_semantic_generation(root.clone()).await?;
 
         let nt_started = tokio::time::Instant::now();
@@ -1253,7 +1256,7 @@ impl CacheLedger {
         let retained_bytes = declaration_index.accounted_core_bytes();
         permit
             .reserve_with_wait(
-                retained_bytes.min(crate::build_coordinator::DEFAULT_TEMPORARY_RESERVATION_BYTES),
+                declaration_index.name_table().compaction_temporary_bytes(),
                 retained_bytes,
             )
             .await?;
@@ -1267,6 +1270,21 @@ impl CacheLedger {
         let Some(compacted) = compacted else {
             return Ok(false);
         };
+
+        // A one-shot test barrier makes save-during-compaction deterministic
+        // even when consolidating a tiny delta finishes in microseconds. The
+        // actual replacement has been built and remains counted in the peak.
+        #[cfg(test)]
+        {
+            let ready = self.compaction_ready_for_test.lock().unwrap().take();
+            if let Some(ready) = ready {
+                ready.notify_one();
+                tokio::time::timeout(std::time::Duration::from_secs(30), cancellation.cancelled())
+                    .await
+                    .context("test save did not cancel the completed compaction")?;
+                return Ok(false);
+            }
+        }
 
         let _publish_guard = self.publish_gate.lock().await;
         permit.check_cancelled()?;

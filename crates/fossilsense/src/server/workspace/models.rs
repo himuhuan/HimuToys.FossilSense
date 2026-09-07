@@ -42,6 +42,9 @@ pub(in crate::server) struct CacheLedger {
     #[cfg(test)]
     pub(super) completion_overlay_cache_hits: Arc<AtomicU64>,
     #[cfg(test)]
+    pub(in crate::server) compaction_ready_for_test:
+        Arc<StdMutex<Option<Arc<tokio::sync::Notify>>>>,
+    #[cfg(test)]
     pub(super) completion_overlay_cache_misses: Arc<AtomicU64>,
 }
 
@@ -143,6 +146,8 @@ impl Default for CacheLedger {
             snapshot_memory_reports: Arc::new(StdMutex::new(HashMap::new())),
             #[cfg(test)]
             completion_overlay_cache_hits: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            compaction_ready_for_test: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             completion_overlay_cache_misses: Arc::new(AtomicU64::new(0)),
         }

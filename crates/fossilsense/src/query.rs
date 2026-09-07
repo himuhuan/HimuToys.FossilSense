@@ -364,6 +364,7 @@ impl CompletionScope {
 }
 
 struct NameSegment {
+    memory: std::sync::OnceLock<NameSegmentMemoryBreakdown>,
     entries: Vec<CompactNameEntry>,
     names: Vec<NameString>,
     paths: Vec<Arc<str>>,
@@ -1687,6 +1688,9 @@ impl NameTable {
         &self,
         cancellation: &crate::build_coordinator::BuildCancellation,
     ) -> Option<Self> {
+        if self.can_compact_deltas_only() {
+            return self.compact_deltas_with_cancellation(cancellation);
+        }
         let mut builder = name_index_builder::NameIndexBuilder::new(None);
         for index in 0..self.slot_len {
             if cancellation_checkpoint(cancellation, index) {
@@ -1766,6 +1770,7 @@ impl NameSegment {
             }
         }
         Self {
+            memory: std::sync::OnceLock::new(),
             entries,
             names,
             paths,
@@ -1850,6 +1855,7 @@ impl NameSegment {
             }
         }
         (!cancellation.is_cancelled()).then_some(Self {
+            memory: std::sync::OnceLock::new(),
             entries,
             names,
             paths,
@@ -1903,6 +1909,12 @@ impl NameSegment {
     }
 
     fn memory_breakdown(&self) -> NameSegmentMemoryBreakdown {
+        *self
+            .memory
+            .get_or_init(|| self.calculate_memory_breakdown())
+    }
+
+    fn calculate_memory_breakdown(&self) -> NameSegmentMemoryBreakdown {
         let arc_header = size_of::<usize>().saturating_mul(2);
         let mut breakdown = NameSegmentMemoryBreakdown {
             declaration_entry_bytes: self
