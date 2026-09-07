@@ -3388,6 +3388,60 @@ fn name_table_compaction_preserves_active_results_and_removes_segments() {
 }
 
 #[test]
+fn name_table_compaction_checks_cancellation_inside_segmented_sorting() {
+    let entries = (0..3_000)
+        .map(|index| {
+            (
+                index as i64 + 1,
+                format!("symbol_{index:04}"),
+                false,
+                format!("src/file_{index:04}.c"),
+                "function".to_string(),
+                false,
+            )
+        })
+        .collect();
+    let table = NameTable::build_with_paths(entries);
+    let cancellation = crate::build_coordinator::BuildCancellation::new();
+    cancellation.cancel_after_checks_for_test(6);
+    assert!(
+        table.compacted_with_cancellation(&cancellation).is_none(),
+        "cancellation triggered after collection must stop a segmented sorting phase"
+    );
+
+    let completed = table
+        .compacted_with_cancellation(&crate::build_coordinator::BuildCancellation::new())
+        .expect("uncancelled compaction");
+    assert_eq!(completed.len(), table.len());
+    assert_eq!(
+        completed.search_ranked("symbol_2999", 8),
+        table.search_ranked("symbol_2999", 8)
+    );
+}
+
+#[test]
+fn name_table_compaction_checks_cancellation_before_scanning_tombstoned_slots() {
+    let mut table = NameTable::build_with_paths(vec![(
+        1,
+        "removed".to_string(),
+        false,
+        "src/removed.c".to_string(),
+        "function".to_string(),
+        false,
+    )]);
+    let paths = std::collections::HashSet::from(["src/removed.c".to_string()]);
+    table = table.with_updated_paths(&paths, Vec::new());
+    assert_eq!(table.active_indices().count(), 0);
+
+    // A cancelled compaction must return before looking up even its first
+    // tombstoned slot. The extra sentinel makes a late check deterministic.
+    table.slot_len += 1;
+    let cancellation = crate::build_coordinator::BuildCancellation::new();
+    cancellation.cancel();
+    assert!(table.compacted_with_cancellation(&cancellation).is_none());
+}
+
+#[test]
 fn identifier_completion_starts_at_one_character() {
     assert_eq!(MIN_PREFIX_LEN, 1);
 }

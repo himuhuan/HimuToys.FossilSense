@@ -666,6 +666,9 @@ impl CacheLedger {
         if roots.is_empty() {
             return;
         }
+        for root in roots {
+            self.build_coordinator.remove_root(root);
+        }
         self.engine_snapshots
             .lock()
             .await

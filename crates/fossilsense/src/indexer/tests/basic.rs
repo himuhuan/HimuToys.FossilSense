@@ -4,6 +4,64 @@ use crate::store::test_support::{
 };
 
 #[test]
+fn cancelled_full_build_removes_its_unpublished_staging_database() {
+    let workspace = tempdir().expect("workspace");
+    fs::write(workspace.path().join("main.c"), "int cancelled_build;\n").expect("source");
+    let cache_dir = crate::pathing::default_index_directory(workspace.path()).expect("cache dir");
+    if cache_dir.exists() {
+        fs::remove_dir_all(&cache_dir).expect("clean prior test cache");
+    }
+
+    let coordinator = crate::build_coordinator::BuildCoordinator::with_policy_and_sampler(
+        crate::build_coordinator::BuildPolicy::default(),
+        || 0,
+    );
+    let permit = coordinator
+        .try_acquire(
+            workspace.path().to_path_buf(),
+            crate::build_coordinator::BuildKind::FullIndex,
+        )
+        .expect("permit");
+    let cancellation = permit.cancellation();
+    let result = index_workspace_with_permit(
+        workspace.path(),
+        IndexOptions {
+            force: true,
+            ..Default::default()
+        },
+        &permit,
+        |status| {
+            if status.phase.as_deref() == Some("checking") {
+                cancellation.cancel();
+            }
+        },
+    );
+    assert!(result
+        .expect_err("cancelled build")
+        .to_string()
+        .contains("cancelled"));
+
+    let staging: Vec<_> = fs::read_dir(&cache_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("index-build-")
+        })
+        .collect();
+    assert!(
+        staging.is_empty(),
+        "cancelled build must remove its staging SQLite family: {staging:?}"
+    );
+    if cache_dir.exists() {
+        fs::remove_dir_all(cache_dir).expect("clean test cache");
+    }
+}
+
+#[test]
 fn language_evidence_override_reindexes_unchanged_source_even_with_same_grammar() {
     let workspace = tempdir().expect("workspace");
     fs::write(workspace.path().join("shared.h"), "int visible;\n").unwrap();

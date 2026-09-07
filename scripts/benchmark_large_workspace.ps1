@@ -9,6 +9,7 @@ param(
     [switch]$IncludeFullIndex,
     [switch]$IncludeEngineHydration,
     [switch]$IncludeCompletionReplay,
+    [switch]$IncludeLspLifecycle,
     [switch]$IncludeV142SemanticCases,
     [string]$V142Harness = '',
     [switch]$ListCases,
@@ -42,6 +43,40 @@ function Get-SampleRevision([string]$Workspace) {
         # the report instead of making the measurement unusable.
     }
     return 'unavailable'
+}
+
+function Get-SourceState([string]$Repository) {
+    $revision = (& git -C $Repository rev-parse HEAD 2>$null |
+        Select-Object -First 1).ToString().Trim()
+    if ($revision -notmatch '^[0-9a-f]{40}$') {
+        throw "cannot determine source revision for benchmark repository: $Repository"
+    }
+
+    $fingerprintParts = [System.Collections.Generic.List[string]]::new()
+    foreach ($line in @(& git -C $Repository diff --binary HEAD -- . 2>$null)) {
+        $fingerprintParts.Add($line.ToString())
+    }
+    foreach ($relativePath in @(
+        & git -C $Repository ls-files --others --exclude-standard 2>$null |
+            Sort-Object
+    )) {
+        $fileHash = (& git -C $Repository hash-object -- $relativePath 2>$null |
+            Select-Object -First 1).ToString().Trim()
+        $fingerprintParts.Add("untracked:$relativePath`:$fileHash")
+    }
+
+    $payload = $fingerprintParts -join "`n"
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($payload)
+        $fingerprint = [System.BitConverter]::ToString($sha256.ComputeHash($bytes)).Replace('-', '').ToLowerInvariant()
+    } finally {
+        $sha256.Dispose()
+    }
+    return [pscustomobject]@{
+        Revision = $revision
+        ChangeFingerprint = $fingerprint
+    }
 }
 
 function Get-DatabaseSizeBytes([string]$Database) {
@@ -304,6 +339,47 @@ function Convert-WhitelistedMetrics([string[]]$Lines) {
         warm_publication_second_file_relations_bytes = $true
         warm_publication_old_epoch_consistent = $true
         warm_publication_old_generation_consistent = $true
+        lsp_lifecycle_declarations = $true
+        lsp_lifecycle_files = $true
+        lsp_lifecycle_warm_cache_percent = $true
+        lsp_lifecycle_phases_seen_mask = $true
+        lsp_lifecycle_active_builds_peak = $true
+        lsp_lifecycle_reserved_bytes_peak = $true
+        lsp_lifecycle_retained_bytes_peak = $true
+        lsp_lifecycle_peak_process_bytes = $true
+        lsp_lifecycle_memory_sample_available = $true
+        lsp_lifecycle_memory_metric_private_bytes = $true
+        lsp_lifecycle_old_requests_held_peak = $true
+        lsp_lifecycle_old_epoch_consistent = $true
+        lsp_lifecycle_new_epoch_consistent = $true
+        lsp_lifecycle_generation_mismatches = $true
+        lsp_lifecycle_database_identity_mismatches = $true
+        lsp_lifecycle_cancelled_compactions = $true
+        lsp_lifecycle_hover_requests = $true
+        lsp_lifecycle_hover_p50_us = $true
+        lsp_lifecycle_hover_p95_us = $true
+        lsp_lifecycle_hover_max_us = $true
+        lsp_lifecycle_definition_requests = $true
+        lsp_lifecycle_definition_p50_us = $true
+        lsp_lifecycle_definition_p95_us = $true
+        lsp_lifecycle_definition_max_us = $true
+        lsp_lifecycle_completion_requests = $true
+        lsp_lifecycle_completion_candidates_min = $true
+        lsp_lifecycle_completion_p95_us = $true
+        lsp_lifecycle_completion_entries_inspected_min = $true
+        lsp_lifecycle_completion_entries_inspected_max = $true
+        lsp_lifecycle_completion_candidate_budget_min = $true
+        lsp_lifecycle_completion_candidate_budget_max = $true
+        lsp_lifecycle_completion_indexed_returned_min = $true
+        lsp_lifecycle_completion_active_entries_min = $true
+        lsp_lifecycle_completion_truncated_requests = $true
+        lsp_lifecycle_completion_sql_reads = $true
+        lsp_lifecycle_dirty_updates_applied = $true
+        lsp_lifecycle_final_active_builds = $true
+        lsp_lifecycle_final_reserved_bytes = $true
+        lsp_lifecycle_database_size_bytes = $true
+        lsp_lifecycle_elapsed_ms = $true
+        lsp_lifecycle_write_ms = $true
     }
     $metrics = [ordered]@{}
     foreach ($line in $Lines) {
@@ -418,6 +494,40 @@ if ($IncludeCompletionReplay) {
             '-Workspace',
             $completionWorkspace
         )
+    }
+}
+
+if ($IncludeLspLifecycle) {
+    $lifecycleHarness = Resolve-FullPath (
+        Join-Path $PSScriptRoot 'benchmark_lsp_lifecycle.ps1'
+    )
+    if (-not (Test-Path -LiteralPath $lifecycleHarness -PathType Leaf)) {
+        throw "LSP lifecycle benchmark harness not found: $lifecycleHarness"
+    }
+    foreach ($sampleName in @('u-boot', 'wine')) {
+        $lifecycleWorkspace = Join-Path $repoRoot "samples\$sampleName"
+        $lifecycleDatabase = Join-Path $benchmarkPath "index-$sampleName-rebuild.sqlite"
+        $cases += [pscustomobject]@{
+            Id = "$sampleName-lsp-lifecycle"
+            Executable = 'powershell.exe'
+            Workspace = $lifecycleWorkspace
+            Database = $lifecycleDatabase
+            ResetDatabase = $null
+            OuterMetricsComparable = $false
+            Arguments = @(
+                '-NoProfile',
+                '-ExecutionPolicy',
+                'Bypass',
+                '-File',
+                $lifecycleHarness,
+                '-Database',
+                $lifecycleDatabase,
+                '-Workspace',
+                $lifecycleWorkspace,
+                '-Sample',
+                $sampleName
+            )
+        }
     }
 }
 
@@ -563,6 +673,9 @@ foreach ($case in $cases) {
                 -OuterElapsedMs $sample.ElapsedMs `
                 -EngineElapsedMs $metrics.elapsed_ms
         }
+        if ($case.Id -like '*-lsp-lifecycle') {
+            Assert-LspLifecycleGate -CaseId $case.Id -Metrics $metrics
+        }
         $outerMetricsComparable = if (
             $case.PSObject.Properties.Name -contains 'OuterMetricsComparable'
         ) {
@@ -570,11 +683,13 @@ foreach ($case in $cases) {
         } else {
             $true
         }
+        $sampleState = Get-SourceState (Resolve-FullPath $case.Workspace)
         $results.Add([pscustomobject]@{
             case_id = $case.Id
             run = $run
             workspace = (Resolve-FullPath $case.Workspace)
-            sample_revision = (Get-SampleRevision $case.Workspace)
+            sample_revision = $sampleState.Revision
+            sample_change_fingerprint = $sampleState.ChangeFingerprint
             database_path = if ([string]::IsNullOrWhiteSpace($database)) { $null } else { Resolve-FullPath $database }
             database_size_bytes = (Get-DatabaseSizeBytes $database)
             outer_process_metrics_comparable = $outerMetricsComparable
@@ -610,11 +725,14 @@ try {
 } catch {
     # Version metadata is diagnostic only and must not invalidate benchmark data.
 }
+$sourceState = Get-SourceState (Resolve-FullPath (Join-Path $PSScriptRoot '..'))
 $report = [ordered]@{
     schema_version = 1
     measured_at = (Get-Date).ToUniversalTime().ToString('o')
     command_line = [System.Environment]::CommandLine
     binary_version = $binaryVersion
+    source_revision = $sourceState.Revision
+    source_change_fingerprint = $sourceState.ChangeFingerprint
     machine = Get-BenchmarkMachine
     sample_interval_ms = 20
     results = $results

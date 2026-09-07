@@ -33,6 +33,30 @@ use parse_pipeline::{parse_and_write_changed, parse_thread_count, ParsePipelineC
 use progress_limiter::ProgressLimiter;
 use protobuf_c::{build_protobuf_c_sources, ProtoScanLimits};
 
+struct UnpublishedDefaultIndexBuild {
+    staging: Option<PathBuf>,
+}
+
+impl UnpublishedDefaultIndexBuild {
+    fn new(staging: PathBuf) -> Self {
+        Self {
+            staging: Some(staging),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.staging = None;
+    }
+}
+
+impl Drop for UnpublishedDefaultIndexBuild {
+    fn drop(&mut self) {
+        if let Some(staging) = self.staging.as_deref() {
+            crate::pathing::remove_sqlite_file_family(staging);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct IndexOptions {
     pub db_path: Option<PathBuf>,
@@ -136,11 +160,31 @@ pub struct DirtyFileChange {
     pub kind: DirtyFileKind,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn index_workspace(
     workspace: impl AsRef<Path>,
     options: IndexOptions,
     mut progress: impl FnMut(IndexStatus),
 ) -> Result<IndexStats> {
+    index_workspace_impl(workspace.as_ref(), options, None, &mut progress)
+}
+
+pub(crate) fn index_workspace_with_permit(
+    workspace: impl AsRef<Path>,
+    options: IndexOptions,
+    permit: &crate::build_coordinator::BuildPermit,
+    mut progress: impl FnMut(IndexStatus),
+) -> Result<IndexStats> {
+    index_workspace_impl(workspace.as_ref(), options, Some(permit), &mut progress)
+}
+
+fn index_workspace_impl(
+    workspace: &Path,
+    options: IndexOptions,
+    permit: Option<&crate::build_coordinator::BuildPermit>,
+    mut progress: &mut impl FnMut(IndexStatus),
+) -> Result<IndexStats> {
+    check_build_cancelled(permit)?;
     let started = Instant::now();
     let workspace = canonical_workspace(workspace)?;
     let workspace_display = workspace.display().to_string();
@@ -213,6 +257,8 @@ pub fn index_workspace(
         };
     let side_by_side_publication =
         default_side_by_side_publication || explicit_publication.is_some();
+    let mut default_staging = default_side_by_side_publication
+        .then(|| UnpublishedDefaultIndexBuild::new(db_path.clone()));
     let database_existed = db_path.exists();
     let mut stats = IndexStats::default();
     progress(IndexStatus::indexing_phase(
@@ -263,6 +309,7 @@ pub fn index_workspace(
     candidates.extend(external_go_candidates);
     candidates.sort_by(|left, right| left.fingerprint.path.cmp(&right.fingerprint.path));
     candidates.dedup_by(|left, right| left.fingerprint.path == right.fingerprint.path);
+    check_build_cancelled(permit)?;
     stats.discover_ms = discover_started.elapsed().as_millis();
     stats.total_files = candidates.len();
 
@@ -311,7 +358,10 @@ pub fn index_workspace(
     let stored_files = store.stored_files(&candidate_paths)?;
     let replace_all_files = side_by_side_publication || options.force || stored_files.is_empty();
     let build = store.begin_index_build(replace_all_files)?;
-    for candidate in candidates {
+    for (candidate_index, candidate) in candidates.into_iter().enumerate() {
+        if candidate_index % crate::build_coordinator::CANCELLATION_CHECK_INTERVAL == 0 {
+            check_build_cancelled(permit)?;
+        }
         // Fast incremental check: reading and hashing every unchanged workspace
         // file defeats the point of an incremental pass. Size + mtime is the
         // cheap gate; content hash is recomputed only for files that pass it.
@@ -344,6 +394,7 @@ pub fn index_workspace(
         ParsePipelineConfig {
             parse_threads: parse_thread_count(options.parse_threads),
             language_resolver,
+            cancellation: permit.map(crate::build_coordinator::BuildPermit::cancellation),
         },
         build,
         &mut store,
@@ -351,6 +402,7 @@ pub fn index_workspace(
         &mut stats,
         &mut progress,
     )?;
+    check_build_cancelled(permit)?;
 
     progress(IndexStatus::indexing_phase(
         workspace_display.clone(),
@@ -391,6 +443,7 @@ pub fn index_workspace(
             issue.message,
         ));
     }
+    check_build_cancelled(permit)?;
     let commit = store.commit_index_build(build, &include_graph)?;
     stats.semantic_generation = commit.generation;
     stats.maintenance_warning = commit.cleanup_warning;
@@ -424,6 +477,10 @@ pub fn index_workspace(
         drop(store);
         if default_side_by_side_publication {
             publish_default_index(&workspace, &db_path, stats.semantic_generation)?;
+            default_staging
+                .as_mut()
+                .expect("default staging guard")
+                .disarm();
         } else {
             let publication = explicit_publication
                 .take()
@@ -447,6 +504,7 @@ pub fn index_workspace(
         stats.publication_ms = publication_started.elapsed().as_millis();
     }
     stats.elapsed_ms = started.elapsed().as_millis();
+    check_build_cancelled(permit)?;
     progress(IndexStatus::ready(workspace_display, &stats));
     Ok(stats)
 }
@@ -474,12 +532,40 @@ fn latest_default_generation(workspace: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn index_dirty_files(
     workspace: impl AsRef<Path>,
     changes: Vec<DirtyFileChange>,
     options: IndexOptions,
     mut progress: impl FnMut(IndexStatus),
 ) -> Result<IndexStats> {
+    index_dirty_files_impl(workspace.as_ref(), changes, options, None, &mut progress)
+}
+
+pub(crate) fn index_dirty_files_with_permit(
+    workspace: impl AsRef<Path>,
+    changes: Vec<DirtyFileChange>,
+    options: IndexOptions,
+    permit: &crate::build_coordinator::BuildPermit,
+    mut progress: impl FnMut(IndexStatus),
+) -> Result<IndexStats> {
+    index_dirty_files_impl(
+        workspace.as_ref(),
+        changes,
+        options,
+        Some(permit),
+        &mut progress,
+    )
+}
+
+fn index_dirty_files_impl(
+    workspace: &Path,
+    changes: Vec<DirtyFileChange>,
+    options: IndexOptions,
+    permit: Option<&crate::build_coordinator::BuildPermit>,
+    mut progress: &mut impl FnMut(IndexStatus),
+) -> Result<IndexStats> {
+    check_build_cancelled(permit)?;
     let started = Instant::now();
     let workspace = canonical_workspace(workspace)?;
     let workspace_display = workspace.display().to_string();
@@ -547,7 +633,10 @@ pub fn index_dirty_files(
     let mut changed_rels: Vec<String> = Vec::new();
     let mut seen = HashSet::new();
 
-    for change in changes {
+    for (change_index, change) in changes.into_iter().enumerate() {
+        if change_index % crate::build_coordinator::CANCELLATION_CHECK_INTERVAL == 0 {
+            check_build_cancelled(permit)?;
+        }
         let absolute_path = if change.kind == DirtyFileKind::Upsert {
             change
                 .absolute_path
@@ -597,6 +686,7 @@ pub fn index_dirty_files(
         ParsePipelineConfig {
             parse_threads: parse_thread_count(options.parse_threads),
             language_resolver,
+            cancellation: permit.map(crate::build_coordinator::BuildPermit::cancellation),
         },
         build,
         &mut store,
@@ -604,6 +694,7 @@ pub fn index_dirty_files(
         &mut stats,
         &mut progress,
     )?;
+    check_build_cancelled(permit)?;
 
     // Rebuild include edges for changed source files and for any existing source
     // whose raw include target could resolve to a newly added/deleted path.
@@ -665,8 +756,16 @@ pub fn index_dirty_files(
     stats.callable_anchors = call_coverage.callable_anchors as usize;
     stats.call_sites = call_coverage.call_sites as usize;
     stats.elapsed_ms = started.elapsed().as_millis();
+    check_build_cancelled(permit)?;
     progress(IndexStatus::ready(workspace_display, &stats));
     Ok(stats)
+}
+
+fn check_build_cancelled(permit: Option<&crate::build_coordinator::BuildPermit>) -> Result<()> {
+    if let Some(permit) = permit {
+        permit.check_cancelled()?;
+    }
+    Ok(())
 }
 
 fn external_go_module_roots(

@@ -431,9 +431,12 @@ async fn update_indexed_file_list(
 /// while `publish_gate` is held, before the replacement snapshot begins to
 /// build. If any later step returns early, its payload-cache lease restores the
 /// old generation's effective budget on drop.
-struct FullPublicationState {
+pub(in crate::server) struct FullPublicationState {
     old_payload_cache: Option<DeclarationPayloadCachePublicationLease>,
     effective_budget_after_shrink_bytes: Option<usize>,
+    expected_epoch: Option<crate::server::state::EngineEpoch>,
+    retained_bytes: usize,
+    replacement_reservation_bytes: usize,
 }
 
 impl FullPublicationState {
@@ -452,25 +455,70 @@ impl FullPublicationState {
     fn effective_budget_after_shrink_bytes(&self) -> Option<usize> {
         self.effective_budget_after_shrink_bytes
     }
+
+    pub(in crate::server) fn expected_epoch(&self) -> Option<crate::server::state::EngineEpoch> {
+        self.expected_epoch
+    }
+
+    pub(in crate::server) fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+    }
+
+    pub(in crate::server) fn replacement_reservation_bytes(&self) -> usize {
+        self.replacement_reservation_bytes
+    }
 }
 
 impl CacheLedger {
-    /// Begin the common complete-publication lifecycle. Callers must already
-    /// own `publish_gate`; the old snapshot remains published and readable.
-    async fn begin_full_publication_under_gate(&self, root: &PathBuf) -> FullPublicationState {
+    /// Suspend the replaceable payload cache before a complete database build
+    /// starts. The returned RAII state restores the still-active generation on
+    /// failure and is committed only after the replacement snapshot is swapped.
+    pub(in crate::server) async fn begin_full_build_lifecycle(
+        &self,
+        root: &PathBuf,
+    ) -> FullPublicationState {
         let previous = self.current_engine_snapshot(root).await;
-        let (old_payload_cache, effective_budget_after_shrink_bytes) = previous
+        let expected_epoch = previous.as_ref().map(|snapshot| snapshot.epoch);
+        let (
+            old_payload_cache,
+            effective_budget_after_shrink_bytes,
+            retained_bytes,
+            replacement_reservation_bytes,
+        ) = previous
             .and_then(|snapshot| snapshot.declaration_index.clone())
             .map(|index| {
+                let retained_bytes = index.accounted_core_bytes();
+                let replacement_reservation_bytes = retained_bytes
+                    .min(crate::build_coordinator::DEFAULT_TEMPORARY_RESERVATION_BYTES);
                 let lease = index.suspend_payload_cache_for_full_publication();
                 let effective_budget_after_shrink_bytes = index.effective_payload_budget_bytes();
-                (Some(lease), Some(effective_budget_after_shrink_bytes))
+                (
+                    Some(lease),
+                    Some(effective_budget_after_shrink_bytes),
+                    retained_bytes,
+                    replacement_reservation_bytes,
+                )
             })
-            .unwrap_or((None, None));
+            .unwrap_or((
+                None,
+                None,
+                0,
+                crate::build_coordinator::DEFAULT_FIRST_BUILD_RESERVATION_BYTES,
+            ));
         FullPublicationState {
             old_payload_cache,
             effective_budget_after_shrink_bytes,
+            expected_epoch,
+            retained_bytes,
+            replacement_reservation_bytes,
         }
+    }
+
+    /// Begin the common complete-publication lifecycle. Callers must already
+    /// own `publish_gate`; the old snapshot remains published and readable.
+    #[cfg(test)]
+    async fn begin_full_publication_under_gate(&self, root: &PathBuf) -> FullPublicationState {
+        self.begin_full_build_lifecycle(root).await
     }
 
     /// Atomically expose a fully built replacement snapshot and permanently
@@ -512,8 +560,20 @@ impl CacheLedger {
         root: PathBuf,
         db_path: PathBuf,
     ) -> Result<Arc<EngineSnapshot>> {
-        let _publish_guard = self.publish_gate.lock().await;
-        let mut publication = self.begin_full_publication_under_gate(&root).await;
+        let cancellation = crate::build_coordinator::BuildCancellation::new();
+        let permit = self
+            .build_coordinator
+            .acquire(
+                root.clone(),
+                crate::build_coordinator::BuildKind::ReadModel,
+                cancellation,
+            )
+            .await?;
+        let mut publication = self.begin_full_build_lifecycle(&root).await;
+        permit.reserve(
+            publication.replacement_reservation_bytes(),
+            publication.retained_bytes(),
+        )?;
         let total_budget_bytes = self.semantic_index_memory_budget_bytes();
         let epoch = self.allocate_engine_epoch();
         let build_root = root.clone();
@@ -576,6 +636,15 @@ impl CacheLedger {
         })
         .await??;
 
+        permit.check_cancelled()?;
+        let _publish_guard = self.publish_gate.lock().await;
+        anyhow::ensure!(
+            self.current_engine_snapshot(&root)
+                .await
+                .map(|current| current.epoch)
+                == publication.expected_epoch(),
+            "engine epoch changed while building the benchmark snapshot"
+        );
         Ok(self
             .finish_full_publication_under_gate(&mut publication, snapshot)
             .await)
@@ -598,27 +667,47 @@ impl CacheLedger {
             .await
     }
 
+    #[cfg(test)]
     pub(in crate::server) async fn publish_full_index_with_semantics(
         &self,
         client: &Client,
         root: PathBuf,
         workspace_semantics: Arc<super::super::workspace_config::PublishedWorkspaceSemantics>,
     ) -> Result<CachePublishReport> {
-        // SQLite has one writer and the runtime has one snapshot publisher. The
-        // previous engine snapshot stays visible while every next component is
-        // built off to the side.
-        let _publish_guard = self.publish_gate.lock().await;
-        self.publish_full_index_under_gate(client, root, workspace_semantics)
-            .await
+        let cancellation = crate::build_coordinator::BuildCancellation::new();
+        let permit = self
+            .build_coordinator
+            .acquire(
+                root.clone(),
+                crate::build_coordinator::BuildKind::ReadModel,
+                cancellation,
+            )
+            .await?;
+        let publication = self.begin_full_build_lifecycle(&root).await;
+        permit.reserve(
+            publication.replacement_reservation_bytes(),
+            publication.retained_bytes(),
+        )?;
+        self.publish_full_index_with_semantics_in_lifecycle(
+            client,
+            root,
+            workspace_semantics,
+            publication,
+            &permit,
+        )
+        .await
     }
 
-    async fn publish_full_index_under_gate(
+    pub(in crate::server) async fn publish_full_index_with_semantics_in_lifecycle(
         &self,
         client: &Client,
         root: PathBuf,
         workspace_semantics: Arc<super::super::workspace_config::PublishedWorkspaceSemantics>,
+        mut publication: FullPublicationState,
+        permit: &crate::build_coordinator::BuildPermit,
     ) -> Result<CachePublishReport> {
-        let mut publication = self.begin_full_publication_under_gate(&root).await;
+        let _read_model_stage = permit.inherit(crate::build_coordinator::BuildKind::ReadModel);
+        permit.check_cancelled()?;
         let semantic_generation = load_semantic_generation(root.clone()).await?;
 
         let nt_started = tokio::time::Instant::now();
@@ -700,13 +789,13 @@ impl CacheLedger {
         };
         let reference_file_count = indexed_files.as_ref().map_or(0, |files| files.len());
         let reach_graph_ms = rg_started.elapsed().as_millis();
+        permit.check_cancelled()?;
         let observed_generation = load_semantic_generation(root.clone()).await?;
         anyhow::ensure!(
             observed_generation == semantic_generation,
             "semantic generation changed while building the engine snapshot"
         );
 
-        let epoch = self.allocate_engine_epoch();
         if let Some(shrink) = publication.shrink() {
             client
                 .log_message(
@@ -722,6 +811,22 @@ impl CacheLedger {
                 )
                 .await;
         }
+        let _publish_guard = self.publish_gate.lock().await;
+        permit.check_cancelled()?;
+        let current_epoch = self
+            .current_engine_snapshot(&root)
+            .await
+            .map(|snapshot| snapshot.epoch);
+        anyhow::ensure!(
+            current_epoch == publication.expected_epoch(),
+            "engine epoch changed while building the replacement snapshot"
+        );
+        let final_generation = load_semantic_generation(root.clone()).await?;
+        anyhow::ensure!(
+            final_generation == semantic_generation,
+            "semantic generation changed before publishing the engine snapshot"
+        );
+        let epoch = self.allocate_engine_epoch();
         self.finish_full_publication_under_gate(
             &mut publication,
             EngineSnapshot {
@@ -743,6 +848,7 @@ impl CacheLedger {
             },
         )
         .await;
+        drop(_publish_guard);
         self.invalidate_after_index_change().await;
 
         Ok(CachePublishReport {
@@ -791,6 +897,7 @@ impl CacheLedger {
         .await
     }
 
+    #[cfg(test)]
     pub(in crate::server) async fn publish_dirty_index_with_semantics(
         &self,
         client: &Client,
@@ -799,16 +906,54 @@ impl CacheLedger {
         include_edge_sources_rebuilt: &[String],
         workspace_semantics: Arc<super::super::workspace_config::PublishedWorkspaceSemantics>,
     ) -> Result<CachePublishReport> {
-        let _publish_guard = self.publish_gate.lock().await;
+        let cancellation = crate::build_coordinator::BuildCancellation::new();
+        let permit = self
+            .build_coordinator
+            .acquire(
+                root.clone(),
+                crate::build_coordinator::BuildKind::DirtyIndex,
+                cancellation,
+            )
+            .await?;
+        self.publish_dirty_index_with_semantics_in_lifecycle(
+            client,
+            root,
+            rel_paths,
+            include_edge_sources_rebuilt,
+            workspace_semantics,
+            &permit,
+        )
+        .await
+    }
+
+    pub(in crate::server) async fn publish_dirty_index_with_semantics_in_lifecycle(
+        &self,
+        client: &Client,
+        root: PathBuf,
+        rel_paths: &[String],
+        include_edge_sources_rebuilt: &[String],
+        workspace_semantics: Arc<super::super::workspace_config::PublishedWorkspaceSemantics>,
+        permit: &crate::build_coordinator::BuildPermit,
+    ) -> Result<CachePublishReport> {
+        let _read_model_stage = permit.inherit(crate::build_coordinator::BuildKind::ReadModel);
+        permit.check_cancelled()?;
         let semantic_generation = load_semantic_generation(root.clone()).await?;
         let previous = self.current_engine_snapshot(&root).await;
+        let expected_epoch = previous.as_ref().map(|snapshot| snapshot.epoch);
         let direct_base = previous.as_ref().is_some_and(|snapshot| {
             snapshot.semantic_generation != crate::call_model::SemanticGeneration::MISSING
                 && snapshot.semantic_generation.0.checked_add(1) == Some(semantic_generation.0)
         });
         if !direct_base {
+            let publication = self.begin_full_build_lifecycle(&root).await;
             return self
-                .publish_full_index_under_gate(client, root, workspace_semantics)
+                .publish_full_index_with_semantics_in_lifecycle(
+                    client,
+                    root,
+                    workspace_semantics,
+                    publication,
+                    permit,
+                )
                 .await;
         }
         anyhow::ensure!(
@@ -907,12 +1052,28 @@ impl CacheLedger {
         };
         let reference_file_count = indexed_files.as_ref().map_or(0, |files| files.len());
         let reach_graph_ms = rg_started.elapsed().as_millis();
+        permit.check_cancelled()?;
         let observed_generation = load_semantic_generation(root.clone()).await?;
         anyhow::ensure!(
             observed_generation == semantic_generation,
             "semantic generation changed while building the engine snapshot"
         );
 
+        let _publish_guard = self.publish_gate.lock().await;
+        permit.check_cancelled()?;
+        let current_epoch = self
+            .current_engine_snapshot(&root)
+            .await
+            .map(|snapshot| snapshot.epoch);
+        anyhow::ensure!(
+            current_epoch == expected_epoch,
+            "engine epoch changed while building the dirty replacement snapshot"
+        );
+        let final_generation = load_semantic_generation(root.clone()).await?;
+        anyhow::ensure!(
+            final_generation == semantic_generation,
+            "semantic generation changed before publishing the dirty engine snapshot"
+        );
         let epoch = self.allocate_engine_epoch();
         self.publish_engine_snapshot(EngineSnapshot {
             root: root.clone(),
@@ -932,7 +1093,6 @@ impl CacheLedger {
             degraded: degraded.clone(),
         })
         .await;
-        self.invalidate_after_index_change().await;
 
         let report = CachePublishReport {
             semantic_generation,
@@ -948,55 +1108,136 @@ impl CacheLedger {
             reference_file_list_error,
         };
         drop(_publish_guard);
+        self.invalidate_after_index_change().await;
         if should_compact_name_index {
             self.spawn_name_index_compaction(client.clone(), root, epoch);
         }
         Ok(report)
     }
 
-    fn spawn_name_index_compaction(
+    pub(in crate::server) fn spawn_name_index_compaction(
         &self,
         client: Client,
         root: PathBuf,
         expected_epoch: crate::server::state::EngineEpoch,
     ) {
+        if self
+            .build_coordinator
+            .request_compaction(root.clone(), expected_epoch.as_u64())
+            != crate::build_coordinator::CompactionRequest::StartWorker
+        {
+            return;
+        }
         let cache = self.clone();
         tokio::spawn(async move {
-            let started = tokio::time::Instant::now();
-            match cache
-                .compact_name_index_if_current(root.clone(), expected_epoch)
-                .await
+            while let Some((target_epoch, cancellation)) =
+                cache.build_coordinator.begin_next_compaction(&root)
             {
-                Ok(true) => {
-                    client
-                        .log_message(
-                            MessageType::INFO,
-                            format!(
-                                "name index compacted for {} in {}ms",
-                                root.display(),
-                                started.elapsed().as_millis()
-                            ),
+                let started = tokio::time::Instant::now();
+                let expected_epoch = crate::server::state::EngineEpoch::published(target_epoch);
+                let result = match cache
+                    .build_coordinator
+                    .acquire(
+                        root.clone(),
+                        crate::build_coordinator::BuildKind::NameCompaction,
+                        cancellation.clone(),
+                    )
+                    .await
+                {
+                    Ok(permit) => {
+                        cache
+                            .compact_name_index_if_current_under_permit(
+                                root.clone(),
+                                expected_epoch,
+                                cancellation.clone(),
+                                &permit,
+                            )
+                            .await
+                    }
+                    Err(error) => Err(error.into()),
+                };
+                let retry_after_failure = cancellation.is_cancelled()
+                    || result.as_ref().err().is_some_and(|error| {
+                        matches!(
+                            error.downcast_ref::<crate::build_coordinator::AcquireError>(),
+                            Some(
+                                crate::build_coordinator::AcquireError::Cancelled
+                                    | crate::build_coordinator::AcquireError::Deferred
+                            )
+                        ) || matches!(
+                            error.downcast_ref::<crate::build_coordinator::ReservationError>(),
+                            Some(
+                                crate::build_coordinator::ReservationError::Cancelled
+                                    | crate::build_coordinator::ReservationError::ProcessPressure
+                            )
                         )
-                        .await;
+                    });
+                match result {
+                    Ok(true) => {
+                        client
+                            .log_message(
+                                MessageType::INFO,
+                                format!(
+                                    "name index compacted for {} in {}ms",
+                                    root.display(),
+                                    started.elapsed().as_millis()
+                                ),
+                            )
+                            .await;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        client
+                            .log_message(
+                                MessageType::WARNING,
+                                format!("name index compaction failed: {error:#}"),
+                            )
+                            .await;
+                    }
                 }
-                Ok(false) => {}
-                Err(error) => {
-                    client
-                        .log_message(
-                            MessageType::WARNING,
-                            format!("name index compaction failed: {error:#}"),
-                        )
-                        .await;
+                let should_continue = if retry_after_failure {
+                    cache
+                        .build_coordinator
+                        .retry_compaction(&root, target_epoch)
+                } else {
+                    cache
+                        .build_coordinator
+                        .finish_compaction(&root, target_epoch)
+                };
+                if !should_continue {
+                    break;
                 }
             }
         });
     }
 
+    #[cfg(test)]
     pub(in crate::server) async fn compact_name_index_if_current(
         &self,
         root: PathBuf,
         expected_epoch: crate::server::state::EngineEpoch,
     ) -> Result<bool> {
+        let cancellation = crate::build_coordinator::BuildCancellation::new();
+        let permit = self
+            .build_coordinator
+            .acquire(
+                root.clone(),
+                crate::build_coordinator::BuildKind::NameCompaction,
+                cancellation.clone(),
+            )
+            .await?;
+        self.compact_name_index_if_current_under_permit(root, expected_epoch, cancellation, &permit)
+            .await
+    }
+
+    async fn compact_name_index_if_current_under_permit(
+        &self,
+        root: PathBuf,
+        expected_epoch: crate::server::state::EngineEpoch,
+        cancellation: crate::build_coordinator::BuildCancellation,
+        permit: &crate::build_coordinator::BuildPermit,
+    ) -> Result<bool> {
+        permit.check_cancelled()?;
         let Some(snapshot) = self.current_engine_snapshot(&root).await else {
             return Ok(false);
         };
@@ -1009,10 +1250,29 @@ impl CacheLedger {
         if !declaration_index.needs_compaction() {
             return Ok(false);
         }
-        let compacted =
-            tokio::task::spawn_blocking(move || Arc::new(declaration_index.compacted())).await?;
+        let retained_bytes = declaration_index.accounted_core_bytes();
+        permit
+            .reserve_with_wait(
+                retained_bytes.min(crate::build_coordinator::DEFAULT_TEMPORARY_RESERVATION_BYTES),
+                retained_bytes,
+            )
+            .await?;
+        let cancellation_for_build = cancellation.clone();
+        let compacted = tokio::task::spawn_blocking(move || {
+            declaration_index
+                .compacted_with_cancellation(&cancellation_for_build)
+                .map(Arc::new)
+        })
+        .await?;
+        let Some(compacted) = compacted else {
+            return Ok(false);
+        };
 
         let _publish_guard = self.publish_gate.lock().await;
+        permit.check_cancelled()?;
+        if cancellation.is_cancelled() {
+            return Ok(false);
+        }
         let Some(current) = self.current_engine_snapshot(&root).await else {
             return Ok(false);
         };
@@ -1049,11 +1309,28 @@ impl CacheLedger {
         client: &Client,
         root: PathBuf,
     ) -> Result<usize> {
-        let _publish_guard = self.publish_gate.lock().await;
+        let cancellation = crate::build_coordinator::BuildCancellation::new();
+        let permit = self
+            .build_coordinator
+            .acquire(
+                root.clone(),
+                crate::build_coordinator::BuildKind::ProjectContext,
+                cancellation,
+            )
+            .await?;
         let previous = self
             .current_engine_snapshot(&root)
             .await
             .context("project context refresh requires a published engine snapshot")?;
+        let expected_epoch = previous.epoch;
+        let retained_bytes = previous
+            .declaration_index
+            .as_ref()
+            .map_or(0, |index| index.accounted_core_bytes());
+        permit.reserve(
+            retained_bytes.min(crate::build_coordinator::DEFAULT_TEMPORARY_RESERVATION_BYTES),
+            retained_bytes,
+        )?;
         let project_context = rebuild_project_context(
             client,
             root.clone(),
@@ -1072,6 +1349,15 @@ impl CacheLedger {
         let mut degraded = previous.degraded.clone();
         degraded.project_context = project_context.is_none();
 
+        permit.check_cancelled()?;
+        let _publish_guard = self.publish_gate.lock().await;
+        permit.check_cancelled()?;
+        anyhow::ensure!(
+            self.current_engine_snapshot(&root)
+                .await
+                .is_some_and(|current| current.epoch == expected_epoch),
+            "engine epoch changed while rebuilding project context"
+        );
         self.publish_engine_snapshot(EngineSnapshot {
             root,
             epoch: self.allocate_engine_epoch(),
@@ -1090,6 +1376,7 @@ impl CacheLedger {
             degraded,
         })
         .await;
+        drop(_publish_guard);
         self.invalidate_after_index_change().await;
         self.completion_memo.lock().await.clear();
         Ok(project_count)

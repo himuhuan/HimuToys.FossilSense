@@ -33,6 +33,7 @@ pub struct IndexStatus {
 #[serde(rename_all = "camelCase")]
 pub enum IndexState {
     Indexing,
+    Deferred,
     Ready,
     Failed,
 }
@@ -231,5 +232,12 @@ impl IndexStatus {
             degraded_capabilities: DegradedCapabilities::default(),
             message: Some(message),
         }
+    }
+
+    pub fn deferred(workspace: String, message: String) -> Self {
+        let mut status = Self::failed(workspace, message);
+        status.state = IndexState::Deferred;
+        status.phase = Some("waiting-for-resources".to_string());
+        status
     }
 }

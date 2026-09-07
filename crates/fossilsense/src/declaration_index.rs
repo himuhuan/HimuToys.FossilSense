@@ -363,8 +363,13 @@ impl SemanticDeclarationIndex {
         self.names.needs_compaction()
     }
 
-    pub fn compacted(&self) -> Self {
-        Self::build(self.names.compacted(), self.total_budget_bytes)
+    pub(crate) fn compacted_with_cancellation(
+        &self,
+        cancellation: &crate::build_coordinator::BuildCancellation,
+    ) -> Option<Self> {
+        self.names
+            .compacted_with_cancellation(cancellation)
+            .map(|names| Self::build(names, self.total_budget_bytes))
     }
 }
 

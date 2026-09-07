@@ -1,3 +1,4 @@
+mod build_coordinator;
 mod c_lexical;
 mod call_catalog;
 mod call_model;
@@ -313,13 +314,24 @@ async fn main() -> Result<()> {
             db,
             force,
         } => {
-            let stats = indexer::index_workspace(
+            let coordinator = build_coordinator::BuildCoordinator::default();
+            let permit = coordinator
+                .acquire(
+                    workspace.clone(),
+                    build_coordinator::BuildKind::CliIndex,
+                    build_coordinator::BuildCancellation::new(),
+                )
+                .await?;
+            permit.reserve(build_coordinator::DEFAULT_FIRST_BUILD_RESERVATION_BYTES, 0)?;
+            permit.check_cancelled()?;
+            let stats = indexer::index_workspace_with_permit(
                 workspace,
                 indexer::IndexOptions {
                     db_path: db,
                     force,
                     ..Default::default()
                 },
+                &permit,
                 |status| {
                     // During indexing a populated message denotes a scope-config
                     // warning (see WorkspaceConfig::load); surface it to stderr and
@@ -345,6 +357,7 @@ async fn main() -> Result<()> {
                     }
                 },
             )?;
+            permit.check_cancelled()?;
 
             println!("FossilSense index");
             println!("files: {}", stats.total_files);
@@ -391,10 +404,23 @@ async fn main() -> Result<()> {
             budget_mb,
             json,
         } => {
+            let coordinator = build_coordinator::BuildCoordinator::default();
+            let permit = coordinator
+                .acquire(
+                    workspace.clone(),
+                    build_coordinator::BuildKind::CliMemory,
+                    build_coordinator::BuildCancellation::new(),
+                )
+                .await?;
             let db_path = resolve_db_path(db, &workspace)?;
             let budget_bytes =
                 usize::try_from(budget_mb.saturating_mul(1024 * 1024)).unwrap_or(usize::MAX);
+            permit.reserve(
+                budget_bytes.min(build_coordinator::DEFAULT_TEMPORARY_RESERVATION_BYTES),
+                0,
+            )?;
             let hydrated = server::hydrate_memory_report(&workspace, Some(db_path), budget_bytes)?;
+            permit.check_cancelled()?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&hydrated)?);
             } else {

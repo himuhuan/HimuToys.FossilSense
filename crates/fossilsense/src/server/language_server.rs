@@ -25,6 +25,7 @@ impl LanguageServer for Backend {
     }
 
     async fn shutdown(&self) -> LspResult<()> {
+        self.session.cache.build_coordinator.shutdown();
         self.resource_monitor_shutdown.notify_one();
         self.client
             .log_message(MessageType::INFO, "FossilSense shutting down")

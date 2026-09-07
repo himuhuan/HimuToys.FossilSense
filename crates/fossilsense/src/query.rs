@@ -509,6 +509,82 @@ struct CompactFuzzyPostings {
 const UNSEEN_PATH_ID: u32 = u32::MAX - 1;
 const MULTI_PATH_ID: u32 = u32::MAX;
 
+fn cancellation_checkpoint(
+    cancellation: &crate::build_coordinator::BuildCancellation,
+    processed: usize,
+) -> bool {
+    processed.is_multiple_of(crate::build_coordinator::CANCELLATION_CHECK_INTERVAL)
+        && cancellation.is_cancelled()
+}
+
+type CandidatePostingsByFamily = ([HashMap<u8, Vec<u32>>; 2], [CompactFuzzyPostings; 2]);
+
+fn cancelable_sort_by<T, Compare>(
+    values: &mut Vec<T>,
+    cancellation: &crate::build_coordinator::BuildCancellation,
+    compare: Compare,
+) -> bool
+where
+    T: Clone,
+    Compare: Fn(&T, &T) -> std::cmp::Ordering,
+{
+    let chunk = crate::build_coordinator::CANCELLATION_CHECK_INTERVAL;
+    for part in values.chunks_mut(chunk) {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        part.sort_unstable_by(&compare);
+    }
+    let mut source = Vec::with_capacity(values.len());
+    for part in values.chunks(chunk) {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        source.extend_from_slice(part);
+    }
+    let mut target = Vec::with_capacity(source.len());
+    for part in source.chunks(chunk) {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        target.extend_from_slice(part);
+    }
+    let mut width = chunk;
+    while width < source.len() {
+        let mut start = 0usize;
+        let mut processed = 0usize;
+        while start < source.len() {
+            let middle = start.saturating_add(width).min(source.len());
+            let end = middle.saturating_add(width).min(source.len());
+            let (mut left, mut right, mut output) = (start, middle, start);
+            while left < middle || right < end {
+                if cancellation_checkpoint(cancellation, processed) {
+                    return false;
+                }
+                let take_left = right >= end
+                    || (left < middle && compare(&source[left], &source[right]).is_le());
+                let selected = if take_left {
+                    let selected = left;
+                    left += 1;
+                    selected
+                } else {
+                    let selected = right;
+                    right += 1;
+                    selected
+                };
+                target[output] = source[selected].clone();
+                output += 1;
+                processed += 1;
+            }
+            start = end;
+        }
+        std::mem::swap(&mut source, &mut target);
+        width = width.saturating_mul(2);
+    }
+    *values = source;
+    !cancellation.is_cancelled()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CompactPrefixPathPair {
     token: u32,
@@ -558,6 +634,50 @@ impl CompactPathPostings {
             positions[path] += 1;
         }
         Self { offsets, indices }
+    }
+
+    fn build_with_cancellation(
+        entries: &[CompactNameEntry],
+        sorted_indices: &[u32],
+        path_count: usize,
+        cancellation: &crate::build_coordinator::BuildCancellation,
+    ) -> Option<Self> {
+        let mut counts = vec![0u32; path_count];
+        for (processed, &index) in sorted_indices.iter().enumerate() {
+            if cancellation_checkpoint(cancellation, processed) {
+                return None;
+            }
+            let path = entries[index as usize].path_id as usize;
+            counts[path] = counts[path]
+                .checked_add(1)
+                .expect("path posting length exceeds u32");
+        }
+        let mut offsets = Vec::with_capacity(path_count + 1);
+        offsets.push(0u32);
+        for (processed, count) in counts.into_iter().enumerate() {
+            if cancellation_checkpoint(cancellation, processed) {
+                return None;
+            }
+            let next = offsets
+                .last()
+                .copied()
+                .unwrap_or_default()
+                .checked_add(count)
+                .expect("path posting offsets exceed u32");
+            offsets.push(next);
+        }
+        let mut positions = offsets[..path_count].to_vec();
+        let mut indices = vec![0u32; sorted_indices.len()];
+        for (processed, &index) in sorted_indices.iter().enumerate() {
+            if cancellation_checkpoint(cancellation, processed) {
+                return None;
+            }
+            let path = entries[index as usize].path_id as usize;
+            let position = positions[path] as usize;
+            indices[position] = index;
+            positions[path] += 1;
+        }
+        (!cancellation.is_cancelled()).then_some(Self { offsets, indices })
     }
 
     fn posting(&self, path_id: u32) -> &[u32] {
@@ -621,6 +741,69 @@ impl CompactFuzzyPostings {
             );
         }
         Self { ranges, name_ids }
+    }
+
+    fn build_with_cancellation(
+        ordered_name_ids: &[u32],
+        names: &[NameString],
+        cancellation: &crate::build_coordinator::BuildCancellation,
+    ) -> Option<Self> {
+        let mut slot_by_token = HashMap::<u32, u32>::new();
+        let mut counts = Vec::<u32>::new();
+        for (processed, &name_id) in ordered_name_ids.iter().enumerate() {
+            if cancellation_checkpoint(cancellation, processed) {
+                return None;
+            }
+            for token in fuzzy_tokens_for_name(&names[name_id as usize]) {
+                let slot = *slot_by_token.entry(token).or_insert_with(|| {
+                    let slot = u32::try_from(counts.len()).expect("fuzzy token slots exceed u32");
+                    counts.push(0);
+                    slot
+                });
+                counts[slot as usize] = counts[slot as usize]
+                    .checked_add(1)
+                    .expect("fuzzy posting length exceeds u32");
+            }
+        }
+        let mut starts = Vec::with_capacity(counts.len());
+        let mut total = 0u32;
+        for (processed, &count) in counts.iter().enumerate() {
+            if cancellation_checkpoint(cancellation, processed) {
+                return None;
+            }
+            starts.push(total);
+            total = total
+                .checked_add(count)
+                .expect("fuzzy posting rows exceed u32");
+        }
+        let mut cursors = starts.clone();
+        let mut name_ids = vec![0u32; total as usize];
+        for (processed, &name_id) in ordered_name_ids.iter().enumerate() {
+            if cancellation_checkpoint(cancellation, processed) {
+                return None;
+            }
+            for token in fuzzy_tokens_for_name(&names[name_id as usize]) {
+                let slot = slot_by_token[&token] as usize;
+                let cursor = &mut cursors[slot];
+                name_ids[*cursor as usize] = name_id;
+                *cursor += 1;
+            }
+        }
+        let mut ranges = HashMap::with_capacity(slot_by_token.len());
+        for (processed, (token, slot)) in slot_by_token.into_iter().enumerate() {
+            if cancellation_checkpoint(cancellation, processed) {
+                return None;
+            }
+            let slot = slot as usize;
+            ranges.insert(
+                token,
+                CompactPostingRange {
+                    start: starts[slot],
+                    len: counts[slot],
+                },
+            );
+        }
+        (!cancellation.is_cancelled()).then_some(Self { ranges, name_ids })
     }
 
     fn posting(&self, token: u32) -> &[u32] {
@@ -706,6 +889,79 @@ impl CompactPrefixPathPostings {
             pairs,
             project_positions,
         }
+    }
+
+    fn build_with_cancellation(
+        entries: &[CompactNameEntry],
+        names: &[NameString],
+        family_slot: usize,
+        cancellation: &crate::build_coordinator::BuildCancellation,
+    ) -> Option<Self> {
+        let mut raw_pairs = Vec::new();
+        for (processed, entry) in entries.iter().enumerate() {
+            if cancellation_checkpoint(cancellation, processed) {
+                return None;
+            }
+            if semantic_family_slot(entry.flags.semantic_family()) != family_slot {
+                continue;
+            }
+            if let Some(token) = three_byte_prefix_token(&names[entry.name_id as usize].lower) {
+                raw_pairs.push((
+                    CompactPrefixPathPair {
+                        token,
+                        path_id: entry.path_id,
+                    },
+                    entry.project_id,
+                ));
+            }
+        }
+        if !cancelable_sort_by(
+            &mut raw_pairs,
+            cancellation,
+            |(left, left_project), (right, right_project)| {
+                (left.token, left.path_id, *left_project).cmp(&(
+                    right.token,
+                    right.path_id,
+                    *right_project,
+                ))
+            },
+        ) {
+            return None;
+        }
+        let mut unique_pairs = Vec::with_capacity(raw_pairs.len());
+        for (processed, pair) in raw_pairs.into_iter().enumerate() {
+            if cancellation_checkpoint(cancellation, processed) {
+                return None;
+            }
+            if unique_pairs.last() != Some(&pair) {
+                unique_pairs.push(pair);
+            }
+        }
+        let mut pairs = Vec::with_capacity(unique_pairs.len());
+        let mut project_positions = HashMap::<u32, Vec<u32>>::new();
+        for (processed, (pair, project_id)) in unique_pairs.into_iter().enumerate() {
+            if cancellation_checkpoint(cancellation, processed) {
+                return None;
+            }
+            let position = if pairs.last() == Some(&pair) {
+                u32::try_from(pairs.len() - 1).expect("prefix path positions exceed u32")
+            } else {
+                let position =
+                    u32::try_from(pairs.len()).expect("prefix path positions exceed u32");
+                pairs.push(pair);
+                position
+            };
+            if project_id != NO_PROJECT_ID {
+                let positions = project_positions.entry(project_id).or_default();
+                if positions.last().copied() != Some(position) {
+                    positions.push(position);
+                }
+            }
+        }
+        (!cancellation.is_cancelled()).then_some(Self {
+            pairs,
+            project_positions,
+        })
     }
 
     fn paths_for_prefix(&self, prefix: &str) -> &[CompactPrefixPathPair] {
@@ -987,6 +1243,61 @@ fn sorted_indices_by_family(entries: &[CompactNameEntry], names: &[NameString]) 
     by_family
 }
 
+fn sorted_indices_by_family_with_cancellation(
+    entries: &[CompactNameEntry],
+    names: &[NameString],
+    cancellation: &crate::build_coordinator::BuildCancellation,
+) -> Option<[Vec<u32>; 2]> {
+    let mut name_order: Vec<u32> = (0..names.len())
+        .map(|index| u32::try_from(index).expect("name arena exceeds u32 IDs"))
+        .collect();
+    if !cancelable_sort_by(&mut name_order, cancellation, |&a, &b| {
+        names[a as usize]
+            .lower
+            .cmp(&names[b as usize].lower)
+            .then_with(|| names[a as usize].original.cmp(&names[b as usize].original))
+    }) {
+        return None;
+    }
+    let mut counts = vec![0_u32; names.len()];
+    for (processed, entry) in entries.iter().enumerate() {
+        if cancellation_checkpoint(cancellation, processed) {
+            return None;
+        }
+        counts[entry.name_id as usize] += 1;
+    }
+    let mut cursors = vec![0_u32; names.len()];
+    let mut next = 0_u32;
+    for (processed, name_id) in name_order.into_iter().enumerate() {
+        if cancellation_checkpoint(cancellation, processed) {
+            return None;
+        }
+        cursors[name_id as usize] = next;
+        next = next
+            .checked_add(counts[name_id as usize])
+            .expect("name index exceeds u32 entry positions");
+    }
+    let mut sorted = vec![0_u32; entries.len()];
+    for (index, entry) in entries.iter().enumerate() {
+        if cancellation_checkpoint(cancellation, index) {
+            return None;
+        }
+        let cursor = &mut cursors[entry.name_id as usize];
+        sorted[*cursor as usize] =
+            u32::try_from(index).expect("name segment exceeds u32 entry indices");
+        *cursor += 1;
+    }
+    let mut by_family = [Vec::new(), Vec::new()];
+    for (processed, index) in sorted.into_iter().enumerate() {
+        if cancellation_checkpoint(cancellation, processed) {
+            return None;
+        }
+        by_family[semantic_family_slot(entries[index as usize].flags.semantic_family())]
+            .push(index);
+    }
+    (!cancellation.is_cancelled()).then_some(by_family)
+}
+
 fn candidate_postings_by_family(
     entries: &[CompactNameEntry],
     names: &[NameString],
@@ -1046,6 +1357,84 @@ fn candidate_postings_by_family(
         CompactFuzzyPostings::build(&go_names, names),
     ];
     (heads, fuzzy)
+}
+
+fn candidate_postings_by_family_with_cancellation(
+    entries: &[CompactNameEntry],
+    names: &[NameString],
+    paths: &[Arc<str>],
+    cancellation: &crate::build_coordinator::BuildCancellation,
+) -> Option<CandidatePostingsByFamily> {
+    let mut heads = [HashMap::new(), HashMap::new()];
+    let mut static_order = [Vec::new(), Vec::new()];
+    for (index, entry) in entries.iter().enumerate() {
+        if cancellation_checkpoint(cancellation, index) {
+            return None;
+        }
+        static_order[semantic_family_slot(entry.flags.semantic_family())]
+            .push(u32::try_from(index).expect("name segment exceeds u32 entry indices"));
+    }
+    for indices in &mut static_order {
+        if !cancelable_sort_by(indices, cancellation, |&left, &right| {
+            static_segment_entry_order(entries, names, paths, left, right)
+        }) {
+            return None;
+        }
+    }
+    for (family_slot, indices) in static_order.iter().enumerate() {
+        for (processed, &local) in indices.iter().enumerate() {
+            if cancellation_checkpoint(cancellation, processed) {
+                return None;
+            }
+            let entry = entries[local as usize];
+            let name = &names[entry.name_id as usize];
+            if let Some(&head) = name.lower.as_bytes().first() {
+                heads[family_slot]
+                    .entry(head)
+                    .or_insert_with(Vec::new)
+                    .push(local);
+            }
+        }
+    }
+    let mut name_families = vec![0u8; names.len()];
+    for (processed, entry) in entries.iter().enumerate() {
+        if cancellation_checkpoint(cancellation, processed) {
+            return None;
+        }
+        name_families[entry.name_id as usize] |=
+            1u8 << semantic_family_slot(entry.flags.semantic_family());
+    }
+    let mut ordered_names = [Vec::new(), Vec::new()];
+    for name_id in 0..names.len() {
+        if cancellation_checkpoint(cancellation, name_id) {
+            return None;
+        }
+        let name_id = u32::try_from(name_id).expect("name arena exceeds u32 IDs");
+        for (family_slot, family_names) in ordered_names.iter_mut().enumerate() {
+            if name_families[name_id as usize] & (1u8 << family_slot) != 0 {
+                family_names.push(name_id);
+            }
+        }
+    }
+    for family_names in &mut ordered_names {
+        if !cancelable_sort_by(family_names, cancellation, |&left, &right| {
+            let left_name = &names[left as usize].original;
+            let right_name = &names[right as usize].original;
+            left_name
+                .len()
+                .cmp(&right_name.len())
+                .then_with(|| left_name.cmp(right_name))
+                .then_with(|| left.cmp(&right))
+        }) {
+            return None;
+        }
+    }
+    let [c_names, go_names] = ordered_names;
+    let fuzzy = [
+        CompactFuzzyPostings::build_with_cancellation(&c_names, names, cancellation)?,
+        CompactFuzzyPostings::build_with_cancellation(&go_names, names, cancellation)?,
+    ];
+    Some((heads, fuzzy))
 }
 
 fn all_workspace_reach(segment: &NameSegment) -> ReachScope {
@@ -1158,6 +1547,59 @@ impl NameTable {
         }
     }
 
+    fn from_base_segment_with_cancellation(
+        base: NameSegment,
+        cancellation: &crate::build_coordinator::BuildCancellation,
+    ) -> Option<Self> {
+        let mut workspace_files = HashSet::new();
+        for (processed, (path, external)) in
+            base.paths.iter().zip(&base.path_is_external).enumerate()
+        {
+            if cancellation_checkpoint(cancellation, processed) {
+                return None;
+            }
+            if !*external {
+                workspace_files.insert(path.to_string());
+            }
+        }
+        let all_workspace_reach = Arc::new(ReachScope {
+            files: workspace_files,
+            heuristic_files: HashSet::new(),
+            open: false,
+            reason: None,
+        });
+        let active_len = base.entries.len();
+        let mut active_base_paths = base.paths.clone();
+        if !cancelable_sort_by(&mut active_base_paths, cancellation, |left, right| {
+            left.cmp(right)
+        }) {
+            return None;
+        }
+        let mut active_project_family_counts = HashMap::new();
+        for (processed, (key, postings)) in base.by_project.iter().enumerate() {
+            if cancellation_checkpoint(cancellation, processed) {
+                return None;
+            }
+            active_project_family_counts.insert(
+                key.clone(),
+                [postings.by_family[0].len(), postings.by_family[1].len()],
+            );
+        }
+        (!cancellation.is_cancelled()).then_some(Self {
+            base: Arc::new(base),
+            deltas: Arc::new(Vec::new()),
+            path_overrides: Arc::new(HashMap::new()),
+            active_base_paths: Arc::new(active_base_paths),
+            active_delta_paths: Arc::new(Vec::new()),
+            active_project_family_counts: Arc::new(active_project_family_counts),
+            delta_offsets: Arc::new(Vec::new()),
+            active_len,
+            slot_len: active_len,
+            direct_include_overrides: Arc::new(HashMap::new()),
+            all_workspace_reach,
+        })
+    }
+
     fn entry(&self, index: usize) -> NameEntryRef<'_> {
         if index < self.base.entries.len() {
             return self.base.entry(index);
@@ -1230,6 +1672,7 @@ impl NameTable {
                 > self.base.entries.len().saturating_div(4)
     }
 
+    #[cfg(test)]
     pub(crate) fn compacted(&self) -> Self {
         let mut builder = name_index_builder::NameIndexBuilder::new(None);
         for index in self.active_indices() {
@@ -1238,6 +1681,27 @@ impl NameTable {
         let mut compacted = builder.finish();
         compacted.direct_include_overrides = self.direct_include_overrides.clone();
         compacted
+    }
+
+    pub(crate) fn compacted_with_cancellation(
+        &self,
+        cancellation: &crate::build_coordinator::BuildCancellation,
+    ) -> Option<Self> {
+        let mut builder = name_index_builder::NameIndexBuilder::new(None);
+        for index in 0..self.slot_len {
+            if cancellation_checkpoint(cancellation, index) {
+                return None;
+            }
+            if self.is_active_index(index) {
+                builder.push_ref(self.entry(index));
+            }
+        }
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        let mut compacted = builder.finish_with_cancellation(cancellation)?;
+        compacted.direct_include_overrides = self.direct_include_overrides.clone();
+        Some(compacted)
     }
 
     #[cfg(test)]
@@ -1317,6 +1781,90 @@ impl NameSegment {
             path_postings_by_family,
             by_project,
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_compact_parts_with_cancellation(
+        entries: Vec<CompactNameEntry>,
+        names: Vec<NameString>,
+        paths: Vec<Arc<str>>,
+        path_ids: HashMap<Arc<str>, u32>,
+        path_counts: Vec<usize>,
+        path_is_external: Vec<bool>,
+        projects: Vec<ProjectKey>,
+        cancellation: &crate::build_coordinator::BuildCancellation,
+    ) -> Option<Self> {
+        let sorted_by_family =
+            sorted_indices_by_family_with_cancellation(&entries, &names, cancellation)?;
+        let (short_prefix_heads_by_family, fuzzy_postings_by_family) =
+            candidate_postings_by_family_with_cancellation(&entries, &names, &paths, cancellation)?;
+        let mut sole_path_by_name = vec![UNSEEN_PATH_ID; names.len()];
+        for (processed, entry) in entries.iter().enumerate() {
+            if cancellation_checkpoint(cancellation, processed) {
+                return None;
+            }
+            let path = &mut sole_path_by_name[entry.name_id as usize];
+            *path = match *path {
+                UNSEEN_PATH_ID => entry.path_id,
+                existing if existing == entry.path_id => existing,
+                _ => MULTI_PATH_ID,
+            };
+        }
+        let prefix_paths_by_family = [
+            CompactPrefixPathPostings::build_with_cancellation(&entries, &names, 0, cancellation)?,
+            CompactPrefixPathPostings::build_with_cancellation(&entries, &names, 1, cancellation)?,
+        ];
+        let path_postings_by_family = [
+            CompactPathPostings::build_with_cancellation(
+                &entries,
+                &sorted_by_family[0],
+                paths.len(),
+                cancellation,
+            )?,
+            CompactPathPostings::build_with_cancellation(
+                &entries,
+                &sorted_by_family[1],
+                paths.len(),
+                cancellation,
+            )?,
+        ];
+        let mut by_project: HashMap<ProjectKey, CompactProjectPostings> = HashMap::new();
+        let mut processed = 0usize;
+        for (family_slot, sorted) in sorted_by_family.iter().enumerate() {
+            for &index in sorted {
+                if cancellation_checkpoint(cancellation, processed) {
+                    return None;
+                }
+                processed += 1;
+                let entry = entries[index as usize];
+                if entry.project_id != NO_PROJECT_ID {
+                    let postings = by_project
+                        .entry(projects[entry.project_id as usize].clone())
+                        .or_insert_with(|| CompactProjectPostings {
+                            project_id: entry.project_id,
+                            by_family: std::array::from_fn(|_| Vec::new()),
+                        });
+                    debug_assert_eq!(postings.project_id, entry.project_id);
+                    postings.by_family[family_slot].push(index);
+                }
+            }
+        }
+        (!cancellation.is_cancelled()).then_some(Self {
+            entries,
+            names,
+            paths,
+            path_ids,
+            path_counts,
+            path_is_external,
+            projects,
+            sorted_by_family,
+            short_prefix_heads_by_family,
+            fuzzy_postings_by_family,
+            sole_path_by_name,
+            prefix_paths_by_family,
+            path_postings_by_family,
+            by_project,
+        })
     }
 
     fn entry(&self, index: usize) -> NameEntryRef<'_> {

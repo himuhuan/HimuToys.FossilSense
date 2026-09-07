@@ -417,7 +417,7 @@ fn ensure_sqlite_sidecars_absent(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn remove_sqlite_file_family(path: &Path) {
+pub(crate) fn remove_sqlite_file_family(path: &Path) {
     let _ = fs::remove_file(path);
     for suffix in ["-wal", "-shm", "-journal"] {
         let _ = fs::remove_file(sqlite_sidecar_path(path, suffix));

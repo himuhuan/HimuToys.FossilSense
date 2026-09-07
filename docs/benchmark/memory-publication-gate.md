@@ -17,7 +17,23 @@
 
     powershell -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark_large_workspace.ps1 -Repeats 1 -IncludeFullIndex -IncludeEngineHydration -IncludeCompletionReplay -CaseFilter u-boot-full-index,u-boot-engine-hydration,u-boot-completion-replay -TimeoutSeconds 120
 
-结果 JSON 与 Markdown 必须保存样本提交、机器信息、完整命令、`elapsed_ms`、`write_ms`、峰值内存、数据库文件大小、冷单代/双代、热单代、缓存收缩、第二代增量和名称索引分项。完整索引的实际运行时间或 `elapsed_ms` 任一超过 120,000 ms 即失败。冷或热场景中单代超过 384 MiB、发布窗口绝对峰值超过 512 MiB、内存采样缺失、缓存预热未达到可用预算的 75%，或旧请求代次不一致，也都判定失败；不得以多次平均值、小样本或机器波动放行。
+同一生产 LSP 生命周期门禁：
+
+    powershell -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark_large_workspace.ps1 -Repeats 1 -IncludeLspLifecycle -CaseFilter u-boot-lsp-lifecycle,wine-lsp-lifecycle -TimeoutSeconds 180
+
+生命周期 case 使用一个 LSP 进程完成旧索引发布、详情缓存预热、生产 full rebuild、并发 Hover/F12/补全、dirty 保存、名称压实和压实时再次保存。并发补全固定执行 64 次，逐项检查 P95、召回检查量、处理预算、索引候选、截断标记和详情 SQL 次数。case 还记录阶段覆盖、活动构建峰值、预留/保留字节、取消次数、旧请求 epoch、新请求 generation、数据库身份、Hover/F12 分位延迟、完整索引 `elapsed_ms`/`write_ms`、数据库大小和进程峰值。
+
+| 检查项 | U-Boot 门槛 | Wine 当前判定 |
+|---|---:|---|
+| 样本规模 | 至少 500,000 个声明、10,000 个文件 | 记录实际规模 |
+| 同时活动的重型构建 | 峰值必须为 1 | 峰值必须为 1 |
+| 临时预留 | 峰值大于 0 且不超过 256 MiB | 相同 |
+| 进程峰值 | 不超过 512 MiB | 首次记录真实值，不套用 U-Boot 结论 |
+| 完整索引 | `elapsed_ms` 不超过 120,000 ms | 相同 |
+| 请求一致性 | 旧/新 epoch、generation 与数据库身份均不得混用 | 相同 |
+| 压实过期 | 至少观察到一次协作取消，最终许可与预留归零 | 相同 |
+
+结果 JSON 与 Markdown 必须保存源码提交与改动指纹、样本提交与改动指纹、机器信息、完整命令、`elapsed_ms`、`write_ms`、峰值内存、数据库文件大小、冷单代/双代、热单代、缓存收缩、第二代增量和名称索引分项。完整索引的实际运行时间或 `elapsed_ms` 任一超过 120,000 ms 即失败。冷或热场景中单代超过 384 MiB、发布窗口绝对峰值超过 512 MiB、内存采样缺失、缓存预热未达到可用预算的 75%，或旧请求代次不一致，也都判定失败；不得以多次平均值、小样本或机器波动放行。
 
 ## 2026-09-06 preserve-c-declaration-context 验证结果
 

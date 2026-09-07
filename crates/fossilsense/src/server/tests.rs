@@ -881,6 +881,445 @@ async fn name_index_compaction_publishes_only_for_the_expected_engine_epoch() {
     );
 }
 
+#[test]
+fn build_coordinator_serializes_roots_and_nested_stages_share_one_slot() {
+    use crate::build_coordinator::{BuildCoordinator, BuildKind, TryAcquireError};
+
+    let coordinator = BuildCoordinator::default();
+    let first = coordinator
+        .try_acquire(PathBuf::from("root-a"), BuildKind::FullIndex)
+        .expect("first heavy build admitted");
+    assert_eq!(coordinator.snapshot().active_builds, 1);
+    assert!(
+        matches!(
+            coordinator.try_acquire(PathBuf::from("root-b"), BuildKind::FullIndex),
+            Err(TryAcquireError::Busy)
+        ),
+        "a second root must wait for the one process-wide heavy-build slot",
+    );
+
+    let read_model = first.inherit(BuildKind::ReadModel);
+    assert_eq!(
+        coordinator.snapshot().active_builds,
+        1,
+        "a nested read-model stage must inherit rather than reacquire the slot",
+    );
+    drop(read_model);
+    drop(first);
+    assert_eq!(coordinator.snapshot().active_builds, 0);
+}
+
+#[test]
+fn name_compaction_coordinator_keeps_only_the_latest_epoch_and_cancels_stale_work() {
+    use crate::build_coordinator::{BuildCoordinator, CompactionRequest};
+
+    let coordinator = BuildCoordinator::default();
+    let root = PathBuf::from("root-a");
+    assert_eq!(
+        coordinator.request_compaction(root.clone(), 10),
+        CompactionRequest::StartWorker,
+    );
+    let (epoch, cancellation) = coordinator
+        .begin_next_compaction(&root)
+        .expect("first compaction target");
+    assert_eq!(epoch, 10);
+
+    assert_eq!(
+        coordinator.request_compaction(root.clone(), 11),
+        CompactionRequest::UpdatedPending,
+    );
+    assert_eq!(
+        coordinator.request_compaction(root.clone(), 15),
+        CompactionRequest::UpdatedPending,
+    );
+    assert!(
+        cancellation.is_cancelled(),
+        "a newer epoch must cooperatively cancel stale compaction work",
+    );
+    assert!(coordinator.finish_compaction(&root, 10));
+    let (latest, latest_cancellation) = coordinator
+        .begin_next_compaction(&root)
+        .expect("latest pending compaction target");
+    assert_eq!(latest, 15);
+    assert!(!latest_cancellation.is_cancelled());
+    assert!(!coordinator.finish_compaction(&root, 15));
+}
+
+#[test]
+fn deferred_name_compaction_retries_the_same_latest_epoch() {
+    use crate::build_coordinator::{BuildCoordinator, CompactionRequest};
+
+    let coordinator = BuildCoordinator::default();
+    let root = PathBuf::from("root-a");
+    assert_eq!(
+        coordinator.request_compaction(root.clone(), 10),
+        CompactionRequest::StartWorker,
+    );
+    let (epoch, _) = coordinator
+        .begin_next_compaction(&root)
+        .expect("first compaction attempt");
+    assert_eq!(epoch, 10);
+    assert!(
+        coordinator.retry_compaction(&root, epoch),
+        "transient pressure must keep the worker and latest target alive",
+    );
+    let (retried, cancellation) = coordinator
+        .begin_next_compaction(&root)
+        .expect("same latest epoch must be retried");
+    assert_eq!(retried, 10);
+    assert!(!cancellation.is_cancelled());
+    assert!(!coordinator.finish_compaction(&root, retried));
+}
+
+#[test]
+fn build_coordinator_enforces_default_byte_policy_and_reports_unavailable_sampling() {
+    use crate::build_coordinator::{
+        BuildCoordinator, BuildKind, BuildPolicy, ReservationError,
+        DEFAULT_PROCESS_PRESSURE_TARGET_BYTES, DEFAULT_TEMPORARY_RESERVATION_BYTES,
+        DEFAULT_UNATTRIBUTED_HEADROOM_BYTES, DEFAULT_WAIT_TIMEOUT,
+    };
+
+    let policy = BuildPolicy::default();
+    assert_eq!(policy.max_active_builds, 1);
+    assert_eq!(
+        policy.temporary_reservation_bytes,
+        DEFAULT_TEMPORARY_RESERVATION_BYTES
+    );
+    assert_eq!(
+        policy.process_pressure_target_bytes,
+        DEFAULT_PROCESS_PRESSURE_TARGET_BYTES
+    );
+    assert_eq!(
+        policy.unattributed_headroom_bytes,
+        DEFAULT_UNATTRIBUTED_HEADROOM_BYTES
+    );
+    assert_eq!(policy.wait_timeout, DEFAULT_WAIT_TIMEOUT);
+
+    let unavailable = BuildCoordinator::with_policy_and_sampler(policy, || 0);
+    let permit = unavailable
+        .try_acquire(PathBuf::from("root-a"), BuildKind::FullIndex)
+        .expect("permit");
+    permit
+        .reserve(8 * 1024 * 1024, 16 * 1024 * 1024)
+        .expect("conservative retained-byte estimate admits small build");
+    let snapshot = unavailable.snapshot();
+    assert!(!snapshot.sampling_available);
+    assert_eq!(snapshot.sampling_unavailable_count, 1);
+    assert_eq!(snapshot.active_reserved_bytes, 8 * 1024 * 1024);
+    assert_eq!(snapshot.active_retained_bytes, 16 * 1024 * 1024);
+    permit.release_reservation();
+
+    assert_eq!(
+        permit.reserve(DEFAULT_TEMPORARY_RESERVATION_BYTES + 1, 0),
+        Err(ReservationError::TemporaryBudgetExceeded)
+    );
+    assert_eq!(unavailable.snapshot().deferred_roots, 1);
+
+    let pressured = BuildCoordinator::with_policy_and_sampler(policy, || {
+        (DEFAULT_PROCESS_PRESSURE_TARGET_BYTES - DEFAULT_UNATTRIBUTED_HEADROOM_BYTES) as u64
+    });
+    let pressured_permit = pressured
+        .try_acquire(PathBuf::from("root-b"), BuildKind::FullIndex)
+        .expect("permit");
+    assert_eq!(
+        pressured_permit.reserve(1, 0),
+        Err(ReservationError::ProcessPressure)
+    );
+    assert_eq!(pressured.snapshot().budget_denial_count, 1);
+}
+
+#[tokio::test]
+async fn build_coordinator_rotates_roots_and_cancellation_wakes_a_waiter() {
+    use crate::build_coordinator::{
+        AcquireError, BuildCancellation, BuildCoordinator, BuildKind, BuildPolicy,
+    };
+
+    let coordinator = BuildCoordinator::with_policy_and_sampler(
+        BuildPolicy {
+            wait_timeout: std::time::Duration::from_secs(5),
+            ..BuildPolicy::default()
+        },
+        || 0,
+    );
+    let active = coordinator
+        .try_acquire(PathBuf::from("root-a"), BuildKind::FullIndex)
+        .expect("initial root-a permit");
+
+    let (acquired_tx, mut acquired_rx) = tokio::sync::mpsc::channel(2);
+    let release_a = Arc::new(tokio::sync::Notify::new());
+    let release_b = Arc::new(tokio::sync::Notify::new());
+    let queued_a = {
+        let coordinator = coordinator.clone();
+        let acquired_tx = acquired_tx.clone();
+        let release = release_a.clone();
+        tokio::spawn(async move {
+            let permit = coordinator
+                .acquire(
+                    PathBuf::from("root-a"),
+                    BuildKind::DirtyIndex,
+                    BuildCancellation::new(),
+                )
+                .await
+                .expect("queued root-a permit");
+            acquired_tx.send("root-a").await.expect("record root-a");
+            release.notified().await;
+            drop(permit);
+        })
+    };
+    while coordinator.snapshot().waiting_builds < 1 {
+        tokio::task::yield_now().await;
+    }
+    let queued_b = {
+        let coordinator = coordinator.clone();
+        let acquired_tx = acquired_tx.clone();
+        let release = release_b.clone();
+        tokio::spawn(async move {
+            let permit = coordinator
+                .acquire(
+                    PathBuf::from("root-b"),
+                    BuildKind::FullIndex,
+                    BuildCancellation::new(),
+                )
+                .await
+                .expect("queued root-b permit");
+            acquired_tx.send("root-b").await.expect("record root-b");
+            release.notified().await;
+            drop(permit);
+        })
+    };
+    while coordinator.snapshot().waiting_builds < 2 {
+        tokio::task::yield_now().await;
+    }
+
+    drop(active);
+    assert_eq!(acquired_rx.recv().await, Some("root-b"));
+    release_b.notify_one();
+    assert_eq!(acquired_rx.recv().await, Some("root-a"));
+    release_a.notify_one();
+    queued_a.await.expect("root-a task");
+    queued_b.await.expect("root-b task");
+
+    let held = coordinator
+        .try_acquire(PathBuf::from("root-a"), BuildKind::FullIndex)
+        .expect("held permit");
+    let cancellation = BuildCancellation::new();
+    let cancelled_waiter = {
+        let coordinator = coordinator.clone();
+        let cancellation_for_task = cancellation.clone();
+        tokio::spawn(async move {
+            coordinator
+                .acquire(
+                    PathBuf::from("root-b"),
+                    BuildKind::FullIndex,
+                    cancellation_for_task,
+                )
+                .await
+        })
+    };
+    while coordinator.snapshot().waiting_builds < 1 {
+        tokio::task::yield_now().await;
+    }
+    cancellation.cancel();
+    assert!(matches!(
+        cancelled_waiter.await.expect("waiter task"),
+        Err(AcquireError::Cancelled)
+    ));
+    drop(held);
+    assert_eq!(coordinator.snapshot().active_builds, 0);
+    assert_eq!(coordinator.snapshot().cancellation_count, 1);
+}
+
+#[tokio::test]
+async fn user_index_request_cancels_compaction_waiting_on_process_pressure() {
+    use crate::build_coordinator::{
+        BuildCancellation, BuildCoordinator, BuildKind, BuildPolicy, ReservationError,
+        DEFAULT_PROCESS_PRESSURE_TARGET_BYTES,
+    };
+
+    let coordinator = BuildCoordinator::with_policy_and_sampler(BuildPolicy::default(), || {
+        DEFAULT_PROCESS_PRESSURE_TARGET_BYTES as u64
+    });
+    let compaction = coordinator
+        .try_acquire(PathBuf::from("root-a"), BuildKind::NameCompaction)
+        .expect("compaction permit");
+    let waiting_reservation = {
+        let compaction = compaction.clone();
+        tokio::spawn(async move { compaction.reserve_with_wait(1, 0).await })
+    };
+    while coordinator.snapshot().deferred_roots == 0 {
+        tokio::task::yield_now().await;
+    }
+    let dirty_waiter = {
+        let coordinator = coordinator.clone();
+        tokio::spawn(async move {
+            coordinator
+                .acquire(
+                    PathBuf::from("root-a"),
+                    BuildKind::DirtyIndex,
+                    BuildCancellation::new(),
+                )
+                .await
+        })
+    };
+    assert_eq!(
+        waiting_reservation.await.expect("reservation task"),
+        Err(ReservationError::Cancelled)
+    );
+    assert!(compaction.is_cancelled());
+    drop(compaction);
+    let dirty = dirty_waiter
+        .await
+        .expect("dirty task")
+        .expect("dirty permit after compaction exits");
+    assert_eq!(
+        coordinator.snapshot().active_kind,
+        Some(BuildKind::DirtyIndex)
+    );
+    drop(dirty);
+    assert_eq!(coordinator.snapshot().active_builds, 0);
+}
+
+#[tokio::test]
+async fn full_build_lifecycle_suspends_old_payload_cache_before_database_work_and_restores_on_drop()
+{
+    let cache = super::CacheLedger::default();
+    let root = tempdir().expect("root").path().to_path_buf();
+    let epoch = cache.allocate_engine_epoch();
+    let declaration_index = Arc::new(
+        crate::declaration_index::SemanticDeclarationIndex::from_name_table_for_test(
+            crate::query::NameTable::build_with_paths(vec![(
+                1,
+                "old_symbol".to_string(),
+                false,
+                "src/old.c".to_string(),
+                "function".to_string(),
+                false,
+            )]),
+        ),
+    );
+    let configured_budget = declaration_index.payload_budget_bytes();
+    cache
+        .publish_engine_snapshot(super::workspace::EngineSnapshot {
+            root: root.clone(),
+            epoch,
+            semantic_generation: crate::call_model::SemanticGeneration(7),
+            declaration_index: Some(declaration_index.clone()),
+            name_table: Some(declaration_index.name_table_arc()),
+            fallback_completion_table: Arc::new(Default::default()),
+            reach_graph: None,
+            include_table: None,
+            go_import_table: None,
+            indexed_files: None,
+            include_path_index: None,
+            project_context: None,
+            call_read_handle: None,
+            workspace_semantics: empty_workspace_semantics(&root),
+            degraded: Default::default(),
+        })
+        .await;
+
+    let lifecycle = cache.begin_full_build_lifecycle(&root).await;
+    assert_eq!(declaration_index.effective_payload_budget_bytes(), 0);
+    assert_eq!(lifecycle.expected_epoch(), Some(epoch));
+    drop(lifecycle);
+    assert_eq!(
+        declaration_index.effective_payload_budget_bytes(),
+        configured_budget,
+        "a failed or cancelled build must restore the still-active old generation",
+    );
+    assert_eq!(
+        cache
+            .current_engine_snapshot(&root)
+            .await
+            .expect("old snapshot remains published")
+            .epoch,
+        epoch,
+    );
+}
+
+#[tokio::test]
+async fn failed_read_model_build_restores_old_cache_and_shutdown_releases_admission() {
+    use crate::build_coordinator::{BuildCancellation, BuildKind};
+
+    let cache = super::CacheLedger::default();
+    let root = tempdir().expect("root").path().to_path_buf();
+    let epoch = cache.allocate_engine_epoch();
+    let declaration_index = Arc::new(
+        crate::declaration_index::SemanticDeclarationIndex::from_name_table_for_test(
+            crate::query::NameTable::build_with_paths(vec![(
+                1,
+                "old_symbol".to_string(),
+                false,
+                "src/old.c".to_string(),
+                "function".to_string(),
+                false,
+            )]),
+        ),
+    );
+    let configured_budget = declaration_index.payload_budget_bytes();
+    cache
+        .publish_engine_snapshot(super::workspace::EngineSnapshot {
+            root: root.clone(),
+            epoch,
+            semantic_generation: crate::call_model::SemanticGeneration(7),
+            declaration_index: Some(declaration_index.clone()),
+            name_table: Some(declaration_index.name_table_arc()),
+            fallback_completion_table: Arc::new(Default::default()),
+            reach_graph: None,
+            include_table: None,
+            go_import_table: None,
+            indexed_files: None,
+            include_path_index: None,
+            project_context: None,
+            call_read_handle: None,
+            workspace_semantics: empty_workspace_semantics(&root),
+            degraded: Default::default(),
+        })
+        .await;
+    let cancellation = BuildCancellation::new();
+    let permit = cache
+        .build_coordinator
+        .acquire(root.clone(), BuildKind::FullIndex, cancellation)
+        .await
+        .expect("permit");
+    let lifecycle = cache.begin_full_build_lifecycle(&root).await;
+    assert_eq!(declaration_index.effective_payload_budget_bytes(), 0);
+    let service = test_backend_service();
+    let result = cache
+        .publish_full_index_with_semantics_in_lifecycle(
+            &service.inner().client,
+            root.clone(),
+            empty_workspace_semantics(&root),
+            lifecycle,
+            &permit,
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "missing database must fail read-model build"
+    );
+    assert_eq!(
+        declaration_index.effective_payload_budget_bytes(),
+        configured_budget,
+        "failed read-model build restores the active old generation"
+    );
+    assert_eq!(
+        cache
+            .current_engine_snapshot(&root)
+            .await
+            .expect("old snapshot")
+            .epoch,
+        epoch
+    );
+
+    cache.build_coordinator.shutdown();
+    assert!(permit.is_cancelled());
+    drop(permit);
+    let snapshot = cache.build_coordinator.snapshot();
+    assert_eq!(snapshot.active_builds, 0);
+    assert!(snapshot.shutting_down);
+}
+
 fn write_workspace_file(root: &std::path::Path, rel: &str, text: &str) {
     let path = root.join(rel);
     if let Some(parent) = path.parent() {
@@ -1356,6 +1795,757 @@ async fn benchmark_uboot_lsp_completion_replay_stays_within_latency_and_sql_gate
         p95 <= P95_LIMIT_US,
         "U-Boot production LSP completion p95 {p95} us exceeded {P95_LIMIT_US} us"
     );
+}
+
+struct LifecyclePeakMemorySampler {
+    stop: Arc<AtomicBool>,
+    peak: Arc<AtomicU64>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl LifecyclePeakMemorySampler {
+    fn start() -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let peak = Arc::new(AtomicU64::new(
+            crate::resource::current_process_memory_bytes(),
+        ));
+        let worker_stop = stop.clone();
+        let worker_peak = peak.clone();
+        let worker = std::thread::spawn(move || {
+            while !worker_stop.load(std::sync::atomic::Ordering::Acquire) {
+                let sample = crate::resource::current_process_memory_bytes();
+                worker_peak.fetch_max(sample, std::sync::atomic::Ordering::AcqRel);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        });
+        Self {
+            stop,
+            peak,
+            worker: Some(worker),
+        }
+    }
+
+    fn finish(mut self) -> u64 {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            worker.join().expect("lifecycle memory sampler");
+        }
+        self.peak
+            .load(std::sync::atomic::Ordering::Acquire)
+            .max(crate::resource::current_process_memory_bytes())
+    }
+}
+
+struct LifecycleProbeFile {
+    path: PathBuf,
+    removed: bool,
+}
+
+impl LifecycleProbeFile {
+    fn create(root: &std::path::Path) -> Self {
+        let path = root.join(format!(
+            "fossilsense_lifecycle_probe_{}.c",
+            std::process::id()
+        ));
+        assert!(!path.exists(), "lifecycle probe path already exists");
+        fs::write(&path, "int fossilsense_lifecycle_probe;\n").expect("write lifecycle probe");
+        Self {
+            path,
+            removed: false,
+        }
+    }
+
+    fn remove(&mut self) {
+        if !self.removed {
+            fs::remove_file(&self.path).expect("remove lifecycle probe");
+            self.removed = true;
+        }
+    }
+
+    fn update_during_compaction(&self) {
+        fs::write(
+            &self.path,
+            "int fossilsense_lifecycle_probe;\nint fossilsense_lifecycle_probe_updated;\n",
+        )
+        .expect("update lifecycle probe");
+    }
+}
+
+impl Drop for LifecycleProbeFile {
+    fn drop(&mut self) {
+        if !self.removed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+async fn wait_for_lifecycle_indexing_to_settle(
+    service: &LspService<super::Backend>,
+    failure_message: &str,
+) {
+    let started = tokio::time::Instant::now();
+    loop {
+        let schedule_idle = {
+            let state = service.inner().index_schedule.lock().await;
+            !state.running && !state.scheduled && !state.pending_requested
+        };
+        let build = service.inner().session.cache.build_coordinator.snapshot();
+        if schedule_idle && build.active_builds == 0 && build.compaction_roots == 0 {
+            return;
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(120),
+            "{failure_message}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+fn lifecycle_database_has_symbol(database: &std::path::Path, name: &str, path: &str) -> bool {
+    let store = crate::store::IndexStore::open_readonly(database).expect("open lifecycle database");
+    store
+        .declaration_view()
+        .by_name_limited(name, 16)
+        .expect("read lifecycle probe declaration")
+        .0
+        .into_iter()
+        .any(|row| row.fact.path == path)
+}
+
+fn lifecycle_latency_percentiles(samples: &mut [u64]) -> (u64, u64, u64) {
+    samples.sort_unstable();
+    let p50 = samples[samples.len() * 50 / 100];
+    let p95 = samples[samples.len() * 95 / 100];
+    let max = *samples.last().expect("latency sample");
+    (p50, p95, max)
+}
+
+fn sqlite_family_size(path: &std::path::Path) -> u64 {
+    ["", "-wal", "-shm"]
+        .into_iter()
+        .map(|suffix| {
+            let candidate = PathBuf::from(format!("{}{}", path.display(), suffix));
+            fs::metadata(candidate).map_or(0, |metadata| metadata.len())
+        })
+        .sum()
+}
+
+#[cfg(debug_assertions)]
+fn require_release_lifecycle_gate() {
+    panic!("lifecycle gate requires --release");
+}
+
+#[cfg(not(debug_assertions))]
+fn require_release_lifecycle_gate() {}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "production LSP index lifecycle gate; set FOSSILSENSE_BENCH_DB, FOSSILSENSE_BENCH_ROOT, and FOSSILSENSE_BENCH_SAMPLE"]
+async fn benchmark_lsp_index_lifecycle_gate() {
+    require_release_lifecycle_gate();
+    let db_path = std::env::var_os("FOSSILSENSE_BENCH_DB")
+        .map(PathBuf::from)
+        .expect("set FOSSILSENSE_BENCH_DB");
+    let root = std::env::var_os("FOSSILSENSE_BENCH_ROOT")
+        .map(PathBuf::from)
+        .expect("set FOSSILSENSE_BENCH_ROOT");
+    let sample = std::env::var("FOSSILSENSE_BENCH_SAMPLE").expect("set FOSSILSENSE_BENCH_SAMPLE");
+    assert!(matches!(sample.as_str(), "u-boot" | "wine"));
+    assert!(db_path.is_file(), "benchmark database does not exist");
+    assert!(root.is_dir(), "benchmark workspace does not exist");
+    assert!(
+        crate::resource::current_process_memory_bytes() > 0,
+        "process Private Bytes/RSS sampling is unavailable"
+    );
+
+    let lifecycle_started = std::time::Instant::now();
+    let memory_sampler = LifecyclePeakMemorySampler::start();
+    let service = test_backend_service();
+    *service.inner().workspace_roots.lock().await = vec![root.clone()];
+    let first_snapshot = service
+        .inner()
+        .session
+        .cache
+        .publish_full_index_from_db_for_test(root.clone(), db_path.clone())
+        .await
+        .expect("publish initial benchmark snapshot");
+    let old_request = service
+        .inner()
+        .session
+        .request_context_for_root(root.clone())
+        .await;
+    let old_epoch = old_request.engine.epoch;
+    let old_generation = old_request.engine.semantic_generation;
+    assert_eq!(old_epoch, first_snapshot.epoch);
+    drop(first_snapshot);
+    let old_index = old_request
+        .engine
+        .declaration_index
+        .clone()
+        .expect("initial declaration index");
+    let old_handle = old_request
+        .engine
+        .call_read_handle
+        .clone()
+        .expect("initial read handle");
+    let declarations = old_index.len();
+    let files = old_request
+        .engine
+        .indexed_files
+        .as_ref()
+        .map_or(0, |files| files.len());
+    if sample == "u-boot" {
+        assert!(
+            declarations >= 500_000,
+            "U-Boot declaration sample is too small"
+        );
+        assert!(files >= 10_000, "U-Boot file sample is too small");
+    }
+
+    let budget = old_index.payload_budget_bytes();
+    assert!(budget > 0, "lifecycle preheat requires a payload budget");
+    let warm_target = budget.saturating_mul(75) / 100;
+    let store = crate::store::IndexStore::open_readonly(&db_path).expect("open benchmark database");
+    let mut batch = Vec::with_capacity(512);
+    let mut stable_id = None;
+    let mut witness = None;
+    store
+        .declaration_view()
+        .visit_name_rows(|row| {
+            if witness.is_none() && !row.external && root.join(row.path).is_file() {
+                witness = Some(crate::store::views::DeclarationNameRow {
+                    id: row.id,
+                    name: row.name.to_string(),
+                    declaration_kind: row.declaration_kind,
+                    role: row.role,
+                    semantic_family: row.semantic_family,
+                    path: row.path.to_string(),
+                    external: row.external,
+                    directly_included: row.directly_included,
+                });
+            }
+            if old_index.payload_cache_stats().bytes < warm_target {
+                stable_id.get_or_insert(row.id);
+                batch.push(row.id);
+                if batch.len() == batch.capacity() {
+                    old_index
+                        .payloads_by_ids(&old_handle, &batch)
+                        .expect("warm payload batch");
+                    batch.clear();
+                }
+            }
+            Ok(())
+        })
+        .expect("stream declaration names");
+    if !batch.is_empty() && old_index.payload_cache_stats().bytes < warm_target {
+        old_index
+            .payloads_by_ids(&old_handle, &batch)
+            .expect("warm final payload batch");
+    }
+    let warm_stats = old_index.payload_cache_stats();
+    assert!(
+        warm_stats.bytes >= warm_target,
+        "payload cache did not reach 75 percent"
+    );
+    let warm_percent = warm_stats.bytes.saturating_mul(100) / budget;
+    let stable_id = stable_id.expect("stable warmed declaration ID");
+    let old_before = old_index
+        .payloads_by_ids(&old_handle, &[stable_id])
+        .expect("read old stable declaration");
+    let witness = witness.expect("workspace declaration witness");
+    let witness_row = store
+        .declaration_view()
+        .by_name_limited(&witness.name, 256)
+        .expect("read witness declaration")
+        .0
+        .into_iter()
+        .find(|row| row.id == witness.id)
+        .expect("witness payload");
+    let witness_uri = Url::from_file_path(root.join(&witness.path)).expect("witness URI");
+    let witness_position = witness_row.fact.name_range.start;
+    let completion_position = Position::new(
+        witness_position.line,
+        witness_position.character.saturating_add(1),
+    );
+    drop(store);
+    assert!(service.inner().take_completion_perf_for_test().is_empty());
+
+    let mut phases_seen_mask = 1u64;
+    let mut hover_us = Vec::new();
+    let mut definition_us = Vec::new();
+    let mut completion_us = Vec::with_capacity(64);
+    let mut completion_requests = 0u64;
+    let mut completion_candidates_min = usize::MAX;
+    let mut completion_sql_reads = 0u64;
+    service.inner().spawn_index_roots(Some(true)).await;
+    let rebuild_started = tokio::time::Instant::now();
+    loop {
+        let running = {
+            let state = service.inner().index_schedule.lock().await;
+            state.running || state.scheduled || state.pending_requested
+        };
+        if !running {
+            break;
+        }
+        assert!(
+            rebuild_started.elapsed() <= std::time::Duration::from_secs(180),
+            "production LSP lifecycle rebuild did not finish"
+        );
+        let started = std::time::Instant::now();
+        let hover = service
+            .inner()
+            .hover(hover_params(
+                witness_uri.clone(),
+                witness_position.line,
+                witness_position.character,
+            ))
+            .await
+            .expect("lifecycle hover request");
+        assert!(
+            hover.is_some(),
+            "old snapshot hover disappeared during rebuild"
+        );
+        hover_us.push(started.elapsed().as_micros() as u64);
+
+        let started = std::time::Instant::now();
+        let definition = service
+            .inner()
+            .goto_definition(goto_definition_params(
+                witness_uri.clone(),
+                witness_position.line,
+                witness_position.character,
+            ))
+            .await
+            .expect("lifecycle definition request");
+        assert!(
+            definition.is_some(),
+            "old snapshot definition disappeared during rebuild"
+        );
+        definition_us.push(started.elapsed().as_micros() as u64);
+        if completion_requests < 64 {
+            let sql_reads_before = old_index.payload_cache_stats().sql_reads;
+            let started = std::time::Instant::now();
+            let completion = service
+                .inner()
+                .completion(completion_params(
+                    witness_uri.clone(),
+                    completion_position.line,
+                    completion_position.character,
+                ))
+                .await
+                .expect("lifecycle completion request")
+                .expect("lifecycle completion response");
+            completion_us.push(started.elapsed().as_micros() as u64);
+            completion_sql_reads = completion_sql_reads.saturating_add(
+                old_index
+                    .payload_cache_stats()
+                    .sql_reads
+                    .saturating_sub(sql_reads_before),
+            );
+            assert!(
+                completion_response_is_incomplete(&completion),
+                "lifecycle completion did not expose bounded truncation"
+            );
+            let completion_candidates = completion_items(completion).len();
+            assert!(
+                completion_candidates > 0,
+                "lifecycle completion returned no indexed candidates"
+            );
+            completion_candidates_min = completion_candidates_min.min(completion_candidates);
+            completion_requests += 1;
+        }
+        let delay = if completion_requests < 64 { 250 } else { 1_000 };
+        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+    }
+    assert!(
+        !hover_us.is_empty(),
+        "rebuild completed without concurrent requests"
+    );
+    assert_eq!(
+        completion_requests, 64,
+        "lifecycle rebuild completed before 64 production completion requests"
+    );
+    let completion_observations = service.inner().take_completion_perf_for_test();
+    assert_eq!(completion_observations.len(), 64);
+    let completion_recall: Vec<_> = completion_observations
+        .iter()
+        .map(|(_, metrics)| metrics.recall_channels)
+        .collect();
+    validate_completion_replay_recall(&completion_recall, 500_000)
+        .expect("lifecycle production completion recall gate");
+    assert_eq!(
+        completion_sql_reads, 0,
+        "lifecycle completion list hydrated declaration payloads"
+    );
+    completion_us.sort_unstable();
+    let completion_p95_us = completion_us[completion_us.len() * 95 / 100];
+    assert!(
+        completion_p95_us <= 50_000,
+        "lifecycle completion P95 was {completion_p95_us} us"
+    );
+    let completion_entries_inspected_min = completion_recall
+        .iter()
+        .map(|metrics| metrics.entries_inspected)
+        .min()
+        .unwrap_or_default();
+    let completion_entries_inspected_max = completion_recall
+        .iter()
+        .map(|metrics| metrics.entries_inspected)
+        .max()
+        .unwrap_or_default();
+    let completion_candidate_budget_min = completion_recall
+        .iter()
+        .map(|metrics| metrics.candidate_budget)
+        .min()
+        .unwrap_or_default();
+    let completion_candidate_budget_max = completion_recall
+        .iter()
+        .map(|metrics| metrics.candidate_budget)
+        .max()
+        .unwrap_or_default();
+    let completion_indexed_returned_min = completion_recall
+        .iter()
+        .map(|metrics| metrics.indexed_returned)
+        .min()
+        .unwrap_or_default();
+    let completion_active_entries_min = completion_recall
+        .iter()
+        .map(|metrics| metrics.active_entries_total)
+        .min()
+        .unwrap_or_default();
+    let completion_truncated_requests = completion_recall
+        .iter()
+        .filter(|metrics| metrics.truncated)
+        .count();
+    phases_seen_mask |= 2 | 4;
+    let full_stats = service.inner().session.cache.build_coordinator.snapshot();
+    assert!(
+        full_stats.last_index_elapsed_ms <= 120_000,
+        "production lifecycle full index took {} ms",
+        full_stats.last_index_elapsed_ms
+    );
+
+    let rebuilt = service
+        .inner()
+        .session
+        .cache
+        .current_engine_snapshot(&root)
+        .await
+        .expect("rebuilt snapshot");
+    assert_ne!(rebuilt.epoch, old_epoch);
+    let rebuilt_index = rebuilt
+        .declaration_index
+        .clone()
+        .expect("rebuilt declaration index");
+    let default_db = rebuilt
+        .call_read_handle
+        .as_ref()
+        .expect("rebuilt read handle")
+        .database_path()
+        .to_path_buf();
+    let rebuilt_generation = rebuilt.semantic_generation;
+    let old_after = old_index
+        .payloads_by_ids(&old_handle, &[stable_id])
+        .expect("old request remains readable across full publication");
+    let old_consistent = old_request.engine.epoch == old_epoch
+        && old_request.engine.semantic_generation == old_generation
+        && old_handle.generation == old_generation
+        && old_before == old_after;
+    let old_database_path = old_handle.database_path().to_path_buf();
+    assert!(old_consistent);
+    // The old request exercises the full-publication overlap. Release it before
+    // the independent dirty/compaction overlap so this gate measures the two
+    // supported two-generation lifecycles instead of retaining three epochs.
+    drop(old_after);
+    drop(old_before);
+    drop(old_handle);
+    drop(old_index);
+    drop(old_request);
+    let current_store = crate::store::IndexStore::open_readonly(&default_db)
+        .expect("open rebuilt default database");
+    let path_rows = current_store
+        .declaration_view()
+        .name_rows_for_paths(std::slice::from_ref(&witness.path))
+        .expect("load witness path rows");
+    assert!(
+        !path_rows.is_empty(),
+        "witness path has no rebuilt declarations"
+    );
+    drop(current_store);
+
+    let paths = HashSet::from([witness.path.clone()]);
+    let mut fragmented = rebuilt_index.as_ref().clone();
+    for _ in 0..63 {
+        fragmented = fragmented.with_updated_paths(
+            &paths,
+            path_rows.clone(),
+            rebuilt.project_context.as_deref(),
+            rebuilt_index.total_budget_bytes(),
+        );
+    }
+    assert!(
+        !fragmented.needs_compaction(),
+        "the production watcher update must cross the compaction threshold"
+    );
+    let fragmented = Arc::new(fragmented);
+    let fragmented_epoch = service.inner().session.cache.allocate_engine_epoch();
+    let mut fragmented_snapshot = rebuilt.as_ref().clone();
+    fragmented_snapshot.epoch = fragmented_epoch;
+    fragmented_snapshot.declaration_index = Some(fragmented.clone());
+    fragmented_snapshot.name_table = Some(fragmented.name_table_arc());
+    service
+        .inner()
+        .session
+        .cache
+        .publish_engine_snapshot(fragmented_snapshot)
+        .await;
+    drop(fragmented);
+    drop(rebuilt_index);
+    drop(rebuilt);
+
+    let mut probe = LifecycleProbeFile::create(&root);
+    let probe_rel = probe
+        .path
+        .strip_prefix(&root)
+        .expect("probe under root")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let probe_uri = Url::from_file_path(&probe.path).expect("lifecycle probe URI");
+    service
+        .inner()
+        .did_change_watched_files(DidChangeWatchedFilesParams {
+            changes: vec![FileEvent {
+                uri: probe_uri.clone(),
+                typ: FileChangeType::CREATED,
+            }],
+        })
+        .await;
+    let compaction_wait = tokio::time::Instant::now();
+    loop {
+        let schedule_idle = {
+            let state = service.inner().index_schedule.lock().await;
+            !state.running && !state.scheduled && !state.pending_requested
+        };
+        let build = service.inner().session.cache.build_coordinator.snapshot();
+        if schedule_idle
+            && build.active_kind == Some(crate::build_coordinator::BuildKind::NameCompaction)
+        {
+            break;
+        }
+        assert!(
+            compaction_wait.elapsed() < std::time::Duration::from_secs(30),
+            "production watcher update did not start name compaction"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let first_dirty = service
+        .inner()
+        .session
+        .cache
+        .current_engine_snapshot(&root)
+        .await
+        .expect("first production dirty snapshot");
+    assert!(first_dirty.semantic_generation.0 > rebuilt_generation.0);
+    let first_dirty_generation = first_dirty.semantic_generation;
+    drop(first_dirty);
+
+    probe.update_during_compaction();
+    service
+        .inner()
+        .did_change_watched_files(DidChangeWatchedFilesParams {
+            changes: vec![FileEvent {
+                uri: probe_uri.clone(),
+                typ: FileChangeType::CHANGED,
+            }],
+        })
+        .await;
+    wait_for_lifecycle_indexing_to_settle(&service, "updated probe build did not settle").await;
+    let updated_dirty = service
+        .inner()
+        .session
+        .cache
+        .current_engine_snapshot(&root)
+        .await
+        .expect("updated production dirty snapshot");
+    assert!(updated_dirty.semantic_generation.0 > first_dirty_generation.0);
+    let updated_dirty_generation = updated_dirty.semantic_generation;
+    drop(updated_dirty);
+    assert!(lifecycle_database_has_symbol(
+        &default_db,
+        "fossilsense_lifecycle_probe",
+        &probe_rel
+    ));
+    assert!(lifecycle_database_has_symbol(
+        &default_db,
+        "fossilsense_lifecycle_probe_updated",
+        &probe_rel
+    ));
+    phases_seen_mask |= 8 | 16;
+
+    probe.remove();
+    service
+        .inner()
+        .did_change_watched_files(DidChangeWatchedFilesParams {
+            changes: vec![FileEvent {
+                uri: probe_uri,
+                typ: FileChangeType::DELETED,
+            }],
+        })
+        .await;
+    wait_for_lifecycle_indexing_to_settle(&service, "deleted probe build did not settle").await;
+    let deleted_dirty = service
+        .inner()
+        .session
+        .cache
+        .current_engine_snapshot(&root)
+        .await
+        .expect("deleted production dirty snapshot");
+    assert!(deleted_dirty.semantic_generation.0 > updated_dirty_generation.0);
+    drop(deleted_dirty);
+    assert!(!lifecycle_database_has_symbol(
+        &default_db,
+        "fossilsense_lifecycle_probe",
+        &probe_rel
+    ));
+    assert!(!lifecycle_database_has_symbol(
+        &default_db,
+        "fossilsense_lifecycle_probe_updated",
+        &probe_rel
+    ));
+
+    let final_request = service
+        .inner()
+        .session
+        .request_context_for_root(root.clone())
+        .await;
+    let final_snapshot = final_request.engine.clone();
+    let final_handle = final_snapshot
+        .call_read_handle
+        .as_ref()
+        .expect("final read handle");
+    assert!(service
+        .inner()
+        .hover(hover_params(
+            witness_uri.clone(),
+            witness_position.line,
+            witness_position.character,
+        ))
+        .await
+        .expect("final hover")
+        .is_some());
+    assert!(service
+        .inner()
+        .goto_definition(goto_definition_params(
+            witness_uri,
+            witness_position.line,
+            witness_position.character,
+        ))
+        .await
+        .expect("final definition")
+        .is_some());
+
+    let coordinator = service.inner().session.cache.build_coordinator.snapshot();
+    let peak_process_bytes = memory_sampler.finish();
+    let new_consistent = final_request.engine.epoch == final_snapshot.epoch
+        && final_handle.generation == final_snapshot.semantic_generation;
+    let database_identity_mismatches = usize::from(
+        old_database_path != db_path
+            || final_handle.database_path() != default_db
+            || !final_handle.database_path().is_file(),
+    );
+    let (hover_p50, hover_p95, hover_max) = lifecycle_latency_percentiles(&mut hover_us);
+    let (definition_p50, definition_p95, definition_max) =
+        lifecycle_latency_percentiles(&mut definition_us);
+    assert_eq!(phases_seen_mask, 31);
+    assert_eq!(coordinator.peak_active_builds, 1);
+    assert!(coordinator.cancellation_count >= 1);
+    assert!(coordinator.peak_reserved_bytes > 0);
+    assert_eq!(coordinator.active_builds, 0);
+    assert_eq!(coordinator.active_reserved_bytes, 0);
+    assert!(old_consistent && new_consistent);
+    assert_eq!(database_identity_mismatches, 0);
+    if sample == "u-boot" {
+        assert!(
+            peak_process_bytes <= 512 * 1024 * 1024,
+            "U-Boot LSP lifecycle peaked at {:.2} MiB, above 512 MiB",
+            peak_process_bytes as f64 / (1024.0 * 1024.0)
+        );
+    }
+
+    println!("lsp_lifecycle_declarations: {declarations}");
+    println!("lsp_lifecycle_files: {files}");
+    println!("lsp_lifecycle_warm_cache_percent: {warm_percent}");
+    println!("lsp_lifecycle_phases_seen_mask: {phases_seen_mask}");
+    println!(
+        "lsp_lifecycle_active_builds_peak: {}",
+        coordinator.peak_active_builds
+    );
+    println!(
+        "lsp_lifecycle_reserved_bytes_peak: {}",
+        coordinator.peak_reserved_bytes
+    );
+    println!(
+        "lsp_lifecycle_retained_bytes_peak: {}",
+        coordinator.peak_retained_bytes
+    );
+    println!("lsp_lifecycle_peak_process_bytes: {peak_process_bytes}");
+    println!("lsp_lifecycle_memory_sample_available: 1");
+    println!(
+        "lsp_lifecycle_memory_metric_private_bytes: {}",
+        usize::from(cfg!(windows))
+    );
+    println!("lsp_lifecycle_old_requests_held_peak: 1");
+    println!(
+        "lsp_lifecycle_old_epoch_consistent: {}",
+        usize::from(old_consistent)
+    );
+    println!(
+        "lsp_lifecycle_new_epoch_consistent: {}",
+        usize::from(new_consistent)
+    );
+    println!("lsp_lifecycle_generation_mismatches: 0");
+    println!("lsp_lifecycle_database_identity_mismatches: {database_identity_mismatches}");
+    println!(
+        "lsp_lifecycle_cancelled_compactions: {}",
+        coordinator.cancellation_count
+    );
+    println!("lsp_lifecycle_hover_requests: {}", hover_us.len());
+    println!("lsp_lifecycle_hover_p50_us: {hover_p50}");
+    println!("lsp_lifecycle_hover_p95_us: {hover_p95}");
+    println!("lsp_lifecycle_hover_max_us: {hover_max}");
+    println!("lsp_lifecycle_definition_requests: {}", definition_us.len());
+    println!("lsp_lifecycle_definition_p50_us: {definition_p50}");
+    println!("lsp_lifecycle_definition_p95_us: {definition_p95}");
+    println!("lsp_lifecycle_definition_max_us: {definition_max}");
+    println!("lsp_lifecycle_completion_requests: {completion_requests}");
+    println!("lsp_lifecycle_completion_candidates_min: {completion_candidates_min}");
+    println!("lsp_lifecycle_completion_p95_us: {completion_p95_us}");
+    println!("lsp_lifecycle_completion_entries_inspected_min: {completion_entries_inspected_min}");
+    println!("lsp_lifecycle_completion_entries_inspected_max: {completion_entries_inspected_max}");
+    println!("lsp_lifecycle_completion_candidate_budget_min: {completion_candidate_budget_min}");
+    println!("lsp_lifecycle_completion_candidate_budget_max: {completion_candidate_budget_max}");
+    println!("lsp_lifecycle_completion_indexed_returned_min: {completion_indexed_returned_min}");
+    println!("lsp_lifecycle_completion_active_entries_min: {completion_active_entries_min}");
+    println!("lsp_lifecycle_completion_truncated_requests: {completion_truncated_requests}");
+    println!("lsp_lifecycle_completion_sql_reads: {completion_sql_reads}");
+    println!("lsp_lifecycle_dirty_updates_applied: 3");
+    println!(
+        "lsp_lifecycle_final_active_builds: {}",
+        coordinator.active_builds
+    );
+    println!(
+        "lsp_lifecycle_final_reserved_bytes: {}",
+        coordinator.active_reserved_bytes
+    );
+    println!(
+        "lsp_lifecycle_database_size_bytes: {}",
+        sqlite_family_size(&default_db)
+    );
+    println!(
+        "lsp_lifecycle_elapsed_ms: {}",
+        full_stats.last_index_elapsed_ms
+    );
+    println!("lsp_lifecycle_write_ms: {}", full_stats.last_index_write_ms);
+    let _total_lifecycle_ms = lifecycle_started.elapsed().as_millis();
 }
 
 #[tokio::test]
@@ -10373,6 +11563,33 @@ fn index_schedule_dirty_follows_full() {
     assert!(!state.scheduled);
     assert!(state.pending_changes.is_empty());
     assert!(!state.pending_requested);
+}
+
+#[test]
+fn shutdown_and_cancelled_builds_are_not_requeued_as_deferred_work() {
+    use crate::build_coordinator::{AcquireError, ReservationError};
+
+    assert!(!super::indexing::should_retry_acquire(
+        AcquireError::ShuttingDown
+    ));
+    assert!(!super::indexing::should_retry_acquire(
+        AcquireError::Cancelled
+    ));
+    assert!(super::indexing::should_retry_acquire(
+        AcquireError::Deferred
+    ));
+    assert!(!super::indexing::should_retry_reservation(
+        ReservationError::Cancelled
+    ));
+    assert!(!super::indexing::should_retry_reservation(
+        ReservationError::StalePermit
+    ));
+    assert!(super::indexing::should_retry_reservation(
+        ReservationError::ProcessPressure
+    ));
+    assert!(super::indexing::should_retry_reservation(
+        ReservationError::TemporaryBudgetExceeded
+    ));
 }
 
 // --- R7: error degradation — IndexStatus state correctness ---------------

@@ -202,4 +202,21 @@ impl<'a> NameIndexBuilder<'a> {
             self.projects,
         )
     }
+
+    pub(super) fn finish_with_cancellation(
+        self,
+        cancellation: &crate::build_coordinator::BuildCancellation,
+    ) -> Option<NameTable> {
+        let segment = NameSegment::from_compact_parts_with_cancellation(
+            self.entries,
+            self.names,
+            self.paths,
+            self.path_ids,
+            self.path_counts,
+            self.path_is_external,
+            self.projects,
+            cancellation,
+        )?;
+        NameTable::from_base_segment_with_cancellation(segment, cancellation)
+    }
 }

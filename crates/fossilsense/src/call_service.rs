@@ -27,6 +27,11 @@ pub struct CallReadHandle {
 }
 
 impl CallReadHandle {
+    #[cfg(test)]
+    pub(crate) fn database_path(&self) -> &std::path::Path {
+        self.db.path()
+    }
+
     pub fn at_generation(db_path: PathBuf, generation: SemanticGeneration) -> Self {
         Self {
             db: IndexDbLease::acquire(db_path),

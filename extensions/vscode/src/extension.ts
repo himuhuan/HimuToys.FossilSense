@@ -91,7 +91,7 @@ const projectContextPromptTracker = new ProjectContextPromptTracker();
 let projectContextUpdateEpoch = 0;
 
 interface IndexStatus {
-  state: 'indexing' | 'ready' | 'failed';
+  state: 'indexing' | 'deferred' | 'ready' | 'failed';
   workspace: string;
   phase?: string;
   processedFiles: number;
@@ -670,6 +670,12 @@ function handleIndexStatus(status: IndexStatus): void {
       setStatus('ready');
       output.appendLine(
         `Index ready: ${status.workspace}; files=${status.totalFiles}, indexed=${status.indexedFiles}, skipped=${status.skippedFiles}, declarations=${status.symbols}, elapsed=${status.elapsedMs}ms (discover=${status.discoverMs}ms, check=${status.checkMs}ms, parse=${status.parseMs}ms, write=${status.writeMs}ms, include_edge=${status.includeEdgeMs}ms, name_table=${status.nameTableMs}ms, reach_graph=${status.reachGraphMs}ms)${capabilityWarning ? `; degraded=${capabilityWarning}` : ''}`,
+      );
+      break;
+    case 'deferred':
+      setStatus('waiting for resources');
+      output.appendLine(
+        `Index deferred: ${status.workspace}; ${status.message ?? 'waiting for build resources'}`,
       );
       break;
     case 'failed':

@@ -404,10 +404,52 @@ async fn run_workspace_semantics_bootstrap(
         resume.wait().await;
     }
 
+    let cancellation = crate::build_coordinator::BuildCancellation::new();
+    let permit = match cache
+        .build_coordinator
+        .acquire(
+            root.clone(),
+            crate::build_coordinator::BuildKind::WorkspaceSemantics,
+            cancellation,
+        )
+        .await
+    {
+        Ok(permit) => permit,
+        Err(error) => {
+            client
+                .log_message(
+                    MessageType::WARNING,
+                    format!(
+                        "workspace configuration bootstrap deferred for {}: {error}",
+                        root.display()
+                    ),
+                )
+                .await;
+            return;
+        }
+    };
+    if let Err(error) = permit.reserve(
+        crate::build_coordinator::DEFAULT_INCREMENTAL_BUILD_RESERVATION_BYTES,
+        0,
+    ) {
+        client
+            .log_message(
+                MessageType::WARNING,
+                format!(
+                    "workspace configuration resource admission deferred for {}: {error}",
+                    root.display()
+                ),
+            )
+            .await;
+        return;
+    }
+
     let include_paths = include_paths.lock().await.clone();
     let go_module_paths = go_module_paths.lock().await.clone();
     let prepare_root = root.clone();
+    let build_permit = permit.inherit(crate::build_coordinator::BuildKind::WorkspaceSemantics);
     let prepared = tokio::task::spawn_blocking(move || {
+        build_permit.check_cancelled()?;
         crate::indexer::prepare_index_configuration(
             &prepare_root,
             &include_paths,
@@ -464,6 +506,10 @@ async fn run_workspace_semantics_bootstrap(
 
     match configuration {
         Some(configuration) if workspace_roots.lock().await.contains(&root) => {
+            if permit.check_cancelled().is_err() {
+                bootstrap.entries.remove(&root);
+                return;
+            }
             let workspace_semantics = Arc::new(
                 PublishedWorkspaceSemantics::from_index_configuration(&root, &configuration),
             );

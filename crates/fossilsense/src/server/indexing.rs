@@ -12,6 +12,7 @@ use super::{
     emit_perf_log, uri_to_path, Backend, CacheLedger, CachePublishReport, DocumentStore,
     IndexSchedule,
 };
+use crate::build_coordinator::{AcquireError, BuildCancellation, BuildKind, ReservationError};
 use crate::indexer::{self, IndexOptions};
 use crate::pathing;
 use crate::progress::{IndexState, IndexStatus};
@@ -26,6 +27,17 @@ pub(super) use cache::{rebuild_include_table, rebuild_indexed_file_list};
 pub(super) use watch::watched_change_in_scope;
 
 const INDEX_DEBOUNCE: Duration = Duration::from_millis(350);
+
+pub(super) fn should_retry_acquire(error: AcquireError) -> bool {
+    matches!(error, AcquireError::Deferred)
+}
+
+pub(super) fn should_retry_reservation(error: ReservationError) -> bool {
+    matches!(
+        error,
+        ReservationError::TemporaryBudgetExceeded | ReservationError::ProcessPressure
+    )
+}
 
 #[derive(Debug, Default)]
 pub(super) struct IndexScheduleState {
@@ -61,8 +73,18 @@ pub(super) enum ScheduledIndex {
     Dirty(Vec<RootDirtyChange>),
 }
 
+#[derive(Default)]
+struct DeferredIndexWork {
+    full_roots: Vec<PathBuf>,
+    force_full: bool,
+    dirty_changes: Vec<RootDirtyChange>,
+}
+
 impl IndexScheduleState {
     pub(super) fn request_dirty_changes(&mut self, changes: Vec<RootDirtyChange>) {
+        if changes.is_empty() {
+            return;
+        }
         self.pending_requested = true;
         self.pending_changes.extend(changes);
     }
@@ -77,6 +99,10 @@ impl IndexScheduleState {
     }
 
     pub(super) fn request_full_roots(&mut self, roots: Vec<PathBuf>) {
+        self.request_full_roots_with_force(roots, false);
+    }
+
+    fn request_full_roots_with_force(&mut self, roots: Vec<PathBuf>, force: bool) {
         if roots.is_empty() {
             return;
         }
@@ -88,6 +114,7 @@ impl IndexScheduleState {
         self.pending_full_roots.extend(roots);
         self.pending_full_roots.sort();
         self.pending_full_roots.dedup();
+        self.pending_force |= force;
         self.pending_changes
             .retain(|change| !self.pending_full_roots.contains(&change.root));
     }
@@ -328,6 +355,7 @@ async fn run_scheduled_indexes(
             state.take_scheduled_index()
         };
 
+        let mut deferred = DeferredIndexWork::default();
         match scheduled {
             ScheduledIndex::Full {
                 roots,
@@ -342,18 +370,21 @@ async fn run_scheduled_indexes(
                         scoped
                     },
                 );
-                index_roots(
-                    client.clone(),
-                    roots,
-                    configuration.clone(),
-                    cache.clone(),
-                    workspace_state.clone(),
-                    force,
-                    perf_logging_enabled,
-                )
-                .await;
+                deferred.full_roots.extend(
+                    index_roots(
+                        client.clone(),
+                        roots,
+                        configuration.clone(),
+                        cache.clone(),
+                        workspace_state.clone(),
+                        force,
+                        perf_logging_enabled,
+                    )
+                    .await,
+                );
+                deferred.force_full |= force && !deferred.full_roots.is_empty();
                 if !changes.is_empty() {
-                    index_dirty_roots(
+                    let dirty_deferred = index_dirty_roots(
                         client.clone(),
                         configuration.clone(),
                         cache.clone(),
@@ -362,10 +393,13 @@ async fn run_scheduled_indexes(
                         perf_logging_enabled,
                     )
                     .await;
+                    deferred.full_roots.extend(dirty_deferred.full_roots);
+                    deferred.force_full |= dirty_deferred.force_full;
+                    deferred.dirty_changes.extend(dirty_deferred.dirty_changes);
                 }
             }
             ScheduledIndex::Dirty(changes) if !changes.is_empty() => {
-                index_dirty_roots(
+                deferred = index_dirty_roots(
                     client.clone(),
                     configuration.clone(),
                     cache.clone(),
@@ -380,6 +414,11 @@ async fn run_scheduled_indexes(
 
         let should_continue = {
             let mut state = index_schedule.lock().await;
+            state.request_full_roots_with_force(
+                std::mem::take(&mut deferred.full_roots),
+                deferred.force_full,
+            );
+            state.request_dirty_changes(std::mem::take(&mut deferred.dirty_changes));
             state.running = false;
             if state.pending_requested {
                 state.scheduled = true;
@@ -403,7 +442,7 @@ async fn index_roots(
     workspace_state: IndexWorkspaceState,
     force: bool,
     perf_logging_enabled: bool,
-) {
+) -> Vec<PathBuf> {
     if roots.is_empty() {
         client
             .log_message(
@@ -411,11 +450,77 @@ async fn index_roots(
                 "FossilSense has no workspace root to index",
             )
             .await;
-        return;
+        return Vec::new();
     }
 
+    let mut deferred_roots = Vec::new();
     for root in roots {
         let display_root = root.display().to_string();
+        let cancellation = BuildCancellation::new();
+        let permit = match cache
+            .build_coordinator
+            .acquire(root.clone(), BuildKind::FullIndex, cancellation)
+            .await
+        {
+            Ok(permit) => permit,
+            Err(error) => {
+                if !should_retry_acquire(error) {
+                    client
+                        .log_message(
+                            MessageType::LOG,
+                            format!("index stopped for {}: {error}", display_root),
+                        )
+                        .await;
+                    continue;
+                }
+                client
+                    .send_notification::<IndexStatusNotification>(IndexStatus::deferred(
+                        display_root.clone(),
+                        error.to_string(),
+                    ))
+                    .await;
+                client
+                    .log_message(
+                        MessageType::WARNING,
+                        format!("index deferred for {}: {error}", display_root),
+                    )
+                    .await;
+                deferred_roots.push(root);
+                continue;
+            }
+        };
+        let publication = cache.begin_full_build_lifecycle(&root).await;
+        if let Err(error) = permit.reserve(
+            publication.replacement_reservation_bytes(),
+            publication.retained_bytes(),
+        ) {
+            if !should_retry_reservation(error) {
+                client
+                    .log_message(
+                        MessageType::LOG,
+                        format!("index stopped for {}: {error}", display_root),
+                    )
+                    .await;
+                continue;
+            }
+            client
+                .send_notification::<IndexStatusNotification>(IndexStatus::deferred(
+                    display_root.clone(),
+                    error.to_string(),
+                ))
+                .await;
+            client
+                .log_message(
+                    MessageType::WARNING,
+                    format!(
+                        "index resource admission deferred for {}: {error}",
+                        display_root
+                    ),
+                )
+                .await;
+            deferred_roots.push(root);
+            continue;
+        }
         client
             .log_message(MessageType::INFO, format!("scanning {}", display_root))
             .await;
@@ -428,7 +533,9 @@ async fn index_roots(
             protobuf_c_enabled: protobuf_c_enabled_for_index,
             protobuf_c_proto_paths: protobuf_c_proto_paths_for_index,
         } = configuration.clone();
+        let index_permit = permit.inherit(BuildKind::FullIndex);
         let result = tokio::task::spawn_blocking(move || {
+            index_permit.check_cancelled()?;
             let prepared = indexer::prepare_index_configuration(
                 &index_root,
                 &include_paths_for_index,
@@ -436,7 +543,7 @@ async fn index_roots(
                 protobuf_c_enabled_for_index,
                 &protobuf_c_proto_paths_for_index,
             )?;
-            let stats = indexer::index_workspace(
+            let stats = indexer::index_workspace_with_permit(
                 &index_root,
                 IndexOptions {
                     db_path: None,
@@ -448,10 +555,12 @@ async fn index_roots(
                     prepared_configuration: Some(prepared.clone()),
                     ..Default::default()
                 },
+                &index_permit,
                 |status| {
                     let _ = sender.send(status);
                 },
             )?;
+            index_permit.check_cancelled()?;
             let workspace_semantics = Arc::new(
                 super::workspace_config::PublishedWorkspaceSemantics::from_index_configuration(
                     &index_root,
@@ -482,6 +591,9 @@ async fn index_roots(
 
         match result.await {
             Ok(Ok((mut stats, workspace_semantics))) => {
+                cache
+                    .build_coordinator
+                    .record_index_stats(stats.elapsed_ms, stats.write_ms);
                 if let Some(warning) = &stats.maintenance_warning {
                     client
                         .log_message(MessageType::WARNING, warning.clone())
@@ -507,7 +619,13 @@ async fn index_roots(
                     )
                     .await;
                 match cache
-                    .publish_full_index_with_semantics(&client, root.clone(), workspace_semantics)
+                    .publish_full_index_with_semantics_in_lifecycle(
+                        &client,
+                        root.clone(),
+                        workspace_semantics,
+                        publication,
+                        &permit,
+                    )
                     .await
                 {
                     Ok(report) => {
@@ -623,6 +741,7 @@ async fn index_roots(
             }
         }
     }
+    deferred_roots
 }
 
 async fn index_dirty_roots(
@@ -632,7 +751,8 @@ async fn index_dirty_roots(
     workspace_state: IndexWorkspaceState,
     changes: Vec<RootDirtyChange>,
     perf_logging_enabled: bool,
-) {
+) -> DeferredIndexWork {
+    let mut deferred = DeferredIndexWork::default();
     let mut latest_by_file: HashMap<(PathBuf, String), RootDirtyChange> = HashMap::new();
     for change in changes {
         latest_by_file.insert((change.root.clone(), change.rel_path.clone()), change);
@@ -665,7 +785,7 @@ async fn index_dirty_roots(
                     ),
                 )
                 .await;
-            index_roots(
+            let full_deferred = index_roots(
                 client.clone(),
                 vec![root],
                 configuration.clone(),
@@ -675,9 +795,11 @@ async fn index_dirty_roots(
                 perf_logging_enabled,
             )
             .await;
+            deferred.full_roots.extend(full_deferred);
             continue;
         }
         let workspace_semantics = published
+            .as_ref()
             .expect("incremental eligibility requires a published snapshot")
             .workspace_semantics
             .clone();
@@ -686,6 +808,74 @@ async fn index_dirty_roots(
             .iter()
             .map(|change| change.rel_path.clone())
             .collect();
+        let cancellation = BuildCancellation::new();
+        let permit = match cache
+            .build_coordinator
+            .acquire(root.clone(), BuildKind::DirtyIndex, cancellation)
+            .await
+        {
+            Ok(permit) => permit,
+            Err(error) => {
+                if !should_retry_acquire(error) {
+                    client
+                        .log_message(
+                            MessageType::LOG,
+                            format!("dirty update stopped for {}: {error}", display_root),
+                        )
+                        .await;
+                    continue;
+                }
+                client
+                    .send_notification::<IndexStatusNotification>(IndexStatus::deferred(
+                        display_root.clone(),
+                        error.to_string(),
+                    ))
+                    .await;
+                client
+                    .log_message(
+                        MessageType::WARNING,
+                        format!("dirty update deferred for {}: {error}", display_root),
+                    )
+                    .await;
+                deferred.dirty_changes.extend(changes);
+                continue;
+            }
+        };
+        let retained_bytes = published
+            .as_ref()
+            .and_then(|snapshot| snapshot.declaration_index.as_ref())
+            .map_or(0, |index| index.accounted_core_bytes());
+        if let Err(error) = permit.reserve(
+            crate::build_coordinator::DEFAULT_INCREMENTAL_BUILD_RESERVATION_BYTES,
+            retained_bytes,
+        ) {
+            if !should_retry_reservation(error) {
+                client
+                    .log_message(
+                        MessageType::LOG,
+                        format!("dirty update stopped for {}: {error}", display_root),
+                    )
+                    .await;
+                continue;
+            }
+            client
+                .send_notification::<IndexStatusNotification>(IndexStatus::deferred(
+                    display_root.clone(),
+                    error.to_string(),
+                ))
+                .await;
+            client
+                .log_message(
+                    MessageType::WARNING,
+                    format!(
+                        "dirty update resource admission deferred for {}: {error}",
+                        display_root
+                    ),
+                )
+                .await;
+            deferred.dirty_changes.extend(changes);
+            continue;
+        }
         client
             .log_message(
                 MessageType::INFO,
@@ -708,9 +898,11 @@ async fn index_dirty_roots(
         let workspace_semantics_for_index = workspace_semantics.clone();
         let dirty_changes: Vec<indexer::DirtyFileChange> =
             changes.into_iter().map(|change| change.change).collect();
+        let index_permit = permit.inherit(BuildKind::DirtyIndex);
         let result = tokio::task::spawn_blocking(move || {
+            index_permit.check_cancelled()?;
             let prepared = workspace_semantics_for_index.index_configuration_snapshot();
-            let stats = indexer::index_dirty_files(
+            let stats = indexer::index_dirty_files_with_permit(
                 &index_root,
                 dirty_changes,
                 IndexOptions {
@@ -723,10 +915,12 @@ async fn index_dirty_roots(
                     prepared_configuration: Some(prepared.clone()),
                     ..Default::default()
                 },
+                &index_permit,
                 |status| {
                     let _ = sender.send(status);
                 },
             )?;
+            index_permit.check_cancelled()?;
             Ok::<_, anyhow::Error>((stats, workspace_semantics_for_index))
         });
 
@@ -748,6 +942,9 @@ async fn index_dirty_roots(
 
         match result.await {
             Ok(Ok((mut stats, workspace_semantics))) => {
+                cache
+                    .build_coordinator
+                    .record_index_stats(stats.elapsed_ms, stats.write_ms);
                 if let Some(warning) = &stats.maintenance_warning {
                     client
                         .log_message(MessageType::WARNING, warning.clone())
@@ -772,12 +969,13 @@ async fn index_dirty_roots(
                     )
                     .await;
                 match cache
-                    .publish_dirty_index_with_semantics(
+                    .publish_dirty_index_with_semantics_in_lifecycle(
                         &client,
                         root.clone(),
                         &rel_paths,
                         &stats.include_edge_sources_rebuilt,
                         workspace_semantics,
+                        &permit,
                     )
                     .await
                 {
@@ -892,12 +1090,13 @@ async fn index_dirty_roots(
             }
         }
     }
+    deferred
 }
 
 #[cfg(test)]
 impl Backend {
     pub(super) async fn run_dirty_index_for_test(&self, changes: Vec<RootDirtyChange>) {
-        index_dirty_roots(
+        let _ = index_dirty_roots(
             self.client.clone(),
             IndexClientConfiguration {
                 include_paths: self.include_paths.lock().await.clone(),

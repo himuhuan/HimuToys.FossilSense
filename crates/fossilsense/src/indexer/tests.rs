@@ -2,7 +2,10 @@ use std::fs;
 
 use tempfile::tempdir;
 
-use super::{index_dirty_files, index_workspace, DirtyFileChange, DirtyFileKind, IndexOptions};
+use super::{
+    index_dirty_files, index_workspace, index_workspace_with_permit, DirtyFileChange,
+    DirtyFileKind, IndexOptions,
+};
 use crate::store::IndexStore;
 
 mod ambiguity;

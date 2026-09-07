@@ -28,6 +28,7 @@ struct ParsedFile {
 pub(super) struct ParsePipelineConfig {
     pub parse_threads: usize,
     pub language_resolver: LanguageResolver,
+    pub cancellation: Option<crate::build_coordinator::BuildCancellation>,
 }
 
 pub(super) fn parse_and_write_changed(
@@ -59,12 +60,20 @@ pub(super) fn parse_and_write_changed(
     let channel_capacity = config.parse_threads.saturating_mul(2).max(1);
     let (sender, receiver) = mpsc::sync_channel::<ParsedFile>(channel_capacity);
     let mut index_progress = ProgressLimiter::new();
+    let cancellation = config.cancellation.clone();
     std::thread::scope(|scope| -> Result<()> {
         let producer = scope.spawn(move || {
             pool.install(|| {
                 changed
                     .into_par_iter()
                     .for_each_with(sender, |sender, candidate| {
+                        if config
+                            .cancellation
+                            .as_ref()
+                            .is_some_and(|cancellation| cancellation.is_cancelled())
+                        {
+                            return;
+                        }
                         // A closed receiver means the SQLite consumer failed; stop
                         // retaining parsed products and let the producer drain.
                         let _ = sender.send(parse_candidate(candidate, &config.language_resolver));
@@ -74,6 +83,12 @@ pub(super) fn parse_and_write_changed(
 
         let mut batch = Vec::with_capacity(WRITE_BATCH_SIZE);
         for parsed in receiver {
+            if cancellation
+                .as_ref()
+                .is_some_and(|cancellation| cancellation.is_cancelled())
+            {
+                break;
+            }
             batch.push(parsed);
             if batch.len() == WRITE_BATCH_SIZE {
                 write_parsed_batch(
@@ -102,6 +117,12 @@ pub(super) fn parse_and_write_changed(
         producer
             .join()
             .map_err(|_| anyhow::anyhow!("parser producer thread panicked"))?;
+        anyhow::ensure!(
+            !cancellation
+                .as_ref()
+                .is_some_and(|cancellation| cancellation.is_cancelled()),
+            "index build cancelled"
+        );
         Ok(())
     })?;
     stats.parse_ms = parse_started

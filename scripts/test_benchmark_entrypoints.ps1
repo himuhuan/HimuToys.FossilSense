@@ -31,6 +31,97 @@ foreach ($invalid in @(
         throw "The 120,000 ms full-index gate accepted outer=$($invalid.Outer), engine=$($invalid.Engine)."
     }
 }
+$validLifecycleMetrics = @{
+    lsp_lifecycle_declarations = 500000
+    lsp_lifecycle_files = 10000
+    lsp_lifecycle_warm_cache_percent = 75
+    lsp_lifecycle_phases_seen_mask = 31
+    lsp_lifecycle_active_builds_peak = 1
+    lsp_lifecycle_reserved_bytes_peak = 1
+    lsp_lifecycle_retained_bytes_peak = 1
+    lsp_lifecycle_peak_process_bytes = 536870912
+    lsp_lifecycle_memory_sample_available = 1
+    lsp_lifecycle_memory_metric_private_bytes = 1
+    lsp_lifecycle_old_requests_held_peak = 1
+    lsp_lifecycle_old_epoch_consistent = 1
+    lsp_lifecycle_new_epoch_consistent = 1
+    lsp_lifecycle_generation_mismatches = 0
+    lsp_lifecycle_database_identity_mismatches = 0
+    lsp_lifecycle_cancelled_compactions = 1
+    lsp_lifecycle_hover_requests = 1
+    lsp_lifecycle_hover_p50_us = 1
+    lsp_lifecycle_hover_p95_us = 1
+    lsp_lifecycle_hover_max_us = 1
+    lsp_lifecycle_definition_requests = 1
+    lsp_lifecycle_definition_p50_us = 1
+    lsp_lifecycle_definition_p95_us = 1
+    lsp_lifecycle_definition_max_us = 1
+    lsp_lifecycle_completion_requests = 64
+    lsp_lifecycle_completion_candidates_min = 1
+    lsp_lifecycle_completion_p95_us = 50000
+    lsp_lifecycle_completion_entries_inspected_min = 1
+    lsp_lifecycle_completion_entries_inspected_max = 16384
+    lsp_lifecycle_completion_candidate_budget_min = 16384
+    lsp_lifecycle_completion_candidate_budget_max = 16384
+    lsp_lifecycle_completion_indexed_returned_min = 1
+    lsp_lifecycle_completion_active_entries_min = 500000
+    lsp_lifecycle_completion_truncated_requests = 64
+    lsp_lifecycle_completion_sql_reads = 0
+    lsp_lifecycle_dirty_updates_applied = 3
+    lsp_lifecycle_final_active_builds = 0
+    lsp_lifecycle_final_reserved_bytes = 0
+    lsp_lifecycle_database_size_bytes = 1
+    lsp_lifecycle_elapsed_ms = 1
+    lsp_lifecycle_write_ms = 1
+}
+Assert-LspLifecycleGate -CaseId 'u-boot-lsp-lifecycle' -Metrics $validLifecycleMetrics
+
+$missingLifecycleMetrics = $validLifecycleMetrics.Clone()
+$missingLifecycleMetrics.Remove('lsp_lifecycle_old_epoch_consistent')
+$missingRejected = $false
+try {
+    Assert-LspLifecycleGate -CaseId 'u-boot-lsp-lifecycle' -Metrics $missingLifecycleMetrics
+} catch {
+    $missingRejected = $true
+}
+if (-not $missingRejected) {
+    throw 'The LSP lifecycle gate accepted a result with a missing required field.'
+}
+
+$overMemoryMetrics = $validLifecycleMetrics.Clone()
+$overMemoryMetrics.lsp_lifecycle_peak_process_bytes = 536870913
+$overMemoryRejected = $false
+try {
+    Assert-LspLifecycleGate -CaseId 'u-boot-lsp-lifecycle' -Metrics $overMemoryMetrics
+} catch {
+    $overMemoryRejected = $true
+}
+if (-not $overMemoryRejected) {
+    throw 'The U-Boot LSP lifecycle gate accepted a peak above 512 MiB.'
+}
+
+$mixedGenerationMetrics = $validLifecycleMetrics.Clone()
+$mixedGenerationMetrics.lsp_lifecycle_generation_mismatches = 1
+$mixedGenerationRejected = $false
+try {
+    Assert-LspLifecycleGate -CaseId 'u-boot-lsp-lifecycle' -Metrics $mixedGenerationMetrics
+} catch {
+    $mixedGenerationRejected = $true
+}
+if (-not $mixedGenerationRejected) {
+    throw 'The LSP lifecycle gate accepted mixed-generation request results.'
+}
+$shortCompletionMetrics = $validLifecycleMetrics.Clone()
+$shortCompletionMetrics.lsp_lifecycle_completion_requests = 63
+$shortCompletionRejected = $false
+try {
+    Assert-LspLifecycleGate -CaseId 'u-boot-lsp-lifecycle' -Metrics $shortCompletionMetrics
+} catch {
+    $shortCompletionRejected = $true
+}
+if (-not $shortCompletionRejected) {
+    throw 'The LSP lifecycle gate accepted fewer than 64 completion requests.'
+}
 $benchmarkSource = Get-Content -Raw -LiteralPath $benchmarkScript
 if ($benchmarkSource -notmatch 'Assert-FullIndexPerformanceGate' -or
     $benchmarkSource -notmatch "-like '\*-full-index'" -or
@@ -59,7 +150,15 @@ foreach ($metricName in @(
     'warm_publication_first_file_relations_bytes',
     'warm_publication_second_file_relations_bytes',
     'warm_publication_second_generation_incremental_bytes',
-    'warm_publication_old_generation_consistent'
+    'warm_publication_old_generation_consistent',
+    'lsp_lifecycle_active_builds_peak',
+    'lsp_lifecycle_old_epoch_consistent',
+    'lsp_lifecycle_hover_p95_us',
+    'lsp_lifecycle_definition_p95_us',
+    'lsp_lifecycle_completion_p95_us',
+    'lsp_lifecycle_completion_entries_inspected_max',
+    'lsp_lifecycle_completion_sql_reads',
+    'lsp_lifecycle_database_identity_mismatches'
 )) {
     if ($metricWhitelist.Value -notmatch [regex]::Escape($metricName)) {
         throw "The large-workspace runner drops the required engine metric: $metricName"
@@ -82,6 +181,10 @@ if ($defaultCases -contains 'u-boot-engine-hydration') {
 if ($defaultCases -contains 'u-boot-completion-replay') {
     throw 'The U-Boot completion replay case leaked into the default benchmark plan.'
 }
+if ($defaultCases -contains 'u-boot-lsp-lifecycle' -or
+    $defaultCases -contains 'wine-lsp-lifecycle') {
+    throw 'The LSP lifecycle cases leaked into the default benchmark plan.'
+}
 
 $engineCases = @(
     & powershell -NoProfile -ExecutionPolicy Bypass -File $benchmarkScript `
@@ -98,6 +201,16 @@ $completionCases = @(
 )
 if ($LASTEXITCODE -ne 0 -or $completionCases -notcontains 'u-boot-completion-replay') {
     throw "Completion replay benchmark case listing failed:`n$($completionCases -join "`n")"
+}
+$lifecycleCases = @(
+    & powershell -NoProfile -ExecutionPolicy Bypass -File $benchmarkScript `
+        -ListCases -IncludeLspLifecycle 2>&1 |
+        ForEach-Object { $_.ToString() }
+)
+if ($LASTEXITCODE -ne 0 -or
+    $lifecycleCases -notcontains 'u-boot-lsp-lifecycle' -or
+    $lifecycleCases -notcontains 'wine-lsp-lifecycle') {
+    throw "LSP lifecycle benchmark case listing failed:`n$($lifecycleCases -join "`n")"
 }
 $combinedGateCases = @(
     & powershell -NoProfile -ExecutionPolicy Bypass -File $benchmarkScript `
@@ -136,6 +249,19 @@ if ($completionHarnessSource -notmatch 'cargo test' -or
     $completionHarnessSource -notmatch 'FOSSILSENSE_BENCH_DB' -or
     $completionHarnessSource -notmatch 'FOSSILSENSE_BENCH_ROOT') {
     throw 'The completion replay harness does not execute the release U-Boot LSP gate.'
+}
+$lifecycleHarness = Join-Path $PSScriptRoot 'benchmark_lsp_lifecycle.ps1'
+if (-not (Test-Path -LiteralPath $lifecycleHarness -PathType Leaf)) {
+    throw 'The LSP lifecycle benchmark harness is missing.'
+}
+$lifecycleHarnessSource = Get-Content -Raw -LiteralPath $lifecycleHarness
+if ($lifecycleHarnessSource -notmatch 'cargo test' -or
+    $lifecycleHarnessSource -notmatch 'benchmark_lsp_index_lifecycle_gate' -or
+    $lifecycleHarnessSource -notmatch 'Assert-LspLifecycleGate' -or
+    $lifecycleHarnessSource -notmatch 'FOSSILSENSE_BENCH_DB' -or
+    $lifecycleHarnessSource -notmatch 'FOSSILSENSE_BENCH_ROOT' -or
+    $lifecycleHarnessSource -notmatch 'FOSSILSENSE_BENCH_SAMPLE') {
+    throw 'The LSP lifecycle harness does not execute and validate the production lifecycle gate.'
 }
 
 $allCases = @(
@@ -234,12 +360,15 @@ try {
         throw 'Real semantic aggregate metrics were not preserved in the JSON report.'
     }
     if ([string]::IsNullOrWhiteSpace($report.command_line) -or
+        $report.source_revision -notmatch '^[0-9a-f]{40}$' -or
+        $report.source_change_fingerprint -notmatch '^[0-9a-f]{64}$' -or
         [string]::IsNullOrWhiteSpace($report.machine.os_version) -or
         $report.machine.processor_count -le 0 -or
         [string]::IsNullOrWhiteSpace($result.workspace) -or
         [string]::IsNullOrWhiteSpace($result.sample_revision) -or
+        $result.sample_change_fingerprint -notmatch '^[0-9a-f]{64}$' -or
         $result.database_size_bytes -lt 0) {
-        throw 'Benchmark JSON is missing the command, machine, sample revision, or database-size evidence required for reproduction.'
+        throw 'Benchmark JSON is missing the command, source fingerprint, machine, sample revision, or database-size evidence required for reproduction.'
     }
     if (Test-Path -LiteralPath (Join-Path $result.workspace '.git')) {
         $actualRevision = (& git -C $result.workspace rev-parse HEAD 2>$null |

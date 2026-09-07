@@ -23,7 +23,26 @@ struct ResourceUsage {
     memory_bytes: u64,
     index_disk_bytes: u64,
     memory: MemoryReport,
+    build: BuildResourceUsage,
     timestamp: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BuildResourceUsage {
+    active_builds: u64,
+    peak_active_builds: u64,
+    active_kind: Option<String>,
+    waiting_builds: u64,
+    deferred_roots: u64,
+    active_reserved_bytes: u64,
+    active_retained_bytes: u64,
+    peak_reserved_bytes: u64,
+    peak_retained_bytes: u64,
+    sampling_available: bool,
+    sampling_unavailable_count: u64,
+    budget_denial_count: u64,
+    cancellation_count: u64,
 }
 
 enum ResourceUsageNotification {}
@@ -62,6 +81,7 @@ pub(super) fn spawn_resource_usage_reporter(
                         .unwrap_or(0);
                     }
                     let memory_bytes = current_process_memory_bytes();
+                    let build_snapshot = session.cache.build_coordinator.snapshot();
                     let snapshots: Vec<Arc<EngineSnapshot>> = session
                         .cache
                         .engine_snapshots
@@ -102,6 +122,23 @@ pub(super) fn spawn_resource_usage_reporter(
                             memory_bytes,
                             index_disk_bytes,
                             memory,
+                            build: BuildResourceUsage {
+                                active_builds: build_snapshot.active_builds as u64,
+                                peak_active_builds: build_snapshot.peak_active_builds as u64,
+                                active_kind: build_snapshot
+                                    .active_kind
+                                    .map(|kind| kind.as_str().to_string()),
+                                waiting_builds: build_snapshot.waiting_builds as u64,
+                                deferred_roots: build_snapshot.deferred_roots as u64,
+                                active_reserved_bytes: build_snapshot.active_reserved_bytes as u64,
+                                active_retained_bytes: build_snapshot.active_retained_bytes as u64,
+                                peak_reserved_bytes: build_snapshot.peak_reserved_bytes as u64,
+                                peak_retained_bytes: build_snapshot.peak_retained_bytes as u64,
+                                sampling_available: build_snapshot.sampling_available,
+                                sampling_unavailable_count: build_snapshot.sampling_unavailable_count,
+                                budget_denial_count: build_snapshot.budget_denial_count,
+                                cancellation_count: build_snapshot.cancellation_count,
+                            },
                             timestamp,
                         })
                         .await;

@@ -28,6 +28,7 @@ type SnapshotMemoryReports =
 pub(in crate::server) struct CacheLedger {
     pub(in crate::server) engine_snapshots: EngineSnapshots,
     pub(in crate::server) publish_gate: Arc<Mutex<()>>,
+    pub(in crate::server) build_coordinator: crate::build_coordinator::BuildCoordinator,
     pub(super) next_engine_epoch: Arc<AtomicU64>,
     pub(in crate::server) reference_role_cache: Arc<references::ReferenceRoleCache>,
     pub(in crate::server) reference_search_cache: Arc<references::ReferenceSearchCache>,
@@ -132,6 +133,7 @@ impl Default for CacheLedger {
         Self {
             engine_snapshots: Arc::new(Mutex::new(HashMap::new())),
             publish_gate: Arc::new(Mutex::new(())),
+            build_coordinator: crate::build_coordinator::BuildCoordinator::default(),
             next_engine_epoch: Arc::new(AtomicU64::new(1)),
             reference_role_cache: Arc::new(references::ReferenceRoleCache::new()),
             reference_search_cache: Arc::new(references::ReferenceSearchCache::new()),
