@@ -184,6 +184,20 @@ fn record_declaration(
             record_key: record.record_key.clone(),
         },
     );
+    declaration.tag_kind = Some(match record.kind {
+        crate::semantic_model::RecordKind::Struct => {
+            crate::semantic_model::DeclarationTagKind::Struct
+        }
+        crate::semantic_model::RecordKind::Union => {
+            crate::semantic_model::DeclarationTagKind::Union
+        }
+        crate::semantic_model::RecordKind::Class => {
+            crate::semantic_model::DeclarationTagKind::Class
+        }
+        crate::semantic_model::RecordKind::Interface => {
+            crate::semantic_model::DeclarationTagKind::Interface
+        }
+    });
     if language == SourceLanguage::C {
         if let Some(tag_name) = record.tag_name.as_deref() {
             let tag_kind = match record.kind {
@@ -285,7 +299,11 @@ fn ast_symbol_declaration(
         |owner| format!("{owner}::{}", symbol.name),
     );
     let guard_fingerprint = symbol.guard.as_ref().map(|guard| digest(guard));
-    let linkage = if language == SourceLanguage::C && kind == SemanticDeclarationKind::Type {
+    let linkage = if kind == SemanticDeclarationKind::Type
+        && (language == SourceLanguage::C
+            || (role == SemanticDeclarationRole::Declaration
+                && matches!(symbol.tag_kind, Some("struct" | "union" | "class"))))
+    {
         LinkageDomain::External
     } else {
         LinkageDomain::Unknown
@@ -321,6 +339,9 @@ fn ast_symbol_declaration(
         guard_fingerprint,
         DeclarationBacking::SourceRange { range },
     );
+    declaration.tag_kind = symbol
+        .tag_kind
+        .and_then(crate::semantic_model::DeclarationTagKind::from_keyword);
     if language == SourceLanguage::C {
         if let Some(tag_kind) = symbol.tag_kind {
             declaration.identity.logical_key.canonical_signature =
@@ -360,6 +381,7 @@ fn fact(
         guard_fingerprint,
     };
     DeclarationFact {
+        tag_kind: None,
         identity: DeclarationIdentity {
             locator: DeclarationLocator {
                 workspace_id: String::new(),

@@ -430,6 +430,33 @@ impl CandidateQueryService<'_> {
         ))
     }
 
+    pub fn declaration_by_id(
+        &self,
+        id: i64,
+        original_name: &str,
+    ) -> Result<Option<ResolvedDeclarationCandidate>> {
+        let Some(handle) = self.handle else {
+            return Ok(None);
+        };
+        let row = if let Some(index) = self.declaration_index {
+            index
+                .payloads_by_ids(handle, &[id])?
+                .pop()
+                .map(|row| (*row).clone())
+        } else {
+            handle
+                .read(|store| store.declaration_view().by_ids(&[id]))?
+                .pop()
+        };
+        Ok(row
+            .filter(|row| {
+                row.fact.name == original_name
+                    && row.fact.identity.language.semantic_family() == self.semantic_family
+                    && !self.overlays.shadows(&row.fact.path)
+            })
+            .map(|row| self.candidate_from_row(row)))
+    }
+
     pub fn resolve_candidate_handle(
         &self,
         candidate: &CandidateHandle,
@@ -453,69 +480,36 @@ impl CandidateQueryService<'_> {
                 {
                     return Ok(None);
                 }
-                Ok(self
-                    .semantic_candidates(&row.fact.name, SemanticIntent::Neutral)?
-                    .all
-                    .into_iter()
-                    .flat_map(|group| group.candidates)
-                    .find(|resolved| resolved.persistent_id == Some(*declaration_id)))
-            }
-            CandidateHandleLocator::Overlay { fingerprint } => {
-                let Some(entry) = self.overlays.declaration_by_fingerprint(fingerprint) else {
-                    let name = candidate
-                        .logical_key
-                        .qualified_name
-                        .rsplit("::")
-                        .next()
-                        .unwrap_or(candidate.logical_key.qualified_name.as_str());
-                    if let Some(resolved) = self
-                        .semantic_candidates(name, SemanticIntent::Neutral)?
-                        .all
-                        .into_iter()
-                        .flat_map(|group| group.candidates)
-                        .find(|resolved| {
-                            resolved.fact.identity.logical_key == candidate.logical_key
-                        })
-                    {
-                        return Ok(Some(resolved));
-                    }
-                    let Some(read_handle) = self.handle else {
-                        return Ok(None);
-                    };
-                    let (rows, _) = read_handle.read(|store| {
-                        store.declaration_view().by_logical_key_family_limited(
-                            &candidate.logical_key,
-                            self.semantic_family,
-                            self.exact_name_limit,
-                        )
-                    })?;
-                    let Some(name) = rows
-                        .into_iter()
-                        .find(|row| !self.overlays.shadows(&row.fact.path))
-                        .map(|row| row.fact.name)
-                    else {
-                        return Ok(None);
-                    };
-                    return Ok(self
-                        .semantic_candidates(&name, SemanticIntent::Neutral)?
-                        .all
-                        .into_iter()
-                        .flat_map(|group| group.candidates)
-                        .find(|resolved| {
-                            resolved.fact.identity.logical_key == candidate.logical_key
-                        }));
-                };
-                if entry.fact.identity.logical_key != candidate.logical_key
-                    || entry.fact.identity.locator.fingerprint != candidate.locator_fingerprint
-                {
+                if row.fact.identity.language.semantic_family() != self.semantic_family {
                     return Ok(None);
                 }
-                Ok(self
-                    .semantic_candidates(&entry.fact.name, SemanticIntent::Neutral)?
-                    .all
-                    .into_iter()
-                    .flat_map(|group| group.candidates)
-                    .find(|resolved| resolved.fact.identity.locator.fingerprint == *fingerprint))
+                Ok(Some(self.candidate_from_row(row)))
+            }
+            CandidateHandleLocator::Overlay { fingerprint } => {
+                if fingerprint != &candidate.locator_fingerprint {
+                    return Ok(None);
+                }
+                if let Some(entry) = self.overlays.declaration_by_fingerprint(fingerprint) {
+                    return Ok((entry.fact.identity.logical_key == candidate.logical_key
+                        && entry.fact.identity.language.semantic_family()
+                            == self.semantic_family)
+                        .then(|| self.candidate_from_overlay(entry)));
+                }
+                let Some(read_handle) = self.handle else {
+                    return Ok(None);
+                };
+                let row = read_handle.read(|store| {
+                    store
+                        .declaration_view()
+                        .by_locator_fingerprint_family(fingerprint, self.semantic_family)
+                })?;
+                Ok(row
+                    .filter(|row| {
+                        row.fact.identity.locator.fingerprint == candidate.locator_fingerprint
+                            && row.fact.identity.logical_key == candidate.logical_key
+                            && !self.overlays.shadows(&row.fact.path)
+                    })
+                    .map(|row| self.candidate_from_row(row)))
             }
         }
     }

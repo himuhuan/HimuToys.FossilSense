@@ -575,6 +575,18 @@ impl IndexStore {
                        )",
                 [],
             )?;
+            // Bulk cleanup has FK enforcement suspended. Preserve both the
+            // declaration and revision cascades of compact entity occurrences.
+            tx.execute(
+                "DELETE FROM entity_occurrences
+                 WHERE revision_id IN (SELECT revision_id FROM cleanup_obsolete_revisions)
+                    OR declaration_id IN (
+                        SELECT id FROM declaration_facts
+                        WHERE revision_id IN (SELECT revision_id FROM cleanup_obsolete_revisions)
+                           OR file_id IN (SELECT file_id FROM cleanup_orphan_files)
+                    )",
+                [],
+            )?;
             tx.execute(
                 "DELETE FROM protobuf_c_sources
                  WHERE declaration_id IN (

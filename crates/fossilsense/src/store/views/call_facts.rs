@@ -72,6 +72,32 @@ impl<'a> CallFactStoreView<'a> {
         Self { store }
     }
 
+    pub fn anchors_by_ids_family(
+        &self,
+        ids: &[i64],
+        family: crate::semantic_model::SemanticFamily,
+    ) -> Result<Vec<CallableAnchorRow>> {
+        anyhow::ensure!(ids.len() <= 256, "callable detail ID budget exceeded");
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let language = semantic_family_sql_predicate(family, "rev.language");
+        let placeholders = vec!["?"; ids.len()].join(",");
+        let values: Vec<_> = ids.iter().map(i64::to_string).collect();
+        let params: Vec<_> = values.iter().map(String::as_str).collect();
+        let mut rows = Vec::new();
+        self.visit_anchors(
+            &format!("WHERE a.id IN ({placeholders}) AND {language}"),
+            &params,
+            Some(ids.len()),
+            |row| {
+                rows.push(row);
+                Ok(())
+            },
+        )?;
+        Ok(rows)
+    }
+
     pub fn anchors_by_entity_key_family_limited(
         &self,
         entity_key: &str,

@@ -1,11 +1,12 @@
+use crate::semantic_model::LogicalEntityKey;
 use anyhow::{Context, Result};
 use rusqlite::params;
 
 use crate::call_model::{LinkageDomain, SourcePosition, SourceRange};
 use crate::semantic_model::{
     DeclarationBacking, DeclarationFact, DeclarationIdentity, DeclarationLocator, LanguageFidelity,
-    LogicalEntityKey, SemanticDeclarationKind, SemanticDeclarationRole, SemanticFactFidelity,
-    SemanticFactProvenance, SemanticLanguage,
+    SemanticDeclarationKind, SemanticDeclarationRole, SemanticFactFidelity, SemanticFactProvenance,
+    SemanticLanguage,
 };
 
 use crate::store::IndexStore;
@@ -24,7 +25,7 @@ const SELECT: &str = "SELECT
     d.backing_kind, d.backing_id, d.backing_key,
     d.backing_start_byte, d.backing_end_byte,
     f.path, rev.source, f.directly_included,
-    rev.id, rev.size, rev.mtime_ns, rev.hash
+    rev.id, rev.size, rev.mtime_ns, rev.hash, d.tag_kind
     FROM declarations d
     JOIN file_entries f ON f.id = d.file_id
     JOIN file_revisions rev ON rev.id = d.revision_id";
@@ -266,6 +267,33 @@ impl<'a> DeclarationStoreView<'a> {
         Ok(truncate(output, limit))
     }
 
+    pub fn at_name_range(
+        &self,
+        path: &str,
+        start: SourcePosition,
+        end: SourcePosition,
+    ) -> Result<Vec<DeclarationReadRow>> {
+        let sql = format!("{SELECT} WHERE d.revision_id = (SELECT a.revision_id FROM active_file_revisions a JOIN file_entries f ON f.id = a.file_id WHERE f.path = ?1) AND d.name_start_line = ?2 AND d.name_start_col = ?3 AND d.name_end_line = ?4 AND d.name_end_col = ?5 LIMIT 8");
+        self.read(
+            &sql,
+            params![path, start.line, start.character, end.line, end.character],
+        )
+    }
+
+    /// Resolve a previously selected occurrence without rediscovering its name.
+    /// Two matches are enough to reject an ambiguous fingerprint conservatively.
+    pub fn by_locator_fingerprint_family(
+        &self,
+        fingerprint: &str,
+        family: crate::semantic_model::SemanticFamily,
+    ) -> Result<Option<DeclarationReadRow>> {
+        let language = semantic_family_sql_predicate(family, "d.language");
+        let sql =
+            format!("{SELECT} WHERE d.locator_fingerprint = unhex(?1) AND {language} LIMIT 2");
+        let mut rows = self.read(&sql, params![fingerprint])?;
+        Ok(if rows.len() == 1 { rows.pop() } else { None })
+    }
+
     pub fn by_ids(&self, ids: &[i64]) -> Result<Vec<DeclarationReadRow>> {
         let mut by_id = std::collections::HashMap::new();
         for chunk in ids.chunks(400) {
@@ -295,31 +323,6 @@ impl<'a> DeclarationStoreView<'a> {
             .unwrap_or(key.qualified_name.as_str());
         let sql = format!(
             "{SELECT} WHERE d.name = ?1 AND d.logical_key_digest = ?2 ORDER BY d.id LIMIT ?3"
-        );
-        let rows = self.read(&sql, params![name, digest, limit.saturating_add(1) as i64])?;
-        let rows = rows
-            .into_iter()
-            .filter(|row| &row.fact.identity.logical_key == key)
-            .collect();
-        Ok(truncate(rows, limit))
-    }
-
-    pub fn by_logical_key_family_limited(
-        &self,
-        key: &LogicalEntityKey,
-        semantic_family: crate::semantic_model::SemanticFamily,
-        limit: usize,
-    ) -> Result<(Vec<DeclarationReadRow>, bool)> {
-        let digest = logical_key_digest(key)?;
-        let name = key
-            .qualified_name
-            .rsplit("::")
-            .next()
-            .unwrap_or(key.qualified_name.as_str());
-        let language = semantic_family_sql_predicate(semantic_family, "d.language");
-        let sql = format!(
-            "{SELECT} WHERE d.name = ?1 AND d.logical_key_digest = ?2 AND {language} \
-             ORDER BY d.id LIMIT ?3"
         );
         let rows = self.read(&sql, params![name, digest, limit.saturating_add(1) as i64])?;
         let rows = rows
@@ -452,6 +455,13 @@ fn declaration_row(row: &rusqlite::Row<'_>) -> Result<DeclarationReadRow> {
         role,
     };
     let fact = DeclarationFact {
+        tag_kind: row
+            .get::<_, Option<i64>>(44)?
+            .map(|code| {
+                crate::semantic_model::DeclarationTagKind::from_code(code)
+                    .with_context(|| format!("invalid tag kind {code}"))
+            })
+            .transpose()?,
         identity,
         name,
         qualified_name,
@@ -661,6 +671,7 @@ fn truncate(mut rows: Vec<DeclarationReadRow>, limit: usize) -> (Vec<Declaration
     (rows, truncated)
 }
 
+#[cfg(test)]
 pub(crate) fn logical_key_digest(key: &LogicalEntityKey) -> Result<Vec<u8>> {
     let encoded = serde_json::to_vec(key)?;
     Ok(blake3::hash(&encoded).as_bytes()[..12].to_vec())

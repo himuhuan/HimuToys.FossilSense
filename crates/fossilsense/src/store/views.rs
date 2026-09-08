@@ -6,6 +6,11 @@ use crate::reachability::OpenReason;
 mod call_facts;
 mod coverage;
 mod declarations;
+mod entities;
+#[allow(unused_imports)]
+pub use entities::{
+    EntityOccurrencePage, EntityOccurrenceReadRow, EntityStoreView, ENTITY_PAGE_LIMIT,
+};
 mod go_package_graph;
 mod member;
 mod package_imports;

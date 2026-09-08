@@ -149,7 +149,13 @@ impl Backend {
                     timer,
                 )
                 .await;
-            let locations = super::member_navigation::locations(&members);
+            let locations = self
+                .member_entity_locations(
+                    &query_session,
+                    members,
+                    operation == NavigationOperation::Declaration,
+                )
+                .await;
             return Ok((!locations.is_empty()).then_some(GotoDefinitionResponse::Array(locations)));
         }
 
@@ -227,90 +233,27 @@ impl Backend {
                         semantic_family,
                     );
                 let call_context = service.complete_call_context_at(source_position)?;
-                let semantic_set = service.semantic_candidates_with_policy(
+                let (semantic_set, subjects) = service.resolve_subject(
                     &word,
-                    if call_context.is_some() {
-                        crate::candidate_service::SemanticIntent::Call
-                    } else {
-                        crate::candidate_service::SemanticIntent::Neutral
-                    },
+                    if call_context.is_some() { crate::candidate_service::SemanticIntent::Call }
+                    else { crate::candidate_service::SemanticIntent::Neutral },
                     crate::candidate_service::LookupPolicy::BoundDomain { domain: syntax.domain, qualifier: syntax.qualifier.as_deref() },
+                    call_context,
                 )?;
-                let semantic_count = semantic_set
-                    .all
-                    .iter()
-                    .map(|group| group.candidates.len())
-                    .sum();
-                let callable_fingerprints =
-                    crate::candidate_service::focused_callable_fingerprints(&semantic_set);
-                let callable_set = if callable_fingerprints.is_empty() {
-                    None
-                } else {
-                    Some(service.callable_candidates(&word, call_context.clone())?)
+                let semantic_count = semantic_set.all.iter().map(|group| group.candidates.len()).sum();
+                let related = service.entity_locations_at(&subjects, operation == NavigationOperation::Declaration, Some(source_position))?;
+                let candidates = related.candidates();
+                let mut perf = SemanticRequestPerf {
+                    reach_us, entity_visits: related.coverage.entities,
+                    entity_edges: related.coverage.edges, entity_locations: related.locations.len(),
+                    entity_truncated: related.coverage.truncated, ..Default::default()
                 };
-                let mut perf = callable_set
-                    .as_ref()
-                    .map(SemanticRequestPerf::from_callable_set)
-                    .unwrap_or_default();
-                perf.reach_us = reach_us;
-                if let Some(callable_set) = callable_set
-                    .as_ref()
-                    .filter(|set| !set.anchors.is_empty())
-                {
-                    let mut selected = match operation {
-                        NavigationOperation::Definition => {
-                            query::call_definition_presentations(&callable_set.groups)
-                        }
-                        NavigationOperation::Declaration => {
-                            query::call_declaration_presentations_at(
-                                &callable_set.groups,
-                                &current_rel,
-                                source_cursor_byte,
-                            )
-                        }
-                    };
-                    selected.retain(|candidate| {
-                        callable_fingerprints
-                            .contains(candidate.anchor.anchor_fingerprint.as_str())
-                    });
-                    let candidates: Vec<_> = selected
-                        .iter()
-                        .map(|candidate| candidate.candidate.clone())
-                        .collect();
-                    perf.query_us = query_started.elapsed().as_micros();
-                    let mut debug_lines = candidate_reason_log_lines(&candidates, debug_reasons);
-                    if debug_reasons && callable_set.arity_mismatch_fallback {
-                        debug_lines.insert(
-                            0,
-                            "arity_mismatch_fallback: no candidate matched the available argument-count evidence; retained candidates use fallback confidence"
-                                .to_string(),
-                        );
-                    }
-                    if debug_reasons {
-                        debug_lines.insert(0, candidate_set_debug_line(&semantic_set));
-                    }
-                    let render_started = std::time::Instant::now();
-                    let locations: Vec<Location> = candidates
-                        .iter()
-                        .filter_map(|candidate| candidate_to_location(&root, candidate))
-                        .collect();
-                    perf.returned = locations.len();
-                    perf.render_us += render_started.elapsed().as_micros();
-                    if !locations.is_empty() {
-                        return Ok((locations, debug_lines, perf));
-                    }
-                }
-
-                let candidates = crate::candidate_service::navigation_presentations(
-                    &semantic_set,
-                    operation == NavigationOperation::Declaration,
-                    &current_rel,
-                );
                 perf.include_non_callable_candidates(semantic_count);
                 perf.query_us = query_started.elapsed().as_micros();
                 let mut debug_lines = candidate_reason_log_lines(&candidates, debug_reasons);
                 if debug_reasons {
                     debug_lines.insert(0, candidate_set_debug_line(&semantic_set));
+                    debug_lines.push(format!("entity_locations: {} entities={} edges={} truncated={}", related.diagnostic(), related.coverage.entities, related.coverage.edges, related.coverage.truncated));
                 }
                 let render_started = std::time::Instant::now();
                 let locations: Vec<Location> = candidates
@@ -330,6 +273,11 @@ impl Backend {
             .and_then(|result| result.as_ref().ok().map(|(_, _, metrics)| *metrics))
             .unwrap_or_default();
         timer.observation.query_us = metrics.query_us;
+        timer.observation.entity_visits = metrics.entity_visits;
+        timer.observation.entity_edges = metrics.entity_edges;
+        timer.observation.entity_locations = metrics.entity_locations;
+        timer.observation.entity_truncated = metrics.entity_truncated;
+
         timer.observation.hydration_us = metrics.hydration_us;
         timer.observation.render_us = metrics.render_us;
         self.perf_log(|| metrics.log_line(operation.label(), total_started.elapsed().as_micros()))

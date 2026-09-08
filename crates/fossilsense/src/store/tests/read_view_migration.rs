@@ -107,7 +107,8 @@ fn core_symbol_features_route_through_candidate_sets_and_stable_handles() {
             assert_present(
                 path,
                 &[
-                    "semantic_candidates_with_policy(",
+                    "resolve_subject(",
+                    "entity_locations_at(",
                     "LookupPolicy::BoundDomain",
                     "capture_query_session(",
                 ],
@@ -133,8 +134,8 @@ fn core_symbol_features_route_through_candidate_sets_and_stable_handles() {
         &[
             "new_with_declarations_for_family(",
             "resolve_candidate_handle(&handle)",
-            "semantic_candidates(",
-            "persistent_id == Some(declaration_id)",
+            "entity_documentation_locations(&subjects)",
+            "declaration_by_id(declaration_id, &declaration_name)",
         ],
     );
     assert_absent(

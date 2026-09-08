@@ -1,8 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::call_model::{
-    AnchorRole, CallableKind, LinkageDomain, OwnerKindHint, SignatureFidelity,
-};
+use crate::call_model::AnchorRole;
 use crate::model::ScopeTier;
 use crate::reachability::ReachScope;
 
@@ -128,37 +126,11 @@ fn strict_edge(
     header: &ResolvedCallableAnchor,
     source_reach: &HashMap<String, ReachScope>,
 ) -> bool {
-    if !strict_identity_compatible(source, header) {
-        return false;
-    }
-    source_reach
+    let reachable = source_reach
         .get(&source.anchor.path)
-        .is_some_and(|scope| scope.files.contains(&header.anchor.path))
-}
-
-fn strict_identity_compatible(
-    source: &ResolvedCallableAnchor,
-    header: &ResolvedCallableAnchor,
-) -> bool {
-    !(source.anchor.name != header.anchor.name
-        || source.anchor.kind != header.anchor.kind
-        || source.anchor.kind != CallableKind::Function
-        || !is_free_function(source)
-        || !is_free_function(header)
-        || source.anchor.qualified_name != header.anchor.qualified_name
-        || source.canonical_signature().is_empty()
-        || source.canonical_signature() != header.canonical_signature()
-        || source.anchor.signature_fidelity != SignatureFidelity::AstExact
-        || header.anchor.signature_fidelity != SignatureFidelity::AstExact
-        || !matches!(source.anchor.linkage, LinkageDomain::External)
-        || !matches!(header.anchor.linkage, LinkageDomain::External))
-}
-
-fn is_free_function(anchor: &ResolvedCallableAnchor) -> bool {
-    matches!(
-        anchor.anchor.owner_kind,
-        None | Some(OwnerKindHint::Namespace)
-    )
+        .is_some_and(|scope| scope.files.contains(&header.anchor.path));
+    crate::semantic_model::callable_relation(&source.anchor, &header.anchor, reachable).strength
+        == crate::semantic_model::RelationStrength::Proven
 }
 
 fn is_source_definition(anchor: &ResolvedCallableAnchor) -> bool {

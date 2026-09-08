@@ -4622,3 +4622,48 @@ fn declaration_and_call_relation_masks_are_strictly_decoupled() {
     assert!(!records_only.records.is_empty());
     assert!(records_only.declarations.is_empty());
 }
+
+#[test]
+fn cpp_forward_tags_keep_typed_kind_without_fabricated_record_bodies() {
+    use crate::semantic_model::{DeclarationTagKind as Tag, SemanticDeclarationRole as Role};
+    let parsed = parse(
+        std::path::Path::new("forward.h"),
+        "struct Device;\nunion Payload;\nclass Worker;\n",
+    );
+    assert_eq!(
+        parsed.language,
+        crate::semantic_model::SemanticLanguage::Cpp
+    );
+    assert!(parsed.records.is_empty());
+    for (name, kind) in [
+        ("Device", Tag::Struct),
+        ("Payload", Tag::Union),
+        ("Worker", Tag::Class),
+    ] {
+        let fact = parsed
+            .declarations
+            .iter()
+            .find(|fact| fact.name == name)
+            .expect("forward canonical fact");
+        assert_eq!(fact.tag_kind, Some(kind));
+        assert_eq!(fact.role, Role::Declaration);
+    }
+}
+
+#[test]
+fn cpp_forward_tags_exclude_type_uses_and_keep_namespace_declarations() {
+    let parsed = parse(std::path::Path::new("forward.h"),
+        "struct Outer { int field; };\ntypedef struct Outer Alias;\nstruct Outer *object;\nnamespace N { struct Device; }\nvoid use(struct Outer *param);\n");
+    let outer: Vec<_> = parsed
+        .declarations
+        .iter()
+        .filter(|fact| fact.name == "Outer")
+        .collect();
+    assert_eq!(
+        outer.len(),
+        1,
+        "type uses must not become new declarations: {outer:?}"
+    );
+    assert!(parsed.declarations.iter().any(|fact| fact.name == "Device"
+        && fact.role == crate::semantic_model::SemanticDeclarationRole::Declaration));
+}

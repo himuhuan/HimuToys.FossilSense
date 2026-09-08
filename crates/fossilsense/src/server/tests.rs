@@ -618,6 +618,10 @@ fn text_and_position(marked: &str) -> (String, u32, u32) {
 #[test]
 fn semantic_candidate_perf_log_contains_only_aggregate_contract_fields() {
     let metrics = super::SemanticRequestPerf {
+        entity_visits: 1,
+        entity_edges: 2,
+        entity_locations: 1,
+        entity_truncated: false,
         render_us: 0,
         candidates: crate::query::CallableCandidateMetrics {
             raw_candidates: 9,
@@ -11915,3 +11919,5 @@ async fn pressure_failed_full_rebuild_keeps_production_queries_and_cleans_stagin
 }
 
 mod member_resolution;
+
+mod entity_locations;

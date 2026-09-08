@@ -192,9 +192,9 @@ pub struct CallableAnchor {
     pub role: AnchorRole,
     pub linkage: LinkageDomain,
     pub signature: SignatureShape,
-    /// Full normalized declaration spelling used only for conservative
-    /// declaration/definition identity. It deliberately retains parameter
-    /// names and storage spelling and performs no type equivalence.
+    /// Structural spelling used for supported declaration/definition identity.
+    /// C/C++ parser normalization removes parameter names and non-identity
+    /// storage spelling; it does not perform general type equivalence.
     #[serde(skip)]
     pub canonical_signature: String,
     /// Human-readable declaration spelling with a function body removed.

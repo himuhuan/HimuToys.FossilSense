@@ -7,6 +7,60 @@ use crate::model;
 use tower_lsp::lsp_types::{HoverContents, MarkupContent, MarkupKind, Position, Range};
 
 impl Backend {
+    pub(super) async fn member_entity_locations(
+        &self,
+        session: &super::query_session::QuerySession,
+        members: Vec<OwnerMemberRef>,
+        declaration: bool,
+    ) -> Vec<Location> {
+        let fallback = locations(&members);
+        if !members
+            .iter()
+            .any(|selected| selected.member.kind == parser::MemberKind::Method)
+        {
+            return fallback;
+        }
+        let overlay = self
+            .candidate_overlay_snapshot_from_documents(
+                &session.root,
+                session.context.engine.clone(),
+                session.documents.clone(),
+            )
+            .await;
+        let root = session.root.clone();
+        let engine = session.context.engine.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Location>> {
+            let family = members
+                .first()
+                .map(|member| member.family)
+                .unwrap_or(crate::semantic_model::SemanticFamily::CFamily);
+            let service =
+                crate::candidate_service::CandidateQueryService::new_with_declarations_for_family(
+                    engine.call_read_handle.as_deref(),
+                    engine.declaration_index.as_deref(),
+                    &overlay,
+                    "",
+                    None,
+                    engine.reach_graph.as_deref(),
+                    family,
+                );
+            let subjects = service.member_entity_subjects(&members)?;
+            if subjects.is_empty() {
+                return Ok(fallback.clone());
+            }
+            let related = service.entity_locations_at(&subjects, declaration, None)?;
+            Ok(related
+                .candidates()
+                .iter()
+                .filter_map(|candidate| candidate_to_location(&root, candidate))
+                .collect())
+        })
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default()
+    }
+
     pub(super) async fn member_hover(
         &self,
         members: Vec<OwnerMemberRef>,

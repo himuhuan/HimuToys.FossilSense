@@ -4,6 +4,10 @@ use crate::query;
 pub(in crate::server) struct SemanticRequestPerf {
     pub(in crate::server) candidates: query::CallableCandidateMetrics,
     pub(in crate::server) returned: usize,
+    pub(in crate::server) entity_visits: usize,
+    pub(in crate::server) entity_edges: usize,
+    pub(in crate::server) entity_locations: usize,
+    pub(in crate::server) entity_truncated: bool,
     pub(in crate::server) hydration_count: usize,
     pub(in crate::server) hydration_bytes: usize,
     pub(in crate::server) query_us: u128,

@@ -23,9 +23,10 @@ function Assert-FullIndexPerformanceGate {
 function Get-BindingReplayMetricNames {
     'binding_replay_declarations'
     'binding_replay_files'
+    'binding_replay_entity_occurrences'
     foreach ($phase in @('cold', 'warm', 'edited')) {
         foreach ($feature in @('hover', 'definition')) {
-            foreach ($metric in @('requests', 'correct_targets', 'p50_us', 'p95_us', 'p99_us', 'sqlite_read_sessions', 'parse_cache_hits', 'capture_p95_us', 'parse_p95_us', 'binding_p95_us', 'overlay_p95_us', 'query_p95_us', 'hydration_p95_us', 'render_p95_us')) {
+            foreach ($metric in @('requests', 'correct_targets', 'p50_us', 'p95_us', 'p99_us', 'sqlite_read_sessions', 'parse_cache_hits', 'entity_visits_max', 'entity_edges_max', 'entity_locations_max', 'entity_truncated_requests', 'capture_p95_us', 'parse_p95_us', 'binding_p95_us', 'overlay_p95_us', 'query_p95_us', 'hydration_p95_us', 'render_p95_us')) {
                 "binding_${phase}_${feature}_${metric}"
             }
         }
@@ -40,6 +41,9 @@ function Assert-BindingReplayGate([System.Collections.IDictionary]$Metrics) {
     foreach ($phase in @('cold', 'warm', 'edited')) {
         foreach ($feature in @('hover', 'definition')) {
             $prefix = "binding_${phase}_${feature}"
+            if ($Metrics["${prefix}_entity_visits_max"] -lt 1 -or $Metrics["${prefix}_entity_visits_max"] -gt 64 -or
+                $Metrics["${prefix}_entity_edges_max"] -gt 1024 -or $Metrics["${prefix}_entity_locations_max"] -gt 256 -or
+                $Metrics["${prefix}_entity_truncated_requests"] -gt 64) { throw "Binding replay entity budget exceeded: $prefix" }
             if ($Metrics["${prefix}_requests"] -ne 64 -or $Metrics["${prefix}_correct_targets"] -ne 64) { throw "Binding replay incorrect target or request count: $prefix" }
             if ($Metrics["${prefix}_p50_us"] -gt $Metrics["${prefix}_p95_us"] -or $Metrics["${prefix}_p95_us"] -gt $Metrics["${prefix}_p99_us"]) { throw "Binding replay invalid percentiles: $prefix" }
         }

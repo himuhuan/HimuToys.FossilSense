@@ -509,6 +509,15 @@ impl IndexStore {
             "SQLite foreign_key_check reported a violation"
         );
         drop(foreign_key_check);
+        let mut occurrence_check = self.conn.prepare(
+            "SELECT 1 FROM declaration_facts d
+             LEFT JOIN entity_occurrences e ON e.declaration_id=d.id
+             WHERE e.declaration_id IS NULL OR e.revision_id != d.revision_id OR e.role != d.role LIMIT 1"
+        )?;
+        anyhow::ensure!(
+            !occurrence_check.exists([])?,
+            "entity occurrence integrity check failed"
+        );
         Ok(())
     }
 
@@ -941,6 +950,16 @@ impl IndexStore {
         }
 
         transaction.execute_batch(schema::CREATE_SCHEMA_SQL)?;
+        if schema_mismatch || parser_mismatch {
+            transaction.execute("DELETE FROM meta WHERE key = 'entity_incarnation'", [])?;
+        }
+        transaction.execute(
+            "INSERT OR IGNORE INTO meta(key,value) VALUES ('entity_incarnation', lower(hex(randomblob(16))))", [],
+        )?;
+        transaction.execute(
+            "INSERT OR REPLACE INTO meta(key,value) VALUES ('entity_relation_format', ?1)",
+            [crate::semantic_model::ENTITY_RELATION_FORMAT_VERSION.to_string()],
+        )?;
         if create_deferred_indexes {
             transaction.execute_batch(schema::CREATE_LOOKUP_INDEXES_SQL)?;
             transaction.execute_batch(schema::CREATE_DEFERRED_LOOKUP_INDEXES_SQL)?;

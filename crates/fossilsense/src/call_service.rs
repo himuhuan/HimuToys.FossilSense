@@ -27,7 +27,6 @@ pub struct CallReadHandle {
 }
 
 impl CallReadHandle {
-    #[cfg(test)]
     pub(crate) fn database_path(&self) -> &std::path::Path {
         self.db.path()
     }

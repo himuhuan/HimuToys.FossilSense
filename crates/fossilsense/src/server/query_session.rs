@@ -13,6 +13,10 @@ pub(super) struct BindingObservation {
     pub hydration_us: u128,
     pub render_us: u128,
     pub sqlite_read_sessions: usize,
+    pub entity_visits: usize,
+    pub entity_edges: usize,
+    pub entity_locations: usize,
+    pub entity_truncated: bool,
     pub completed: bool,
     pub returned: bool,
 }

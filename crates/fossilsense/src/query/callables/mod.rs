@@ -24,17 +24,18 @@ pub use counterpart::{resolve_counterparts, CounterpartEvidence};
 #[cfg(test)]
 pub use presentation::anchor_opposite_definition;
 #[cfg(test)]
-pub use presentation::{call_declaration_presentations, hover_presentations};
+pub use presentation::call_declaration_presentations_at;
+#[cfg(test)]
 pub use presentation::{
-    call_declaration_presentations_at, call_definition_presentations, focused_hover_presentations,
-    signature_active_index, signature_presentations,
+    call_declaration_presentations, call_definition_presentations, hover_presentations,
 };
+pub use presentation::{signature_active_index, signature_presentations};
 
 /// Changes whenever callable identity/filter/grouping semantics change.
 ///
 /// This is deliberately independent from the Call Relations wire protocol.
 #[allow(dead_code)] // Read by the release hardening gate and future relation cursors.
-pub const CALLABLE_CANDIDATE_RESOLVER_VERSION: u32 = 5;
+pub const CALLABLE_CANDIDATE_RESOLVER_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CandidateOrigin {
@@ -95,10 +96,6 @@ impl ResolvedCallableAnchor {
             arity_compatibility: ArityCompatibility::Unknown,
             origin,
         }
-    }
-
-    pub fn canonical_signature(&self) -> &str {
-        &self.anchor.canonical_signature
     }
 }
 
@@ -195,6 +192,17 @@ pub struct CallableQueryInput {
 /// The store-backed `CandidateQueryService` owns generation guards and bounded
 /// reads; this function deliberately owns no persistence resources.
 pub fn resolve_callable_candidates(input: CallableQueryInput) -> CallableCandidateSet {
+    resolve_callable_input(input, true)
+}
+pub(crate) fn resolve_callable_subject_candidates(
+    input: CallableQueryInput,
+) -> CallableCandidateSet {
+    resolve_callable_input(input, false)
+}
+fn resolve_callable_input(
+    input: CallableQueryInput,
+    with_counterparts: bool,
+) -> CallableCandidateSet {
     let mut anchors: Vec<_> = input
         .base_anchors
         .into_iter()
@@ -256,7 +264,11 @@ pub fn resolve_callable_candidates(input: CallableQueryInput) -> CallableCandida
     });
 
     let arity_outcome = apply_arity_policy(&mut anchors, input.call_context.as_ref());
-    let groups = resolve_counterparts(&anchors, &input.source_reach, &input.coverage);
+    let groups = if with_counterparts {
+        resolve_counterparts(&anchors, &input.source_reach, &input.coverage)
+    } else {
+        Vec::new()
+    };
 
     CallableCandidateSet {
         anchors,

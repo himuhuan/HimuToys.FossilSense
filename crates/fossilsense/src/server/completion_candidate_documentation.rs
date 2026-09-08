@@ -77,16 +77,7 @@ impl Backend {
                     reach_graph.as_deref(),
                     semantic_family,
                 );
-            let semantic = service.semantic_candidates(
-                &declaration_name,
-                crate::candidate_service::SemanticIntent::Neutral,
-            )?;
-            let Some(candidate) = semantic
-                .all
-                .iter()
-                .flat_map(|group| group.candidates.iter())
-                .find(|candidate| candidate.persistent_id == Some(declaration_id))
-                .cloned()
+            let Some(candidate) = service.declaration_by_id(declaration_id, &declaration_name)?
             else {
                 return Ok(None);
             };
@@ -97,7 +88,6 @@ impl Backend {
                 &current_rel,
                 &current_text,
                 &overlay,
-                Some(semantic),
             )
         })
         .await;
@@ -152,6 +142,7 @@ impl Backend {
             .documents
             .capture_request_snapshot(request_uri.as_ref())
             .await;
+
         if documents.overlay_epoch < overlay_epoch
             || (overlay_handle && documents.overlay_epoch != overlay_epoch)
             || documents
@@ -163,6 +154,7 @@ impl Backend {
         }
         let context = self.request_context_for_root(root.clone()).await;
         let generation = crate::call_model::SemanticGeneration(semantic_generation);
+
         if context.engine.semantic_generation != generation {
             return None;
         }
@@ -189,6 +181,7 @@ impl Backend {
                     reach_graph.as_deref(),
                     semantic_family,
                 );
+
             let Some(candidate) = service.resolve_candidate_handle(&handle)? else {
                 return Ok(None);
             };
@@ -199,10 +192,10 @@ impl Backend {
                 &current_rel,
                 &current_text,
                 &overlay,
-                None,
             )
         })
         .await;
+
         self.unwrap_query("candidate completion documentation", result)
             .await
             .flatten()
@@ -216,9 +209,6 @@ fn render_candidate_popup(
     current_rel: &str,
     current_text: &str,
     overlay: &crate::candidate_service::CandidateOverlaySnapshot,
-    semantic: Option<
-        crate::model::CandidateSet<crate::candidate_service::ResolvedDeclarationCandidate>,
-    >,
 ) -> Result<Option<String>> {
     let presentation = query::DocumentationCandidate {
         candidate: candidate.as_definition_candidate(),
@@ -228,18 +218,24 @@ fn render_candidate_popup(
             .clone()
             .unwrap_or_else(|| candidate.fact.name.clone()),
     };
-    let semantic = match semantic {
-        Some(semantic) => semantic,
-        None => service.semantic_candidates(
-            &candidate.fact.name,
-            crate::candidate_service::SemanticIntent::Neutral,
-        )?,
-    };
-    let mut candidates: Vec<_> = semantic
-        .all
-        .iter()
-        .flat_map(|group| group.candidates.iter())
-        .filter(|related| related.fact.identity.logical_key == candidate.fact.identity.logical_key)
+    let subjects = service.entity_subjects(vec![candidate.clone()])?;
+    let related = service.entity_documentation_locations(&subjects)?;
+
+    // The selected occurrence is always available as a documentation source,
+    // even when a large relation page exhausts its budget before reaching it.
+    let mut rows = vec![candidate.clone()];
+    rows.extend(
+        related
+            .locations
+            .into_iter()
+            .map(|item| item.candidate)
+            .filter(|row| {
+                row.fact.identity.locator.fingerprint != candidate.fact.identity.locator.fingerprint
+            })
+            .take(crate::candidate_service::entities::LOCATION_LIMIT - 1),
+    );
+    let mut candidates: Vec<_> = rows
+        .into_iter()
         .map(|related| {
             (
                 related.fact.role,
@@ -295,6 +291,7 @@ fn render_candidate_popup(
                 &source_candidate.candidate.range,
             )
         });
+
         if comment.is_some() {
             return Ok(completion_popup_markdown(
                 super::completion_documentation::PreferredSymbolDocumentation {

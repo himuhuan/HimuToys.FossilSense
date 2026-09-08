@@ -1280,6 +1280,7 @@ fn declaration(
         declaration_range.start_byte, declaration_range.end_byte
     ));
     DeclarationFact {
+        tag_kind: None,
         identity: DeclarationIdentity {
             locator: DeclarationLocator {
                 workspace_id: String::new(),

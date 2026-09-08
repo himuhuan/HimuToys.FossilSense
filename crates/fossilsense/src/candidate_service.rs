@@ -41,6 +41,7 @@ use crate::semantic_model::{
 
 mod callable_queries;
 mod coverage;
+pub(crate) mod entities;
 pub(crate) mod member_resolution;
 mod semantic;
 mod type_queries;
@@ -838,6 +839,7 @@ pub struct CandidateOverlaySnapshot {
     callable_by_path: HashMap<String, Vec<CallableAnchor>>,
     declaration_by_name: HashMap<String, Vec<OverlayDeclarationFact>>,
     declaration_by_fingerprint: HashMap<String, OverlayDeclarationFact>,
+    declaration_entity_fingerprints: HashMap<[u8; 12], Vec<String>>,
     record_by_name: HashMap<String, Vec<OverlayRecordFact>>,
     record_by_key: HashMap<(String, String), OverlayRecordFact>,
     records_by_path: HashMap<String, Vec<OverlayRecordFact>>,
@@ -913,6 +915,13 @@ impl CandidateOverlaySnapshot {
                     path: file.path.clone(),
                     fact: declaration,
                 };
+                snapshot
+                    .declaration_entity_fingerprints
+                    .entry(
+                        crate::semantic_model::EntityIdentity::digest_for_declaration(&entry.fact),
+                    )
+                    .or_default()
+                    .push(entry.fact.identity.locator.fingerprint.clone());
                 snapshot.declaration_by_fingerprint.insert(
                     entry.fact.identity.locator.fingerprint.clone(),
                     entry.clone(),
@@ -3251,6 +3260,222 @@ mod tests {
                 .map(|candidate| candidate.path.as_str())
                 .collect::<Vec<_>>(),
             vec!["src/shared.c", "lib/shared.c"]
+        );
+    }
+    #[test]
+    fn entity_location_subject_rejects_new_database_reusing_ids_and_fingerprints() {
+        let dir = tempdir().unwrap();
+        let first_db = dir.path().join("first.sqlite");
+        let second_db = dir.path().join("second.sqlite");
+        for path in [&first_db, &second_db] {
+            let mut store = IndexStore::open(path, dir.path()).unwrap();
+            upsert_candidate_test_file(&mut store, "api.h", "int run_task(void);\n");
+        }
+        let first = CallReadHandle::capture(first_db).unwrap();
+        let second = CallReadHandle::capture(second_db).unwrap();
+        assert_eq!(first.generation, second.generation);
+        let overlay = CandidateOverlaySnapshot::default();
+        let service = CandidateQueryService::new(Some(&first), &overlay, "api.h", None, None);
+        let (_, subjects) = service
+            .resolve_subject(
+                "run_task",
+                SemanticIntent::Neutral,
+                LookupPolicy::Exploratory,
+                None,
+            )
+            .unwrap();
+        assert_eq!(subjects.len(), 1);
+        let changed = CandidateQueryService::new(Some(&second), &overlay, "api.h", None, None);
+        let result = changed.entity_locations(&subjects, false).unwrap();
+        assert!(result.coverage.stale);
+        assert!(result.locations.is_empty());
+    }
+
+    #[test]
+    fn entity_location_related_page_has_shared_location_and_edge_limits() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("index.sqlite");
+        let mut store = IndexStore::open(&db, dir.path()).unwrap();
+        upsert_candidate_test_file(&mut store, "api.h", &"int run_task(void);\n".repeat(300));
+        drop(store);
+        let handle = CallReadHandle::capture(db).unwrap();
+        let overlay = CandidateOverlaySnapshot::default();
+        let service = CandidateQueryService::new(Some(&handle), &overlay, "api.h", None, None);
+        let (_, subjects) = service
+            .resolve_subject(
+                "run_task",
+                SemanticIntent::Neutral,
+                LookupPolicy::Exploratory,
+                None,
+            )
+            .unwrap();
+        let result = service.entity_locations(&subjects[..1], true).unwrap();
+        assert_eq!(result.locations.len(), 256);
+        assert!(result.coverage.truncated);
+        assert!(result.coverage.edges <= 1024);
+        assert_eq!(result.coverage.entities, 1);
+    }
+    #[test]
+    fn entity_location_subject_limit_is_visible_in_coverage() {
+        let mut source = String::new();
+        for count in 0..65 {
+            let params = (0..count)
+                .map(|i| format!("int arg{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            source.push_str(&format!("int run_task({params});\n"));
+        }
+        let parsed = parse_with_handle(
+            Path::new("api.h"),
+            &source,
+            None,
+            ParseFacts::HOVER_SEMANTICS,
+        );
+        let overlay = CandidateOverlaySnapshot::new(
+            1,
+            vec![FileCandidateOverlay::from_index("api.h".into(), &parsed)],
+        );
+        let service = CandidateQueryService::new(None, &overlay, "api.h", None, None);
+        let candidates = service
+            .semantic_candidates("run_task", SemanticIntent::Neutral)
+            .unwrap();
+        let candidates = candidates
+            .all
+            .into_iter()
+            .flat_map(|group| group.candidates)
+            .collect::<Vec<_>>();
+        assert_eq!(candidates.len(), 65);
+        let subjects = service.entity_subjects(candidates).unwrap();
+        let result = service.entity_locations(&subjects, true).unwrap();
+        assert!(
+            result.coverage.truncated,
+            "65 subjects were silently reduced to 64"
+        );
+        assert!(result.coverage.entities <= 64);
+    }
+    #[test]
+    fn entity_location_known_declaration_handle_does_not_repeat_name_discovery() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("index.sqlite");
+        let mut store = IndexStore::open(&db, dir.path()).unwrap();
+        upsert_candidate_test_file(&mut store, "api.h", &"int run_task(void);\n".repeat(300));
+        let row = store
+            .declaration_view()
+            .by_name("run_task")
+            .unwrap()
+            .pop()
+            .unwrap();
+        let candidate = CandidateHandle {
+            locator: CandidateHandleLocator::Persistent {
+                declaration_id: row.id,
+            },
+            logical_key: row.fact.identity.logical_key,
+            locator_fingerprint: row.fact.identity.locator.fingerprint,
+            semantic_family: SemanticFamily::CFamily,
+        };
+        drop(store);
+        let handle = CallReadHandle::capture(db).unwrap();
+        let overlay = CandidateOverlaySnapshot::default();
+        let service = CandidateQueryService::new(Some(&handle), &overlay, "api.h", None, None);
+        assert_eq!(
+            service
+                .resolve_candidate_handle(&candidate)
+                .unwrap()
+                .map(|c| c.persistent_id),
+            Some(Some(row.id))
+        );
+    }
+
+    #[test]
+    fn entity_location_subject_cannot_cross_copied_database_paths() {
+        let dir = tempdir().unwrap();
+        let first_db = dir.path().join("first.sqlite");
+        let mut store = IndexStore::open(&first_db, dir.path()).unwrap();
+        upsert_candidate_test_file(&mut store, "api.h", "int run_task(void);\n");
+        store.prepare_full_build_publication().unwrap();
+        drop(store);
+        let second_db = dir.path().join("copy.sqlite");
+        std::fs::copy(&first_db, &second_db).unwrap();
+        let first = CallReadHandle::capture(first_db).unwrap();
+        let second = CallReadHandle::capture(second_db).unwrap();
+        let overlay = CandidateOverlaySnapshot::default();
+        let service = CandidateQueryService::new(Some(&first), &overlay, "api.h", None, None);
+        let (_, subjects) = service
+            .resolve_subject(
+                "run_task",
+                SemanticIntent::Neutral,
+                LookupPolicy::Exploratory,
+                None,
+            )
+            .unwrap();
+        let changed = CandidateQueryService::new(Some(&second), &overlay, "api.h", None, None);
+        let result = changed.entity_locations(&subjects, false).unwrap();
+        assert!(result.coverage.stale);
+        assert!(result.locations.is_empty());
+    }
+    #[test]
+    fn entity_location_known_overlay_handle_does_not_repeat_name_discovery() {
+        let parsed = parse_with_handle(
+            Path::new("api.h"),
+            &"int run_task(void);\n".repeat(300),
+            None,
+            ParseFacts::HOVER_SEMANTICS,
+        );
+        let overlay = CandidateOverlaySnapshot::new(
+            1,
+            vec![FileCandidateOverlay::from_index("api.h".into(), &parsed)],
+        );
+        let fact = &overlay.declarations("run_task").last().unwrap().fact;
+        let fingerprint = fact.identity.locator.fingerprint.clone();
+        let candidate = CandidateHandle {
+            locator: CandidateHandleLocator::Overlay {
+                fingerprint: fingerprint.clone(),
+            },
+            logical_key: fact.identity.logical_key.clone(),
+            locator_fingerprint: fingerprint.clone(),
+            semantic_family: SemanticFamily::CFamily,
+        };
+        let service = CandidateQueryService::new(None, &overlay, "api.h", None, None);
+        assert_eq!(
+            service
+                .resolve_candidate_handle(&candidate)
+                .unwrap()
+                .map(|c| c.fact.identity.locator.fingerprint),
+            Some(fingerprint)
+        );
+    }
+
+    #[test]
+    fn entity_location_overlay_handle_to_persisted_fact_keeps_exact_fingerprint() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("index.sqlite");
+        let mut store = IndexStore::open(&db, dir.path()).unwrap();
+        upsert_candidate_test_file(&mut store, "api.h", &"int run_task(void);\n".repeat(300));
+        let row = store
+            .declaration_view()
+            .by_name("run_task")
+            .unwrap()
+            .pop()
+            .unwrap();
+        let fingerprint = row.fact.identity.locator.fingerprint.clone();
+        let candidate = CandidateHandle {
+            locator: CandidateHandleLocator::Overlay {
+                fingerprint: fingerprint.clone(),
+            },
+            logical_key: row.fact.identity.logical_key,
+            locator_fingerprint: fingerprint.clone(),
+            semantic_family: SemanticFamily::CFamily,
+        };
+        drop(store);
+        let handle = CallReadHandle::capture(db).unwrap();
+        let overlay = CandidateOverlaySnapshot::default();
+        let service = CandidateQueryService::new(Some(&handle), &overlay, "api.h", None, None);
+        assert_eq!(
+            service
+                .resolve_candidate_handle(&candidate)
+                .unwrap()
+                .map(|c| c.fact.identity.locator.fingerprint),
+            Some(fingerprint)
         );
     }
 }

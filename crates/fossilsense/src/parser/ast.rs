@@ -175,7 +175,9 @@ pub(super) fn collect_ast_index(
             let body = node.child_by_field_name("body");
             let role = if body.is_some() {
                 Some(SymbolRole::Definition)
-            } else if language == SourceLanguage::C && is_c_file_scope_tag_declaration(node) {
+            } else if (language == SourceLanguage::C && is_c_file_scope_tag_declaration(node))
+                || (language == SourceLanguage::Cpp && is_cpp_forward_tag_declaration(node))
+            {
                 Some(SymbolRole::Declaration)
             } else {
                 None
@@ -184,11 +186,12 @@ pub(super) fn collect_ast_index(
                 if let Some(mut symbol) =
                     symbol_from_name_node(name, SymbolKind::Type, role, node, source, line_starts)
                 {
-                    if language == SourceLanguage::C {
+                    {
                         symbol.tag_kind = match node.kind() {
                             "struct_specifier" => Some("struct"),
                             "union_specifier" => Some("union"),
                             "enum_specifier" => Some("enum"),
+                            "class_specifier" => Some("class"),
                             _ => None,
                         };
                         if let Some(signature) =
@@ -509,5 +512,15 @@ fn is_c_file_scope_tag_declaration(node: tree_sitter::Node<'_>) -> bool {
     is_namespace_or_file_scope_declaration(node)
         && node.parent().is_some_and(|parent| {
             parent.kind() == "translation_unit" || parent.kind().starts_with("preproc_")
+        })
+}
+
+fn is_cpp_forward_tag_declaration(node: tree_sitter::Node<'_>) -> bool {
+    is_namespace_or_file_scope_declaration(node)
+        && node.parent().is_some_and(|parent| {
+            matches!(parent.kind(), "translation_unit" | "declaration_list")
+                || parent.kind().starts_with("preproc_")
+                || (parent.kind() == "declaration"
+                    && parent.child_by_field_name("declarator").is_none())
         })
 }

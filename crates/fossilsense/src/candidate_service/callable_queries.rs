@@ -125,6 +125,21 @@ impl<'a> CandidateQueryService<'a> {
         name: &str,
         call_context: Option<CallSiteContext>,
     ) -> Result<CallableCandidateSet> {
+        self.callable_query(name, call_context, true)
+    }
+    pub fn callable_subject_candidates(
+        &self,
+        name: &str,
+        call_context: Option<CallSiteContext>,
+    ) -> Result<CallableCandidateSet> {
+        self.callable_query(name, call_context, false)
+    }
+    fn callable_query(
+        &self,
+        name: &str,
+        call_context: Option<CallSiteContext>,
+        with_counterparts: bool,
+    ) -> Result<CallableCandidateSet> {
         if call_context.as_ref().is_some_and(|context| {
             context.reliability == ContextReliability::UnsupportedCallForm
                 || !matches!(
@@ -262,7 +277,9 @@ impl<'a> CandidateQueryService<'a> {
         let source_paths: HashSet<_> = base_anchors
             .iter()
             .chain(overlay_anchors.iter())
-            .filter(|candidate| crate::query::is_source_path(&candidate.anchor.path))
+            .filter(|candidate| {
+                with_counterparts && crate::query::is_source_path(&candidate.anchor.path)
+            })
             .map(|candidate| candidate.anchor.path.clone())
             .collect();
         let mut source_reach: HashMap<String, ReachScope> = HashMap::new();
@@ -289,7 +306,7 @@ impl<'a> CandidateQueryService<'a> {
             .map(|scope| scope.files.clone())
             .unwrap_or_default();
         visible_internal_paths.insert(self.current_path.to_string());
-        Ok(resolve_callable_candidates(CallableQueryInput {
+        let input = CallableQueryInput {
             base_anchors,
             overlay_anchors,
             shadowed_paths: self.overlays.shadowed_paths().clone(),
@@ -297,7 +314,12 @@ impl<'a> CandidateQueryService<'a> {
             source_reach,
             visible_internal_paths,
             coverage,
-        }))
+        };
+        Ok(if with_counterparts {
+            resolve_callable_candidates(input)
+        } else {
+            crate::query::callables::resolve_callable_subject_candidates(input)
+        })
     }
 
     /// Request-local reach scope after dirty include edges replace their

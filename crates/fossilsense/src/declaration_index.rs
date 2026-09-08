@@ -446,6 +446,7 @@ mod tests {
         DeclarationReadRow {
             id,
             fact: DeclarationFact {
+                tag_kind: None,
                 identity: DeclarationIdentity {
                     locator: DeclarationLocator {
                         workspace_id: "workspace".into(),

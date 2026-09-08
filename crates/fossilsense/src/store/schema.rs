@@ -1,5 +1,5 @@
-// Version 32 persists bounded declaration coverage with each file revision.
-pub(crate) const SCHEMA_VERSION: i64 = 33;
+// Version 34 adds compact entity occurrence lookup without duplicating facts.
+pub(crate) const SCHEMA_VERSION: i64 = 34;
 
 pub(crate) const DROP_DATA_TABLES_SQL: &str = "
     DROP TABLE IF EXISTS pending_file_revisions;
@@ -8,6 +8,7 @@ pub(crate) const DROP_DATA_TABLES_SQL: &str = "
     DROP TABLE IF EXISTS symbol_facts;
     DROP TABLE IF EXISTS fallback_completion_facts;
     DROP TABLE IF EXISTS protobuf_c_sources;
+    DROP TABLE IF EXISTS entity_occurrences;
     DROP TABLE IF EXISTS declaration_facts;
     DROP TABLE IF EXISTS declaration_coverage_gaps;
     DROP TABLE IF EXISTS import_facts;
@@ -123,6 +124,7 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
         name TEXT NOT NULL,
         qualified_name TEXT NOT NULL,
         declaration_kind INTEGER NOT NULL CHECK(declaration_kind BETWEEN 0 AND 6),
+        tag_kind INTEGER CHECK(tag_kind BETWEEN 0 AND 4),
         role INTEGER NOT NULL CHECK(role BETWEEN 0 AND 3),
         name_start_byte INTEGER NOT NULL CHECK(name_start_byte >= 0),
         name_end_byte INTEGER NOT NULL CHECK(name_end_byte >= name_start_byte),
@@ -166,6 +168,15 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
         backing_key TEXT,
         backing_start_byte INTEGER,
         backing_end_byte INTEGER
+    );
+
+    CREATE TABLE IF NOT EXISTS entity_occurrences (
+        declaration_id INTEGER PRIMARY KEY REFERENCES declaration_facts(id) ON DELETE CASCADE,
+        revision_id INTEGER NOT NULL REFERENCES file_revisions(id) ON DELETE CASCADE,
+        family INTEGER NOT NULL CHECK(family IN (0, 1)),
+        domain INTEGER NOT NULL CHECK(domain BETWEEN 0 AND 4),
+        identity_digest BLOB NOT NULL CHECK(typeof(identity_digest) = 'blob' AND length(identity_digest) = 12),
+        role INTEGER NOT NULL CHECK(role BETWEEN 0 AND 3)
     );
 
     CREATE TABLE IF NOT EXISTS protobuf_c_sources (
@@ -501,6 +512,9 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
 ";
 
 pub(crate) const CREATE_LOOKUP_INDEXES_SQL: &str = "
+    CREATE INDEX IF NOT EXISTS idx_entity_occurrence_identity ON entity_occurrences(family, domain, identity_digest, role, declaration_id);
+    CREATE INDEX IF NOT EXISTS idx_entity_occurrence_revision ON entity_occurrences(revision_id);
+    CREATE INDEX IF NOT EXISTS idx_declaration_occurrence_range ON declaration_facts(revision_id, name_start_line, name_start_col, name_end_line, name_end_col);
     CREATE INDEX IF NOT EXISTS idx_files_source ON file_entries(source);
     CREATE INDEX IF NOT EXISTS idx_file_revisions_file_id ON file_revisions(file_id);
     CREATE INDEX IF NOT EXISTS idx_fallback_completion_name ON fallback_completion_facts(name);
@@ -508,6 +522,7 @@ pub(crate) const CREATE_LOOKUP_INDEXES_SQL: &str = "
     CREATE INDEX IF NOT EXISTS idx_declaration_facts_name ON declaration_facts(name);
     CREATE INDEX IF NOT EXISTS idx_declaration_facts_file_id ON declaration_facts(file_id);
     CREATE INDEX IF NOT EXISTS idx_declaration_facts_logical_key ON declaration_facts(logical_key_digest);
+    CREATE INDEX IF NOT EXISTS idx_declaration_facts_locator ON declaration_facts(locator_fingerprint);
     CREATE INDEX IF NOT EXISTS idx_package_facts_name ON package_facts(name);
     CREATE INDEX IF NOT EXISTS idx_package_facts_file_id ON package_facts(file_id);
     CREATE INDEX IF NOT EXISTS idx_import_facts_path ON import_facts(import_path);
@@ -532,6 +547,9 @@ pub(crate) const CREATE_LOOKUP_INDEXES_SQL: &str = "
 ";
 
 pub(crate) const DROP_LOOKUP_INDEXES_SQL: &str = "
+    DROP INDEX IF EXISTS idx_entity_occurrence_identity;
+    DROP INDEX IF EXISTS idx_entity_occurrence_revision;
+    DROP INDEX IF EXISTS idx_declaration_occurrence_range;
     DROP INDEX IF EXISTS idx_files_source;
     DROP INDEX IF EXISTS idx_file_revisions_file_id;
     DROP INDEX IF EXISTS idx_fallback_completion_name;
@@ -539,6 +557,7 @@ pub(crate) const DROP_LOOKUP_INDEXES_SQL: &str = "
     DROP INDEX IF EXISTS idx_declaration_facts_name;
     DROP INDEX IF EXISTS idx_declaration_facts_file_id;
     DROP INDEX IF EXISTS idx_declaration_facts_logical_key;
+    DROP INDEX IF EXISTS idx_declaration_facts_locator;
     DROP INDEX IF EXISTS idx_package_facts_name;
     DROP INDEX IF EXISTS idx_package_facts_file_id;
     DROP INDEX IF EXISTS idx_import_facts_path;

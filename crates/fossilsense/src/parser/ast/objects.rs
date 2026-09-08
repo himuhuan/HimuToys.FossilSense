@@ -29,6 +29,7 @@ pub(super) fn collect_macro_declaration(
         node.end_byte()
     ));
     declarations.push(DeclarationFact {
+        tag_kind: None,
         identity: DeclarationIdentity {
             locator: DeclarationLocator {
                 workspace_id: String::new(),
@@ -224,6 +225,7 @@ pub(super) fn collect_object_declarations(
             fingerprint,
         };
         declarations.push(DeclarationFact {
+            tag_kind: None,
             identity: DeclarationIdentity {
                 locator,
                 logical_key,

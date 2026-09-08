@@ -1,38 +1,15 @@
+#[cfg(test)]
 use crate::call_model::AnchorRole;
 
 use super::counterpart::{is_header_path, is_source_path};
-use super::{CallableVariantGroup, CounterpartEvidence, ResolvedCallableAnchor};
+#[cfg(test)]
+use super::CounterpartEvidence;
+use super::{CallableVariantGroup, ResolvedCallableAnchor};
 
 pub fn hover_presentations(groups: &[CallableVariantGroup]) -> Vec<&ResolvedCallableAnchor> {
     sorted_presentations(
         groups,
         |group| {
-            group
-                .header_declaration
-                .as_ref()
-                .or(group.source_definition.as_ref())
-                .or(group.other_variants.first())
-        },
-        true,
-    )
-}
-
-/// Select an already focused callable group before choosing its display anchor.
-/// A header declaration and its source definition have distinct occurrence
-/// fingerprints; filtering the display anchor afterwards can erase the group.
-pub fn focused_hover_presentations<'a>(
-    groups: &'a [CallableVariantGroup],
-    fingerprints: &std::collections::HashSet<&str>,
-) -> Vec<&'a ResolvedCallableAnchor> {
-    sorted_presentations(
-        groups,
-        |group| {
-            if !group
-                .variants()
-                .any(|variant| fingerprints.contains(variant.anchor.anchor_fingerprint.as_str()))
-            {
-                return None;
-            }
             group
                 .header_declaration
                 .as_ref()
@@ -65,6 +42,7 @@ pub fn signature_active_index(presentations: &[&ResolvedCallableAnchor]) -> usiz
         .unwrap_or(0)
 }
 
+#[cfg(test)]
 pub fn call_definition_presentations(
     groups: &[CallableVariantGroup],
 ) -> Vec<&ResolvedCallableAnchor> {
@@ -123,6 +101,7 @@ pub fn call_declaration_presentations(
 /// the origin file must precede (or contain) the use site; declarations in an
 /// included file are ordered by reach tier because their byte offsets are not
 /// comparable with the origin cursor.
+#[cfg(test)]
 pub fn call_declaration_presentations_at<'a>(
     groups: &'a [CallableVariantGroup],
     origin_path: &str,
@@ -131,6 +110,7 @@ pub fn call_declaration_presentations_at<'a>(
     call_declaration_presentations_for_origin(groups, Some((origin_path, cursor_byte)))
 }
 
+#[cfg(test)]
 fn call_declaration_presentations_for_origin<'a>(
     groups: &'a [CallableVariantGroup],
     origin: Option<(&str, usize)>,
@@ -176,12 +156,14 @@ fn call_declaration_presentations_for_origin<'a>(
         .collect()
 }
 
+#[cfg(test)]
 fn declaration_is_visible(anchor: &ResolvedCallableAnchor, origin: Option<(&str, usize)>) -> bool {
     origin.is_none_or(|(origin_path, cursor_byte)| {
         anchor.anchor.path != origin_path || anchor.anchor.name_range.start_byte <= cursor_byte
     })
 }
 
+#[cfg(test)]
 fn retain_strongest_group_tier<'a>(
     selected: &mut Vec<(&'a CallableVariantGroup, &'a ResolvedCallableAnchor)>,
 ) {
@@ -195,6 +177,7 @@ fn retain_strongest_group_tier<'a>(
     selected.retain(|(group, _)| group.group_tier.rank() == best);
 }
 
+#[cfg(test)]
 fn retain_strongest_candidate_tier<'a>(
     selected: &mut Vec<(&'a CallableVariantGroup, &'a ResolvedCallableAnchor)>,
 ) {
@@ -281,6 +264,7 @@ fn sort_selected_presentations<'a>(
     selected.into_iter().map(|(_, anchor)| anchor).collect()
 }
 
+#[cfg(test)]
 fn strongest_nearest_presentation<'a>(
     mut selected: Vec<(&'a CallableVariantGroup, &'a ResolvedCallableAnchor)>,
 ) -> Option<&'a ResolvedCallableAnchor> {

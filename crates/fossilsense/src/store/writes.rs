@@ -28,6 +28,7 @@ pub(super) fn stage_file_updates(
     let tx = conn.transaction()?;
     let indexed_at = now_unix_secs();
     {
+        let mut entity_stmt = tx.prepare("INSERT INTO entity_occurrences (declaration_id, revision_id, family, domain, identity_digest, role) VALUES (?1, ?2, ?3, ?4, ?5, ?6)")?;
         let mut file_stmt = tx.prepare(
             "INSERT INTO file_entries (path, extension, size, mtime_ns, hash, indexed_at, status, error, source)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
@@ -64,12 +65,12 @@ pub(super) fn stage_file_updates(
                 logical_key_digest, locator_fingerprint, logical_linkage_domain,
                 guard_fingerprint, logical_canonical_signature,
                 backing_kind, backing_id, backing_key,
-                backing_start_byte, backing_end_byte
+                backing_start_byte, backing_end_byte, tag_kind
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                 ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
                 ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35,
-                ?36, ?37, ?38
+                ?36, ?37, ?38, ?39
              )",
         )?;
         let mut include_stmt = tx
@@ -734,6 +735,17 @@ pub(super) fn stage_file_updates(
                     backing_key,
                     backing_start,
                     backing_end,
+                    declaration.tag_kind.map(|kind| kind as u8),
+                ])?;
+                entity_stmt.execute(params![
+                    tx.last_insert_rowid(),
+                    revision_id,
+                    declaration.identity.language.semantic_family() as u8,
+                    crate::semantic_model::EntityIdentity::domain_for_declaration(&declaration)
+                        as u8,
+                    crate::semantic_model::EntityIdentity::digest_for_declaration(&declaration)
+                        .as_slice(),
+                    declaration_role_code(declaration.role)
                 ])?;
             }
         }

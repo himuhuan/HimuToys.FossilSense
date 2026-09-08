@@ -202,7 +202,7 @@ impl Backend {
                 let call_context = service.complete_call_context_at(source_position)?;
                 let is_call_site = call_context.is_some();
                 let origin_anchor = service.anchor_at(source_position)?;
-                let semantic_set = service.semantic_candidates_with_policy(
+                let (semantic_set, subjects) = service.resolve_subject(
                     &word,
                     if is_call_site || origin_anchor.is_some() {
                         crate::candidate_service::SemanticIntent::Call
@@ -213,6 +213,7 @@ impl Backend {
                         domain: syntax.domain,
                         qualifier: syntax.qualifier.as_deref(),
                     },
+                    call_context.clone(),
                 )?;
                 let semantic_count = semantic_set
                     .all
@@ -236,7 +237,7 @@ impl Backend {
                 let callable_set = if callable_fingerprints.is_empty() {
                     None
                 } else {
-                    Some(service.callable_candidates(&word, call_context)?)
+                    Some(service.callable_subject_candidates(&word, call_context)?)
                 };
                 let mut perf = callable_set
                     .as_ref()
@@ -244,14 +245,22 @@ impl Backend {
                     .unwrap_or_default();
                 perf.reach_us = reach_us;
 
+                let entity_presentations = if callable_set.is_some() {
+                    let related =
+                        service.entity_locations_at(&subjects, true, Some(source_position))?;
+                    perf.entity_visits = related.coverage.entities;
+                    perf.entity_edges = related.coverage.edges;
+                    perf.entity_locations = related.locations.len();
+                    perf.entity_truncated = related.coverage.truncated;
+                    service.entity_callable_presentations(&related)?
+                } else {
+                    Vec::new()
+                };
                 let mut hydration = HydrationStats::default();
                 if let Some(callable_set) = callable_set.as_ref().filter(|set| {
                     !set.anchors.is_empty() && (origin_anchor.is_some() || is_call_site)
                 }) {
-                    let presentations: Vec<_> = query::focused_hover_presentations(
-                        &callable_set.groups,
-                        &callable_fingerprints,
-                    );
+                    let presentations: Vec<_> = entity_presentations.iter().collect();
                     let source_paths = presentation_paths(&presentations);
                     let source_revisions = service.source_revisions(&source_paths)?;
                     perf.query_us = query_started.elapsed().as_micros();
@@ -332,10 +341,7 @@ impl Backend {
                 if let Some(callable_set) =
                     callable_set.as_ref().filter(|set| !set.anchors.is_empty())
                 {
-                    let presentations: Vec<_> = query::focused_hover_presentations(
-                        &callable_set.groups,
-                        &callable_fingerprints,
-                    );
+                    let presentations: Vec<_> = entity_presentations.iter().collect();
                     let source_paths = presentation_paths(&presentations);
                     let source_revisions = service.source_revisions(&source_paths)?;
                     perf.query_us = query_started.elapsed().as_micros();
@@ -426,6 +432,11 @@ impl Backend {
             .and_then(|result| result.as_ref().ok().map(|(_, metrics)| *metrics))
             .unwrap_or_default();
         timer.observation.query_us = metrics.query_us;
+        timer.observation.entity_visits = metrics.entity_visits;
+        timer.observation.entity_edges = metrics.entity_edges;
+        timer.observation.entity_locations = metrics.entity_locations;
+        timer.observation.entity_truncated = metrics.entity_truncated;
+
         timer.observation.hydration_us = metrics.hydration_us;
         timer.observation.render_us = metrics.render_us;
         self.perf_log(|| metrics.log_line("hover", total_started.elapsed().as_micros()))

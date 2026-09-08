@@ -140,7 +140,7 @@ fn current_schema_has_members_table_and_version_9_or_newer() {
 }
 
 #[test]
-fn opening_schema_25_rebuilds_without_locator_lookup_index() {
+fn opening_schema_25_rebuilds_with_current_occurrence_locator_index() {
     let dir = tempdir().expect("tempdir");
     let db = dir.path().join("index.sqlite");
     {
@@ -220,8 +220,8 @@ fn opening_schema_25_rebuilds_without_locator_lookup_index() {
         )
         .expect("locator index count");
     assert_eq!(
-        locator_index_count, 0,
-        "schema 26 must not recreate the unused locator lookup index"
+        locator_index_count, 1,
+        "current schema must index exact occurrence handles without name rediscovery"
     );
 }
 
@@ -577,7 +577,7 @@ fn opening_old_schema_and_parser_facts_drops_old_symbol_data_for_current_rebuild
 fn parser_fact_version_mismatch_invalidates_and_rebuilds_current_schema() {
     assert_eq!(
         crate::parser::PARSER_FACT_VERSION,
-        19,
+        20,
         "member type namespace changes persisted member facts"
     );
     let dir = tempdir().expect("tempdir");

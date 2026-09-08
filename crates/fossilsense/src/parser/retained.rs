@@ -304,7 +304,8 @@ impl HeapBytes for crate::semantic_model::CompletionKindHint {
         0
     }
 }
-struct_heap!(crate::semantic_model::DeclarationFact, { identity, name, qualified_name, declaration_kind, role, path, name_range, declaration_range, canonical_signature, declarator_shape, has_initializer, owner, linkage, guard, backing });
+scalars!(crate::semantic_model::DeclarationTagKind);
+struct_heap!(crate::semantic_model::DeclarationFact, { tag_kind, identity, name, qualified_name, declaration_kind, role, path, name_range, declaration_range, canonical_signature, declarator_shape, has_initializer, owner, linkage, guard, backing });
 impl HeapBytes for crate::semantic_model::SemanticDeclarationRole {
     fn heap_bytes(&self) -> usize {
         0

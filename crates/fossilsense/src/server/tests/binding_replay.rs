@@ -94,6 +94,9 @@ async fn replay_binding_requests() {
     }
     println!("binding_replay_declarations: {}", index.len());
     println!("binding_replay_files: {files}");
+    let occurrences = store.entity_view().active_count().unwrap();
+    assert_eq!(occurrences as usize, index.len());
+    println!("binding_replay_entity_occurrences: {occurrences}");
     for phase in ["cold", "warm", "edited"] {
         for feature in ["hover", "definition"] {
             let mut observations = Vec::with_capacity(64);
@@ -195,6 +198,43 @@ async fn replay_binding_requests() {
                     .map(|item| item.sqlite_read_sessions)
                     .sum::<usize>()
             );
+            for (name, maximum) in [
+                (
+                    "entity_visits_max",
+                    observations
+                        .iter()
+                        .map(|v| v.entity_visits)
+                        .max()
+                        .unwrap_or(0),
+                ),
+                (
+                    "entity_edges_max",
+                    observations
+                        .iter()
+                        .map(|v| v.entity_edges)
+                        .max()
+                        .unwrap_or(0),
+                ),
+                (
+                    "entity_locations_max",
+                    observations
+                        .iter()
+                        .map(|v| v.entity_locations)
+                        .max()
+                        .unwrap_or(0),
+                ),
+            ] {
+                println!("{prefix}_{name}: {maximum}");
+            }
+            println!(
+                "{prefix}_entity_truncated_requests: {}",
+                observations.iter().filter(|v| v.entity_truncated).count()
+            );
+            assert!(observations
+                .iter()
+                .all(|v| (1..=64).contains(&v.entity_visits)
+                    && v.entity_edges <= 1024
+                    && v.entity_locations <= 256));
             println!(
                 "{prefix}_parse_cache_hits: {}",
                 observations.iter().filter(|item| item.cache_hit).count()

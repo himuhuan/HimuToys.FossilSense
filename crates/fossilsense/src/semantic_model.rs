@@ -4,6 +4,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::call_model::SourceRange;
 
+mod entity;
+pub use entity::{
+    callable_relation, declaration_relation, ConditionRelation, EntityDomain, EntityIdentity,
+    RelationEvidence, RelationStrength, ENTITY_RELATION_FORMAT_VERSION,
+};
+
 mod coverage;
 pub use coverage::{
     CoverageEvidence, CoverageGap, CoverageReason, DeclarationCoverage, DeclarationCoverageSummary,
@@ -15,7 +21,7 @@ pub use coverage::{
 /// This is deliberately independent from the SQLite schema version: changing
 /// how a fact is derived must invalidate persisted rows even when their SQL
 /// column layout happens to stay compatible.
-pub const PARSER_FACT_VERSION: i64 = 19;
+pub const PARSER_FACT_VERSION: i64 = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -178,9 +184,50 @@ pub struct DeclarationIdentity {
     pub role: SemanticDeclarationRole,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum DeclarationTagKind {
+    Struct,
+    Union,
+    Class,
+    Enum,
+    Interface,
+}
+impl DeclarationTagKind {
+    pub fn from_keyword(value: &str) -> Option<Self> {
+        match value {
+            "struct" => Some(Self::Struct),
+            "union" => Some(Self::Union),
+            "class" => Some(Self::Class),
+            "enum" => Some(Self::Enum),
+            "interface" => Some(Self::Interface),
+            _ => None,
+        }
+    }
+    pub fn from_code(value: i64) -> Option<Self> {
+        match value {
+            0 => Some(Self::Struct),
+            1 => Some(Self::Union),
+            2 => Some(Self::Class),
+            3 => Some(Self::Enum),
+            4 => Some(Self::Interface),
+            _ => None,
+        }
+    }
+    pub fn entity_kind(self) -> &'static str {
+        match self {
+            Self::Struct | Self::Class => "struct",
+            Self::Union => "union",
+            Self::Enum => "enum",
+            Self::Interface => "interface",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeclarationFact {
+    pub tag_kind: Option<DeclarationTagKind>,
     pub identity: DeclarationIdentity,
     pub name: String,
     pub qualified_name: String,
