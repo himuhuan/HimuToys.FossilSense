@@ -238,6 +238,10 @@ fn field_member_type_names_are_persisted_for_chain_completion() {
         .find(|member| member.name == "mem1")
         .expect("mem1");
     assert_eq!(mem1.type_name.as_deref(), Some("Inner"));
+    assert_eq!(
+        mem1.type_domain,
+        Some(crate::semantic_model::TypeNameDomain::Tag)
+    );
 
     let inner = reader
         .resolve_record_candidates(&[mem1.type_name.as_deref().expect("type")], None)

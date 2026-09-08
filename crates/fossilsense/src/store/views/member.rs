@@ -19,6 +19,7 @@ use crate::semantic_model::{AliasTargetFidelity, DeclaratorShape, RecordRangeFid
 use crate::store::record_kind_from_str;
 use crate::store::IndexStore;
 
+#[cfg(test)]
 const MEMBER_FALLBACK_SCAN_LIMIT: usize = 8_192;
 
 const RECORD_READ_SELECT: &str = "SELECT r.id, r.display_name, r.tag_name, r.typedef_name, r.kind,
@@ -141,6 +142,7 @@ pub struct MemberReadRow {
     pub signature: String,
     pub confidence: crate::semantic_model::MemberConfidence,
     pub type_name: Option<String>,
+    pub type_domain: Option<crate::semantic_model::TypeNameDomain>,
     pub owner_path: String,
     pub external: bool,
     pub directly_included: bool,
@@ -174,6 +176,7 @@ impl MemberReadRow {
             kind: self.kind,
             signature: self.signature,
             type_name: self.type_name,
+            type_domain: self.type_domain,
             tier: resolver::scope_tier(
                 &self.owner_path,
                 self.external,
@@ -355,7 +358,7 @@ impl<'a> MemberStoreView<'a> {
                  FROM record_defs
                  WHERE id IN ({placeholders})
              )
-             SELECT m.id, m.name, m.kind, m.signature, m.confidence, m.type_name, f.path, f.source, f.directly_included, rev.hash, m.start_byte, m.end_byte, m.start_line, m.start_col, m.end_line, m.end_col, m.guard \
+             SELECT m.id, m.name, m.kind, m.signature, m.confidence, m.type_name, f.path, f.source, f.directly_included, rev.hash, m.start_byte, m.end_byte, m.start_line, m.start_col, m.end_line, m.end_col, m.guard, m.type_domain \
              FROM members m \
              JOIN files f ON f.id = m.file_id \
              JOIN file_revisions rev ON rev.id = m.revision_id \
@@ -418,17 +421,31 @@ impl<'a> MemberStoreView<'a> {
         limit: usize,
         ctx: Option<&ResolveContext<'_>>,
     ) -> Result<(Vec<MemberCandidate>, bool)> {
-        self.fallback_member_candidates_filtered_limited(prefix, limit, ctx, None)
+        self.fallback_member_candidates_filtered_limited(
+            prefix,
+            limit,
+            ctx,
+            None,
+            MEMBER_FALLBACK_SCAN_LIMIT,
+        )
+        .map(|(rows, truncated, _)| (rows, truncated))
     }
 
-    pub fn fallback_member_candidates_family_limited(
+    pub(crate) fn fallback_member_candidates_family_with_budget(
         &self,
         prefix: &str,
         limit: usize,
         ctx: Option<&ResolveContext<'_>>,
-        semantic_family: crate::semantic_model::SemanticFamily,
-    ) -> Result<(Vec<MemberCandidate>, bool)> {
-        self.fallback_member_candidates_filtered_limited(prefix, limit, ctx, Some(semantic_family))
+        family: crate::semantic_model::SemanticFamily,
+        scan_limit: usize,
+    ) -> Result<(Vec<MemberCandidate>, bool, usize)> {
+        self.fallback_member_candidates_filtered_limited(
+            prefix,
+            limit,
+            ctx,
+            Some(family),
+            scan_limit,
+        )
     }
 
     fn fallback_member_candidates_filtered_limited(
@@ -437,9 +454,10 @@ impl<'a> MemberStoreView<'a> {
         limit: usize,
         ctx: Option<&ResolveContext<'_>>,
         semantic_family: Option<crate::semantic_model::SemanticFamily>,
-    ) -> Result<(Vec<MemberCandidate>, bool)> {
-        if limit == 0 {
-            return Ok((Vec::new(), false));
+        scan_limit: usize,
+    ) -> Result<(Vec<MemberCandidate>, bool, usize)> {
+        if limit == 0 || scan_limit == 0 {
+            return Ok((Vec::new(), scan_limit == 0, 0));
         }
         let pattern = format!("{}%", prefix.replace('%', "\\%").replace('_', "\\_"));
         let language = semantic_family.map_or_else(
@@ -447,7 +465,7 @@ impl<'a> MemberStoreView<'a> {
             |family| semantic_family_sql_predicate(family, "rev.language"),
         );
         let sql = format!(
-            "SELECT m.id, m.name, m.kind, m.signature, m.confidence, m.type_name, f.path, f.source, f.directly_included, rev.hash, m.start_byte, m.end_byte, m.start_line, m.start_col, m.end_line, m.end_col, m.guard \
+            "SELECT m.id, m.name, m.kind, m.signature, m.confidence, m.type_name, f.path, f.source, f.directly_included, rev.hash, m.start_byte, m.end_byte, m.start_line, m.start_col, m.end_line, m.end_col, m.guard, m.type_domain \
              FROM members m \
              JOIN files f ON f.id = m.file_id \
              JOIN file_revisions rev ON rev.id = m.revision_id \
@@ -459,7 +477,7 @@ impl<'a> MemberStoreView<'a> {
         let rows = stmt.query_map(
             rusqlite::params![
                 pattern,
-                i64::try_from(MEMBER_FALLBACK_SCAN_LIMIT.saturating_add(1)).unwrap_or(i64::MAX)
+                i64::try_from(scan_limit.saturating_add(1)).unwrap_or(i64::MAX)
             ],
             member_read_row,
         )?;
@@ -472,11 +490,13 @@ impl<'a> MemberStoreView<'a> {
         let mut by_member: HashMap<(String, crate::semantic_model::MemberKind), MemberMeta> =
             HashMap::new();
         let mut truncated = false;
+        let mut scanned_count = 0;
         for (scanned, row) in rows.enumerate() {
-            if scanned >= MEMBER_FALLBACK_SCAN_LIMIT {
+            if scanned >= scan_limit {
                 truncated = true;
                 break;
             }
+            scanned_count += 1;
             let candidate = row?.into_candidate(ctx);
             let key = (candidate.name.to_ascii_lowercase(), candidate.kind);
             let entry = by_member.entry(key).or_insert(MemberMeta {
@@ -513,6 +533,7 @@ impl<'a> MemberStoreView<'a> {
                 .map(|meta| meta.candidate)
                 .collect(),
             truncated,
+            scanned_count,
         ))
     }
 
@@ -864,6 +885,10 @@ fn member_read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemberReadRow> {
         end_line: row.get::<_, i64>(14)? as u32,
         end_col: row.get::<_, i64>(15)? as u32,
         guard: row.get(16)?,
+        type_domain: row
+            .get::<_, Option<String>>(17)?
+            .as_deref()
+            .and_then(crate::semantic_model::TypeNameDomain::from_str),
     })
 }
 

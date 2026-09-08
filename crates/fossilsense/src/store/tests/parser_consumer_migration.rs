@@ -84,11 +84,11 @@ fn live_parser_consumers_consume_request_facts_and_availability() {
     );
 
     assert_absent(
-        "src/server/member_completion.rs",
-        &["index.local_declarations"],
+        "src/candidate_service/member_resolution.rs",
+        &["index.local_declarations", "index.local_bindings"],
     );
     assert_present(
-        "src/server/member_completion.rs",
+        "src/candidate_service/member_resolution.rs",
         &[
             "request_facts()",
             "fact_availability",

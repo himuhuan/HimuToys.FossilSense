@@ -1,5 +1,5 @@
 // Version 32 persists bounded declaration coverage with each file revision.
-pub(crate) const SCHEMA_VERSION: i64 = 32;
+pub(crate) const SCHEMA_VERSION: i64 = 33;
 
 pub(crate) const DROP_DATA_TABLES_SQL: &str = "
     DROP TABLE IF EXISTS pending_file_revisions;
@@ -313,6 +313,7 @@ pub(crate) const CREATE_SCHEMA_SQL: &str = "
         end_col INTEGER NOT NULL,
         signature TEXT NOT NULL,
         type_name TEXT,
+        type_domain TEXT CHECK(type_domain IS NULL OR type_domain IN ('tag', 'ordinary')),
         guard TEXT
     );
 

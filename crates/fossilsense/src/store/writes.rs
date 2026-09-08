@@ -110,10 +110,10 @@ pub(super) fn stage_file_updates(
             "INSERT INTO member_facts (
                     revision_id, file_id, record_id, record_key,
                     name, kind, confidence, start_byte, end_byte,
-                    start_line, start_col, end_line, end_col, signature, type_name, guard
+                    start_line, start_col, end_line, end_col, signature, type_name, guard, type_domain
                  ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                    ?11, ?12, ?13, ?14, ?15, ?16
+                    ?11, ?12, ?13, ?14, ?15, ?16, ?17
                  )",
         )?;
         let mut alias_stmt = tx.prepare(
@@ -443,6 +443,9 @@ pub(super) fn stage_file_updates(
                     member.signature.as_str(),
                     member.type_name.as_deref(),
                     member.guard.as_deref(),
+                    member
+                        .type_domain
+                        .map(crate::semantic_model::TypeNameDomain::as_str),
                 ])?;
             }
 

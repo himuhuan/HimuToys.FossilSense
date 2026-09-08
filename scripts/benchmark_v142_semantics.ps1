@@ -105,7 +105,8 @@ try {
         Pop-Location
     }
     if ($cargoExit -ne 0) {
-        throw "v1.4.2 semantic benchmark failed for $Case (cargo exit $cargoExit)."
+        $tail = @($rawOutput | Select-Object -Last 30) -join [Environment]::NewLine
+        throw "v1.4.2 semantic benchmark failed for $Case (cargo exit $cargoExit):$([Environment]::NewLine)$tail"
     }
 
     $emitted = 0

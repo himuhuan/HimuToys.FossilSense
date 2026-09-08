@@ -58,14 +58,15 @@ pub(super) struct CallFactCollector<'a> {
     global_entity_key: Option<String>,
     record_names: HashSet<String>,
     collect_call_sites: bool,
+    anchor_bytes: super::retained::AppendOnlyVecBytes,
+    call_site_bytes: super::retained::AppendOnlyVecBytes,
 }
 
 impl<'a> CallFactCollector<'a> {
-    pub(super) fn retained_fact_bytes(&self) -> usize {
-        use super::retained::HeapBytes;
-        self.anchors
-            .heap_bytes()
-            .saturating_add(self.call_sites.heap_bytes())
+    pub(super) fn retained_fact_bytes(&mut self) -> usize {
+        self.anchor_bytes
+            .observe(&self.anchors)
+            .saturating_add(self.call_site_bytes.observe(&self.call_sites))
     }
 
     pub(super) fn new(
@@ -89,6 +90,8 @@ impl<'a> CallFactCollector<'a> {
             global_entity_key: None,
             record_names: HashSet::new(),
             collect_call_sites,
+            anchor_bytes: Default::default(),
+            call_site_bytes: Default::default(),
         }
     }
 

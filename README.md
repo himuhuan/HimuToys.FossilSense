@@ -42,6 +42,8 @@ Go 查询使用 package/import 图而不是套用 `#include`。同 package 文�
 
 `1.5.0` 将 Go 的文档/工作区符号、Declaration/Definition、Find All、普通/局部/成员/import 补全、Hover、References、Signature Help、Semantic Tokens 和 Call Hierarchy 接入统一候选服务。Go package、import、build guard、声明、方法、字段、局部绑定和直接调用事实都写入与 C/C++ 共用的 typed read model；公开结果仍是 best-effort 候选，不声称完成编译器级绑定。
 
+当参数或局部对象的所属类型有明确证据时，字段与直接方法名称的悬停、定义跳转和声明跳转共用成员事实，定位成员自己的位置；字段悬停的注释来自同一文件修订。支持普通对象、指针、有限成员链、成员声明，以及 `struct S s = {.state = 1}` 这类简单初始化器。Go 目前限于有证据的同 package 类型；数组下标、复杂初始化器和未能证明所属类型的表达式不做可靠跳转，成员补全仍可提供探索候选。方法只返回已有证据的位置，尚不保证已找到对应实现。升级后旧索引会自动重新建立，以保存成员类型的命名空间信息。
+
 ## 符号从哪里来，为什么补全分两段
 
 跳转与悬停会先判断光标处是变量、类型、标签还是成员，并共用当前文档的解析结果。已经确定查找范围但无法解析时，会返回空结果；注释和字符串中的名称也不会触发普通符号跳转。成员所属类型尚未证明时，不提供默认成员跳转。需要更广泛地探索同名候选时，可使用 **Find All Possible Definitions / Declarations**；成员补全仍保留其候选提示。

@@ -138,6 +138,21 @@ impl Backend {
         timer.observation.binding_us = cursor_binding.binding_us;
         timer.observation.cache_hit = cursor_binding.cache_hit;
         let syntax = cursor_binding.syntax;
+        if syntax.domain == crate::parser::LookupDomain::Member {
+            let members = self
+                .bound_members(
+                    &query_session,
+                    &uri,
+                    (version, text.clone()),
+                    &syntax,
+                    &word,
+                    timer,
+                )
+                .await;
+            let locations = super::member_navigation::locations(&members);
+            return Ok((!locations.is_empty()).then_some(GotoDefinitionResponse::Array(locations)));
+        }
+
         match cursor_binding.resolution {
             query::BindingResolution::Resolved(local) => {
                 let render_started = std::time::Instant::now();
@@ -646,7 +661,7 @@ fn is_label_scope_node(node: tree_sitter::Node<'_>) -> bool {
     matches!(node.kind(), "function_definition" | "lambda_expression")
 }
 
-fn source_position_for_byte(text: &str, byte: usize) -> tower_lsp::lsp_types::Position {
+pub(super) fn source_position_for_byte(text: &str, byte: usize) -> tower_lsp::lsp_types::Position {
     let byte = byte.min(text.len());
     let before = &text[..byte];
     let line = before.bytes().filter(|value| *value == b'\n').count() as u32;

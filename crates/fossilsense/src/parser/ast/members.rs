@@ -67,6 +67,15 @@ pub(super) fn collect_body_members(
         let member_type_name = child
             .child_by_field_name("type")
             .and_then(|type_node| record_type_name(type_node, source));
+        let member_type_domain =
+            child
+                .child_by_field_name("type")
+                .and_then(|node| match node.kind() {
+                    "struct_specifier" | "union_specifier" | "enum_specifier"
+                    | "class_specifier" => Some(crate::semantic_model::TypeNameDomain::Tag),
+                    "type_identifier" => Some(crate::semantic_model::TypeNameDomain::Ordinary),
+                    _ => None,
+                });
         let anonymous_record_type = child
             .child_by_field_name("type")
             .filter(|type_node| anonymous_record_type_node(*type_node));
@@ -181,6 +190,9 @@ pub(super) fn collect_body_members(
                 source,
                 line_starts,
             );
+            if let Some(member) = members.last_mut() {
+                member.type_domain = member.type_name.as_ref().and(member_type_domain);
+            }
         }
     }
 }
@@ -450,6 +462,7 @@ pub(super) fn push_member_at_byte(
         kind,
         confidence,
         type_name,
+        type_domain: None,
         start_byte,
         end_byte,
         start_line,

@@ -15,7 +15,7 @@ pub use coverage::{
 /// This is deliberately independent from the SQLite schema version: changing
 /// how a fact is derived must invalidate persisted rows even when their SQL
 /// column layout happens to stay compatible.
-pub const PARSER_FACT_VERSION: i64 = 18;
+pub const PARSER_FACT_VERSION: i64 = 19;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -324,6 +324,28 @@ impl MemberConfidence {
     }
 }
 
+/// Namespace proven by the field's type syntax. Missing means no proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TypeNameDomain {
+    Tag,
+    Ordinary,
+}
+impl TypeNameDomain {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tag => "tag",
+            Self::Ordinary => "ordinary",
+        }
+    }
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "tag" => Some(Self::Tag),
+            "ordinary" => Some(Self::Ordinary),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberDef {
     pub record_key: String,
@@ -331,6 +353,7 @@ pub struct MemberDef {
     pub kind: MemberKind,
     pub confidence: MemberConfidence,
     pub type_name: Option<String>,
+    pub type_domain: Option<TypeNameDomain>,
     pub start_byte: usize,
     pub end_byte: usize,
     pub start_line: usize,

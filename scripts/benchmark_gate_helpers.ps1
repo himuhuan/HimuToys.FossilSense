@@ -3,12 +3,14 @@ function Assert-FullIndexPerformanceGate {
     param(
         [Parameter(Mandatory = $true)][string]$CaseId,
         [Parameter(Mandatory = $true)][double]$OuterElapsedMs,
-        [Parameter(Mandatory = $true)][double]$EngineElapsedMs
+        [Parameter(Mandatory = $true)][double]$EngineElapsedMs,
+        [switch]$ObserveOnly
     )
 
     if ($CaseId -notlike '*-full-index') {
         return
     }
+    if ($ObserveOnly) { return }
     $limitMs = 120000.0
     if ($OuterElapsedMs -gt $limitMs) {
         throw "$CaseId outer elapsed $OuterElapsedMs ms exceeded the 120,000 ms full-index gate"

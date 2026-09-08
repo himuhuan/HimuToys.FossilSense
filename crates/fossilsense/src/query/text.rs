@@ -84,6 +84,7 @@ pub fn is_member_completion_context(line_text: &str, character: u32) -> bool {
 pub struct MemberAccessChain {
     pub receiver: String,
     pub completed_members: Vec<String>,
+    pub has_subscript: bool,
 }
 
 /// The single receiver name before the `.`/`->` at the cursor when the
@@ -102,6 +103,9 @@ pub fn member_receiver_name(line_text: &str, character: u32) -> Option<String> {
 /// member completion remains a best-effort candidate lookup, not expression
 /// type inference.
 pub fn member_access_chain_at(line_text: &str, character: u32) -> Option<MemberAccessChain> {
+    if line_text.len() > 8192 {
+        return None;
+    }
     let chars: Vec<char> = line_text.chars().collect();
     let target = char_index_at_utf16(&chars, character);
     let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
@@ -144,12 +148,15 @@ fn member_operator_before_prefix(chars: &[char], prefix_start: usize) -> Option<
 fn parse_member_chain_expr(chars: &[char]) -> Option<MemberAccessChain> {
     let mut cursor = 0usize;
     skip_ws(chars, &mut cursor);
-    let chain = parse_chain_expr(chars, &mut cursor)?;
+    let chain = parse_chain_expr(chars, &mut cursor, 0)?;
     skip_ws(chars, &mut cursor);
     (cursor == chars.len()).then_some(chain)
 }
 
-fn parse_chain_expr(chars: &[char], cursor: &mut usize) -> Option<MemberAccessChain> {
+fn parse_chain_expr(chars: &[char], cursor: &mut usize, depth: usize) -> Option<MemberAccessChain> {
+    if depth > 8 {
+        return None;
+    }
     skip_ws(chars, cursor);
     while *cursor < chars.len() && matches!(chars[*cursor], '*' | '&') {
         *cursor += 1;
@@ -158,7 +165,7 @@ fn parse_chain_expr(chars: &[char], cursor: &mut usize) -> Option<MemberAccessCh
 
     let mut chain = if *cursor < chars.len() && chars[*cursor] == '(' {
         *cursor += 1;
-        let inner = parse_chain_expr(chars, cursor)?;
+        let inner = parse_chain_expr(chars, cursor, depth + 1)?;
         skip_ws(chars, cursor);
         if chars.get(*cursor) != Some(&')') {
             return None;
@@ -170,12 +177,14 @@ fn parse_chain_expr(chars: &[char], cursor: &mut usize) -> Option<MemberAccessCh
         MemberAccessChain {
             receiver,
             completed_members: Vec::new(),
+            has_subscript: false,
         }
     };
 
     loop {
         skip_ws(chars, cursor);
         if chars.get(*cursor) == Some(&'[') {
+            chain.has_subscript = true;
             *cursor = skip_balanced(chars, *cursor, '[', ']')?;
             continue;
         }
@@ -195,6 +204,9 @@ fn parse_chain_expr(chars: &[char], cursor: &mut usize) -> Option<MemberAccessCh
 
         skip_ws(chars, cursor);
         let member = parse_identifier(chars, cursor)?;
+        if chain.completed_members.len() == 8 {
+            return None;
+        }
         chain.completed_members.push(member);
     }
 
@@ -454,6 +466,7 @@ mod tests {
             Some(MemberAccessChain {
                 receiver: "a".to_string(),
                 completed_members: vec!["mem1".to_string()],
+                has_subscript: false,
             })
         );
         assert_eq!(
@@ -461,6 +474,7 @@ mod tests {
             Some(MemberAccessChain {
                 receiver: "ptr".to_string(),
                 completed_members: vec!["inner".to_string()],
+                has_subscript: false,
             })
         );
         assert_eq!(
@@ -468,6 +482,7 @@ mod tests {
             Some(MemberAccessChain {
                 receiver: "a".to_string(),
                 completed_members: vec!["mem1".to_string()],
+                has_subscript: true,
             })
         );
         assert_eq!(
@@ -475,6 +490,7 @@ mod tests {
             Some(MemberAccessChain {
                 receiver: "ptr".to_string(),
                 completed_members: vec!["inner".to_string()],
+                has_subscript: false,
             })
         );
         assert_eq!(
@@ -482,6 +498,7 @@ mod tests {
             Some(MemberAccessChain {
                 receiver: "arr".to_string(),
                 completed_members: Vec::new(),
+                has_subscript: true,
             })
         );
         assert_eq!(member_access_chain_at("get()->value", 12), None);

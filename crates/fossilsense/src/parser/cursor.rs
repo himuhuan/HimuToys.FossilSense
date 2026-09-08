@@ -1,7 +1,7 @@
 //! Compact request-only syntax evidence. No AST or workspace symbols are kept.
 use crate::semantic_model::SemanticDeclarationKind;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum LookupDomain {
     Value,
     DeclarationName,
@@ -36,6 +36,7 @@ pub struct CursorSyntax {
     pub domain: LookupDomain,
     pub qualifier: Option<String>,
     pub conditional: bool,
+    pub owner_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -175,12 +176,21 @@ pub(super) fn collect(root: tree_sitter::Node<'_>, source: &str) -> CursorFacts 
                     }
                 }
             }
+            let owner_type = initializer_owner(node, source);
+            if node
+                .parent()
+                .is_some_and(|parent| parent.kind() == "field_designator")
+                && owner_type.is_none()
+            {
+                domain = LookupDomain::Unsupported;
+            }
             facts.spans.push(CursorSyntax {
                 start_byte: node.start_byte(),
                 end_byte: node.end_byte(),
                 domain,
                 qualifier,
                 conditional: !conditional_ends.is_empty(),
+                owner_type,
             });
         }
         if !non_code && cursor.goto_first_child() {
@@ -196,4 +206,41 @@ pub(super) fn collect(root: tree_sitter::Node<'_>, source: &str) -> CursorFacts 
         }
     }
     facts
+}
+
+fn initializer_owner(mut node: tree_sitter::Node<'_>, source: &str) -> Option<String> {
+    if node.parent()?.kind() != "field_designator" {
+        return None;
+    }
+    let mut lists = 0;
+    for _ in 0..8 {
+        node = node.parent()?;
+        if node.kind() == "initializer_pair" {
+            if node.named_child_count() > 4 {
+                return None;
+            }
+            let mut walk = node.walk();
+            let mut designators = node
+                .named_children(&mut walk)
+                .filter(|child| child.kind().ends_with("designator"));
+            if designators.next()?.kind() != "field_designator" || designators.next().is_some() {
+                return None;
+            }
+        }
+        if node.kind() == "initializer_list" {
+            lists += 1;
+        }
+        if lists > 1 {
+            return None;
+        }
+        if node.kind() == "init_declarator" {
+            let declaration = node.parent()?;
+            let ty = declaration.child_by_field_name("type")?;
+            return source
+                .get(ty.byte_range())
+                .filter(|name| name.len() <= 512)
+                .map(str::to_owned);
+        }
+    }
+    None
 }

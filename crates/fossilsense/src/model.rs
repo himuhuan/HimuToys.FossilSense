@@ -397,6 +397,7 @@ pub struct MemberCandidate {
     pub kind: crate::parser::MemberKind,
     pub signature: String,
     pub type_name: Option<String>,
+    pub type_domain: Option<crate::semantic_model::TypeNameDomain>,
     pub tier: ScopeTier,
     pub confidence: crate::parser::MemberConfidence,
     pub owner_path: String,

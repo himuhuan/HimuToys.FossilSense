@@ -11,6 +11,8 @@ param(
     [ValidateRange(5, 3600)]
     [int]$LifecycleTimeoutSeconds = 240,
     [switch]$IncludeFullIndex,
+    # Record build duration without enforcing the historical 120 s target.
+    [switch]$ObserveFullIndexTime,
     [switch]$IncludeEngineHydration,
     [switch]$IncludeCompletionReplay,
     [switch]$IncludeBindingReplay,
@@ -153,10 +155,12 @@ function Invoke-SampledProcess {
     $stderrTask = $process.StandardError.ReadToEndAsync()
     $peakWorkingSet = 0L
     $peakPrivateBytes = 0L
+    $timedOut = $false
 
     try {
         while (-not $process.HasExited) {
             if ($stopwatch.Elapsed.TotalSeconds -gt $Timeout) {
+                $timedOut = $true
                 $process.Kill()
                 throw "benchmark process exceeded ${Timeout}s"
             }
@@ -182,6 +186,24 @@ function Invoke-SampledProcess {
             PeakPrivateBytes = $peakPrivateBytes
             Stdout = $stdout
         }
+    }
+    catch {
+        $message = $_.Exception.Message
+        if (-not $process.HasExited) { $process.Kill() }
+        # A failed run is still evidence. Bound shutdown/output collection;
+        # do not report the time used to save diagnostics as engine runtime.
+        $stopwatch.Stop()
+        [void]$process.WaitForExit(5000)
+        $failure = [System.Exception]::new($message)
+        $failure.Data['benchmark_sample'] = [pscustomobject]@{
+            status = if ($timedOut) { 'timeout' } else { 'failed' }
+            ElapsedMs = [Math]::Round($stopwatch.Elapsed.TotalMilliseconds, 3)
+            PeakWorkingSetBytes = $peakWorkingSet
+            PeakPrivateBytes = $peakPrivateBytes
+            Stdout = if ($stdoutTask.IsCompleted) { @($stdoutTask.Result -split "`r?`n") } else { @() }
+            Stderr = if ($stderrTask.IsCompleted) { @($stderrTask.Result -split "`r?`n") } else { @() }
+        }
+        throw $failure
     }
     finally {
         if ($process -and -not $process.HasExited) {
@@ -688,15 +710,41 @@ foreach ($case in $cases) {
             }
         }
         Write-Host "benchmark $($case.Id) run $run/$Repeats"
-        $caseTimeoutSeconds = if ($case.Id -like '*-full-index') {
+        $caseTimeoutSeconds = if ($case.Id -like '*-full-index' -and -not $ObserveFullIndexTime) {
             [Math]::Min($TimeoutSeconds, 120)
         } elseif ($case.Id -like '*-lsp-lifecycle') {
             $LifecycleTimeoutSeconds
         } else {
             $TimeoutSeconds
         }
-        $sample = Invoke-SampledProcess -FilePath $case.Executable -ArgumentList $case.Arguments `
-            -Timeout $caseTimeoutSeconds
+        try {
+            $sample = Invoke-SampledProcess -FilePath $case.Executable -ArgumentList $case.Arguments `
+                -Timeout $caseTimeoutSeconds
+        } catch {
+            $failureReport = [ordered]@{
+                schema_version = 1
+                status = 'failed'
+                measured_at = (Get-Date).ToUniversalTime().ToString('o')
+                full_index_time_policy = if ($ObserveFullIndexTime) { 'observed' } else { '120s_gate' }
+            case_id = $case.Id
+                run = $run
+                command_line = [System.Environment]::CommandLine
+                source_revision = $checkpointSource.Revision
+                source_change_fingerprint = $checkpointSource.ChangeFingerprint
+                machine = $checkpointMachine
+                sample_source = Get-SourceState (Resolve-FullPath $case.Workspace)
+                executable = $case.Executable
+                arguments = $case.Arguments
+                timeout_seconds = $caseTimeoutSeconds
+                error = $_.Exception.Message
+                process = $_.Exception.Data['benchmark_sample']
+                completed_results = $results
+            }
+            $failurePath = Join-Path $benchmarkPath ('large-workspace-failed-' + [guid]::NewGuid().ToString('N') + '.json')
+            $failureReport | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $failurePath -Encoding UTF8
+            Write-Host "failure_report: $failurePath"
+            throw
+        }
         $metrics = Convert-WhitelistedMetrics $sample.Stdout
         $database = if ([string]::IsNullOrWhiteSpace($case.Database)) {
             $case.ResetDatabase
@@ -710,7 +758,8 @@ foreach ($case in $cases) {
             Assert-FullIndexPerformanceGate `
                 -CaseId $case.Id `
                 -OuterElapsedMs $sample.ElapsedMs `
-                -EngineElapsedMs $metrics.elapsed_ms
+                -EngineElapsedMs $metrics.elapsed_ms `
+                -ObserveOnly:$ObserveFullIndexTime
         }
         if ($case.Id -like '*-lsp-lifecycle') {
             Assert-LspLifecycleGate -CaseId $case.Id -Metrics $metrics
@@ -727,6 +776,7 @@ foreach ($case in $cases) {
         }
         $sampleState = Get-SourceState (Resolve-FullPath $case.Workspace)
         $results.Add([pscustomobject]@{
+            full_index_time_policy = if ($ObserveFullIndexTime) { 'observed' } else { '120s_gate' }
             case_id = $case.Id
             run = $run
             workspace = (Resolve-FullPath $case.Workspace)

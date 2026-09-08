@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -12,8 +12,6 @@ use super::{
     empty_completion_list, member_completion_is_incomplete, uri_to_path, Backend,
     CompletionDocumentationData,
 };
-use crate::call_service::CallReadHandle;
-use crate::candidate_service::{CandidateOverlaySnapshot, CandidateQueryService};
 use crate::model;
 use crate::parser::{self, FactAvailability, FactGroup, FileSemanticIndex, MemberKind};
 use crate::pathing;
@@ -27,7 +25,10 @@ use presentation::{
     retain_global_highest_record_tier,
 };
 
-const RESOLVED_MEMBER_SCAN_LIMIT: usize = 8_192;
+use crate::candidate_service::member_resolution::{
+    weak_receiver_lookup_names, weak_receiver_matches_record, MemberPolicy,
+    MemberResolutionService, MemberRootQueryContext,
+};
 
 impl Backend {
     /// Member-access (`.`/`->`) completion: narrow to the receiver record's
@@ -174,10 +175,11 @@ impl Backend {
                         ) {
                             return None;
                         }
-                        parser::infer_receiver_record(
-                            index.request_facts().local_declarations,
+                        MemberResolutionService::receiver_record(
+                            index,
                             name,
                             byte_offset,
+                            MemberPolicy::ExploratoryCompletion,
                         )
                     }),
                     _ => None,
@@ -191,14 +193,14 @@ impl Backend {
                 let mut owner_ambiguous = false;
                 let mut explicit_record_found = false;
                 let mut record_candidates_by_root = Vec::new();
-                let mut resolved_member_scan_remaining = RESOLVED_MEMBER_SCAN_LIMIT;
+                let mut member_service = MemberResolutionService::new(
+                    &roots,
+                    &member_root_contexts,
+                    MemberPolicy::ExploratoryCompletion,
+                );
                 if let Some(key) = record_key.as_deref() {
                     let type_names = [key.to_string()];
-                    let resolution = resolve_record_names_across_roots(
-                        &roots,
-                        &type_names,
-                        &member_root_contexts,
-                    )?;
+                    let resolution = member_service.resolve_names(&type_names)?;
                     owner_incomplete |= resolution.incomplete;
                     owner_ambiguous |= resolution.ambiguous;
                     explicit_record_found =
@@ -217,16 +219,12 @@ impl Backend {
                         let lookup_names = weak_receiver_lookup_names(receiver_name);
                         let mut weak_matches = Vec::new();
                         let mut seen_weak = HashSet::new();
-                        for root in &roots {
-                            let Some(context) = member_root_contexts.get(root) else {
-                                continue;
-                            };
-                            let service = context.service();
-                            for lookup_name in &lookup_names {
-                                let resolution =
-                                    service.records_for_type_name_with_evidence(lookup_name)?;
-                                owner_incomplete |= resolution.incomplete;
-                                for candidate in resolution.records.into_iter().filter(|record| {
+                        for lookup_name in &lookup_names {
+                            let resolution =
+                                member_service.resolve_names(std::slice::from_ref(lookup_name))?;
+                            owner_incomplete |= resolution.incomplete;
+                            for (root, candidates) in resolution.candidates {
+                                for candidate in candidates.into_iter().filter(|record| {
                                     weak_receiver_matches_record(receiver_name, record)
                                 }) {
                                     if seen_weak.insert((root.clone(), candidate.identity.clone()))
@@ -245,13 +243,18 @@ impl Backend {
                 }
 
                 if !completed_members.is_empty() && !record_candidates_by_root.is_empty() {
-                    for member_name in completed_members {
-                        let (type_names, member_read_limited) = member_type_names_for_segment(
-                            &record_candidates_by_root,
-                            &member_name,
-                            &member_root_contexts,
-                            &mut resolved_member_scan_remaining,
-                        )?;
+                    if completed_members.len()
+                        > crate::candidate_service::member_resolution::MEMBER_CHAIN_LIMIT
+                    {
+                        owner_incomplete = true;
+                        record_candidates_by_root.clear();
+                    }
+                    for member_name in completed_members
+                        .into_iter()
+                        .take(crate::candidate_service::member_resolution::MEMBER_CHAIN_LIMIT)
+                    {
+                        let (type_names, member_read_limited) =
+                            member_service.next_types(&record_candidates_by_root, &member_name)?;
                         owner_incomplete |= member_read_limited;
                         owner_ambiguous |= type_names.len() > 1;
                         owner_incomplete |= type_names.len() > 1;
@@ -260,11 +263,7 @@ impl Backend {
                             break;
                         }
 
-                        let resolution = resolve_record_names_across_roots(
-                            &roots,
-                            &type_names,
-                            &member_root_contexts,
-                        )?;
+                        let resolution = member_service.resolve_types(&type_names)?;
                         owner_incomplete |= resolution.incomplete;
                         owner_ambiguous |= resolution.ambiguous;
                         explicit_record_found |= resolution.authoritative;
@@ -314,17 +313,17 @@ impl Backend {
                             let Some(context) = member_root_contexts.get(root) else {
                                 continue;
                             };
-                            if resolved_member_scan_remaining == 0 {
+                            if member_service.member_remaining == 0 {
                                 owner_incomplete = true;
                                 break;
                             }
                             let read = context.service().members_for_records_limited(
                                 &selected,
                                 None,
-                                resolved_member_scan_remaining,
+                                member_service.member_remaining,
                             )?;
-                            resolved_member_scan_remaining =
-                                resolved_member_scan_remaining.saturating_sub(read.scanned);
+                            member_service.member_remaining =
+                                member_service.member_remaining.saturating_sub(read.scanned);
                             owner_incomplete |= read.truncated;
                             for member in read.candidates {
                                 remember_member(
@@ -362,9 +361,8 @@ impl Backend {
                         let Some(context) = member_root_contexts.get(root) else {
                             continue;
                         };
-                        let (candidates, fallback_truncated) = context
-                            .service()
-                            .fallback_member_candidates(&prefix, limit)?;
+                        let (candidates, fallback_truncated) =
+                            member_service.fallback(root, &prefix, limit)?;
                         owner_incomplete |= fallback_truncated;
                         for candidate in candidates {
                             remember_member(
@@ -540,39 +538,6 @@ struct MemberPresentation {
     ambiguous_owner: bool,
 }
 
-#[derive(Clone)]
-struct MemberRootQueryContext {
-    handle: Option<Arc<CallReadHandle>>,
-    declaration_index: Option<Arc<crate::declaration_index::SemanticDeclarationIndex>>,
-    overlay: Arc<CandidateOverlaySnapshot>,
-    current_path: String,
-    reach_graph: Option<Arc<crate::reachability::ReachGraph>>,
-    semantic_generation: crate::call_model::SemanticGeneration,
-    semantic_family: crate::semantic_model::SemanticFamily,
-}
-
-impl MemberRootQueryContext {
-    fn service(&self) -> CandidateQueryService<'_> {
-        CandidateQueryService::new_with_declarations_for_family(
-            self.handle.as_deref(),
-            self.declaration_index.as_deref(),
-            self.overlay.as_ref(),
-            &self.current_path,
-            None,
-            self.reach_graph.as_deref(),
-            self.semantic_family,
-        )
-    }
-}
-
-#[derive(Default)]
-struct RootRecordResolution {
-    candidates: Vec<(PathBuf, Vec<crate::query::RecordCandidate>)>,
-    authoritative: bool,
-    incomplete: bool,
-    ambiguous: bool,
-}
-
 #[derive(Clone, Copy, Default)]
 struct MemberCompletionMetrics {
     resolved_owner: bool,
@@ -581,223 +546,6 @@ struct MemberCompletionMetrics {
     fields: usize,
     methods: usize,
     returned: usize,
-}
-
-fn member_type_names_for_segment(
-    record_candidates_by_root: &[(PathBuf, Vec<crate::query::RecordCandidate>)],
-    member_name: &str,
-    member_root_contexts: &HashMap<PathBuf, MemberRootQueryContext>,
-    scan_remaining: &mut usize,
-) -> Result<(Vec<String>, bool)> {
-    let mut names = Vec::new();
-    let mut truncated = false;
-    for (root, candidates) in record_candidates_by_root {
-        let Some(highest_rank) = candidates
-            .iter()
-            .map(|candidate| candidate.tier.rank())
-            .max()
-        else {
-            continue;
-        };
-        let selected: Vec<_> = candidates
-            .iter()
-            .filter(|candidate| candidate.tier.rank() == highest_rank)
-            .cloned()
-            .collect();
-        if selected.is_empty() {
-            continue;
-        }
-        let Some(context) = member_root_contexts.get(root) else {
-            continue;
-        };
-        if *scan_remaining == 0 {
-            truncated = true;
-            break;
-        }
-        let read = context.service().members_for_records_limited(
-            &selected,
-            Some(member_name),
-            *scan_remaining,
-        )?;
-        *scan_remaining = scan_remaining.saturating_sub(read.scanned);
-        truncated |= read.truncated;
-        for member in read.candidates {
-            if member.kind == MemberKind::Field && member.name == member_name {
-                if let Some(type_name) = member.type_name {
-                    names.push(type_name);
-                }
-            }
-        }
-    }
-    names.sort();
-    names.dedup();
-    Ok((names, truncated))
-}
-
-fn resolve_record_names_across_roots(
-    roots: &[PathBuf],
-    type_names: &[String],
-    member_root_contexts: &HashMap<PathBuf, MemberRootQueryContext>,
-) -> Result<RootRecordResolution> {
-    const MULTI_ROOT_RECORD_LIMIT: usize = crate::query::TYPE_CANDIDATE_LIMIT * 4;
-
-    let mut combined = RootRecordResolution::default();
-    let mut frontier = VecDeque::new();
-    let mut strongest_frontier = HashMap::new();
-    for type_name in type_names {
-        enqueue_type_frontier(
-            &mut frontier,
-            &mut strongest_frontier,
-            type_name.clone(),
-            crate::model::ScopeTier::Current,
-        );
-    }
-    let mut candidates_by_root: HashMap<PathBuf, Vec<crate::query::RecordCandidate>> =
-        HashMap::new();
-    let mut type_queries = 0usize;
-    let mut record_count = 0usize;
-
-    'frontier: while let Some((type_name, tier_cap)) = frontier.pop_front() {
-        if strongest_frontier.get(&type_name).copied() != Some(tier_cap) {
-            continue;
-        }
-        for root in roots {
-            if type_queries >= crate::query::ALIAS_RESOLUTION_MAX_VISITS {
-                combined.incomplete = true;
-                break 'frontier;
-            }
-            let Some(context) = member_root_contexts.get(root) else {
-                continue;
-            };
-            type_queries += 1;
-            let bundle = context.service().type_candidates(&type_name)?;
-            combined.authoritative |= bundle.shadowed_evidence
-                || !bundle.records.candidates.is_empty()
-                || !bundle.aliases.candidates.is_empty();
-            combined.incomplete |= !bundle.records.coverage.permits_uniqueness()
-                || !bundle.aliases.coverage.permits_uniqueness();
-
-            let mut records = bundle.records.candidates;
-            for resolution in bundle.alias_resolutions {
-                combined.ambiguous |=
-                    resolution.status == crate::query::AliasResolutionStatus::AmbiguousRecord;
-                combined.incomplete |=
-                    resolution.status != crate::query::AliasResolutionStatus::UniqueRecord;
-                records.extend(resolution.terminal_records);
-            }
-            for alias in bundle.aliases.candidates {
-                let target_name = match alias.target {
-                    crate::query::TypeAliasTarget::TypeName(name) => Some(name),
-                    crate::query::TypeAliasTarget::NamedRecord { tag, .. } => Some(tag),
-                    crate::query::TypeAliasTarget::StableRecord(_) => None,
-                };
-                if let Some(target_name) = target_name.filter(|name| !name.is_empty()) {
-                    let next_tier = if tier_cap.rank() <= alias.tier.rank() {
-                        tier_cap
-                    } else {
-                        alias.tier
-                    };
-                    enqueue_type_frontier(
-                        &mut frontier,
-                        &mut strongest_frontier,
-                        target_name,
-                        next_tier,
-                    );
-                }
-            }
-
-            let root_candidates = candidates_by_root.entry(root.clone()).or_default();
-            for mut record in records {
-                if tier_cap.rank() < record.tier.rank() {
-                    record.tier = tier_cap;
-                }
-                if let Some(existing) = root_candidates
-                    .iter_mut()
-                    .find(|candidate| candidate.identity == record.identity)
-                {
-                    if record.tier.rank() > existing.tier.rank() {
-                        *existing = record;
-                    }
-                    continue;
-                }
-                if record_count >= MULTI_ROOT_RECORD_LIMIT {
-                    combined.incomplete = true;
-                    break 'frontier;
-                }
-                record_count += 1;
-                root_candidates.push(record);
-            }
-        }
-    }
-
-    for root in roots {
-        if let Some(mut candidates) = candidates_by_root.remove(root) {
-            candidates.sort_by(|left, right| {
-                right
-                    .tier
-                    .rank()
-                    .cmp(&left.tier.rank())
-                    .then_with(|| left.path.cmp(&right.path))
-                    .then_with(|| left.name_range.start_byte.cmp(&right.name_range.start_byte))
-            });
-            if !candidates.is_empty() {
-                combined.candidates.push((root.clone(), candidates));
-            }
-        }
-    }
-    Ok(combined)
-}
-
-fn enqueue_type_frontier(
-    frontier: &mut VecDeque<(String, crate::model::ScopeTier)>,
-    strongest: &mut HashMap<String, crate::model::ScopeTier>,
-    name: String,
-    tier: crate::model::ScopeTier,
-) {
-    if name.is_empty()
-        || strongest
-            .get(&name)
-            .is_some_and(|known| known.rank() >= tier.rank())
-    {
-        return;
-    }
-    strongest.insert(name.clone(), tier);
-    frontier.push_back((name, tier));
-}
-
-fn weak_receiver_lookup_names(receiver_name: &str) -> Vec<String> {
-    let hint = query::normalized_receiver_record_hint(receiver_name);
-    let mut names = Vec::new();
-    if !hint.is_empty() {
-        names.push(hint.clone());
-        let mut chars = hint.chars();
-        if let Some(first) = chars.next() {
-            let pascal = format!("{}{}", first.to_ascii_uppercase(), chars.as_str());
-            names.push(pascal);
-        }
-    }
-    names.sort();
-    names.dedup();
-    names
-}
-
-fn weak_receiver_matches_record(
-    receiver_name: &str,
-    record: &crate::query::RecordCandidate,
-) -> bool {
-    let hint = query::normalized_receiver_record_hint(receiver_name);
-    if hint.is_empty() {
-        return false;
-    }
-    record.display_name.eq_ignore_ascii_case(&hint)
-        || record
-            .tag_name
-            .as_deref()
-            .is_some_and(|name| name.eq_ignore_ascii_case(&hint))
-        || record
-            .typedef_name
-            .as_deref()
-            .is_some_and(|name| name.eq_ignore_ascii_case(&hint))
 }
 
 #[cfg(test)]
@@ -879,6 +627,7 @@ mod tests {
             kind: MemberKind::Field,
             signature: "int shared".into(),
             type_name: Some("int".into()),
+            type_domain: Some(crate::semantic_model::TypeNameDomain::Ordinary),
             tier,
             confidence,
             owner_path: owner_path.into(),

@@ -131,6 +131,20 @@ impl Backend {
         timer.observation.binding_us = cursor_binding.binding_us;
         timer.observation.cache_hit = cursor_binding.cache_hit;
         let syntax = cursor_binding.syntax;
+        if syntax.domain == crate::parser::LookupDomain::Member {
+            let members = self
+                .bound_members(
+                    &query_session,
+                    &uri,
+                    (version, text.clone()),
+                    &syntax,
+                    &word,
+                    timer,
+                )
+                .await;
+            return Ok(self.member_hover(members, timer).await);
+        }
+
         match cursor_binding.resolution {
             query::BindingResolution::Resolved(local) => {
                 let render_started = std::time::Instant::now();

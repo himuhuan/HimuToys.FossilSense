@@ -18,6 +18,7 @@ pub struct TypeCandidateBundle {
 /// distinguishes a genuine miss from a dirty-path tombstone, while
 /// `incomplete` and `ambiguous` prevent a merged best-effort member list from
 /// being presented as a closed, compiler-bound result.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeRecordResolution {
     pub records: Vec<RecordCandidate>,
@@ -41,12 +42,38 @@ impl CandidateQueryService<'_> {
     /// only exact alias targets under a strict visit bound. All durable rows
     /// remain generation-pinned and every dirty path shadows its base rows.
     pub fn type_candidates(&self, name: &str) -> Result<TypeCandidateBundle> {
+        self.type_candidates_inner(name, None, None)
+    }
+
+    pub(crate) fn type_candidates_with_budget(
+        &self,
+        name: &str,
+        remaining: &mut usize,
+    ) -> Result<TypeCandidateBundle> {
+        self.type_candidates_inner(name, Some(remaining), None)
+    }
+
+    pub(crate) fn type_candidates_for_member_domain(
+        &self,
+        name: &str,
+        domain: crate::parser::LookupDomain,
+        remaining: &mut usize,
+    ) -> Result<TypeCandidateBundle> {
+        self.type_candidates_inner(name, Some(remaining), Some(domain))
+    }
+
+    fn type_candidates_inner(
+        &self,
+        name: &str,
+        mut budget: Option<&mut usize>,
+        root_domain: Option<crate::parser::LookupDomain>,
+    ) -> Result<TypeCandidateBundle> {
         let resolve_context = ResolveContext {
             current_path: Some(self.current_path),
             reach: self.current_reach.as_deref(),
             direct_external_files: None,
         };
-        let mut names = vec![name.to_string()];
+        let mut names = vec![(name.to_string(), root_domain)];
         let mut visited_names = HashSet::new();
         let mut records = Vec::new();
         let mut aliases = Vec::new();
@@ -54,30 +81,44 @@ impl CandidateQueryService<'_> {
         let mut truncated = false;
         let mut shadowed_evidence = false;
 
-        while let Some(next_name) = names.pop() {
+        while let Some((next_name, next_domain)) = names.pop() {
+            if !take_type_budget(&mut budget, 1) {
+                truncated = true;
+                break;
+            }
             if visited_names.len() >= ALIAS_RESOLUTION_MAX_VISITS
-                || !visited_names.insert(next_name.clone())
+                || !visited_names.insert((next_name.clone(), next_domain))
             {
                 if visited_names.len() >= ALIAS_RESOLUTION_MAX_VISITS {
                     truncated = true;
                 }
                 continue;
             }
+            let tag_only = next_domain == Some(crate::parser::LookupDomain::Tag);
+            let alias_root = next_domain == Some(crate::parser::LookupDomain::Type);
             let (base_records, record_truncated, base_aliases, alias_truncated) = match self.handle
             {
                 Some(handle) => handle.read(|store| {
-                    let (record_rows, record_truncated) =
+                    let (record_rows, record_truncated) = if alias_root {
+                        (Vec::new(), false)
+                    } else {
                         store.member_view().record_rows_by_name_family_limited(
                             &next_name,
                             self.semantic_family,
-                            TYPE_CANDIDATE_LIMIT,
-                        )?;
-                    let (alias_rows, alias_truncated) =
+                            type_budget_limit(&budget),
+                        )?
+                    };
+                    take_type_budget(&mut budget, record_rows.len());
+                    let (alias_rows, alias_truncated) = if tag_only {
+                        (Vec::new(), false)
+                    } else {
                         store.member_view().alias_rows_by_name_family_limited(
                             &next_name,
                             self.semantic_family,
-                            TYPE_CANDIDATE_LIMIT,
-                        )?;
+                            type_budget_limit(&budget),
+                        )?
+                    };
+                    take_type_budget(&mut budget, alias_rows.len());
                     Ok((record_rows, record_truncated, alias_rows, alias_truncated))
                 })?,
                 None => (Vec::new(), false, Vec::new(), false),
@@ -85,6 +126,9 @@ impl CandidateQueryService<'_> {
             scanned += base_records.len() + base_aliases.len();
             truncated |= record_truncated || alias_truncated;
             for row in base_records {
+                if !self.member_type_path_allowed(&row.path, &mut budget)? {
+                    continue;
+                }
                 if self.overlays.shadows(&row.path) {
                     shadowed_evidence = true;
                     continue;
@@ -101,6 +145,9 @@ impl CandidateQueryService<'_> {
             }
             let mut converted_aliases = Vec::new();
             for row in base_aliases {
+                if !self.member_type_path_allowed(&row.path, &mut budget)? {
+                    continue;
+                }
                 if self.overlays.shadows(&row.path) {
                     shadowed_evidence = true;
                     continue;
@@ -119,15 +166,57 @@ impl CandidateQueryService<'_> {
                     converted_aliases.push(alias);
                 }
             }
-            enqueue_alias_targets(&converted_aliases, &mut names);
+            enqueue_alias_targets(&converted_aliases, &mut names, root_domain.is_some());
             aliases.extend(converted_aliases);
 
-            let overlay_records = self
-                .overlays
-                .records_for_family(&next_name, self.semantic_family);
-            let overlay_aliases = self
-                .overlays
-                .aliases_for_family(&next_name, self.semantic_family);
+            let raw_records = if alias_root {
+                &[][..]
+            } else {
+                self.overlays.records(&next_name)
+            };
+            let record_limit = raw_records
+                .len()
+                .min(budget.as_deref().copied().unwrap_or(usize::MAX));
+            truncated |= record_limit < raw_records.len();
+            take_type_budget(&mut budget, record_limit);
+            let mut overlay_records: Vec<_> = raw_records
+                .iter()
+                .take(record_limit)
+                .filter(|fact| {
+                    self.overlays.semantic_family_for_path(&fact.path) == Some(self.semantic_family)
+                })
+                .collect();
+            let mut allowed_records = Vec::with_capacity(overlay_records.len());
+            for fact in overlay_records.drain(..) {
+                if self.member_type_path_allowed(&fact.path, &mut budget)? {
+                    allowed_records.push(fact);
+                }
+            }
+            let overlay_records = allowed_records;
+            let raw_aliases = if tag_only {
+                &[][..]
+            } else {
+                self.overlays.aliases(&next_name)
+            };
+            let alias_limit = raw_aliases
+                .len()
+                .min(budget.as_deref().copied().unwrap_or(usize::MAX));
+            truncated |= alias_limit < raw_aliases.len();
+            take_type_budget(&mut budget, alias_limit);
+            let mut overlay_aliases: Vec<_> = raw_aliases
+                .iter()
+                .take(alias_limit)
+                .filter(|fact| {
+                    self.overlays.semantic_family_for_path(&fact.path) == Some(self.semantic_family)
+                })
+                .collect();
+            let mut allowed_aliases = Vec::with_capacity(overlay_aliases.len());
+            for fact in overlay_aliases.drain(..) {
+                if self.member_type_path_allowed(&fact.path, &mut budget)? {
+                    allowed_aliases.push(fact);
+                }
+            }
+            let overlay_aliases = allowed_aliases;
             scanned += overlay_records.len() + overlay_aliases.len();
             records.extend(overlay_records.into_iter().map(|fact| {
                 let (external, directly_included) =
@@ -156,11 +245,28 @@ impl CandidateQueryService<'_> {
                         fact.alias.clone(),
                         tier,
                     );
-                    bind_overlay_alias_to_unique_same_file_record(&mut alias, self.overlays);
+                    if root_domain.is_none() {
+                        let count = match &alias.target {
+                            TypeAliasTarget::TypeName(name) => self.overlays.records(name).len(),
+                            _ => 0,
+                        };
+                        if take_type_budget(&mut budget, count) {
+                            bind_overlay_alias_to_unique_same_file_record(
+                                &mut alias,
+                                self.overlays,
+                            );
+                        } else {
+                            truncated = true;
+                        }
+                    }
                     alias
                 })
                 .collect();
-            enqueue_alias_targets(&converted_overlay_aliases, &mut names);
+            enqueue_alias_targets(
+                &converted_overlay_aliases,
+                &mut names,
+                root_domain.is_some(),
+            );
             aliases.extend(converted_overlay_aliases);
         }
 
@@ -172,6 +278,10 @@ impl CandidateQueryService<'_> {
             })
             .collect();
         for identity in stable_targets {
+            if !take_type_budget(&mut budget, 1) {
+                truncated = true;
+                break;
+            }
             if records.iter().any(|record| record.identity == identity) {
                 continue;
             }
@@ -184,8 +294,18 @@ impl CandidateQueryService<'_> {
                         None => None,
                     };
                     if let Some(row) = row {
+                        if !self.member_type_path_allowed(&row.path, &mut budget)? {
+                            continue;
+                        }
                         if self.overlays.shadows(&row.path) {
                             shadowed_evidence = true;
+                            if !take_type_budget(
+                                &mut budget,
+                                self.overlays.records_for_path(&row.path).len(),
+                            ) {
+                                truncated = true;
+                                continue;
+                            }
                             if let Some(fact) = unique_overlay_replacement_for_record(
                                 self.overlays.records_for_path(&row.path),
                                 &row,
@@ -229,6 +349,9 @@ impl CandidateQueryService<'_> {
                     }
                 }
                 RecordCandidateIdentity::ParserKey { path, record_key } => {
+                    if !self.member_type_path_allowed(&path, &mut budget)? {
+                        continue;
+                    }
                     if let Some(fact) = self.overlays.record_by_parser_key(&path, &record_key) {
                         scanned += 1;
                         let (external, directly_included) =
@@ -249,6 +372,7 @@ impl CandidateQueryService<'_> {
             }
         }
 
+        truncated |= budget.as_deref().is_some_and(|remaining| *remaining == 0);
         let coverage = CandidateCoverage {
             scanned,
             truncated,
@@ -257,12 +381,15 @@ impl CandidateQueryService<'_> {
                 truncated.then_some(crate::query::CandidateIncompleteReason::CandidateBudget)
             }),
         };
-        let root_records = record_candidates_exact(
+        let mut root_records = record_candidates_exact(
             name,
             records.clone(),
             coverage.clone(),
             TYPE_CANDIDATE_LIMIT,
         );
+        if root_domain == Some(crate::parser::LookupDomain::Type) {
+            root_records.candidates.clear();
+        }
         let root_aliases = type_alias_candidates_exact(
             name,
             aliases.clone(),
@@ -284,10 +411,43 @@ impl CandidateQueryService<'_> {
         })
     }
 
+    fn member_type_path_allowed(
+        &self,
+        path: &str,
+        budget: &mut Option<&mut usize>,
+    ) -> Result<bool> {
+        if budget.is_none() || self.semantic_family != SemanticFamily::Go {
+            return Ok(true);
+        }
+        if !take_type_budget(budget, 1) {
+            return Ok(false);
+        }
+        let package = |path: &str| -> Result<Option<String>> {
+            if let Some(package) = self.overlays.go_overlay_packages.get(path) {
+                return Ok(package.as_ref().map(|(key, _)| key.clone()));
+            }
+            if self.overlays.shadows(path) {
+                return Ok(None);
+            }
+            match self.handle {
+                Some(handle) => handle.read(|store| {
+                    Ok(store
+                        .package_import_view()
+                        .package_for_path(path)?
+                        .map(|row| super::physical_package_key(path, &row.name)))
+                }),
+                None => Ok(None),
+            }
+        };
+        let current = package(self.current_path)?;
+        Ok(current.is_some() && current == package(path)?)
+    }
+
     /// Resolve terminal records while retaining whether the shared candidate
     /// facade found authoritative root or tombstone evidence. An empty record
     /// list with `true` means “resolved to no live terminal”, not “try a stale
     /// generation-unaware fallback”.
+    #[cfg(test)]
     pub fn records_for_type_name_with_evidence(&self, name: &str) -> Result<TypeRecordResolution> {
         let bundle = self.type_candidates(name)?;
         let authoritative = bundle.shadowed_evidence
@@ -395,6 +555,7 @@ impl CandidateQueryService<'_> {
                     kind: member.kind,
                     signature: member.signature.clone(),
                     type_name: member.type_name.clone(),
+                    type_domain: member.type_domain,
                     tier: record.tier,
                     confidence: member.confidence,
                     owner_path: path.clone(),
@@ -457,37 +618,55 @@ impl CandidateQueryService<'_> {
     /// Bounded global member fallback with the same all-open tombstones as
     /// exact owner resolution. Durable rows from every dirty owner path are
     /// removed, then current-buffer member facts are added back.
-    pub fn fallback_member_candidates(
+    pub(crate) fn fallback_member_candidates_with_budget(
         &self,
         prefix: &str,
         limit: usize,
+        remaining: &mut usize,
+    ) -> Result<(Vec<MemberCandidate>, bool)> {
+        self.fallback_member_candidates_inner(prefix, limit, Some(remaining))
+    }
+    fn fallback_member_candidates_inner(
+        &self,
+        prefix: &str,
+        limit: usize,
+        mut budget: Option<&mut usize>,
     ) -> Result<(Vec<MemberCandidate>, bool)> {
         let resolve_context = ResolveContext {
             current_path: Some(self.current_path),
             reach: self.current_reach.as_deref(),
             direct_external_files: None,
         };
-        let (mut members, mut truncated) = match self.handle {
+        let (mut members, mut truncated, base_scanned) = match self.handle {
             Some(handle) => handle.read(|store| {
                 store
                     .member_view()
-                    .fallback_member_candidates_family_limited(
+                    .fallback_member_candidates_family_with_budget(
                         prefix,
                         limit,
                         Some(&resolve_context),
                         self.semantic_family,
+                        budget
+                            .as_deref()
+                            .copied()
+                            .unwrap_or(MEMBER_FALLBACK_OVERLAY_SCAN_LIMIT),
                     )
             })?,
-            None => (Vec::new(), false),
+            None => (Vec::new(), false, 0),
         };
+        take_type_budget(&mut budget, base_scanned);
         members.retain(|member| !self.overlays.shadows(&member.owner_path));
 
-        let (overlay_members, overlay_truncated) =
+        let (overlay_members, overlay_truncated, overlay_scanned) =
             self.overlays.fallback_members_by_prefix_for_family_limited(
                 prefix,
                 self.semantic_family,
-                MEMBER_FALLBACK_OVERLAY_SCAN_LIMIT,
+                budget
+                    .as_deref()
+                    .copied()
+                    .unwrap_or(MEMBER_FALLBACK_OVERLAY_SCAN_LIMIT),
             );
+        take_type_budget(&mut budget, overlay_scanned);
         truncated |= overlay_truncated;
         for fact in overlay_members {
             let path = &fact.path;
@@ -505,6 +684,7 @@ impl CandidateQueryService<'_> {
                 kind: member.kind,
                 signature: member.signature.clone(),
                 type_name: member.type_name.clone(),
+                type_domain: member.type_domain,
                 tier,
                 confidence: member.confidence,
                 owner_path: path.clone(),
@@ -601,13 +781,40 @@ fn remap_persistent_alias_targets(
     }
 }
 
-fn enqueue_alias_targets(aliases: &[TypeAliasCandidate], names: &mut Vec<String>) {
+fn enqueue_alias_targets(
+    aliases: &[TypeAliasCandidate],
+    names: &mut Vec<(String, Option<crate::parser::LookupDomain>)>,
+    strict: bool,
+) {
     for alias in aliases {
         match &alias.target {
-            TypeAliasTarget::NamedRecord { tag, .. } | TypeAliasTarget::TypeName(tag) => {
-                names.push(tag.clone());
-            }
+            TypeAliasTarget::NamedRecord { tag, .. } => names.push((
+                tag.clone(),
+                strict.then_some(crate::parser::LookupDomain::Tag),
+            )),
+            TypeAliasTarget::TypeName(name) => names.push((
+                name.clone(),
+                strict.then_some(crate::parser::LookupDomain::Type),
+            )),
             TypeAliasTarget::StableRecord(_) => {}
         }
     }
+}
+
+fn type_budget_limit(budget: &Option<&mut usize>) -> usize {
+    budget
+        .as_deref()
+        .copied()
+        .unwrap_or(usize::MAX)
+        .min(TYPE_CANDIDATE_LIMIT)
+}
+fn take_type_budget(budget: &mut Option<&mut usize>, amount: usize) -> bool {
+    if let Some(remaining) = budget.as_deref_mut() {
+        if *remaining < amount {
+            *remaining = 0;
+            return false;
+        }
+        *remaining -= amount;
+    }
+    true
 }

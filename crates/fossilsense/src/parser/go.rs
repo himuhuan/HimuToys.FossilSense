@@ -58,13 +58,14 @@ pub(super) fn collect_go_ast_index(
     let mut stack = vec![Visit::Enter(root)];
 
     let mut budget_visits = 0usize;
+    let mut fact_bytes = super::retained::AstFactBytes::default();
     while let Some(visit) = stack.pop() {
         budget_visits += 1;
-        if budget_visits.is_multiple_of(1024) && super::budget::active() {
-            use super::retained::HeapBytes;
-            if !super::budget::check(ast.heap_bytes()) {
-                break;
-            }
+        if budget_visits.is_multiple_of(1024)
+            && super::budget::active()
+            && !super::budget::check(fact_bytes.observe(&ast))
+        {
+            break;
         }
 
         let node = match visit {
@@ -610,6 +611,7 @@ fn collect_interface_members(
             kind: MemberKind::Method,
             confidence: MemberConfidence::InBody,
             type_name: None,
+            type_domain: None,
             start_byte: name_range.start_byte,
             end_byte: name_range.end_byte,
             start_line: name_range.start.line as usize,
@@ -682,6 +684,9 @@ fn collect_struct_members(
                 kind: MemberKind::Field,
                 confidence: MemberConfidence::InBody,
                 type_name: type_text.clone(),
+                type_domain: type_text
+                    .as_ref()
+                    .map(|_| crate::semantic_model::TypeNameDomain::Ordinary),
                 start_byte: name_range.start_byte,
                 end_byte: name_range.end_byte,
                 start_line: name_range.start.line as usize,
@@ -755,6 +760,7 @@ fn method_member(owner: &str, package_key: &str, anchor: &CallableAnchor) -> Mem
         kind: MemberKind::Method,
         confidence: MemberConfidence::OutOfClassOwner,
         type_name: None,
+        type_domain: None,
         start_byte: anchor.name_range.start_byte,
         end_byte: anchor.name_range.end_byte,
         start_line: anchor.name_range.start.line as usize,

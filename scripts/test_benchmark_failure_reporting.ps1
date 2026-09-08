@@ -20,6 +20,16 @@ try {
     if ($null -eq $checkpoint) { throw 'A later benchmark failure discarded the earlier successful case' }
     $report = Get-Content -LiteralPath $checkpoint.FullName -Raw | ConvertFrom-Json
     if ($report.status -ne 'partial' -or @($report.results).Count -ne 1 -or $report.results[0].case_id -ne 'v142-high-duplication-callable-query' -or $report.results[0].metrics.query_us -ne 1) { throw 'Partial report did not preserve the completed case honestly' }
+    $failedFile = Get-ChildItem -LiteralPath $testRoot -Filter '*failed*.json' | Select-Object -First 1
+    if ($null -eq $failedFile) { throw 'Failed case evidence was discarded' }
+    $failed = Get-Content -LiteralPath $failedFile.FullName -Raw | ConvertFrom-Json
+    if ($failed.status -ne 'failed' -or $failed.case_id -ne 'v142-counterpart-scan-cap' -or
+        $failed.process.status -ne 'failed' -or @($failed.completed_results).Count -ne 1 -or
+        ($failed.process.Stderr -join "`n") -notmatch 'intentional second-case failure') {
+        throw 'Failed report lost its case, output, or prior completed result'
+    }
+    $completeFiles = @(Get-ChildItem -LiteralPath $testRoot -Filter '*.json' | Where-Object { $_.Name -notmatch 'partial|failed' })
+    if ($completeFiles.Count -ne 0) { throw 'Failed run produced a completion report' }
     Write-Output 'Benchmark failure reporting passed.'
 } finally {
     $resolvedTest = [System.IO.Path]::GetFullPath($testRoot)

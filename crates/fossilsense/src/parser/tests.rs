@@ -1076,6 +1076,10 @@ fn field_members_capture_record_type_name() {
         .find(|member| member.name == "mem1")
         .expect("mem1");
     assert_eq!(mem1.type_name.as_deref(), Some("Inner"));
+    assert_eq!(
+        mem1.type_domain,
+        Some(crate::semantic_model::TypeNameDomain::Tag)
+    );
 
     let mem2 = index
         .members
@@ -1083,6 +1087,10 @@ fn field_members_capture_record_type_name() {
         .find(|member| member.name == "mem2")
         .expect("mem2");
     assert_eq!(mem2.type_name.as_deref(), Some("Inner"));
+    assert_eq!(
+        mem2.type_domain,
+        Some(crate::semantic_model::TypeNameDomain::Ordinary)
+    );
 
     let mem3 = index
         .members
@@ -1090,6 +1098,10 @@ fn field_members_capture_record_type_name() {
         .find(|member| member.name == "mem3")
         .expect("mem3");
     assert_eq!(mem3.type_name.as_deref(), Some("Inner"));
+    assert_eq!(
+        mem3.type_domain,
+        Some(crate::semantic_model::TypeNameDomain::Tag)
+    );
 
     let count = index
         .members

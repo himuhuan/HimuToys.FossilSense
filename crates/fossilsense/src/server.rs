@@ -56,6 +56,7 @@ mod indexing;
 mod language_server;
 mod lsp_adapters;
 mod member_completion;
+mod member_navigation;
 mod navigation;
 mod options;
 mod possible_targets;

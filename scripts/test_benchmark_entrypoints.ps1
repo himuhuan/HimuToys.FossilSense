@@ -35,6 +35,8 @@ if (-not (Test-Path -LiteralPath $bindingHarness -PathType Leaf)) { throw 'Bindi
 $bindingCases = @(& $benchmarkScript -IncludeBindingReplay -CaseFilter 'u-boot-binding-replay' -ListCases)
 if (($bindingCases -join "`n") -notmatch 'u-boot-binding-replay') { throw 'Binding replay case is not registered.' }
 
+& (Join-Path $PSScriptRoot 'test_benchmark_time_policy.ps1')
+
 Assert-FullIndexPerformanceGate `
     -CaseId 'u-boot-full-index' -OuterElapsedMs 120000 -EngineElapsedMs 120000
 foreach ($invalid in @(
@@ -491,3 +493,5 @@ try {
 Write-Host 'Benchmark entry-point tests passed.' -ForegroundColor Green
 
 & (Join-Path $PSScriptRoot "test_replay_process_gate.ps1")
+
+& (Join-Path $PSScriptRoot "test_benchmark_timeout_evidence.ps1")

@@ -51,6 +51,59 @@ pub(super) fn with_limit<T>(bytes: usize, operation: impl FnOnce() -> T) -> Resu
 #[cfg(test)]
 mod tests {
     #[test]
+    fn fact_budget_checkpoints_visit_growing_facts_linearly() {
+        use crate::config::SourceLanguage;
+        let calls = 6_000;
+        for (filename, language, source) in [
+            (
+                "dense_calls.c",
+                SourceLanguage::C,
+                format!(
+                    "int target(void); int run(void) {{ {} return 0; }}",
+                    "target();\n".repeat(calls)
+                ),
+            ),
+            (
+                "pkg/dense_calls.go",
+                SourceLanguage::Go,
+                format!(
+                    "package main\nfunc target() {{}}\nfunc run() {{\n{}\n}}",
+                    "target()\n".repeat(calls)
+                ),
+            ),
+        ] {
+            let path = std::path::Path::new(filename);
+            let selection = crate::config::LanguageSelection::explicit(language);
+            let cancel = std::sync::atomic::AtomicBool::new(false);
+            super::super::retained::reset_accounted_entries();
+            let parsed = super::super::parse_thread_local_with_selection_budget(
+                path,
+                &source,
+                selection,
+                super::super::ParseFacts::INDEX,
+                &cancel,
+                64 * 1024 * 1024,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(parsed.call_sites.len(), calls);
+            let visits = super::super::retained::accounted_entries();
+            println!("fact_budget_accounted_entries_{language:?}: {visits}");
+            assert!(
+                visits <= 12 * calls,
+                "{filename}: budget accounting revisited {visits} facts for {calls} calls"
+            );
+            let reference = super::super::parse_thread_local_with_selection(
+                path,
+                &source,
+                selection,
+                super::super::ParseFacts::INDEX,
+            );
+            assert_eq!(parsed, reference);
+        }
+    }
+
+    #[test]
     fn fact_budget_failure_never_returns_partial_facts_and_restores_thread_state() {
         let source: String = (0..3000).map(|i| format!("int v{i};\n")).collect();
         let path = std::path::Path::new("dense.c");

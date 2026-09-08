@@ -11913,3 +11913,5 @@ async fn pressure_failed_full_rebuild_keeps_production_queries_and_cleans_stagin
             .to_string_lossy()
             .starts_with("index-build-")));
 }
+
+mod member_resolution;

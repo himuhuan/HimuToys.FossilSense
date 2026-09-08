@@ -2,6 +2,25 @@
 //! File facts currently own their allocations (no shared Arc payloads).
 use super::FileSemanticIndex;
 use std::mem::size_of;
+#[cfg(test)]
+thread_local! {
+    static ACCOUNTED_ENTRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[cfg(test)]
+pub(super) fn reset_accounted_entries() {
+    ACCOUNTED_ENTRIES.set(0);
+}
+#[cfg(test)]
+pub(super) fn accounted_entries() -> usize {
+    ACCOUNTED_ENTRIES.get()
+}
+#[cfg(test)]
+pub(super) fn record_accounted_entries(count: usize) {
+    if super::budget::active() {
+        ACCOUNTED_ENTRIES.set(ACCOUNTED_ENTRIES.get().saturating_add(count));
+    }
+}
+
 pub(super) trait HeapBytes {
     fn heap_bytes(&self) -> usize;
 }
@@ -34,12 +53,68 @@ impl<T: HeapBytes> HeapBytes for Option<T> {
 }
 impl<T: HeapBytes> HeapBytes for Vec<T> {
     fn heap_bytes(&self) -> usize {
+        #[cfg(test)]
+        record_accounted_entries(self.len());
         self.iter()
             .fold(self.capacity().saturating_mul(size_of::<T>()), |n, v| {
                 n.saturating_add(v.heap_bytes())
             })
     }
 }
+/// Construction-only accounting for facts that are immutable after append.
+/// Final parser output still receives a complete retained_bytes check.
+#[derive(Default)]
+pub(super) struct AppendOnlyVecBytes {
+    counted_len: usize,
+    payload_heap: usize,
+}
+impl AppendOnlyVecBytes {
+    pub(super) fn observe<T: HeapBytes>(&mut self, values: &Vec<T>) -> usize {
+        // A shrink starts a new accounting sequence. This is defensive; AST
+        // collection does not retain, clear, or mutate prior payloads.
+        if values.len() < self.counted_len {
+            self.counted_len = 0;
+            self.payload_heap = 0;
+        }
+        #[cfg(test)]
+        record_accounted_entries(values.len() - self.counted_len);
+        for value in &values[self.counted_len..] {
+            self.payload_heap = self.payload_heap.saturating_add(value.heap_bytes());
+        }
+        self.counted_len = values.len();
+        self.payload_heap
+            .saturating_add(values.capacity().saturating_mul(size_of::<T>()))
+    }
+}
+
+macro_rules! ast_fact_bytes {
+    ($($field:ident),* $(,)?) => {
+        #[derive(Default)]
+        pub(super) struct AstFactBytes { $($field: AppendOnlyVecBytes),* }
+        impl AstFactBytes {
+            pub(super) fn observe(&mut self, ast: &super::ast::AstIndex) -> usize {
+                // Exhaustive pattern: adding a fact vector requires accounting.
+                let super::ast::AstIndex { parse_error_count: _, $($field),* } = ast;
+                0usize$(.saturating_add(self.$field.observe($field)))*
+            }
+        }
+    };
+}
+ast_fact_bytes!(
+    declarations,
+    type_symbols,
+    occurrences,
+    fields,
+    members,
+    enum_constants,
+    aliases,
+    records,
+    local_declarations,
+    local_bindings,
+    callable_anchors,
+    call_sites
+);
+
 // Exhaustive destructuring makes newly added fact fields a compile error here.
 macro_rules! struct_heap { ($ty:path, { $($field:ident),* }) => { impl HeapBytes for $ty { fn heap_bytes(&self) -> usize { let Self { $($field),* } = self; 0usize$(.saturating_add($field.heap_bytes()))* } } }; }
 impl FileSemanticIndex {
@@ -88,9 +163,14 @@ impl HeapBytes for crate::semantic_model::DeclaratorShape {
         }
     }
 }
+impl HeapBytes for crate::semantic_model::TypeNameDomain {
+    fn heap_bytes(&self) -> usize {
+        0
+    }
+}
 struct_heap!(super::FileSemanticIndex, { source_fingerprint, cursor, language, language_evidence, includes, package, imports, build_guard, declarations, fallback_completions, parse_outcome, occurrences, records, fields, members, aliases, callable_anchors, call_sites, local_declarations, local_bindings, diagnostics });
 struct_heap!(super::CursorFacts, { spans, truncated });
-struct_heap!(super::CursorSyntax, { start_byte, end_byte, domain, qualifier, conditional });
+struct_heap!(super::CursorSyntax, { start_byte, end_byte, domain, qualifier, conditional, owner_type });
 struct_heap!(super::ParseDiagnostics, { parse_error_count, fallback_used, lexical_source, ast_source, requested_facts, recovery, recovery_budget_exhausted, coverage });
 struct_heap!(crate::semantic_model::DeclarationCoverage, { summary, gaps });
 struct_heap!(crate::semantic_model::CoverageGap, { range, groups, reason, evidence, related_declarations, recovery_rules });
@@ -179,7 +259,7 @@ impl HeapBytes for crate::semantic_model::AliasTargetFidelity {
         0
     }
 }
-struct_heap!(crate::semantic_model::MemberDef, { record_key, name, kind, confidence, type_name, start_byte, end_byte, start_line, start_col, end_line, end_col, signature, guard });
+struct_heap!(crate::semantic_model::MemberDef, { record_key, name, kind, confidence, type_name, type_domain, start_byte, end_byte, start_line, start_col, end_line, end_col, signature, guard });
 impl HeapBytes for crate::semantic_model::MemberConfidence {
     fn heap_bytes(&self) -> usize {
         0
@@ -274,6 +354,23 @@ struct_heap!(super::ast::AstIndex, { parse_error_count, declarations, type_symbo
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn append_only_budget_counts_spare_capacity_and_new_payloads() {
+        use super::{AppendOnlyVecBytes, HeapBytes};
+        let mut ledger = AppendOnlyVecBytes::default();
+        let mut values = Vec::with_capacity(8);
+        let mut first = String::with_capacity(2048);
+        first.push_str("field");
+        values.push(first);
+        assert_eq!(ledger.observe(&values), values.heap_bytes());
+        values.reserve_exact(128);
+        assert_eq!(ledger.observe(&values), values.heap_bytes());
+        values.push("another field".into());
+        assert_eq!(ledger.observe(&values), values.heap_bytes());
+        assert_eq!(ledger.observe(&values), values.heap_bytes());
+        values.clear();
+        assert_eq!(ledger.observe(&values), values.heap_bytes());
+    }
     #[test]
     fn retained_capacity_saturates_in_nested_containers() {
         use super::HeapBytes;

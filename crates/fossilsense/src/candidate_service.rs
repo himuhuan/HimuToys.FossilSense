@@ -13,6 +13,9 @@ use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+use crate::query::AliasResolutionStatus;
+
 use anyhow::Result;
 use serde::Serialize;
 
@@ -23,11 +26,11 @@ use crate::model::{CandidateRange, DefinitionCandidate, MemberCandidate};
 use crate::parser::{FactAvailability, FactGroup, FileSemanticIndex};
 use crate::query::{
     record_candidates_exact, resolve_callable_candidates, resolve_type_alias,
-    type_alias_candidates_exact, AliasResolution, AliasResolutionStatus, CallSiteContext,
-    CallableCandidateSet, CallableQueryInput, CandidateCoverage, CandidateOrigin,
-    CandidateRevision, ContextReliability, RecordCandidate, RecordCandidateIdentity,
-    RecordCandidateSet, ResolvedCallableAnchor, TypeAliasCandidate, TypeAliasCandidateSet,
-    TypeAliasTarget, ALIAS_RESOLUTION_MAX_VISITS, TYPE_CANDIDATE_LIMIT,
+    type_alias_candidates_exact, AliasResolution, CallSiteContext, CallableCandidateSet,
+    CallableQueryInput, CandidateCoverage, CandidateOrigin, CandidateRevision, ContextReliability,
+    RecordCandidate, RecordCandidateIdentity, RecordCandidateSet, ResolvedCallableAnchor,
+    TypeAliasCandidate, TypeAliasCandidateSet, TypeAliasTarget, ALIAS_RESOLUTION_MAX_VISITS,
+    TYPE_CANDIDATE_LIMIT,
 };
 use crate::reachability::{ReachGraph, ReachScope};
 use crate::resolver::{self, ResolveContext};
@@ -38,6 +41,7 @@ use crate::semantic_model::{
 
 mod callable_queries;
 mod coverage;
+pub(crate) mod member_resolution;
 mod semantic;
 mod type_queries;
 pub use callable_queries::CandidateQueryService;
@@ -48,7 +52,7 @@ pub use semantic::{
     CandidateHandle, LookupPolicy, ResolvedDeclarationCandidate, SemanticIntent,
 };
 #[allow(unused_imports)]
-pub use type_queries::{BoundedMemberCandidates, TypeCandidateBundle, TypeRecordResolution};
+pub use type_queries::{BoundedMemberCandidates, TypeCandidateBundle};
 
 pub const DEFAULT_EXACT_NAME_CANDIDATE_LIMIT: usize = 256;
 const MEMBER_FALLBACK_OVERLAY_SCAN_LIMIT: usize = 8_192;
@@ -1330,17 +1334,6 @@ impl CandidateOverlaySnapshot {
             .unwrap_or_default()
     }
 
-    pub fn records_for_family(
-        &self,
-        name: &str,
-        family: SemanticFamily,
-    ) -> Vec<&OverlayRecordFact> {
-        self.records(name)
-            .iter()
-            .filter(|entry| self.semantic_family_for_path(&entry.path) == Some(family))
-            .collect()
-    }
-
     pub fn record_by_parser_key(&self, path: &str, record_key: &str) -> Option<&OverlayRecordFact> {
         self.record_by_key
             .get(&(path.to_string(), record_key.to_string()))
@@ -1393,9 +1386,9 @@ impl CandidateOverlaySnapshot {
         prefix: &str,
         family: SemanticFamily,
         limit: usize,
-    ) -> (Vec<&OverlayMemberFact>, bool) {
+    ) -> (Vec<&OverlayMemberFact>, bool, usize) {
         if limit == 0 {
-            return (Vec::new(), false);
+            return (Vec::new(), true, 0);
         }
         let needle = prefix.to_ascii_lowercase();
         let start = self
@@ -1403,20 +1396,21 @@ impl CandidateOverlaySnapshot {
             .partition_point(|fact| fact.name_lower.as_str() < needle.as_str());
         let mut matches = Vec::new();
         let mut truncated = false;
+        let mut scanned = 0;
         for fact in &self.member_prefix_index[start..] {
             if !fact.name_lower.starts_with(&needle) {
                 break;
             }
-            if self.semantic_family_for_path(&fact.path) != Some(family) {
-                continue;
-            }
-            if matches.len() >= limit {
+            if scanned >= limit {
                 truncated = true;
                 break;
             }
-            matches.push(fact);
+            scanned += 1;
+            if self.semantic_family_for_path(&fact.path) == Some(family) {
+                matches.push(fact);
+            }
         }
-        (matches, truncated)
+        (matches, truncated, scanned)
     }
 
     /// Stable projection used to replace shadowed NameTable paths in ordinary
@@ -1483,13 +1477,6 @@ impl CandidateOverlaySnapshot {
             .get(name)
             .map(Vec::as_slice)
             .unwrap_or_default()
-    }
-
-    pub fn aliases_for_family(&self, name: &str, family: SemanticFamily) -> Vec<&OverlayAliasFact> {
-        self.aliases(name)
-            .iter()
-            .filter(|entry| self.semantic_family_for_path(&entry.path) == Some(family))
-            .collect()
     }
 
     pub fn source_text(&self, path: &str) -> Option<&str> {
