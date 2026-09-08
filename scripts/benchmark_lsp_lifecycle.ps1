@@ -6,7 +6,9 @@ param(
     [string]$Workspace,
     [Parameter(Mandatory = $true)]
     [ValidateSet('u-boot', 'wine')]
-    [string]$Sample
+    [string]$Sample,
+    [switch]$ObserveFullIndexTime,
+    [switch]$AllowTransientMemoryPeak
 )
 
 $ErrorActionPreference = 'Stop'
@@ -35,6 +37,11 @@ $allowedMetrics = [System.Collections.Generic.HashSet[string]]::new(
     'lsp_lifecycle_reserved_bytes_peak',
     'lsp_lifecycle_retained_bytes_peak',
     'lsp_lifecycle_peak_process_bytes',
+    'lsp_lifecycle_stable_max_bytes',
+    'lsp_lifecycle_stable_samples',
+    'lsp_lifecycle_stable_window_ms',
+    'lsp_lifecycle_above_limit_ms',
+    'lsp_lifecycle_longest_above_limit_ms',
     'lsp_lifecycle_memory_sample_available',
     'lsp_lifecycle_memory_metric_private_bytes',
     'lsp_lifecycle_old_requests_held_peak',
@@ -74,10 +81,14 @@ $allowedMetrics = [System.Collections.Generic.HashSet[string]]::new(
 $previousDatabase = $env:FOSSILSENSE_BENCH_DB
 $previousWorkspace = $env:FOSSILSENSE_BENCH_ROOT
 $previousSample = $env:FOSSILSENSE_BENCH_SAMPLE
+$previousObserve = $env:FOSSILSENSE_BENCH_OBSERVE_FULL_INDEX_TIME
+$previousTransient = $env:FOSSILSENSE_BENCH_ALLOW_TRANSIENT_MEMORY_PEAK
 try {
     $env:FOSSILSENSE_BENCH_DB = $databasePath
     $env:FOSSILSENSE_BENCH_ROOT = $workspacePath
     $env:FOSSILSENSE_BENCH_SAMPLE = $Sample
+    $env:FOSSILSENSE_BENCH_OBSERVE_FULL_INDEX_TIME = if ($ObserveFullIndexTime) { "1" } else { "0" }
+    $env:FOSSILSENSE_BENCH_ALLOW_TRANSIENT_MEMORY_PEAK = if ($AllowTransientMemoryPeak) { "1" } else { "0" }
     Push-Location $repoRoot
     try {
         $savedErrorAction = $ErrorActionPreference
@@ -111,7 +122,7 @@ try {
             $metrics[$Matches[1]] = [long]$Matches[2]
         }
     }
-    Assert-LspLifecycleGate -CaseId "$Sample-lsp-lifecycle" -Metrics $metrics
+    Assert-LspLifecycleGate -CaseId "$Sample-lsp-lifecycle" -Metrics $metrics -ObserveFullIndexTime:$ObserveFullIndexTime -AllowTransientMemoryPeak:$AllowTransientMemoryPeak
     foreach ($name in $allowedMetrics) {
         Write-Output "${name}: $($metrics[$name])"
     }
@@ -119,4 +130,6 @@ try {
     $env:FOSSILSENSE_BENCH_DB = $previousDatabase
     $env:FOSSILSENSE_BENCH_ROOT = $previousWorkspace
     $env:FOSSILSENSE_BENCH_SAMPLE = $previousSample
+    $env:FOSSILSENSE_BENCH_OBSERVE_FULL_INDEX_TIME = $previousObserve
+    $env:FOSSILSENSE_BENCH_ALLOW_TRANSIENT_MEMORY_PEAK = $previousTransient
 }

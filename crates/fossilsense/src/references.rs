@@ -396,21 +396,15 @@ fn search_references_inner(
     cache: Option<&ReferenceRoleCache>,
     indexed_files: Option<Vec<(String, PathBuf)>>,
 ) -> Result<(Vec<ReferenceHit>, bool, ReferencesTiming)> {
-    search_references_inner_borrowed(
-        root,
-        identifier,
-        cache,
-        indexed_files.as_deref(),
-        None,
-        None,
-    )
+    let indexed_files = indexed_files.map(crate::indexed_files::IndexedFileList::from_vec);
+    search_references_inner_borrowed(root, identifier, cache, indexed_files.as_ref(), None, None)
 }
 
 fn search_references_inner_borrowed(
     root: impl AsRef<Path>,
     identifier: &str,
     cache: Option<&ReferenceRoleCache>,
-    indexed_files: Option<&[(String, PathBuf)]>,
+    indexed_files: Option<&crate::indexed_files::IndexedFileList>,
     semantic_family: Option<SemanticFamily>,
     config_snapshot: Option<(&WorkspaceConfig, &LanguageResolver)>,
 ) -> Result<(Vec<ReferenceHit>, bool, ReferencesTiming)> {
@@ -444,7 +438,9 @@ fn search_references_inner_borrowed(
     let candidates = match indexed_files {
         Some(files) if !files.is_empty() => files,
         _ => {
-            discovered = discover_reference_files(&root, config);
+            discovered = crate::indexed_files::IndexedFileList::from_vec(discover_reference_files(
+                &root, config,
+            ));
             &discovered
         }
     };
@@ -457,7 +453,15 @@ fn search_references_inner_borrowed(
     let mut search_acc = Duration::ZERO;
     let mut classify_acc = Duration::ZERO;
     let mut truncated = false;
-    for candidate_chunk in candidates.chunks(REFERENCE_SEARCH_CHUNK) {
+    let mut candidate_files = candidates.iter();
+    loop {
+        let candidate_chunk: Vec<_> = candidate_files
+            .by_ref()
+            .take(REFERENCE_SEARCH_CHUNK)
+            .collect();
+        if candidate_chunk.is_empty() {
+            break;
+        }
         let file_results: Result<Vec<_>> = candidate_chunk
             .par_iter()
             .filter(|(_, path)| {
@@ -524,7 +528,7 @@ pub fn search_references_with_shared_files_for_family(
     role_cache: &ReferenceRoleCache,
     search_cache: &ReferenceSearchCache,
     generation: u64,
-    indexed_files: Option<Arc<Vec<(String, PathBuf)>>>,
+    indexed_files: Option<Arc<crate::indexed_files::IndexedFileList>>,
     semantic_family: SemanticFamily,
     cache_epoch: u64,
     workspace_config: WorkspaceConfig,
@@ -551,7 +555,7 @@ fn search_references_with_shared_files_filtered(
     role_cache: &ReferenceRoleCache,
     search_cache: &ReferenceSearchCache,
     generation: u64,
-    indexed_files: Option<Arc<Vec<(String, PathBuf)>>>,
+    indexed_files: Option<Arc<crate::indexed_files::IndexedFileList>>,
     semantic_family: Option<SemanticFamily>,
     cache_epoch: u64,
     workspace_config: WorkspaceConfig,
@@ -584,7 +588,7 @@ fn search_references_with_shared_files_filtered(
         &root,
         identifier,
         Some(role_cache),
-        indexed_files.as_deref().map(Vec::as_slice),
+        indexed_files.as_deref(),
         semantic_family,
         Some((&workspace_config, &language_resolver)),
     )?;

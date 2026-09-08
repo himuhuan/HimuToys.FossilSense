@@ -26,6 +26,15 @@ impl IndexStore {
 }
 impl EntityStoreView<'_> {
     #[cfg(test)]
+    pub(crate) fn replace_incarnation_for_test(&self, incarnation: &str) -> Result<()> {
+        self.store.conn.execute(
+            "UPDATE meta SET value=?1 WHERE key='entity_incarnation'",
+            [incarnation],
+        )?;
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub fn active_count(&self) -> Result<i64> {
         Ok(self.store.conn.query_row("SELECT COUNT(*) FROM entity_occurrences e JOIN active_file_revisions a ON a.revision_id=e.revision_id", [], |row| row.get(0))?)
     }

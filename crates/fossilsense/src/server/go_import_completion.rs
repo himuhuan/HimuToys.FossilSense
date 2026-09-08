@@ -1,13 +1,13 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::mem::size_of;
 use std::ops::Range as IndexRange;
+use std::sync::Arc;
 
 use tower_lsp::lsp_types::{
     CompletionItem, CompletionItemKind, CompletionList, CompletionResponse, CompletionTextEdit,
     Position, Range, TextEdit,
 };
 
-use crate::memory_report::vec_bytes;
 use crate::store::views::GoImportablePackageRow;
 
 const GO_IMPORT_COMPLETION_LIMIT: usize = 100;
@@ -23,7 +23,7 @@ pub(super) struct GoImportCompletionContext {
     cursor_character: u32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct GoImportCompletionEntry {
     import_path: String,
     package_keys: Vec<String>,
@@ -39,10 +39,18 @@ impl GoImportCompletionEntry {
 
 #[derive(Debug, Default)]
 pub(super) struct GoImportCompletionTable {
-    entries: Vec<GoImportCompletionEntry>,
+    entries: Arc<Vec<GoImportCompletionEntry>>,
+    by_directory: Arc<HashMap<String, Vec<(usize, usize)>>>,
+    updates: Arc<BTreeMap<String, Option<GoImportCompletionEntry>>>,
+    base_bytes: usize,
 }
 
 impl GoImportCompletionTable {
+    #[cfg(test)]
+    pub(in crate::server) fn shares_base_for_test(&self, other: &Self) -> bool {
+        self.entries.as_ptr() == other.entries.as_ptr()
+    }
+
     pub(super) fn build(rows: Vec<GoImportablePackageRow>) -> Self {
         let mut by_path = BTreeMap::<String, Vec<String>>::new();
         for row in rows
@@ -54,7 +62,7 @@ impl GoImportCompletionTable {
                 .or_default()
                 .push(package_key_identity(&row.package_key));
         }
-        let entries = by_path
+        let entries: Vec<_> = by_path
             .into_iter()
             .map(|(import_path, mut package_keys)| {
                 package_keys.sort();
@@ -65,7 +73,35 @@ impl GoImportCompletionTable {
                 }
             })
             .collect();
-        Self { entries }
+        let mut by_directory = HashMap::<String, Vec<(usize, usize)>>::new();
+        for (entry_index, entry) in entries.iter().enumerate() {
+            for (key_index, key) in entry.package_keys.iter().enumerate() {
+                if let Some((directory, _)) = key.rsplit_once('#') {
+                    by_directory
+                        .entry(directory.to_owned())
+                        .or_default()
+                        .push((entry_index, key_index));
+                }
+            }
+        }
+        let base_bytes = size_of::<Self>()
+            + entries.capacity() * size_of::<GoImportCompletionEntry>()
+            + entries.iter().map(entry_payload_bytes).sum::<usize>()
+            + crate::memory_report::hash_table_bytes::<String, Vec<(usize, usize)>>(
+                by_directory.capacity(),
+            )
+            + by_directory
+                .iter()
+                .map(|(dir, positions)| {
+                    dir.capacity() + positions.capacity() * size_of::<(usize, usize)>()
+                })
+                .sum::<usize>();
+        Self {
+            entries: Arc::new(entries),
+            by_directory: Arc::new(by_directory),
+            updates: Arc::new(BTreeMap::new()),
+            base_bytes,
+        }
     }
 
     fn matching_range(&self, prefix: &str) -> IndexRange<usize> {
@@ -77,22 +113,128 @@ impl GoImportCompletionTable {
         start..end
     }
 
-    /// Structure-level estimate of the bytes this table holds, for memory
-    /// observability. Not an allocator promise; the process-level gates stay
-    /// authoritative.
-    pub(super) fn accounted_bytes(&self) -> usize {
-        let mut bytes = size_of::<Self>().saturating_add(vec_bytes::<GoImportCompletionEntry>(
-            self.entries.capacity(),
-        ));
-        for entry in &self.entries {
-            bytes = bytes
-                .saturating_add(entry.import_path.len())
-                .saturating_add(vec_bytes::<String>(entry.package_keys.capacity()));
-            for package_key in &entry.package_keys {
-                bytes = bytes.saturating_add(package_key.len());
+    fn base_entry(&self, path: &str) -> Option<&GoImportCompletionEntry> {
+        self.entries
+            .binary_search_by(|entry| entry.import_path.as_str().cmp(path))
+            .ok()
+            .map(|i| &self.entries[i])
+    }
+    fn entry(&self, path: &str) -> Option<&GoImportCompletionEntry> {
+        self.updates
+            .get(path)
+            .map_or_else(|| self.base_entry(path), Option::as_ref)
+    }
+    pub(in crate::server) fn updated_directories(
+        self: &Arc<Self>,
+        directories: &[String],
+        rows: Vec<GoImportablePackageRow>,
+    ) -> Option<Arc<Self>> {
+        if directories.len() > 256 {
+            return None;
+        }
+        let dirs: HashSet<String> = directories
+            .iter()
+            .map(|dir| {
+                #[cfg(windows)]
+                {
+                    dir.to_ascii_lowercase()
+                }
+                #[cfg(not(windows))]
+                {
+                    dir.clone()
+                }
+            })
+            .collect();
+        let belongs = |key: &str| {
+            key.rsplit_once('#')
+                .is_some_and(|(dir, _)| dirs.contains(dir))
+        };
+        let fresh: BTreeMap<_, _> = rows
+            .into_iter()
+            .map(|row| (package_key_identity(&row.package_key), row.import_path))
+            .collect();
+        let mut current = BTreeMap::new();
+        for dir in &dirs {
+            if let Some(positions) = self.by_directory.get(dir) {
+                if current.len() + positions.len() > 4096 {
+                    return None;
+                }
+                for (entry_index, key_index) in positions {
+                    let entry = &self.entries[*entry_index];
+                    if !self.updates.contains_key(&entry.import_path) {
+                        current.insert(
+                            entry.package_keys[*key_index].clone(),
+                            entry.import_path.clone(),
+                        );
+                    }
+                }
             }
         }
-        bytes
+        for entry in self.updates.values().filter_map(Option::as_ref) {
+            for key in entry.package_keys.iter().filter(|key| belongs(key)) {
+                current.insert(key.clone(), entry.import_path.clone());
+            }
+        }
+        if current == fresh {
+            return Some(self.clone());
+        }
+        let mut affected: Vec<_> = current.values().chain(fresh.values()).cloned().collect();
+        affected.sort();
+        affected.dedup();
+        if affected.len() > 256 {
+            return None;
+        }
+        let mut updates = self.updates.as_ref().clone();
+        for path in affected {
+            if self
+                .entry(&path)
+                .is_some_and(|entry| entry_payload_bytes(entry) > 4 * 1024 * 1024)
+            {
+                return None;
+            }
+            let mut keys: Vec<_> = self
+                .entry(&path)
+                .into_iter()
+                .flat_map(|entry| entry.package_keys.iter())
+                .filter(|key| !belongs(key))
+                .cloned()
+                .collect();
+            keys.extend(
+                fresh
+                    .iter()
+                    .filter(|(_, value)| *value == &path)
+                    .map(|(key, _)| key.clone()),
+            );
+            keys.sort();
+            keys.dedup();
+            let replacement = (!keys.is_empty()).then(|| GoImportCompletionEntry {
+                import_path: path.clone(),
+                package_keys: keys,
+            });
+            if replacement.as_ref() == self.base_entry(&path) {
+                updates.remove(&path);
+            } else {
+                updates.insert(path, replacement);
+            }
+        }
+        if updates.len() > 256 || update_bytes(&updates) > 4 * 1024 * 1024 {
+            return None;
+        }
+        Some(Arc::new(Self {
+            entries: self.entries.clone(),
+            by_directory: self.by_directory.clone(),
+            updates: Arc::new(updates),
+            base_bytes: self.base_bytes,
+        }))
+    }
+    pub(super) fn accounted_bytes(&self) -> usize {
+        self.base_bytes + self.delta_bytes()
+    }
+    pub(in crate::server) fn delta_bytes(&self) -> usize {
+        update_bytes(&self.updates)
+    }
+    pub(in crate::server) fn delta_partitions(&self) -> usize {
+        self.updates.len()
     }
 
     pub(super) fn complete(
@@ -102,7 +244,26 @@ impl GoImportCompletionTable {
     ) -> CompletionResponse {
         let mut items = Vec::new();
         let current_package_key = current_package_key.map(package_key_identity);
-        for entry in &self.entries[self.matching_range(&context.prefix)] {
+        let mut base = self.entries[self.matching_range(&context.prefix)]
+            .iter()
+            .filter(|entry| !self.updates.contains_key(&entry.import_path))
+            .peekable();
+        let mut delta = self
+            .updates
+            .values()
+            .filter_map(Option::as_ref)
+            .filter(|entry| entry.import_path.starts_with(&context.prefix))
+            .peekable();
+        loop {
+            let entry = match (base.peek(), delta.peek()) {
+                (Some(a), Some(b)) if a.import_path < b.import_path => base.next(),
+                (_, Some(_)) => delta.next(),
+                (Some(_), None) => base.next(),
+                _ => None,
+            };
+            let Some(entry) = entry else {
+                break;
+            };
             if current_package_key
                 .as_deref()
                 .is_some_and(|current| entry.contains_package_key(current))
@@ -134,6 +295,24 @@ impl GoImportCompletionTable {
             items,
         })
     }
+}
+
+fn entry_payload_bytes(entry: &GoImportCompletionEntry) -> usize {
+    entry.import_path.capacity()
+        + entry.package_keys.capacity() * size_of::<String>()
+        + entry
+            .package_keys
+            .iter()
+            .map(String::capacity)
+            .sum::<usize>()
+}
+fn update_bytes(updates: &BTreeMap<String, Option<GoImportCompletionEntry>>) -> usize {
+    updates.len()
+        * (11 * size_of::<(String, Option<GoImportCompletionEntry>)>() + 12 * size_of::<usize>())
+        + updates
+            .iter()
+            .map(|(key, value)| key.capacity() + value.as_ref().map_or(0, entry_payload_bytes))
+            .sum::<usize>()
 }
 
 fn package_key_identity(package_key: &str) -> String {
@@ -473,6 +652,51 @@ mod tests {
         }
     }
 
+    #[test]
+    fn segmented_go_import_continuous_delete_readd_and_shared_paths_match_rebuild() {
+        let context = GoImportCompletionContext {
+            prefix: "example.test/".into(),
+            line: 1,
+            path_start_character: 8,
+            path_end_character: 21,
+            cursor_character: 21,
+        };
+        let mut rows = vec![
+            import_row("left#lib", "example.test/shared"),
+            import_row("right#lib", "example.test/shared"),
+            import_row("keep#keep", "example.test/keep"),
+        ];
+        let base = Arc::new(GoImportCompletionTable::build(rows.clone()));
+        let mut current = base.clone();
+        for step in 0..24 {
+            rows.retain(|row| !row.package_key.starts_with("left#"));
+            if step % 3 != 0 {
+                rows.push(import_row(
+                    "left#lib",
+                    if step % 2 == 0 {
+                        "example.test/moved"
+                    } else {
+                        "example.test/shared"
+                    },
+                ));
+            }
+            let fresh = rows
+                .iter()
+                .filter(|r| r.package_key.starts_with("left#"))
+                .cloned()
+                .collect();
+            current = current
+                .updated_directories(&["left".into()], fresh)
+                .unwrap();
+            let rebuilt = GoImportCompletionTable::build(rows.clone());
+            assert_eq!(
+                serde_json::to_value(current.complete(&context, None)).unwrap(),
+                serde_json::to_value(rebuilt.complete(&context, None)).unwrap()
+            );
+            assert!(current.shares_base_for_test(&base));
+        }
+        assert_eq!(base.entries.len(), 2);
+    }
     #[test]
     fn accounted_bytes_grows_with_entries() {
         let empty = GoImportCompletionTable::default();

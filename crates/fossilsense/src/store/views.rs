@@ -119,33 +119,60 @@ impl<'a> FallbackCompletionStoreView<'a> {
     }
 
     pub fn all(&self) -> Result<Vec<FallbackCompletionRow>> {
-        let mut stmt = self.store.conn.prepare(
-            "SELECT c.id, c.name, c.kind_hint, f.path, c.start_byte, c.end_byte,
-                    c.start_line, c.start_col, c.end_line, c.end_col, c.detail,
-                    rev.language
-             FROM fallback_completions c
-             JOIN files f ON f.id = c.file_id
-             JOIN file_revisions rev ON rev.id = c.revision_id
-             ORDER BY lower(c.name), c.name, f.path, c.start_byte, c.id",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok(FallbackCompletionRow {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                kind_hint: row.get(2)?,
-                path: row.get(3)?,
-                start_byte: row.get::<_, i64>(4)? as usize,
-                end_byte: row.get::<_, i64>(5)? as usize,
-                start_line: row.get::<_, i64>(6)? as u32,
-                start_col: row.get::<_, i64>(7)? as u32,
-                end_line: row.get::<_, i64>(8)? as u32,
-                end_col: row.get::<_, i64>(9)? as u32,
-                detail: row.get(10)?,
-                semantic_family: semantic_family_from_language_code(row.get(11)?)?,
-            })
-        })?;
+        let sql =
+            format!("{FALLBACK_SELECT} ORDER BY lower(c.name), c.name, f.path, c.start_byte, c.id");
+        let mut stmt = self.store.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], fallback_completion_row)?;
         collect_rows(rows)
     }
+
+    pub fn by_paths_limited(
+        &self,
+        paths: &[String],
+        limit: usize,
+    ) -> Result<(Vec<FallbackCompletionRow>, bool)> {
+        let mut output = Vec::new();
+        for chunk in paths.chunks(256) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let probe = limit.saturating_sub(output.len()).saturating_add(1);
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!("{FALLBACK_SELECT} WHERE f.path IN ({placeholders}) LIMIT {probe}");
+            let mut stmt = self.store.conn.prepare(&sql)?;
+            output.extend(collect_rows(stmt.query_map(
+                rusqlite::params_from_iter(chunk),
+                fallback_completion_row,
+            )?)?);
+            if output.len() > limit {
+                output.truncate(limit);
+                return Ok((output, true));
+            }
+        }
+        Ok((output, false))
+    }
+}
+
+const FALLBACK_SELECT: &str = "SELECT c.id, c.name, c.kind_hint, f.path, c.start_byte, c.end_byte,
+    c.start_line, c.start_col, c.end_line, c.end_col, c.detail, rev.language
+    FROM fallback_completions c JOIN files f ON f.id = c.file_id
+    JOIN file_revisions rev ON rev.id = c.revision_id";
+
+fn fallback_completion_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FallbackCompletionRow> {
+    Ok(FallbackCompletionRow {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        kind_hint: row.get(2)?,
+        path: row.get(3)?,
+        start_byte: row.get::<_, i64>(4)? as usize,
+        end_byte: row.get::<_, i64>(5)? as usize,
+        start_line: row.get::<_, i64>(6)? as u32,
+        start_col: row.get::<_, i64>(7)? as u32,
+        end_line: row.get::<_, i64>(8)? as u32,
+        end_col: row.get::<_, i64>(9)? as u32,
+        detail: row.get(10)?,
+        semantic_family: semantic_family_from_language_code(row.get(11)?)?,
+    })
 }
 
 fn semantic_family_from_language_code(
@@ -198,6 +225,38 @@ impl<'a> ReachGraphStoreView<'a> {
             })
         })?;
         collect_rows(rows)
+    }
+
+    pub fn include_edges_for_sources_limited(
+        &self,
+        sources: &[String],
+        limit: usize,
+    ) -> Result<(Vec<IncludeEdgeRow>, bool)> {
+        let mut output = Vec::new();
+        for chunk in sources.chunks(256) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let parameters = vec!["?"; chunk.len()].join(",");
+            let probe = limit.saturating_sub(output.len()).saturating_add(1);
+            let sql=format!("SELECT sf.path, df.path, e.resolution FROM include_edges e JOIN files sf ON sf.id=e.src_file_id JOIN files df ON df.id=e.dst_file_id WHERE sf.path IN ({parameters}) LIMIT {probe}");
+            let mut stmt = self.store.conn.prepare(&sql)?;
+            output.extend(collect_rows(stmt.query_map(
+                rusqlite::params_from_iter(chunk),
+                |row| {
+                    Ok(IncludeEdgeRow {
+                        source_path: row.get(0)?,
+                        target_path: row.get(1)?,
+                        resolution: ResolutionKind::from_str(&row.get::<_, String>(2)?),
+                    })
+                },
+            )?)?);
+            if output.len() > limit {
+                output.truncate(limit);
+                return Ok((output, true));
+            }
+        }
+        Ok((output, false))
     }
 
     pub fn unresolved_includes(&self) -> Result<Vec<OpenIncludeRow>> {
@@ -317,6 +376,27 @@ impl<'a> IncludeTableStoreView<'a> {
             .prepare("SELECT path, source = 'workspace' FROM files ORDER BY path")?;
         let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
         collect_rows(rows)
+    }
+
+    pub fn include_resolution_paths_for_paths(
+        &self,
+        paths: &[String],
+    ) -> Result<Vec<(String, bool)>> {
+        let mut output = Vec::new();
+        for chunk in paths.chunks(256) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let parameters = vec!["?"; chunk.len()].join(",");
+            let sql = format!("SELECT path, source = 'workspace' FROM files WHERE path IN ({parameters}) ORDER BY path LIMIT 256");
+            let mut stmt = self.store.conn.prepare(&sql)?;
+            output.extend(collect_rows(
+                stmt.query_map(rusqlite::params_from_iter(chunk), |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })?,
+            )?);
+        }
+        Ok(output)
     }
 
     pub fn workspace_file_paths(&self) -> Result<Vec<String>> {

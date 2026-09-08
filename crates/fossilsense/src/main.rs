@@ -12,6 +12,7 @@ mod config;
 mod declaration_index;
 mod explain;
 mod includes;
+mod indexed_files;
 mod indexer;
 mod language_builtins;
 mod memory_report;
@@ -75,6 +76,7 @@ mod cli_tests {
                 reach_graph_bytes: 300,
                 include_edge_count: 3,
                 include_table_bytes: 80,
+                include_path_index_bytes: 0,
                 go_import_table_bytes: 20,
                 indexed_files_bytes: 60,
                 file_count: 2,
@@ -125,6 +127,7 @@ mod cli_tests {
             "reach_graph_bytes: 300",
             "include_edges: 3",
             "include_table_bytes: 80",
+            "include_path_index_bytes: 0",
             "go_import_table_bytes: 20",
             "indexed_files_bytes: 60",
             "project_context_bytes: 10",
@@ -597,6 +600,10 @@ fn memory_report_lines(hydrated: &memory_report::HydratedMemoryReport) -> Vec<St
         format!(
             "include_table_bytes: {}",
             report.file_relations.include_table_bytes
+        ),
+        format!(
+            "include_path_index_bytes: {}",
+            report.file_relations.include_path_index_bytes
         ),
         format!(
             "go_import_table_bytes: {}",

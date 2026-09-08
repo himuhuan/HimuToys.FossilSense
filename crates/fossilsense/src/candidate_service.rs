@@ -337,8 +337,10 @@ pub struct OverlayFallbackCompletionFact {
 /// positions instead of cloning every full path into a second workspace map.
 #[derive(Debug)]
 pub(crate) struct IncludePathIndex {
-    paths: Vec<String>,
-    workspace_by_basename: HashMap<String, Vec<usize>>,
+    paths: Arc<Vec<String>>,
+    workspace_by_basename: Arc<HashMap<String, Vec<usize>>>,
+    updates: Arc<std::collections::BTreeMap<String, Option<bool>>>,
+    base_bytes: usize,
 }
 
 const EXTERNAL_PATH_PROBE_QUEUE_CAPACITY: usize = 64;
@@ -588,6 +590,11 @@ fn external_path_probe_cache() -> &'static ExternalPathProbeCache {
 }
 
 impl IncludePathIndex {
+    #[cfg(test)]
+    pub(crate) fn shares_base_for_test(&self, other: &Self) -> bool {
+        self.paths.as_ptr() == other.paths.as_ptr()
+    }
+
     /// Build from `(normalized path, participates in workspace suffix recall)`.
     /// External paths remain exact-matchable but never enter the suffix tier.
     pub(crate) fn build(paths: impl IntoIterator<Item = (String, bool)>) -> Self {
@@ -612,16 +619,97 @@ impl IncludePathIndex {
                 }
             }
         }
+        let paths: Vec<String> = deduplicated.into_iter().map(|(path, _)| path).collect();
+        let base_bytes = std::mem::size_of::<Self>()
+            + paths.capacity() * std::mem::size_of::<String>()
+            + paths.iter().map(String::capacity).sum::<usize>()
+            + crate::memory_report::hash_table_bytes::<String, Vec<usize>>(
+                workspace_by_basename.capacity(),
+            )
+            + workspace_by_basename
+                .iter()
+                .map(|(name, positions)| {
+                    name.capacity() + positions.capacity() * std::mem::size_of::<usize>()
+                })
+                .sum::<usize>();
         Self {
-            paths: deduplicated.into_iter().map(|(path, _)| path).collect(),
-            workspace_by_basename,
+            paths: Arc::new(paths),
+            workspace_by_basename: Arc::new(workspace_by_basename),
+            updates: Arc::new(std::collections::BTreeMap::new()),
+            base_bytes,
         }
     }
 
+    fn base_membership(&self, path: &str) -> Option<bool> {
+        let position = self
+            .paths
+            .binary_search_by(|value| value.as_str().cmp(path))
+            .ok()?;
+        let workspace = path
+            .rsplit('/')
+            .next()
+            .and_then(|name| self.workspace_by_basename.get(name))
+            .is_some_and(|positions| positions.binary_search(&position).is_ok());
+        Some(workspace)
+    }
+    fn membership(&self, path: &str) -> Option<bool> {
+        self.updates
+            .get(path)
+            .copied()
+            .unwrap_or_else(|| self.base_membership(path))
+    }
     fn contains(&self, candidate: &str) -> bool {
-        self.paths
-            .binary_search_by(|path| path.as_str().cmp(candidate))
-            .is_ok()
+        self.membership(candidate).is_some()
+    }
+
+    pub(crate) fn updated_paths(
+        self: &Arc<Self>,
+        paths: &[String],
+        rows: Vec<(String, bool)>,
+    ) -> Option<Arc<Self>> {
+        if paths.len() > 256 {
+            return None;
+        }
+        let fresh: HashMap<_, _> = rows.into_iter().collect();
+        if paths
+            .iter()
+            .all(|path| self.membership(path) == fresh.get(path).copied())
+        {
+            return Some(self.clone());
+        }
+        let mut updates = self.updates.as_ref().clone();
+        for path in paths {
+            let value = fresh.get(path).copied();
+            if self.base_membership(path) == value {
+                updates.remove(path);
+            } else {
+                updates.insert(path.clone(), value);
+            }
+        }
+        if updates.len() > 256 || Self::update_bytes(&updates) > 4 * 1024 * 1024 {
+            return None;
+        }
+        Some(Arc::new(Self {
+            paths: self.paths.clone(),
+            workspace_by_basename: self.workspace_by_basename.clone(),
+            updates: Arc::new(updates),
+            base_bytes: self.base_bytes,
+        }))
+    }
+    fn update_bytes(updates: &std::collections::BTreeMap<String, Option<bool>>) -> usize {
+        updates.len()
+            * (11 * std::mem::size_of::<(String, Option<bool>)>()
+                + 12 * std::mem::size_of::<usize>())
+            + updates.keys().map(String::capacity).sum::<usize>()
+    }
+    pub(crate) fn accounted_bytes(&self) -> usize {
+        self.base_bytes + self.delta_bytes()
+    }
+    pub(crate) fn delta_bytes(&self) -> usize {
+        Self::update_bytes(&self.updates)
+    }
+    pub(crate) fn delta_paths(&self) -> usize {
+        self.updates.len()
     }
 
     fn suffix_candidates_bounded(
@@ -632,20 +720,18 @@ impl IncludePathIndex {
         scan_limit: usize,
         candidate_limit: usize,
     ) -> crate::includes::SuffixCandidateLookup {
-        let Some(posting) = self.workspace_by_basename.get(basename) else {
-            return crate::includes::SuffixCandidateLookup::default();
-        };
         let mut lookup = crate::includes::SuffixCandidateLookup::default();
-        for position in posting {
+        // Inspect new paths first so removed base postings cannot starve them.
+        for (candidate, state) in self.updates.iter() {
+            if *state != Some(true) || candidate.rsplit('/').next() != Some(basename) {
+                continue;
+            }
             if lookup.inspected >= scan_limit {
                 lookup.truncated = true;
                 break;
             }
             lookup.inspected += 1;
-            let Some(candidate) = self.paths.get(*position) else {
-                continue;
-            };
-            if candidate.as_str() != rel && !candidate.ends_with(suffix) {
+            if candidate != rel && !candidate.ends_with(suffix) {
                 continue;
             }
             if lookup.candidates.len() >= candidate_limit {
@@ -654,6 +740,28 @@ impl IncludePathIndex {
             }
             lookup.candidates.push(candidate.clone());
         }
+        if let Some(posting) = self.workspace_by_basename.get(basename) {
+            for position in posting {
+                if lookup.inspected >= scan_limit {
+                    lookup.truncated = true;
+                    break;
+                }
+                lookup.inspected += 1;
+                let candidate = &self.paths[*position];
+                if self.updates.contains_key(candidate)
+                    || (candidate != rel && !candidate.ends_with(suffix))
+                {
+                    continue;
+                }
+                if lookup.candidates.len() >= candidate_limit {
+                    lookup.truncated = true;
+                    break;
+                }
+                lookup.candidates.push(candidate.clone());
+            }
+        }
+        lookup.candidates.sort();
+        lookup.candidates.dedup();
         lookup
     }
 }
@@ -3477,5 +3585,34 @@ mod tests {
                 .map(|c| c.fact.identity.locator.fingerprint),
             Some(fingerprint)
         );
+    }
+}
+
+#[cfg(test)]
+mod include_path_delta_tests {
+    use super::*;
+    #[test]
+    fn segmented_include_paths_match_rebuild_and_prioritize_new_rows() {
+        let base = Arc::new(IncludePathIndex::build(vec![
+            ("old/item.h".into(), true),
+            ("keep.h".into(), true),
+            ("external/item.h".into(), false),
+        ]));
+        let updated = base
+            .updated_paths(
+                &["old/item.h".into(), "new/item.h".into()],
+                vec![("new/item.h".into(), true)],
+            )
+            .unwrap();
+        assert!(base.shares_base_for_test(&updated));
+        assert!(base.contains("old/item.h"));
+        assert!(!updated.contains("old/item.h"));
+        assert!(updated.contains("external/item.h"));
+        let result = updated.suffix_candidates_bounded("item.h", "item.h", "/item.h", 8, 8);
+        assert_eq!(result.candidates, vec!["new/item.h"]);
+        assert!(!result.truncated);
+        let bounded = updated.suffix_candidates_bounded("item.h", "item.h", "/item.h", 1, 1);
+        assert_eq!(bounded.candidates, vec!["new/item.h"]);
+        assert!(bounded.truncated);
     }
 }

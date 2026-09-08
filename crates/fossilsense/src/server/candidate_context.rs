@@ -18,7 +18,7 @@ pub(super) struct CompletionOverlayRequest<'a> {
     pub(super) engine_epoch: super::state::EngineEpoch,
     pub(super) generation: SemanticGeneration,
     pub(super) base_reach_graph: Option<&'a crate::reachability::ReachGraph>,
-    pub(super) indexed_workspace_files: Option<&'a [(String, PathBuf)]>,
+    pub(super) indexed_workspace_files: Option<&'a crate::indexed_files::IndexedFileList>,
     pub(super) workspace_semantics: Arc<super::workspace_config::PublishedWorkspaceSemantics>,
 }
 
@@ -218,9 +218,8 @@ impl Backend {
                 .then(|| snapshot.indexed_files.clone())
                 .flatten()
                 .filter(|indexed| {
-                    indexed_workspace_files.is_some_and(|requested| {
-                        std::ptr::eq::<[(String, PathBuf)]>(indexed.as_slice(), requested)
-                    })
+                    indexed_workspace_files
+                        .is_some_and(|requested| std::ptr::eq(indexed.as_ref(), requested))
                 })
         });
         let owned_include_path_index = published.as_ref().and_then(|snapshot| {
@@ -277,7 +276,7 @@ impl Backend {
         root: &Path,
         generation: SemanticGeneration,
         base_reach_graph: Option<&crate::reachability::ReachGraph>,
-        indexed_workspace_files: Option<&[(String, PathBuf)]>,
+        indexed_workspace_files: Option<&crate::indexed_files::IndexedFileList>,
     ) -> Arc<CandidateOverlaySnapshot> {
         let documents = self.session.documents.capture_request_snapshot(None).await;
         let published = self
@@ -306,7 +305,7 @@ impl Backend {
                     (None, None) => true,
                     _ => false,
                 }) && (match (&snapshot.indexed_files, indexed_workspace_files) {
-                    (Some(a), Some(b)) => std::ptr::eq(a.as_slice(), b),
+                    (Some(a), Some(b)) => std::ptr::eq(a.as_ref(), b),
                     (None, None) => true,
                     _ => false,
                 })

@@ -1,12 +1,14 @@
 # FossilSense for VS Code
 
-FossilSense gives large, difficult-to-build C, C++, and Go workspaces useful navigation without requiring a complete compiler setup. The `1.7.0` VSIX is self-contained: open a workspace and let the bundled native engine build its local index. Go support is experimental and does not require the Go toolchain or gopls.
+FossilSense gives large, difficult-to-build C, C++, and Go workspaces useful navigation without requiring a complete compiler setup. The `1.7.1` VSIX is self-contained: open a workspace and let the bundled native engine build its local index. Go support is experimental and does not require the Go toolchain or gopls.
 
-Version 1.7.0 unifies tolerant C declaration discovery. Multiple declarators, function pointers, typedefs, conditional branches, and local scopes retain consistent identities and original positions. Header language selection uses configuration and source evidence. Healthy declarations remain available when other regions are only partially understood, with partial or unknown coverage made visible.
+Version 1.7.1 improves completion, symbol binding, and memory management in large workspaces. Navigation, hover, and completion details share evidence-backed declaration relationships. Index builds bound concurrent work and temporary parse data; declaration caches evict by recent use. Small saves reuse unchanged auxiliary indexes.
 
 The new read-only `query explain` command separates disk observations, stale indexes, bounded recall, and navigation omissions. Reviewed C fixtures and an independent Clang oracle check the supported regression contracts; this development validation adds no Clang requirement for users. Opt-in protobuf-c source tracing remains available. FossilSense does not expand arbitrary macros or claim complete C++ compiler semantics.
 
 It is designed for firmware, embedded systems, drivers, kernels, legacy code, vendored SDKs, and repositories where `compile_commands.json` is missing or unreliable.
+
+Saved-file updates share the base data for fallback names, include completion, Go imports, header paths, and file lists, retaining only bounded changes. Configuration, module, or database identity changes and accumulated update limits trigger a complete rebuild of the affected read models. Include completion reports incomplete results when its inspection budget is exhausted. Memory details include the header-path index.
 
 ## What you get
 
@@ -46,7 +48,7 @@ C++ record methods intentionally participate in ordinary identifier recall as fu
 
 ## Install and start
 
-Install `fossilsense-vscode-1.7.0_BUILD*.vsix` with:
+Install `fossilsense-vscode-1.7.1_BUILD*.vsix` with:
 
 ```text
 Extensions -> ... -> Install from VSIX

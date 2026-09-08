@@ -89,6 +89,7 @@ const memory: MemoryReport = {
     reachGraphBytes: 30 * MB,
     includeEdgeCount: 45678,
     includeTableBytes: 5 * MB,
+    includePathIndexBytes: 128 * 1024,
     goImportTableBytes: 2 * MB,
     indexedFilesBytes: 10 * MB,
     fileCount: 10234,
@@ -138,7 +139,7 @@ assert.ok(
 );
 assert.ok(
   tooltip.includes(
-    '- File relations: 10,234 files · 45,678 include edges · reach 30MB · include 5.0MB · go imports 2.0MB · file list 10MB · projects 1.0MB',
+    '- File relations: 10,234 files · 45,678 include edges · reach 30MB · include 5.0MB · include paths 128KB · go imports 2.0MB · file list 10MB · projects 1.0MB',
   ),
 );
 assert.ok(tooltip.includes('- Open documents: 4 files · overlay 512KB'));

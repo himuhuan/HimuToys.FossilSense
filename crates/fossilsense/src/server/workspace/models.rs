@@ -97,7 +97,7 @@ pub(in crate::server) struct EngineSnapshot {
     pub(in crate::server) reach_graph: Option<Arc<ReachGraph>>,
     pub(in crate::server) include_table: Option<Arc<IncludeCompletionTable>>,
     pub(in crate::server) go_import_table: Option<Arc<GoImportCompletionTable>>,
-    pub(in crate::server) indexed_files: Option<Arc<Vec<(String, PathBuf)>>>,
+    pub(in crate::server) indexed_files: Option<Arc<crate::indexed_files::IndexedFileList>>,
     pub(in crate::server) include_path_index: Option<Arc<IncludePathIndex>>,
     pub(in crate::server) project_context: Option<Arc<ProjectContextIndex>>,
     pub(in crate::server) call_read_handle: Option<Arc<CallReadHandle>>,
@@ -197,11 +197,9 @@ impl CacheLedger {
                     &snapshot.fallback_completion_table,
                     snapshot.reach_graph.as_deref(),
                     snapshot.include_table.as_deref(),
+                    snapshot.include_path_index.as_deref(),
                     snapshot.go_import_table.as_deref(),
-                    snapshot
-                        .indexed_files
-                        .as_ref()
-                        .map(|files| files.as_slice()),
+                    snapshot.indexed_files.as_ref().map(|files| files.as_ref()),
                     snapshot.project_context.as_deref(),
                 ))
             });
@@ -251,8 +249,22 @@ pub(in crate::server) struct RequestContext {
     pub(in crate::server) settings: RequestSettings,
 }
 
+/// Auxiliary catalogue work only; excludes the existing NameTable and reach graph.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub(in crate::server) struct AuxiliaryUpdateStats {
+    pub(in crate::server) full_reason: Option<&'static str>,
+    pub(in crate::server) full_components: Vec<&'static str>,
+    pub(in crate::server) scoped_rows_read: usize,
+    pub(in crate::server) delta_partitions: usize,
+    pub(in crate::server) delta_bytes: usize,
+    pub(in crate::server) copied_directory_entries: usize,
+    pub(in crate::server) shared_components: usize,
+    pub(in crate::server) new_delta_bytes: usize,
+}
+
 #[derive(Clone)]
 pub(in crate::server) struct CachePublishReport {
+    pub(in crate::server) auxiliary: AuxiliaryUpdateStats,
     pub(in crate::server) semantic_generation: SemanticGeneration,
     pub(in crate::server) declaration_count: usize,
     pub(in crate::server) include_count: usize,

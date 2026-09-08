@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -23,7 +22,7 @@ use crate::progress::DegradedCapabilities;
 use crate::project_context::{self, ProjectContextIndex};
 use crate::reachability::ReachGraph;
 use crate::resource::current_process_memory_bytes;
-use crate::server::workspace::EngineSnapshot;
+use crate::server::workspace::{AuxiliaryUpdateStats, EngineSnapshot};
 use crate::server::{
     CacheLedger, CachePublishReport, GoImportCompletionTable, IncludeCompletionTable,
 };
@@ -33,7 +32,7 @@ mod declaration_models;
 use declaration_models::{
     build_declaration_index_from_db, capture_call_read_handle, load_semantic_generation,
     rebuild_declaration_index, rebuild_fallback_completion_table, rebuild_project_context,
-    update_declaration_index_paths,
+    update_declaration_index_paths, update_fallback_completion_table,
 };
 mod message;
 pub(in crate::server) use message::ready_cache_message;
@@ -163,6 +162,40 @@ pub(in crate::server) async fn rebuild_include_table(
     }
 }
 
+async fn update_include_table(
+    previous: Arc<IncludeCompletionTable>,
+    root: PathBuf,
+    paths: &[String],
+    sources: &[String],
+    work: &mut AuxiliaryUpdateStats,
+) -> Result<Arc<IncludeCompletionTable>> {
+    let changed = paths.to_vec();
+    let edge_sources = sources.to_vec();
+    let load_root = root.clone();
+    let (fresh, edges, truncated) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let store = IndexStore::open_readonly(&pathing::default_index_path(&load_root)?)?;
+        let fresh = store
+            .reference_file_view()
+            .indexed_workspace_files_for_paths(&changed)?
+            .into_iter()
+            .map(|row| row.path)
+            .collect::<Vec<_>>();
+        let (edges, truncated) = store
+            .reach_graph_view()
+            .include_edges_for_sources_limited(&edge_sources, 8192)?;
+        Ok((fresh, edges, truncated))
+    })
+    .await??;
+    work.scoped_rows_read += fresh.len() + edges.len();
+    if !truncated {
+        if let Some(updated) = previous.updated_paths(paths, &fresh, sources, edges) {
+            return Ok(updated);
+        }
+    }
+    work.full_components.push("include_table");
+    rebuild_include_table(root).await
+}
+
 fn build_include_table_from_db(db_path: &Path) -> Result<IncludeCompletionTable> {
     let store = IndexStore::open_readonly(db_path)?;
     Ok(IncludeCompletionTable::build_from_rows(
@@ -190,15 +223,54 @@ pub(in crate::server) async fn rebuild_go_import_table(
     }
 }
 
+async fn update_go_import_table(
+    previous: Arc<GoImportCompletionTable>,
+    root: PathBuf,
+    paths: &[String],
+    work: &mut AuxiliaryUpdateStats,
+) -> Result<Arc<GoImportCompletionTable>> {
+    let mut directories: Vec<_> = paths
+        .iter()
+        .map(|path| {
+            let dir = path
+                .rsplit_once('/')
+                .map(|(dir, _)| dir)
+                .filter(|dir| !dir.is_empty())
+                .unwrap_or(".");
+            dir.to_owned()
+        })
+        .collect();
+    directories.sort();
+    directories.dedup();
+    let query_dirs = directories.clone();
+    let load_root = root.clone();
+    let (rows, truncated) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let store = IndexStore::open_readonly(&pathing::default_index_path(&load_root)?)?;
+        store
+            .go_package_graph_view()
+            .importable_packages_for_directories(&query_dirs, 4096)
+    })
+    .await??;
+    work.scoped_rows_read += rows.len();
+    if !truncated {
+        if let Some(updated) = previous.updated_directories(&directories, rows) {
+            return Ok(updated);
+        }
+    }
+    work.full_components.push("go_import_table");
+    rebuild_go_import_table(root).await
+}
+
 pub(in crate::server) async fn rebuild_indexed_file_list(
     root: PathBuf,
-) -> Result<Arc<Vec<(String, PathBuf)>>> {
+) -> Result<Arc<crate::indexed_files::IndexedFileList>> {
     let build_root = root.clone();
-    let built = tokio::task::spawn_blocking(move || -> Result<Vec<(String, PathBuf)>> {
-        let db_path = pathing::default_index_path(&build_root)?;
-        build_indexed_file_list_from_db(&db_path, &build_root)
-    })
-    .await;
+    let built =
+        tokio::task::spawn_blocking(move || -> Result<crate::indexed_files::IndexedFileList> {
+            let db_path = pathing::default_index_path(&build_root)?;
+            build_indexed_file_list_from_db(&db_path, &build_root)
+        })
+        .await;
 
     match built {
         Ok(Ok(files)) => Ok(Arc::new(files)),
@@ -207,17 +279,22 @@ pub(in crate::server) async fn rebuild_indexed_file_list(
     }
 }
 
-fn build_indexed_file_list_from_db(db_path: &Path, root: &Path) -> Result<Vec<(String, PathBuf)>> {
+fn build_indexed_file_list_from_db(
+    db_path: &Path,
+    root: &Path,
+) -> Result<crate::indexed_files::IndexedFileList> {
     let store = IndexStore::open_readonly(db_path)?;
-    Ok(store
-        .reference_file_view()
-        .indexed_workspace_files()?
-        .into_iter()
-        .map(|row| {
-            let abs = root.join(row.path.replace('/', std::path::MAIN_SEPARATOR_STR));
-            (row.path, abs)
-        })
-        .collect())
+    Ok(crate::indexed_files::IndexedFileList::from_vec(
+        store
+            .reference_file_view()
+            .indexed_workspace_files()?
+            .into_iter()
+            .map(|row| {
+                let abs = root.join(row.path.replace('/', std::path::MAIN_SEPARATOR_STR));
+                (row.path, abs)
+            })
+            .collect(),
+    ))
 }
 
 async fn rebuild_include_path_index(root: PathBuf) -> Result<Arc<IncludePathIndex>> {
@@ -234,6 +311,29 @@ async fn rebuild_include_path_index(root: PathBuf) -> Result<Arc<IncludePathInde
     }
 }
 
+async fn update_include_path_index(
+    previous: Arc<IncludePathIndex>,
+    root: PathBuf,
+    paths: &[String],
+    work: &mut AuxiliaryUpdateStats,
+) -> Result<Arc<IncludePathIndex>> {
+    let changed = paths.to_vec();
+    let load_root = root.clone();
+    let rows = tokio::task::spawn_blocking(move || -> Result<_> {
+        let store = IndexStore::open_readonly(&pathing::default_index_path(&load_root)?)?;
+        store
+            .include_table_view()
+            .include_resolution_paths_for_paths(&changed)
+    })
+    .await??;
+    work.scoped_rows_read += rows.len();
+    if let Some(updated) = previous.updated_paths(paths, rows) {
+        return Ok(updated);
+    }
+    work.full_components.push("include_path_index");
+    rebuild_include_path_index(root).await
+}
+
 fn build_include_path_index_from_db(db_path: &Path) -> Result<IncludePathIndex> {
     let store = IndexStore::open_readonly(db_path)?;
     Ok(IncludePathIndex::build(
@@ -245,13 +345,15 @@ fn build_include_path_index_from_db(db_path: &Path) -> Result<IncludePathIndex> 
 /// Shared by the resource monitor (once per published generation) and the
 /// headless `fossilsense memory` CLI. Values are structure-level estimates;
 /// the process-level gates stay authoritative.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn snapshot_memory_report_from_parts(
     declaration_index: Option<&SemanticDeclarationIndex>,
     fallback_table: &FallbackCompletionNameTable,
     reach_graph: Option<&ReachGraph>,
     include_table: Option<&IncludeCompletionTable>,
+    include_path_index: Option<&IncludePathIndex>,
     go_import_table: Option<&GoImportCompletionTable>,
-    indexed_files: Option<&[(String, PathBuf)]>,
+    indexed_files: Option<&crate::indexed_files::IndexedFileList>,
     project_context: Option<&ProjectContextIndex>,
 ) -> SnapshotMemoryReport {
     let mut report = SnapshotMemoryReport {
@@ -292,18 +394,15 @@ pub(crate) fn snapshot_memory_report_from_parts(
     if let Some(table) = include_table {
         report.include_table_bytes = table.accounted_bytes();
     }
+    if let Some(index) = include_path_index {
+        report.include_path_index_bytes = index.accounted_bytes();
+    }
     if let Some(table) = go_import_table {
         report.go_import_table_bytes = table.accounted_bytes();
     }
     if let Some(files) = indexed_files {
         report.file_count = files.len();
-        let mut bytes = crate::memory_report::vec_bytes::<(String, PathBuf)>(files.len());
-        for (relative, absolute) in files {
-            bytes = bytes
-                .saturating_add(relative.len())
-                .saturating_add(absolute.as_os_str().len());
-        }
-        report.indexed_files_bytes = bytes;
+        report.indexed_files_bytes = files.accounted_bytes();
     }
     if let Some(context) = project_context {
         report.project_context_bytes = context.accounted_bytes();
@@ -315,9 +414,7 @@ pub(crate) fn snapshot_memory_report_from_parts(
 /// publishes from an existing index and measure their memory footprint.
 /// Backs the headless `fossilsense memory` CLI: synchronous, and on large
 /// workspaces takes seconds plus hundreds of MiB by design. The include path
-/// index and call read handles are not hydrated; like on the live server
-/// they stay inside `process.other_bytes`, keeping the CLI and server
-/// category accounting consistent.
+/// index is included in the same category as the live server.
 pub(crate) fn hydrate_memory_report(
     root: &Path,
     db_path: Option<PathBuf>,
@@ -343,6 +440,7 @@ pub(crate) fn hydrate_memory_report(
     };
     let reach_graph = build_reach_graph_from_db(&db_path)?;
     let include_table = build_include_table_from_db(&db_path)?;
+    let include_path_index = build_include_path_index_from_db(&db_path)?;
     let indexed_files = build_indexed_file_list_from_db(&db_path, root)?;
     let hydration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let memory_after = current_process_memory_bytes();
@@ -352,6 +450,7 @@ pub(crate) fn hydrate_memory_report(
         &fallback_table,
         Some(&reach_graph),
         Some(&include_table),
+        Some(&include_path_index),
         Some(&go_import_table),
         Some(&indexed_files),
         Some(&project_context),
@@ -396,10 +495,11 @@ fn index_db_disk_bytes(db_path: &Path) -> u64 {
 }
 
 async fn update_indexed_file_list(
-    previous: Option<Arc<Vec<(String, PathBuf)>>>,
+    previous: Option<Arc<crate::indexed_files::IndexedFileList>>,
     root: PathBuf,
     paths: &[String],
-) -> Result<Arc<Vec<(String, PathBuf)>>> {
+    work: &mut AuxiliaryUpdateStats,
+) -> Result<Arc<crate::indexed_files::IndexedFileList>> {
     let Some(previous) = previous else {
         return rebuild_indexed_file_list(root).await;
     };
@@ -413,18 +513,19 @@ async fn update_indexed_file_list(
             .indexed_workspace_files_for_paths(&changed)
     })
     .await??;
-    let changed: HashSet<&str> = paths.iter().map(String::as_str).collect();
-    let mut files: Vec<(String, PathBuf)> = previous
-        .iter()
-        .filter(|(path, _)| !changed.contains(path.as_str()))
-        .cloned()
+    work.scoped_rows_read += rows.len();
+    let fresh = rows
+        .into_iter()
+        .map(|row| {
+            let absolute = root.join(row.path.replace('/', std::path::MAIN_SEPARATOR_STR));
+            (row.path, absolute)
+        })
         .collect();
-    files.extend(rows.into_iter().map(|row| {
-        let absolute = root.join(row.path.replace('/', std::path::MAIN_SEPARATOR_STR));
-        (row.path, absolute)
-    }));
-    files.sort_by(|left, right| left.0.cmp(&right.0));
-    Ok(Arc::new(files))
+    if let Some(updated) = previous.update(paths, fresh) {
+        return Ok(updated);
+    }
+    work.full_components.push("indexed_file_list");
+    rebuild_indexed_file_list(root).await
 }
 
 /// State shared by runtime and benchmark full publications. It is created only
@@ -855,6 +956,10 @@ impl CacheLedger {
         self.invalidate_after_index_change().await;
 
         Ok(CachePublishReport {
+            auxiliary: AuxiliaryUpdateStats {
+                full_reason: Some("full-publication"),
+                ..Default::default()
+            },
             semantic_generation,
             declaration_count,
             include_count,
@@ -942,14 +1047,43 @@ impl CacheLedger {
         permit.check_cancelled()?;
         let semantic_generation = load_semantic_generation(root.clone()).await?;
         let previous = self.current_engine_snapshot(&root).await;
+        let call_read_handle = capture_call_read_handle(&root, semantic_generation)?;
+        let same_database = previous
+            .as_ref()
+            .and_then(|snapshot| snapshot.call_read_handle.as_ref())
+            .and_then(|handle| handle.database_incarnation())
+            .is_some_and(|old| Some(old) == call_read_handle.database_incarnation());
         let expected_epoch = previous.as_ref().map(|snapshot| snapshot.epoch);
         let direct_base = previous.as_ref().is_some_and(|snapshot| {
             snapshot.semantic_generation != crate::call_model::SemanticGeneration::MISSING
                 && snapshot.semantic_generation.0.checked_add(1) == Some(semantic_generation.0)
         });
-        if !direct_base {
+        let bounded_paths = rel_paths.len() <= 256 && include_edge_sources_rebuilt.len() <= 256;
+        let same_configuration = previous.as_ref().is_some_and(|snapshot| {
+            Arc::ptr_eq(&snapshot.workspace_semantics, &workspace_semantics)
+        });
+        let module_change = rel_paths.iter().any(|path| {
+            matches!(
+                Path::new(path).file_name().and_then(|name| name.to_str()),
+                Some("go.mod" | "go.work")
+            ) || path.ends_with("vendor/modules.txt")
+        });
+        let full_reason = if !same_database {
+            Some("database-instance")
+        } else if !direct_base {
+            Some("generation-gap")
+        } else if !bounded_paths {
+            Some("changed-path-budget")
+        } else if !same_configuration {
+            Some("configuration")
+        } else if module_change {
+            Some("module-boundary")
+        } else {
+            None
+        };
+        if let Some(reason) = full_reason {
             let publication = self.begin_full_build_lifecycle(&root).await;
-            return self
+            let mut report = self
                 .publish_full_index_with_semantics_in_lifecycle(
                     client,
                     root,
@@ -957,7 +1091,9 @@ impl CacheLedger {
                     publication,
                     permit,
                 )
-                .await;
+                .await?;
+            report.auxiliary.full_reason = Some(reason);
+            return Ok(report);
         }
         anyhow::ensure!(
             previous.as_ref().is_some_and(|snapshot| Arc::ptr_eq(
@@ -984,8 +1120,32 @@ impl CacheLedger {
         let declaration_count = declaration_index.len();
         let name_table_ms = nt_started.elapsed().as_millis();
         let should_compact_name_index = declaration_index.needs_compaction();
-        let call_read_handle = capture_call_read_handle(&root, semantic_generation)?;
-        let fallback_completion_table = rebuild_fallback_completion_table(root.clone()).await?;
+        let mut auxiliary = AuxiliaryUpdateStats::default();
+        let base = previous.as_ref().expect("validated direct base");
+        let fallback_completion_table = update_fallback_completion_table(
+            base.fallback_completion_table.clone(),
+            root.clone(),
+            rel_paths,
+            &mut auxiliary,
+        )
+        .await?;
+        let indexed_files_result = update_indexed_file_list(
+            base.indexed_files.clone(),
+            root.clone(),
+            rel_paths,
+            &mut auxiliary,
+        )
+        .await;
+        let paths_unchanged = indexed_files_result
+            .as_ref()
+            .ok()
+            .zip(base.indexed_files.as_ref())
+            .is_some_and(|(current, old)| Arc::ptr_eq(current, old))
+            && rel_paths.iter().all(|path| {
+                base.indexed_files
+                    .as_ref()
+                    .is_some_and(|files| files.contains_path(path))
+            });
 
         let rg_started = tokio::time::Instant::now();
         let reach_graph = refresh_reach_graph_incremental(
@@ -1005,7 +1165,24 @@ impl CacheLedger {
         };
 
         let mut include_table_error = None;
-        let include_table = match rebuild_include_table(root.clone()).await {
+        let include_table = match if let Some(previous) = base
+            .include_table
+            .as_ref()
+            .filter(|_| paths_unchanged && include_edge_sources_rebuilt.is_empty())
+        {
+            Ok(previous.clone())
+        } else if let Some(previous) = &base.include_table {
+            update_include_table(
+                previous.clone(),
+                root.clone(),
+                rel_paths,
+                include_edge_sources_rebuilt,
+                &mut auxiliary,
+            )
+            .await
+        } else {
+            rebuild_include_table(root.clone()).await
+        } {
             Ok(table) => Some(table),
             Err(err) => {
                 degraded.include_table = true;
@@ -1015,7 +1192,19 @@ impl CacheLedger {
         };
         let include_count = include_table.as_ref().map_or(0, |table| table.len());
         let mut go_import_table_error = None;
-        let go_import_table = match rebuild_go_import_table(root.clone()).await {
+        let go_import_table = match if let Some(previous) =
+            base.go_import_table.as_ref().filter(|_| {
+                !rel_paths.iter().any(|path| {
+                    base.workspace_semantics.language_for_path(&root.join(path))
+                        == crate::config::SourceLanguage::Go
+                })
+            }) {
+            Ok(previous.clone())
+        } else if let Some(previous) = &base.go_import_table {
+            update_go_import_table(previous.clone(), root.clone(), rel_paths, &mut auxiliary).await
+        } else {
+            rebuild_go_import_table(root.clone()).await
+        } {
             Ok(table) => Some(table),
             Err(err) => {
                 degraded.go_import_table = true;
@@ -1025,15 +1214,7 @@ impl CacheLedger {
         };
 
         let mut reference_file_list_error = None;
-        let indexed_files = match update_indexed_file_list(
-            previous
-                .as_ref()
-                .and_then(|snapshot| snapshot.indexed_files.clone()),
-            root.clone(),
-            rel_paths,
-        )
-        .await
-        {
+        let indexed_files = match indexed_files_result {
             Ok(files) => Some(files),
             Err(err) => {
                 degraded.reference_file_list = true;
@@ -1041,7 +1222,16 @@ impl CacheLedger {
                 None
             }
         };
-        let include_path_index = match rebuild_include_path_index(root.clone()).await {
+        let include_path_index = match if let Some(previous) =
+            base.include_path_index.as_ref().filter(|_| paths_unchanged)
+        {
+            Ok(previous.clone())
+        } else if let Some(previous) = &base.include_path_index {
+            update_include_path_index(previous.clone(), root.clone(), rel_paths, &mut auxiliary)
+                .await
+        } else {
+            rebuild_include_path_index(root.clone()).await
+        } {
             Ok(index) => Some(index),
             Err(err) => {
                 degraded.reference_file_list = true;
@@ -1053,6 +1243,78 @@ impl CacheLedger {
                 None
             }
         };
+        let delta_partitions = fallback_completion_table.delta_partitions()
+            + include_table.as_ref().map_or(0, |t| t.delta_partitions())
+            + go_import_table.as_ref().map_or(0, |t| t.delta_partitions())
+            + indexed_files.as_ref().map_or(0, |t| t.delta_paths())
+            + include_path_index.as_ref().map_or(0, |t| t.delta_paths());
+        let delta_bytes = fallback_completion_table.delta_bytes()
+            + include_table.as_ref().map_or(0, |t| t.delta_bytes())
+            + go_import_table.as_ref().map_or(0, |t| t.delta_bytes())
+            + indexed_files.as_ref().map_or(0, |t| t.delta_bytes())
+            + include_path_index.as_ref().map_or(0, |t| t.delta_bytes());
+        if delta_partitions > 256 || delta_bytes > 32 * 1024 * 1024 {
+            drop((
+                declaration_index,
+                fallback_completion_table,
+                include_table,
+                go_import_table,
+                indexed_files,
+                include_path_index,
+                reach_graph,
+            ));
+            let publication = self.begin_full_build_lifecycle(&root).await;
+            let mut report = self
+                .publish_full_index_with_semantics_in_lifecycle(
+                    client,
+                    root,
+                    workspace_semantics,
+                    publication,
+                    permit,
+                )
+                .await?;
+            report.auxiliary.full_reason = Some("cumulative-delta-budget");
+            return Ok(report);
+        }
+        auxiliary.delta_partitions = delta_partitions;
+        auxiliary.delta_bytes = delta_bytes;
+        macro_rules! measure_update {
+            ($old:expr, $new:expr, $part:ident) => {
+                if let (Some(old), Some(new)) = ($old, $new) {
+                    if Arc::ptr_eq(old, new) {
+                        auxiliary.shared_components += 1;
+                    } else {
+                        auxiliary.copied_directory_entries += old.$part();
+                        auxiliary.new_delta_bytes += new.delta_bytes();
+                    }
+                }
+            };
+        }
+        measure_update!(
+            Some(&base.fallback_completion_table),
+            Some(&fallback_completion_table),
+            delta_partitions
+        );
+        measure_update!(
+            base.include_table.as_ref(),
+            include_table.as_ref(),
+            delta_partitions
+        );
+        measure_update!(
+            base.go_import_table.as_ref(),
+            go_import_table.as_ref(),
+            delta_partitions
+        );
+        measure_update!(
+            base.indexed_files.as_ref(),
+            indexed_files.as_ref(),
+            delta_paths
+        );
+        measure_update!(
+            base.include_path_index.as_ref(),
+            include_path_index.as_ref(),
+            delta_paths
+        );
         let reference_file_count = indexed_files.as_ref().map_or(0, |files| files.len());
         let reach_graph_ms = rg_started.elapsed().as_millis();
         permit.check_cancelled()?;
@@ -1097,7 +1359,14 @@ impl CacheLedger {
         })
         .await;
 
+        client
+            .log_message(
+                MessageType::LOG,
+                format!("auxiliary read models: {:?}", auxiliary),
+            )
+            .await;
         let report = CachePublishReport {
+            auxiliary,
             semantic_generation,
             declaration_count,
             include_count,
@@ -1403,7 +1672,6 @@ impl CacheLedger {
 
 #[cfg(test)]
 mod memory_tests {
-    use std::mem::size_of;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
@@ -1445,7 +1713,7 @@ mod memory_tests {
         declarations: SemanticDeclarationIndex,
         reach_graph: ReachGraph,
         include_table: IncludeCompletionTable,
-        indexed_files: Vec<(String, PathBuf)>,
+        indexed_files: crate::indexed_files::IndexedFileList,
         include_path_index: crate::candidate_service::IncludePathIndex,
         project_context: ProjectContextIndex,
         call_read_handle: CallReadHandle,
@@ -1520,22 +1788,12 @@ mod memory_tests {
     fn file_relation_bytes(
         reach_graph: &ReachGraph,
         include_table: &IncludeCompletionTable,
-        indexed_files: &[(String, PathBuf)],
-        indexed_file_capacity: usize,
+        indexed_files: &crate::indexed_files::IndexedFileList,
     ) -> usize {
         reach_graph
             .accounted_bytes()
             .saturating_add(include_table.accounted_bytes())
-            .saturating_add(indexed_file_capacity.saturating_mul(size_of::<(String, PathBuf)>()))
-            .saturating_add(
-                indexed_files
-                    .iter()
-                    .fold(0usize, |bytes, (path, absolute)| {
-                        bytes
-                            .saturating_add(path.len())
-                            .saturating_add(absolute.as_os_str().len())
-                    }),
-            )
+            .saturating_add(indexed_files.accounted_bytes())
     }
 
     fn snapshot_file_relation_bytes(snapshot: &crate::server::workspace::EngineSnapshot) -> usize {
@@ -1544,12 +1802,9 @@ mod memory_tests {
             snapshot.include_table.as_deref(),
             snapshot.indexed_files.as_deref(),
         ) {
-            (Some(reach_graph), Some(include_table), Some(indexed_files)) => file_relation_bytes(
-                reach_graph,
-                include_table,
-                indexed_files,
-                indexed_files.capacity(),
-            ),
+            (Some(reach_graph), Some(include_table), Some(indexed_files)) => {
+                file_relation_bytes(reach_graph, include_table, indexed_files)
+            }
             _ => 0,
         }
     }
@@ -1765,13 +2020,11 @@ mod memory_tests {
             &first.reach_graph,
             &first.include_table,
             &first.indexed_files,
-            first.indexed_files.capacity(),
         );
         let second_file_relations_bytes = file_relation_bytes(
             &second.reach_graph,
             &second.include_table,
             &second.indexed_files,
-            second.indexed_files.capacity(),
         );
 
         println!(
@@ -1979,7 +2232,8 @@ mod memory_tests {
         assert!(shrink_stats.publication_shrink_entries >= warm_stats.entries);
         assert!(
             publish_peak_private_bytes <= SIDE_BY_SIDE_PEAK_PRIVATE_LIMIT_BYTES,
-            "warm full publication peaks at {} MiB; hard limit is {} MiB",
+            "warm full publication peaks at {} bytes ({} MiB); hard limit is {} MiB",
+            publish_peak_private_bytes,
             publish_peak_private_bytes / MIB,
             SIDE_BY_SIDE_PEAK_PRIVATE_LIMIT_BYTES / MIB,
         );

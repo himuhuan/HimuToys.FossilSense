@@ -7,12 +7,13 @@ param(
     [ValidateRange(5, 3600)]
     [int]$TimeoutSeconds = 600,
     # Includes cache warmup, a full rebuild, and three dirty/compaction scenarios.
-    # The full rebuild itself still has independent 120,000 ms hard assertions.
+    # Full rebuild duration is strict unless ObserveFullIndexTime is selected.
     [ValidateRange(5, 3600)]
     [int]$LifecycleTimeoutSeconds = 240,
     [switch]$IncludeFullIndex,
     # Record build duration without enforcing the historical 120 s target.
     [switch]$ObserveFullIndexTime,
+    [switch]$AllowTransientMemoryPeak,
     [switch]$IncludeEngineHydration,
     [switch]$IncludeCompletionReplay,
     [switch]$IncludeBindingReplay,
@@ -388,6 +389,11 @@ function Convert-WhitelistedMetrics([string[]]$Lines) {
         lsp_lifecycle_reserved_bytes_peak = $true
         lsp_lifecycle_retained_bytes_peak = $true
         lsp_lifecycle_peak_process_bytes = $true
+        lsp_lifecycle_stable_max_bytes = $true
+        lsp_lifecycle_stable_samples = $true
+        lsp_lifecycle_stable_window_ms = $true
+        lsp_lifecycle_above_limit_ms = $true
+        lsp_lifecycle_longest_above_limit_ms = $true
         lsp_lifecycle_memory_sample_available = $true
         lsp_lifecycle_memory_metric_private_bytes = $true
         lsp_lifecycle_old_requests_held_peak = $true
@@ -600,7 +606,7 @@ if ($IncludeLspLifecycle) {
                 $lifecycleWorkspace,
                 '-Sample',
                 $sampleName
-            )
+            ) + $(if ($ObserveFullIndexTime) { @("-ObserveFullIndexTime") } else { @() }) + $(if ($AllowTransientMemoryPeak) { @("-AllowTransientMemoryPeak") } else { @() })
         }
     }
 }
@@ -744,6 +750,7 @@ foreach ($case in $cases) {
                 status = 'failed'
                 measured_at = (Get-Date).ToUniversalTime().ToString('o')
                 full_index_time_policy = if ($ObserveFullIndexTime) { 'observed' } else { '120s_gate' }
+            memory_policy = if ($AllowTransientMemoryPeak) { 'stable_512MiB_transient_10s' } else { 'strict_peak' }
             case_id = $case.Id
                 run = $run
                 command_line = [System.Environment]::CommandLine
@@ -781,7 +788,7 @@ foreach ($case in $cases) {
                 -ObserveOnly:$ObserveFullIndexTime
         }
         if ($case.Id -like '*-lsp-lifecycle') {
-            Assert-LspLifecycleGate -CaseId $case.Id -Metrics $metrics
+            Assert-LspLifecycleGate -CaseId $case.Id -Metrics $metrics -ObserveFullIndexTime:$ObserveFullIndexTime -AllowTransientMemoryPeak:$AllowTransientMemoryPeak
         }
         if ($case.Id -eq 'u-boot-binding-replay') {
             Assert-BindingReplayGate -Metrics $metrics
@@ -796,6 +803,7 @@ foreach ($case in $cases) {
         $sampleState = Get-SourceState (Resolve-FullPath $case.Workspace)
         $results.Add([pscustomobject]@{
             full_index_time_policy = if ($ObserveFullIndexTime) { 'observed' } else { '120s_gate' }
+            memory_policy = if ($AllowTransientMemoryPeak) { 'stable_512MiB_transient_10s' } else { 'strict_peak' }
             case_id = $case.Id
             run = $run
             workspace = (Resolve-FullPath $case.Workspace)

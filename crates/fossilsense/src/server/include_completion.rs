@@ -9,6 +9,7 @@ use crate::includes::IncludeForm;
 use crate::pathing;
 use crate::store::IndexStore;
 
+mod delta;
 mod model;
 pub(super) use model::{CurrentIncludeEvidence, IncludeCompletionMetrics, IncludeCompletionTable};
 
@@ -327,6 +328,7 @@ pub(super) fn collect_include_candidates_with_table_and_evidence(
         }
     }
 
+    metrics.truncated |= scored.len() > limit;
     scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     let items = scored
         .into_iter()
@@ -497,6 +499,7 @@ struct IndexedIncludeCandidate {
     name_lower: String,
     is_dir: bool,
     rel_path: String,
+    contributors: usize,
 }
 
 fn indexed_workspace_include_candidates(
@@ -511,6 +514,7 @@ fn indexed_workspace_include_candidates(
         if let Some((first, _)) = rel.split_once('/') {
             if !first.is_empty() && first.to_ascii_lowercase().starts_with(seg_lower) {
                 out.push(IndexedIncludeCandidate {
+                    contributors: 1,
                     name: first.to_string(),
                     name_lower: first.to_ascii_lowercase(),
                     is_dir: true,
@@ -524,6 +528,7 @@ fn indexed_workspace_include_candidates(
                 && looks_like_header(name)
             {
                 out.push(IndexedIncludeCandidate {
+                    contributors: 1,
                     name: name.to_string(),
                     name_lower: name.to_ascii_lowercase(),
                     is_dir: false,
@@ -559,6 +564,7 @@ fn indexed_workspace_include_candidates(
             rel.clone()
         };
         out.push(IndexedIncludeCandidate {
+            contributors: 1,
             name: name.to_string(),
             name_lower: name.to_ascii_lowercase(),
             is_dir,

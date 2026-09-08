@@ -23,16 +23,26 @@ const DEFAULT_CANDIDATE_EXPANSION_LIMIT: usize = 32_768;
 pub struct CallReadHandle {
     db: IndexDbLease,
     pub generation: SemanticGeneration,
+    database_incarnation: Option<Arc<str>>,
     diagnostic: Option<Arc<Mutex<crate::store::DiagnosticReadSnapshot>>>,
 }
 
 impl CallReadHandle {
+    pub(crate) fn database_incarnation(&self) -> Option<&str> {
+        self.database_incarnation.as_deref()
+    }
+
     pub(crate) fn database_path(&self) -> &std::path::Path {
         self.db.path()
     }
 
     pub fn at_generation(db_path: PathBuf, generation: SemanticGeneration) -> Self {
+        let database_incarnation = IndexStore::open_readonly(&db_path)
+            .and_then(|store| store.entity_view().incarnation())
+            .ok()
+            .map(Arc::from);
         Self {
+            database_incarnation,
             db: IndexDbLease::acquire(db_path),
             generation,
             diagnostic: None,
@@ -43,8 +53,15 @@ impl CallReadHandle {
         db_path: PathBuf,
         generation: SemanticGeneration,
     ) -> Result<Self> {
+        let db = IndexDbLease::acquire_default_generation(db_path)?;
+        let database_incarnation = Some(Arc::from(
+            IndexStore::open_readonly(db.path())?
+                .entity_view()
+                .incarnation()?,
+        ));
         Ok(Self {
-            db: IndexDbLease::acquire_default_generation(db_path)?,
+            database_incarnation,
+            db,
             generation,
             diagnostic: None,
         })
@@ -64,7 +81,9 @@ impl CallReadHandle {
         let guard = store.begin_semantic_read(None)?;
         let generation = SemanticGeneration(guard.generation());
         guard.finish()?;
+        let database_incarnation = Some(Arc::from(store.entity_view().incarnation()?));
         Ok(Self {
+            database_incarnation,
             db,
             generation,
             diagnostic: None,
@@ -78,6 +97,7 @@ impl CallReadHandle {
         Ok(Self {
             db: IndexDbLease::acquire(db_path),
             generation: SemanticGeneration(snapshot.metadata.generation.unwrap_or(0)),
+            database_incarnation: None,
             diagnostic: Some(Arc::new(Mutex::new(snapshot))),
         })
     }

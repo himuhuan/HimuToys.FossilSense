@@ -40,6 +40,31 @@ pub(super) async fn rebuild_fallback_completion_table(
     .await?
 }
 
+pub(super) async fn update_fallback_completion_table(
+    previous: Arc<crate::completion::ordinary_service::FallbackCompletionNameTable>,
+    root: PathBuf,
+    paths: &[String],
+    work: &mut crate::server::workspace::AuxiliaryUpdateStats,
+) -> Result<Arc<crate::completion::ordinary_service::FallbackCompletionNameTable>> {
+    let changed = paths.to_vec();
+    let load_root = root.clone();
+    let (rows, truncated) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let store = IndexStore::open_readonly(&pathing::default_index_path(&load_root)?)?;
+        store
+            .fallback_completion_view()
+            .by_paths_limited(&changed, 8192)
+    })
+    .await??;
+    work.scoped_rows_read += rows.len();
+    if !truncated {
+        if let Some(updated) = previous.update_published_rows(paths, rows) {
+            return Ok(updated);
+        }
+    }
+    work.full_components.push("fallback_completion_table");
+    rebuild_fallback_completion_table(root).await
+}
+
 pub(super) async fn rebuild_declaration_index(
     root: PathBuf,
     project_context: Option<Arc<ProjectContextIndex>>,

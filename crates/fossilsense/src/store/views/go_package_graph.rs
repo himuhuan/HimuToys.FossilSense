@@ -106,6 +106,40 @@ impl<'a> GoPackageGraphStoreView<'a> {
             .map_err(Into::into)
     }
 
+    pub fn importable_packages_for_directories(
+        &self,
+        directories: &[String],
+        limit: usize,
+    ) -> Result<(Vec<GoImportablePackageRow>, bool)> {
+        let mut output = Vec::new();
+        for directory in directories {
+            let lower = format!("{directory}#");
+            let upper = format!("{directory}$");
+            let mut stmt=self.store.conn.prepare("SELECT package_key, import_path FROM go_importable_packages WHERE package_key >= ?1 AND package_key < ?2 ORDER BY package_key LIMIT ?3")?;
+            let rows = stmt.query_map(
+                rusqlite::params![
+                    lower,
+                    upper,
+                    limit.saturating_sub(output.len()).saturating_add(1) as i64
+                ],
+                |row| {
+                    Ok(GoImportablePackageRow {
+                        package_key: row.get(0)?,
+                        import_path: row.get(1)?,
+                    })
+                },
+            )?;
+            for row in rows {
+                output.push(row?);
+            }
+            if output.len() > limit {
+                output.truncate(limit);
+                return Ok((output, true));
+            }
+        }
+        Ok((output, false))
+    }
+
     pub fn importable_packages(&self) -> Result<Vec<GoImportablePackageRow>> {
         let mut stmt = self.store.conn.prepare(
             "SELECT package_key, import_path

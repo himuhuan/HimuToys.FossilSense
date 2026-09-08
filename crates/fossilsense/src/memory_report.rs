@@ -166,6 +166,8 @@ pub struct FileRelationsMemoryReport {
     pub reach_graph_bytes: u64,
     pub include_edge_count: u64,
     pub include_table_bytes: u64,
+    #[serde(default)]
+    pub include_path_index_bytes: u64,
     pub go_import_table_bytes: u64,
     pub indexed_files_bytes: u64,
     pub file_count: u64,
@@ -216,6 +218,7 @@ pub struct SnapshotMemoryReport {
     pub reach_graph_bytes: usize,
     pub include_edge_count: usize,
     pub include_table_bytes: usize,
+    pub include_path_index_bytes: usize,
     pub go_import_table_bytes: usize,
     pub indexed_files_bytes: usize,
     pub file_count: usize,
@@ -286,6 +289,9 @@ impl MemoryReport {
             file_relations.include_table_bytes = file_relations
                 .include_table_bytes
                 .saturating_add(snapshot.include_table_bytes as u64);
+            file_relations.include_path_index_bytes = file_relations
+                .include_path_index_bytes
+                .saturating_add(snapshot.include_path_index_bytes as u64);
             file_relations.go_import_table_bytes = file_relations
                 .go_import_table_bytes
                 .saturating_add(snapshot.go_import_table_bytes as u64);
@@ -307,6 +313,7 @@ impl MemoryReport {
         file_relations.bytes = file_relations
             .reach_graph_bytes
             .saturating_add(file_relations.include_table_bytes)
+            .saturating_add(file_relations.include_path_index_bytes)
             .saturating_add(file_relations.go_import_table_bytes)
             .saturating_add(file_relations.indexed_files_bytes)
             .saturating_add(file_relations.project_context_bytes);
@@ -371,6 +378,7 @@ mod tests {
             reach_graph_bytes: 300,
             include_edge_count: 9,
             include_table_bytes: 80,
+            include_path_index_bytes: 0,
             go_import_table_bytes: 20,
             indexed_files_bytes: 60,
             file_count: 7,

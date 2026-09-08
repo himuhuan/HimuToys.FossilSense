@@ -90,6 +90,8 @@ struct IndexedFallbackCompletionName {
 pub(crate) struct FallbackCompletionNameTable {
     entries: Arc<[IndexedFallbackCompletionName]>,
     match_index: Arc<std::collections::HashMap<u32, Vec<usize>>>,
+    by_path: Arc<std::collections::HashMap<String, Vec<usize>>>,
+    base_bytes: usize,
     shadowed_paths: Arc<HashSet<String>>,
     overlay_entries: Arc<[IndexedFallbackCompletionName]>,
 }
@@ -139,9 +141,29 @@ impl FallbackCompletionNameTable {
             .map(|(entry, family)| IndexedFallbackCompletionName::new(entry, family))
             .collect();
         let match_index = fallback_match_index(&entries);
+        let mut by_path = std::collections::HashMap::<String, Vec<usize>>::new();
+        for (index, entry) in entries.iter().enumerate() {
+            by_path
+                .entry(entry.value.path.clone())
+                .or_default()
+                .push(index);
+        }
+        let base_bytes = indexed_entries_bytes(&entries)
+            + hash_table_bytes::<u32, Vec<usize>>(match_index.capacity())
+            + match_index
+                .values()
+                .map(|v| vec_bytes::<usize>(v.capacity()))
+                .sum::<usize>()
+            + hash_table_bytes::<String, Vec<usize>>(by_path.capacity())
+            + by_path
+                .iter()
+                .map(|(p, v)| p.capacity() + vec_bytes::<usize>(v.capacity()))
+                .sum::<usize>();
         Self {
+            base_bytes,
             entries: entries.into(),
             match_index: Arc::new(match_index),
+            by_path: Arc::new(by_path),
             shadowed_paths: Arc::new(HashSet::new()),
             overlay_entries: Arc::from([]),
         }
@@ -208,13 +230,23 @@ impl FallbackCompletionNameTable {
         shadowed_paths: &HashSet<String>,
         overlay_entries: impl IntoIterator<Item = (FallbackCompletionName, SemanticFamily)>,
     ) -> Self {
-        let mut overlay_entries: Vec<_> = overlay_entries.into_iter().collect();
+        let mut overlay_entries: Vec<_> = self
+            .overlay_entries
+            .iter()
+            .filter(|entry| !shadowed_paths.contains(&entry.value.path))
+            .map(|entry| (entry.value.clone(), entry.semantic_family))
+            .chain(overlay_entries)
+            .collect();
+        let mut merged_shadow = self.shadowed_paths.as_ref().clone();
+        merged_shadow.extend(shadowed_paths.iter().cloned());
         overlay_entries.sort_by(|left, right| fallback_entry_order(&left.0, &right.0));
         overlay_entries.dedup();
         Self {
             entries: self.entries.clone(),
             match_index: self.match_index.clone(),
-            shadowed_paths: Arc::new(shadowed_paths.clone()),
+            by_path: self.by_path.clone(),
+            base_bytes: self.base_bytes,
+            shadowed_paths: Arc::new(merged_shadow),
             overlay_entries: overlay_entries
                 .into_iter()
                 .map(|(entry, family)| IndexedFallbackCompletionName::new(entry, family))
@@ -223,39 +255,106 @@ impl FallbackCompletionNameTable {
         }
     }
 
+    /// Apply a bounded, cumulative publication delta. None requests a full rebuild.
+    pub(crate) fn update_published_rows(
+        self: &Arc<Self>,
+        paths: &[String],
+        rows: Vec<FallbackCompletionRow>,
+    ) -> Option<Arc<Self>> {
+        const MAX_PATHS: usize = 256;
+        const MAX_ROWS: usize = 8192;
+        let fresh = Self::build(rows);
+        let changed: HashSet<_> = paths.iter().cloned().collect();
+        let mut old = Vec::new();
+        for path in &changed {
+            if !self.shadowed_paths.contains(path) {
+                if let Some(indices) = self.by_path.get(path) {
+                    if old.len().saturating_add(indices.len()) > MAX_ROWS {
+                        return None;
+                    }
+                    old.extend(indices.iter().map(|index| &self.entries[*index]));
+                }
+            }
+        }
+        old.extend(
+            self.overlay_entries
+                .iter()
+                .filter(|entry| changed.contains(&entry.value.path)),
+        );
+        old.sort_by(|left, right| fallback_entry_order(&left.value, &right.value));
+        if old.len() == fresh.entries.len()
+            && old.iter().zip(fresh.entries.iter()).all(|(a, b)| **a == *b)
+        {
+            return Some(self.clone());
+        }
+        let mut shadowed = self.shadowed_paths.as_ref().clone();
+        shadowed.extend(paths.iter().cloned());
+        if shadowed.len() > MAX_PATHS {
+            return None;
+        }
+        let mut overlay: Vec<_> = self
+            .overlay_entries
+            .iter()
+            .filter(|entry| !changed.contains(&entry.value.path))
+            .cloned()
+            .collect();
+        overlay.extend(fresh.entries.iter().cloned());
+        if overlay.len() > MAX_ROWS {
+            return None;
+        }
+        let bytes: usize = overlay
+            .iter()
+            .map(|entry| {
+                std::mem::size_of::<IndexedFallbackCompletionName>()
+                    + entry.value.name.capacity()
+                    + entry.value.path.capacity()
+                    + entry.lower.capacity()
+                    + entry.value.detail.as_ref().map_or(0, String::capacity)
+            })
+            .sum();
+        if bytes > 4 * 1024 * 1024 {
+            return None;
+        }
+        Some(Arc::new(
+            self.with_updated_family_paths(
+                &shadowed,
+                overlay
+                    .into_iter()
+                    .map(|entry| (entry.value, entry.semantic_family)),
+            ),
+        ))
+    }
+
     /// Structure-level estimate of the bytes this table holds, for memory
     /// observability. Not an allocator promise; the process-level gates stay
     /// authoritative.
     pub(crate) fn accounted_bytes(&self) -> usize {
-        fn indexed_entries_bytes(entries: &[IndexedFallbackCompletionName]) -> usize {
-            let mut bytes = vec_bytes::<IndexedFallbackCompletionName>(entries.len());
-            for entry in entries {
-                bytes = bytes
-                    .saturating_add(entry.value.name.len())
-                    .saturating_add(entry.value.detail.as_deref().map_or(0, str::len))
-                    .saturating_add(entry.value.path.len())
-                    .saturating_add(entry.lower.len());
-            }
-            bytes
-        }
-
-        let mut bytes = size_of::<Self>()
-            .saturating_add(indexed_entries_bytes(&self.entries))
-            .saturating_add(indexed_entries_bytes(&self.overlay_entries))
-            .saturating_add(hash_table_bytes::<u32, Vec<usize>>(
-                self.match_index.capacity(),
-            ));
-        for positions in self.match_index.values() {
-            bytes = bytes.saturating_add(vec_bytes::<usize>(positions.capacity()));
-        }
-        bytes = bytes.saturating_add(hash_table_bytes::<String, ()>(
-            self.shadowed_paths.capacity(),
-        ));
-        for path in self.shadowed_paths.iter() {
-            bytes = bytes.saturating_add(path.len());
-        }
-        bytes
+        size_of::<Self>() + self.base_bytes + self.delta_bytes()
     }
+    pub(crate) fn delta_partitions(&self) -> usize {
+        self.shadowed_paths.len()
+    }
+    pub(crate) fn delta_bytes(&self) -> usize {
+        indexed_entries_bytes(&self.overlay_entries)
+            + hash_table_bytes::<String, ()>(self.shadowed_paths.capacity())
+            + self
+                .shadowed_paths
+                .iter()
+                .map(String::capacity)
+                .sum::<usize>()
+    }
+}
+fn indexed_entries_bytes(entries: &[IndexedFallbackCompletionName]) -> usize {
+    vec_bytes::<IndexedFallbackCompletionName>(entries.len())
+        + entries
+            .iter()
+            .map(|entry| {
+                entry.value.name.capacity()
+                    + entry.value.path.capacity()
+                    + entry.lower.capacity()
+                    + entry.value.detail.as_ref().map_or(0, String::capacity)
+            })
+            .sum::<usize>()
 }
 
 impl IndexedFallbackCompletionName {

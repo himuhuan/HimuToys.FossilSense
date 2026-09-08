@@ -579,11 +579,7 @@ impl LanguageServer for Backend {
                             engine_epoch: context.engine.epoch,
                             generation: context.engine.semantic_generation,
                             base_reach_graph: context.engine.reach_graph.as_deref(),
-                            indexed_workspace_files: context
-                                .engine
-                                .indexed_files
-                                .as_deref()
-                                .map(Vec::as_slice),
+                            indexed_workspace_files: context.engine.indexed_files.as_deref(),
                             workspace_semantics: context.engine.workspace_semantics.clone(),
                         },
                         document_request.clone(),

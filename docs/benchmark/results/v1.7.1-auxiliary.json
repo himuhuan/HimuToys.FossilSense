@@ -1,0 +1,76 @@
+{
+  "go_import_bytes": 43776,
+  "go_packages": 129,
+  "headers": 1000,
+  "include_bytes": 860838,
+  "include_path_bytes": 196609,
+  "observations": [
+    {
+      "feature": "include",
+      "max_us": 3473,
+      "p95_us": 2827,
+      "phase": "first-pass",
+      "requests": 64,
+      "returned_min": 100
+    },
+    {
+      "feature": "go-import",
+      "max_us": 128,
+      "p95_us": 52,
+      "phase": "first-pass",
+      "requests": 64,
+      "returned_min": 100
+    },
+    {
+      "feature": "include",
+      "max_us": 4975,
+      "p95_us": 3140,
+      "phase": "warm",
+      "requests": 64,
+      "returned_min": 100
+    },
+    {
+      "feature": "go-import",
+      "max_us": 111,
+      "p95_us": 43,
+      "phase": "warm",
+      "requests": 64,
+      "returned_min": 100
+    },
+    {
+      "feature": "include",
+      "max_us": 3580,
+      "p95_us": 3233,
+      "phase": "after-rename",
+      "requests": 64,
+      "returned_min": 100
+    },
+    {
+      "feature": "go-import",
+      "max_us": 70,
+      "p95_us": 35,
+      "phase": "after-rename",
+      "requests": 64,
+      "returned_min": 100
+    }
+  ],
+  "requests": 384,
+  "update": {
+    "full_reason": null,
+    "full_components": [],
+    "scoped_rows_read": 3,
+    "delta_partitions": 11,
+    "delta_bytes": 8358,
+    "copied_directory_entries": 0,
+    "shared_components": 2,
+    "new_delta_bytes": 8358
+  },
+  "engine_sha256": "0f03956ee543d83c97c8648ed6e5c7b6fbbd85ef8962f4b7b4162bd37aec4599",
+  "test_sha256": "d389a7c087990284e1858ba162e0e4f6393258d74452076cbf1037db1153334f",
+  "machine": {
+    "os_version": "Microsoft Windows NT 10.0.26220.0",
+    "processor_count": 16,
+    "processor_name": "12th Gen Intel(R) Core(TM) i5-12500H",
+    "physical_memory_bytes": 25459482624
+  }
+}

@@ -30,8 +30,8 @@ use models::{
     CompletionOverlayCacheKey,
 };
 pub(super) use models::{
-    CacheLedger, CachePublishReport, CompletionMemoLookup, EngineSnapshot, RequestContext,
-    RequestSettings,
+    AuxiliaryUpdateStats, CacheLedger, CachePublishReport, CompletionMemoLookup, EngineSnapshot,
+    RequestContext, RequestSettings,
 };
 pub(super) use session::WorkspaceSession;
 
@@ -1142,7 +1142,9 @@ impl CacheLedger {
             reach_graph: current.reach_graph.clone(),
             include_table: current.include_table.clone(),
             go_import_table: current.go_import_table.clone(),
-            indexed_files: Some(files),
+            indexed_files: Some(Arc::new(
+                crate::indexed_files::IndexedFileList::from_shared(files),
+            )),
             include_path_index: Some(include_path_index),
             project_context: current.project_context.clone(),
             call_read_handle: current.call_read_handle.clone(),

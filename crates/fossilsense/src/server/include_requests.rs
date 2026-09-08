@@ -132,7 +132,7 @@ impl Backend {
             .unwrap_or_default();
         self.perf_log(|| {
             format!(
-                "[perf] include_completion total={}ms workspace_table={} workspace_index={} same_directory={} recent={} sibling={} basename={} depth_penalty={}",
+                "[perf] include_completion total={}ms workspace_table={} workspace_index={} same_directory={} recent={} sibling={} basename={} depth_penalty={} inspected={} truncated={}",
                 total_ms,
                 if hit_memory { "memory" } else { "unavailable" },
                 if hit_db { "available" } else { "unavailable" },
@@ -141,12 +141,21 @@ impl Backend {
                 metrics.sibling,
                 metrics.basename,
                 metrics.depth_penalty,
+                metrics.inspected,
+                metrics.truncated,
             )
         })
         .await;
 
         match self.unwrap_query("include completion", result).await {
-            Some((items, _)) if !items.is_empty() => Ok(Some(CompletionResponse::Array(items))),
+            Some((items, metrics)) if !items.is_empty() => Ok(Some(if metrics.truncated {
+                CompletionResponse::List(CompletionList {
+                    is_incomplete: true,
+                    items,
+                })
+            } else {
+                CompletionResponse::Array(items)
+            })),
             _ => Ok(Some(empty_completion_list(true))),
         }
     }

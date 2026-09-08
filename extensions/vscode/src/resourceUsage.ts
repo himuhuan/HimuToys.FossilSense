@@ -54,6 +54,7 @@ export interface FileRelationsMemoryReport {
   reachGraphBytes: number;
   includeEdgeCount: number;
   includeTableBytes: number;
+  includePathIndexBytes: number;
   goImportTableBytes: number;
   indexedFilesBytes: number;
   fileCount: number;
@@ -185,7 +186,7 @@ export function resourceUsageTooltip(usage: ResourceUsage): string {
     '**Internal stats**',
     `- Name index: ${formatCount(memory.nameIndex.entryCount)} entries · base ${formatBytes(memory.nameIndex.baseSegmentBytes)} · deltas ${formatBytes(memory.nameIndex.deltaSegmentsBytes)} (${formatCount(memory.nameIndex.deltaSegmentCount)}) · fallback ${formatBytes(memory.nameIndex.fallbackTableBytes)}`,
     `- Declaration cache: ${formatCount(memory.declarationCache.entryCount)} entries, budget ${formatBytes(memory.declarationCache.budgetBytes)} · hits ${formatCount(memory.declarationCache.hits)} · misses ${formatCount(memory.declarationCache.misses)} · evictions ${formatCount(memory.declarationCache.evictions)} · SQL reads ${formatCount(memory.declarationCache.sqlReads)}`,
-    `- File relations: ${formatCount(memory.fileRelations.fileCount)} files · ${formatCount(memory.fileRelations.includeEdgeCount)} include edges · reach ${formatBytes(memory.fileRelations.reachGraphBytes)} · include ${formatBytes(memory.fileRelations.includeTableBytes)} · go imports ${formatBytes(memory.fileRelations.goImportTableBytes)} · file list ${formatBytes(memory.fileRelations.indexedFilesBytes)} · projects ${formatBytes(memory.fileRelations.projectContextBytes)}`,
+    `- File relations: ${formatCount(memory.fileRelations.fileCount)} files · ${formatCount(memory.fileRelations.includeEdgeCount)} include edges · reach ${formatBytes(memory.fileRelations.reachGraphBytes)} · include ${formatBytes(memory.fileRelations.includeTableBytes)} · include paths ${formatBytes(memory.fileRelations.includePathIndexBytes ?? 0)} · go imports ${formatBytes(memory.fileRelations.goImportTableBytes)} · file list ${formatBytes(memory.fileRelations.indexedFilesBytes)} · projects ${formatBytes(memory.fileRelations.projectContextBytes)}`,
     `- Open documents: ${formatCount(memory.openDocuments.documentCount)} files · overlay ${formatBytes(memory.openDocuments.overlayBytes)}`,
   ];
   const components = memory.nameIndex.components;
