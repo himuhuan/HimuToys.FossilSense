@@ -16,6 +16,7 @@ param(
     [switch]$IncludeEngineHydration,
     [switch]$IncludeCompletionReplay,
     [switch]$IncludeBindingReplay,
+    [switch]$IncludeCacheReplay,
     [switch]$IncludeLspLifecycle,
     [switch]$IncludeV142SemanticCases,
     [string]$V142Harness = '',
@@ -423,6 +424,7 @@ function Convert-WhitelistedMetrics([string[]]$Lines) {
         lsp_lifecycle_write_ms = $true
     }
     foreach ($name in (Get-BindingReplayMetricNames)) { $allowed[$name] = $true }
+    foreach ($name in @(Get-CacheReplayMetricNames)) { $allowed[$name] = $true }
     $metrics = [ordered]@{}
     foreach ($line in $Lines) {
         if ($line -match '^([a-z][a-z0-9_]+):\s+([0-9]+)$' -and $allowed.ContainsKey($Matches[1])) {
@@ -550,6 +552,22 @@ if ($IncludeBindingReplay) {
         ResetDatabase = $null
         OuterMetricsComparable = $false
         Arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $PSScriptRoot 'benchmark_binding_replay.ps1'), '-Database', $bindingDatabase, '-Workspace', $bindingWorkspace)
+    }
+}
+
+if ($IncludeCacheReplay) {
+    $cacheHarness = Resolve-FullPath (Join-Path $PSScriptRoot 'benchmark_cache_replay.ps1')
+    $cacheWorkspace = Join-Path $repoRoot 'samples\u-boot'
+    $cacheDatabase = Join-Path $benchmarkPath 'index-u-boot-rebuild.sqlite'
+    $cases += [pscustomobject]@{
+        Id = 'u-boot-declaration-cache-replay'
+        Executable = 'powershell.exe'
+        Workspace = $cacheWorkspace
+        Database = $cacheDatabase
+        ResetDatabase = $null
+        OuterMetricsComparable = $false
+        Arguments = @('-NoProfile','-ExecutionPolicy','Bypass','-File',$cacheHarness,
+            '-Database',$cacheDatabase,'-Workspace',$cacheWorkspace)
     }
 }
 
@@ -746,6 +764,7 @@ foreach ($case in $cases) {
             throw
         }
         $metrics = Convert-WhitelistedMetrics $sample.Stdout
+        if ($case.Id -eq 'u-boot-declaration-cache-replay') { Assert-CacheReplayGate -Metrics $metrics }
         $database = if ([string]::IsNullOrWhiteSpace($case.Database)) {
             $case.ResetDatabase
         } else {

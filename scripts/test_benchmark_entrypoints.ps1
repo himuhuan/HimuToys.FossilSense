@@ -497,3 +497,4 @@ Write-Host 'Benchmark entry-point tests passed.' -ForegroundColor Green
 & (Join-Path $PSScriptRoot "test_benchmark_timeout_evidence.ps1")
 
 & (Join-Path $PSScriptRoot 'test_entity_replay_contract.ps1')
+& (Join-Path $PSScriptRoot 'test_cache_replay_contract.ps1')

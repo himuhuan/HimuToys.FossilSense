@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::mem::size_of;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::call_service::CallReadHandle;
 use crate::project_context::ProjectContextIndex;
@@ -14,7 +14,14 @@ pub struct DeclarationPayloadCacheStats {
     pub misses: u64,
     pub sql_reads: u64,
     pub evictions: u64,
+    /// Retained payload and allocated cache metadata, excluding caller-held rows.
     pub bytes: usize,
+    pub payload_bytes: usize,
+    pub metadata_bytes: usize,
+    pub admission_skips: u64,
+    pub eviction_limit_skips: u64,
+    pub victim_steps: u64,
+    pub lock_wait_ns: u64,
     pub entries: usize,
     pub configured_budget_bytes: usize,
     pub effective_budget_bytes: usize,
@@ -22,24 +29,8 @@ pub struct DeclarationPayloadCacheStats {
     pub publication_shrink_bytes: usize,
 }
 
-struct CachedPayload {
-    row: Arc<DeclarationReadRow>,
-    bytes: usize,
-    last_used: u64,
-}
-
-struct DeclarationPayloadCacheState {
-    entries: HashMap<i64, CachedPayload>,
-    bytes: usize,
-    clock: u64,
-    effective_budget_bytes: usize,
-    stats: DeclarationPayloadCacheStats,
-}
-
-struct DeclarationPayloadCache {
-    configured_budget_bytes: usize,
-    state: Mutex<DeclarationPayloadCacheState>,
-}
+mod cache;
+use cache::DeclarationPayloadCache;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct DeclarationPayloadCacheShrink {
@@ -47,156 +38,6 @@ pub(crate) struct DeclarationPayloadCacheShrink {
     pub(crate) effective_budget_before_bytes: usize,
     pub(crate) removed_entries: usize,
     pub(crate) removed_bytes: usize,
-}
-
-impl DeclarationPayloadCache {
-    fn new(budget_bytes: usize) -> Self {
-        Self {
-            configured_budget_bytes: budget_bytes,
-            state: Mutex::new(DeclarationPayloadCacheState {
-                entries: HashMap::new(),
-                bytes: 0,
-                clock: 0,
-                effective_budget_bytes: budget_bytes,
-                stats: DeclarationPayloadCacheStats::default(),
-            }),
-        }
-    }
-
-    fn get(&self, id: i64) -> Option<Arc<DeclarationReadRow>> {
-        let mut state = self
-            .state
-            .lock()
-            .expect("declaration payload cache poisoned");
-        state.clock = state.clock.wrapping_add(1).max(1);
-        let clock = state.clock;
-        let row = state.entries.get_mut(&id).map(|entry| {
-            entry.last_used = clock;
-            entry.row.clone()
-        });
-        if row.is_some() {
-            state.stats.hits += 1;
-        } else {
-            state.stats.misses += 1;
-        }
-        row
-    }
-
-    fn record_sql_read(&self) {
-        self.state
-            .lock()
-            .expect("declaration payload cache poisoned")
-            .stats
-            .sql_reads += 1;
-    }
-
-    fn insert(&self, row: DeclarationReadRow) -> Arc<DeclarationReadRow> {
-        let row = Arc::new(row);
-        let bytes = declaration_payload_bytes(&row);
-        let mut state = self
-            .state
-            .lock()
-            .expect("declaration payload cache poisoned");
-        let effective_budget_bytes = state.effective_budget_bytes;
-        if effective_budget_bytes == 0 || bytes > effective_budget_bytes {
-            return row;
-        }
-        state.clock = state.clock.wrapping_add(1).max(1);
-        while state.bytes.saturating_add(bytes) > effective_budget_bytes {
-            let Some((&victim, _)) = state
-                .entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.last_used)
-            else {
-                break;
-            };
-            if let Some(removed) = state.entries.remove(&victim) {
-                state.bytes = state.bytes.saturating_sub(removed.bytes);
-                state.stats.evictions += 1;
-            }
-        }
-        let clock = state.clock;
-        if let Some(replaced) = state.entries.insert(
-            row.id,
-            CachedPayload {
-                row: row.clone(),
-                bytes,
-                last_used: clock,
-            },
-        ) {
-            state.bytes = state.bytes.saturating_sub(replaced.bytes);
-        }
-        state.bytes = state.bytes.saturating_add(bytes);
-        row
-    }
-
-    fn configured_budget_bytes(&self) -> usize {
-        self.configured_budget_bytes
-    }
-
-    fn effective_budget_bytes(&self) -> usize {
-        self.state
-            .lock()
-            .expect("declaration payload cache poisoned")
-            .effective_budget_bytes
-    }
-
-    /// Clear the replaceable cache by swapping its map while locked and
-    /// releasing the old rows after unlocking. Readers that already own an
-    /// `Arc<DeclarationReadRow>` remain valid.
-    fn suspend_for_full_publication(&self) -> DeclarationPayloadCacheShrink {
-        let (removed, shrink) = {
-            let mut state = self
-                .state
-                .lock()
-                .expect("declaration payload cache poisoned");
-            let effective_budget_before_bytes = state.effective_budget_bytes;
-            state.effective_budget_bytes = 0;
-            let removed = std::mem::take(&mut state.entries);
-            let removed_entries = removed.len();
-            let removed_bytes = std::mem::take(&mut state.bytes);
-            state.stats.publication_shrink_entries = state
-                .stats
-                .publication_shrink_entries
-                .saturating_add(removed_entries);
-            state.stats.publication_shrink_bytes = state
-                .stats
-                .publication_shrink_bytes
-                .saturating_add(removed_bytes);
-            (
-                removed,
-                DeclarationPayloadCacheShrink {
-                    configured_budget_bytes: self.configured_budget_bytes,
-                    effective_budget_before_bytes,
-                    removed_entries,
-                    removed_bytes,
-                },
-            )
-        };
-        drop(removed);
-        shrink
-    }
-
-    fn restore_configured_budget(&self) {
-        self.state
-            .lock()
-            .expect("declaration payload cache poisoned")
-            .effective_budget_bytes = self.configured_budget_bytes;
-    }
-
-    fn stats(&self) -> DeclarationPayloadCacheStats {
-        let state = self
-            .state
-            .lock()
-            .expect("declaration payload cache poisoned");
-        DeclarationPayloadCacheStats {
-            bytes: state.bytes,
-            entries: state.entries.len(),
-            configured_budget_bytes: self.configured_budget_bytes,
-            effective_budget_bytes: state.effective_budget_bytes,
-            ..state.stats
-        }
-    }
 }
 
 /// Owns the temporary cache suspension used only while a complete replacement
@@ -240,6 +81,15 @@ pub struct SemanticDeclarationIndex {
 }
 
 impl SemanticDeclarationIndex {
+    #[cfg(test)]
+    pub(crate) fn with_payload_budget_for_test(&self, budget: usize) -> Self {
+        Self {
+            names: self.names.clone(),
+            accounted_core_bytes: self.accounted_core_bytes,
+            total_budget_bytes: self.accounted_core_bytes.saturating_add(budget),
+            payloads: Arc::new(DeclarationPayloadCache::new(budget)),
+        }
+    }
     #[cfg(test)]
     pub(crate) fn from_name_table_for_test(names: NameTable) -> Self {
         Self::build(names, 0)
@@ -377,27 +227,66 @@ fn declaration_payload_bytes(row: &DeclarationReadRow) -> usize {
     let fact = &row.fact;
     let key = &fact.identity.logical_key;
     size_of::<DeclarationReadRow>()
-        .saturating_add(size_of::<CachedPayload>())
-        .saturating_add(size_of::<i64>())
         .saturating_add(size_of::<usize>().saturating_mul(2))
-        .saturating_add(1)
-        .saturating_add(fact.name.len())
-        .saturating_add(fact.qualified_name.len())
-        .saturating_add(fact.path.len())
-        .saturating_add(fact.canonical_signature.as_deref().map_or(0, str::len))
-        .saturating_add(fact.owner.as_deref().map_or(0, str::len))
-        .saturating_add(fact.guard.as_deref().map_or(0, str::len))
-        .saturating_add(fact.identity.locator.workspace_id.len())
-        .saturating_add(fact.identity.locator.path.len())
-        .saturating_add(fact.identity.locator.fingerprint.len())
-        .saturating_add(key.qualified_name.len())
-        .saturating_add(key.owner.as_deref().map_or(0, str::len))
-        .saturating_add(key.canonical_signature.as_deref().map_or(0, str::len))
-        .saturating_add(key.linkage_domain.len())
-        .saturating_add(key.guard_fingerprint.as_deref().map_or(0, str::len))
-        .saturating_add(row.logical_key_digest.len())
-        .saturating_add(row.backing_kind.len())
-        .saturating_add(row.revision_hash.len())
+        .saturating_add(fact.name.capacity())
+        .saturating_add(fact.qualified_name.capacity())
+        .saturating_add(fact.path.capacity())
+        .saturating_add(
+            fact.canonical_signature
+                .as_ref()
+                .map_or(0, String::capacity),
+        )
+        .saturating_add(fact.owner.as_ref().map_or(0, String::capacity))
+        .saturating_add(fact.guard.as_ref().map_or(0, String::capacity))
+        .saturating_add(fact.identity.locator.workspace_id.capacity())
+        .saturating_add(fact.identity.locator.path.capacity())
+        .saturating_add(fact.identity.locator.fingerprint.capacity())
+        .saturating_add(key.qualified_name.capacity())
+        .saturating_add(key.owner.as_ref().map_or(0, String::capacity))
+        .saturating_add(key.canonical_signature.as_ref().map_or(0, String::capacity))
+        .saturating_add(key.linkage_domain.capacity())
+        .saturating_add(key.guard_fingerprint.as_ref().map_or(0, String::capacity))
+        .saturating_add(row.logical_key_digest.capacity())
+        .saturating_add(row.backing_kind.capacity())
+        .saturating_add(row.revision_hash.capacity())
+        .saturating_add(match &fact.linkage {
+            crate::call_model::LinkageDomain::Internal(path)
+            | crate::call_model::LinkageDomain::Package(path) => path.capacity(),
+            crate::call_model::LinkageDomain::External
+            | crate::call_model::LinkageDomain::Unknown => 0,
+        })
+        .saturating_add(match &fact.backing {
+            crate::semantic_model::DeclarationBacking::CallableAnchor { fingerprint }
+            | crate::semantic_model::DeclarationBacking::TypeAlias { fingerprint } => {
+                fingerprint.capacity()
+            }
+            crate::semantic_model::DeclarationBacking::Record { record_key } => {
+                record_key.capacity()
+            }
+            crate::semantic_model::DeclarationBacking::SourceRange { .. }
+            | crate::semantic_model::DeclarationBacking::None => 0,
+        })
+        .saturating_add(match &fact.declarator_shape {
+            Some(
+                crate::semantic_model::DeclaratorShape::Pointer { qualifiers }
+                | crate::semantic_model::DeclaratorShape::Qualified { qualifiers },
+            ) => qualifiers.iter().fold(
+                qualifiers.capacity().saturating_mul(size_of::<String>()),
+                |bytes, value| bytes.saturating_add(value.capacity()),
+            ),
+            Some(crate::semantic_model::DeclaratorShape::Array { extent_text }) => {
+                extent_text.capacity()
+            }
+            Some(
+                crate::semantic_model::DeclaratorShape::Function { signature }
+                | crate::semantic_model::DeclaratorShape::FunctionPointer { signature },
+            ) => signature.capacity(),
+            Some(
+                crate::semantic_model::DeclaratorShape::Identity
+                | crate::semantic_model::DeclaratorShape::Unsupported,
+            )
+            | None => 0,
+        })
 }
 
 #[cfg(test)]
@@ -493,6 +382,155 @@ mod tests {
             revision_mtime_ns: 0,
             revision_hash: "revision".into(),
         }
+    }
+
+    #[test]
+    fn cache_insert_evicts_at_most_32_rows() {
+        let cache = DeclarationPayloadCache::new(256 * 1024);
+        for id in 0..100 {
+            cache.insert(read_row(id));
+        }
+        let before = cache.stats();
+        cache.state.lock().unwrap().effective_budget_bytes = before.bytes;
+        let mut large = read_row(1000);
+        large.fact.canonical_signature = Some("x".repeat(before.bytes * 3 / 4));
+        let returned = cache.insert(large);
+        assert_eq!(returned.id, 1000);
+        assert!(
+            cache.stats().evictions - before.evictions <= 32,
+            "one insert must not evict an unbounded number of small rows"
+        );
+        assert!(
+            cache.get(1000).is_none(),
+            "an oversized admission must return the row without caching it"
+        );
+    }
+
+    #[test]
+    fn cache_duplicate_id_does_not_evict_unrelated_rows() {
+        let cache = DeclarationPayloadCache::new(256 * 1024);
+        for id in 0..100 {
+            cache.insert(read_row(id));
+        }
+        let before = cache.stats();
+        cache.state.lock().unwrap().effective_budget_bytes = before.bytes;
+        let returned = cache.insert(read_row(99));
+        assert_eq!(returned.id, 99);
+        assert_eq!(cache.stats().evictions, before.evictions);
+        assert_eq!(cache.stats().entries, before.entries);
+        assert!(cache.get(0).is_some());
+    }
+
+    #[test]
+    fn cache_victim_work_stays_constant_as_capacity_grows() {
+        for count in [10, 1_000, 100_000] {
+            let cache = DeclarationPayloadCache::new(512 * 1024 * 1024);
+            for id in 0..count {
+                cache.insert(read_row(id));
+            }
+            let before = cache.stats();
+            cache.state.lock().unwrap().effective_budget_bytes = before.bytes;
+            cache.get(0).unwrap();
+            cache.insert(read_row(count));
+            let after = cache.stats();
+            assert!(
+                (1..=2).contains(&(after.victim_steps - before.victim_steps)),
+                "{count}: {after:?}"
+            );
+            assert!(cache.get(0).is_some(), "recent hit remains resident");
+            assert!(
+                cache.get(1).is_none(),
+                "least recently used is removed directly"
+            );
+            assert!(after.bytes <= after.effective_budget_bytes);
+            cache.validate_for_test();
+        }
+    }
+
+    #[test]
+    fn cache_metadata_capacity_and_payload_spare_capacity_are_charged() {
+        let mut spare = read_row(1);
+        spare.fact.name.reserve(4096);
+        spare.logical_key_digest.reserve(1024);
+        assert!(
+            declaration_payload_bytes(&spare) >= declaration_payload_bytes(&read_row(1)) + 5000
+        );
+        let cache = DeclarationPayloadCache::new(declaration_payload_bytes(&read_row(1)));
+        cache.insert(read_row(1));
+        assert_eq!(
+            cache.stats().entries,
+            0,
+            "a payload-only budget cannot allocate cache metadata"
+        );
+        let cache = DeclarationPayloadCache::new(64 * 1024);
+        for id in 0..1000 {
+            cache.insert(read_row(id));
+            cache.validate_for_test();
+        }
+        let before = cache.stats();
+        assert!(before.metadata_bytes > 0);
+        assert_eq!(before.bytes, before.payload_bytes + before.metadata_bytes);
+        let mut huge = read_row(1001);
+        huge.fact.canonical_signature = Some("x".repeat(64 * 1024));
+        cache.insert(huge);
+        assert_eq!(cache.stats().evictions, before.evictions);
+        let zero = DeclarationPayloadCache::new(0);
+        assert_eq!(zero.insert(read_row(2)).id, 2);
+        assert_eq!(zero.stats().bytes, 0);
+        assert_eq!(zero.stats().evictions, 0);
+    }
+
+    #[test]
+    fn cache_concurrent_same_id_has_one_node_and_releases_victims_outside_lock() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let cache = Arc::new(DeclarationPayloadCache::new(16 * 1024));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let weak = Arc::downgrade(&cache);
+        let observed = drops.clone();
+        cache.set_drop_probe(Arc::new(move || {
+            if let Some(cache) = weak.upgrade() {
+                assert!(
+                    cache.state.try_lock().is_ok(),
+                    "payload destructor ran under cache mutex"
+                );
+                observed.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let cache = cache.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..100 {
+                        cache.insert(read_row(7));
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(cache.stats().entries, 1);
+        assert_eq!(cache.stats().evictions, 0);
+        let held = cache.get(7).unwrap();
+        for id in 100..200 {
+            cache.insert(read_row(id));
+        }
+        assert!(cache.get(7).is_none());
+        assert_eq!(held.id, 7);
+        assert_eq!(held.revision_hash, "revision");
+        cache.validate_for_test();
+        let before = drops.load(Ordering::SeqCst);
+        assert!(before > 0);
+        cache.suspend_for_full_publication();
+        assert!(drops.load(Ordering::SeqCst) > before);
+        assert_eq!(cache.stats().bytes, 0);
+        cache.restore_configured_budget();
+        cache.insert(read_row(8));
+        assert!(cache.get(8).is_some());
+        cache.validate_for_test();
     }
 
     #[test]

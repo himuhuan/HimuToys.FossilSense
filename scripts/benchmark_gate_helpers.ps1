@@ -195,3 +195,44 @@ function Assert-ReplayProcessSuccess {
         throw "Replay process failed (exit $ExitCode): $(@($Output | Select-Object -Last 35) -join [Environment]::NewLine)"
     }
 }
+
+function Get-CacheReplayMetricNames {
+    'cache_replay_declarations'; 'cache_replay_files'
+    foreach ($phase in @('cold','warm','boundary','eviction')) {
+        foreach ($feature in @('hover','definition')) {
+            foreach ($suffix in @('requests','correct_targets','p50_us','p95_us','p99_us','hits','misses',
+                'payload_sql_reads','evictions','admission_skips','eviction_limit_skips','victim_steps','lock_wait_ns','bytes','budget_bytes')) {
+                "cache_${phase}_${feature}_${suffix}"
+            }
+        }
+    }
+}
+
+function Assert-CacheReplayGate {
+    param([Parameter(Mandatory=$true)][System.Collections.IDictionary]$Metrics)
+    foreach ($name in @(Get-CacheReplayMetricNames)) {
+        if (-not $Metrics.Contains($name)) { throw "cache replay missing metric: $name" }
+        if ([long]$Metrics[$name] -lt 0) { throw "cache replay negative metric: $name" }
+    }
+    if ([long]$Metrics.cache_replay_declarations -lt 500000 -or [long]$Metrics.cache_replay_files -lt 10000) {
+        throw 'cache replay sample is too small'
+    }
+    foreach ($phase in @('cold','warm','boundary','eviction')) {
+        foreach ($feature in @('hover','definition')) {
+            $prefix = "cache_${phase}_${feature}"
+            if ([long]$Metrics["${prefix}_requests"] -ne 64 -or [long]$Metrics["${prefix}_correct_targets"] -ne 64) {
+                throw "cache replay requires 64 correct requests: $prefix"
+            }
+            if ([long]$Metrics["${prefix}_bytes"] -gt [long]$Metrics["${prefix}_budget_bytes"] -or
+                [long]$Metrics["${prefix}_p50_us"] -gt [long]$Metrics["${prefix}_p95_us"] -or
+                [long]$Metrics["${prefix}_p95_us"] -gt [long]$Metrics["${prefix}_p99_us"]) {
+                throw "cache replay invalid budget or latency: $prefix"
+            }
+            if (($phase -eq 'cold' -and [long]$Metrics["${prefix}_payload_sql_reads"] -lt 1) -or
+                ($phase -eq 'warm' -and [long]$Metrics["${prefix}_hits"] -lt 1) -or
+                ($phase -eq 'eviction' -and [long]$Metrics["${prefix}_evictions"] -lt 1)) {
+                throw "cache replay did not exercise its scenario: $prefix"
+            }
+        }
+    }
+}

@@ -11920,4 +11920,5 @@ async fn pressure_failed_full_rebuild_keeps_production_queries_and_cleans_stagin
 
 mod member_resolution;
 
+mod cache_replay;
 mod entity_locations;
