@@ -1,39 +1,37 @@
-# 内存发布门禁
+# 资源与交互验收方法
 
-本方法用于复现 FossilSense 在大型 C/C++ 工作区中的完整索引、冷态读取模型和已预热旧代发布检查。结构分项用于定位变化来源；Windows 使用 Private Bytes，Linux/macOS 使用 RSS 作为是否通过的依据。
+以下为 1.7.2 起的当前方法。后面的带日期结果保留当时策略与原始结论，不能用作当前构建的验收证据。
 
-执行前记录样本名称与固定提交、测试机器的操作系统/CPU/内存、Rust 版本和可用的 U-Boot 数据库路径。样本必须至少有 500,000 个当前有效声明和 10,000 个文件。
+## 按修改范围执行
 
-先在仓库根目录构建，避免首次编译时间进入 120 秒索引门禁：
+局部 Rust 修改：`powershell -NoProfile -File scripts/verify.ps1 -Profile Local -TestFilter candidate_service::`。扩展或脚本修改使用 `-Scope Extension` 或 `-Scope Scripts`。Local Rust 必须给出过滤器，避免无意运行全部测试。
 
-    cargo build --release -p fossilsense
-    cargo test --release -p fossilsense --bin fossilsense --no-run
+默认脚本入口测试只用合成指标验证报告与失败处理；需要复现旧版六组真实回放时，显式运行 `scripts/test_benchmark_entrypoints.ps1 -IncludeLegacyReplay`。
 
-完整索引门禁：
+准备合入：`powershell -NoProfile -File scripts/verify.ps1 -Profile Merge -SkipInstall`。完整日志和逐项退出状态、耗时保存在 `target/verification/`。CI 显式运行 Merge；打包默认不重复源码测试，需要检查加打包时使用 `build.ps1 -Verify`。复用结果前核对相关源码、测试、配置和工具链，打包本身不证明测试通过。
 
-    powershell -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark_large_workspace.ps1 -Repeats 1 -IncludeFullIndex -CaseFilter u-boot-full-index -TimeoutSeconds 120
+性能敏感行为调整后，选择受影响的场景。例如索引资源与发布调整：
 
-冷态与热旧代发布门禁：
+    powershell -NoProfile -File scripts/verify.ps1 -Profile Performance -CaseFilter u-boot-full-index,u-boot-lsp-lifecycle
 
-    powershell -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark_large_workspace.ps1 -Repeats 1 -IncludeFullIndex -IncludeEngineHydration -IncludeCompletionReplay -CaseFilter u-boot-full-index,u-boot-engine-hydration,u-boot-completion-replay -TimeoutSeconds 120
+Performance 先构建 release，再运行显式选择的场景。已有数据库可以用于单独生命周期回放；没有数据库时先选同一个样本的 full-index。不要因每轮会话或 reviewer 接手重复测量。纯职责迁移复用行为回归；验收脚本策略用合成报告测试。
 
-同一生产 LSP 生命周期门禁：
+## 资源判断
 
-    powershell -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark_large_workspace.ps1 -Repeats 1 -IncludeLspLifecycle -CaseFilter u-boot-lsp-lifecycle,wine-lsp-lifecycle -TimeoutSeconds 180
+完整索引默认记录耗时，不以统一 120 秒拒绝；`TimeoutSeconds` 和 `LifecycleTimeoutSeconds` 是防止执行挂起的超时，触发仍为失败。历史复现才使用 `-StrictFullIndexTime` 或 `-StrictMemoryPeak`。旧 ObserveFullIndexTime、AllowTransientMemoryPeak 参数兼容保留，当前默认已开启。
 
-生命周期 case 使用一个 LSP 进程完成旧索引发布、详情缓存预热、生产 full rebuild、并发 Hover/F12/补全、dirty 保存、名称压实和压实时再次保存。并发补全固定执行 64 次，逐项检查 P95、召回检查量、处理预算、索引候选、截断标记和详情 SQL 次数。case 还记录阶段覆盖、活动构建峰值、预留/保留字节、取消次数、旧请求 epoch、新请求 generation、数据库身份、Hover/F12 分位延迟、完整索引 `elapsed_ms`/`write_ms`、数据库大小和进程峰值。
+| 场景 | 当前判断 | 产品含义 |
+| --- | --- | --- |
+| U-Boot 在线稳定内存 | 任务后至少 10 秒、100 次采样，最大值 ≤512 MiB | 长期资源负担参考 |
+| U-Boot 在线短暂增长 | 峰值 ≤768 MiB，连续超线 ≤10 秒，累计 ≤30 秒 | 同时限制幅度、单次持续时间和反复增长 |
+| U-Boot 冷/暖加载专项 | 单代384 MiB、双代512 MiB保留为专项参考检查，按影响选用 | 与在线生命周期分开解释 |
+| Wine 完整索引/在线回放 | 保存真实规模、时间、内存与正确性结果；不套用 U-Boot 内存数字 | 不从 CLI 成功推断在线成功 |
+| 真实补全 | 64 次、P95 ≤50 ms、每次1..=16,384项、预算16,384、零详情SQL、有索引候选与截断标记 | 保护日常交互和查询有界 |
+| 数据正确性 | 数据库完整性、旧新代一致、取消不发布、删除不复活 | 不因资源放宽而放宽 |
 
-| 检查项 | U-Boot 门槛 | Wine 当前判定 |
-|---|---:|---|
-| 样本规模 | 至少 500,000 个声明、10,000 个文件 | 记录实际规模 |
-| 同时活动的重型构建 | 峰值必须为 1 | 峰值必须为 1 |
-| 临时预留 | 峰值大于 0 且不超过 256 MiB | 相同 |
-| 进程峰值 | 不超过 512 MiB | 首次记录真实值，不套用 U-Boot 结论 |
-| 完整索引 | `elapsed_ms` 不超过 120,000 ms | 相同 |
-| 请求一致性 | 旧/新 epoch、generation 与数据库身份均不得混用 | 相同 |
-| 压实过期 | 至少观察到一次协作取消，最终许可与预留归零 | 相同 |
+生产资源档位与测量参考预算是不同用途：默认进程准入目标1 GiB，可选择512 MiB或2 GiB；临时预留仍256 MiB。具体选择依据机器余量和实际工作量，不按仓库目录总大小机械换算。内存不足最多等待30秒，之后明确失败并保留旧索引；工作区记录补偿扫描状态，下次保存或刷新补齐未成功的更新；释放资源或调高档位、重启服务后执行完整重建。
 
-结果 JSON 与 Markdown 必须保存源码提交与改动指纹、样本提交与改动指纹、机器信息、完整命令、`elapsed_ms`、`write_ms`、峰值内存、数据库文件大小、冷单代/双代、热单代、缓存收缩、第二代增量和名称索引分项。完整索引的实际运行时间或 `elapsed_ms` 任一超过 120,000 ms 即失败。冷或热场景中单代超过 384 MiB、发布窗口绝对峰值超过 512 MiB、内存采样缺失、缓存预热未达到可用预算的 75%，或旧请求代次不一致，也都判定失败；不得以多次平均值、小样本或机器波动放行。
+对比版本时保持机器、样本版本和测量命令一致，记录有效文件数、声明数、源码字节数和最大文件（可获得时）、关系数量、elapsed_ms、write_ms、Windows Private Bytes或其他平台RSS、数据库及日志文件体积。源码字节数应排除.git、构建产物与不参与索引的资源；数据库体积不代表累计磁盘写入或SSD损耗。重点解释首次可用、打开已有索引、保存更新和重建期间交互，严重退化需分析，不能用空结果换速度。
 
 ## 2026-09-06 preserve-c-declaration-context 验证结果
 

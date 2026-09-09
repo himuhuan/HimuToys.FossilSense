@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -27,6 +27,9 @@ type SnapshotMemoryReports =
 #[derive(Clone)]
 pub(in crate::server) struct CacheLedger {
     pub(in crate::server) engine_snapshots: EngineSnapshots,
+    /// A rejected update needs a full rescan on the next user event, without
+    /// creating an automatic retry loop or retaining unbounded file events.
+    pub(in crate::server) roots_needing_rescan: Arc<Mutex<HashSet<PathBuf>>>,
     pub(in crate::server) publish_gate: Arc<Mutex<()>>,
     pub(in crate::server) build_coordinator: crate::build_coordinator::BuildCoordinator,
     pub(super) next_engine_epoch: Arc<AtomicU64>,
@@ -136,6 +139,7 @@ impl Default for CacheLedger {
     fn default() -> Self {
         Self {
             engine_snapshots: Arc::new(Mutex::new(HashMap::new())),
+            roots_needing_rescan: Arc::new(Mutex::new(HashSet::new())),
             publish_gate: Arc::new(Mutex::new(())),
             build_coordinator: crate::build_coordinator::BuildCoordinator::default(),
             next_engine_epoch: Arc::new(AtomicU64::new(1)),

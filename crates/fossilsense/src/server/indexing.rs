@@ -32,11 +32,17 @@ pub(super) fn should_retry_acquire(error: AcquireError) -> bool {
     matches!(error, AcquireError::Deferred)
 }
 
-pub(super) fn should_retry_reservation(error: ReservationError) -> bool {
-    matches!(
-        error,
-        ReservationError::TemporaryBudgetExceeded | ReservationError::ProcessPressure
-    )
+pub(super) fn reservation_failure_status(
+    root: String,
+    error: ReservationError,
+) -> Option<IndexStatus> {
+    match error {
+        ReservationError::ProcessPressure | ReservationError::TemporaryBudgetExceeded => Some(IndexStatus::failed(
+            root,
+            format!("{error}; old index remains available but may be stale. Free memory or increase fossilsense.resources.profile, restart the server, then run Full Rebuild Index."),
+        )),
+        ReservationError::Cancelled | ReservationError::StalePermit => None,
+    }
 }
 
 #[derive(Debug, Default)]
@@ -455,6 +461,8 @@ async fn index_roots(
 
     let mut deferred_roots = Vec::new();
     for root in roots {
+        let force = force || cache.roots_needing_rescan.lock().await.contains(&root);
+        cache.roots_needing_rescan.lock().await.insert(root.clone());
         let display_root = root.display().to_string();
         let cancellation = BuildCancellation::new();
         let permit = match cache
@@ -490,35 +498,26 @@ async fn index_roots(
             }
         };
         let publication = cache.begin_full_build_lifecycle(&root).await;
-        if let Err(error) = permit.reserve(
-            publication.replacement_reservation_bytes(),
-            publication.retained_bytes(),
-        ) {
-            if !should_retry_reservation(error) {
+        if let Err(error) = permit
+            .reserve_with_wait(
+                publication.replacement_reservation_bytes(),
+                publication.retained_bytes(),
+            )
+            .await
+        {
+            if let Some(status) = reservation_failure_status(display_root.clone(), error) {
                 client
-                    .log_message(
-                        MessageType::LOG,
-                        format!("index stopped for {}: {error}", display_root),
-                    )
+                    .send_notification::<IndexStatusNotification>(status)
                     .await;
-                continue;
             }
             client
-                .send_notification::<IndexStatusNotification>(IndexStatus::deferred(
-                    display_root.clone(),
-                    error.to_string(),
-                ))
-                .await;
-            client
                 .log_message(
-                    MessageType::WARNING,
-                    format!(
-                        "index resource admission deferred for {}: {error}",
-                        display_root
-                    ),
+                    MessageType::LOG,
+                    format!("index stopped for {display_root}: {error}"),
                 )
                 .await;
-            deferred_roots.push(root);
+            // The bounded reservation wait has finished. A later explicit
+            // rebuild/save can retry; do not endlessly requeue this baseline.
             continue;
         }
         client
@@ -629,6 +628,7 @@ async fn index_roots(
                     .await
                 {
                     Ok(report) => {
+                        cache.roots_needing_rescan.lock().await.remove(&root);
                         if !workspace_state.roots.lock().await.contains(&root) {
                             cache
                                 .remove_workspace_roots(std::slice::from_ref(&root))
@@ -771,12 +771,14 @@ async fn index_dirty_roots(
         }
         let published = cache.current_engine_snapshot(&root).await;
         let store_generation = cache::load_store_semantic_generation(root.clone()).await;
-        let may_increment = published.as_ref().is_some_and(|snapshot| {
-            snapshot.semantic_generation != crate::call_model::SemanticGeneration::MISSING
-                && store_generation
-                    .as_ref()
-                    .is_ok_and(|generation| *generation == snapshot.semantic_generation)
-        });
+        let needs_rescan = cache.roots_needing_rescan.lock().await.contains(&root);
+        let may_increment = !needs_rescan
+            && published.as_ref().is_some_and(|snapshot| {
+                snapshot.semantic_generation != crate::call_model::SemanticGeneration::MISSING
+                    && store_generation
+                        .as_ref()
+                        .is_ok_and(|generation| *generation == snapshot.semantic_generation)
+            });
         if !may_increment {
             client
                 .log_message(
@@ -800,6 +802,7 @@ async fn index_dirty_roots(
             deferred.full_roots.extend(full_deferred);
             continue;
         }
+        cache.roots_needing_rescan.lock().await.insert(root.clone());
         let workspace_semantics = published
             .as_ref()
             .expect("incremental eligibility requires a published snapshot")
@@ -847,35 +850,26 @@ async fn index_dirty_roots(
             .as_ref()
             .and_then(|snapshot| snapshot.declaration_index.as_ref())
             .map_or(0, |index| index.accounted_core_bytes());
-        if let Err(error) = permit.reserve(
-            crate::build_coordinator::DEFAULT_INCREMENTAL_BUILD_RESERVATION_BYTES,
-            retained_bytes,
-        ) {
-            if !should_retry_reservation(error) {
+        if let Err(error) = permit
+            .reserve_with_wait(
+                crate::build_coordinator::DEFAULT_INCREMENTAL_BUILD_RESERVATION_BYTES,
+                retained_bytes,
+            )
+            .await
+        {
+            if let Some(status) = reservation_failure_status(display_root.clone(), error) {
                 client
-                    .log_message(
-                        MessageType::LOG,
-                        format!("dirty update stopped for {}: {error}", display_root),
-                    )
+                    .send_notification::<IndexStatusNotification>(status)
                     .await;
-                continue;
             }
             client
-                .send_notification::<IndexStatusNotification>(IndexStatus::deferred(
-                    display_root.clone(),
-                    error.to_string(),
-                ))
-                .await;
-            client
                 .log_message(
-                    MessageType::WARNING,
-                    format!(
-                        "dirty update resource admission deferred for {}: {error}",
-                        display_root
-                    ),
+                    MessageType::LOG,
+                    format!("index stopped for {display_root}: {error}"),
                 )
                 .await;
-            deferred.dirty_changes.extend(changes);
+            // The bounded reservation wait has finished. A later explicit
+            // rebuild/save can retry; do not endlessly requeue this baseline.
             continue;
         }
         client
@@ -982,6 +976,7 @@ async fn index_dirty_roots(
                     .await
                 {
                     Ok(report) => {
+                        cache.roots_needing_rescan.lock().await.remove(&root);
                         if !workspace_state.roots.lock().await.contains(&root) {
                             cache
                                 .remove_workspace_roots(std::slice::from_ref(&root))

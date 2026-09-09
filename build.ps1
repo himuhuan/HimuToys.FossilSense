@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-Builds, tests, and packages the self-contained FossilSense VS Code extension.
+Builds and packages the self-contained FossilSense VS Code extension.
 
 .DESCRIPTION
 The extension packaging command owns the release binary build, binary staging,
@@ -11,11 +11,12 @@ it provides a reproducible repository-level entry point around that command.
 .\build.ps1
 
 .EXAMPLE
-.\build.ps1 -SkipInstall -SkipTests
+.\build.ps1 -Verify
 #>
 [CmdletBinding()]
 param(
     [switch]$SkipInstall,
+    [switch]$Verify,
     [switch]$SkipTests,
     [switch]$SkipReleaseValidation
 )
@@ -84,12 +85,13 @@ if (-not $SkipInstall) {
     Invoke-NativeCommand -FilePath $Pnpm -Arguments @("install", "--frozen-lockfile", "--force") -WorkingDirectory $ExtensionDir
 }
 
-if (-not $SkipTests) {
-    Write-Host "`nRunning Rust tests..." -ForegroundColor Yellow
-    Invoke-NativeCommand -FilePath $Cargo -Arguments @("test", "-p", "fossilsense") -WorkingDirectory $RepoRoot
-
-    Write-Host "`nRunning extension tests..." -ForegroundColor Yellow
-    Invoke-NativeCommand -FilePath $Pnpm -Arguments @("run", "test") -WorkingDirectory $ExtensionDir
+if ($Verify -and $SkipTests) { throw '-Verify and -SkipTests cannot be combined.' }
+if ($Verify) {
+    Invoke-NativeCommand -FilePath (Get-RequiredCommand "powershell") -Arguments @(
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $RepoRoot 'scripts/verify.ps1'), '-Profile', 'Merge', '-SkipInstall'
+    ) -WorkingDirectory $RepoRoot
+} else {
+    Write-Host 'Packaging only. Reuse relevant verification evidence or use -Verify for Merge checks.'
 }
 
 Write-Host "`nCreating self-contained VSIX..." -ForegroundColor Yellow

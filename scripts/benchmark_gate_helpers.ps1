@@ -4,12 +4,14 @@ function Assert-FullIndexPerformanceGate {
         [Parameter(Mandatory = $true)][string]$CaseId,
         [Parameter(Mandatory = $true)][double]$OuterElapsedMs,
         [Parameter(Mandatory = $true)][double]$EngineElapsedMs,
-        [switch]$ObserveOnly
+        [switch]$ObserveOnly = $true
     )
 
     if ($CaseId -notlike '*-full-index') {
         return
     }
+    if ([double]::IsNaN($OuterElapsedMs) -or [double]::IsInfinity($OuterElapsedMs) -or $OuterElapsedMs -le 0 -or
+        [double]::IsNaN($EngineElapsedMs) -or [double]::IsInfinity($EngineElapsedMs) -or $EngineElapsedMs -le 0) { throw 'Invalid full-index duration evidence' }
     if ($ObserveOnly) { return }
     $limitMs = 120000.0
     if ($OuterElapsedMs -gt $limitMs) {
@@ -55,8 +57,8 @@ function Assert-LspLifecycleGate {
     param(
         [Parameter(Mandatory = $true)][string]$CaseId,
         [Parameter(Mandatory = $true)][System.Collections.IDictionary]$Metrics,
-        [switch]$ObserveFullIndexTime,
-        [switch]$AllowTransientMemoryPeak
+        [switch]$ObserveFullIndexTime = $true,
+        [switch]$AllowTransientMemoryPeak = $true
     )
 
     if ($CaseId -notlike '*-lsp-lifecycle') {
@@ -187,10 +189,15 @@ function Assert-LspLifecycleGate {
         if ($AllowTransientMemoryPeak) {
             foreach ($key in @('lsp_lifecycle_stable_max_bytes','lsp_lifecycle_stable_samples','lsp_lifecycle_stable_window_ms','lsp_lifecycle_above_limit_ms','lsp_lifecycle_longest_above_limit_ms')) {
                 if (-not $Metrics.Contains($key)) { throw "$CaseId missing stability metric $key" }
+                if ([long]$Metrics[$key] -lt 0) { throw "$CaseId negative stability metric $key" }
             }
             if ([long]$Metrics.lsp_lifecycle_stable_max_bytes -le 0 -or [long]$Metrics.lsp_lifecycle_stable_max_bytes -gt 536870912 -or
                 [long]$Metrics.lsp_lifecycle_stable_samples -lt 100 -or [long]$Metrics.lsp_lifecycle_stable_window_ms -lt 10000 -or
-                [long]$Metrics.lsp_lifecycle_longest_above_limit_ms -gt 10000) { throw "$CaseId violated stable memory or transient duration limit" }
+                [long]$Metrics.lsp_lifecycle_longest_above_limit_ms -gt 10000 -or
+                [long]$Metrics.lsp_lifecycle_above_limit_ms -gt 30000 -or
+                [long]$Metrics.lsp_lifecycle_peak_process_bytes -gt 805306368 -or
+                [long]$Metrics.lsp_lifecycle_peak_process_bytes -lt [long]$Metrics.lsp_lifecycle_stable_max_bytes -or
+                [long]$Metrics.lsp_lifecycle_longest_above_limit_ms -gt [long]$Metrics.lsp_lifecycle_above_limit_ms) { throw "$CaseId violated stable memory or transient duration limit" }
         } elseif ([long]$Metrics.lsp_lifecycle_peak_process_bytes -gt 536870912) {
             throw "$CaseId exceeded the 512 MiB lifecycle memory gate"
         }

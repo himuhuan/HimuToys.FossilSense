@@ -48,7 +48,7 @@ FossilSense 当前实际具备哪些能力，只能以**当前源码、自动化
 
 ## 项目定位
 
-FossilSense `1.7.1` 是一个面向大型 Windows C/C++ 和 Go 代码仓库的 VS Code 代码导航与分析工具。
+FossilSense `1.7.2` 是一个面向大型 Windows C/C++ 和 Go 代码仓库的 VS Code 代码导航与分析工具。
 
 它把“用户没有完整、可靠的编译环境”视为常见情况。用户不需要提前准备：
 
@@ -213,102 +213,42 @@ WAL 表示数据库写入时先记录修改日志，使读取和写入可以较�
 * 引入新依赖时，需要说明它对运行时、许可证、支持平台以及 VSIX 是否仍然能够独立运行的影响。
 * 用户可见行为发生变化时，需要同步修改根目录 `README.md` 和 `extensions/vscode/README.md`，但不要记录开发过程。
 
-## 功能验证
+## 功能验证与资源取舍
 
-日常问题修复和小功能开发，应优先使用 `samples/mini-c` 或其他小型代码库进行快速验证：
+验证服务于可用结果、交互顺畅和索引持续更新；不能为了满足参考机数值而过滤正确候选、返回空结果或无限延期更新。
 
-```powershell
-cargo test -p fossilsense
-cargo run -p fossilsense -- scan samples/mini-c
-cargo run -p fossilsense -- index samples/mini-c --db target/mini.sqlite --force
-cargo run -p fossilsense -- memory samples/mini-c --db target/mini.sqlite # 内存分类统计；--json 输出完整报告
+| 阶段 | 执行范围 | 不自动执行 |
+| --- | --- | --- |
+| 局部迭代 | 本次失败回归、受影响模块测试；使用 verify.ps1 的 Local 档位 | 全量测试、打包、大仓库重建 |
+| 准备合入 | verify.ps1 的 Merge 档位：完整正确性与静态检查，一次集中执行 | 无关性能矩阵、重复测试 |
+| 性能敏感修改或发布 | 最终构建上选择受影响的真实仓库场景 | 每次细节调整后重跑所有 benchmark |
 
-Set-Location extensions/vscode
-pnpm run test
-```
+验证由一个执行者负责。主代理与 reviewer 复核已有结果，不因会话或角色切换重复执行。只有相关源码、测试、配置、工具链或测量输入变化，才使对应证据失效。命令默认汇报退出状态、耗时和失败摘要；完整日志留在 target 下，失败时按需读取。
 
-完整仓库级检查：
+修复先证明失败场景，再修改实现；纯职责迁移复用既有行为测试，不为私有函数名、源码表达式或文件行数建立测试。不要删除遮蔽、声明角色、未保存覆盖、删除、取消发布与索引版本一致性等有独立失败意义的回归。已有正确性覆盖不要求重复造用例。
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify.ps1 -SkipInstall
-```
+大型仓库样本使用 samples/u-boot 或 samples/wine，不能提交。纯模块迁移用相关回归和架构检查；解析工作量、存储布局、查询算法或生命周期行为改变时，选一个代表性 release 场景，在最终实现上测一次；若本轮只改验收策略，用小型合成报告测试边界。发布时再核对最终构建的实际性能证据。禁止把缺失或历史测量写成当前 PASS。
 
-### 大型代码库性能硬门禁
+性能记录必须包含代码/样本版本、机器、命令、参与索引的文件和声明规模、elapsed_ms、write_ms、进程峰值与数据库体积。可取得时记录源码字节数、最大文件和关系数量。数据库体积是占用，不能称为累计写入量或 SSD 损耗。
 
-`mini-c` 只适合快速验证功能是否基本正确。
+完整索引时间默认观察，不再统一以 120 秒失败。执行超时仍须报失败，不能混同产品时长阈值。同机器同样本对比版本趋势，优先检查打开已有索引的就绪时间、保存后更新和重建期间的查询响应。严重退化必须解释。
 
-出现以下情况时，必须选择 **U-Boot 或 Wine** 中至少一个大型代码库，执行 release 模式下的完整索引性能测试：
+资源限制分为局部声明缓存预算、重型构建临时预算和进程压力目标。不能用文件数单独推算内存，也不能用 semanticIndex.memoryBudgetMB 代替进程预算。机器资源与工作负载共同决定预算；超限必须保留旧索引并提供明确恢复方法，不能把长期不更新当作成功；未成功更新的工作区要保留补偿扫描标记，下一次用户事件补齐遗漏后才能报告就绪。
 
-* 对外发布新版本；
-* 新增或调整重大功能；
-* 修改架构、索引、存储、解析、查询、并发或索引发布流程。
+Windows 采样 Private Bytes，Linux/macOS 采样 RSS，缺失测量不能按零通过。512 MiB 是 U-Boot 参考稳定预算，不是所有仓库的通用红线。在线短暂增长需要同时限制峰值幅度、最长连续时长、累计时长与任务完成后稳定窗口；人工调整预算要记录，不能清缓存制造低值。
 
-测试样本放在本地 `samples/u-boot` 或 `samples/wine`，不能提交到仓库。
+自动补全参考机 P95 50 ms 保留为交互目标；调整机器阈值必须显式记录。以下正确性与工作量契约不可放宽：真实 LSP 回放恰好 64 次；每次检查 1..=16,384 项，预算为 16,384，列表阶段完整声明 SQLite 读取为 0，每次返回索引候选；大型验收至少 500,000 个有效声明，未处理完必须 truncated。新旧版本一致性、数据库完整性、取消不发布必须保持。
 
-先构建 release 版本，再运行对应测试：
+不要为追求少量资源余量引入无证据必要性的缓存框架、磁盘分片或第二套语义模型。大文件治理按职责和状态所有权拆分；文件行数告警用于提示，不作为机械阻断。模块迁移时约束必须覆盖子模块。
 
-```powershell
-cargo build --release -p fossilsense
-cargo test --release -p fossilsense --bin fossilsense --no-run
-
-# 二选一；发布前可以两个都运行
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark_large_workspace.ps1 `
-  -Repeats 1 -IncludeFullIndex -CaseFilter u-boot-full-index -ObserveFullIndexTime -TimeoutSeconds 600
-
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark_large_workspace.ps1 `
-  -Repeats 1 -IncludeFullIndex -CaseFilter wine-full-index -ObserveFullIndexTime -TimeoutSeconds 600
-
-# 如果修改了声明读取模型、自动补全、查询或发布架构，还必须运行 U-Boot 内存检查
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark_large_workspace.ps1 `
-  -Repeats 1 -IncludeFullIndex -IncludeEngineHydration -IncludeCompletionReplay `
-  -CaseFilter u-boot-full-index,u-boot-engine-hydration,u-boot-completion-replay `
-  -ObserveFullIndexTime -TimeoutSeconds 600
-```
-
-v1.7.1 的主要放行依据是补全响应、内存和结果正确性；完整索引耗时作为观察指标。
-
-使用 `-ObserveFullIndexTime` 保存实际运行时间及 `elapsed_ms`，不因超过 120 秒单独阻断；默认脚本仍保留历史严格模式。
-
-构建失败、数据库完整性失败或下列补全及内存断言失败仍不能放行；小型样本不能替代大型测试。
-
-性能报告需要同时保留样本代码版本、测试机器信息、执行命令、`elapsed_ms`、`write_ms`、峰值内存和数据库文件大小。
-
-详细复现方法见 `docs/benchmark/`。
-
-U-Boot engine hydration 测试用于检查引擎把大型索引加载到可查询状态时的内存使用。
-
-该测试还必须满足：
-
-* 至少包含 500,000 个声明；
-* 至少包含 10,000 个文件；
-* 单个完整索引版本的读取模型不超过 384 MiB；
-* 双代读取模型加载测试保留 512 MiB 的保守检查；真实在线生命周期允许短暂峰值，后台任务结束后的稳定内存必须低于 512 MiB。
-
-Windows 使用 Private Bytes 判断进程实际占用的私有内存，Linux/macOS 使用 RSS 判断常驻物理内存。
-
-在线生命周期使用 `-AllowTransientMemoryPeak`：任务结束后连续采样至少 10 秒、100 次，稳定最大值不超过 512 MiB；单次连续超线不超过 10 秒。记录峰值及累计、最长超线时长，不清理正常缓存来制造低值。
-
-任意一项断言失败，都不能发布。
-
-自动补全相关变化还必须通过真实生产 LSP 请求回放测试：
-
-* 共执行 64 个自动补全请求；
-* 95% 的请求耗时不能超过 50,000 微秒，即 50 毫秒；
-* 每个请求检查的召回条目数量必须在 `1..=16,384` 之间；
-* 候选结果处理上限必须为 16,384；
-* 自动补全列表阶段读取完整声明信息的 SQLite 次数必须为 0；
-* 每个请求必须实际返回来自索引的候选结果；
-* 测试时必须能够看到至少 500,000 个当前有效声明；
-* 在大型候选表上，如果结果未全部处理，必须明确标记为 `truncated`，让调用方知道结果已被截断。
-
-即使完整索引性能标准有所调整，也不能借此放宽这些自动补全性能标准。
+详细复现入口见 docs/benchmark/。
 
 ## 编译
 
 环境要求：
 
 * Windows PowerShell；
-* stable Rust，即 Rust 当前稳定版本；
+* Rust 版本以 rust-toolchain.toml 为准；工具链升级单独验证；
 * Node.js 22；
 * pnpm 10。
 
@@ -336,7 +276,7 @@ pnpm run test
 
 ## 打包与发布
 
-仓库根目录的一键构建入口会安装依赖，运行 Rust 与扩展测试，创建不依赖用户本地工具链的 VSIX，并执行发布前验证。
+仓库根目录构建入口默认安装依赖、生成独立 VSIX 并验证产物。源码正确性使用 `scripts/verify.ps1 -Profile Merge` 集中验证；需要一条命令完成检查和打包时使用 `build.ps1 -Verify`。已经验证过相同相关输入时直接打包，不因打包重复执行测试；打包成功本身不代表源码正确性或性能验收通过。
 
 命令如下：
 
@@ -382,7 +322,7 @@ dist/fossilsense-vscode-<version>_BUILD<YYYYMMDD_HHMMSS>.vsix
 * 实际实现是否与自动化测试一致；
 * README 是否只描述已经真实存在的能力；
 * 是否错误新增了开发过程中的中间文档；
-* 重大变更是否通过大型仓库正确性、补全和内存门禁，并保留完整索引耗时。
+* 是否按修改风险完成对应验证，并如实标明当前测量与未覆盖范围。
 
 ## 工作流程与指南（必做）
 
@@ -394,7 +334,7 @@ dist/fossilsense-vscode-<version>_BUILD<YYYYMMDD_HHMMSS>.vsix
 
 ### 2. 修复用户明确提出的问题
 
-由主代理直接修改，不需要委托 test-executor 或 reviewer，也不需要提交代码或执行完整测试、编译流程；完成后只需要告知用户已经处理完成。
+由主代理直接修改，不需要委托 test-executor 或 reviewer，不自动提交或执行全套验证；运行本次失败回归并报告结果。
 
 ### 3. 用户提出想法或模糊的新功能需求
 

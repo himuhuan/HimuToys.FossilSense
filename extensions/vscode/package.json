@@ -2,7 +2,7 @@
   "name": "fossilsense-vscode",
   "displayName": "FossilSense",
   "description": "FossilSense C/C++ and Go best-effort semantics: stable navigation, role-aware candidates, bounded reachability evidence, Hover, completion, references, and call relations.",
-  "version": "1.7.1",
+  "version": "1.7.2",
   "private": true,
   "license": "UNLICENSED",
   "publisher": "himutoys",
@@ -234,7 +234,14 @@
           "default": false,
           "markdownDescription": "Show `:line` suffixes in the **Find References (Grouped by Role)** QuickPick. Off by default to keep labels focused on relative paths; selection still navigates to the full returned range."
         },
-        "fossilsense.resourceMonitor.enabled": {
+        "fossilsense.resources.profile": {
+        "type": "string",
+        "enum": ["conservative", "balanced", "large"],
+        "default": "balanced",
+        "scope": "window",
+        "markdownDescription": "Process memory admission target: conservative 512 MiB, balanced 1 GiB, large 2 GiB. Choose according to workspace and available machine memory. This is an estimate, not an OS hard cap. Restart FossilSense after changing it. Declaration cache budget is separate."
+      },
+      "fossilsense.resourceMonitor.enabled": {
           "type": "boolean",
           "default": true,
           "markdownDescription": "Show a status bar item with the FossilSense server's process memory and the on-disk size of its index cache. Hover the item for a per-category memory breakdown. Updates every 2 seconds while the server is running. Does not affect server behavior; turning it off only hides the item."

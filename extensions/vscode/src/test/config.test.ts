@@ -98,3 +98,8 @@ assert.ok(extensionSource.includes('protobufCEnabledOverrideFromConfig()'));
 assert.ok(extensionSource.includes('protobufCProtoPathsFromConfig()'));
 assert.ok(extensionSource.includes("affectsConfiguration('fossilsense.protobufC.enabled')"));
 assert.ok(extensionSource.includes("affectsConfiguration('fossilsense.protobufC.protoPaths')"));
+
+const resourceProfile = packageJson.contributes.configuration.properties['fossilsense.resources.profile'];
+assert.strictEqual(resourceProfile.default, 'balanced');
+assert.deepStrictEqual(resourceProfile.enum, ['conservative', 'balanced', 'large']);
+assert.strictEqual(resourceProfile.scope, 'window');

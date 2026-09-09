@@ -11,7 +11,7 @@ use tokio::sync::Notify;
 
 pub(crate) const DEFAULT_MAX_ACTIVE_BUILDS: usize = 1;
 pub(crate) const DEFAULT_TEMPORARY_RESERVATION_BYTES: usize = 256 * 1024 * 1024;
-pub(crate) const DEFAULT_PROCESS_PRESSURE_TARGET_BYTES: usize = 512 * 1024 * 1024;
+pub(crate) const DEFAULT_PROCESS_PRESSURE_TARGET_BYTES: usize = 1024 * 1024 * 1024;
 pub(crate) const DEFAULT_UNATTRIBUTED_HEADROOM_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const DEFAULT_FIRST_BUILD_RESERVATION_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const DEFAULT_INCREMENTAL_BUILD_RESERVATION_BYTES: usize = 8 * 1024 * 1024;
@@ -141,6 +141,39 @@ impl Default for BuildPolicy {
             process_pressure_target_bytes: DEFAULT_PROCESS_PRESSURE_TARGET_BYTES,
             unattributed_headroom_bytes: DEFAULT_UNATTRIBUTED_HEADROOM_BYTES,
             wait_timeout: DEFAULT_WAIT_TIMEOUT,
+        }
+    }
+}
+
+impl BuildPolicy {
+    /// Process-wide setting: one coordinator serves every workspace root.
+    pub(crate) fn for_resource_profile(profile: &str) -> Self {
+        Self {
+            process_pressure_target_bytes: match profile {
+                "conservative" => 512 * 1024 * 1024,
+                "large" => 2048 * 1024 * 1024,
+                _ => DEFAULT_PROCESS_PRESSURE_TARGET_BYTES,
+            },
+            ..Self::default()
+        }
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+    #[test]
+    fn resource_profiles_keep_temporary_work_bounded() {
+        for (profile, mib) in [
+            ("conservative", 512),
+            ("balanced", 1024),
+            ("large", 2048),
+            ("invalid", 1024),
+        ] {
+            let policy = BuildPolicy::for_resource_profile(profile);
+            assert_eq!(policy.process_pressure_target_bytes, mib * 1024 * 1024);
+            assert_eq!(policy.temporary_reservation_bytes, 256 * 1024 * 1024);
+            assert_eq!(policy.max_active_builds, 1);
         }
     }
 }
@@ -367,9 +400,12 @@ pub(crate) enum CompactionRequest {
 
 impl Default for BuildCoordinator {
     fn default() -> Self {
-        Self::with_policy_and_sampler(BuildPolicy::default(), || {
-            crate::resource::current_process_memory_bytes()
-        })
+        Self::with_policy_and_sampler(
+            BuildPolicy::for_resource_profile(
+                &std::env::var("FOSSILSENSE_RESOURCE_PROFILE").unwrap_or_default(),
+            ),
+            crate::resource::current_process_memory_bytes,
+        )
     }
 }
 

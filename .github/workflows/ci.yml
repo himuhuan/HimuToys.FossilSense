@@ -9,8 +9,9 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.97.0
           components: rustfmt, clippy
       - uses: pnpm/action-setup@v4
         with:
@@ -22,14 +23,21 @@ jobs:
           cache-dependency-path: extensions/vscode/pnpm-lock.yaml
       - name: Verify
         shell: pwsh
-        run: ./scripts/verify.ps1
+        run: ./scripts/verify.ps1 -Profile Merge
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: verification-logs
+          path: target/verification
 
   c-frontend-conformance:
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.0
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -49,13 +57,6 @@ jobs:
           $clangPath = Join-Path $llvmRoot 'bin/clang.exe'
           if (-not (Test-Path -LiteralPath $clangPath -PathType Leaf)) { throw 'Pinned Clang is missing.' }
           "FOSSILSENSE_CLANG=$clangPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-      - name: Check comparator failure detection
-        shell: pwsh
-        run: |
-          node scripts/test_c_frontend_conformance.mjs
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          node scripts/test_c_frontend_clang.mjs
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Compare complete source declarations
         shell: pwsh
         run: node scripts/verify_c_frontend_conformance.mjs

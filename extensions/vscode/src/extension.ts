@@ -257,6 +257,10 @@ async function startServer(context: vscode.ExtensionContext): Promise<void> {
     args: ['lsp'],
     options: {
       cwd: firstWorkspaceFolder.uri.fsPath,
+      env: {
+        ...process.env,
+        FOSSILSENSE_RESOURCE_PROFILE: vscode.workspace.getConfiguration('fossilsense').get<string>('resources.profile', 'balanced'),
+      },
     },
   };
 

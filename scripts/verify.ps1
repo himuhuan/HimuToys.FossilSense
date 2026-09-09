@@ -1,48 +1,40 @@
 [CmdletBinding()]
-param([switch]$SkipInstall)
-
+param(
+    [ValidateSet('Local', 'Merge', 'Performance')][string]$Profile = 'Local',
+    [ValidateSet('Rust', 'Extension', 'Scripts')][string]$Scope = 'Rust',
+    [string]$TestFilter = '',
+    [string]$CaseFilter = '',
+    [switch]$SkipInstall,
+    [switch]$ListSteps
+)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $RepoRoot = Split-Path -Parent $PSScriptRoot
-$ExtensionRoot = Join-Path $RepoRoot 'extensions\vscode'
-
-function Invoke-Checked {
-    param([string]$Command, [string[]]$Arguments, [string]$WorkingDirectory)
-    Push-Location -LiteralPath $WorkingDirectory
+. (Join-Path $PSScriptRoot 'verification_plan.ps1')
+$steps = @(Get-VerificationPlan $Profile $Scope $TestFilter $CaseFilter $SkipInstall.IsPresent)
+if ($ListSteps) { ConvertTo-Json -InputObject $steps -Depth 5; exit 0 }
+$logRoot = Join-Path $RepoRoot ("target/verification/{0}-{1}-{2}" -f $Profile, (Get-Date -Format 'yyyyMMdd-HHmmss'), $PID)
+New-Item -ItemType Directory -Path $logRoot -Force | Out-Null
+$results = [System.Collections.Generic.List[object]]::new()
+foreach ($step in $steps) {
+    $log = Join-Path $logRoot ("{0:D2}.log" -f $results.Count)
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    Push-Location (Join-Path $RepoRoot $step.directory)
     try {
-        & $Command @Arguments
-        if ($LASTEXITCODE -ne 0) {
-            throw "$Command $($Arguments -join ' ') failed with exit code $LASTEXITCODE"
-        }
-    } finally {
-        Pop-Location
+        $command = $step.command
+        $arguments = $step.arguments
+        Get-Command $command -ErrorAction Stop | Out-Null
+        $ErrorActionPreference = 'Continue'
+        & $command @arguments > $log 2>&1
+        $code = $LASTEXITCODE
+    } finally { $ErrorActionPreference = 'Stop'; Pop-Location }
+    $timer.Stop()
+    $results.Add(@{ command = $command; arguments = $arguments; exit_code = $code; elapsed_ms = $timer.ElapsedMilliseconds; log = $log })
+    $results | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $logRoot 'results.json') -Encoding UTF8
+    Write-Host "$command $($arguments -join ' '): exit=$code, $($timer.ElapsedMilliseconds) ms; $log"
+    if ($code -ne 0) {
+        Get-Content -LiteralPath $log -Tail 35
+        throw "Verification failed; full evidence: $logRoot"
     }
 }
-
-if (-not $SkipInstall) {
-    Invoke-Checked pnpm @('install', '--frozen-lockfile') $ExtensionRoot
-}
-Invoke-Checked cargo @('fmt', '--all', '--', '--check') $RepoRoot
-Invoke-Checked cargo @('clippy', '-p', 'fossilsense', '--all-targets', '--', '-D', 'warnings') $RepoRoot
-Invoke-Checked cargo @('test', '-p', 'fossilsense') $RepoRoot
-Invoke-Checked node @('scripts/test_architecture_fitness.js') $RepoRoot
-Invoke-Checked node @('scripts/test_c_frontend_conformance.mjs') $RepoRoot
-Invoke-Checked node @('scripts/test_c_frontend_clang.mjs') $RepoRoot
-Invoke-Checked node @('scripts/architecture_fitness.js') $RepoRoot
-Invoke-Checked powershell @(
-    '-NoProfile',
-    '-ExecutionPolicy',
-    'Bypass',
-    '-File',
-    'scripts/test_release_hardening.ps1'
-) $RepoRoot
-Invoke-Checked powershell @(
-    '-NoProfile',
-    '-ExecutionPolicy',
-    'Bypass',
-    '-File',
-    'scripts/test_benchmark_entrypoints.ps1'
-) $RepoRoot
-Invoke-Checked pnpm @('test') $ExtensionRoot
-
-Write-Host 'FossilSense verification passed.' -ForegroundColor Green
+Write-Host "$Profile verification passed. Evidence: $logRoot" -ForegroundColor Green

@@ -1,14 +1,6 @@
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
-$scriptPath = Join-Path $PSScriptRoot 'benchmark_large_workspace.ps1'
-$tokens = $null
-$errors = $null
-$ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$errors)
-if ($errors.Count -gt 0) { throw 'Benchmark script has syntax errors' }
-foreach ($name in @('Quote-ProcessArgument', 'Invoke-SampledProcess')) {
-    $function = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }.GetNewClosure(), $true)
-    . ([scriptblock]::Create($function.Extent.Text))
-}
+. (Join-Path $PSScriptRoot 'benchmark_process.ps1')
 $fixture = "[Console]::Out.WriteLine('parsing 7/20 files'); [Console]::Error.WriteLine('fixture diagnostic'); Start-Sleep -Seconds 20"
 $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($fixture))
 $failure = $null

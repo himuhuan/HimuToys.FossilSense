@@ -91,3 +91,13 @@ for (const testCase of cases) {
 }
 
 console.log(`architecture fitness golden tests passed (${cases.length} cases)`);
+
+// Moving a hot path into a child module must retain its I/O constraint.
+const tempRoot = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'fossilsense-architecture-'));
+try {
+  const target = path.join(tempRoot, 'crates/fossilsense/src/completion/ordinary_service/nested.rs');
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(target, 'use std::fs;\npub fn read() { let _ = fs::read_dir("."); }\n');
+  const result = spawnSync(process.execPath, [script, '--root', tempRoot], { encoding: 'utf8', windowsHide: true });
+  assert.equal(result.status, 1, 'ordinary completion child module must reject filesystem I/O');
+} finally { fs.rmSync(tempRoot, { recursive: true, force: true }); }

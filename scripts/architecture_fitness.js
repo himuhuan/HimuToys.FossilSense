@@ -231,7 +231,8 @@ function isStoreBoundary(relPath) {
 }
 
 function isOrdinaryCompletionService(relPath) {
-  return relPath === "crates/fossilsense/src/completion/ordinary_service.rs";
+  return relPath === "crates/fossilsense/src/completion/ordinary_service.rs" ||
+    relPath.startsWith("crates/fossilsense/src/completion/ordinary_service/");
 }
 
 function isCallService(relPath) {

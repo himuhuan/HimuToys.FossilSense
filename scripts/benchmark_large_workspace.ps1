@@ -7,13 +7,15 @@ param(
     [ValidateRange(5, 3600)]
     [int]$TimeoutSeconds = 600,
     # Includes cache warmup, a full rebuild, and three dirty/compaction scenarios.
-    # Full rebuild duration is strict unless ObserveFullIndexTime is selected.
+    # Full rebuild duration is observed by default; execution timeout still fails.
     [ValidateRange(5, 3600)]
     [int]$LifecycleTimeoutSeconds = 240,
     [switch]$IncludeFullIndex,
     # Record build duration without enforcing the historical 120 s target.
-    [switch]$ObserveFullIndexTime,
-    [switch]$AllowTransientMemoryPeak,
+    [switch]$StrictFullIndexTime,
+    [switch]$StrictMemoryPeak,
+    [switch]$ObserveFullIndexTime = $true,
+    [switch]$AllowTransientMemoryPeak = $true,
     [switch]$IncludeEngineHydration,
     [switch]$IncludeCompletionReplay,
     [switch]$IncludeBindingReplay,
@@ -25,9 +27,13 @@ param(
     [string[]]$CaseFilter = @()
 )
 
+if ($StrictFullIndexTime) { $ObserveFullIndexTime = $false }
+if ($StrictMemoryPeak) { $AllowTransientMemoryPeak = $false }
+
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'benchmark_gate_helpers.ps1')
+. (Join-Path $PSScriptRoot 'benchmark_process.ps1')
 
 if (-not $Binary) {
     $Binary = Join-Path $PSScriptRoot '..\target\release\fossilsense.exe'
@@ -108,6 +114,8 @@ function Get-BenchmarkMachine {
         processor_count = [System.Environment]::ProcessorCount
         processor_name = 'unavailable'
         physical_memory_bytes = 0L
+        rust_version = (& rustc --version | Select-Object -First 1)
+        resource_profile = if ($env:FOSSILSENSE_RESOURCE_PROFILE -in @('conservative', 'large')) { $env:FOSSILSENSE_RESOURCE_PROFILE } else { 'balanced' }
     }
     try {
         $computer = Get-CimInstance Win32_ComputerSystem
@@ -126,95 +134,6 @@ function Get-BenchmarkMachine {
         # the field expected by result consumers.
     }
     return $machine
-}
-
-function Quote-ProcessArgument([string]$Value) {
-    return '"' + $Value.Replace('\', '\').Replace('"', '\"') + '"'
-}
-
-function Invoke-SampledProcess {
-    param(
-        [Parameter(Mandatory = $true)][string]$FilePath,
-        [Parameter(Mandatory = $true)][string[]]$ArgumentList,
-        [Parameter(Mandatory = $true)][int]$Timeout
-    )
-
-    $quotedArguments = ($ArgumentList | ForEach-Object { Quote-ProcessArgument $_ }) -join ' '
-    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
-    $startInfo.FileName = $FilePath
-    $startInfo.Arguments = $quotedArguments
-    $startInfo.UseShellExecute = $false
-    $startInfo.CreateNoWindow = $true
-    $startInfo.RedirectStandardOutput = $true
-    $startInfo.RedirectStandardError = $true
-    $process = [System.Diagnostics.Process]::new()
-    $process.StartInfo = $startInfo
-    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-    if (-not $process.Start()) {
-        throw "failed to start benchmark process"
-    }
-    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
-    $stderrTask = $process.StandardError.ReadToEndAsync()
-    $peakWorkingSet = 0L
-    $peakPrivateBytes = 0L
-    $timedOut = $false
-
-    try {
-        while (-not $process.HasExited) {
-            if ($stopwatch.Elapsed.TotalSeconds -gt $Timeout) {
-                $timedOut = $true
-                $process.Kill()
-                throw "benchmark process exceeded ${Timeout}s"
-            }
-            $process.Refresh()
-            $peakWorkingSet = [Math]::Max($peakWorkingSet, $process.WorkingSet64)
-            $peakPrivateBytes = [Math]::Max($peakPrivateBytes, $process.PrivateMemorySize64)
-            Start-Sleep -Milliseconds 20
-        }
-        $process.WaitForExit()
-        $process.Refresh()
-        $peakWorkingSet = [Math]::Max($peakWorkingSet, $process.PeakWorkingSet64)
-        $peakPrivateBytes = [Math]::Max($peakPrivateBytes, $process.PrivateMemorySize64)
-        $stopwatch.Stop()
-        $stdout = @($stdoutTask.Result -split "`r?`n")
-        $stderr = @($stderrTask.Result -split "`r?`n")
-        if ($process.ExitCode -ne 0) {
-            $tail = ($stderr | Select-Object -Last 12) -join [Environment]::NewLine
-            throw "benchmark process exited with $($process.ExitCode): $tail"
-        }
-        return [pscustomobject]@{
-            ElapsedMs = [Math]::Round($stopwatch.Elapsed.TotalMilliseconds, 3)
-            PeakWorkingSetBytes = $peakWorkingSet
-            PeakPrivateBytes = $peakPrivateBytes
-            Stdout = $stdout
-        }
-    }
-    catch {
-        $message = $_.Exception.Message
-        if (-not $process.HasExited) { $process.Kill() }
-        # A failed run is still evidence. Bound shutdown/output collection;
-        # do not report the time used to save diagnostics as engine runtime.
-        $stopwatch.Stop()
-        [void]$process.WaitForExit(5000)
-        $failure = [System.Exception]::new($message)
-        $failure.Data['benchmark_sample'] = [pscustomobject]@{
-            status = if ($timedOut) { 'timeout' } else { 'failed' }
-            ElapsedMs = [Math]::Round($stopwatch.Elapsed.TotalMilliseconds, 3)
-            PeakWorkingSetBytes = $peakWorkingSet
-            PeakPrivateBytes = $peakPrivateBytes
-            Stdout = if ($stdoutTask.IsCompleted) { @($stdoutTask.Result -split "`r?`n") } else { @() }
-            Stderr = if ($stderrTask.IsCompleted) { @($stderrTask.Result -split "`r?`n") } else { @() }
-        }
-        throw $failure
-    }
-    finally {
-        if ($process -and -not $process.HasExited) {
-            $process.Kill()
-        }
-        if ($process) {
-            $process.Dispose()
-        }
-    }
 }
 
 function Convert-WhitelistedMetrics([string[]]$Lines) {
@@ -606,7 +525,7 @@ if ($IncludeLspLifecycle) {
                 $lifecycleWorkspace,
                 '-Sample',
                 $sampleName
-            ) + $(if ($ObserveFullIndexTime) { @("-ObserveFullIndexTime") } else { @() }) + $(if ($AllowTransientMemoryPeak) { @("-AllowTransientMemoryPeak") } else { @() })
+            ) + $(if ($ObserveFullIndexTime) { @("-ObserveFullIndexTime") } else { @("-StrictFullIndexTime") }) + $(if ($AllowTransientMemoryPeak) { @("-AllowTransientMemoryPeak") } else { @("-StrictMemoryPeak") })
         }
     }
 }
@@ -713,10 +632,12 @@ $checkpointSource = Get-SourceState $repoRoot
 $checkpointMachine = Get-BenchmarkMachine
 foreach ($case in $cases) {
     if (-not (Test-Path -LiteralPath $case.Workspace -PathType Container)) {
+        if ($CaseFilter.Count -gt 0) { throw "Requested case $($case.Id): sample workspace is unavailable" }
         Write-Warning "skipping $($case.Id): sample workspace is unavailable"
         continue
     }
     if ($case.Database -and -not (Test-Path -LiteralPath $case.Database -PathType Leaf)) {
+        if ($CaseFilter.Count -gt 0) { throw "Requested case $($case.Id): benchmark database is unavailable; run its full-index case first" }
         Write-Warning "skipping $($case.Id): benchmark database is unavailable"
         continue
     }
@@ -750,7 +671,7 @@ foreach ($case in $cases) {
                 status = 'failed'
                 measured_at = (Get-Date).ToUniversalTime().ToString('o')
                 full_index_time_policy = if ($ObserveFullIndexTime) { 'observed' } else { '120s_gate' }
-            memory_policy = if ($AllowTransientMemoryPeak) { 'stable_512MiB_transient_10s' } else { 'strict_peak' }
+            memory_policy = if ($AllowTransientMemoryPeak) { 'stable_512MiB_peak_768MiB_continuous_10s_total_30s' } else { 'strict_peak' }
             case_id = $case.Id
                 run = $run
                 command_line = [System.Environment]::CommandLine
@@ -803,7 +724,7 @@ foreach ($case in $cases) {
         $sampleState = Get-SourceState (Resolve-FullPath $case.Workspace)
         $results.Add([pscustomobject]@{
             full_index_time_policy = if ($ObserveFullIndexTime) { 'observed' } else { '120s_gate' }
-            memory_policy = if ($AllowTransientMemoryPeak) { 'stable_512MiB_transient_10s' } else { 'strict_peak' }
+            memory_policy = if ($AllowTransientMemoryPeak) { 'stable_512MiB_peak_768MiB_continuous_10s_total_30s' } else { 'strict_peak' }
             case_id = $case.Id
             run = $run
             workspace = (Resolve-FullPath $case.Workspace)

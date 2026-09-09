@@ -672,6 +672,10 @@ impl CacheLedger {
         for root in roots {
             self.build_coordinator.remove_root(root);
         }
+        self.roots_needing_rescan
+            .lock()
+            .await
+            .retain(|root| !roots.contains(root));
         self.engine_snapshots
             .lock()
             .await

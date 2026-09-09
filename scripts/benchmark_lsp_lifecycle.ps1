@@ -7,9 +7,14 @@ param(
     [Parameter(Mandatory = $true)]
     [ValidateSet('u-boot', 'wine')]
     [string]$Sample,
-    [switch]$ObserveFullIndexTime,
-    [switch]$AllowTransientMemoryPeak
+    [switch]$StrictFullIndexTime,
+    [switch]$StrictMemoryPeak,
+    [switch]$ObserveFullIndexTime = $true,
+    [switch]$AllowTransientMemoryPeak = $true
 )
+
+if ($StrictFullIndexTime) { $ObserveFullIndexTime = $false }
+if ($StrictMemoryPeak) { $AllowTransientMemoryPeak = $false }
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest

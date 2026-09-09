@@ -60,7 +60,10 @@ fn failed_exclusive_retry_keeps_old_dirty_generation_after_successful_neighbor()
             .collect::<String>(),
     )
     .unwrap();
-    let coordinator = BuildCoordinator::with_policy_and_sampler(BuildPolicy::default(), || 0);
+    let coordinator = BuildCoordinator::with_policy_and_sampler(
+        BuildPolicy::for_resource_profile("conservative"),
+        || 0,
+    );
     let permit = coordinator
         .try_acquire(workspace.path().into(), BuildKind::DirtyIndex)
         .unwrap();

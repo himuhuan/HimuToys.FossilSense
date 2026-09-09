@@ -1,50 +1,8 @@
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'benchmark_gate_helpers.ps1')
-$validLifecycleMetrics = @{
-    lsp_lifecycle_declarations = 500000
-    lsp_lifecycle_files = 10000
-    lsp_lifecycle_warm_cache_percent = 75
-    lsp_lifecycle_phases_seen_mask = 31
-    lsp_lifecycle_active_builds_peak = 1
-    lsp_lifecycle_reserved_bytes_peak = 1
-    lsp_lifecycle_retained_bytes_peak = 1
-    lsp_lifecycle_peak_process_bytes = 536870912
-    lsp_lifecycle_memory_sample_available = 1
-    lsp_lifecycle_memory_metric_private_bytes = 1
-    lsp_lifecycle_old_requests_held_peak = 1
-    lsp_lifecycle_old_epoch_consistent = 1
-    lsp_lifecycle_new_epoch_consistent = 1
-    lsp_lifecycle_generation_mismatches = 0
-    lsp_lifecycle_database_identity_mismatches = 0
-    lsp_lifecycle_cancelled_compactions = 1
-    lsp_lifecycle_hover_requests = 1
-    lsp_lifecycle_hover_p50_us = 1
-    lsp_lifecycle_hover_p95_us = 1
-    lsp_lifecycle_hover_max_us = 1
-    lsp_lifecycle_definition_requests = 1
-    lsp_lifecycle_definition_p50_us = 1
-    lsp_lifecycle_definition_p95_us = 1
-    lsp_lifecycle_definition_max_us = 1
-    lsp_lifecycle_completion_requests = 64
-    lsp_lifecycle_completion_candidates_min = 1
-    lsp_lifecycle_completion_p95_us = 50000
-    lsp_lifecycle_completion_entries_inspected_min = 1
-    lsp_lifecycle_completion_entries_inspected_max = 16384
-    lsp_lifecycle_completion_candidate_budget_min = 16384
-    lsp_lifecycle_completion_candidate_budget_max = 16384
-    lsp_lifecycle_completion_indexed_returned_min = 1
-    lsp_lifecycle_completion_active_entries_min = 500000
-    lsp_lifecycle_completion_truncated_requests = 64
-    lsp_lifecycle_completion_sql_reads = 0
-    lsp_lifecycle_dirty_updates_applied = 3
-    lsp_lifecycle_final_active_builds = 0
-    lsp_lifecycle_final_reserved_bytes = 0
-    lsp_lifecycle_database_size_bytes = 1
-    lsp_lifecycle_elapsed_ms = 1
-    lsp_lifecycle_rebuild_wall_ms = 1
-    lsp_lifecycle_write_ms = 1
-}
+. (Join-Path $PSScriptRoot 'fixtures/lifecycle_metrics.ps1')
+$validLifecycleMetrics = New-LifecycleMetricsFixture
 $validLifecycleMetrics.lsp_lifecycle_peak_process_bytes = 550000000
 $validLifecycleMetrics.lsp_lifecycle_stable_max_bytes = 400000000
 $validLifecycleMetrics.lsp_lifecycle_stable_samples = 101
@@ -52,14 +10,15 @@ $validLifecycleMetrics.lsp_lifecycle_stable_window_ms = 10000
 $validLifecycleMetrics.lsp_lifecycle_above_limit_ms = 300
 $validLifecycleMetrics.lsp_lifecycle_longest_above_limit_ms = 300
 Assert-LspLifecycleGate -CaseId 'u-boot-lsp-lifecycle' -Metrics $validLifecycleMetrics -AllowTransientMemoryPeak
-foreach ($failure in @(@('lsp_lifecycle_stable_max_bytes',536870913), @('lsp_lifecycle_stable_samples',99), @('lsp_lifecycle_stable_window_ms',9999), @('lsp_lifecycle_longest_above_limit_ms',10001))) {
+foreach ($failure in @(@('lsp_lifecycle_above_limit_ms',-1), @('lsp_lifecycle_peak_process_bytes',805306369), @('lsp_lifecycle_above_limit_ms',30001), @('lsp_lifecycle_stable_max_bytes',536870913), @('lsp_lifecycle_stable_samples',99), @('lsp_lifecycle_stable_window_ms',9999), @('lsp_lifecycle_longest_above_limit_ms',10001))) {
     $invalid = $validLifecycleMetrics.Clone()
     $invalid[$failure[0]] = $failure[1]
     $rejected = $false
     try { Assert-LspLifecycleGate -CaseId 'u-boot-lsp-lifecycle' -Metrics $invalid -AllowTransientMemoryPeak } catch { $rejected = $true }
     if (-not $rejected) { throw "Stability gate accepted invalid $($failure[0])" }
 }
+Assert-LspLifecycleGate -CaseId 'u-boot-lsp-lifecycle' -Metrics $validLifecycleMetrics
 $strictRejected = $false
-try { Assert-LspLifecycleGate -CaseId 'u-boot-lsp-lifecycle' -Metrics $validLifecycleMetrics } catch { $strictRejected = $true }
+try { Assert-LspLifecycleGate -CaseId 'u-boot-lsp-lifecycle' -Metrics $validLifecycleMetrics -AllowTransientMemoryPeak:$false } catch { $strictRejected = $true }
 if (-not $strictRejected) { throw 'Default strict peak gate changed.' }
 Write-Host 'Transient peak policy requires stable memory and a bounded excursion.'

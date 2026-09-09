@@ -655,7 +655,10 @@ mod tests {
     #[test]
     fn parse_pipeline_budget_preserves_parent_memory_when_sampling_unavailable() {
         use crate::build_coordinator::{BuildCoordinator, BuildKind, BuildPolicy};
-        let coordinator = BuildCoordinator::with_policy_and_sampler(BuildPolicy::default(), || 0);
+        let coordinator = BuildCoordinator::with_policy_and_sampler(
+            BuildPolicy::for_resource_profile("conservative"),
+            || 0,
+        );
         let permit = coordinator
             .try_acquire("root".into(), BuildKind::FullIndex)
             .unwrap();
@@ -764,7 +767,10 @@ mod tests {
         fs::write(&path, &source).unwrap();
         let mut store = IndexStore::open(&ws.path().join("index.sqlite"), ws.path()).unwrap();
         let build = store.begin_index_build(false).unwrap();
-        let coordinator = BuildCoordinator::with_policy_and_sampler(BuildPolicy::default(), || 0);
+        let coordinator = BuildCoordinator::with_policy_and_sampler(
+            BuildPolicy::for_resource_profile("conservative"),
+            || 0,
+        );
         let permit = coordinator
             .try_acquire(ws.path().into(), BuildKind::FullIndex)
             .unwrap();
@@ -838,7 +844,10 @@ mod tests {
         }
         let mut store = IndexStore::open(&ws.path().join("index.sqlite"), ws.path()).unwrap();
         let build = store.begin_index_build(false).unwrap();
-        let coordinator = BuildCoordinator::with_policy_and_sampler(BuildPolicy::default(), || 0);
+        let coordinator = BuildCoordinator::with_policy_and_sampler(
+            BuildPolicy::for_resource_profile("conservative"),
+            || 0,
+        );
         let permit = coordinator
             .try_acquire(ws.path().into(), BuildKind::FullIndex)
             .unwrap();
@@ -895,14 +904,16 @@ mod tests {
         let mut store = IndexStore::open(&ws.path().join("index.sqlite"), ws.path()).unwrap();
         let build = store.begin_index_build(false).unwrap();
         let samples = std::sync::Arc::new(AtomicUsize::new(0));
-        let coordinator =
-            BuildCoordinator::with_policy_and_sampler(BuildPolicy::default(), move || {
+        let coordinator = BuildCoordinator::with_policy_and_sampler(
+            BuildPolicy::for_resource_profile("conservative"),
+            move || {
                 if samples.fetch_add(1, Ordering::SeqCst) == 0 {
                     0
                 } else {
                     455 * 1024 * 1024
                 }
-            });
+            },
+        );
         let permit = coordinator
             .try_acquire(ws.path().into(), BuildKind::FullIndex)
             .unwrap();
