@@ -75,6 +75,8 @@ C++ 记录类型中的方法名会作为 function-kind 名称进入普通标识�
 | `Select Project Context` | 选择自动识别的项目范围或关闭项目证据 |
 | `Clear Completion History` | 清除当前工作区的本地补全历史 |
 
+扩展会把手动启停、配置或工作区变化，以及 `fossilsense.json` 触发的防抖重启统一协调到当前服务实例。停止未确认时，状态栏会显示 `stop failed` 并保留重试所需的 client；再次执行 Start Server 或 Stop Server 会先重试清理，不会用第二个服务掩盖停止失败。服务连接意外关闭时不会绕过协调器自行重启，状态栏会显示 `failed`，执行 Start Server 可明确重试。
+
 ## 可选配置
 
 在工作区根目录创建 `fossilsense.json`，可以限制扫描范围，加入外部头文件与 Go 模块目录，或选择启用 protobuf-c 来源追溯：

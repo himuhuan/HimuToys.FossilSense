@@ -72,6 +72,8 @@ If an active clangd, Microsoft C/C++, ccls, or Go extension matches a source lan
 | `FossilSense: Select Project Context` | Select automatic, manual, unspecified, or disabled project evidence |
 | `FossilSense: Clear Completion History` | Remove local completion-ranking history |
 
+Manual start/stop, configuration or workspace changes, and debounced `fossilsense.json` restarts are coordinated against the current service instance. If shutdown cannot be confirmed, the status item shows `stop failed` and retains the client needed for retry; the next Start Server or Stop Server first retries cleanup instead of masking the failure with a second service. An unexpected connection close does not restart outside this coordinator: the status item shows `failed`, and Start Server performs an explicit retry.
+
 ## Workspace scope
 
 An optional `fossilsense.json` at the workspace root controls source scope, external headers, explicit external Go modules, and opt-in protobuf-c source tracing:

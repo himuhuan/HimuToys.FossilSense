@@ -1,10 +1,13 @@
 import * as fs from 'fs';
 import * as vscode from 'vscode';
 import {
+  CloseAction,
+  ErrorAction,
   ExecuteCommandRequest,
   LanguageClient,
   LanguageClientOptions,
   ServerOptions,
+  State,
 } from 'vscode-languageclient/node';
 import {
   completionHistoryModeFromConfig,
@@ -68,6 +71,12 @@ import {
   resourceUsageStatusText,
   resourceUsageTooltip,
 } from './resourceUsage';
+import {
+  CreatedService,
+  ServiceInstanceScope,
+  ServiceLifecycle,
+  ServiceLifecycleState,
+} from './extensionLifecycle';
 
 const REFRESH_INDEX_COMMAND = 'fossilsense.refreshIndex';
 const REFRESH_INDEX_LSP_COMMAND = 'fossilsense.lsp.refreshIndex';
@@ -75,7 +84,7 @@ const REBUILD_INDEX_COMMAND = 'fossilsense.rebuildIndex';
 const REBUILD_INDEX_LSP_COMMAND = 'fossilsense.lsp.rebuildIndex';
 const GROUPED_REFERENCES_COMMAND = 'fossilsense.findReferencesGrouped';
 const POSSIBLE_TARGETS_COMMAND = 'fossilsense.findAllPossibleTargets';
-let client: LanguageClient | undefined;
+let serviceLifecycle: ServiceLifecycle<LanguageClient> | undefined;
 let statusBar: vscode.StatusBarItem;
 let projectContextStatusBar: vscode.StatusBarItem;
 let resourceStatusBar: vscode.StatusBarItem;
@@ -85,8 +94,6 @@ let configWarning: string | undefined;
 let capabilityWarning: string | undefined;
 let currentIndexStartedWithWarning = false;
 let mutualExclusionWarningShown = false;
-let watchPlanRestarting = false;
-let watchPlanListeners: vscode.Disposable[] = [];
 const projectContextPromptTracker = new ProjectContextPromptTracker();
 let projectContextUpdateEpoch = 0;
 
@@ -126,19 +133,24 @@ export function activate(context: vscode.ExtensionContext): void {
   resourceStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 98);
   resourceStatusBar.tooltip = '';
   resourceStatusBar.hide();
-  callRelationsController = registerCallRelationViews(context, () => client);
+  callRelationsController = registerCallRelationViews(context, () => serviceLifecycle?.client);
+  serviceLifecycle = createServiceLifecycle(context);
 
   context.subscriptions.push(
     output,
     statusBar,
     projectContextStatusBar,
     resourceStatusBar,
-    vscode.commands.registerCommand('fossilsense.startServer', () => startServer(context)),
-    vscode.commands.registerCommand('fossilsense.stopServer', () => stopServer()),
+    vscode.commands.registerCommand('fossilsense.startServer', () => serviceLifecycle?.start()),
+    vscode.commands.registerCommand('fossilsense.stopServer', () => serviceLifecycle?.stop()),
     vscode.commands.registerCommand(REFRESH_INDEX_COMMAND, () => refreshIndex()),
     vscode.commands.registerCommand(REBUILD_INDEX_COMMAND, () => rebuildIndex()),
-    vscode.commands.registerCommand(GROUPED_REFERENCES_COMMAND, () => findReferencesGrouped(client)),
-    vscode.commands.registerCommand(POSSIBLE_TARGETS_COMMAND, () => findAllPossibleTargets(client)),
+    vscode.commands.registerCommand(GROUPED_REFERENCES_COMMAND, () =>
+      findReferencesGrouped(serviceLifecycle?.client),
+    ),
+    vscode.commands.registerCommand(POSSIBLE_TARGETS_COMMAND, () =>
+      findAllPossibleTargets(serviceLifecycle?.client),
+    ),
     vscode.commands.registerCommand(CLEAR_COMPLETION_HISTORY_COMMAND, () =>
       clearCompletionHistory(),
     ),
@@ -153,13 +165,13 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.workspace.onDidChangeConfiguration(async (event) => {
       if (event.affectsConfiguration('fossilsense.mode')) {
         output.appendLine('fossilsense.mode changed; restarting server.');
-        await stopServer();
-        await startServer(context);
+        await serviceLifecycle?.restart();
         return;
       }
-      if (event.affectsConfiguration('fossilsense.projectContext.mode') && client) {
-        await applyProjectContextSelectionFromState(context);
-        await updateProjectContextForActiveEditor(context);
+      const current = serviceLifecycle?.client;
+      if (event.affectsConfiguration('fossilsense.projectContext.mode') && current) {
+        await applyProjectContextSelectionFromState(context, current);
+        await updateProjectContextForActiveEditor(context, current);
         return;
       }
       if (event.affectsConfiguration('fossilsense.resourceMonitor.enabled')) {
@@ -173,7 +185,7 @@ export function activate(context: vscode.ExtensionContext): void {
         return;
       }
       if (
-        client &&
+        current &&
         (event.affectsConfiguration('fossilsense.includePaths') ||
           event.affectsConfiguration('fossilsense.goModulePaths') ||
           event.affectsConfiguration('fossilsense.protobufC.enabled') ||
@@ -188,37 +200,103 @@ export function activate(context: vscode.ExtensionContext): void {
           event.affectsConfiguration('fossilsense.trace.server'))
       ) {
         output.appendLine('FossilSense configuration changed; restarting server.');
-        await stopServer();
-        await startServer(context);
+        await serviceLifecycle?.restart();
       }
     }),
     vscode.workspace.onDidChangeWorkspaceFolders(async () => {
-      if (!client) {
+      if (!serviceLifecycle?.client) {
         return;
       }
       output.appendLine('Workspace folders changed; restarting to refresh file watchers.');
-      await stopServer();
       if (vscode.workspace.workspaceFolders?.length) {
-        await startServer(context);
+        await serviceLifecycle.restart();
+      } else {
+        await serviceLifecycle.stop();
       }
     }),
   );
 
   // Auto-start when a workspace is open; the manual command stays as a fallback.
   if (vscode.workspace.workspaceFolders?.length) {
-    void startServer(context);
+    void serviceLifecycle.start();
   }
 }
 
 export async function deactivate(): Promise<void> {
-  await stopServer();
+  await serviceLifecycle?.deactivate();
 }
 
-async function startServer(context: vscode.ExtensionContext): Promise<void> {
-  if (client) {
-    output.appendLine('FossilSense server is already running.');
-    return;
+function createServiceLifecycle(
+  context: vscode.ExtensionContext,
+): ServiceLifecycle<LanguageClient> {
+  return new ServiceLifecycle<LanguageClient>({
+    create: (scope) => createServiceInstance(context, scope),
+    stateChanged: handleServiceLifecycleState,
+    backgroundError: (error) => {
+      output.appendLine(`FossilSense lifecycle cleanup failed: ${String(error)}`);
+    },
+    stopTimeoutMs: 5000,
+    // vscode-languageclient waits another two seconds before terminating a
+    // process retained after a shutdown timeout. Do not replace that process
+    // until the dependency's cleanup window has elapsed.
+    stopFailureRecoveryDelayMs: 2500,
+  });
+}
+
+function handleServiceLifecycleState(state: ServiceLifecycleState, error?: unknown): void {
+  switch (state) {
+    case 'starting':
+      setStatus('starting');
+      break;
+    case 'ready':
+      setStatus('ready');
+      break;
+    case 'stopping':
+      clearServicePresentation('stopping...');
+      break;
+    case 'stopped':
+    case 'deactivated':
+      clearServicePresentation('stopped');
+      break;
+    case 'startFailed':
+      clearServicePresentation('scan failed');
+      output.appendLine(`Failed to start FossilSense: ${String(error)}`);
+      void vscode.window.showErrorMessage(`Failed to start FossilSense: ${String(error)}`);
+      break;
+    case 'failed':
+      clearServicePresentation('failed');
+      output.appendLine(`FossilSense server stopped unexpectedly: ${String(error)}`);
+      void vscode.window.showErrorMessage(
+        `FossilSense server stopped unexpectedly. Run Start Server to retry: ${String(error)}`,
+      );
+      break;
+    case 'stopFailed':
+      clearServicePresentation('stop failed');
+      output.appendLine(`Failed to stop FossilSense; retry Stop or Start: ${String(error)}`);
+      void vscode.window.showErrorMessage(
+        `Failed to stop FossilSense; its client handle was retained for retry: ${String(error)}`,
+      );
+      break;
   }
+}
+
+function clearServicePresentation(status: string): void {
+  configWarning = undefined;
+  currentIndexStartedWithWarning = false;
+  projectContextPromptTracker.clear();
+  projectContextUpdateEpoch += 1;
+  callRelationsController?.clear();
+  setStatus(status);
+  setProjectContextStatus(undefined);
+  resourceStatusBar.hide();
+  resourceStatusBar.text = '';
+  resourceStatusBar.tooltip = '';
+}
+
+function createServiceInstance(
+  context: vscode.ExtensionContext,
+  scope: ServiceInstanceScope,
+): CreatedService<LanguageClient> | undefined {
 
   const fossilsenseMode = fossilsenseModeFromConfig();
   if (fossilsenseMode === 'off') {
@@ -227,14 +305,14 @@ async function startServer(context: vscode.ExtensionContext): Promise<void> {
     void vscode.window.showInformationMessage(
       'FossilSense is disabled by fossilsense.mode=off. Change the setting to start it.',
     );
-    return;
+    return undefined;
   }
 
   const workspaceFolders = vscode.workspace.workspaceFolders;
   const firstWorkspaceFolder = workspaceFolders?.[0];
   if (!firstWorkspaceFolder) {
     void vscode.window.showWarningMessage('Open a workspace folder before starting FossilSense.');
-    return;
+    return undefined;
   }
 
   const serverPath = resolveServerPath(context);
@@ -243,10 +321,9 @@ async function startServer(context: vscode.ExtensionContext): Promise<void> {
     void vscode.window.showErrorMessage(
       'FossilSense server binary was not found. Run `cargo build` or set `fossilsense.serverPath`.',
     );
-    return;
+    return undefined;
   }
 
-  setStatus('starting');
   output.appendLine(`Starting FossilSense server: ${serverPath}`);
   output.appendLine(
     `Workspaces: ${workspaceFolders.map((folder) => folder.uri.fsPath).join('; ')}`,
@@ -285,16 +362,29 @@ async function startServer(context: vscode.ExtensionContext): Promise<void> {
       ),
     ),
   ];
+  for (const watcher of fileEvents) {
+    scope.own(watcher);
+  }
 
   const conflictingExtensions = detectedLanguageServers();
 
   const completionMode = completionModeFromConfig();
   const completionHistoryMode = completionHistoryModeFromConfig();
   const semanticColoringMode = semanticColoringModeFromConfig();
+  let reachedReady = false;
 
   const clientOptions: LanguageClientOptions = {
     documentSelector: languageDocumentSelectors(),
     outputChannel: output,
+    errorHandler: {
+      error: () => ({ action: ErrorAction.Continue, handled: true }),
+      closed: () => {
+        if (reachedReady) {
+          scope.fail(new Error('language server connection closed'));
+        }
+        return { action: CloseAction.DoNotRestart, handled: true };
+      },
+    },
     synchronize: {
       fileEvents,
     },
@@ -331,140 +421,161 @@ async function startServer(context: vscode.ExtensionContext): Promise<void> {
     },
   };
 
-  client = new LanguageClient('fossilsense', 'FossilSense', serverOptions, clientOptions);
+  const currentClient = new LanguageClient(
+    'fossilsense',
+    'FossilSense',
+    serverOptions,
+    clientOptions,
+  );
   for (const watcher of configWatchers) {
-    watchPlanListeners.push(
-      watcher.onDidCreate(() => scheduleWatchPlanRestart(context)),
-      watcher.onDidChange(() => scheduleWatchPlanRestart(context)),
-      watcher.onDidDelete(() => scheduleWatchPlanRestart(context)),
+    scope.own(
+      watcher.onDidCreate(scope.guard(() => scheduleWatchPlanRestart())),
+    );
+    scope.own(
+      watcher.onDidChange(scope.guard(() => scheduleWatchPlanRestart())),
+    );
+    scope.own(
+      watcher.onDidDelete(scope.guard(() => scheduleWatchPlanRestart())),
     );
   }
-  client.setTrace(traceFromConfig());
-  client.onNotification('fossilsense/indexStatus', (status: IndexStatus) => {
-    handleIndexStatus(status);
-    if (status.state === 'ready') {
-      callRelationsController.clear();
-      void applyProjectContextSelectionFromState(context).then(() =>
-        updateProjectContextForActiveEditor(context),
-      );
+  void currentClient.setTrace(traceFromConfig()).catch((error) => {
+    if (scope.isCurrent()) {
+      output.appendLine(`Failed to update FossilSense protocol trace: ${String(error)}`);
     }
   });
-  client.onNotification('fossilsense/projectContextChanged', () => {
-    void applyProjectContextSelectionFromState(context).then(() =>
-      updateProjectContextForActiveEditor(context),
-    );
-  });
-  client.onNotification('fossilsense/resourceUsage', (usage: ResourceUsage) => {
-    if (!resourceMonitorEnabledFromConfig()) {
-      return;
-    }
-    setResourceStatus(usage);
-  });
+  scope.own(
+    currentClient.onNotification(
+      'fossilsense/indexStatus',
+      scope.guard((status: IndexStatus) => {
+        handleIndexStatus(status);
+        if (status.state === 'ready') {
+          callRelationsController.clear();
+          runInstanceTask(scope, 'project context refresh', () =>
+            refreshProjectContextForInstance(context, currentClient, scope),
+          );
+        }
+      }),
+    ),
+  );
+  scope.own(
+    currentClient.onNotification(
+      'fossilsense/projectContextChanged',
+      scope.guard(() => {
+        runInstanceTask(scope, 'project context notification', () =>
+          refreshProjectContextForInstance(context, currentClient, scope),
+        );
+      }),
+    ),
+  );
+  scope.own(
+    currentClient.onNotification(
+      'fossilsense/resourceUsage',
+      scope.guard((usage: ResourceUsage) => {
+        if (resourceMonitorEnabledFromConfig()) {
+          setResourceStatus(usage);
+        }
+      }),
+    ),
+  );
 
-  try {
-    await client.start();
-    setStatus('ready');
-    await applyProjectContextSelectionFromState(context);
-    await updateProjectContextForActiveEditor(context);
-    if (fossilsenseMode === 'auto' && conflictingExtensions.length > 0) {
-      void showMutualExclusionWarning(conflictingExtensions);
-    }
-  } catch (error) {
-    client = undefined;
-    setStatus('scan failed');
-    output.appendLine(`Failed to start FossilSense: ${String(error)}`);
-    void vscode.window.showErrorMessage(`Failed to start FossilSense: ${String(error)}`);
-  }
+  return {
+    client: currentClient,
+    isReady: () => currentClient.state === State.Running,
+    onReady: async (readyScope) => {
+      reachedReady = true;
+      await refreshProjectContextForInstance(context, currentClient, readyScope);
+      if (
+        readyScope.isCurrent() &&
+        fossilsenseMode === 'auto' &&
+        conflictingExtensions.length > 0
+      ) {
+        void showMutualExclusionWarning(conflictingExtensions, readyScope);
+      }
+    },
+  };
 }
 
-async function stopServer(): Promise<void> {
-  const current = client;
-  client = undefined;
-  configWarning = undefined;
-  currentIndexStartedWithWarning = false;
-  projectContextPromptTracker.clear();
-  projectContextUpdateEpoch += 1;
-  callRelationsController?.clear();
-  for (const listener of watchPlanListeners.splice(0)) {
-    listener.dispose();
-  }
-
-  if (current) {
-    await current.stop();
-  }
-
-  setStatus('stopped');
-  setProjectContextStatus(undefined);
-  resourceStatusBar.hide();
-  resourceStatusBar.text = '';
-  resourceStatusBar.tooltip = '';
+function runInstanceTask(
+  scope: ServiceInstanceScope,
+  description: string,
+  task: () => Promise<void>,
+): void {
+  void task().catch((error) => {
+    if (scope.isCurrent()) {
+      output.appendLine(`FossilSense ${description} failed: ${String(error)}`);
+    }
+  });
 }
 
-function scheduleWatchPlanRestart(context: vscode.ExtensionContext): void {
-  if (watchPlanRestarting) {
+async function refreshProjectContextForInstance(
+  context: vscode.ExtensionContext,
+  currentClient: LanguageClient,
+  scope: ServiceInstanceScope,
+): Promise<void> {
+  await applyProjectContextSelectionFromState(context, currentClient);
+  if (!scope.isCurrent()) {
     return;
   }
-  watchPlanRestarting = true;
-  setTimeout(() => {
-    void (async () => {
-      try {
-        output.appendLine('fossilsense.json changed; refreshing source-extension watchers.');
-        await stopServer();
-        if (vscode.workspace.workspaceFolders?.length) {
-          await startServer(context);
-        }
-      } finally {
-        watchPlanRestarting = false;
-      }
-    })();
-  }, 150);
+  await updateProjectContextForActiveEditor(context, currentClient);
+}
+
+function scheduleWatchPlanRestart(): void {
+  output.appendLine('fossilsense.json changed; scheduling source-extension watcher refresh.');
+  serviceLifecycle?.scheduleRestart(150);
 }
 
 async function refreshIndex(): Promise<void> {
-  if (!client) {
+  const current = serviceLifecycle?.client;
+  if (!current) {
     void vscode.window.showWarningMessage('FossilSense server is not running. Start it first.');
     return;
   }
 
   output.appendLine('Refreshing index (incremental)...');
   setStatus('refreshing...');
-  await client.sendRequest(ExecuteCommandRequest.type, {
+  await current.sendRequest(ExecuteCommandRequest.type, {
     command: REFRESH_INDEX_LSP_COMMAND,
     arguments: [],
   });
 }
 
 async function rebuildIndex(): Promise<void> {
-  if (!client) {
+  const current = serviceLifecycle?.client;
+  if (!current) {
     void vscode.window.showWarningMessage('FossilSense server is not running. Start it first.');
     return;
   }
 
   output.appendLine('Full rebuild index (force)...');
   setStatus('full rebuild...');
-  await client.sendRequest(ExecuteCommandRequest.type, {
+  await current.sendRequest(ExecuteCommandRequest.type, {
     command: REBUILD_INDEX_LSP_COMMAND,
     arguments: [],
   });
 }
 
 async function clearCompletionHistory(): Promise<void> {
-  if (!client) {
+  const current = serviceLifecycle?.client;
+  if (!current) {
     void vscode.window.showWarningMessage('FossilSense server is not running. Start it first.');
     return;
   }
 
   output.appendLine('Clearing local completion history...');
-  await client.sendRequest(ExecuteCommandRequest.type, clearCompletionHistoryRequest());
+  await current.sendRequest(ExecuteCommandRequest.type, clearCompletionHistoryRequest());
 }
 
 async function applyProjectContextSelectionFromState(
   context: vscode.ExtensionContext,
+  current: LanguageClient | undefined = serviceLifecycle?.client,
 ): Promise<void> {
-  if (!client) {
+  if (!current) {
     return;
   }
-  const status = await requestProjectContextStatus();
+  const status = await requestProjectContextStatus(current);
+  if (!isCurrentClient(current)) {
+    return;
+  }
   if (!status) {
     setProjectContextStatus(undefined);
     return;
@@ -474,7 +585,10 @@ async function applyProjectContextSelectionFromState(
   if (!status.available) {
     const initial: ProjectContextSelection =
       mode === 'off' ? { kind: 'unspecified' } : { kind: 'auto' };
-    setProjectContextStatus((await sendProjectContextSelection(initial)) ?? status);
+    const selected = await sendProjectContextSelection(current, initial);
+    if (isCurrentClient(current)) {
+      setProjectContextStatus(selected ?? status);
+    }
     return;
   }
 
@@ -482,23 +596,31 @@ async function applyProjectContextSelectionFromState(
   const validStored = validStoredProjectContextSelection(stored, status.projects);
   if (stored !== undefined && validStored === undefined) {
     await context.workspaceState.update(PROJECT_CONTEXT_WORKSPACE_STATE_KEY, undefined);
+    if (!isCurrentClient(current)) {
+      return;
+    }
   }
   const selection = effectiveSelectionForMode(mode, validStored);
-  setProjectContextStatus((await sendProjectContextSelection(selection)) ?? status);
+  const selected = await sendProjectContextSelection(current, selection);
+  if (isCurrentClient(current)) {
+    setProjectContextStatus(selected ?? status);
+  }
 }
 
 async function updateProjectContextForActiveEditor(
   context: vscode.ExtensionContext,
+  current: LanguageClient | undefined = serviceLifecycle?.client,
 ): Promise<void> {
-  if (!client) {
+  if (!current) {
     setProjectContextStatus(undefined);
     return;
   }
   const updateEpoch = ++projectContextUpdateEpoch;
   const editor = vscode.window.activeTextEditor;
   const uri = editor?.document.uri.toString();
-  const status = await requestProjectContextStatus(uri);
+  const status = await requestProjectContextStatus(current, uri);
   if (
+    !isCurrentClient(current) ||
     updateEpoch !== projectContextUpdateEpoch ||
     vscode.window.activeTextEditor?.document.uri.toString() !== uri
   ) {
@@ -518,20 +640,25 @@ async function updateProjectContextForActiveEditor(
   if (!projectContextPromptTracker.claim(localUri)) {
     return;
   }
-  await showProjectContextSelector(context, true, localUri);
+  await showProjectContextSelector(context, true, localUri, current);
 }
 
 async function showProjectContextSelector(
   context: vscode.ExtensionContext,
   prompted: boolean,
   expectedUri?: string,
+  current: LanguageClient | undefined = serviceLifecycle?.client,
 ): Promise<void> {
-  if (!client) {
+  if (!current) {
     void vscode.window.showWarningMessage('FossilSense server is not running. Start it first.');
     return;
   }
   if (projectContextModeFromConfig() === 'off') {
-    setProjectContextStatus(await sendProjectContextSelection({ kind: 'unspecified' }));
+    const selected = await sendProjectContextSelection(current, { kind: 'unspecified' });
+    if (!isCurrentClient(current)) {
+      return;
+    }
+    setProjectContextStatus(selected);
     void vscode.window.showInformationMessage(
       'FossilSense project context is disabled by fossilsense.projectContext.mode=off.',
     );
@@ -546,11 +673,12 @@ async function showProjectContextSelector(
     return;
   }
 
-  const status = await requestProjectContextStatus();
+  const status = await requestProjectContextStatus(current);
   if (
-    prompted &&
-    expectedUri !== undefined &&
-    vscode.window.activeTextEditor?.document.uri.toString() !== expectedUri
+    !isCurrentClient(current) ||
+    (prompted &&
+      expectedUri !== undefined &&
+      vscode.window.activeTextEditor?.document.uri.toString() !== expectedUri)
   ) {
     return;
   }
@@ -575,43 +703,46 @@ async function showProjectContextSelector(
   if (!chosen) {
     return;
   }
+  if (!isCurrentClient(current)) {
+    return;
+  }
   await context.workspaceState.update(
     PROJECT_CONTEXT_WORKSPACE_STATE_KEY,
     chosen.row.selection,
   );
+  if (!isCurrentClient(current)) {
+    return;
+  }
   // A user choice wins over any status request that started before the
   // QuickPick completed.
   projectContextUpdateEpoch += 1;
-  setProjectContextStatus(
-    (await sendProjectContextSelection(chosen.row.selection)) ?? status,
-  );
+  const selected = await sendProjectContextSelection(current, chosen.row.selection);
+  if (isCurrentClient(current)) {
+    setProjectContextStatus(selected ?? status);
+  }
 }
 
 async function requestProjectContextStatus(
+  current: LanguageClient,
   uri?: string,
 ): Promise<ProjectContextStatus | undefined> {
-  const current = client;
-  if (!current) {
-    return undefined;
-  }
   try {
     return (await current.sendRequest(ExecuteCommandRequest.type, {
       command: PROJECT_CONTEXTS_LSP_COMMAND,
       arguments: uriArgument(uri),
     })) as ProjectContextStatus | undefined;
   } catch (error) {
-    output.appendLine(`Project context status request failed: ${String(error)}`);
+    if (isCurrentClient(current)) {
+      output.appendLine(`Project context status request failed: ${String(error)}`);
+    }
     return undefined;
   }
 }
 
 async function sendProjectContextSelection(
+  current: LanguageClient,
   selection: ProjectContextSelection,
 ): Promise<ProjectContextStatus | undefined> {
-  const current = client;
-  if (!current) {
-    return undefined;
-  }
   const effective =
     projectContextModeFromConfig() === 'off' ? { kind: 'unspecified' as const } : selection;
   const [uri] = activeEditorUriArgument();
@@ -621,9 +752,15 @@ async function sendProjectContextSelection(
       arguments: [{ selection: effective, ...(uri ?? {}) }],
     })) as ProjectContextStatus | undefined;
   } catch (error) {
-    output.appendLine(`Project context selection request failed: ${String(error)}`);
+    if (isCurrentClient(current)) {
+      output.appendLine(`Project context selection request failed: ${String(error)}`);
+    }
     return undefined;
   }
+}
+
+function isCurrentClient(current: LanguageClient): boolean {
+  return serviceLifecycle?.isCurrentClient(current) ?? false;
 }
 
 function activeEditorUriArgument(): Array<{ uri: string }> {
@@ -635,7 +772,10 @@ function uriArgument(uri: string | undefined): Array<{ uri: string }> {
   return uri ? [{ uri }] : [];
 }
 
-async function showMutualExclusionWarning(conflictingExtensions: string[]): Promise<void> {
+async function showMutualExclusionWarning(
+  conflictingExtensions: string[],
+  scope: ServiceInstanceScope,
+): Promise<void> {
   if (mutualExclusionWarningShown) {
     return;
   }
@@ -647,8 +787,11 @@ async function showMutualExclusionWarning(conflictingExtensions: string[]): Prom
   const stop = 'Stop FossilSense';
   const settings = 'Open Settings';
   const selected = await vscode.window.showWarningMessage(msg, stop, settings);
+  if (!scope.isCurrent()) {
+    return;
+  }
   if (selected === stop) {
-    await stopServer();
+    await serviceLifecycle?.stop();
   } else if (selected === settings) {
     await vscode.commands.executeCommand('workbench.action.openSettings', 'fossilsense.mode');
   }
