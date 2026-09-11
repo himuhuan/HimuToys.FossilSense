@@ -11,10 +11,25 @@ async fn owner_member_navigation_and_hover_use_exact_field_identity() {
         "typedef int state;\nstruct S { int state; };\nint f(struct S *p) { return (p)->state/*cursor*/; }\n",
     ] {
         let (_dir, service, uri, line, character) = indexed_backend_with_open_doc(&[], "main.c", source).await;
-        let definitions = definition_locations(service.inner().goto_definition(goto_definition_params(uri.clone(), line, character)).await.unwrap().expect("owner-proven field target"));
-        assert_eq!(definitions.len(), 1, "{source}: {definitions:?}");
-        assert_eq!(definitions[0].uri, uri);
-        assert_eq!(definitions[0].range.start, Position::new(1, 15));
+        for response in [
+            service
+                .inner()
+                .goto_definition(goto_definition_params(uri.clone(), line, character))
+                .await
+                .unwrap()
+                .expect("owner-proven field definition"),
+            service
+                .inner()
+                .goto_declaration(goto_definition_params(uri.clone(), line, character))
+                .await
+                .unwrap()
+                .expect("owner-proven field declaration"),
+        ] {
+            let locations = definition_locations(response);
+            assert_eq!(locations.len(), 1, "{source}: {locations:?}");
+            assert_eq!(locations[0].uri, uri);
+            assert_eq!(locations[0].range.start, Position::new(1, 15));
+        }
         let hover = service.inner().hover(hover_params(uri, line, character)).await.unwrap().expect("field hover");
         let text = hover_text(hover.contents);
         assert!(text.contains("int state"), "{text}");

@@ -109,6 +109,7 @@ use completion_adapter::{
 };
 mod query_session;
 mod request_metrics;
+mod request_target;
 use request_metrics::{
     live_parse_cache_log, HydrationStats, LiveParseCacheEvent, SemanticRequestPerf,
 };

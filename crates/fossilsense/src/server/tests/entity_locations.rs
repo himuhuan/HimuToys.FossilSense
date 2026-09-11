@@ -281,6 +281,19 @@ async fn entity_location_declaration_and_hover_keep_interface_identity() {
         ("api.h", "#ifndef API_H\n#define API_H\n/** Public interface documentation. */\nint run_task(void);\n#endif\n"),
         ("impl.c", "#include \"api.h\"\nint run_task(void) { return 1; }\n"),
     ], "caller.c", "#include \"api.h\"\nint use(void) { return run_task/*cursor*/(); }\n").await;
+    let definitions = definition_locations(
+        service
+            .inner()
+            .goto_definition(goto_definition_params(uri.clone(), line, col))
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+    assert_eq!(definitions.len(), 1);
+    assert_eq!(
+        definitions[0].uri,
+        Url::from_file_path(dir.path().join("impl.c")).unwrap()
+    );
     let locations = definition_locations(
         service
             .inner()

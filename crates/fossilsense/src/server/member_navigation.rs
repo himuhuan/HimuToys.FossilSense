@@ -6,6 +6,23 @@ use crate::candidate_service::member_resolution::{
 use crate::model;
 use tower_lsp::lsp_types::{HoverContents, MarkupContent, MarkupKind, Position, Range};
 
+pub(super) enum MemberTargetResolution {
+    Found(Vec<OwnerMemberRef>),
+    Unresolved { reason: query::BindingReason },
+    Unsupported,
+    Failed(String),
+}
+
+impl MemberTargetResolution {
+    #[cfg(test)]
+    fn into_members(self) -> Vec<OwnerMemberRef> {
+        match self {
+            Self::Found(members) => members,
+            Self::Unresolved { .. } | Self::Unsupported | Self::Failed(_) => Vec::new(),
+        }
+    }
+}
+
 impl Backend {
     pub(super) async fn member_entity_locations(
         &self,
@@ -153,7 +170,7 @@ impl Backend {
         result
     }
 
-    pub(super) async fn bound_members(
+    pub(super) async fn resolve_bound_members(
         &self,
         session: &super::query_session::QuerySession,
         uri: &Url,
@@ -161,10 +178,10 @@ impl Backend {
         syntax: &parser::CursorSyntax,
         word: &str,
         timer: &mut super::query_session::BindingTimer<'_>,
-    ) -> Vec<OwnerMemberRef> {
+    ) -> MemberTargetResolution {
         let (version, text) = document;
         let Some(path) = uri_to_path(uri) else {
-            return Vec::new();
+            return MemberTargetResolution::Failed("member URI is not a file path".into());
         };
         let selection = session
             .context
@@ -190,7 +207,7 @@ impl Backend {
             )
             .await
         else {
-            return Vec::new();
+            return MemberTargetResolution::Failed("member document parse unavailable".into());
         };
         timer.observation.parse_us += started.elapsed().as_micros();
         let root = session.root.clone();
@@ -210,90 +227,144 @@ impl Backend {
         let word = word.to_owned();
         let reads = timer.reads.clone();
         let started = std::time::Instant::now();
-        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<OwnerMemberRef>> {
-            let _reads = crate::call_service::ReadSessionProbe::enter(reads);
-            let mut contexts = HashMap::new();
-            contexts.insert(
-                root.clone(),
-                MemberRootQueryContext {
-                    declaration_read: engine.declaration_read_context()?.map(Arc::new),
-                    overlay,
-                    current_path: current_path.clone(),
-                    reach_graph: engine.reach_graph.clone(),
-                    semantic_generation: engine.semantic_generation,
-                    semantic_family: selection.semantic_family(),
-                },
-            );
-            let roots = [root.clone()];
-            let mut resolver =
-                MemberResolutionService::new(&roots, &contexts, MemberPolicy::BoundNavigation);
-            let declaration = parsed.members.iter().find(|member| {
-                member.name == word
-                    && member.start_byte <= syntax.start_byte
-                    && syntax.end_byte <= member.end_byte
-            });
-            let (owners, chain) = if let Some(member) = declaration {
-                let Some(record) = parsed
-                    .records
-                    .iter()
-                    .find(|record| record.record_key == member.record_key)
-                else {
-                    return Ok(Vec::new());
-                };
-                (
-                    vec![(
-                        root.clone(),
-                        vec![query::RecordCandidate::from_overlay(
-                            current_path.clone(),
-                            record.clone(),
-                            model::ScopeTier::Current,
+        let result = tokio::task::spawn_blocking(
+            move || -> anyhow::Result<query::BindingResolution<OwnerMemberRef>> {
+                let _reads = crate::call_service::ReadSessionProbe::enter(reads);
+                let mut contexts = HashMap::new();
+                contexts.insert(
+                    root.clone(),
+                    MemberRootQueryContext {
+                        declaration_read: engine.declaration_read_context()?.map(Arc::new),
+                        overlay,
+                        current_path: current_path.clone(),
+                        reach_graph: engine.reach_graph.clone(),
+                        semantic_generation: engine.semantic_generation,
+                        semantic_family: selection.semantic_family(),
+                    },
+                );
+                let roots = [root.clone()];
+                let mut resolver =
+                    MemberResolutionService::new(&roots, &contexts, MemberPolicy::BoundNavigation);
+                let declaration = parsed.members.iter().find(|member| {
+                    member.name == word
+                        && member.start_byte <= syntax.start_byte
+                        && syntax.end_byte <= member.end_byte
+                });
+                let (owners, chain) = if let Some(member) = declaration {
+                    let Some(record) = parsed
+                        .records
+                        .iter()
+                        .find(|record| record.record_key == member.record_key)
+                    else {
+                        return Ok(query::BindingResolution::UnresolvedWithinDomain {
+                            domain: parser::LookupDomain::Member,
+                            reason: query::BindingReason::DedicatedDomain,
+                        });
+                    };
+                    (
+                        vec![(
+                            root.clone(),
+                            vec![query::RecordCandidate::from_overlay(
+                                current_path.clone(),
+                                record.clone(),
+                                model::ScopeTier::Current,
+                            )],
                         )],
-                    )],
-                    Vec::new(),
-                )
-            } else if let Some(owner) = syntax.owner_type.as_ref() {
-                let resolved = resolver.resolve_owner_spelling(
-                    owner,
-                    parsed.language == crate::semantic_model::SemanticLanguage::C,
-                )?;
-                if resolved.budget_exhausted {
-                    return Ok(Vec::new());
-                }
-                (resolved.candidates, Vec::new())
-            } else {
-                let end = super::navigation::source_position_for_byte(&text, syntax.end_byte);
-                let line = text.lines().nth(end.line as usize).unwrap_or_default();
-                let Some(chain) = query::member_access_chain_at(line, end.character) else {
-                    return Ok(Vec::new());
+                        Vec::new(),
+                    )
+                } else if let Some(owner) = syntax.owner_type.as_ref() {
+                    let resolved = resolver.resolve_owner_spelling(
+                        owner,
+                        parsed.language == crate::semantic_model::SemanticLanguage::C,
+                    )?;
+                    if resolved.budget_exhausted {
+                        return Ok(query::BindingResolution::Unsupported {
+                            domain_hint: parser::LookupDomain::Member,
+                        });
+                    }
+                    (resolved.candidates, Vec::new())
+                } else {
+                    let end = super::navigation::source_position_for_byte(&text, syntax.end_byte);
+                    let line = text.lines().nth(end.line as usize).unwrap_or_default();
+                    let Some(chain) = query::member_access_chain_at(line, end.character) else {
+                        return Ok(query::BindingResolution::Unsupported {
+                            domain_hint: parser::LookupDomain::Member,
+                        });
+                    };
+                    if chain.has_subscript {
+                        return Ok(query::BindingResolution::Unsupported {
+                            domain_hint: parser::LookupDomain::Member,
+                        });
+                    }
+                    let resolved =
+                        resolver.resolve_receiver(&parsed, &chain.receiver, syntax.start_byte)?;
+                    if resolved.budget_exhausted {
+                        return Ok(query::BindingResolution::Unsupported {
+                            domain_hint: parser::LookupDomain::Member,
+                        });
+                    }
+                    (resolved.candidates, chain.completed_members)
                 };
-                if chain.has_subscript {
-                    return Ok(Vec::new());
-                }
-                let resolved =
-                    resolver.resolve_receiver(&parsed, &chain.receiver, syntax.start_byte)?;
-                if resolved.budget_exhausted {
-                    return Ok(Vec::new());
-                }
-                (resolved.candidates, chain.completed_members)
-            };
-            Ok(match resolver.resolve_selected(owners, &chain, &word)? {
-                query::BindingResolution::Resolved(member) => vec![member],
-                query::BindingResolution::Ambiguous(members) => members,
-                _ => Vec::new(),
-            })
-        })
+                resolver.resolve_selected(owners, &chain, &word)
+            },
+        )
         .await;
         timer.observation.query_us += started.elapsed().as_micros();
-        result
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|selected| {
-                selected.generation == expected_generation
-                    && selected.family == selection.semantic_family()
-            })
-            .collect()
+        match result {
+            Ok(Ok(query::BindingResolution::Resolved(member))) => {
+                let members = vec![member]
+                    .into_iter()
+                    .filter(|selected| {
+                        selected.generation == expected_generation
+                            && selected.family == selection.semantic_family()
+                    })
+                    .collect::<Vec<_>>();
+                if members.is_empty() {
+                    MemberTargetResolution::Failed("member target snapshot changed".into())
+                } else {
+                    MemberTargetResolution::Found(members)
+                }
+            }
+            Ok(Ok(query::BindingResolution::Ambiguous(members))) => {
+                let members = members
+                    .into_iter()
+                    .filter(|selected| {
+                        selected.generation == expected_generation
+                            && selected.family == selection.semantic_family()
+                    })
+                    .collect::<Vec<_>>();
+                if members.is_empty() {
+                    MemberTargetResolution::Failed("member target snapshot changed".into())
+                } else {
+                    MemberTargetResolution::Found(members)
+                }
+            }
+            Ok(Ok(query::BindingResolution::UnresolvedWithinDomain { reason, .. })) => {
+                MemberTargetResolution::Unresolved { reason }
+            }
+            Ok(Ok(query::BindingResolution::Unsupported { .. })) => {
+                MemberTargetResolution::Unsupported
+            }
+            Ok(Err(error)) => MemberTargetResolution::Failed(format!(
+                "member target resolution failed: {error:#}"
+            )),
+            Err(error) => MemberTargetResolution::Failed(format!("member task failed: {error}")),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) async fn bound_members(
+        &self,
+        session: &super::query_session::QuerySession,
+        uri: &Url,
+        document: (i32, Arc<str>),
+        syntax: &parser::CursorSyntax,
+        word: &str,
+        timer: &mut super::query_session::BindingTimer<'_>,
+    ) -> Vec<OwnerMemberRef> {
+        self.resolve_bound_members(session, uri, document, syntax, word, timer)
+            .await
+            .into_members()
     }
 }
 

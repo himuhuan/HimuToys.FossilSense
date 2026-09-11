@@ -5,9 +5,11 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use tower_lsp::jsonrpc::Result as LspResult;
-use tower_lsp::lsp_types::{Hover, HoverContents, HoverParams, MarkupContent, MarkupKind};
+use tower_lsp::lsp_types::{
+    Hover, HoverContents, HoverParams, MarkupContent, MarkupKind, MessageType,
+};
 
-use super::{uri_to_path, Backend, HydrationStats, SemanticRequestPerf};
+use super::{request_target, uri_to_path, Backend, HydrationStats, SemanticRequestPerf};
 use crate::call_model::SourcePosition;
 use crate::candidate_service::CandidateQueryService;
 use crate::pathing;
@@ -73,82 +75,33 @@ impl Backend {
         let cursor_byte =
             query::byte_offset_at(&text, position.position.line, position.position.character);
 
-        // C and C++ labels inhabit a function-local namespace. Hover shares
-        // navigation's label proof instead of describing workspace symbols
-        // that merely share the spelling.
-        if super::navigation::label_navigation_syntax_hint(&text, &word, cursor_byte) {
-            let label_started = std::time::Instant::now();
-            let label_path = current_rel.clone();
-            let label_text = text.clone();
-            let label_word = word.clone();
-            let label_uri = uri.clone();
-            let label_result = tokio::task::spawn_blocking(move || {
-                super::navigation::label_navigation_location(
-                    &label_uri,
-                    &label_path,
-                    &label_text,
-                    &label_word,
+        let target = self
+            .resolve_request_target(
+                &query_session,
+                request_target::RequestTargetInput {
+                    uri: &uri,
+                    document: (version, text.clone()),
+                    word: &word,
                     cursor_byte,
                     source_language,
-                )
-            })
+                },
+                timer,
+            )
             .await;
-            timer.observation.parse_us += label_started.elapsed().as_micros();
-            match label_result {
-                Ok(super::navigation::LabelNavigation::Found(location)) => {
-                    let total_us = total_started.elapsed().as_micros();
-                    self.perf_log(|| SemanticRequestPerf::default().log_line("hover", total_us))
-                        .await;
-                    return Ok(Some(markdown_hover(label_hover_markdown(
-                        &current_rel,
-                        &text,
-                        &location,
-                    ))));
-                }
-                // A proven `goto name` resolves only in the enclosing
-                // function's label namespace; a missing label must not surface
-                // unrelated workspace candidates named `name`.
-                Ok(super::navigation::LabelNavigation::MissingDefinition) => {
-                    let total_us = total_started.elapsed().as_micros();
-                    self.perf_log(|| SemanticRequestPerf::default().log_line("hover", total_us))
-                        .await;
-                    return Ok(None);
-                }
-                Ok(super::navigation::LabelNavigation::NotLabelSyntax) | Err(_) => {}
+        let syntax = match target {
+            request_target::RequestTarget::Label(label) => {
+                let total_us = total_started.elapsed().as_micros();
+                self.perf_log(|| SemanticRequestPerf::default().log_line("hover", total_us))
+                    .await;
+                return Ok(Some(markdown_hover(label_hover_markdown(
+                    &current_rel,
+                    &text,
+                    label.start_byte,
+                ))));
             }
-        }
-
-        let started = std::time::Instant::now();
-        let cursor_binding = query_session
-            .bind_cursor(self, &uri, (version, text.clone()), &word, cursor_byte)
-            .await;
-        let binding_parse_us = started.elapsed().as_micros();
-        let Some(cursor_binding) = cursor_binding else {
-            timer.observation.parse_us += binding_parse_us;
-            return Ok(None);
-        };
-        timer.observation.parse_us += cursor_binding.parse_us;
-        timer.observation.binding_us = cursor_binding.binding_us;
-        timer.observation.cache_hit = cursor_binding.cache_hit;
-        let syntax = cursor_binding.syntax;
-        if syntax.domain == crate::parser::LookupDomain::Member {
-            let members = self
-                .bound_members(
-                    &query_session,
-                    &uri,
-                    (version, text.clone()),
-                    &syntax,
-                    &word,
-                    timer,
-                )
-                .await;
-            return Ok(self.member_hover(members, timer).await);
-        }
-
-        match cursor_binding.resolution {
-            query::BindingResolution::Resolved(local) => {
+            request_target::RequestTarget::Local(local) => {
                 let render_started = std::time::Instant::now();
-                let binding = &cursor_binding.parsed.local_bindings[local.binding_index];
+                let binding = &local.parsed.local_bindings[local.binding.binding_index];
                 let result = Some(markdown_hover(local_binding_hover_markdown(
                     &current_rel,
                     &text,
@@ -157,12 +110,19 @@ impl Backend {
                 timer.observation.render_us = render_started.elapsed().as_micros();
                 return Ok(result);
             }
-            query::BindingResolution::UnresolvedWithinDomain {
-                reason: query::BindingReason::NoLocalBinding,
-                ..
-            } => {}
-            _ => return Ok(None),
-        }
+            request_target::RequestTarget::Members(members) => {
+                return Ok(self.member_hover(members, timer).await);
+            }
+            request_target::RequestTarget::Workspace(syntax) => syntax,
+            request_target::RequestTarget::Unavailable(unavailable) => {
+                if unavailable.is_failure() {
+                    self.client
+                        .log_message(MessageType::ERROR, unavailable.diagnostic())
+                        .await;
+                }
+                return Ok(None);
+            }
+        };
         let reach_started = std::time::Instant::now();
         let reach_scope = self
             .reach_scope_from_context(&uri, &context)
@@ -198,22 +158,16 @@ impl Backend {
                     reach_graph.as_deref(),
                     semantic_family,
                 );
-                let call_context = service.complete_call_context_at(source_position)?;
-                let is_call_site = call_context.is_some();
-                let origin_anchor = service.anchor_at(source_position)?;
-                let (semantic_set, subjects) = service.resolve_subject(
+                let target = request_target::resolve_workspace_target(
+                    &service,
                     &word,
-                    if is_call_site || origin_anchor.is_some() {
-                        crate::candidate_service::SemanticIntent::Call
-                    } else {
-                        crate::candidate_service::SemanticIntent::Neutral
-                    },
-                    crate::candidate_service::LookupPolicy::BoundDomain {
-                        domain: syntax.domain,
-                        qualifier: syntax.qualifier.as_deref(),
-                    },
-                    call_context.clone(),
+                    &syntax,
+                    source_position,
                 )?;
+                let call_context = target.call_context;
+                let is_call_site = call_context.is_some();
+                let origin_anchor = target.origin_anchor;
+                let semantic_set = target.semantic_set;
                 let semantic_count = semantic_set
                     .all
                     .iter()
@@ -245,8 +199,11 @@ impl Backend {
                 perf.reach_us = reach_us;
 
                 let entity_presentations = if callable_set.is_some() {
-                    let related =
-                        service.entity_locations_at(&subjects, true, Some(source_position))?;
+                    let related = service.entity_locations_at(
+                        &target.subjects,
+                        true,
+                        Some(source_position),
+                    )?;
                     perf.entity_visits = related.coverage.entities;
                     perf.entity_edges = related.coverage.edges;
                     perf.entity_locations = related.locations.len();
@@ -497,16 +454,8 @@ fn local_binding_hover_markdown(
 }
 
 /// Hover for a proven label definition/use inside the enclosing function.
-fn label_hover_markdown(
-    current_rel: &str,
-    text: &str,
-    location: &tower_lsp::lsp_types::Location,
-) -> String {
-    let declaration = text
-        .lines()
-        .nth(location.range.start.line as usize)
-        .unwrap_or_default()
-        .trim();
+fn label_hover_markdown(current_rel: &str, text: &str, target_byte: usize) -> String {
+    let declaration = source_line_at_byte(text, target_byte);
     let mut out = String::new();
     out.push_str("```c\n");
     out.push_str(&format!("// In {current_rel}\n"));

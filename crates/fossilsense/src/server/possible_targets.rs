@@ -154,7 +154,8 @@ impl Backend {
                     .ok();
                 }
                 Ok(navigation::LabelNavigation::MissingDefinition) => return None,
-                Ok(navigation::LabelNavigation::NotLabelSyntax) | Err(_) => {}
+                Ok(navigation::LabelNavigation::Failed(_)) | Err(_) => return None,
+                Ok(navigation::LabelNavigation::NotLabelSyntax) => {}
             }
         }
 

@@ -107,9 +107,9 @@ fn core_symbol_features_route_through_candidate_sets_and_stable_handles() {
             assert_present(
                 path,
                 &[
-                    "resolve_subject(",
+                    "resolve_request_target(",
+                    "resolve_workspace_target(",
                     "entity_locations_at(",
-                    "LookupPolicy::BoundDomain",
                     "capture_query_session(",
                 ],
             );
@@ -118,6 +118,10 @@ fn core_symbol_features_route_through_candidate_sets_and_stable_handles() {
         }
         assert_absent(path, &["non_callable_symbols("]);
     }
+    assert_present(
+        "src/server/request_target.rs",
+        &["resolve_subject(", "LookupPolicy::BoundDomain"],
+    );
     assert_absent(
         "src/server/language_server.rs",
         &[

@@ -1,3 +1,4 @@
+use super::request_target;
 use super::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,86 +84,33 @@ impl Backend {
         let source_cursor_byte =
             query::byte_offset_at(&text, position.position.line, position.position.character);
 
-        // C and C++ labels inhabit a function-local namespace. Only parse the
-        // request document when the bytes around the selected identifier could
-        // be `goto name` or `name:`; tree-sitter then proves the exact syntax
-        // context and the enclosing function before a local label can dominate
-        // workspace candidates with the same spelling.
-        if label_navigation_syntax_hint(&text, &word, source_cursor_byte) {
-            let label_started = std::time::Instant::now();
-            let label_uri = uri.clone();
-            let label_path = current_rel.clone();
-            let label_text = text.clone();
-            let label_word = word.clone();
-            let label_result = tokio::task::spawn_blocking(move || {
-                label_navigation_location(
-                    &label_uri,
-                    &label_path,
-                    &label_text,
-                    &label_word,
-                    source_cursor_byte,
+        let target = self
+            .resolve_request_target(
+                &query_session,
+                request_target::RequestTargetInput {
+                    uri: &uri,
+                    document: (version, text.clone()),
+                    word: &word,
+                    cursor_byte: source_cursor_byte,
                     source_language,
-                )
-            })
-            .await;
-            timer.observation.parse_us += label_started.elapsed().as_micros();
-            match label_result {
-                Ok(LabelNavigation::Found(location)) => {
-                    return Ok(Some(GotoDefinitionResponse::Array(vec![location])));
-                }
-                // A proven `goto name` belongs exclusively to the enclosing
-                // function's label namespace.  A missing label must not fall
-                // through to an unrelated workspace function/object named
-                // `name`.
-                Ok(LabelNavigation::MissingDefinition) => return Ok(None),
-                Ok(LabelNavigation::NotLabelSyntax) | Err(_) => {}
-            }
-        }
-
-        let started = std::time::Instant::now();
-        let cursor_binding = query_session
-            .bind_cursor(
-                self,
-                &uri,
-                (version, text.clone()),
-                &word,
-                source_cursor_byte,
+                },
+                timer,
             )
             .await;
-        let binding_parse_us = started.elapsed().as_micros();
-        let Some(cursor_binding) = cursor_binding else {
-            timer.observation.parse_us += binding_parse_us;
-            return Ok(None);
-        };
-        timer.observation.parse_us += cursor_binding.parse_us;
-        timer.observation.binding_us = cursor_binding.binding_us;
-        timer.observation.cache_hit = cursor_binding.cache_hit;
-        let syntax = cursor_binding.syntax;
-        if syntax.domain == crate::parser::LookupDomain::Member {
-            let members = self
-                .bound_members(
-                    &query_session,
-                    &uri,
-                    (version, text.clone()),
-                    &syntax,
-                    &word,
-                    timer,
-                )
-                .await;
-            let locations = self
-                .member_entity_locations(
-                    &query_session,
-                    members,
-                    operation == NavigationOperation::Declaration,
-                )
-                .await;
-            return Ok((!locations.is_empty()).then_some(GotoDefinitionResponse::Array(locations)));
-        }
-
-        match cursor_binding.resolution {
-            query::BindingResolution::Resolved(local) => {
+        let syntax = match target {
+            request_target::RequestTarget::Label(label) => {
+                let location = Location {
+                    uri,
+                    range: tower_lsp::lsp_types::Range {
+                        start: source_position_for_byte(&text, label.start_byte),
+                        end: source_position_for_byte(&text, label.end_byte),
+                    },
+                };
+                return Ok(Some(GotoDefinitionResponse::Array(vec![location])));
+            }
+            request_target::RequestTarget::Local(local) => {
                 let render_started = std::time::Instant::now();
-                let binding = &cursor_binding.parsed.local_bindings[local.binding_index];
+                let binding = &local.parsed.local_bindings[local.binding.binding_index];
                 let start = source_position_for_byte(&text, binding.decl_start_byte);
                 let end = tower_lsp::lsp_types::Position {
                     line: start.line,
@@ -175,12 +123,28 @@ impl Backend {
                 timer.observation.render_us = render_started.elapsed().as_micros();
                 return Ok(result);
             }
-            query::BindingResolution::UnresolvedWithinDomain {
-                reason: query::BindingReason::NoLocalBinding,
-                ..
-            } => {}
-            _ => return Ok(None),
-        }
+            request_target::RequestTarget::Members(members) => {
+                let locations = self
+                    .member_entity_locations(
+                        &query_session,
+                        members,
+                        operation == NavigationOperation::Declaration,
+                    )
+                    .await;
+                return Ok(
+                    (!locations.is_empty()).then_some(GotoDefinitionResponse::Array(locations))
+                );
+            }
+            request_target::RequestTarget::Workspace(syntax) => syntax,
+            request_target::RequestTarget::Unavailable(unavailable) => {
+                if unavailable.is_failure() {
+                    self.client
+                        .log_message(MessageType::ERROR, unavailable.diagnostic())
+                        .await;
+                }
+                return Ok(None);
+            }
+        };
         // Reachability scope for candidate tier resolution (Current / Reachable
         // / External / Unknown / Global). A file in the set is proved reachable
         // regardless of whether the set is open; an open scope routes
@@ -230,27 +194,20 @@ impl Backend {
                     reach_graph.as_deref(),
                     semantic_family,
                 );
-                let call_context = service.complete_call_context_at(source_position)?;
-                let (semantic_set, subjects) = service.resolve_subject(
+                let target = request_target::resolve_workspace_target(
+                    &service,
                     &word,
-                    if call_context.is_some() {
-                        crate::candidate_service::SemanticIntent::Call
-                    } else {
-                        crate::candidate_service::SemanticIntent::Neutral
-                    },
-                    crate::candidate_service::LookupPolicy::BoundDomain {
-                        domain: syntax.domain,
-                        qualifier: syntax.qualifier.as_deref(),
-                    },
-                    call_context,
+                    &syntax,
+                    source_position,
                 )?;
+                let semantic_set = target.semantic_set;
                 let semantic_count = semantic_set
                     .all
                     .iter()
                     .map(|group| group.candidates.len())
                     .sum();
                 let related = service.entity_locations_at(
-                    &subjects,
+                    &target.subjects,
                     operation == NavigationOperation::Declaration,
                     Some(source_position),
                 )?;
@@ -390,6 +347,7 @@ pub(super) enum LabelNavigation<T> {
     NotLabelSyntax,
     MissingDefinition,
     Found(T),
+    Failed(String),
 }
 
 pub(super) fn label_navigation_location(
@@ -410,6 +368,7 @@ pub(super) fn label_navigation_location(
         LabelNavigation::NotLabelSyntax => return LabelNavigation::NotLabelSyntax,
         LabelNavigation::MissingDefinition => return LabelNavigation::MissingDefinition,
         LabelNavigation::Found(range) => range,
+        LabelNavigation::Failed(reason) => return LabelNavigation::Failed(reason),
     };
     LabelNavigation::Found(Location {
         uri: uri.clone(),
@@ -435,7 +394,9 @@ fn label_definition_byte_range(
 ) -> Option<(usize, usize)> {
     match label_navigation_byte_range(current_path, text, word, cursor_byte) {
         LabelNavigation::Found(range) => Some(range),
-        LabelNavigation::NotLabelSyntax | LabelNavigation::MissingDefinition => None,
+        LabelNavigation::NotLabelSyntax
+        | LabelNavigation::MissingDefinition
+        | LabelNavigation::Failed(_) => None,
     }
 }
 
@@ -462,172 +423,22 @@ fn label_navigation_byte_range_with_language(
     cursor_byte: usize,
     language: crate::config::SourceLanguage,
 ) -> LabelNavigation<(usize, usize)> {
-    let Some((query_start, query_end)) = identifier_byte_range_at(text, cursor_byte) else {
-        return LabelNavigation::NotLabelSyntax;
-    };
-    if text.get(query_start..query_end) != Some(word)
-        || !label_navigation_syntax_hint_for_range(text, query_start, query_end)
-    {
-        return LabelNavigation::NotLabelSyntax;
+    match super::request_target::label_target_byte_range(text, word, cursor_byte, language) {
+        super::request_target::LabelTargetResolution::NotLabelSyntax => {
+            LabelNavigation::NotLabelSyntax
+        }
+        super::request_target::LabelTargetResolution::MissingDefinition => {
+            LabelNavigation::MissingDefinition
+        }
+        super::request_target::LabelTargetResolution::Found(range) => LabelNavigation::Found(range),
+        super::request_target::LabelTargetResolution::Failed(reason) => {
+            LabelNavigation::Failed(reason)
+        }
     }
-
-    let parser = parser::ParserHandle::new();
-    let Some(tree) = parser
-        .parse_with_language(language.tree_sitter_language(), text, None)
-        .ok()
-        .flatten()
-    else {
-        return LabelNavigation::NotLabelSyntax;
-    };
-    let Some(context) = label_context_node_at(tree.root_node(), query_start, query_end) else {
-        return LabelNavigation::NotLabelSyntax;
-    };
-    let Some(scope) = enclosing_label_scope(context) else {
-        return LabelNavigation::NotLabelSyntax;
-    };
-
-    let target = if context.kind() == "labeled_statement" {
-        context.child_by_field_name("label")
-    } else {
-        label_definition_in_scope(scope, text, word)
-    };
-    target.map_or(LabelNavigation::MissingDefinition, |target| {
-        LabelNavigation::Found((target.start_byte(), target.end_byte()))
-    })
 }
 
 pub(super) fn label_navigation_syntax_hint(text: &str, word: &str, cursor_byte: usize) -> bool {
-    let Some((start, end)) = identifier_byte_range_at(text, cursor_byte) else {
-        return false;
-    };
-    text.get(start..end) == Some(word) && label_navigation_syntax_hint_for_range(text, start, end)
-}
-
-fn label_navigation_syntax_hint_for_range(text: &str, start: usize, end: usize) -> bool {
-    let bytes = text.as_bytes();
-
-    let mut after = end;
-    while bytes
-        .get(after)
-        .is_some_and(|byte| byte.is_ascii_whitespace())
-    {
-        after += 1;
-    }
-    if bytes.get(after) == Some(&b':') {
-        return true;
-    }
-
-    let mut before = start;
-    while before > 0 && bytes[before - 1].is_ascii_whitespace() {
-        before -= 1;
-    }
-    let previous_end = before;
-    while before > 0 && is_ascii_identifier_byte(bytes[before - 1]) {
-        before -= 1;
-    }
-    text.get(before..previous_end) == Some("goto")
-        && (before == 0 || !is_ascii_identifier_byte(bytes[before - 1]))
-}
-
-fn identifier_byte_range_at(text: &str, cursor_byte: usize) -> Option<(usize, usize)> {
-    let bytes = text.as_bytes();
-    let mut anchor = cursor_byte.min(bytes.len());
-    if anchor == bytes.len()
-        || !bytes
-            .get(anchor)
-            .is_some_and(|byte| is_ascii_identifier_byte(*byte))
-    {
-        if anchor == 0 || !is_ascii_identifier_byte(bytes[anchor - 1]) {
-            return None;
-        }
-        anchor -= 1;
-    }
-
-    let mut start = anchor;
-    while start > 0 && is_ascii_identifier_byte(bytes[start - 1]) {
-        start -= 1;
-    }
-    let mut end = anchor + 1;
-    while end < bytes.len() && is_ascii_identifier_byte(bytes[end]) {
-        end += 1;
-    }
-    (bytes[start].is_ascii_alphabetic() || bytes[start] == b'_').then_some((start, end))
-}
-
-fn is_ascii_identifier_byte(byte: u8) -> bool {
-    byte == b'_' || byte.is_ascii_alphanumeric()
-}
-
-fn label_context_node_at<'tree>(
-    root: tree_sitter::Node<'tree>,
-    query_start: usize,
-    query_end: usize,
-) -> Option<tree_sitter::Node<'tree>> {
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if node.start_byte() > query_start || node.end_byte() < query_end {
-            continue;
-        }
-        if matches!(node.kind(), "goto_statement" | "labeled_statement") {
-            if let Some(label) = node.child_by_field_name("label") {
-                if label.kind() == "statement_identifier"
-                    && label.start_byte() == query_start
-                    && label.end_byte() == query_end
-                {
-                    return Some(node);
-                }
-            }
-        }
-        for index in (0..node.named_child_count()).rev() {
-            if let Some(child) = node.named_child(index) {
-                stack.push(child);
-            }
-        }
-    }
-    None
-}
-
-fn enclosing_label_scope(context: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
-    let mut current = context.parent();
-    while let Some(node) = current {
-        if is_label_scope_node(node) {
-            return Some(node);
-        }
-        current = node.parent();
-    }
-    None
-}
-
-fn label_definition_in_scope<'tree>(
-    scope: tree_sitter::Node<'tree>,
-    text: &str,
-    word: &str,
-) -> Option<tree_sitter::Node<'tree>> {
-    let mut stack = vec![scope];
-    while let Some(node) = stack.pop() {
-        if node.id() != scope.id() && is_label_scope_node(node) {
-            continue;
-        }
-        if node.kind() == "labeled_statement" {
-            if let Some(label) = node.child_by_field_name("label") {
-                if label.kind() == "statement_identifier"
-                    && text.get(label.start_byte()..label.end_byte()) == Some(word)
-                {
-                    return Some(label);
-                }
-            }
-        }
-        for index in (0..node.named_child_count()).rev() {
-            if let Some(child) = node.named_child(index) {
-                stack.push(child);
-            }
-        }
-    }
-    None
-}
-
-fn is_label_scope_node(node: tree_sitter::Node<'_>) -> bool {
-    matches!(node.kind(), "function_definition" | "lambda_expression")
+    super::request_target::label_target_syntax_hint(text, word, cursor_byte)
 }
 
 pub(super) fn source_position_for_byte(text: &str, byte: usize) -> tower_lsp::lsp_types::Position {

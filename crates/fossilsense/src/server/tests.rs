@@ -19,7 +19,7 @@ use tower_lsp::lsp_types::{
     DidChangeTextDocumentParams, DidChangeWatchedFilesParams, DidChangeWorkspaceFoldersParams,
     DidOpenTextDocumentParams, DocumentSymbolParams, DocumentSymbolResponse, Documentation,
     ExecuteCommandParams, FileChangeType, FileEvent, GotoDefinitionParams, GotoDefinitionResponse,
-    HoverContents, HoverParams, InitializeParams, OneOf, Position, ReferenceContext,
+    HoverContents, HoverParams, InitializeParams, OneOf, Position, Range, ReferenceContext,
     ReferenceParams, SemanticTokensParams, SemanticTokensResult, SignatureHelpParams,
     TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
     TextDocumentPositionParams, Url, VersionedTextDocumentIdentifier, WorkspaceFolder,
@@ -4327,9 +4327,32 @@ async fn hover_agrees_with_navigation_on_labels() {
     )
     .await;
 
+    for response in [
+        service
+            .inner()
+            .goto_definition(goto_definition_params(uri.clone(), line, character))
+            .await
+            .expect("label definition request")
+            .expect("label definition response"),
+        service
+            .inner()
+            .goto_declaration(goto_definition_params(uri.clone(), line, character))
+            .await
+            .expect("label declaration request")
+            .expect("label declaration response"),
+    ] {
+        let locations = definition_locations(response);
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0].uri, uri);
+        assert_eq!(
+            locations[0].range,
+            Range::new(Position::new(2, 0), Position::new(2, 4))
+        );
+    }
+
     let hover = service
         .inner()
-        .hover(hover_params(uri, line, character))
+        .hover(hover_params(uri.clone(), line, character))
         .await
         .expect("hover request")
         .expect("label hover");
