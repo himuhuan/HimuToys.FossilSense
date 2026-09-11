@@ -2386,6 +2386,13 @@ async fn benchmark_lsp_index_lifecycle_gate() {
             rebuilt_index.total_budget_bytes(),
         );
     }
+    fragmented = fragmented
+        .bind_identity(
+            rebuilt_index
+                .read_identity()
+                .expect("rebuilt declaration index identity"),
+        )
+        .expect("bind fragmented index to rebuilt database");
     assert!(
         !fragmented.needs_compaction(),
         "the production watcher update must cross the compaction threshold"

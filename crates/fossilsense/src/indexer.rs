@@ -476,7 +476,12 @@ fn index_workspace_impl(
             },
         ));
         let publication_started = Instant::now();
+        check_build_cancelled(permit)?;
         store.prepare_full_build_publication()?;
+        // Publication is the cancellation commit point. Once the validated
+        // database starts replacing the active generation, report the build as
+        // successful even if a later request asks to cancel it.
+        check_build_cancelled(permit)?;
         drop(store);
         if default_side_by_side_publication {
             publish_default_index(&workspace, &db_path, stats.semantic_generation)?;
@@ -503,11 +508,11 @@ fn index_workspace_impl(
             "checkpointing database",
         ));
         let publication_started = Instant::now();
+        check_build_cancelled(permit)?;
         store.checkpoint_full_rebuild()?;
         stats.publication_ms = publication_started.elapsed().as_millis();
     }
     stats.elapsed_ms = started.elapsed().as_millis();
-    check_build_cancelled(permit)?;
     progress(IndexStatus::ready(workspace_display, &stats));
     Ok(stats)
 }
@@ -751,6 +756,7 @@ fn index_dirty_files_impl(
             issue.message,
         ));
     }
+    check_build_cancelled(permit)?;
     let commit = store.commit_index_build(build, &include_graph)?;
     stats.semantic_generation = commit.generation;
     stats.maintenance_warning = commit.cleanup_warning;
@@ -760,7 +766,6 @@ fn index_dirty_files_impl(
     stats.callable_anchors = call_coverage.callable_anchors as usize;
     stats.call_sites = call_coverage.call_sites as usize;
     stats.elapsed_ms = started.elapsed().as_millis();
-    check_build_cancelled(permit)?;
     progress(IndexStatus::ready(workspace_display, &stats));
     Ok(stats)
 }

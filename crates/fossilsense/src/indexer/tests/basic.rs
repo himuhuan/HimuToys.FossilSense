@@ -215,6 +215,81 @@ fn cancelled_full_build_removes_its_unpublished_staging_database() {
 }
 
 #[test]
+fn cancellation_at_publication_boundary_keeps_the_active_generation() {
+    let workspace = tempdir().expect("workspace");
+    let source = workspace.path().join("main.c");
+    fs::write(&source, "int original_generation;\n").expect("initial source");
+
+    let initial = index_workspace(
+        workspace.path(),
+        IndexOptions {
+            force: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .expect("initial index");
+    let initial_path =
+        crate::pathing::default_index_path(workspace.path()).expect("initial active database");
+    fs::write(&source, "int cancelled_generation;\n").expect("replacement source");
+
+    let coordinator = crate::build_coordinator::BuildCoordinator::with_policy_and_sampler(
+        crate::build_coordinator::BuildPolicy::default(),
+        || 0,
+    );
+    let permit = coordinator
+        .try_acquire(
+            workspace.path().to_path_buf(),
+            crate::build_coordinator::BuildKind::FullIndex,
+        )
+        .expect("permit");
+    permit
+        .reserve(256 * 1024 * 1024, 200 * 1024 * 1024)
+        .expect("reservation");
+    let cancellation = permit.cancellation();
+    let result = index_workspace_with_permit(
+        workspace.path(),
+        IndexOptions {
+            force: true,
+            ..Default::default()
+        },
+        &permit,
+        |status| {
+            if status.phase.as_deref() == Some("publishing database generation") {
+                cancellation.cancel();
+            }
+        },
+    );
+
+    assert!(result
+        .expect_err("publication-boundary cancellation")
+        .to_string()
+        .contains("cancelled"));
+    let active_path = crate::pathing::default_index_path(workspace.path())
+        .expect("active database after cancellation");
+    assert_eq!(
+        active_path, initial_path,
+        "cancelled build must not publish"
+    );
+    let store = IndexStore::open_readonly(&active_path).expect("preserved active database");
+    assert_eq!(
+        store.semantic_generation().expect("preserved generation"),
+        initial.semantic_generation
+    );
+    assert_eq!(
+        store
+            .declarations_by_name("original_generation")
+            .expect("original declaration")
+            .len(),
+        1
+    );
+    assert!(store
+        .declarations_by_name("cancelled_generation")
+        .expect("cancelled declaration lookup")
+        .is_empty());
+}
+
+#[test]
 fn language_evidence_override_reindexes_unchanged_source_even_with_same_grammar() {
     let workspace = tempdir().expect("workspace");
     fs::write(workspace.path().join("shared.h"), "int visible;\n").unwrap();
