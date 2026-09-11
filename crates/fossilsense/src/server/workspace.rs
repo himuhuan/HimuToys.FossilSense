@@ -662,7 +662,9 @@ impl CacheLedger {
         let mut snapshot = EngineSnapshot::empty(root);
         snapshot.epoch = self.allocate_engine_epoch();
         snapshot.workspace_semantics = workspace_semantics;
-        self.publish_engine_snapshot(snapshot).await
+        self.publish_engine_snapshot(snapshot)
+            .await
+            .expect("empty workspace snapshot has no declaration identity")
     }
 
     pub(super) async fn remove_workspace_roots(&self, roots: &[PathBuf]) {
@@ -706,7 +708,7 @@ impl CacheLedger {
     pub(in crate::server) async fn publish_engine_snapshot(
         &self,
         snapshot: EngineSnapshot,
-    ) -> Arc<EngineSnapshot> {
+    ) -> anyhow::Result<Arc<EngineSnapshot>> {
         self.publish_engine_snapshot_with_after_swap(snapshot, || {}, std::future::ready(()))
             .await
     }
@@ -720,11 +722,12 @@ impl CacheLedger {
         snapshot: EngineSnapshot,
         after_snapshot_swap: F,
         after_swap: AfterSwap,
-    ) -> Arc<EngineSnapshot>
+    ) -> anyhow::Result<Arc<EngineSnapshot>>
     where
         F: FnOnce(),
         AfterSwap: std::future::Future<Output = ()>,
     {
+        snapshot.declaration_read_context()?;
         let snapshot = Arc::new(snapshot);
         // Invalidate on both sides of the engine-map swap. A builder captured
         // in either half of this publication window receives a stale cache
@@ -746,7 +749,7 @@ impl CacheLedger {
             let mut overlays = self.candidate_overlays.lock().await;
             invalidate_candidate_overlay_root(&mut overlays, &snapshot.root);
         }
-        snapshot
+        Ok(snapshot)
     }
 
     #[cfg(test)]
@@ -1117,7 +1120,8 @@ impl CacheLedger {
             workspace_semantics: current.workspace_semantics.clone(),
             degraded: current.degraded.clone(),
         })
-        .await;
+        .await
+        .expect("test name-table snapshot has compatible declaration identity");
     }
 
     #[cfg(test)]
@@ -1155,7 +1159,8 @@ impl CacheLedger {
             workspace_semantics: current.workspace_semantics.clone(),
             degraded: current.degraded.clone(),
         })
-        .await;
+        .await
+        .expect("test indexed-file snapshot has compatible declaration identity");
     }
 
     #[cfg(test)]
@@ -1181,7 +1186,8 @@ impl CacheLedger {
             workspace_semantics: current.workspace_semantics.clone(),
             degraded: current.degraded.clone(),
         })
-        .await;
+        .await
+        .expect("test reach-graph snapshot has compatible declaration identity");
     }
 
     #[cfg(test)]

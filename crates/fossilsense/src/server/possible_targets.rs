@@ -194,8 +194,7 @@ impl Backend {
         let reach_scope: Option<Arc<ReachScope>> = self
             .reach_scope_from_context(&uri, &context)
             .map(|(_, reach)| reach);
-        let call_read_handle = context.engine.call_read_handle.clone();
-        let declaration_index = context.engine.declaration_index.clone();
+        let declaration_read = context.engine.declaration_read_context();
         let reach_graph = context.engine.reach_graph.clone();
         let overlay = self
             .candidate_overlay_snapshot_from_documents(&root, context.engine.clone(), documents)
@@ -228,9 +227,9 @@ impl Backend {
         };
 
         let result = tokio::task::spawn_blocking(move || -> Result<PossibleTargetsResponse> {
-            let service = CandidateQueryService::new_with_declarations_for_family(
-                call_read_handle.as_deref(),
-                declaration_index.as_deref(),
+            let declaration_read = declaration_read?;
+            let service = CandidateQueryService::new_for_family(
+                declaration_read.as_ref(),
                 &overlay,
                 &current_path,
                 reach_scope.as_deref(),
@@ -248,8 +247,8 @@ impl Backend {
             )?;
             let current_file_coverage = if include_coverage_details {
                 let hash = blake3::hash(text.as_bytes()).to_hex().to_string();
-                let saved = match call_read_handle.as_deref() {
-                    Some(handle) => handle.read(|store| {
+                let saved = match declaration_read.as_ref() {
+                    Some(read_context) => read_context.read(|store| {
                         let Some(row) = store.coverage_view().for_path(&current_path)? else {
                             return Ok(None);
                         };

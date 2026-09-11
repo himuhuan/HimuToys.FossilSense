@@ -772,7 +772,8 @@ async fn workspace_folder_removal_drops_root_and_published_snapshot() {
             workspace_semantics: empty_workspace_semantics(&root),
             degraded: Default::default(),
         })
-        .await;
+        .await
+        .expect("test engine snapshot identity");
 
     service
         .inner()
@@ -855,7 +856,8 @@ async fn name_index_compaction_publishes_only_for_the_expected_engine_epoch() {
             workspace_semantics: empty_workspace_semantics(&root),
             degraded: Default::default(),
         })
-        .await;
+        .await
+        .expect("test engine snapshot identity");
 
     assert!(cache
         .compact_name_index_if_current(root.clone(), initial_epoch)
@@ -1256,7 +1258,8 @@ async fn full_build_lifecycle_suspends_old_payload_cache_before_database_work_an
             workspace_semantics: empty_workspace_semantics(&root),
             degraded: Default::default(),
         })
-        .await;
+        .await
+        .expect("test engine snapshot identity");
 
     let lifecycle = cache.begin_full_build_lifecycle(&root).await;
     assert_eq!(declaration_index.effective_payload_budget_bytes(), 0);
@@ -1315,7 +1318,8 @@ async fn failed_read_model_build_restores_old_cache_and_shutdown_releases_admiss
             workspace_semantics: empty_workspace_semantics(&root),
             degraded: Default::default(),
         })
-        .await;
+        .await
+        .expect("test engine snapshot identity");
     let cancellation = BuildCancellation::new();
     let permit = cache
         .build_coordinator
@@ -2121,7 +2125,7 @@ async fn benchmark_lsp_index_lifecycle_gate() {
                 batch.push(row.id);
                 if batch.len() == batch.capacity() {
                     old_index
-                        .payloads_by_ids(&old_handle, &batch)
+                        .payloads_by_ids_bound(&old_handle, &batch)
                         .expect("warm payload batch");
                     batch.clear();
                 }
@@ -2131,7 +2135,7 @@ async fn benchmark_lsp_index_lifecycle_gate() {
         .expect("stream declaration names");
     if !batch.is_empty() && old_index.payload_cache_stats().bytes < warm_target {
         old_index
-            .payloads_by_ids(&old_handle, &batch)
+            .payloads_by_ids_bound(&old_handle, &batch)
             .expect("warm final payload batch");
     }
     let warm_stats = old_index.payload_cache_stats();
@@ -2142,7 +2146,7 @@ async fn benchmark_lsp_index_lifecycle_gate() {
     let warm_percent = warm_stats.bytes.saturating_mul(100) / budget;
     let stable_id = stable_id.expect("stable warmed declaration ID");
     let old_before = old_index
-        .payloads_by_ids(&old_handle, &[stable_id])
+        .payloads_by_ids_bound(&old_handle, &[stable_id])
         .expect("read old stable declaration");
     let witness = witness.expect("workspace declaration witness");
     let witness_row = store
@@ -2344,7 +2348,7 @@ async fn benchmark_lsp_index_lifecycle_gate() {
         .to_path_buf();
     let rebuilt_generation = rebuilt.semantic_generation;
     let old_after = old_index
-        .payloads_by_ids(&old_handle, &[stable_id])
+        .payloads_by_ids_bound(&old_handle, &[stable_id])
         .expect("old request remains readable across full publication");
     let old_consistent = old_request.engine.epoch == old_epoch
         && old_request.engine.semantic_generation == old_generation
@@ -2397,7 +2401,8 @@ async fn benchmark_lsp_index_lifecycle_gate() {
         .session
         .cache
         .publish_engine_snapshot(fragmented_snapshot)
-        .await;
+        .await
+        .expect("fragmented snapshot identity");
     drop(fragmented);
     drop(rebuilt_index);
     drop(rebuilt);
@@ -5251,11 +5256,11 @@ async fn cache_ledger_publishes_full_and_dirty_read_models_with_generations() {
         .declaration_index
         .clone()
         .expect("full declaration index");
-    let full_handle = full_context
+    let full_read = full_context
         .engine
-        .call_read_handle
-        .clone()
-        .expect("full read handle");
+        .declaration_read_context()
+        .expect("compatible full read context")
+        .expect("full read context");
     let alpha_id = full_context
         .engine
         .name_table
@@ -5263,8 +5268,8 @@ async fn cache_ledger_publishes_full_and_dirty_read_models_with_generations() {
         .expect("full name table")
         .search_ranked("alpha_symbol", 1)[0]
         .id;
-    let warmed = full_index
-        .payloads_by_ids(&full_handle, &[alpha_id])
+    let warmed = full_read
+        .payloads_by_ids(&[alpha_id])
         .expect("warm full payload cache");
     assert_eq!(warmed.len(), 1);
     let warm_cache = full_index.payload_cache_stats();
@@ -5325,8 +5330,8 @@ async fn cache_ledger_publishes_full_and_dirty_read_models_with_generations() {
     );
     assert_eq!(full_index.payload_cache_stats().entries, warm_cache.entries);
     let sql_reads_before = full_index.payload_cache_stats().sql_reads;
-    let warmed_after_dirty = full_index
-        .payloads_by_ids(&full_handle, &[alpha_id])
+    let warmed_after_dirty = full_read
+        .payloads_by_ids(&[alpha_id])
         .expect("old request remains readable after dirty publication");
     assert_eq!(warmed_after_dirty[0].fact.name, "alpha_symbol");
     assert_eq!(full_index.payload_cache_stats().sql_reads, sql_reads_before);
@@ -5366,11 +5371,11 @@ async fn full_publication_shrinks_old_cache_without_changing_captured_request_ge
         .declaration_index
         .clone()
         .expect("old declaration index");
-    let old_handle = old_context
+    let old_read = old_context
         .engine
-        .call_read_handle
-        .clone()
-        .expect("old call read handle");
+        .declaration_read_context()
+        .expect("compatible old read context")
+        .expect("old read context");
     let old_id = old_context
         .engine
         .name_table
@@ -5378,8 +5383,8 @@ async fn full_publication_shrinks_old_cache_without_changing_captured_request_ge
         .expect("old name table")
         .search_ranked("alpha_generation_one", 1)[0]
         .id;
-    let before = old_index
-        .payloads_by_ids(&old_handle, &[old_id])
+    let before = old_read
+        .payloads_by_ids(&[old_id])
         .expect("warm old generation");
     assert_eq!(before[0].fact.name, "alpha_generation_one");
     assert_eq!(old_index.payload_cache_stats().entries, 1);
@@ -5407,7 +5412,7 @@ async fn full_publication_shrinks_old_cache_without_changing_captured_request_ge
     assert_ne!(new_report.semantic_generation, old_generation);
     assert_eq!(old_context.engine.epoch, old_epoch);
     assert_eq!(old_context.engine.semantic_generation, old_generation);
-    assert_eq!(old_handle.generation, old_generation);
+    assert_eq!(old_read.handle().generation, old_generation);
     let shrink = old_index.payload_cache_stats();
     assert_eq!(shrink.entries, 0);
     assert_eq!(shrink.bytes, 0);
@@ -5415,8 +5420,8 @@ async fn full_publication_shrinks_old_cache_without_changing_captured_request_ge
     assert_eq!(shrink.publication_shrink_entries, 1);
     assert!(shrink.publication_shrink_bytes > 0);
 
-    let after = old_index
-        .payloads_by_ids(&old_handle, &[old_id])
+    let after = old_read
+        .payloads_by_ids(&[old_id])
         .expect("old request reads its captured generation after publication");
     assert_eq!(after[0].fact.name, "alpha_generation_one");
     assert_eq!(old_index.payload_cache_stats().entries, 0);
@@ -6512,11 +6517,12 @@ async fn project_context_commands_validate_selection_and_outside_uri_has_no_auto
             indexed_files: current.indexed_files.clone(),
             include_path_index: current.include_path_index.clone(),
             project_context: None,
-            call_read_handle: None,
+            call_read_handle: current.call_read_handle.clone(),
             workspace_semantics: current.workspace_semantics.clone(),
             degraded,
         })
-        .await;
+        .await
+        .expect("project-context degradation keeps declaration identity");
     let unavailable_status = service
         .inner()
         .project_context_status(Some(
@@ -7424,7 +7430,8 @@ async fn completion_overlay_cache_rejects_late_old_universe_and_engine_publicati
             workspace_semantics: empty_workspace_semantics(&root),
             degraded: Default::default(),
         })
-        .await;
+        .await
+        .expect("test engine snapshot identity");
     assert!(cache
         .completion_overlay(&root, engine_epoch, generation, 3, new_universe)
         .await
@@ -7848,7 +7855,8 @@ async fn did_close_prevents_a_late_external_authorization_cache_write() {
             workspace_semantics: semantics.clone(),
             degraded: Default::default(),
         })
-        .await;
+        .await
+        .expect("test engine snapshot identity");
     let uri = Url::from_file_path(&header).expect("header uri");
     service
         .inner()
@@ -8051,9 +8059,9 @@ async fn candidate_overlay_shadows_every_persisted_include_alias_identity() {
             "dirty canonical file must shadow persisted alias {identity}"
         );
     }
-    let query = crate::candidate_service::CandidateQueryService::new_with_declarations_for_family(
-        context.engine.call_read_handle.as_deref(),
-        context.engine.declaration_index.as_deref(),
+    let declaration_read = context.engine.declaration_read_context().unwrap();
+    let query = crate::candidate_service::CandidateQueryService::new_for_family(
+        declaration_read.as_ref(),
         &overlay,
         "main.cpp",
         None,
@@ -8427,9 +8435,9 @@ async fn dirty_external_go_alias_shadows_persisted_declarations() {
             context.engine.indexed_files.as_deref(),
         )
         .await;
-    let query = crate::candidate_service::CandidateQueryService::new_with_declarations_for_family(
-        context.engine.call_read_handle.as_deref(),
-        context.engine.declaration_index.as_deref(),
+    let declaration_read = context.engine.declaration_read_context().unwrap();
+    let query = crate::candidate_service::CandidateQueryService::new_for_family(
+        declaration_read.as_ref(),
         &overlay,
         "main.go",
         None,
@@ -8555,9 +8563,9 @@ async fn candidate_overlay_keeps_published_external_semantics_until_next_generat
         overlay.shadows(&identity),
         "generation N dirty file must keep shadowing N facts while N+1 is only scheduled"
     );
-    let query = crate::candidate_service::CandidateQueryService::new_with_declarations_for_family(
-        context.engine.call_read_handle.as_deref(),
-        context.engine.declaration_index.as_deref(),
+    let declaration_read = context.engine.declaration_read_context().unwrap();
+    let query = crate::candidate_service::CandidateQueryService::new_for_family(
+        declaration_read.as_ref(),
         &overlay,
         "main.go",
         None,
@@ -8652,7 +8660,8 @@ async fn candidate_overlay_does_not_adopt_a_new_graph_after_request_publication(
             workspace_semantics: empty_workspace_semantics(&root),
             degraded: Default::default(),
         })
-        .await;
+        .await
+        .expect("test engine snapshot identity");
     let old = service
         .inner()
         .session
@@ -8685,7 +8694,8 @@ async fn candidate_overlay_does_not_adopt_a_new_graph_after_request_publication(
             workspace_semantics: old.workspace_semantics.clone(),
             degraded: Default::default(),
         })
-        .await;
+        .await
+        .expect("test engine snapshot identity");
 
     let overlay = service
         .inner()
@@ -8725,7 +8735,8 @@ async fn candidate_overlay_cache_rejects_a_late_build_after_publication() {
             workspace_semantics: empty_workspace_semantics(&root),
             degraded: Default::default(),
         })
-        .await;
+        .await
+        .expect("test engine snapshot identity");
     let late = Arc::new(crate::candidate_service::CandidateOverlaySnapshot::new(
         3,
         Vec::new(),
@@ -8776,7 +8787,8 @@ async fn indexed_completion_resolve_rejects_cross_generation_context_before_over
             workspace_semantics: empty_workspace_semantics(&root),
             degraded: Default::default(),
         })
-        .await;
+        .await
+        .expect("test engine snapshot identity");
     let item = CompletionItem {
         label: "dirty".into(),
         data: Some(
@@ -9151,7 +9163,8 @@ async fn member_completion_resolve_allows_go_module_owner_and_rejects_sibling() 
             workspace_semantics,
             degraded: Default::default(),
         })
-        .await;
+        .await
+        .expect("test engine snapshot identity");
     let overlay_epoch = service
         .inner()
         .session
@@ -9287,7 +9300,8 @@ async fn member_completion_resolve_uses_alias_identity_language_override() {
             workspace_semantics,
             degraded: Default::default(),
         })
-        .await;
+        .await
+        .expect("test engine snapshot identity");
     let overlay_epoch = service
         .inner()
         .session

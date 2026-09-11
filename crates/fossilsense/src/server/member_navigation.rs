@@ -29,24 +29,24 @@ impl Backend {
             .await;
         let root = session.root.clone();
         let engine = session.context.engine.clone();
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Location>> {
+        let task_fallback = fallback.clone();
+        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Location>> {
+            let declaration_read = engine.declaration_read_context()?;
             let family = members
                 .first()
                 .map(|member| member.family)
                 .unwrap_or(crate::semantic_model::SemanticFamily::CFamily);
-            let service =
-                crate::candidate_service::CandidateQueryService::new_with_declarations_for_family(
-                    engine.call_read_handle.as_deref(),
-                    engine.declaration_index.as_deref(),
-                    &overlay,
-                    "",
-                    None,
-                    engine.reach_graph.as_deref(),
-                    family,
-                );
+            let service = crate::candidate_service::CandidateQueryService::new_for_family(
+                declaration_read.as_ref(),
+                &overlay,
+                "",
+                None,
+                engine.reach_graph.as_deref(),
+                family,
+            );
             let subjects = service.member_entity_subjects(&members)?;
             if subjects.is_empty() {
-                return Ok(fallback.clone());
+                return Ok(task_fallback);
             }
             let related = service.entity_locations_at(&subjects, declaration, None)?;
             Ok(related
@@ -55,10 +55,28 @@ impl Backend {
                 .filter_map(|candidate| candidate_to_location(&root, candidate))
                 .collect())
         })
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .unwrap_or_default()
+        .await;
+        match result {
+            Ok(Ok(locations)) => locations,
+            Ok(Err(error)) => {
+                self.client
+                    .log_message(
+                        tower_lsp::lsp_types::MessageType::ERROR,
+                        format!("member navigation declaration read failed: {error:#}"),
+                    )
+                    .await;
+                fallback
+            }
+            Err(error) => {
+                self.client
+                    .log_message(
+                        tower_lsp::lsp_types::MessageType::ERROR,
+                        format!("member navigation task failed: {error}"),
+                    )
+                    .await;
+                fallback
+            }
+        }
     }
 
     pub(super) async fn member_hover(
@@ -198,8 +216,7 @@ impl Backend {
             contexts.insert(
                 root.clone(),
                 MemberRootQueryContext {
-                    handle: engine.call_read_handle.clone(),
-                    declaration_index: engine.declaration_index.clone(),
+                    declaration_read: engine.declaration_read_context()?.map(Arc::new),
                     overlay,
                     current_path: current_path.clone(),
                     reach_graph: engine.reach_graph.clone(),

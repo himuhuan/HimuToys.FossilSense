@@ -1,160 +1,25 @@
-use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-
 use anyhow::{Context, Result};
+use std::collections::{HashMap, HashSet};
 
 use crate::call_catalog::rows::{anchor_from_row, call_from_row};
 use crate::call_catalog::{raw_entity_key, RelationPage, RelationQueryIndex};
 use crate::call_model::{CallSiteFact, CallableAnchor, CoverageSummary, SourceRange};
-use crate::call_model::{CallableLocator, RelationDirection, SemanticGeneration, SourcePosition};
-use crate::pathing::IndexDbLease;
+use crate::call_model::{CallableLocator, RelationDirection, SourcePosition};
+use crate::declaration_read::DeclarationReadContext;
 use crate::reachability::ReachGraph;
 use crate::semantic_model::SemanticFamily;
 use crate::store::views::CallFactStoreView;
-use crate::store::IndexStore;
+
+pub use crate::declaration_read_handle::CallReadHandle;
+pub(crate) use crate::declaration_read_handle::ReadSessionProbe;
 
 pub use crate::candidate_service::FileCandidateOverlay as FileCallOverlay;
 
 const DEFAULT_SCANNED_SITE_LIMIT: usize = 8_192;
 const DEFAULT_CANDIDATE_EXPANSION_LIMIT: usize = 32_768;
 
-#[derive(Debug, Clone)]
-pub struct CallReadHandle {
-    db: IndexDbLease,
-    pub generation: SemanticGeneration,
-    database_incarnation: Option<Arc<str>>,
-    diagnostic: Option<Arc<Mutex<crate::store::DiagnosticReadSnapshot>>>,
-}
-
-impl CallReadHandle {
-    pub(crate) fn database_incarnation(&self) -> Option<&str> {
-        self.database_incarnation.as_deref()
-    }
-
-    pub(crate) fn database_path(&self) -> &std::path::Path {
-        self.db.path()
-    }
-
-    pub fn at_generation(db_path: PathBuf, generation: SemanticGeneration) -> Self {
-        let database_incarnation = IndexStore::open_readonly(&db_path)
-            .and_then(|store| store.entity_view().incarnation())
-            .ok()
-            .map(Arc::from);
-        Self {
-            database_incarnation,
-            db: IndexDbLease::acquire(db_path),
-            generation,
-            diagnostic: None,
-        }
-    }
-
-    pub(crate) fn at_default_generation(
-        db_path: PathBuf,
-        generation: SemanticGeneration,
-    ) -> Result<Self> {
-        let db = IndexDbLease::acquire_default_generation(db_path)?;
-        let database_incarnation = Some(Arc::from(
-            IndexStore::open_readonly(db.path())?
-                .entity_view()
-                .incarnation()?,
-        ));
-        Ok(Self {
-            database_incarnation,
-            db,
-            generation,
-            diagnostic: None,
-        })
-    }
-
-    pub fn capture(db_path: PathBuf) -> Result<Self> {
-        let store = IndexStore::open_readonly(&db_path)?;
-        let guard = store.begin_semantic_read(None)?;
-        let generation = SemanticGeneration(guard.generation());
-        guard.finish()?;
-        Ok(Self::at_generation(db_path, generation))
-    }
-
-    pub(crate) fn capture_default_generation(db_path: PathBuf) -> Result<Self> {
-        let db = IndexDbLease::acquire_default_generation(db_path)?;
-        let store = IndexStore::open_readonly(db.path())?;
-        let guard = store.begin_semantic_read(None)?;
-        let generation = SemanticGeneration(guard.generation());
-        guard.finish()?;
-        let database_incarnation = Some(Arc::from(store.entity_view().incarnation()?));
-        Ok(Self {
-            database_incarnation,
-            db,
-            generation,
-            diagnostic: None,
-        })
-    }
-
-    /// CLI-only observation: one owned read transaction spans every candidate
-    /// and presentation read, without acquiring a writable generation lease.
-    pub(crate) fn capture_diagnostic(db_path: PathBuf) -> Result<Self> {
-        let snapshot = crate::store::DiagnosticReadSnapshot::open(&db_path)?;
-        Ok(Self {
-            db: IndexDbLease::acquire(db_path),
-            generation: SemanticGeneration(snapshot.metadata.generation.unwrap_or(0)),
-            database_incarnation: None,
-            diagnostic: Some(Arc::new(Mutex::new(snapshot))),
-        })
-    }
-
-    /// Run a typed read against the exact semantic generation captured by
-    /// this handle. Candidate and relation requests share this boundary so a
-    /// publication that happens mid-request cannot mix durable generations.
-    pub(crate) fn read<T>(&self, read: impl FnOnce(&IndexStore) -> Result<T>) -> Result<T> {
-        REQUEST_READ_SESSIONS.with(|slot| {
-            if let Some(counter) = slot.borrow().as_ref() {
-                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-        });
-        if let Some(snapshot) = &self.diagnostic {
-            let snapshot = snapshot
-                .lock()
-                .map_err(|_| anyhow::anyhow!("diagnostic snapshot lock poisoned"))?;
-            return read(&snapshot.store);
-        }
-        let store = IndexStore::open_readonly(self.db.path())?;
-        let guard = store.begin_semantic_read(Some(self.generation.0))?;
-        let value = read(guard.store())?;
-        guard.finish()?;
-        Ok(value)
-    }
-}
-
-thread_local! {
-    static REQUEST_READ_SESSIONS: std::cell::RefCell<Option<Arc<std::sync::atomic::AtomicUsize>>> = const { std::cell::RefCell::new(None) };
-}
-
-/// Counts typed SQLite read sessions on one blocking request thread. A session
-/// may execute several statements; this is deliberately not a SQL statement count.
-pub(crate) struct ReadSessionProbe {
-    previous: Option<Arc<std::sync::atomic::AtomicUsize>>,
-    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
-}
-
-impl ReadSessionProbe {
-    pub(crate) fn enter(counter: Arc<std::sync::atomic::AtomicUsize>) -> Self {
-        Self {
-            previous: REQUEST_READ_SESSIONS.with(|slot| slot.replace(Some(counter))),
-            _thread_bound: std::marker::PhantomData,
-        }
-    }
-}
-
-impl Drop for ReadSessionProbe {
-    fn drop(&mut self) {
-        REQUEST_READ_SESSIONS.with(|slot| {
-            slot.replace(self.previous.take());
-        });
-    }
-}
-
 pub struct CallRelationService<'a> {
-    handle: &'a CallReadHandle,
+    read_context: &'a DeclarationReadContext,
     overlays: &'a [FileCallOverlay],
     reach_graph: Option<&'a ReachGraph>,
     semantic_family: SemanticFamily,
@@ -162,9 +27,9 @@ pub struct CallRelationService<'a> {
 
 impl<'a> CallRelationService<'a> {
     #[cfg(test)]
-    pub fn new(handle: &'a CallReadHandle) -> Self {
+    pub fn new(read_context: &'a DeclarationReadContext) -> Self {
         Self {
-            handle,
+            read_context,
             overlays: &[],
             reach_graph: None,
             semantic_family: SemanticFamily::CFamily,
@@ -172,9 +37,12 @@ impl<'a> CallRelationService<'a> {
     }
 
     #[cfg(test)]
-    pub fn for_request(handle: &'a CallReadHandle, overlays: &'a [FileCallOverlay]) -> Self {
+    pub fn for_request(
+        read_context: &'a DeclarationReadContext,
+        overlays: &'a [FileCallOverlay],
+    ) -> Self {
         Self {
-            handle,
+            read_context,
             overlays,
             reach_graph: None,
             semantic_family: SemanticFamily::CFamily,
@@ -183,12 +51,12 @@ impl<'a> CallRelationService<'a> {
 
     #[cfg(test)]
     pub fn for_request_with_reach(
-        handle: &'a CallReadHandle,
+        read_context: &'a DeclarationReadContext,
         overlays: &'a [FileCallOverlay],
         reach_graph: Option<&'a ReachGraph>,
     ) -> Self {
         Self {
-            handle,
+            read_context,
             overlays,
             reach_graph,
             semantic_family: SemanticFamily::CFamily,
@@ -196,13 +64,13 @@ impl<'a> CallRelationService<'a> {
     }
 
     pub fn for_request_with_reach_and_family(
-        handle: &'a CallReadHandle,
+        read_context: &'a DeclarationReadContext,
         overlays: &'a [FileCallOverlay],
         reach_graph: Option<&'a ReachGraph>,
         semantic_family: SemanticFamily,
     ) -> Self {
         Self {
-            handle,
+            read_context,
             overlays,
             reach_graph,
             semantic_family,
@@ -210,18 +78,16 @@ impl<'a> CallRelationService<'a> {
     }
 
     pub fn prepare_at(&self, path: &str, position: SourcePosition) -> Result<RelationQueryIndex> {
-        let store = IndexStore::open_readonly(self.handle.db.path())?;
-        let guard = store.begin_semantic_read(Some(self.handle.generation.0))?;
-        let catalog = locator_catalog(
-            &guard.store().call_fact_view(),
-            self.overlays,
-            path,
-            position,
-            self.reach_graph,
-            self.semantic_family,
-        )?;
-        guard.finish()?;
-        Ok(catalog)
+        self.read_context.read(|store| {
+            locator_catalog(
+                &store.call_fact_view(),
+                self.overlays,
+                path,
+                position,
+                self.reach_graph,
+                self.semantic_family,
+            )
+        })
     }
 
     pub fn query_at(
@@ -233,44 +99,43 @@ impl<'a> CallRelationService<'a> {
         relation_limit: usize,
         call_site_limit: usize,
     ) -> Result<(RelationQueryIndex, String, RelationPage)> {
-        let store = IndexStore::open_readonly(self.handle.db.path())?;
-        let guard = store.begin_semantic_read(Some(self.handle.generation.0))?;
-        let view = guard.store().call_fact_view();
-        let locator_catalog = locator_catalog(
-            &view,
-            self.overlays,
-            path,
-            position,
-            self.reach_graph,
-            self.semantic_family,
-        )?;
-        let entity = locator_catalog
-            .entity_at(path, position)
-            .context("no callable at requested position")?;
-        let key = entity.entity_key.clone();
-        let name = entity.name.clone();
-        let raw_keys = locator_catalog
-            .raw_keys_for_entity(&key)
-            .context("callable group lost its parser identity")?
-            .to_vec();
+        self.read_context.read(|store| {
+            let view = store.call_fact_view();
+            let locator_catalog = locator_catalog(
+                &view,
+                self.overlays,
+                path,
+                position,
+                self.reach_graph,
+                self.semantic_family,
+            )?;
+            let entity = locator_catalog
+                .entity_at(path, position)
+                .context("no callable at requested position")?;
+            let key = entity.entity_key.clone();
+            let name = entity.name.clone();
+            let raw_keys = locator_catalog
+                .raw_keys_for_entity(&key)
+                .context("callable group lost its parser identity")?
+                .to_vec();
 
-        let (catalog, page) = query_resolved(
-            &view,
-            ResolvedQuery {
-                key: &key,
-                raw_keys: &raw_keys,
-                name: &name,
-                direction,
-                cursor,
-                relation_limit,
-                call_site_limit,
-                overlays: self.overlays,
-                reach_graph: self.reach_graph,
-                semantic_family: self.semantic_family,
-            },
-        )?;
-        guard.finish()?;
-        Ok((catalog, key, page))
+            let (catalog, page) = query_resolved(
+                &view,
+                ResolvedQuery {
+                    key: &key,
+                    raw_keys: &raw_keys,
+                    name: &name,
+                    direction,
+                    cursor,
+                    relation_limit,
+                    call_site_limit,
+                    overlays: self.overlays,
+                    reach_graph: self.reach_graph,
+                    semantic_family: self.semantic_family,
+                },
+            )?;
+            Ok((catalog, key, page))
+        })
     }
 
     pub fn query_locator(
@@ -281,43 +146,29 @@ impl<'a> CallRelationService<'a> {
         relation_limit: usize,
         call_site_limit: usize,
     ) -> Result<(RelationQueryIndex, String, RelationPage)> {
-        let store = IndexStore::open_readonly(self.handle.db.path())?;
-        let guard = store.begin_semantic_read(Some(self.handle.generation.0))?;
-        let view = guard.store().call_fact_view();
-        let raw_key = raw_entity_key(&locator.entity_key);
-        let mut anchors = Vec::new();
-        let mut seen = HashSet::new();
-        let mut candidate_recall_limited = append_anchors_bounded(
-            &mut anchors,
-            &mut seen,
-            self.overlays
-                .iter()
-                .filter(|overlay| overlay.semantic_family == self.semantic_family)
-                .flat_map(|overlay| overlay.anchors.iter())
-                .filter(|anchor| anchor.entity_key == raw_key || anchor.path == locator.path)
-                .cloned(),
-            DEFAULT_CANDIDATE_EXPANSION_LIMIT,
-        );
-        let remaining = DEFAULT_CANDIDATE_EXPANSION_LIMIT.saturating_sub(anchors.len());
-        let (rows, durable_limited) =
-            view.anchors_by_entity_key_family_limited(raw_key, self.semantic_family, remaining)?;
-        candidate_recall_limited |= durable_limited;
-        append_anchors_bounded(
-            &mut anchors,
-            &mut seen,
-            rows.into_iter()
-                .filter(|row| !is_shadowed(self.overlays, &row.path))
-                .map(anchor_from_row),
-            DEFAULT_CANDIDATE_EXPANSION_LIMIT,
-        );
-        if anchors.is_empty() && !candidate_recall_limited {
+        self.read_context.read(|store| {
+            let view = store.call_fact_view();
+            let raw_key = raw_entity_key(&locator.entity_key);
+            let mut anchors = Vec::new();
+            let mut seen = HashSet::new();
+            let mut candidate_recall_limited = append_anchors_bounded(
+                &mut anchors,
+                &mut seen,
+                self.overlays
+                    .iter()
+                    .filter(|overlay| overlay.semantic_family == self.semantic_family)
+                    .flat_map(|overlay| overlay.anchors.iter())
+                    .filter(|anchor| anchor.entity_key == raw_key || anchor.path == locator.path)
+                    .cloned(),
+                DEFAULT_CANDIDATE_EXPANSION_LIMIT,
+            );
             let remaining = DEFAULT_CANDIDATE_EXPANSION_LIMIT.saturating_sub(anchors.len());
-            let (rows, path_limited) = view.anchors_by_path_family_limited(
-                &locator.path,
+            let (rows, durable_limited) = view.anchors_by_entity_key_family_limited(
+                raw_key,
                 self.semantic_family,
                 remaining,
             )?;
-            candidate_recall_limited |= path_limited;
+            candidate_recall_limited |= durable_limited;
             append_anchors_bounded(
                 &mut anchors,
                 &mut seen,
@@ -326,45 +177,61 @@ impl<'a> CallRelationService<'a> {
                     .map(anchor_from_row),
                 DEFAULT_CANDIDATE_EXPANSION_LIMIT,
             );
-        }
-        let (anchors, expansion_limited) =
-            expand_anchor_names(&view, self.overlays, anchors, self.semantic_family)?;
-        candidate_recall_limited |= expansion_limited;
-        let coverage = coverage_summary(view.request_coverage()?);
-        let locator_catalog = RelationQueryIndex::build_from_facts_with_context(
-            anchors,
-            Vec::<CallSiteFact>::new(),
-            coverage,
-            self.reach_graph,
-            overlays_incomplete(self.overlays, self.semantic_family),
-            candidate_recall_limited,
-        );
-        let entity = locator_catalog
-            .resolve_locator(locator)
-            .context("callable locator is stale")?;
-        let key = entity.entity_key.clone();
-        let name = entity.name.clone();
-        let raw_keys = locator_catalog
-            .raw_keys_for_entity(&key)
-            .context("callable group lost its parser identity")?
-            .to_vec();
-        let (catalog, page) = query_resolved(
-            &view,
-            ResolvedQuery {
-                key: &key,
-                raw_keys: &raw_keys,
-                name: &name,
-                direction,
-                cursor,
-                relation_limit,
-                call_site_limit,
-                overlays: self.overlays,
-                reach_graph: self.reach_graph,
-                semantic_family: self.semantic_family,
-            },
-        )?;
-        guard.finish()?;
-        Ok((catalog, key, page))
+            if anchors.is_empty() && !candidate_recall_limited {
+                let remaining = DEFAULT_CANDIDATE_EXPANSION_LIMIT.saturating_sub(anchors.len());
+                let (rows, path_limited) = view.anchors_by_path_family_limited(
+                    &locator.path,
+                    self.semantic_family,
+                    remaining,
+                )?;
+                candidate_recall_limited |= path_limited;
+                append_anchors_bounded(
+                    &mut anchors,
+                    &mut seen,
+                    rows.into_iter()
+                        .filter(|row| !is_shadowed(self.overlays, &row.path))
+                        .map(anchor_from_row),
+                    DEFAULT_CANDIDATE_EXPANSION_LIMIT,
+                );
+            }
+            let (anchors, expansion_limited) =
+                expand_anchor_names(&view, self.overlays, anchors, self.semantic_family)?;
+            candidate_recall_limited |= expansion_limited;
+            let coverage = coverage_summary(view.request_coverage()?);
+            let locator_catalog = RelationQueryIndex::build_from_facts_with_context(
+                anchors,
+                Vec::<CallSiteFact>::new(),
+                coverage,
+                self.reach_graph,
+                overlays_incomplete(self.overlays, self.semantic_family),
+                candidate_recall_limited,
+            );
+            let entity = locator_catalog
+                .resolve_locator(locator)
+                .context("callable locator is stale")?;
+            let key = entity.entity_key.clone();
+            let name = entity.name.clone();
+            let raw_keys = locator_catalog
+                .raw_keys_for_entity(&key)
+                .context("callable group lost its parser identity")?
+                .to_vec();
+            let (catalog, page) = query_resolved(
+                &view,
+                ResolvedQuery {
+                    key: &key,
+                    raw_keys: &raw_keys,
+                    name: &name,
+                    direction,
+                    cursor,
+                    relation_limit,
+                    call_site_limit,
+                    overlays: self.overlays,
+                    reach_graph: self.reach_graph,
+                    semantic_family: self.semantic_family,
+                },
+            )?;
+            Ok((catalog, key, page))
+        })
     }
 
     pub fn query_key(
@@ -375,74 +242,76 @@ impl<'a> CallRelationService<'a> {
         relation_limit: usize,
         call_site_limit: usize,
     ) -> Result<(RelationQueryIndex, String, RelationPage)> {
-        let store = IndexStore::open_readonly(self.handle.db.path())?;
-        let guard = store.begin_semantic_read(Some(self.handle.generation.0))?;
-        let view = guard.store().call_fact_view();
-        let raw_key = raw_entity_key(key);
-        let mut anchors = Vec::new();
-        let mut seen = HashSet::new();
-        let mut candidate_recall_limited = append_anchors_bounded(
-            &mut anchors,
-            &mut seen,
-            self.overlays
-                .iter()
-                .filter(|overlay| overlay.semantic_family == self.semantic_family)
-                .flat_map(|overlay| overlay.anchors.iter())
-                .filter(|anchor| anchor.entity_key == raw_key)
-                .cloned(),
-            DEFAULT_CANDIDATE_EXPANSION_LIMIT,
-        );
-        let remaining = DEFAULT_CANDIDATE_EXPANSION_LIMIT.saturating_sub(anchors.len());
-        let (rows, durable_limited) =
-            view.anchors_by_entity_key_family_limited(raw_key, self.semantic_family, remaining)?;
-        candidate_recall_limited |= durable_limited;
-        append_anchors_bounded(
-            &mut anchors,
-            &mut seen,
-            rows.into_iter()
-                .filter(|row| !is_shadowed(self.overlays, &row.path))
-                .map(anchor_from_row),
-            DEFAULT_CANDIDATE_EXPANSION_LIMIT,
-        );
-        let (anchors, expansion_limited) =
-            expand_anchor_names(&view, self.overlays, anchors, self.semantic_family)?;
-        candidate_recall_limited |= expansion_limited;
-        let coverage = coverage_summary(view.request_coverage()?);
-        let locator_catalog = RelationQueryIndex::build_from_facts_with_context(
-            anchors,
-            Vec::<CallSiteFact>::new(),
-            coverage,
-            self.reach_graph,
-            overlays_incomplete(self.overlays, self.semantic_family),
-            candidate_recall_limited,
-        );
-        let entity = locator_catalog
-            .entity(key)
-            .or_else(|| locator_catalog.entity_for_unique_raw_key(raw_key))
-            .context("callable key is stale")?;
-        let resolved_key = entity.entity_key.clone();
-        let name = entity.name.clone();
-        let raw_keys = locator_catalog
-            .raw_keys_for_entity(&resolved_key)
-            .context("callable group lost its parser identity")?
-            .to_vec();
-        let (catalog, page) = query_resolved(
-            &view,
-            ResolvedQuery {
-                key: &resolved_key,
-                raw_keys: &raw_keys,
-                name: &name,
-                direction,
-                cursor,
-                relation_limit,
-                call_site_limit,
-                overlays: self.overlays,
-                reach_graph: self.reach_graph,
-                semantic_family: self.semantic_family,
-            },
-        )?;
-        guard.finish()?;
-        Ok((catalog, resolved_key, page))
+        self.read_context.read(|store| {
+            let view = store.call_fact_view();
+            let raw_key = raw_entity_key(key);
+            let mut anchors = Vec::new();
+            let mut seen = HashSet::new();
+            let mut candidate_recall_limited = append_anchors_bounded(
+                &mut anchors,
+                &mut seen,
+                self.overlays
+                    .iter()
+                    .filter(|overlay| overlay.semantic_family == self.semantic_family)
+                    .flat_map(|overlay| overlay.anchors.iter())
+                    .filter(|anchor| anchor.entity_key == raw_key)
+                    .cloned(),
+                DEFAULT_CANDIDATE_EXPANSION_LIMIT,
+            );
+            let remaining = DEFAULT_CANDIDATE_EXPANSION_LIMIT.saturating_sub(anchors.len());
+            let (rows, durable_limited) = view.anchors_by_entity_key_family_limited(
+                raw_key,
+                self.semantic_family,
+                remaining,
+            )?;
+            candidate_recall_limited |= durable_limited;
+            append_anchors_bounded(
+                &mut anchors,
+                &mut seen,
+                rows.into_iter()
+                    .filter(|row| !is_shadowed(self.overlays, &row.path))
+                    .map(anchor_from_row),
+                DEFAULT_CANDIDATE_EXPANSION_LIMIT,
+            );
+            let (anchors, expansion_limited) =
+                expand_anchor_names(&view, self.overlays, anchors, self.semantic_family)?;
+            candidate_recall_limited |= expansion_limited;
+            let coverage = coverage_summary(view.request_coverage()?);
+            let locator_catalog = RelationQueryIndex::build_from_facts_with_context(
+                anchors,
+                Vec::<CallSiteFact>::new(),
+                coverage,
+                self.reach_graph,
+                overlays_incomplete(self.overlays, self.semantic_family),
+                candidate_recall_limited,
+            );
+            let entity = locator_catalog
+                .entity(key)
+                .or_else(|| locator_catalog.entity_for_unique_raw_key(raw_key))
+                .context("callable key is stale")?;
+            let resolved_key = entity.entity_key.clone();
+            let name = entity.name.clone();
+            let raw_keys = locator_catalog
+                .raw_keys_for_entity(&resolved_key)
+                .context("callable group lost its parser identity")?
+                .to_vec();
+            let (catalog, page) = query_resolved(
+                &view,
+                ResolvedQuery {
+                    key: &resolved_key,
+                    raw_keys: &raw_keys,
+                    name: &name,
+                    direction,
+                    cursor,
+                    relation_limit,
+                    call_site_limit,
+                    overlays: self.overlays,
+                    reach_graph: self.reach_graph,
+                    semantic_family: self.semantic_family,
+                },
+            )?;
+            Ok((catalog, resolved_key, page))
+        })
     }
 }
 
@@ -846,8 +715,14 @@ fn unique_names<'a>(values: impl Iterator<Item = &'a String>) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::candidate_service::CandidateOverlaySnapshot;
+    use crate::declaration_read::DeclarationReadContext;
     use crate::indexer::{index_workspace, IndexOptions};
+    use crate::store::IndexStore;
     use std::sync::Arc;
+
+    fn read_context(handle: &CallReadHandle) -> DeclarationReadContext {
+        DeclarationReadContext::from_handle(Arc::new(handle.clone()))
+    }
 
     #[test]
     fn diagnostic_handle_pins_one_readonly_snapshot_across_publication() {
@@ -911,6 +786,105 @@ mod tests {
     }
 
     #[test]
+    fn captured_handle_rejects_same_path_replacement_with_reused_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.sqlite");
+        let mut first = IndexStore::open(&db, dir.path()).unwrap();
+        let first_source = "int first_database_name;\n";
+        let first_parsed = crate::parser::parse(std::path::Path::new("main.c"), first_source);
+        let first_fp = crate::store::FileFingerprint {
+            path: "main.c".into(),
+            extension: "c".into(),
+            size: first_source.len() as u64,
+            mtime_ns: 1,
+            hash: blake3::hash(first_source.as_bytes()).to_hex().to_string(),
+        };
+        first
+            .apply_file_updates(&[crate::store::FileIndexUpdate {
+                fingerprint: &first_fp,
+                source: crate::store::FileSource::Workspace,
+                payload: crate::store::FileIndexPayload::Ok(&first_parsed),
+            }])
+            .unwrap();
+        let handle = CallReadHandle::capture(db.clone()).unwrap();
+        let captured_generation = handle.generation;
+        let captured_incarnation = handle.database_incarnation().unwrap().to_string();
+        drop(first);
+
+        let replaced = dir.path().join("replaced.sqlite");
+        std::fs::rename(&db, &replaced).unwrap();
+        let mut second = IndexStore::open(&db, dir.path()).unwrap();
+        let second_source = "int second_database_name;\n";
+        let second_parsed = crate::parser::parse(std::path::Path::new("main.c"), second_source);
+        let second_fp = crate::store::FileFingerprint {
+            path: "main.c".into(),
+            extension: "c".into(),
+            size: second_source.len() as u64,
+            mtime_ns: 1,
+            hash: blake3::hash(second_source.as_bytes()).to_hex().to_string(),
+        };
+        second
+            .apply_file_updates(&[crate::store::FileIndexUpdate {
+                fingerprint: &second_fp,
+                source: crate::store::FileSource::Workspace,
+                payload: crate::store::FileIndexPayload::Ok(&second_parsed),
+            }])
+            .unwrap();
+        assert_eq!(second.semantic_generation().unwrap(), captured_generation.0);
+        assert_ne!(
+            second.entity_view().incarnation().unwrap(),
+            captured_incarnation
+        );
+        drop(second);
+
+        let error = handle
+            .read(|store| store.declaration_view().by_name("second_database_name"))
+            .expect_err("same generation cannot make a replacement database compatible");
+        assert!(
+            format!("{error:#}").contains("database identity"),
+            "unexpected rejection: {error:#}"
+        );
+        assert_eq!(
+            crate::declaration_read_handle::declaration_read_failure_reason(&error),
+            Some(crate::declaration_read_handle::DeclarationReadFailureReason::IdentityMismatch)
+        );
+    }
+
+    #[test]
+    fn declaration_read_reasons_keep_empty_execution_snapshot_and_cancellation_distinct() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.sqlite");
+        let store = IndexStore::open(&db, dir.path()).unwrap();
+        drop(store);
+        let handle = CallReadHandle::capture(db.clone()).unwrap();
+        let context = DeclarationReadContext::from_handle(Arc::new(handle.clone()));
+
+        assert!(context.payloads_by_ids(&[i64::MAX]).unwrap().is_empty());
+        let execution = context
+            .read::<()>(|_| anyhow::bail!("forced typed read failure"))
+            .unwrap_err();
+        assert_eq!(
+            crate::declaration_read_handle::declaration_read_failure_reason(&execution),
+            Some(crate::declaration_read_handle::DeclarationReadFailureReason::ExecutionFailed)
+        );
+
+        let cancelled = anyhow::anyhow!("request cancelled before declaration read");
+        assert_eq!(
+            crate::declaration_read_handle::declaration_read_failure_reason(&cancelled),
+            Some(crate::declaration_read_handle::DeclarationReadFailureReason::Cancelled)
+        );
+
+        std::fs::rename(&db, dir.path().join("unavailable.sqlite")).unwrap();
+        let unavailable = handle
+            .read(|store| store.declaration_view().by_ids(&[i64::MAX]))
+            .unwrap_err();
+        assert_eq!(
+            crate::declaration_read_handle::declaration_read_failure_reason(&unavailable),
+            Some(crate::declaration_read_handle::DeclarationReadFailureReason::SnapshotUnavailable)
+        );
+    }
+
+    #[test]
     fn lazy_store_query_and_overlay_merge_preserve_expected_relation() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
@@ -938,7 +912,8 @@ mod tests {
         .unwrap();
 
         let handle = CallReadHandle::capture(db_path).unwrap();
-        let service = CallRelationService::new(&handle);
+        let context = read_context(&handle);
+        let service = CallRelationService::new(&context);
         let prepared = service
             .prepare_at(
                 "target.c",
@@ -992,7 +967,7 @@ mod tests {
             clean_caller_replacement.callable_anchors,
             clean_caller_replacement.call_sites,
         );
-        let (_, _, shadowed_page) = CallRelationService::for_request(&handle, &[shadow])
+        let (_, _, shadowed_page) = CallRelationService::for_request(&context, &[shadow])
             .query_at(
                 "target.c",
                 SourcePosition {
@@ -1016,7 +991,7 @@ mod tests {
             dirty_other.callable_anchors,
             dirty_other.call_sites,
         );
-        let (_, _, merged_page) = CallRelationService::for_request(&handle, &[other])
+        let (_, _, merged_page) = CallRelationService::for_request(&context, &[other])
             .query_at(
                 "target.c",
                 SourcePosition {
@@ -1063,8 +1038,9 @@ mod tests {
         .unwrap();
 
         let handle = CallReadHandle::capture(db_path).unwrap();
+        let context = read_context(&handle);
         let (_, _, page) = CallRelationService::for_request_with_reach_and_family(
-            &handle,
+            &context,
             &[],
             None,
             crate::semantic_model::SemanticFamily::Go,
@@ -1119,8 +1095,9 @@ mod tests {
         .unwrap();
 
         let handle = CallReadHandle::capture(db_path).unwrap();
+        let context = read_context(&handle);
         let (_, _, page) = CallRelationService::for_request_with_reach_and_family(
-            &handle,
+            &context,
             &[],
             None,
             crate::semantic_model::SemanticFamily::Go,
@@ -1178,8 +1155,9 @@ mod tests {
         .unwrap();
 
         let handle = CallReadHandle::capture(db_path).unwrap();
+        let context = read_context(&handle);
         let service = CallRelationService::for_request_with_reach_and_family(
-            &handle,
+            &context,
             &[],
             None,
             crate::semantic_model::SemanticFamily::Go,
@@ -1282,7 +1260,8 @@ mod tests {
         .unwrap();
 
         let handle = CallReadHandle::capture(db_path).unwrap();
-        let (catalog, _, page) = CallRelationService::new(&handle)
+        let context = read_context(&handle);
+        let (catalog, _, page) = CallRelationService::new(&context)
             .query_at(
                 "target.c",
                 SourcePosition {
@@ -1332,7 +1311,8 @@ mod tests {
             .collect();
         let overlay = FileCallOverlay::new("dirty.c".into(), parsed.callable_anchors, calls);
         let handle = CallReadHandle::capture(db_path).unwrap();
-        let (catalog, _, page) = CallRelationService::for_request(&handle, &[overlay])
+        let context = read_context(&handle);
+        let (catalog, _, page) = CallRelationService::for_request(&context, &[overlay])
             .query_at(
                 "target.c",
                 SourcePosition {
@@ -1375,7 +1355,8 @@ mod tests {
 
         let graph = ReachGraph::new(vec![("impl.c".into(), "api.h".into())], vec![], vec![]);
         let handle = CallReadHandle::capture(db_path).unwrap();
-        let catalog = CallRelationService::for_request_with_reach(&handle, &[], Some(&graph))
+        let context = read_context(&handle);
+        let catalog = CallRelationService::for_request_with_reach(&context, &[], Some(&graph))
             .prepare_at(
                 "impl.c",
                 SourcePosition {
@@ -1398,7 +1379,7 @@ mod tests {
         assert!(entity.primary_anchor.body_range.is_some());
 
         let (catalog, key, page) =
-            CallRelationService::for_request_with_reach(&handle, &[], Some(&graph))
+            CallRelationService::for_request_with_reach(&context, &[], Some(&graph))
                 .query_at(
                     "impl.c",
                     SourcePosition {
@@ -1440,6 +1421,7 @@ mod tests {
         )
         .unwrap();
         let handle = CallReadHandle::capture(db_path).unwrap();
+        let context = read_context(&handle);
 
         let base = Arc::new(ReachGraph::new(
             vec![("impl.c".into(), "old.h".into())],
@@ -1474,7 +1456,7 @@ mod tests {
         let reach = snapshot.effective_reach_graph_arc(None).unwrap();
         let overlays = snapshot.call_relation_overlays();
         let catalog =
-            CallRelationService::for_request_with_reach(&handle, &overlays, Some(reach.as_ref()))
+            CallRelationService::for_request_with_reach(&context, &overlays, Some(reach.as_ref()))
                 .prepare_at(
                     "impl.c",
                     SourcePosition {
@@ -1526,7 +1508,7 @@ mod tests {
         let reach = snapshot.effective_reach_graph_arc(None).unwrap();
         let overlays = snapshot.call_relation_overlays();
         let catalog =
-            CallRelationService::for_request_with_reach(&handle, &overlays, Some(reach.as_ref()))
+            CallRelationService::for_request_with_reach(&context, &overlays, Some(reach.as_ref()))
                 .prepare_at(
                     "impl.c",
                     SourcePosition {

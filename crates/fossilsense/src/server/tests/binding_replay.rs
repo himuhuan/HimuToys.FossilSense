@@ -55,7 +55,7 @@ async fn replay_binding_requests() {
         "64 bounded real-source witnesses are required"
     );
     let witnesses = index
-        .payloads_by_ids(engine.call_read_handle.as_ref().unwrap(), &ids)
+        .payloads_by_ids_bound(engine.call_read_handle.as_ref().unwrap(), &ids)
         .unwrap();
     assert_eq!(witnesses.len(), 64);
     let mut inputs = Vec::new();

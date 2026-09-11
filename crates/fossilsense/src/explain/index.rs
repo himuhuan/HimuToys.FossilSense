@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -9,6 +10,7 @@ use crate::candidate_service::{
     navigation_presentations, CandidateOverlaySnapshot, CandidateQueryService, SemanticIntent,
 };
 use crate::config::LanguageSelection;
+use crate::declaration_read::DeclarationReadContext;
 use crate::semantic_model::PARSER_FACT_VERSION;
 
 use super::{stage, FACT_LIMIT};
@@ -30,9 +32,10 @@ pub(super) fn observe(
     if !path.try_exists()? {
         return not_run(report, "index_missing");
     }
-    let handle = CallReadHandle::capture_diagnostic(path)?;
+    let read_context =
+        DeclarationReadContext::from_handle(Arc::new(CallReadHandle::capture_diagnostic(path)?));
     let metadata: crate::store::DiagnosticIndexMetadata =
-        handle.read(|store| store.diagnostic_metadata())?;
+        read_context.read(|store| store.diagnostic_metadata())?;
     report["indexObservation"]["metadata"] = serde_json::to_value(&metadata)?;
     report["indexObservation"]["generation"] = json!(metadata.generation);
     if !metadata.compatible {
@@ -47,7 +50,7 @@ pub(super) fn observe(
         report["indexObservation"]["status"] = json!("unknown");
         return not_run(report, "index_workspace_mismatch");
     }
-    let (stored, coverage, versions) = handle.read(|store| {
+    let (stored, coverage, versions) = read_context.read(|store| {
         Ok((
             store.stored_file(rel)?,
             store.coverage_view().for_path(rel)?,
@@ -78,7 +81,7 @@ pub(super) fn observe(
     report["indexObservation"]["fileRevision"] =
         json!(coverage.as_ref().map(|row| row.revision_id));
     report["indexObservation"]["coverage"] = json!(coverage.as_ref().map(|row| row.summary));
-    let (rows, limited) = handle.read(|store| {
+    let (rows, limited) = read_context.read(|store| {
         store.declaration_view().by_name_family_in_paths_limited(
             name,
             selection.semantic_family(),
@@ -119,7 +122,7 @@ pub(super) fn observe(
     }
     let overlays = CandidateOverlaySnapshot::default();
     let service = CandidateQueryService::new_for_family(
-        Some(&handle),
+        Some(&read_context),
         &overlays,
         rel,
         None,
@@ -138,7 +141,7 @@ pub(super) fn observe(
     );
     // Final evidence returns through canonical typed rows by ID. Never turn
     // compact recall rows into final presentation content.
-    let hydrated = handle.read(|store| store.declaration_view().by_ids(&ids))?;
+    let hydrated = read_context.read(|store| store.declaration_view().by_ids(&ids))?;
     anyhow::ensure!(
         hydrated.len() == ids.len(),
         "diagnostic snapshot lost a recalled declaration"
@@ -150,7 +153,7 @@ pub(super) fn observe(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    let candidate_versions = handle.read(|store| store.diagnostic_parser_versions(&paths))?;
+    let candidate_versions = read_context.read(|store| store.diagnostic_parser_versions(&paths))?;
     let stale_facts = candidate_versions
         .iter()
         .any(|(_, version)| *version != PARSER_FACT_VERSION);

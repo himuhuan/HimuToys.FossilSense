@@ -170,8 +170,7 @@ impl Backend {
         let mut reach_us = reach_started.elapsed().as_micros();
         let project_context = context.engine.project_context.clone();
         let protobuf_c_enabled = context.engine.workspace_semantics.protobuf_c_enabled();
-        let call_read_handle = context.engine.call_read_handle.clone();
-        let declaration_index = context.engine.declaration_index.clone();
+        let declaration_read = context.engine.declaration_read_context();
         let reach_graph = context.engine.reach_graph.clone();
         let overlay_started = std::time::Instant::now();
         let overlay = self
@@ -190,9 +189,9 @@ impl Backend {
             move || -> Result<(Option<String>, SemanticRequestPerf)> {
                 let _reads = crate::call_service::ReadSessionProbe::enter(reads);
                 let query_started = std::time::Instant::now();
-                let service = CandidateQueryService::new_with_declarations_for_family(
-                    call_read_handle.as_deref(),
-                    declaration_index.as_deref(),
+                let declaration_read = declaration_read?;
+                let service = CandidateQueryService::new_for_family(
+                    declaration_read.as_ref(),
                     &overlay,
                     &current_rel,
                     reach_scope.as_deref(),

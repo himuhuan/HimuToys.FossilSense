@@ -15,7 +15,8 @@ use crate::call_model::{
     BudgetState, CallRelation, CallableEntity, CallableLocator, CoverageSummary, RelationDirection,
     RelationRevision, SourcePosition, SourceRange, RELATION_PROTOCOL_VERSION,
 };
-use crate::call_service::{CallReadHandle, CallRelationService, FileCallOverlay};
+use crate::call_service::{CallRelationService, FileCallOverlay};
+use crate::declaration_read::DeclarationReadContext;
 use crate::pathing;
 use crate::query::CALLABLE_CANDIDATE_RESOLVER_VERSION;
 use crate::reachability::ReachGraph;
@@ -34,7 +35,7 @@ struct ItemData {
 
 pub(super) struct RelationRequestState {
     pub(super) root: PathBuf,
-    pub(super) handle: Arc<CallReadHandle>,
+    pub(super) read_context: Arc<DeclarationReadContext>,
     pub(super) overlays: Arc<Vec<FileCallOverlay>>,
     pub(super) revision: RelationRevision,
     reach_graph: Option<std::sync::Arc<ReachGraph>>,
@@ -51,14 +52,14 @@ impl RelationRequestState {
         relation_limit: usize,
         call_site_limit: usize,
     ) -> anyhow::Result<(RelationQueryIndex, String, RelationPage)> {
-        let handle = self.handle.clone();
+        let read_context = self.read_context.clone();
         let overlays = self.overlays.clone();
         let reach_graph = self.reach_graph.clone();
         let semantic_family = self.semantic_family;
         let path = path.to_string();
         let (catalog, key, mut page) = tokio::task::spawn_blocking(move || {
             CallRelationService::for_request_with_reach_and_family(
-                &handle,
+                &read_context,
                 &overlays,
                 reach_graph.as_deref(),
                 semantic_family,
@@ -85,14 +86,14 @@ impl RelationRequestState {
         relation_limit: usize,
         call_site_limit: usize,
     ) -> anyhow::Result<(RelationQueryIndex, String, RelationPage)> {
-        let handle = self.handle.clone();
+        let read_context = self.read_context.clone();
         let overlays = self.overlays.clone();
         let reach_graph = self.reach_graph.clone();
         let semantic_family = self.semantic_family;
         let key = key.to_string();
         let (catalog, key, mut page) = tokio::task::spawn_blocking(move || {
             CallRelationService::for_request_with_reach_and_family(
-                &handle,
+                &read_context,
                 &overlays,
                 reach_graph.as_deref(),
                 semantic_family,
@@ -112,14 +113,14 @@ impl RelationRequestState {
         relation_limit: usize,
         call_site_limit: usize,
     ) -> anyhow::Result<(RelationQueryIndex, String, RelationPage)> {
-        let handle = self.handle.clone();
+        let read_context = self.read_context.clone();
         let overlays = self.overlays.clone();
         let reach_graph = self.reach_graph.clone();
         let semantic_family = self.semantic_family;
         let locator = locator.clone();
         let (catalog, key, mut page) = tokio::task::spawn_blocking(move || {
             CallRelationService::for_request_with_reach_and_family(
-                &handle,
+                &read_context,
                 &overlays,
                 reach_graph.as_deref(),
                 semantic_family,
@@ -250,7 +251,19 @@ impl Backend {
         context: super::RequestContext,
         documents: super::workspace::DocumentRequestSnapshot,
     ) -> Option<RelationRequestState> {
-        let handle = context.engine.call_read_handle.clone()?;
+        let read_context = match context.engine.declaration_read_context() {
+            Ok(Some(read_context)) => Arc::new(read_context),
+            Ok(None) => return None,
+            Err(error) => {
+                self.client
+                    .log_message(
+                        tower_lsp::lsp_types::MessageType::ERROR,
+                        format!("call hierarchy declaration snapshot unavailable: {error:#}"),
+                    )
+                    .await;
+                return None;
+            }
+        };
         let overlay = self
             .candidate_overlay_snapshot_from_documents(&root, context.engine.clone(), documents)
             .await;
@@ -264,7 +277,7 @@ impl Backend {
             .semantic_family();
         Some(RelationRequestState {
             root,
-            handle,
+            read_context,
             overlays: Arc::new(overlays),
             revision: RelationRevision {
                 engine_epoch: context.engine.epoch.as_u64(),
@@ -285,7 +298,7 @@ impl Backend {
         let state = self.relation_state_for_uri(uri).await?;
         let path = uri_to_path(uri)?;
         let rel = catalog_path(&state.root, &path)?;
-        let handle = state.handle.clone();
+        let read_context = state.read_context.clone();
         let overlays = state.overlays.clone();
         let reach_graph = state.reach_graph.clone();
         let semantic_family = state.semantic_family;
@@ -296,7 +309,7 @@ impl Backend {
         let prepare_rel = rel.clone();
         let catalog = tokio::task::spawn_blocking(move || {
             CallRelationService::for_request_with_reach_and_family(
-                &handle,
+                &read_context,
                 &overlays,
                 reach_graph.as_deref(),
                 semantic_family,

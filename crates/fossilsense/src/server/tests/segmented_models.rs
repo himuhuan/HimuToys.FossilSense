@@ -420,7 +420,8 @@ async fn segmented_include_lsp_reports_inspection_truncation() {
         .session
         .cache
         .publish_engine_snapshot(engine)
-        .await;
+        .await
+        .expect("segmented model snapshot identity");
     let uri = Url::from_file_path(root.path().join("main.c")).unwrap();
     let response = service
         .inner()

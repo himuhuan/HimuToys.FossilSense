@@ -7,8 +7,8 @@ use tower_lsp::lsp_types::MessageType;
 use tower_lsp::Client;
 
 use crate::call_model::SemanticGeneration;
-use crate::call_service::CallReadHandle;
 use crate::declaration_index::SemanticDeclarationIndex;
+use crate::declaration_read_handle::CallReadHandle;
 use crate::pathing;
 use crate::project_context::{self, ProjectContextIndex};
 use crate::store::IndexStore;
@@ -88,12 +88,14 @@ pub(super) fn build_declaration_index_from_db(
     project_context: Option<&ProjectContextIndex>,
     total_budget_bytes: usize,
 ) -> Result<SemanticDeclarationIndex> {
-    let store = IndexStore::open_readonly(db_path)?;
-    let names = crate::query::NameTable::build_from_declaration_view(
-        &store.declaration_view(),
-        project_context,
-    )?;
-    Ok(SemanticDeclarationIndex::build(names, total_budget_bytes))
+    let handle = CallReadHandle::capture(db_path.to_path_buf())?;
+    let names = handle.read(|store| {
+        crate::query::NameTable::build_from_declaration_view(
+            &store.declaration_view(),
+            project_context,
+        )
+    })?;
+    SemanticDeclarationIndex::build(names, total_budget_bytes).bind_identity(handle.identity())
 }
 
 pub(super) fn capture_call_read_handle(
@@ -121,12 +123,13 @@ pub(super) async fn update_declaration_index_paths(
     let query_root = root.clone();
     let built = tokio::task::spawn_blocking(move || -> Result<_> {
         let db_path = pathing::default_index_path(&query_root)?;
-        let store = IndexStore::open_readonly(&db_path)?;
-        store.declaration_view().name_rows_for_paths(&paths_vec)
+        let handle = CallReadHandle::capture(db_path)?;
+        let rows = handle.read(|store| store.declaration_view().name_rows_for_paths(&paths_vec))?;
+        Ok((rows, handle))
     })
     .await;
 
-    let fresh_names = match built {
+    let (fresh_names, handle) = match built {
         Ok(Ok(rows)) => rows,
         Ok(Err(err)) => return Err(err),
         Err(err) => return Err(err.into()),
@@ -138,7 +141,7 @@ pub(super) async fn update_declaration_index_paths(
         project_context.as_deref(),
         total_budget_bytes,
     );
-    Ok(Arc::new(index))
+    Ok(Arc::new(index.bind_identity(handle.identity())?))
 }
 
 pub(super) async fn rebuild_project_context(

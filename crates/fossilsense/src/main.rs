@@ -10,6 +10,8 @@ mod completion_history;
 mod completion_words;
 mod config;
 mod declaration_index;
+mod declaration_read;
+mod declaration_read_handle;
 mod explain;
 mod includes;
 mod indexed_files;
@@ -40,8 +42,6 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-
-use crate::store::IndexStore;
 
 #[derive(Debug, Parser)]
 #[command(name = "fossilsense")]
@@ -646,17 +646,19 @@ fn run_query(kind: QueryCommand) -> Result<()> {
             db,
         } => {
             let db_path = resolve_db_path(db, &workspace)?;
-            let store = IndexStore::open_readonly(&db_path)?;
-            let names =
-                query::NameTable::build_from_declaration_view(&store.declaration_view(), None)?;
+            let read_context = declaration_read::DeclarationReadContext::from_handle(
+                std::sync::Arc::new(call_service::CallReadHandle::capture(db_path)?),
+            );
+            let names = read_context.read(|store| {
+                query::NameTable::build_from_declaration_view(&store.declaration_view(), None)
+            })?;
             let ids: Vec<i64> = names
                 .search_ranked(&text, query::WORKSPACE_SYMBOL_LIMIT)
                 .into_iter()
                 .map(|hit| hit.id)
                 .collect();
-            let records: std::collections::HashMap<_, _> = store
-                .declaration_view()
-                .by_ids(&ids)?
+            let records: std::collections::HashMap<_, _> = read_context
+                .read(|store| store.declaration_view().by_ids(&ids))?
                 .into_iter()
                 .map(|row| (row.id, row))
                 .collect();
@@ -692,10 +694,10 @@ fn run_query(kind: QueryCommand) -> Result<()> {
 
             let rel = pathing::normalize_path_string(&file);
             let semantic_family = query_semantic_family(&workspace, &file);
-            let handle = capture_query_handle(db, &workspace)?;
+            let read_context = capture_query_context(db, &workspace)?;
             let overlay = candidate_service::CandidateOverlaySnapshot::default();
             let service = candidate_service::CandidateQueryService::new_for_family(
-                Some(&handle),
+                Some(&read_context),
                 &overlay,
                 &rel,
                 None,
@@ -755,7 +757,7 @@ fn run_query(kind: QueryCommand) -> Result<()> {
             db,
         } => {
             let build_started = Instant::now();
-            let handle = capture_query_handle(db, &workspace)?;
+            let read_context = capture_query_context(db, &workspace)?;
             let rel = pathing::normalize_path_string(&file);
             let semantic_family = query_semantic_family(&workspace, &file);
             let position = call_model::SourcePosition {
@@ -770,7 +772,7 @@ fn run_query(kind: QueryCommand) -> Result<()> {
             };
             let (query_index, entity_key, page) =
                 call_service::CallRelationService::for_request_with_reach_and_family(
-                    &handle,
+                    &read_context,
                     &[],
                     None,
                     semantic_family,
@@ -868,18 +870,21 @@ fn resolve_db_path(db: Option<PathBuf>, workspace: &Path) -> Result<PathBuf> {
     }
 }
 
-fn capture_query_handle(
+fn capture_query_context(
     db: Option<PathBuf>,
     workspace: &Path,
-) -> Result<call_service::CallReadHandle> {
-    match db {
+) -> Result<declaration_read::DeclarationReadContext> {
+    let handle = match db {
         Some(path) => call_service::CallReadHandle::capture(path),
         None => {
             let workspace = pathing::canonical_workspace(workspace)?;
             let path = pathing::default_index_path(&workspace)?;
             call_service::CallReadHandle::capture_default_generation(path)
         }
-    }
+    }?;
+    Ok(declaration_read::DeclarationReadContext::from_handle(
+        std::sync::Arc::new(handle),
+    ))
 }
 
 fn print_declaration(record: &semantic_model::DeclarationFact) {

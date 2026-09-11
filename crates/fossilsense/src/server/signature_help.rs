@@ -53,8 +53,7 @@ impl Backend {
             .reach_scope_from_context(&uri, &context)
             .map(|(_, reach)| reach);
         let mut reach_us = reach_started.elapsed().as_micros();
-        let call_read_handle = context.engine.call_read_handle.clone();
-        let declaration_index = context.engine.declaration_index.clone();
+        let declaration_read = context.engine.declaration_read_context();
         let reach_graph = context.engine.reach_graph.clone();
         let overlay_started = std::time::Instant::now();
         let overlay = self
@@ -127,9 +126,9 @@ impl Backend {
         let result = tokio::task::spawn_blocking(
             move || -> Result<(Vec<SignatureInformation>, usize, SemanticRequestPerf)> {
                 let query_started = std::time::Instant::now();
-                let service = CandidateQueryService::new_with_declarations_for_family(
-                    call_read_handle.as_deref(),
-                    declaration_index.as_deref(),
+                let declaration_read = declaration_read?;
+                let service = CandidateQueryService::new_for_family(
+                    declaration_read.as_ref(),
                     &overlay,
                     &current_rel,
                     reach_scope.as_deref(),

@@ -628,7 +628,7 @@ impl CacheLedger {
         &self,
         publication: &mut FullPublicationState,
         snapshot: EngineSnapshot,
-    ) -> Arc<EngineSnapshot> {
+    ) -> Result<Arc<EngineSnapshot>> {
         self.publish_engine_snapshot_with_after_swap(
             snapshot,
             || publication.commit(),
@@ -643,7 +643,7 @@ impl CacheLedger {
         mut publication: FullPublicationState,
         snapshot: EngineSnapshot,
         after_swap: AfterSwap,
-    ) -> Arc<EngineSnapshot>
+    ) -> Result<Arc<EngineSnapshot>>
     where
         AfterSwap: std::future::Future<Output = ()>,
     {
@@ -708,7 +708,7 @@ impl CacheLedger {
             let call_read_handle = Arc::new(crate::call_service::CallReadHandle::at_generation(
                 db_path,
                 semantic_generation,
-            ));
+            )?);
             let workspace_semantics = Arc::new(
                 super::super::workspace_config::PublishedWorkspaceSemantics::load_current(
                     &build_root,
@@ -746,9 +746,8 @@ impl CacheLedger {
                 == publication.expected_epoch(),
             "engine epoch changed while building the benchmark snapshot"
         );
-        Ok(self
-            .finish_full_publication_under_gate(&mut publication, snapshot)
-            .await)
+        self.finish_full_publication_under_gate(&mut publication, snapshot)
+            .await
     }
 
     #[cfg(test)]
@@ -951,7 +950,7 @@ impl CacheLedger {
                 degraded: degraded.clone(),
             },
         )
-        .await;
+        .await?;
         drop(_publish_guard);
         self.invalidate_after_index_change().await;
 
@@ -1357,7 +1356,7 @@ impl CacheLedger {
             workspace_semantics,
             degraded: degraded.clone(),
         })
-        .await;
+        .await?;
 
         client
             .log_message(
@@ -1583,7 +1582,7 @@ impl CacheLedger {
             workspace_semantics: current.workspace_semantics.clone(),
             degraded: current.degraded.clone(),
         })
-        .await;
+        .await?;
         self.clear_all_completion_memos().await;
         Ok(true)
     }
@@ -1662,7 +1661,7 @@ impl CacheLedger {
             workspace_semantics: previous.workspace_semantics.clone(),
             degraded,
         })
-        .await;
+        .await?;
         drop(_publish_guard);
         self.invalidate_after_index_change().await;
         self.completion_memo.lock().await.clear();
@@ -1737,7 +1736,8 @@ mod memory_tests {
             let semantic_generation = SemanticGeneration(guard.generation());
             guard.finish()?;
             let call_read_handle =
-                CallReadHandle::at_generation(db_path.to_path_buf(), semantic_generation);
+                CallReadHandle::at_generation(db_path.to_path_buf(), semantic_generation)
+                    .expect("call read handle");
             Ok(Self {
                 declarations,
                 reach_graph,
@@ -1904,7 +1904,8 @@ mod memory_tests {
                 root.clone(),
                 old_index.clone(),
             ))
-            .await;
+            .await
+            .expect("test snapshot identity");
         let _publish_guard = ledger.publish_gate.lock().await;
         let publication = ledger.begin_full_publication_under_gate(&root).await;
         assert_eq!(old_index.effective_payload_budget_bytes(), 0);
@@ -2141,7 +2142,7 @@ mod memory_tests {
                 ids_seen = ids_seen.saturating_add(1);
                 if batch.len() == batch.capacity() {
                     old_index
-                        .payloads_by_ids(&old_handle, &batch)
+                        .payloads_by_ids_bound(&old_handle, &batch)
                         .expect("warm cached declaration batch");
                     batch.clear();
                 }
@@ -2150,7 +2151,7 @@ mod memory_tests {
             .expect("stream stable declaration IDs");
         if !batch.is_empty() && old_index.payload_cache_stats().bytes < warm_target_bytes {
             old_index
-                .payloads_by_ids(&old_handle, &batch)
+                .payloads_by_ids_bound(&old_handle, &batch)
                 .expect("warm final declaration batch");
         }
         let preheat_stats = old_index.payload_cache_stats();
@@ -2185,7 +2186,7 @@ mod memory_tests {
         // sample's declaration ordering instead of on the warmed set.
         let stable_id = first_warmed_id.expect("warm cache holds at least one declaration");
         let before = old_index
-            .payloads_by_ids(&old_handle, &[stable_id])
+            .payloads_by_ids_bound(&old_handle, &[stable_id])
             .expect("read old declaration before publication");
         let warm_stats = old_index.payload_cache_stats();
         assert!(
@@ -2204,7 +2205,7 @@ mod memory_tests {
         let two_generation_private_bytes = current_process_memory_bytes();
         let shrink_stats = old_index.payload_cache_stats();
         let after = old_index
-            .payloads_by_ids(&old_handle, &[stable_id])
+            .payloads_by_ids_bound(&old_handle, &[stable_id])
             .expect("old request reads captured generation after publication");
         let current_request = ledger
             .request_context(root.clone(), Default::default())

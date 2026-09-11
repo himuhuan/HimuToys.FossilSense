@@ -2,7 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::mem::size_of;
 use std::sync::Arc;
 
-use crate::call_service::CallReadHandle;
+use crate::declaration_read_handle::{
+    CallReadHandle, DeclarationReadFailure, DeclarationReadFailureReason, DeclarationReadIdentity,
+};
 use crate::project_context::ProjectContextIndex;
 use crate::query::NameTable;
 use crate::store::views::{DeclarationNameRow, DeclarationReadRow};
@@ -78,6 +80,7 @@ pub struct SemanticDeclarationIndex {
     accounted_core_bytes: usize,
     total_budget_bytes: usize,
     payloads: Arc<DeclarationPayloadCache>,
+    read_identity: Option<DeclarationReadIdentity>,
 }
 
 impl SemanticDeclarationIndex {
@@ -88,6 +91,7 @@ impl SemanticDeclarationIndex {
             accounted_core_bytes: self.accounted_core_bytes,
             total_budget_bytes: self.accounted_core_bytes.saturating_add(budget),
             payloads: Arc::new(DeclarationPayloadCache::new(budget)),
+            read_identity: self.read_identity.clone(),
         }
     }
     #[cfg(test)]
@@ -106,6 +110,7 @@ impl SemanticDeclarationIndex {
             accounted_core_bytes,
             total_budget_bytes,
             payloads: Arc::new(DeclarationPayloadCache::new(payload_budget_bytes)),
+            read_identity: None,
         }
     }
 
@@ -148,11 +153,36 @@ impl SemanticDeclarationIndex {
         self.total_budget_bytes
     }
 
-    pub fn payloads_by_ids(
+    pub(crate) fn read_identity(&self) -> Option<&DeclarationReadIdentity> {
+        self.read_identity.as_ref()
+    }
+
+    pub(crate) fn bind_identity(mut self, identity: &DeclarationReadIdentity) -> Result<Self> {
+        if self
+            .read_identity
+            .as_ref()
+            .is_some_and(|current| current != identity)
+        {
+            return Err(anyhow::Error::new(DeclarationReadFailure::new(
+                DeclarationReadFailureReason::IdentityMismatch,
+                "declaration index is already bound to another read identity",
+            )));
+        }
+        self.read_identity = Some(identity.clone());
+        Ok(self)
+    }
+
+    pub(crate) fn payloads_by_ids_bound(
         &self,
         read_handle: &CallReadHandle,
         ids: &[i64],
     ) -> Result<Vec<Arc<DeclarationReadRow>>> {
+        if self.read_identity.as_ref() != Some(read_handle.identity()) {
+            return Err(anyhow::Error::new(DeclarationReadFailure::new(
+                DeclarationReadFailureReason::IdentityMismatch,
+                "declaration payload cache and read handle identities differ",
+            )));
+        }
         let mut output = HashMap::with_capacity(ids.len());
         let mut missing = Vec::new();
         for &id in ids {
@@ -203,10 +233,12 @@ impl SemanticDeclarationIndex {
     }
 
     pub fn with_project_context(&self, project_context: Option<&ProjectContextIndex>) -> Self {
-        Self::build(
+        let mut rebuilt = Self::build(
             self.names.with_project_context(project_context),
             self.total_budget_bytes,
-        )
+        );
+        rebuilt.read_identity.clone_from(&self.read_identity);
+        rebuilt
     }
 
     pub fn needs_compaction(&self) -> bool {
@@ -219,7 +251,11 @@ impl SemanticDeclarationIndex {
     ) -> Option<Self> {
         self.names
             .compacted_with_cancellation(cancellation)
-            .map(|names| Self::build(names, self.total_budget_bytes))
+            .map(|names| {
+                let mut rebuilt = Self::build(names, self.total_budget_bytes);
+                rebuilt.read_identity.clone_from(&self.read_identity);
+                rebuilt
+            })
     }
 }
 

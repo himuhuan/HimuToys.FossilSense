@@ -293,7 +293,7 @@ impl CandidateQueryService<'_> {
                     .take(self.exact_name_limit)
                     .map(|hit| hit.id)
                     .collect();
-                (index.payloads_by_ids(handle, &ids)?, limited)
+                (index.payloads_by_ids_bound(handle, &ids)?, limited)
             } else {
                 let (current_paths, reachable_paths) = self.durable_priority_path_groups();
                 let (rows, limited) = handle.read(|store| {
@@ -440,7 +440,7 @@ impl CandidateQueryService<'_> {
         };
         let row = if let Some(index) = self.declaration_index {
             index
-                .payloads_by_ids(handle, &[id])?
+                .payloads_by_ids_bound(handle, &[id])?
                 .pop()
                 .map(|row| (*row).clone())
         } else {

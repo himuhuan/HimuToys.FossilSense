@@ -358,7 +358,12 @@ async fn cursor_session_retries_same_generation_engine_swap_and_captures_edit() 
                         .await;
                     let mut next = (*before).clone();
                     next.epoch = backend.session.cache.allocate_engine_epoch();
-                    backend.session.cache.publish_engine_snapshot(next).await;
+                    backend
+                        .session
+                        .cache
+                        .publish_engine_snapshot(next)
+                        .await
+                        .expect("cursor test snapshot identity");
                 }
             }
         })
@@ -406,7 +411,12 @@ async fn cursor_session_continuous_engine_race_stops_after_three_attempts() {
                     let current = backend.request_context_for_root(root).await.engine;
                     let mut next = (*current).clone();
                     next.epoch = backend.session.cache.allocate_engine_epoch();
-                    backend.session.cache.publish_engine_snapshot(next).await;
+                    backend
+                        .session
+                        .cache
+                        .publish_engine_snapshot(next)
+                        .await
+                        .expect("cursor test snapshot identity");
                 }
             }
         })

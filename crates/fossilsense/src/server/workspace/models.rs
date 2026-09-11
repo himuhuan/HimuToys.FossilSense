@@ -13,6 +13,7 @@ use crate::call_model::SemanticGeneration;
 use crate::call_service::CallReadHandle;
 use crate::candidate_service::{CandidateOverlaySnapshot, IncludePathIndex, RecallUniverseId};
 use crate::declaration_index::SemanticDeclarationIndex;
+use crate::declaration_read::DeclarationReadContext;
 use crate::memory_report::{DeclarationCacheSample, SnapshotMemoryReport};
 use crate::project_context::ProjectContextIndex;
 use crate::query::NameTable;
@@ -110,6 +111,23 @@ pub(in crate::server) struct EngineSnapshot {
 }
 
 impl EngineSnapshot {
+    pub(in crate::server) fn declaration_read_context(
+        &self,
+    ) -> anyhow::Result<Option<DeclarationReadContext>> {
+        match (&self.call_read_handle, &self.declaration_index) {
+            (Some(handle), Some(index)) => Ok(Some(DeclarationReadContext::from_bound_parts(
+                handle.clone(),
+                index.clone(),
+            )?)),
+            (Some(handle), None) => Ok(Some(DeclarationReadContext::from_handle(handle.clone()))),
+            (None, None) => Ok(None),
+            (None, Some(index)) if index.read_identity().is_none() => Ok(None),
+            (None, Some(_)) => {
+                anyhow::bail!("published declaration index has no compatible read handle")
+            }
+        }
+    }
+
     pub(in crate::server) fn empty(root: PathBuf) -> Self {
         let workspace_semantics =
             Arc::new(super::super::workspace_config::PublishedWorkspaceSemantics::empty(&root));

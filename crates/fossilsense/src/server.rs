@@ -679,10 +679,13 @@ impl Backend {
         match result {
             Ok(Ok(value)) => Some(value),
             Ok(Err(err)) => {
+                let detail = crate::declaration_read_handle::declaration_read_failure_reason(&err)
+                    .map(|reason| format!("read_reason={reason:?}; {err:#}"))
+                    .unwrap_or_else(|| format!("{err:#}"));
                 self.client
                     .log_message(
                         MessageType::ERROR,
-                        query_error_log_line(what, "query", &format!("{err:#}")),
+                        query_error_log_line(what, "query", &detail),
                     )
                     .await;
                 None

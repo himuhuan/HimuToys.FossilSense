@@ -52,31 +52,40 @@ impl Backend {
             .workspace_semantics
             .language_for_uri(request_uri)
             .semantic_family();
-        let declaration_index = context.engine.declaration_index.clone()?;
+        let declaration_read = match context.engine.declaration_read_context() {
+            Ok(Some(read_context)) => read_context,
+            Ok(None) => return None,
+            Err(error) => {
+                self.client
+                    .log_message(
+                        tower_lsp::lsp_types::MessageType::ERROR,
+                        format!("completion declaration snapshot unavailable: {error:#}"),
+                    )
+                    .await;
+                return None;
+            }
+        };
+        let declaration_index = declaration_read.declaration_index_arc()?;
         let (current_rel, current_text) =
             current_document_for_root(Some(request_uri), &root, documents.current.as_ref());
         let reach_scope = self
             .reach_scope_from_context(request_uri, &context)
             .map(|(_, reach)| reach);
         let reach_graph = context.engine.reach_graph.clone();
-        let call_read_handle = context.engine.call_read_handle.clone();
-        let query_index = declaration_index.clone();
         let overlay = self
             .candidate_overlay_snapshot_from_documents(&root, context.engine.clone(), documents)
             .await;
         let cache_before = declaration_index.payload_cache_stats();
         let query_started = std::time::Instant::now();
         let result = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
-            let service =
-                crate::candidate_service::CandidateQueryService::new_with_declarations_for_family(
-                    call_read_handle.as_deref(),
-                    Some(&query_index),
-                    &overlay,
-                    &current_rel,
-                    reach_scope.as_deref(),
-                    reach_graph.as_deref(),
-                    semantic_family,
-                );
+            let service = crate::candidate_service::CandidateQueryService::new_for_family(
+                Some(&declaration_read),
+                &overlay,
+                &current_rel,
+                reach_scope.as_deref(),
+                reach_graph.as_deref(),
+                semantic_family,
+            );
             let Some(candidate) = service.declaration_by_id(declaration_id, &declaration_name)?
             else {
                 return Ok(None);
@@ -165,22 +174,20 @@ impl Backend {
                 .map(|(_, reach)| reach)
         });
         let reach_graph = context.engine.reach_graph.clone();
-        let call_read_handle = context.engine.call_read_handle.clone();
-        let declaration_index = context.engine.declaration_index.clone();
+        let declaration_read = context.engine.declaration_read_context();
         let overlay = self
             .candidate_overlay_snapshot_from_documents(&root, context.engine.clone(), documents)
             .await;
         let result = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
-            let service =
-                crate::candidate_service::CandidateQueryService::new_with_declarations_for_family(
-                    call_read_handle.as_deref(),
-                    declaration_index.as_deref(),
-                    &overlay,
-                    &current_rel,
-                    reach_scope.as_deref(),
-                    reach_graph.as_deref(),
-                    semantic_family,
-                );
+            let declaration_read = declaration_read?;
+            let service = crate::candidate_service::CandidateQueryService::new_for_family(
+                declaration_read.as_ref(),
+                &overlay,
+                &current_rel,
+                reach_scope.as_deref(),
+                reach_graph.as_deref(),
+                semantic_family,
+            );
 
             let Some(candidate) = service.resolve_candidate_handle(&handle)? else {
                 return Ok(None);

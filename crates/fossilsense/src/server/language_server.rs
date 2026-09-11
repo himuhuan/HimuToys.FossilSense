@@ -248,18 +248,27 @@ impl LanguageServer for Backend {
     ) -> LspResult<Option<Vec<SymbolInformation>>> {
         let tables: Vec<(
             PathBuf,
-            Arc<crate::declaration_index::SemanticDeclarationIndex>,
-            Arc<crate::call_service::CallReadHandle>,
+            Arc<crate::declaration_read::DeclarationReadContext>,
         )> = {
             let roots = self.workspace_roots.lock().await.clone();
             let mut tables = Vec::new();
             for root in roots {
                 let context = self.request_context_for_root(root).await;
-                if let (Some(index), Some(read_handle)) = (
-                    context.engine.declaration_index.clone(),
-                    context.engine.call_read_handle.clone(),
-                ) {
-                    tables.push((context.engine.root.clone(), index, read_handle));
+                match context.engine.declaration_read_context() {
+                    Ok(Some(read_context)) => {
+                        tables.push((context.engine.root.clone(), Arc::new(read_context)));
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        self.client
+                            .log_message(
+                                MessageType::ERROR,
+                                format!(
+                                    "workspace symbol declaration snapshot unavailable: {error:#}"
+                                ),
+                            )
+                            .await;
+                    }
                 }
             }
             tables
@@ -271,7 +280,10 @@ impl LanguageServer for Backend {
         let query_text = params.query;
         let result = tokio::task::spawn_blocking(move || -> Result<Vec<SymbolInformation>> {
             let mut hits = Vec::new();
-            for (root_index, (_, index, _)) in tables.iter().enumerate() {
+            for (root_index, (_, read_context)) in tables.iter().enumerate() {
+                let Some(index) = read_context.declaration_index() else {
+                    continue;
+                };
                 for hit in index
                     .name_table()
                     .search_ranked(&query_text, query::WORKSPACE_SYMBOL_LIMIT)
@@ -293,15 +305,15 @@ impl LanguageServer for Backend {
             }
 
             let mut payloads = Vec::with_capacity(tables.len());
-            for (root_index, (_, index, read_handle)) in tables.iter().enumerate() {
+            for (root_index, (_, read_context)) in tables.iter().enumerate() {
                 let ids: Vec<_> = hits
                     .iter()
                     .filter(|(candidate_root, _)| *candidate_root == root_index)
                     .map(|(_, hit)| hit.id)
                     .collect();
                 payloads.push(
-                    index
-                        .payloads_by_ids(read_handle, &ids)?
+                    read_context
+                        .payloads_by_ids(&ids)?
                         .into_iter()
                         .map(|row| (row.id, row))
                         .collect::<HashMap<_, _>>(),

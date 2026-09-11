@@ -18,7 +18,8 @@ use serde::Serialize;
 
 use crate::call_catalog::rows::{anchor_from_row, call_from_row};
 use crate::call_model::{CallSiteFact, CallableAnchor, LinkageDomain, SourcePosition, SourceRange};
-use crate::call_service::CallReadHandle;
+use crate::declaration_read::DeclarationReadContext;
+use crate::declaration_read_handle::CallReadHandle;
 use crate::model::{CandidateRange, DefinitionCandidate, MemberCandidate};
 use crate::parser::{FactAvailability, FactGroup, FileSemanticIndex};
 use crate::query::{
@@ -2370,12 +2371,16 @@ mod tests {
             crate::query::NameTable::build_from_declaration_view(&reader.declaration_view(), None)
                 .expect("declaration names");
         drop(reader);
-        let index = crate::declaration_index::SemanticDeclarationIndex::build(names, 1024 * 1024);
         let handle = CallReadHandle::capture(db).expect("read handle");
+        let read_context = DeclarationReadContext::bind_index(
+            Arc::new(handle),
+            crate::declaration_index::SemanticDeclarationIndex::build(names, 1024 * 1024),
+        )
+        .expect("bound declaration read context");
+        let index = read_context.declaration_index().expect("declaration index");
         let overlay = CandidateOverlaySnapshot::default();
         let service = CandidateQueryService::new_with_declarations(
-            Some(&handle),
-            Some(&index),
+            Some(&read_context),
             &overlay,
             "main.c",
             None,
@@ -2446,6 +2451,143 @@ mod tests {
         let after_warm = index.payload_cache_stats();
         assert_eq!(after_warm.sql_reads, 1, "warm query must read zero SQL");
         assert!(after_warm.hits >= 2);
+    }
+
+    #[test]
+    fn declaration_payload_reads_reject_a_different_database_before_cold_or_warm_access() {
+        let dir = tempdir().expect("tempdir");
+        let first_db = dir.path().join("first.sqlite");
+        let second_db = dir.path().join("second.sqlite");
+        let mut first_store = IndexStore::open(&first_db, dir.path()).expect("first store");
+        upsert_candidate_test_file(&mut first_store, "api.h", "int first_database_name;\n");
+        drop(first_store);
+        let mut second_store = IndexStore::open(&second_db, dir.path()).expect("second store");
+        upsert_candidate_test_file(&mut second_store, "api.h", "int second_database_name;\n");
+        drop(second_store);
+
+        let build_first_names = || {
+            let first_reader = IndexStore::open_readonly(&first_db).expect("first readonly");
+            crate::query::NameTable::build_from_declaration_view(
+                &first_reader.declaration_view(),
+                None,
+            )
+            .expect("first declaration names")
+        };
+        let first_handle = CallReadHandle::capture(first_db.clone()).expect("first read handle");
+        let second_handle = CallReadHandle::capture(second_db).expect("second read handle");
+        assert_eq!(first_handle.generation, second_handle.generation);
+        assert_ne!(
+            first_handle.database_incarnation(),
+            second_handle.database_incarnation()
+        );
+        let overlay = CandidateOverlaySnapshot::default();
+
+        let cold_context = DeclarationReadContext::bind_index(
+            Arc::new(first_handle.clone()),
+            crate::declaration_index::SemanticDeclarationIndex::build(
+                build_first_names(),
+                1024 * 1024,
+            ),
+        )
+        .expect("cold first database context");
+        let cold_index = cold_context.declaration_index_arc().unwrap();
+        let cold_before = cold_index.payload_cache_stats();
+        assert!(
+            DeclarationReadContext::from_bound_parts(
+                Arc::new(second_handle.clone()),
+                cold_index.clone(),
+            )
+            .is_err(),
+            "an index must reject a different database before its cold cache or SQL is touched"
+        );
+        let cold_after = cold_index.payload_cache_stats();
+        assert_eq!(cold_after.hits, cold_before.hits);
+        assert_eq!(cold_after.misses, cold_before.misses);
+        assert_eq!(cold_after.sql_reads, cold_before.sql_reads);
+        assert_eq!(cold_after.entries, cold_before.entries);
+
+        let warm_context = DeclarationReadContext::bind_index(
+            Arc::new(first_handle),
+            crate::declaration_index::SemanticDeclarationIndex::build(
+                build_first_names(),
+                1024 * 1024,
+            ),
+        )
+        .expect("warm first database context");
+        let warm_index = warm_context.declaration_index_arc().unwrap();
+        let warm_service = CandidateQueryService::new_with_declarations(
+            Some(&warm_context),
+            &overlay,
+            "api.h",
+            None,
+            None,
+        );
+        warm_service
+            .semantic_candidates("first_database_name", SemanticIntent::Neutral)
+            .expect("warm first database payload");
+        let warm_before = warm_index.payload_cache_stats();
+        assert!(
+            DeclarationReadContext::from_bound_parts(Arc::new(second_handle), warm_index.clone(),)
+                .is_err(),
+            "a warm payload cache must not return rows for a different database"
+        );
+        let warm_after = warm_index.payload_cache_stats();
+        assert_eq!(warm_after.hits, warm_before.hits);
+        assert_eq!(warm_after.misses, warm_before.misses);
+        assert_eq!(warm_after.sql_reads, warm_before.sql_reads);
+        assert_eq!(warm_after.entries, warm_before.entries);
+    }
+
+    #[test]
+    fn declaration_payload_reads_reject_a_different_generation_before_cache_access() {
+        let dir = tempdir().expect("tempdir");
+        let db = dir.path().join("index.sqlite");
+        let mut first_store = IndexStore::open(&db, dir.path()).expect("first store");
+        upsert_candidate_test_file(&mut first_store, "api.h", "int stable_name;\n");
+        drop(first_store);
+        let first_handle = CallReadHandle::capture(db.clone()).expect("first read handle");
+        let build_first_names = || {
+            let reader = IndexStore::open_readonly(&db).expect("readonly");
+            crate::query::NameTable::build_from_declaration_view(&reader.declaration_view(), None)
+                .expect("declaration names")
+        };
+        let warm_context = DeclarationReadContext::bind_index(
+            Arc::new(first_handle.clone()),
+            crate::declaration_index::SemanticDeclarationIndex::build(
+                build_first_names(),
+                1024 * 1024,
+            ),
+        )
+        .expect("first generation context");
+        let warm_index = warm_context.declaration_index_arc().unwrap();
+        let overlay = CandidateOverlaySnapshot::default();
+        CandidateQueryService::new_with_declarations(
+            Some(&warm_context),
+            &overlay,
+            "api.h",
+            None,
+            None,
+        )
+        .semantic_candidates("stable_name", SemanticIntent::Neutral)
+        .expect("warm first generation");
+
+        let mut next_store = IndexStore::open(&db, dir.path()).expect("next store");
+        upsert_candidate_test_file(&mut next_store, "extra.h", "int next_generation;\n");
+        drop(next_store);
+        let next_handle = CallReadHandle::capture(db.clone()).expect("next read handle");
+        assert!(next_handle.generation.0 > first_handle.generation.0);
+
+        let warm_before = warm_index.payload_cache_stats();
+        assert!(
+            DeclarationReadContext::from_bound_parts(Arc::new(next_handle), warm_index.clone(),)
+                .is_err(),
+            "a warm payload cache must reject a different generation"
+        );
+        let warm_after = warm_index.payload_cache_stats();
+        assert_eq!(warm_after.hits, warm_before.hits);
+        assert_eq!(warm_after.misses, warm_before.misses);
+        assert_eq!(warm_after.sql_reads, warm_before.sql_reads);
+        assert_eq!(warm_after.entries, warm_before.entries);
     }
 
     #[test]

@@ -29,24 +29,6 @@ impl<'a> CandidateQueryService<'a> {
                 crate::config::SourceLanguage::default_for_path(Path::new(current_path))
                     .semantic_family()
             });
-        Self::new_for_family(
-            handle,
-            overlays,
-            current_path,
-            current_reach,
-            reach_graph,
-            semantic_family,
-        )
-    }
-
-    pub fn new_for_family(
-        handle: Option<&'a CallReadHandle>,
-        overlays: &'a CandidateOverlaySnapshot,
-        current_path: &'a str,
-        current_reach: Option<&'a ReachScope>,
-        reach_graph: Option<&'a ReachGraph>,
-        semantic_family: crate::semantic_model::SemanticFamily,
-    ) -> Self {
         let reach_graph = overlays.effective_reach_graph(reach_graph);
         let current_reach = reach_graph
             .map(|graph| graph.reachable(current_path))
@@ -63,39 +45,52 @@ impl<'a> CandidateQueryService<'a> {
         }
     }
 
-    #[cfg(test)]
-    pub fn new_with_declarations(
-        handle: Option<&'a CallReadHandle>,
-        declaration_index: Option<&'a crate::declaration_index::SemanticDeclarationIndex>,
-        overlays: &'a CandidateOverlaySnapshot,
-        current_path: &'a str,
-        current_reach: Option<&'a ReachScope>,
-        reach_graph: Option<&'a ReachGraph>,
-    ) -> Self {
-        let mut service = Self::new(handle, overlays, current_path, current_reach, reach_graph);
-        service.declaration_index = declaration_index;
-        service
-    }
-
-    pub fn new_with_declarations_for_family(
-        handle: Option<&'a CallReadHandle>,
-        declaration_index: Option<&'a crate::declaration_index::SemanticDeclarationIndex>,
+    pub fn new_for_family(
+        read_context: Option<&'a DeclarationReadContext>,
         overlays: &'a CandidateOverlaySnapshot,
         current_path: &'a str,
         current_reach: Option<&'a ReachScope>,
         reach_graph: Option<&'a ReachGraph>,
         semantic_family: crate::semantic_model::SemanticFamily,
     ) -> Self {
-        let mut service = Self::new_for_family(
-            handle,
+        let reach_graph = overlays.effective_reach_graph(reach_graph);
+        let current_reach = reach_graph
+            .map(|graph| graph.reachable(current_path))
+            .or_else(|| current_reach.cloned().map(Arc::new));
+        Self {
+            handle: read_context.map(DeclarationReadContext::handle),
+            declaration_index: read_context.and_then(DeclarationReadContext::declaration_index),
             overlays,
             current_path,
             current_reach,
             reach_graph,
             semantic_family,
-        );
-        service.declaration_index = declaration_index;
-        service
+            exact_name_limit: DEFAULT_EXACT_NAME_CANDIDATE_LIMIT,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn new_with_declarations(
+        read_context: Option<&'a DeclarationReadContext>,
+        overlays: &'a CandidateOverlaySnapshot,
+        current_path: &'a str,
+        current_reach: Option<&'a ReachScope>,
+        reach_graph: Option<&'a ReachGraph>,
+    ) -> Self {
+        let semantic_family = overlays
+            .semantic_family_for_path(current_path)
+            .unwrap_or_else(|| {
+                crate::config::SourceLanguage::default_for_path(Path::new(current_path))
+                    .semantic_family()
+            });
+        Self::new_for_family(
+            read_context,
+            overlays,
+            current_path,
+            current_reach,
+            reach_graph,
+            semantic_family,
+        )
     }
 
     /// Durable paths that must be recalled before a workspace-wide exact-name

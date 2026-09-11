@@ -132,7 +132,8 @@ fn core_symbol_features_route_through_candidate_sets_and_stable_handles() {
     assert_present(
         "src/server/completion_candidate_documentation.rs",
         &[
-            "new_with_declarations_for_family(",
+            "CandidateQueryService::new_for_family(",
+            "declaration_read_context()",
             "resolve_candidate_handle(&handle)",
             "entity_documentation_locations(&subjects)",
             "declaration_by_id(declaration_id, &declaration_name)",
@@ -146,7 +147,7 @@ fn core_symbol_features_route_through_candidate_sets_and_stable_handles() {
         "src/candidate_service/semantic.rs",
         &[
             "exact_name_hits_scoped_for_family(",
-            "payloads_by_ids(handle, &ids)",
+            "payloads_by_ids_bound(handle, &ids)",
         ],
     );
     assert_absent(
@@ -177,7 +178,7 @@ fn completion_recall_core_cannot_grow_into_a_parallel_semantic_model() {
         "src/declaration_index.rs",
         &[
             "names: Arc<NameTable>",
-            "payloads_by_ids(",
+            "payloads_by_ids_bound(",
             "total_budget_bytes.saturating_sub(accounted_core_bytes)",
         ],
     );
@@ -188,6 +189,69 @@ fn completion_recall_core_cannot_grow_into_a_parallel_semantic_model() {
             "declaration_id: hit.id",
             "declaration_name: hit.name.clone()",
         ],
+    );
+}
+
+#[test]
+fn production_declaration_consumers_use_the_bound_read_context() {
+    assert_absent(
+        "src/candidate_service/callable_queries.rs",
+        &["new_with_declarations_for_family("],
+    );
+    assert_absent(
+        "src/candidate_service.rs",
+        &["crate::call_service::CallReadHandle"],
+    );
+    assert_absent(
+        "src/call_service.rs",
+        &[
+            "pub struct CallReadHandle",
+            "IndexStore::open_readonly(self.",
+        ],
+    );
+    assert_present(
+        "src/declaration_read.rs",
+        &[
+            "pub struct DeclarationReadContext",
+            "from_bound_parts(",
+            "payloads_by_ids(",
+        ],
+    );
+    assert_present(
+        "src/declaration_read_handle.rs",
+        &[
+            "database identity mismatch",
+            "begin_semantic_read(Some(self.generation.0))",
+            "DeclarationReadFailureReason",
+        ],
+    );
+    assert_present(
+        "src/server/workspace.rs",
+        &["snapshot.declaration_read_context()?;"],
+    );
+    for path in [
+        "src/server/navigation.rs",
+        "src/server/hover.rs",
+        "src/server/signature_help.rs",
+        "src/server/completion_candidate_documentation.rs",
+        "src/server/possible_targets.rs",
+        "src/server/member_navigation.rs",
+        "src/server/member_completion.rs",
+        "src/server/language_server.rs",
+        "src/server/call_hierarchy.rs",
+    ] {
+        assert_present(path, &["declaration_read"]);
+    }
+    assert_present(
+        "src/main.rs",
+        &[
+            "capture_query_context(",
+            "DeclarationReadContext::from_handle(",
+        ],
+    );
+    assert_present(
+        "src/explain/index.rs",
+        &["DeclarationReadContext::from_handle(", "read_context.read("],
     );
 }
 

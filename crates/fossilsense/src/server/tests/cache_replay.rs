@@ -38,7 +38,7 @@ async fn benchmark_uboot_declaration_cache_replay() {
         .unwrap();
     let mut witnesses = Vec::new();
     for batch in candidate_ids.chunks(64) {
-        for row in original.payloads_by_ids(handle, batch).unwrap() {
+        for row in original.payloads_by_ids_bound(handle, batch).unwrap() {
             if witnesses.len() == 64 {
                 break;
             }
@@ -69,7 +69,7 @@ async fn benchmark_uboot_declaration_cache_replay() {
     drop(store);
     let ids: Vec<_> = witnesses.iter().map(|row| row.id).collect();
     let budget_probe = original.with_payload_budget_for_test(8 * 1024 * 1024);
-    budget_probe.payloads_by_ids(handle, &ids).unwrap();
+    budget_probe.payloads_by_ids_bound(handle, &ids).unwrap();
     let boundary_budget = budget_probe.payload_cache_stats().bytes;
     drop(budget_probe);
     let caller_uri = Url::from_file_path(root.join("fossilsense_cache_replay.c")).unwrap();
@@ -92,7 +92,7 @@ async fn benchmark_uboot_declaration_cache_replay() {
         for feature in ["hover", "definition"] {
             let index = Arc::new(original.with_payload_budget_for_test(budget));
             if phase != "cold" {
-                index.payloads_by_ids(handle, &ids).unwrap();
+                index.payloads_by_ids_bound(handle, &ids).unwrap();
             }
             let mut snapshot = engine.as_ref().clone();
             snapshot.epoch = service.inner().session.cache.allocate_engine_epoch();
@@ -102,7 +102,8 @@ async fn benchmark_uboot_declaration_cache_replay() {
                 .session
                 .cache
                 .publish_engine_snapshot(snapshot)
-                .await;
+                .await
+                .expect("cache replay snapshot identity");
             let before = index.payload_cache_stats();
             let mut elapsed = Vec::with_capacity(64);
             for row in &witnesses {

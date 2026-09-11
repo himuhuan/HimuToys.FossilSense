@@ -103,11 +103,24 @@ impl Backend {
                 .and_then(|path| pathing::relative_slash_path(root, path).ok())
                 .or_else(|| path.as_deref().map(pathing::normalize_abs_path))
                 .unwrap_or_else(|| uri_owned.clone());
+            let declaration_read = match context.engine.declaration_read_context() {
+                Ok(read_context) => read_context.map(Arc::new),
+                Err(error) => {
+                    self.client
+                        .log_message(
+                            tower_lsp::lsp_types::MessageType::ERROR,
+                            format!(
+                                "member completion declaration snapshot unavailable: {error:#}"
+                            ),
+                        )
+                        .await;
+                    None
+                }
+            };
             member_root_contexts.insert(
                 root.clone(),
                 MemberRootQueryContext {
-                    handle: context.engine.call_read_handle.clone(),
-                    declaration_index: context.engine.declaration_index.clone(),
+                    declaration_read,
                     overlay,
                     current_path,
                     reach_graph: context.engine.reach_graph.clone(),

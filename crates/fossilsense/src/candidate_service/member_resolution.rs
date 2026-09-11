@@ -1,6 +1,5 @@
 //! Shared owner and member evidence; no protocol types or editor state.
 use super::{CandidateOverlaySnapshot, CandidateQueryService};
-use crate::call_service::CallReadHandle;
 use crate::parser::MemberKind;
 use crate::{parser, query};
 use anyhow::Result;
@@ -197,8 +196,7 @@ impl<'a> MemberResolutionService<'a> {
 
 #[derive(Clone)]
 pub(crate) struct MemberRootQueryContext {
-    pub(crate) handle: Option<Arc<CallReadHandle>>,
-    pub(crate) declaration_index: Option<Arc<crate::declaration_index::SemanticDeclarationIndex>>,
+    pub(crate) declaration_read: Option<Arc<crate::declaration_read::DeclarationReadContext>>,
     pub(crate) overlay: Arc<CandidateOverlaySnapshot>,
     pub(crate) current_path: String,
     pub(crate) reach_graph: Option<Arc<crate::reachability::ReachGraph>>,
@@ -208,9 +206,8 @@ pub(crate) struct MemberRootQueryContext {
 
 impl MemberRootQueryContext {
     pub(crate) fn service(&self) -> CandidateQueryService<'_> {
-        CandidateQueryService::new_with_declarations_for_family(
-            self.handle.as_deref(),
-            self.declaration_index.as_deref(),
+        CandidateQueryService::new_for_family(
+            self.declaration_read.as_deref(),
             self.overlay.as_ref(),
             &self.current_path,
             None,
@@ -593,8 +590,7 @@ mod tests {
             parser::ParseFacts::HOVER_SEMANTICS,
         );
         MemberRootQueryContext {
-            handle: None,
-            declaration_index: None,
+            declaration_read: None,
             overlay: Arc::new(CandidateOverlaySnapshot::new(
                 1,
                 vec![crate::candidate_service::FileCandidateOverlay::from_index(

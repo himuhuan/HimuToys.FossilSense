@@ -195,8 +195,7 @@ impl Backend {
             .reach_scope_from_context(&uri, &context)
             .map(|(_, reach)| reach);
         let mut reach_us = reach_started.elapsed().as_micros();
-        let call_read_handle = context.engine.call_read_handle.clone();
-        let declaration_index = context.engine.declaration_index.clone();
+        let declaration_read = context.engine.declaration_read_context();
         let reach_graph = context.engine.reach_graph.clone();
         let overlay_started = std::time::Instant::now();
         let overlay = self
@@ -222,38 +221,60 @@ impl Backend {
             move || -> Result<(Vec<Location>, Vec<String>, SemanticRequestPerf)> {
                 let _reads = crate::call_service::ReadSessionProbe::enter(reads);
                 let query_started = std::time::Instant::now();
-                let service =
-                    crate::candidate_service::CandidateQueryService::new_with_declarations_for_family(
-                        call_read_handle.as_deref(),
-                        declaration_index.as_deref(),
-                        &overlay,
-                        &current_rel,
-                        reach_scope.as_deref(),
-                        reach_graph.as_deref(),
-                        semantic_family,
-                    );
+                let declaration_read = declaration_read?;
+                let service = crate::candidate_service::CandidateQueryService::new_for_family(
+                    declaration_read.as_ref(),
+                    &overlay,
+                    &current_rel,
+                    reach_scope.as_deref(),
+                    reach_graph.as_deref(),
+                    semantic_family,
+                );
                 let call_context = service.complete_call_context_at(source_position)?;
                 let (semantic_set, subjects) = service.resolve_subject(
                     &word,
-                    if call_context.is_some() { crate::candidate_service::SemanticIntent::Call }
-                    else { crate::candidate_service::SemanticIntent::Neutral },
-                    crate::candidate_service::LookupPolicy::BoundDomain { domain: syntax.domain, qualifier: syntax.qualifier.as_deref() },
+                    if call_context.is_some() {
+                        crate::candidate_service::SemanticIntent::Call
+                    } else {
+                        crate::candidate_service::SemanticIntent::Neutral
+                    },
+                    crate::candidate_service::LookupPolicy::BoundDomain {
+                        domain: syntax.domain,
+                        qualifier: syntax.qualifier.as_deref(),
+                    },
                     call_context,
                 )?;
-                let semantic_count = semantic_set.all.iter().map(|group| group.candidates.len()).sum();
-                let related = service.entity_locations_at(&subjects, operation == NavigationOperation::Declaration, Some(source_position))?;
+                let semantic_count = semantic_set
+                    .all
+                    .iter()
+                    .map(|group| group.candidates.len())
+                    .sum();
+                let related = service.entity_locations_at(
+                    &subjects,
+                    operation == NavigationOperation::Declaration,
+                    Some(source_position),
+                )?;
                 let candidates = related.candidates();
                 let mut perf = SemanticRequestPerf {
-                    reach_us, entity_visits: related.coverage.entities,
-                    entity_edges: related.coverage.edges, entity_locations: related.locations.len(),
-                    entity_truncated: related.coverage.truncated, ..Default::default()
+                    reach_us,
+                    entity_visits: related.coverage.entities,
+                    entity_edges: related.coverage.edges,
+                    entity_locations: related.locations.len(),
+                    entity_truncated: related.coverage.truncated,
+                    ..Default::default()
                 };
                 perf.include_non_callable_candidates(semantic_count);
                 perf.query_us = query_started.elapsed().as_micros();
                 let mut debug_lines = candidate_reason_log_lines(&candidates, debug_reasons);
                 if debug_reasons {
                     debug_lines.insert(0, candidate_set_debug_line(&semantic_set));
-                    debug_lines.push(format!("entity_locations: {} entities={} edges={} truncated={}", related.diagnostic(), related.coverage.entities, related.coverage.edges, related.coverage.truncated));
+                    debug_lines.push(format!(
+                        "entity_locations: {} entities={} edges={} truncated={}",
+                        related.diagnostic(),
+                        related.coverage.entities,
+                        related.coverage.edges,
+                        related.coverage.truncated
+                    ));
                 }
                 let render_started = std::time::Instant::now();
                 let locations: Vec<Location> = candidates
