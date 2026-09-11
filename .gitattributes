@@ -1,0 +1,3 @@
+/crates/fossilsense/tests/fixtures/c_frontend/*.c text eol=lf
+/crates/fossilsense/tests/fixtures/c_frontend/*.h text eol=lf
+/crates/fossilsense/tests/fixtures/c_frontend/stubs/*.h text eol=lf

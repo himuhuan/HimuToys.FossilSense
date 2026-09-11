@@ -224,6 +224,97 @@ fn c_frontend_fingerprint_has_fixed_cross_language_vectors() {
 }
 
 #[test]
+fn c_frontend_oracle_fixture_bytes_are_fixed() {
+    let root = fixture_root();
+    for (path, expected_len, expected_hash) in [
+        ("declarators.c", 195, "fnv1a64:239fe05dc316c996"),
+        ("decorated.pb-c.h", 118, "fnv1a64:586f4277a20a50da"),
+        ("empty.c", 22, "fnv1a64:3e46aa63ce4bd237"),
+        ("guards.c", 73, "fnv1a64:a05bcf904a662077"),
+        ("local.c", 112, "fnv1a64:4def40f66bd84fd7"),
+        ("records.c", 98, "fnv1a64:6fafff41b0462ff2"),
+        ("shared.h", 22, "fnv1a64:ea05821b49e14aa0"),
+        ("unknown_macro.c", 35, "fnv1a64:61fad18125cf5cae"),
+        ("stubs/contracts.h", 135, "fnv1a64:f450b1ca5296461e"),
+    ] {
+        let bytes = std::fs::read(root.join(path)).unwrap();
+        assert_eq!(bytes.len(), expected_len, "{path} byte length");
+        assert_eq!(fingerprint(&bytes), expected_hash, "{path} raw bytes");
+        assert!(
+            !bytes.contains(&b'\r'),
+            "{path} must be checked out with LF"
+        );
+    }
+}
+
+#[test]
+fn c_frontend_lf_crlf_and_unicode_use_original_byte_and_utf16_positions() {
+    let variants = [
+        (
+            "lf",
+            "/* plain */\nint target;\n",
+            "fnv1a64:9c53cec172aac0e0",
+            16,
+            1,
+            4,
+        ),
+        (
+            "crlf",
+            "/* plain */\r\nint target;\r\n",
+            "fnv1a64:e5fdbdb10898b91c",
+            17,
+            1,
+            4,
+        ),
+        (
+            "unicode",
+            "/* é🙂 */ int target;\n",
+            "fnv1a64:2321636b235c87b4",
+            17,
+            0,
+            14,
+        ),
+    ];
+    let mut expected_semantics = None;
+
+    for (variant, source, expected_hash, start_byte, line, utf16_character) in variants {
+        assert_eq!(
+            fingerprint(source.as_bytes()),
+            expected_hash,
+            "{variant} hash"
+        );
+        let actual = observe_source("controlled.c", source, "c").unwrap();
+        assert_eq!(actual["sourceHash"], expected_hash, "{variant} source hash");
+        let target = actual["observations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|observation| observation["name"] == "target")
+            .unwrap();
+        assert_eq!(
+            target["nameRange"],
+            mapped_range(source, start_byte, start_byte + "target".len()),
+            "{variant} raw position"
+        );
+        assert_eq!(target["nameRange"]["start"]["line"], line);
+        assert_eq!(target["nameRange"]["start"]["character"], utf16_character);
+
+        let semantics = json!({
+            "name": target["name"],
+            "kind": target["kind"],
+            "role": target["role"],
+            "owner": target["owner"],
+            "scope": target["scope"],
+        });
+        if let Some(expected) = &expected_semantics {
+            assert_eq!(&semantics, expected, "{variant} declaration semantics");
+        } else {
+            expected_semantics = Some(semantics);
+        }
+    }
+}
+
+#[test]
 #[ignore = "explicit conformance script export, never a production CLI command"]
 fn export_c_frontend_observations() {
     let manifest = std::path::PathBuf::from(

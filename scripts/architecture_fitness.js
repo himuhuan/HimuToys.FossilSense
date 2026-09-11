@@ -236,7 +236,7 @@ function isOrdinaryCompletionService(relPath) {
 }
 
 function isCallService(relPath) {
-  return isModule(relPath, "call_hierarchy");
+  return isModule(relPath, "call_service");
 }
 
 function isServerFeature(relPath, feature) {
@@ -256,6 +256,26 @@ function isModule(relPath, moduleName) {
     relPath === `crates/fossilsense/src/${moduleName}.rs` ||
     relPath.startsWith(`crates/fossilsense/src/${moduleName}/`)
   );
+}
+
+const REQUIRED_OWNERS = {
+  "call-service": {
+    rule: RULES.callServiceIoBoundary,
+    expectedFile: "crates/fossilsense/src/call_service.rs",
+    expectedTarget: "crates/fossilsense/src/call_service.rs or crates/fossilsense/src/call_service/**",
+    matches: isCallService,
+  },
+};
+
+function selectRequiredOwners(ownerKeys) {
+  const keys = ownerKeys ?? Object.keys(REQUIRED_OWNERS);
+  return keys.map((key) => {
+    const owner = REQUIRED_OWNERS[key];
+    if (!owner) {
+      throw new Error(`Unknown required architecture owner: ${key}`);
+    }
+    return { key, ...owner };
+  });
 }
 
 function usesCrateModule(text, moduleName) {
@@ -372,6 +392,8 @@ function collectFindings(root, options = {}) {
     .sort();
   const findings = [];
   const largeThreshold = options.largeThreshold ?? DEFAULT_LARGE_THRESHOLD;
+  const requiredOwners = selectRequiredOwners(options.requiredOwners);
+  const requiredOwnerMatches = new Map(requiredOwners.map((owner) => [owner.key, 0]));
 
   for (const filePath of sourceFiles) {
     const relPath = toRepoPath(root, filePath);
@@ -397,7 +419,16 @@ function collectFindings(root, options = {}) {
       continue;
     }
 
+    if (!isTestSource(relPath)) {
+      for (const owner of requiredOwners) {
+        if (owner.matches(relPath)) {
+          requiredOwnerMatches.set(owner.key, requiredOwnerMatches.get(owner.key) + 1);
+        }
+      }
+    }
+
     const text = scanText(raw);
+    const productionText = scanText(stripCfgTestSections(raw));
     if (/\btower_lsp\b/.test(text)) {
       if (isOrdinaryCompletionService(relPath)) {
         addFinding(
@@ -435,7 +466,9 @@ function collectFindings(root, options = {}) {
 
     if (
       isCallService(relPath) &&
-      (/\bstd\s*::\s*fs\b/.test(text) || /\bignore\s*::/.test(text) || usesCrateModule(text, "scanner"))
+      (/\bstd\s*::\s*fs\b/.test(productionText) ||
+        /\bignore\s*::/.test(productionText) ||
+        usesCrateModule(productionText, "scanner"))
     ) {
       addFinding(
         findings,
@@ -524,6 +557,18 @@ function collectFindings(root, options = {}) {
 
     if (!isTestSource(relPath)) {
       checkCoreDirection(findings, relPath, text);
+    }
+  }
+
+  for (const owner of requiredOwners) {
+    if (requiredOwnerMatches.get(owner.key) === 0) {
+      addFinding(
+        findings,
+        "ERROR",
+        owner.rule,
+        owner.expectedFile,
+        `required owner matched zero files; expected ${owner.expectedTarget}`
+      );
     }
   }
 
