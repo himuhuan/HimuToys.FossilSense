@@ -42,6 +42,8 @@ import {
 } from './languageSupport';
 import {
   DegradedCapabilities,
+  IndexStatusTracker,
+  WorkspaceIndexStatus,
   degradedCapabilityWarning,
   statusTooltip,
 } from './status';
@@ -97,7 +99,7 @@ let mutualExclusionWarningShown = false;
 const projectContextPromptTracker = new ProjectContextPromptTracker();
 let projectContextUpdateEpoch = 0;
 
-interface IndexStatus {
+interface IndexStatus extends WorkspaceIndexStatus {
   state: 'indexing' | 'deferred' | 'ready' | 'failed';
   workspace: string;
   phase?: string;
@@ -372,6 +374,7 @@ function createServiceInstance(
   const completionHistoryMode = completionHistoryModeFromConfig();
   const semanticColoringMode = semanticColoringModeFromConfig();
   let reachedReady = false;
+  const indexStatuses = new IndexStatusTracker<IndexStatus>();
 
   const clientOptions: LanguageClientOptions = {
     documentSelector: languageDocumentSelectors(),
@@ -447,7 +450,7 @@ function createServiceInstance(
     currentClient.onNotification(
       'fossilsense/indexStatus',
       scope.guard((status: IndexStatus) => {
-        handleIndexStatus(status);
+        handleIndexStatus(status, indexStatuses);
         if (status.state === 'ready') {
           callRelationsController.clear();
           runInstanceTask(scope, 'project context refresh', () =>
@@ -797,7 +800,8 @@ async function showMutualExclusionWarning(
   }
 }
 
-function handleIndexStatus(status: IndexStatus): void {
+function handleIndexStatus(status: IndexStatus, statuses: IndexStatusTracker<IndexStatus>): void {
+  const aggregate = statuses.update(status);
   switch (status.state) {
     case 'indexing':
       if (status.message) {
@@ -810,25 +814,35 @@ function handleIndexStatus(status: IndexStatus): void {
       } else if (status.processedFiles === 0) {
         currentIndexStartedWithWarning = false;
       }
-      setStatus(indexingStatusText(status));
       break;
     case 'ready':
       capabilityWarning = degradedCapabilityWarning(status.degradedCapabilities);
-      setStatus('ready');
       output.appendLine(
         `Index ready: ${status.workspace}; files=${status.totalFiles}, indexed=${status.indexedFiles}, skipped=${status.skippedFiles}, declarations=${status.symbols}, elapsed=${status.elapsedMs}ms (discover=${status.discoverMs}ms, check=${status.checkMs}ms, parse=${status.parseMs}ms, write=${status.writeMs}ms, include_edge=${status.includeEdgeMs}ms, name_table=${status.nameTableMs}ms, reach_graph=${status.reachGraphMs}ms)${capabilityWarning ? `; degraded=${capabilityWarning}` : ''}`,
       );
       break;
     case 'deferred':
-      setStatus('waiting for resources');
       output.appendLine(
         `Index deferred: ${status.workspace}; ${status.message ?? 'waiting for build resources'}`,
       );
       break;
     case 'failed':
       capabilityWarning = undefined;
-      setStatus('failed');
       output.appendLine(`Index failed: ${status.workspace}; ${status.message ?? 'unknown error'}`);
+      break;
+  }
+  switch (aggregate.state) {
+    case 'indexing':
+      setStatus(indexingStatusText(aggregate));
+      break;
+    case 'ready':
+      setStatus('ready');
+      break;
+    case 'deferred':
+      setStatus('waiting for resources');
+      break;
+    case 'failed':
+      setStatus('failed');
       break;
   }
 }

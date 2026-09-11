@@ -90,6 +90,24 @@ impl SemanticRequestPerf {
         }
     }
 
+    pub(in crate::server) fn include_shared_candidate_coverage(
+        &mut self,
+        coverage: &crate::model::SharedCandidateCoverage,
+    ) {
+        self.coverage_open |= coverage.scope_open;
+        self.coverage_truncated |= coverage.truncated;
+        self.coverage_incomplete |= coverage.facts_incomplete || coverage.generation_mismatch;
+        if self.coverage_reason == 0 {
+            self.coverage_reason = if coverage.generation_mismatch {
+                coverage_reason_code(Some(query::CandidateIncompleteReason::GenerationMismatch))
+            } else if coverage.facts_incomplete {
+                coverage_reason_code(Some(query::CandidateIncompleteReason::FactsUnavailable))
+            } else {
+                0
+            };
+        }
+    }
+
     pub(in crate::server) fn include_non_callable_candidates(&mut self, count: usize) {
         self.candidates.raw_candidates = self.candidates.raw_candidates.saturating_add(count);
         self.candidates.filtered_candidates =

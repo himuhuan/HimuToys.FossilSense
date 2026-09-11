@@ -299,6 +299,41 @@ async fn cursor_domain_hover_and_navigation_share_parse_and_time_empty_results()
     let observations = service.inner().session.binding_observations.lock().unwrap();
     let last = observations.back().unwrap();
     assert!(last.completed && !last.returned);
+    assert_eq!(
+        last.outcome,
+        super::super::query_session::QueryOutcome::NoCandidates
+    );
+}
+
+#[test]
+fn query_outcome_reasons_remain_distinct_before_protocol_mapping() {
+    use super::super::query_session::QueryOutcome;
+    use super::super::request_target::{target_unavailable_outcome, TargetUnavailable};
+    use crate::declaration_read_handle::DeclarationReadFailureReason;
+    use crate::parser::LookupDomain;
+
+    let outcomes = [
+        target_unavailable_outcome(&TargetUnavailable::MissingLabel),
+        target_unavailable_outcome(&TargetUnavailable::Unsupported {
+            domain: LookupDomain::Member,
+        }),
+        QueryOutcome::from_read_failure(DeclarationReadFailureReason::SnapshotUnavailable),
+        QueryOutcome::from_read_failure(DeclarationReadFailureReason::ExecutionFailed),
+        QueryOutcome::from_read_failure(DeclarationReadFailureReason::Cancelled),
+    ];
+
+    assert_eq!(outcomes[0], QueryOutcome::NoCandidates);
+    assert_eq!(outcomes[1], QueryOutcome::Unsupported);
+    assert_eq!(outcomes[2], QueryOutcome::SnapshotUnavailable);
+    assert_eq!(outcomes[3], QueryOutcome::ExecutionFailed);
+    assert_eq!(outcomes[4], QueryOutcome::Cancelled);
+    assert_eq!(
+        outcomes
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        5
+    );
 }
 
 #[tokio::test]
@@ -325,6 +360,33 @@ async fn cursor_domain_cancelled_request_is_recorded_without_unbounded_history()
             .unwrap()
             .completed
     );
+    assert_eq!(
+        service
+            .inner()
+            .session
+            .binding_observations
+            .lock()
+            .unwrap()
+            .back()
+            .unwrap()
+            .outcome,
+        super::super::query_session::QueryOutcome::Cancelled
+    );
+    let cancelled = service
+        .inner()
+        .session
+        .binding_observations
+        .lock()
+        .unwrap()
+        .back()
+        .unwrap()
+        .clone();
+    assert!(
+        super::super::query_session::dropped_observation_log_line(true, &cancelled)
+            .expect("performance logging emits a dropped request")
+            .contains("\"outcome\":\"cancelled\"")
+    );
+    assert!(super::super::query_session::dropped_observation_log_line(false, &cancelled).is_none());
     for _ in 0..140 {
         let timer = super::super::query_session::BindingTimer::new(service.inner(), "hover");
         drop(timer);
@@ -332,6 +394,9 @@ async fn cursor_domain_cancelled_request_is_recorded_without_unbounded_history()
     let observations = service.inner().session.binding_observations.lock().unwrap();
     assert_eq!(observations.len(), 128);
     assert!(observations.iter().all(|item| !item.completed));
+    assert!(observations
+        .iter()
+        .all(|item| item.outcome == super::super::query_session::QueryOutcome::Cancelled));
 }
 
 #[tokio::test]

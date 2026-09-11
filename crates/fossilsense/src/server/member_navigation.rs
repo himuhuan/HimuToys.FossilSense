@@ -8,17 +8,36 @@ use tower_lsp::lsp_types::{HoverContents, MarkupContent, MarkupKind, Position, R
 
 pub(super) enum MemberTargetResolution {
     Found(Vec<OwnerMemberRef>),
-    Unresolved { reason: query::BindingReason },
+    Unresolved {
+        reason: query::BindingReason,
+    },
     Unsupported,
-    Failed(String),
+    Failed {
+        outcome: super::query_session::QueryOutcome,
+        detail: String,
+    },
 }
 
 impl MemberTargetResolution {
+    pub(super) fn from_error(error: anyhow::Error) -> Self {
+        Self::Failed {
+            outcome: super::query_session::QueryOutcome::from_error(&error),
+            detail: format!("member target resolution failed: {error:#}"),
+        }
+    }
+
+    fn from_join_error(error: tokio::task::JoinError) -> Self {
+        Self::Failed {
+            outcome: super::query_session::QueryOutcome::from_join_error(&error),
+            detail: format!("member task failed: {error}"),
+        }
+    }
+
     #[cfg(test)]
     fn into_members(self) -> Vec<OwnerMemberRef> {
         match self {
             Self::Found(members) => members,
-            Self::Unresolved { .. } | Self::Unsupported | Self::Failed(_) => Vec::new(),
+            Self::Unresolved { .. } | Self::Unsupported | Self::Failed { .. } => Vec::new(),
         }
     }
 }
@@ -181,7 +200,10 @@ impl Backend {
     ) -> MemberTargetResolution {
         let (version, text) = document;
         let Some(path) = uri_to_path(uri) else {
-            return MemberTargetResolution::Failed("member URI is not a file path".into());
+            return MemberTargetResolution::Failed {
+                outcome: super::query_session::QueryOutcome::ExecutionFailed,
+                detail: "member URI is not a file path".into(),
+            };
         };
         let selection = session
             .context
@@ -207,7 +229,10 @@ impl Backend {
             )
             .await
         else {
-            return MemberTargetResolution::Failed("member document parse unavailable".into());
+            return MemberTargetResolution::Failed {
+                outcome: super::query_session::QueryOutcome::SnapshotUnavailable,
+                detail: "member document parse unavailable".into(),
+            };
         };
         timer.observation.parse_us += started.elapsed().as_micros();
         let root = session.root.clone();
@@ -320,7 +345,10 @@ impl Backend {
                     })
                     .collect::<Vec<_>>();
                 if members.is_empty() {
-                    MemberTargetResolution::Failed("member target snapshot changed".into())
+                    MemberTargetResolution::Failed {
+                        outcome: super::query_session::QueryOutcome::SnapshotUnavailable,
+                        detail: "member target snapshot changed".into(),
+                    }
                 } else {
                     MemberTargetResolution::Found(members)
                 }
@@ -334,7 +362,10 @@ impl Backend {
                     })
                     .collect::<Vec<_>>();
                 if members.is_empty() {
-                    MemberTargetResolution::Failed("member target snapshot changed".into())
+                    MemberTargetResolution::Failed {
+                        outcome: super::query_session::QueryOutcome::SnapshotUnavailable,
+                        detail: "member target snapshot changed".into(),
+                    }
                 } else {
                     MemberTargetResolution::Found(members)
                 }
@@ -345,10 +376,8 @@ impl Backend {
             Ok(Ok(query::BindingResolution::Unsupported { .. })) => {
                 MemberTargetResolution::Unsupported
             }
-            Ok(Err(error)) => MemberTargetResolution::Failed(format!(
-                "member target resolution failed: {error:#}"
-            )),
-            Err(error) => MemberTargetResolution::Failed(format!("member task failed: {error}")),
+            Ok(Err(error)) => MemberTargetResolution::from_error(error),
+            Err(error) => MemberTargetResolution::from_join_error(error),
         }
     }
 

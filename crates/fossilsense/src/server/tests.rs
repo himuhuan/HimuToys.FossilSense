@@ -11860,6 +11860,28 @@ fn query_error_log_line_is_structured_and_single_line() {
     );
 }
 
+#[test]
+fn semantic_request_log_retains_candidates_with_incomplete_coverage() {
+    let mut metrics = super::request_metrics::SemanticRequestPerf {
+        returned: 1,
+        ..Default::default()
+    };
+    metrics.include_shared_candidate_coverage(&crate::model::SharedCandidateCoverage {
+        scanned: 16_384,
+        truncated: true,
+        scope_open: true,
+        facts_incomplete: true,
+        ..Default::default()
+    });
+
+    let line = metrics.log_line("definition", 10);
+    assert!(line.contains("returned=1"));
+    assert!(line.contains("coverage_open=1"));
+    assert!(line.contains("coverage_truncated=1"));
+    assert!(line.contains("coverage_incomplete=1"));
+    assert!(line.contains("coverage_reason=5"));
+}
+
 #[tokio::test]
 async fn declaration_coverage_lsp_details_follow_dirty_revision_and_preserve_healthy_facts() {
     let (_dir, service, uri, line, character) = indexed_backend_with_open_doc(

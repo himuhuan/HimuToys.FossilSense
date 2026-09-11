@@ -1,5 +1,46 @@
 use super::*;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum QueryOutcome {
+    #[default]
+    Pending,
+    Returned,
+    NoCandidates,
+    Unsupported,
+    SnapshotUnavailable,
+    ExecutionFailed,
+    Cancelled,
+}
+
+impl QueryOutcome {
+    pub(super) fn from_read_failure(
+        reason: crate::declaration_read_handle::DeclarationReadFailureReason,
+    ) -> Self {
+        use crate::declaration_read_handle::DeclarationReadFailureReason;
+        match reason {
+            DeclarationReadFailureReason::IdentityMismatch
+            | DeclarationReadFailureReason::SnapshotUnavailable => Self::SnapshotUnavailable,
+            DeclarationReadFailureReason::ExecutionFailed => Self::ExecutionFailed,
+            DeclarationReadFailureReason::Cancelled => Self::Cancelled,
+        }
+    }
+
+    pub(super) fn from_error(error: &anyhow::Error) -> Self {
+        crate::declaration_read_handle::declaration_read_failure_reason(error)
+            .map(Self::from_read_failure)
+            .unwrap_or(Self::ExecutionFailed)
+    }
+
+    pub(super) fn from_join_error(error: &tokio::task::JoinError) -> Self {
+        if error.is_cancelled() {
+            Self::Cancelled
+        } else {
+            Self::ExecutionFailed
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub(super) struct BindingObservation {
     pub feature: &'static str,
@@ -17,8 +58,29 @@ pub(super) struct BindingObservation {
     pub entity_edges: usize,
     pub entity_locations: usize,
     pub entity_truncated: bool,
+    pub coverage_open: bool,
+    pub coverage_truncated: bool,
+    pub coverage_incomplete: bool,
+    pub coverage_reason: u8,
     pub completed: bool,
     pub returned: bool,
+    pub outcome: QueryOutcome,
+}
+
+impl BindingObservation {
+    fn log_line(&self) -> String {
+        format!(
+            "[perf] cursor_binding {}",
+            serde_json::to_string(self).unwrap_or_default()
+        )
+    }
+}
+
+pub(super) fn dropped_observation_log_line(
+    enabled: bool,
+    observation: &BindingObservation,
+) -> Option<String> {
+    (enabled && !observation.completed).then(|| observation.log_line())
 }
 
 /// Records the whole request even when its future is dropped at an await.
@@ -48,19 +110,66 @@ impl<'a> BindingTimer<'a> {
                 let mut observation = self.observation.clone();
                 observation.total_us = self.started.elapsed().as_micros();
                 observation.sqlite_read_sessions = self.reads.load(Ordering::Relaxed);
-                format!(
-                    "[perf] cursor_binding {}",
-                    serde_json::to_string(&observation).unwrap_or_default()
-                )
+                observation.log_line()
             })
             .await;
+    }
+
+    pub fn mark_outcome(&mut self, outcome: QueryOutcome) {
+        self.observation.outcome = outcome;
+    }
+
+    pub fn observe_query_result<T>(
+        &mut self,
+        result: &std::result::Result<anyhow::Result<T>, tokio::task::JoinError>,
+    ) {
+        match result {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                self.observation.outcome = QueryOutcome::from_error(error);
+            }
+            Err(error) => self.observation.outcome = QueryOutcome::from_join_error(error),
+        }
+    }
+
+    pub fn include_semantic_metrics(&mut self, metrics: SemanticRequestPerf) {
+        self.observation.query_us = metrics.query_us;
+        self.observation.entity_visits = metrics.entity_visits;
+        self.observation.entity_edges = metrics.entity_edges;
+        self.observation.entity_locations = metrics.entity_locations;
+        self.observation.entity_truncated = metrics.entity_truncated;
+        self.observation.coverage_open = metrics.coverage_open;
+        self.observation.coverage_truncated = metrics.coverage_truncated;
+        self.observation.coverage_incomplete = metrics.coverage_incomplete;
+        self.observation.coverage_reason = metrics.coverage_reason;
+        self.observation.hydration_us = metrics.hydration_us;
+        self.observation.render_us = metrics.render_us;
+    }
+
+    pub fn complete<T>(&mut self, result: &tower_lsp::jsonrpc::Result<Option<T>>) {
+        self.observation.completed = true;
+        self.observation.returned = result.as_ref().is_ok_and(Option::is_some);
+        if self.observation.outcome == QueryOutcome::Pending {
+            self.observation.outcome = match result {
+                Ok(Some(_)) => QueryOutcome::Returned,
+                Ok(None) => QueryOutcome::NoCandidates,
+                Err(_) => QueryOutcome::ExecutionFailed,
+            };
+        }
     }
 }
 
 impl Drop for BindingTimer<'_> {
     fn drop(&mut self) {
+        if !self.observation.completed {
+            self.observation.outcome = QueryOutcome::Cancelled;
+        }
         self.observation.total_us = self.started.elapsed().as_micros();
         self.observation.sqlite_read_sessions = self.reads.load(Ordering::Relaxed);
+        let dropped_log = dropped_observation_log_line(
+            self.backend.perf_logging_enabled.load(Ordering::Relaxed),
+            &self.observation,
+        );
         let mut observations = self
             .backend
             .session
@@ -72,6 +181,16 @@ impl Drop for BindingTimer<'_> {
         }
         observations.push_back(self.observation.clone());
         drop(observations);
+        if let Some(line) = dropped_log {
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                let client = self.backend.client.clone();
+                runtime.spawn(async move {
+                    client
+                        .log_message(tower_lsp::lsp_types::MessageType::LOG, line)
+                        .await;
+                });
+            }
+        }
     }
 }
 

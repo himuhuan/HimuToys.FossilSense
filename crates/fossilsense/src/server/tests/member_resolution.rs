@@ -1,5 +1,21 @@
 use super::*;
 
+#[test]
+fn member_read_failure_preserves_snapshot_unavailable_reason() {
+    let failure = anyhow::Error::new(crate::declaration_read_handle::DeclarationReadFailure::new(
+        crate::declaration_read_handle::DeclarationReadFailureReason::SnapshotUnavailable,
+        "captured member database is no longer available",
+    ));
+    let resolution = super::super::member_navigation::MemberTargetResolution::from_error(failure);
+    assert!(matches!(
+        resolution,
+        super::super::member_navigation::MemberTargetResolution::Failed {
+            outcome: super::super::query_session::QueryOutcome::SnapshotUnavailable,
+            ..
+        }
+    ));
+}
+
 #[tokio::test]
 async fn owner_member_navigation_and_hover_use_exact_field_identity() {
     for source in [

@@ -35,7 +35,10 @@ pub(super) enum TargetUnavailable {
         domain: parser::LookupDomain,
         candidate_count: usize,
     },
-    Failed(String),
+    Failed {
+        outcome: query_session::QueryOutcome,
+        detail: String,
+    },
 }
 
 impl TargetUnavailable {
@@ -50,12 +53,24 @@ impl TargetUnavailable {
                 domain,
                 candidate_count,
             } => format!("target ambiguous in {domain:?}: {candidate_count} candidates"),
-            Self::Failed(reason) => reason.clone(),
+            Self::Failed { detail, .. } => detail.clone(),
         }
     }
 
     pub fn is_failure(&self) -> bool {
-        matches!(self, Self::Failed(_))
+        matches!(self, Self::Failed { .. })
+    }
+}
+
+pub(super) fn target_unavailable_outcome(
+    unavailable: &TargetUnavailable,
+) -> query_session::QueryOutcome {
+    match unavailable {
+        TargetUnavailable::Unsupported { .. } => query_session::QueryOutcome::Unsupported,
+        TargetUnavailable::Failed { outcome, .. } => *outcome,
+        TargetUnavailable::MissingLabel
+        | TargetUnavailable::Unresolved { .. }
+        | TargetUnavailable::Ambiguous { .. } => query_session::QueryOutcome::NoCandidates,
     }
 }
 
@@ -130,9 +145,10 @@ impl Backend {
             timer.observation.parse_us += label_started.elapsed().as_micros();
             match label_result {
                 Err(error) => {
-                    return RequestTarget::Unavailable(TargetUnavailable::Failed(format!(
-                        "label target task failed: {error}"
-                    )));
+                    return RequestTarget::Unavailable(TargetUnavailable::Failed {
+                        outcome: query_session::QueryOutcome::from_join_error(&error),
+                        detail: format!("label target task failed: {error}"),
+                    });
                 }
                 Ok(resolution) => {
                     if let Some(target) = target_from_label_resolution(resolution) {
@@ -149,9 +165,10 @@ impl Backend {
         let binding_parse_us = started.elapsed().as_micros();
         let Some(cursor_binding) = cursor_binding else {
             timer.observation.parse_us += binding_parse_us;
-            return RequestTarget::Unavailable(TargetUnavailable::Failed(
-                "cursor target parse unavailable".into(),
-            ));
+            return RequestTarget::Unavailable(TargetUnavailable::Failed {
+                outcome: query_session::QueryOutcome::SnapshotUnavailable,
+                detail: "cursor target parse unavailable".into(),
+            });
         };
         timer.observation.parse_us += cursor_binding.parse_us;
         timer.observation.binding_us = cursor_binding.binding_us;
@@ -183,8 +200,8 @@ impl Backend {
                         domain: parser::LookupDomain::Member,
                     })
                 }
-                member_navigation::MemberTargetResolution::Failed(reason) => {
-                    RequestTarget::Unavailable(TargetUnavailable::Failed(reason))
+                member_navigation::MemberTargetResolution::Failed { outcome, detail } => {
+                    RequestTarget::Unavailable(TargetUnavailable::Failed { outcome, detail })
                 }
             };
         }
@@ -229,9 +246,12 @@ fn target_from_label_resolution(
         LabelTargetResolution::MissingDefinition => {
             Some(RequestTarget::Unavailable(TargetUnavailable::MissingLabel))
         }
-        LabelTargetResolution::Failed(reason) => Some(RequestTarget::Unavailable(
-            TargetUnavailable::Failed(reason),
-        )),
+        LabelTargetResolution::Failed(detail) => {
+            Some(RequestTarget::Unavailable(TargetUnavailable::Failed {
+                outcome: query_session::QueryOutcome::ExecutionFailed,
+                detail,
+            }))
+        }
         LabelTargetResolution::NotLabelSyntax => None,
     }
 }
@@ -431,8 +451,9 @@ mod tests {
         .expect("failed label probe must produce a terminal target result");
         assert!(matches!(
             target,
-            RequestTarget::Unavailable(TargetUnavailable::Failed(reason))
-                if reason == "injected label failure"
+            RequestTarget::Unavailable(TargetUnavailable::Failed { outcome, detail })
+                if outcome == query_session::QueryOutcome::ExecutionFailed
+                    && detail == "injected label failure"
         ));
     }
 }

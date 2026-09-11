@@ -760,7 +760,7 @@ impl CandidateOverlaySnapshot {
 
     pub fn incomplete_facts_reason(&self) -> Option<crate::query::CandidateIncompleteReason> {
         self.has_unavailable_facts()
-            .then_some(crate::query::CandidateIncompleteReason::Cancelled)
+            .then_some(crate::query::CandidateIncompleteReason::FactsUnavailable)
     }
 
     /// Sparse request-local replacement for durable first-layer external
@@ -1325,7 +1325,7 @@ mod tests {
             .expect("callable candidates");
         assert_eq!(
             callable.coverage.incomplete_reason,
-            Some(crate::query::CandidateIncompleteReason::Cancelled)
+            Some(crate::query::CandidateIncompleteReason::FactsUnavailable)
         );
         assert!(callable.groups.iter().all(|group| {
             group.counterpart_evidence != crate::query::CounterpartEvidence::StrictOneToOne
@@ -1485,7 +1485,7 @@ mod tests {
         );
         assert_eq!(
             candidates.coverage.incomplete_reason,
-            Some(crate::query::CandidateIncompleteReason::Cancelled)
+            Some(crate::query::CandidateIncompleteReason::FactsUnavailable)
         );
     }
 

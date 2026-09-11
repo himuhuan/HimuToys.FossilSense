@@ -26,8 +26,7 @@ impl Backend {
         let result = self
             .navigate_symbol_timed(params, operation, &mut timer)
             .await;
-        timer.observation.completed = true;
-        timer.observation.returned = result.as_ref().is_ok_and(Option::is_some);
+        timer.complete(&result);
         timer.log().await;
         result
     }
@@ -45,6 +44,7 @@ impl Backend {
         let session = self.capture_query_session(&uri).await;
         timer.observation.capture_us = started.elapsed().as_micros();
         let Some(query_session) = session else {
+            timer.mark_outcome(query_session::QueryOutcome::SnapshotUnavailable);
             return Ok(None);
         };
         let root = query_session.root.clone();
@@ -52,6 +52,7 @@ impl Backend {
         let documents = query_session.documents.clone();
         let Some((version, text)) = self.document_snapshot_from_request(&uri, &documents).await
         else {
+            timer.mark_outcome(query_session::QueryOutcome::SnapshotUnavailable);
             return Ok(None);
         };
         let line_text = text
@@ -137,6 +138,7 @@ impl Backend {
             }
             request_target::RequestTarget::Workspace(syntax) => syntax,
             request_target::RequestTarget::Unavailable(unavailable) => {
+                timer.mark_outcome(request_target::target_unavailable_outcome(&unavailable));
                 if unavailable.is_failure() {
                     self.client
                         .log_message(MessageType::ERROR, unavailable.diagnostic())
@@ -220,6 +222,7 @@ impl Backend {
                     entity_truncated: related.coverage.truncated,
                     ..Default::default()
                 };
+                perf.include_shared_candidate_coverage(&semantic_set.coverage);
                 perf.include_non_callable_candidates(semantic_count);
                 perf.query_us = query_started.elapsed().as_micros();
                 let mut debug_lines = candidate_reason_log_lines(&candidates, debug_reasons);
@@ -250,17 +253,11 @@ impl Backend {
             .ok()
             .and_then(|result| result.as_ref().ok().map(|(_, _, metrics)| *metrics))
             .unwrap_or_default();
-        timer.observation.query_us = metrics.query_us;
-        timer.observation.entity_visits = metrics.entity_visits;
-        timer.observation.entity_edges = metrics.entity_edges;
-        timer.observation.entity_locations = metrics.entity_locations;
-        timer.observation.entity_truncated = metrics.entity_truncated;
-
-        timer.observation.hydration_us = metrics.hydration_us;
-        timer.observation.render_us = metrics.render_us;
+        timer.include_semantic_metrics(metrics);
         self.perf_log(|| metrics.log_line(operation.label(), total_started.elapsed().as_micros()))
             .await;
 
+        timer.observe_query_result(&result);
         match self.unwrap_query(operation.label(), result).await {
             Some((locations, debug_lines, _)) if !locations.is_empty() => {
                 if !debug_lines.is_empty() {
