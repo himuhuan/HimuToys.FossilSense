@@ -10,6 +10,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub(crate) mod relation_contract;
+
 pub const RELATION_PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

@@ -1,0 +1,348 @@
+{
+  "contractVersion": 3,
+  "cases": [
+    {
+      "name": "typescript_prepare_symbol_request",
+      "producer": "typescript",
+      "kind": "request",
+      "operation": "prepare",
+      "value": {
+        "protocolVersion": 3,
+        "operation": "prepare",
+        "params": {
+          "root": {
+            "kind": "symbol",
+            "uri": "file:///workspace/src/emoji.c",
+            "position": { "line": 4, "character": 3 },
+            "documentVersion": 11
+          }
+        }
+      }
+    },
+    {
+      "name": "rust_prepare_file_request",
+      "producer": "rust",
+      "kind": "request",
+      "operation": "prepare",
+      "value": {
+        "protocolVersion": 3,
+        "operation": "prepare",
+        "params": { "root": { "kind": "file", "uri": "file:///workspace/include/api.h" } }
+      }
+    },
+    {
+      "name": "typescript_expand_request_with_max_u64_snapshot",
+      "producer": "typescript",
+      "kind": "request",
+      "operation": "expand",
+      "value": {
+        "protocolVersion": 3,
+        "operation": "expand",
+        "params": {
+          "snapshot": {
+            "serviceInstance": "service:alpha",
+            "databaseIdentity": "db:one",
+            "workspaceUri": "file:///workspace",
+            "family": "c_cpp",
+            "engineEpoch": "18446744073709551615",
+            "semanticGeneration": "9007199254740993",
+            "overlayEpoch": "7",
+            "resolverVersion": 3
+          },
+          "nodeRef": "node:caller",
+          "relation": "calls",
+          "direction": "outgoing",
+          "cursor": null,
+          "pageSize": 50
+        }
+      }
+    },
+    {
+      "name": "rust_evidence_request",
+      "producer": "rust",
+      "kind": "request",
+      "operation": "evidence",
+      "value": {
+        "protocolVersion": 3,
+        "operation": "evidence",
+        "params": {
+          "snapshot": {
+            "serviceInstance": "service:alpha",
+            "databaseIdentity": "db:one",
+            "workspaceUri": "file:///workspace",
+            "family": "c_cpp",
+            "engineEpoch": "9",
+            "semanticGeneration": "42",
+            "overlayEpoch": "7",
+            "resolverVersion": 3
+          },
+          "edgeRef": "edge:caller-callee:resolved",
+          "cursor": "cursor:evidence:2",
+          "pageSize": 200
+        }
+      }
+    },
+    {
+      "name": "typescript_locate_node_request",
+      "producer": "typescript",
+      "kind": "request",
+      "operation": "locate",
+      "value": {
+        "protocolVersion": 3,
+        "operation": "locate",
+        "params": {
+          "snapshot": {
+            "serviceInstance": "service:alpha",
+            "databaseIdentity": "db:one",
+            "workspaceUri": "file:///workspace",
+            "family": "go",
+            "engineEpoch": "9",
+            "semanticGeneration": "42",
+            "overlayEpoch": "0",
+            "resolverVersion": 3
+          },
+          "target": { "kind": "node", "ref": "node:record" },
+          "intent": "definition",
+          "cursor": null,
+          "pageSize": 1
+        }
+      }
+    },
+    {
+      "name": "rust_locate_evidence_request",
+      "producer": "rust",
+      "kind": "request",
+      "operation": "locate",
+      "value": {
+        "protocolVersion": 3,
+        "operation": "locate",
+        "params": {
+          "snapshot": {
+            "serviceInstance": "service:alpha",
+            "databaseIdentity": "db:one",
+            "workspaceUri": "file:///workspace",
+            "family": "c_cpp",
+            "engineEpoch": "9",
+            "semanticGeneration": "42",
+            "overlayEpoch": "7",
+            "resolverVersion": 3
+          },
+          "target": { "kind": "evidence", "ref": "evidence:site:1" },
+          "intent": "site",
+          "cursor": "cursor:locate:2",
+          "pageSize": 25
+        }
+      }
+    },
+    {
+      "name": "rust_prepare_multiple_roots_all_node_and_relation_kinds",
+      "producer": "rust",
+      "kind": "result",
+      "operation": "prepare",
+      "value": {
+        "protocolVersion": 3,
+        "outcome": "ok",
+        "data": {
+          "snapshot": {
+            "serviceInstance": "service:alpha",
+            "databaseIdentity": "db:one",
+            "workspaceUri": "file:///workspace",
+            "family": "c_cpp",
+            "engineEpoch": "9",
+            "semanticGeneration": "42",
+            "overlayEpoch": "7",
+            "resolverVersion": 3
+          },
+          "roots": [
+            { "ref": "node:callable", "kind": "callable", "name": "run", "qualifiedName": "ns::run", "detail": "void run()", "displayTruncated": false, "relations": [
+              { "relation": "calls", "direction": "outgoing", "support": "supported", "reason": null },
+              { "relation": "references", "direction": "incoming", "support": "partial", "reason": "bounded syntax evidence" }
+            ] },
+            { "ref": "node:record", "kind": "record", "name": "Widget", "qualifiedName": "ns::Widget", "detail": null, "displayTruncated": false, "relations": [
+              { "relation": "members", "direction": "outgoing", "support": "supported", "reason": null },
+              { "relation": "inherits", "direction": "incoming", "support": "supported", "reason": null }
+            ] },
+            { "ref": "node:field", "kind": "field", "name": "value", "qualifiedName": "ns::Widget::value", "detail": null, "displayTruncated": false, "relations": [
+              { "relation": "typeOf", "direction": "outgoing", "support": "supported", "reason": null }
+            ] },
+            { "ref": "node:variable", "kind": "variable", "name": "global", "qualifiedName": "global", "detail": "", "displayTruncated": false, "relations": [
+              { "relation": "references", "direction": "outgoing", "support": "unsupported", "reason": "" }
+            ] },
+            { "ref": "node:local", "kind": "local", "name": "local", "qualifiedName": "run::local", "detail": null, "displayTruncated": false, "relations": [] },
+            { "ref": "node:alias", "kind": "alias", "name": "Alias", "qualifiedName": "Alias", "detail": null, "displayTruncated": false, "relations": [] },
+            { "ref": "node:macro", "kind": "macro", "name": "CALL", "qualifiedName": "CALL", "detail": null, "displayTruncated": false, "relations": [] },
+            { "ref": "node:file", "kind": "file", "name": "api.h", "qualifiedName": "include/api.h", "detail": null, "displayTruncated": false, "relations": [
+              { "relation": "includes", "direction": "outgoing", "support": "supported", "reason": null }
+            ] }
+          ],
+          "selectionRequired": true,
+          "coverage": { "state": "partial", "scope": "workspace c_cpp", "reasons": ["multiple_root_candidates"] }
+        }
+      }
+    },
+    {
+      "name": "typescript_expand_parallel_and_unresolved_page",
+      "producer": "typescript",
+      "kind": "result",
+      "operation": "expand",
+      "value": {
+        "protocolVersion": 3,
+        "outcome": "ok",
+        "data": {
+          "snapshot": {
+            "serviceInstance": "service:alpha",
+            "databaseIdentity": "db:one",
+            "workspaceUri": "file:///workspace",
+            "family": "c_cpp",
+            "engineEpoch": "9",
+            "semanticGeneration": "42",
+            "overlayEpoch": "7",
+            "resolverVersion": 3
+          },
+          "nodes": [
+            { "ref": "node:caller", "kind": "callable", "name": "caller", "qualifiedName": "caller", "detail": null, "displayTruncated": false, "relations": [] },
+            { "ref": "node:callee", "kind": "callable", "name": "callee", "qualifiedName": "callee", "detail": null, "displayTruncated": false, "relations": [] }
+          ],
+          "edges": [
+            { "ref": "edge:direct", "sourceRef": "node:caller", "targetRef": "node:callee", "relation": "calls", "resolution": "resolved", "ambiguitySetRef": null, "roles": ["call"], "knownSiteCount": { "value": 100, "exact": true }, "reasonCodes": [] },
+            { "ref": "edge:callback", "sourceRef": "node:caller", "targetRef": "node:callee", "relation": "calls", "resolution": "candidate", "ambiguitySetRef": "ambiguity:callback", "roles": ["address", "call"], "knownSiteCount": { "value": 2, "exact": false }, "reasonCodes": ["runtime_dispatch_unknown"] },
+            { "ref": "edge:unresolved", "sourceRef": "node:caller", "targetRef": null, "relation": "calls", "resolution": "unresolved", "ambiguitySetRef": null, "roles": ["call"], "knownSiteCount": { "value": 1, "exact": true }, "reasonCodes": ["name_only"] }
+          ],
+          "page": {
+            "continuation": { "kind": "page", "cursor": "cursor:expand:2" },
+            "coverage": { "state": "partial", "scope": "workspace c_cpp calls", "reasons": ["page_pending"] },
+            "budget": "within"
+          }
+        }
+      }
+    },
+    {
+      "name": "rust_expand_reverse_partial_end_page",
+      "producer": "rust",
+      "kind": "result",
+      "operation": "expand",
+      "value": {
+        "protocolVersion": 3,
+        "outcome": "ok",
+        "data": {
+          "snapshot": {
+            "serviceInstance": "service:alpha",
+            "databaseIdentity": "db:one",
+            "workspaceUri": "file:///workspace",
+            "family": "c_cpp",
+            "engineEpoch": "9",
+            "semanticGeneration": "42",
+            "overlayEpoch": "7",
+            "resolverVersion": 3
+          },
+          "nodes": [
+            { "ref": "node:caller", "kind": "callable", "name": "caller", "qualifiedName": "caller", "detail": null, "displayTruncated": false, "relations": [] },
+            { "ref": "node:callee", "kind": "callable", "name": "callee", "qualifiedName": "callee", "detail": null, "displayTruncated": false, "relations": [] }
+          ],
+          "edges": [
+            { "ref": "edge:direct", "sourceRef": "node:caller", "targetRef": "node:callee", "relation": "calls", "resolution": "resolved", "ambiguitySetRef": null, "roles": ["call"], "knownSiteCount": { "value": 50, "exact": false }, "reasonCodes": [] }
+          ],
+          "page": {
+            "continuation": { "kind": "end" },
+            "coverage": { "state": "partial", "scope": "workspace c_cpp calls", "reasons": ["external_bodies_unavailable"] },
+            "budget": "within"
+          }
+        }
+      }
+    },
+    {
+      "name": "typescript_evidence_limited_page",
+      "producer": "typescript",
+      "kind": "result",
+      "operation": "evidence",
+      "value": {
+        "protocolVersion": 3,
+        "outcome": "ok",
+        "data": {
+          "snapshot": {
+            "serviceInstance": "service:alpha",
+            "databaseIdentity": "db:one",
+            "workspaceUri": "file:///workspace",
+            "family": "c_cpp",
+            "engineEpoch": "9",
+            "semanticGeneration": "42",
+            "overlayEpoch": "7",
+            "resolverVersion": 3
+          },
+          "items": [
+            {
+              "ref": "evidence:site:1",
+              "location": { "uri": "file:///workspace/src/emoji.c", "range": { "start": { "line": 4, "character": 3 }, "end": { "line": 4, "character": 9 } }, "documentVersion": 11 },
+              "excerpt": "😀callee();\r\n",
+              "excerptTruncated": false,
+              "supports": ["same_file"],
+              "contradictions": [],
+              "unknowns": []
+            },
+            {
+              "ref": "evidence:site:2",
+              "location": null,
+              "excerpt": "",
+              "excerptTruncated": false,
+              "supports": [],
+              "contradictions": [],
+              "unknowns": ["source_unavailable"]
+            }
+          ],
+          "page": {
+            "continuation": { "kind": "limited", "reason": "candidate budget reached" },
+            "coverage": { "state": "partial", "scope": "edge:direct evidence", "reasons": ["candidate_limit"] },
+            "budget": "candidate_limit"
+          }
+        }
+      }
+    },
+    {
+      "name": "rust_locate_result",
+      "producer": "rust",
+      "kind": "result",
+      "operation": "locate",
+      "value": {
+        "protocolVersion": 3,
+        "outcome": "ok",
+        "data": {
+          "snapshot": {
+            "serviceInstance": "service:alpha",
+            "databaseIdentity": "db:one",
+            "workspaceUri": "file:///workspace",
+            "family": "c_cpp",
+            "engineEpoch": "9",
+            "semanticGeneration": "42",
+            "overlayEpoch": "7",
+            "resolverVersion": 3
+          },
+          "locations": [
+            { "uri": "file:///workspace/include/api.h", "range": { "start": { "line": 2, "character": 0 }, "end": { "line": 2, "character": 8 } }, "documentVersion": null }
+          ],
+          "page": { "continuation": { "kind": "end" }, "coverage": { "state": "complete", "scope": "node declarations", "reasons": [] }, "budget": "within" }
+        }
+      }
+    },
+    {
+      "name": "cancelled_terminal",
+      "producer": "typescript",
+      "kind": "result",
+      "operation": "expand",
+      "value": { "protocolVersion": 3, "outcome": "error", "error": { "code": "cancelled", "message": "request cancelled", "retryable": true, "reasonCodes": ["client_cancelled"] } }
+    },
+    {
+      "name": "stale_snapshot_after_service_restart",
+      "producer": "rust",
+      "kind": "result",
+      "operation": "expand",
+      "value": { "protocolVersion": 3, "outcome": "error", "error": { "code": "stale_snapshot", "message": "service instance changed", "retryable": true, "reasonCodes": ["service_restarted"] } }
+    },
+    {
+      "name": "unsupported_relation_terminal",
+      "producer": "rust",
+      "kind": "result",
+      "operation": "expand",
+      "value": { "protocolVersion": 3, "outcome": "error", "error": { "code": "unsupported", "message": "relation is unsupported for this node", "retryable": false, "reasonCodes": ["family_capability"] } }
+    }
+  ]
+}

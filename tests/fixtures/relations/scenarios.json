@@ -1,0 +1,46 @@
+{
+  "contractVersion": 3,
+  "countMerges": [
+    { "name": "exact_then_reverse_partial_is_monotonic", "current": { "value": 100, "exact": true }, "incoming": { "value": 50, "exact": false }, "expected": { "value": 100, "exact": true } },
+    { "name": "partial_pages_take_max_not_sum", "current": { "value": 40, "exact": false }, "incoming": { "value": 50, "exact": false }, "expected": { "value": 50, "exact": false } },
+    { "name": "conflicting_exact_is_rejected", "current": { "value": 100, "exact": true }, "incoming": { "value": 90, "exact": true }, "expectedCode": "invalid_request" },
+    { "name": "partial_above_exact_is_rejected", "current": { "value": 100, "exact": true }, "incoming": { "value": 101, "exact": false }, "expectedCode": "invalid_request" }
+  ],
+  "snapshotComparisons": [
+    {
+      "name": "identical_snapshot_matches",
+      "left": { "serviceInstance": "service:alpha", "databaseIdentity": "db:one", "workspaceUri": "file:///workspace", "family": "c_cpp", "engineEpoch": "9", "semanticGeneration": "42", "overlayEpoch": "7", "resolverVersion": 3 },
+      "right": { "serviceInstance": "service:alpha", "databaseIdentity": "db:one", "workspaceUri": "file:///workspace", "family": "c_cpp", "engineEpoch": "9", "semanticGeneration": "42", "overlayEpoch": "7", "resolverVersion": 3 },
+      "expected": true
+    },
+    {
+      "name": "same_generation_replaced_engine_is_stale",
+      "left": { "serviceInstance": "service:alpha", "databaseIdentity": "db:one", "workspaceUri": "file:///workspace", "family": "c_cpp", "engineEpoch": "9", "semanticGeneration": "42", "overlayEpoch": "7", "resolverVersion": 3 },
+      "right": { "serviceInstance": "service:alpha", "databaseIdentity": "db:one", "workspaceUri": "file:///workspace", "family": "c_cpp", "engineEpoch": "10", "semanticGeneration": "42", "overlayEpoch": "7", "resolverVersion": 3 },
+      "expected": false
+    },
+    {
+      "name": "service_restart_is_stale",
+      "left": { "serviceInstance": "service:alpha", "databaseIdentity": "db:one", "workspaceUri": "file:///workspace", "family": "c_cpp", "engineEpoch": "9", "semanticGeneration": "42", "overlayEpoch": "7", "resolverVersion": 3 },
+      "right": { "serviceInstance": "service:beta", "databaseIdentity": "db:one", "workspaceUri": "file:///workspace", "family": "c_cpp", "engineEpoch": "9", "semanticGeneration": "42", "overlayEpoch": "7", "resolverVersion": 3 },
+      "expected": false
+    },
+    {
+      "name": "workspace_root_change_is_stale",
+      "left": { "serviceInstance": "service:alpha", "databaseIdentity": "db:one", "workspaceUri": "file:///workspace-a", "family": "c_cpp", "engineEpoch": "9", "semanticGeneration": "42", "overlayEpoch": "7", "resolverVersion": 3 },
+      "right": { "serviceInstance": "service:alpha", "databaseIdentity": "db:one", "workspaceUri": "file:///workspace-b", "family": "c_cpp", "engineEpoch": "9", "semanticGeneration": "42", "overlayEpoch": "7", "resolverVersion": 3 },
+      "expected": false
+    }
+  ],
+  "cursorRejections": [
+    { "name": "cross_root_cursor", "changedBinding": "nodeRef", "expectedCode": "invalid_cursor" },
+    { "name": "cross_direction_cursor", "changedBinding": "direction", "expectedCode": "invalid_cursor" },
+    { "name": "cross_operation_cursor", "changedBinding": "operation", "expectedCode": "invalid_cursor" },
+    { "name": "page_size_change_cursor", "changedBinding": "pageSize", "expectedCode": "invalid_cursor" }
+  ],
+  "terminalRaces": [
+    { "name": "cancel_then_late_success", "first": "cancelled", "late": "ok", "acceptedTerminalCount": 1 },
+    { "name": "success_then_late_cancel", "first": "ok", "late": "cancelled", "acceptedTerminalCount": 1 },
+    { "name": "stale_navigation_after_edit", "first": "stale_snapshot", "late": "ok", "acceptedTerminalCount": 1 }
+  ]
+}

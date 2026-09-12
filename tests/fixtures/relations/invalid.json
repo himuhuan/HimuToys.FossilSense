@@ -1,0 +1,137 @@
+{
+  "contractVersion": 3,
+  "cases": [
+    {
+      "name": "format_2_is_only_a_version_mismatch_counterexample",
+      "kind": "request",
+      "operation": "prepare",
+      "expectedCode": "version_mismatch",
+      "value": { "protocolVersion": 2, "operation": "prepare", "params": { "root": { "kind": "file", "uri": "file:///workspace" } } }
+    },
+    {
+      "name": "unknown_request_field",
+      "kind": "request",
+      "operation": "prepare",
+      "expectedCode": "invalid_request",
+      "value": { "protocolVersion": 3, "operation": "prepare", "params": { "root": { "kind": "file", "uri": "file:///workspace" } }, "compatibilityMode": true }
+    },
+    {
+      "name": "unknown_relation_enum",
+      "kind": "request",
+      "operation": "expand",
+      "expectedCode": "invalid_request",
+      "value": {
+        "protocolVersion": 3,
+        "operation": "expand",
+        "params": {
+          "snapshot": { "serviceInstance": "service:alpha", "databaseIdentity": "db:one", "workspaceUri": "file:///workspace", "family": "c_cpp", "engineEpoch": "9", "semanticGeneration": "42", "overlayEpoch": "7", "resolverVersion": 3 },
+          "nodeRef": "node:a", "relation": "implements", "direction": "outgoing", "cursor": null, "pageSize": 50
+        }
+      }
+    },
+    {
+      "name": "identity_must_not_be_a_js_number",
+      "kind": "request",
+      "operation": "expand",
+      "expectedCode": "invalid_request",
+      "value": {
+        "protocolVersion": 3,
+        "operation": "expand",
+        "params": {
+          "snapshot": { "serviceInstance": "service:alpha", "databaseIdentity": "db:one", "workspaceUri": "file:///workspace", "family": "c_cpp", "engineEpoch": "9", "semanticGeneration": 9007199254740992, "overlayEpoch": "7", "resolverVersion": 3 },
+          "nodeRef": "node:a", "relation": "calls", "direction": "outgoing", "cursor": null, "pageSize": 50
+        }
+      }
+    },
+    {
+      "name": "missing_explicit_nullable_cursor",
+      "kind": "request",
+      "operation": "evidence",
+      "expectedCode": "invalid_request",
+      "value": {
+        "protocolVersion": 3,
+        "operation": "evidence",
+        "params": {
+          "snapshot": { "serviceInstance": "service:alpha", "databaseIdentity": "db:one", "workspaceUri": "file:///workspace", "family": "c_cpp", "engineEpoch": "9", "semanticGeneration": "42", "overlayEpoch": "7", "resolverVersion": 3 },
+          "edgeRef": "edge:a", "pageSize": 50
+        }
+      }
+    },
+    {
+      "name": "locate_intent_does_not_match_target",
+      "kind": "request",
+      "operation": "locate",
+      "expectedCode": "invalid_request",
+      "value": {
+        "protocolVersion": 3,
+        "operation": "locate",
+        "params": {
+          "snapshot": { "serviceInstance": "service:alpha", "databaseIdentity": "db:one", "workspaceUri": "file:///workspace", "family": "c_cpp", "engineEpoch": "9", "semanticGeneration": "42", "overlayEpoch": "7", "resolverVersion": 3 },
+          "target": { "kind": "evidence", "ref": "evidence:a" }, "intent": "definition", "cursor": null, "pageSize": 50
+        }
+      }
+    },
+    {
+      "name": "missing_same_page_target",
+      "kind": "result",
+      "operation": "expand",
+      "expectedCode": "invalid_reference",
+      "value": {
+        "protocolVersion": 3,
+        "outcome": "ok",
+        "data": {
+          "snapshot": { "serviceInstance": "service:alpha", "databaseIdentity": "db:one", "workspaceUri": "file:///workspace", "family": "c_cpp", "engineEpoch": "9", "semanticGeneration": "42", "overlayEpoch": "7", "resolverVersion": 3 },
+          "nodes": [
+            { "ref": "node:a", "kind": "callable", "name": "a", "qualifiedName": "a", "detail": null, "displayTruncated": false, "relations": [] }
+          ],
+          "edges": [
+            { "ref": "edge:a-b", "sourceRef": "node:a", "targetRef": "node:b", "relation": "calls", "resolution": "resolved", "ambiguitySetRef": null, "roles": ["call"], "knownSiteCount": { "value": 1, "exact": true }, "reasonCodes": [] }
+          ],
+          "page": { "continuation": { "kind": "end" }, "coverage": { "state": "complete", "scope": "calls", "reasons": [] }, "budget": "within" }
+        }
+      }
+    },
+    {
+      "name": "unresolved_target_must_be_null",
+      "kind": "result",
+      "operation": "expand",
+      "expectedCode": "invalid_request",
+      "value": {
+        "protocolVersion": 3,
+        "outcome": "ok",
+        "data": {
+          "snapshot": { "serviceInstance": "service:alpha", "databaseIdentity": "db:one", "workspaceUri": "file:///workspace", "family": "c_cpp", "engineEpoch": "9", "semanticGeneration": "42", "overlayEpoch": "7", "resolverVersion": 3 },
+          "nodes": [
+            { "ref": "node:a", "kind": "callable", "name": "a", "qualifiedName": "a", "detail": null, "displayTruncated": false, "relations": [] },
+            { "ref": "node:b", "kind": "callable", "name": "b", "qualifiedName": "b", "detail": null, "displayTruncated": false, "relations": [] }
+          ],
+          "edges": [
+            { "ref": "edge:a-b", "sourceRef": "node:a", "targetRef": "node:b", "relation": "calls", "resolution": "unresolved", "ambiguitySetRef": null, "roles": ["call"], "knownSiteCount": { "value": 1, "exact": true }, "reasonCodes": [] }
+          ],
+          "page": { "continuation": { "kind": "end" }, "coverage": { "state": "partial", "scope": "calls", "reasons": ["unresolved"] }, "budget": "within" }
+        }
+      }
+    },
+    {
+      "name": "range_end_precedes_start",
+      "kind": "result",
+      "operation": "locate",
+      "expectedCode": "invalid_request",
+      "value": {
+        "protocolVersion": 3,
+        "outcome": "ok",
+        "data": {
+          "snapshot": { "serviceInstance": "service:alpha", "databaseIdentity": "db:one", "workspaceUri": "file:///workspace", "family": "c_cpp", "engineEpoch": "9", "semanticGeneration": "42", "overlayEpoch": "7", "resolverVersion": 3 },
+          "locations": [
+            { "uri": "file:///workspace/a.c", "range": { "start": { "line": 5, "character": 8 }, "end": { "line": 5, "character": 7 } }, "documentVersion": null }
+          ],
+          "page": { "continuation": { "kind": "end" }, "coverage": { "state": "complete", "scope": "definitions", "reasons": [] }, "budget": "within" }
+        }
+      }
+    }
+  ],
+  "generatedCases": [
+    { "name": "request_over_32_kib", "kind": "request", "operation": "prepare", "expectedCode": "invalid_request", "repeatCodePoint": "x", "repeatCount": 32769 },
+    { "name": "response_over_1_mib", "kind": "result", "operation": "evidence", "expectedCode": "invalid_request", "repeatCodePoint": "x", "repeatCount": 1048577 }
+  ]
+}
