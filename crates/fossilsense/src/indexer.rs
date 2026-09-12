@@ -204,14 +204,20 @@ fn index_workspace_impl(
     let explicit_db_path = requested_explicit_db_path
         .as_ref()
         .map(|_| writer_lock.destination_path().to_path_buf());
-    let explicit_snapshot = if options.force && explicit_db_path.is_some() {
+    // Rebuild incompatible explicit databases beside the active file, so a
+    // cancelled parse or failed publication cannot commit destructive DDL.
+    let replace_explicit = options.force
+        || explicit_db_path.as_ref().is_some_and(|path| {
+            path.is_file() && !IndexStore::has_current_schema(path).unwrap_or(false)
+        });
+    let explicit_snapshot = if replace_explicit && explicit_db_path.is_some() {
         Some(writer_lock.capture_replacement_snapshot()?)
     } else {
         None
     };
     let mut explicit_publication = explicit_db_path
         .as_ref()
-        .filter(|_| options.force)
+        .filter(|_| replace_explicit)
         .map(|path| ExplicitIndexPublication::new(path.clone()))
         .transpose()?;
     let (db_path, default_side_by_side_publication, previous_generation) =
@@ -219,7 +225,7 @@ fn index_workspace_impl(
             if let Some(publication) = explicit_publication.as_ref() {
                 let previous_generation = explicit_snapshot
                     .as_ref()
-                    .expect("force publication snapshot")
+                    .expect("explicit replacement snapshot")
                     .generation();
                 (
                     publication.staging_path().to_path_buf(),

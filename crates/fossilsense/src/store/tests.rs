@@ -20,6 +20,7 @@ mod query_scoping;
 mod read_model_parity;
 mod read_view_migration;
 mod read_views;
+mod relation_foundation;
 mod resilience_schema;
 mod schema_aliases;
 mod scoping;

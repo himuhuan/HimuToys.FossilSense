@@ -6,8 +6,8 @@ use crate::call_model::SourceRange;
 
 mod entity;
 pub use entity::{
-    callable_relation, declaration_relation, ConditionRelation, EntityDomain, EntityIdentity,
-    RelationEvidence, RelationStrength, ENTITY_RELATION_FORMAT_VERSION,
+    callable_relation, condition_relation, declaration_relation, ConditionRelation, EntityDomain,
+    EntityIdentity, RelationEvidence, RelationStrength, ENTITY_RELATION_FORMAT_VERSION,
 };
 
 mod coverage;
@@ -21,7 +21,8 @@ pub use coverage::{
 /// This is deliberately independent from the SQLite schema version: changing
 /// how a fact is derived must invalidate persisted rows even when their SQL
 /// column layout happens to stay compatible.
-pub const PARSER_FACT_VERSION: i64 = 20;
+pub const PARSER_FACT_VERSION: i64 = 21;
+pub mod relations;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -546,6 +547,7 @@ pub struct PersistentFacts<'a> {
     pub aliases: &'a [TypeAlias],
     pub callable_anchors: &'a [crate::call_model::CallableAnchor],
     pub call_sites: &'a [crate::call_model::CallSiteFact],
+    pub relations: &'a relations::RelationFacts,
 }
 
 #[cfg(test)]

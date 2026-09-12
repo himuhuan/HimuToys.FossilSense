@@ -1,7 +1,9 @@
-// Version 34 adds compact entity occurrence lookup without duplicating facts.
-pub(crate) const SCHEMA_VERSION: i64 = 34;
+// Version 35 adds bounded source facts for semantic relations.
+pub(crate) const SCHEMA_VERSION: i64 = 35;
 
 pub(crate) const DROP_DATA_TABLES_SQL: &str = "
+    DROP TABLE IF EXISTS relation_file_coverage;
+    DROP TABLE IF EXISTS relation_source_facts;
     DROP TABLE IF EXISTS pending_file_revisions;
     DROP TABLE IF EXISTS index_builds;
     DROP TABLE IF EXISTS active_file_revisions;
@@ -30,6 +32,28 @@ pub(crate) const DROP_DATA_TABLES_SQL: &str = "
 ";
 
 pub(crate) const CREATE_SCHEMA_SQL: &str = "
+    CREATE TABLE IF NOT EXISTS relation_file_coverage (
+        revision_id INTEGER NOT NULL REFERENCES file_revisions(id) ON DELETE CASCADE,
+        file_id INTEGER NOT NULL REFERENCES file_entries(id) ON DELETE CASCADE,
+        kind INTEGER NOT NULL, state INTEGER NOT NULL,
+        PRIMARY KEY(revision_id,kind)
+    );
+    CREATE INDEX IF NOT EXISTS relation_coverage_state ON relation_file_coverage(kind,state,revision_id);
+    CREATE INDEX IF NOT EXISTS relation_coverage_file ON relation_file_coverage(file_id,kind);
+    CREATE TABLE IF NOT EXISTS relation_source_facts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        revision_id INTEGER NOT NULL REFERENCES file_revisions(id) ON DELETE CASCADE,
+        file_id INTEGER NOT NULL REFERENCES file_entries(id) ON DELETE CASCADE,
+        kind INTEGER NOT NULL, name TEXT NOT NULL, target_name TEXT NOT NULL,
+        caller TEXT NOT NULL, start_byte INTEGER NOT NULL, payload TEXT NOT NULL,
+        UNIQUE(revision_id,kind,start_byte,name)
+    );
+    CREATE INDEX IF NOT EXISTS relation_name_idx ON relation_source_facts(kind,name,id);
+    CREATE INDEX IF NOT EXISTS relation_target_idx ON relation_source_facts(kind,target_name,id);
+    CREATE INDEX IF NOT EXISTS relation_caller_idx ON relation_source_facts(kind,caller,id);
+    CREATE INDEX IF NOT EXISTS relation_file_idx ON relation_source_facts(file_id,kind,id);
+    CREATE INDEX IF NOT EXISTS relation_revision_idx ON relation_source_facts(revision_id);
+
     CREATE TABLE IF NOT EXISTS meta (
         key TEXT PRIMARY KEY NOT NULL,
         value TEXT NOT NULL
@@ -528,6 +552,8 @@ pub(crate) const CREATE_LOOKUP_INDEXES_SQL: &str = "
     CREATE INDEX IF NOT EXISTS idx_import_facts_path ON import_facts(import_path);
     CREATE INDEX IF NOT EXISTS idx_import_facts_file_id ON import_facts(file_id);
     CREATE INDEX IF NOT EXISTS idx_type_alias_facts_alias ON type_alias_facts(alias);
+    CREATE INDEX IF NOT EXISTS idx_alias_target_name ON type_alias_facts(target_name,id);
+    CREATE INDEX IF NOT EXISTS idx_alias_target_record ON type_alias_facts(target_record_id,id);
     CREATE INDEX IF NOT EXISTS idx_type_alias_facts_fingerprint ON type_alias_facts(fingerprint);
     CREATE INDEX IF NOT EXISTS idx_type_alias_facts_file_id ON type_alias_facts(file_id);
     CREATE INDEX IF NOT EXISTS idx_include_edges_src ON include_edges(src_file_id);
@@ -563,6 +589,8 @@ pub(crate) const DROP_LOOKUP_INDEXES_SQL: &str = "
     DROP INDEX IF EXISTS idx_import_facts_path;
     DROP INDEX IF EXISTS idx_import_facts_file_id;
     DROP INDEX IF EXISTS idx_type_alias_facts_alias;
+    DROP INDEX IF EXISTS idx_alias_target_name;
+    DROP INDEX IF EXISTS idx_alias_target_record;
     DROP INDEX IF EXISTS idx_type_alias_facts_fingerprint;
     DROP INDEX IF EXISTS idx_type_alias_facts_file_id;
     DROP INDEX IF EXISTS idx_include_edges_src;

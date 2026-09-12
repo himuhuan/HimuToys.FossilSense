@@ -1,4 +1,5 @@
 use anyhow::Result;
+use rusqlite::OptionalExtension;
 
 use crate::includes::ResolutionKind;
 use crate::reachability::OpenReason;
@@ -7,6 +8,7 @@ mod call_facts;
 mod coverage;
 mod declarations;
 mod entities;
+pub mod relation_facts;
 #[allow(unused_imports)]
 pub use entities::{
     EntityOccurrencePage, EntityOccurrenceReadRow, EntityStoreView, ENTITY_PAGE_LIMIT,
@@ -349,11 +351,63 @@ impl<'a> ReachGraphStoreView<'a> {
     }
 }
 
+pub type IncludeRelationReadPage = (Vec<(i64, IncludeEdgeRow)>, bool, bool);
+
 pub struct IncludeTableStoreView<'a> {
     store: &'a IndexStore,
 }
 
 impl<'a> IncludeTableStoreView<'a> {
+    #[allow(dead_code)] // Typed relation backend projection.
+    pub fn relation_page(
+        &self,
+        path: &str,
+        incoming: bool,
+        after: i64,
+        limit: usize,
+    ) -> Result<IncludeRelationReadPage> {
+        let limit = limit.min(256);
+        let (selected, other) = if incoming {
+            ("dst", "src")
+        } else {
+            ("src", "dst")
+        };
+        let sql = format!(
+            "SELECT {other}.id,src.path,dst.path,e.resolution FROM include_edges e
+            JOIN files src ON src.id=e.src_file_id JOIN files dst ON dst.id=e.dst_file_id
+            WHERE {selected}.path=?1 AND {other}.id>?2 ORDER BY {other}.id LIMIT ?3"
+        );
+        let mut stmt = self.store.conn.prepare(&sql)?;
+        let mut rows = stmt.query(rusqlite::params![path, after, (limit + 1) as i64])?;
+        let mut output = Vec::new();
+        let mut more = false;
+        while let Some(row) = rows.next()? {
+            if output.len() == limit {
+                more = true;
+                break;
+            }
+            let resolution: String = row.get(3)?;
+            output.push((
+                row.get(0)?,
+                IncludeEdgeRow {
+                    source_path: row.get(1)?,
+                    target_path: row.get(2)?,
+                    resolution: ResolutionKind::from_str(&resolution),
+                },
+            ));
+        }
+        let unresolved = self
+            .store
+            .conn
+            .query_row(
+                "SELECT unresolved_includes+ambiguous_includes>0 FROM file_entries WHERE path=?1",
+                [path],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(false);
+        Ok((output, more, unresolved))
+    }
     pub(super) fn new(store: &'a IndexStore) -> Self {
         Self { store }
     }

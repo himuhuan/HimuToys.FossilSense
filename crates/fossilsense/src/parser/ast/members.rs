@@ -29,7 +29,7 @@ pub(super) fn collect_body_members(
             );
             continue;
         }
-        if child.kind() != "field_declaration" {
+        if !matches!(child.kind(), "field_declaration" | "function_definition") {
             continue;
         }
         let has_declarator = {
@@ -62,8 +62,14 @@ pub(super) fn collect_body_members(
             continue;
         }
 
-        let statement_signature =
-            compact_whitespace(child.utf8_text(source.as_bytes()).unwrap_or_default());
+        let signature_end = child
+            .child_by_field_name("body")
+            .map_or(child.end_byte(), |n| n.start_byte());
+        let statement_signature = compact_whitespace(
+            source
+                .get(child.start_byte()..signature_end)
+                .unwrap_or_default(),
+        );
         let member_type_name = child
             .child_by_field_name("type")
             .and_then(|type_node| record_type_name(type_node, source));

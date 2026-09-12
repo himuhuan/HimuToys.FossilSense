@@ -36,6 +36,8 @@ mod budget;
 mod callables;
 mod coverage;
 mod cursor;
+#[cfg(test)]
+mod relation_foundation_tests;
 pub use cursor::{CursorFacts, CursorSyntax, LookupDomain};
 mod declarations;
 mod declarators;
@@ -656,6 +658,12 @@ bitflags::bitflags! {
         const LOCAL_DECLS   = 1 << 6;
         /// Callable anchors and call-expression facts for relation queries.
         const CALL_RELATIONS = 1 << 7;
+        const BINDING_SITES = 1 << 9;
+        const EXPLICIT_BASES = 1 << 10;
+        const INDIRECT_ASSIGNMENTS = 1 << 11;
+        const MACRO_FACTS = 1 << 12;
+        const RELATION_SEMANTICS = Self::BINDING_SITES.bits() | Self::EXPLICIT_BASES.bits()
+                                | Self::INDIRECT_ASSIGNMENTS.bits() | Self::MACRO_FACTS.bits();
 
         /// Indexing: everything except request-time facts.
         const INDEX         = Self::DECLARATIONS.bits()
@@ -663,7 +671,7 @@ bitflags::bitflags! {
                             | Self::RECORDS.bits()
                             | Self::FIELDS.bits()
                             | Self::ALIASES.bits()
-                            | Self::CALL_RELATIONS.bits();
+                            | Self::CALL_RELATIONS.bits() | Self::RELATION_SEMANTICS.bits();
 
         /// Coloring / references: occurrences + canonical declarations + includes.
         const COLOR_REF     = Self::DECLARATIONS.bits()
@@ -701,7 +709,7 @@ bitflags::bitflags! {
                                | Self::RECORDS.bits()
                                | Self::FIELDS.bits()
                                | Self::ALIASES.bits()
-                               | Self::CALL_RELATIONS.bits();
+                               | Self::CALL_RELATIONS.bits() | Self::RELATION_SEMANTICS.bits();
 
         /// Compact request-only cursor domains.
         const CURSOR = 1 << 8;
@@ -738,6 +746,7 @@ pub struct FileSemanticIndex {
     pub aliases: Vec<TypeAlias>,
     pub callable_anchors: Vec<crate::call_model::CallableAnchor>,
     pub call_sites: Vec<crate::call_model::CallSiteFact>,
+    pub relations: crate::semantic_model::relations::RelationFacts,
     /// Record-typed local/parameter declarations for positional receiver
     /// inference (AST-derived). Request-time data; not persisted.
     pub local_declarations: Vec<LocalDeclaration>,
@@ -893,6 +902,8 @@ impl FileSemanticIndex {
             }
         }
         self.call_sites.clear();
+        self.relations.binding_sites.clear();
+        self.relations.indirect_assignments.clear();
     }
 
     /// Borrow the persistent/index-time facts without changing the legacy field
@@ -917,6 +928,7 @@ impl FileSemanticIndex {
             aliases: &self.aliases,
             callable_anchors: &self.callable_anchors,
             call_sites: &self.call_sites,
+            relations: &self.relations,
         }
     }
 
@@ -1495,6 +1507,7 @@ fn parse_with_handle_control(
         aliases: ast.aliases,
         callable_anchors: ast.callable_anchors,
         call_sites: ast.call_sites,
+        relations: ast.relations,
         local_declarations: ast.local_declarations,
         local_bindings: ast.local_bindings,
         diagnostics: ParseDiagnostics {
@@ -1570,6 +1583,7 @@ fn lexical_fallback(
         aliases: Vec::new(),
         callable_anchors: Vec::new(),
         call_sites: Vec::new(),
+        relations: Default::default(),
         local_declarations: Vec::new(),
         local_bindings: Vec::new(),
         diagnostics: ParseDiagnostics {

@@ -53,6 +53,10 @@ pub(super) fn requested_groups(facts: ParseFacts, fallback: bool) -> u16 {
     FactGroup::ALL
         .into_iter()
         .filter(|group| match group {
+            FactGroup::BindingSites => facts.contains(ParseFacts::BINDING_SITES),
+            FactGroup::ExplicitBases => facts.contains(ParseFacts::EXPLICIT_BASES),
+            FactGroup::IndirectAssignments => facts.contains(ParseFacts::INDIRECT_ASSIGNMENTS),
+            FactGroup::MacroFacts => facts.contains(ParseFacts::MACRO_FACTS),
             FactGroup::Includes => true,
             FactGroup::FallbackCompletions => fallback,
             FactGroup::Declarations => facts.contains(ParseFacts::DECLARATIONS),
@@ -71,7 +75,7 @@ pub(super) fn requested_groups(facts: ParseFacts, fallback: bool) -> u16 {
 }
 
 fn semantic_groups() -> u16 {
-    0x0fff & !(FactGroup::Includes.bit() | FactGroup::FallbackCompletions.bit())
+    !(FactGroup::Includes.bit() | FactGroup::FallbackCompletions.bit())
 }
 fn local_groups() -> u16 {
     FactGroup::Occurrences.bit()

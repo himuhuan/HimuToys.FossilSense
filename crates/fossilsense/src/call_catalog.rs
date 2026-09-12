@@ -48,6 +48,8 @@ pub struct RelationPage {
 #[derive(Debug, Default)]
 pub struct RelationQueryIndex {
     entities: Vec<CallableEntity>,
+    verified_calls: HashMap<String, crate::call_model::VerifiedCallTargets>,
+    entities_by_anchor: HashMap<String, EntityId>,
     entity_by_key: HashMap<String, EntityId>,
     entity_raw_keys: Vec<Vec<String>>,
     entities_by_raw_key: HashMap<String, Vec<EntityId>>,
@@ -62,6 +64,13 @@ pub struct RelationQueryIndex {
     incoming: HashMap<EntityId, Vec<RelationId>>,
     coverage: CoverageSummary,
     entity_candidate_limited: Vec<bool>,
+}
+
+struct CatalogBuildContext<'a> {
+    reach_graph: Option<&'a ReachGraph>,
+    incomplete: bool,
+    candidate_recall_limited: bool,
+    verified_calls: HashMap<String, crate::call_model::VerifiedCallTargets>,
 }
 
 impl RelationQueryIndex {
@@ -121,7 +130,18 @@ impl RelationQueryIndex {
             .into_iter()
             .map(|call| StoredCallSite::from_fact(call, &mut strings))
             .collect();
-        Self::from_stored_facts(anchors, strings, call_sites, coverage, None, true, false)
+        Self::from_stored_facts(
+            anchors,
+            strings,
+            call_sites,
+            coverage,
+            CatalogBuildContext {
+                reach_graph: None,
+                incomplete: true,
+                candidate_recall_limited: false,
+                verified_calls: HashMap::new(),
+            },
+        )
     }
 
     pub(crate) fn build_from_facts_with_context<I>(
@@ -135,6 +155,26 @@ impl RelationQueryIndex {
     where
         I: IntoIterator<Item = CallSiteFact>,
     {
+        Self::build_with_verified_calls(
+            anchors,
+            call_sites,
+            coverage,
+            reach_graph,
+            incomplete,
+            candidate_recall_limited,
+            HashMap::new(),
+        )
+    }
+
+    pub(crate) fn build_with_verified_calls<I: IntoIterator<Item = CallSiteFact>>(
+        anchors: Vec<CallableAnchor>,
+        call_sites: I,
+        coverage: CoverageSummary,
+        reach_graph: Option<&ReachGraph>,
+        incomplete: bool,
+        candidate_recall_limited: bool,
+        verified_calls: HashMap<String, crate::call_model::VerifiedCallTargets>,
+    ) -> Self {
         let mut strings = StringPool::default();
         let call_sites: Vec<_> = call_sites
             .into_iter()
@@ -145,9 +185,12 @@ impl RelationQueryIndex {
             strings,
             call_sites,
             coverage,
-            reach_graph,
-            incomplete,
-            candidate_recall_limited,
+            CatalogBuildContext {
+                reach_graph,
+                incomplete,
+                candidate_recall_limited,
+                verified_calls,
+            },
         )
     }
 
@@ -156,10 +199,14 @@ impl RelationQueryIndex {
         strings: StringPool,
         call_sites: Vec<StoredCallSite>,
         coverage: CoverageSummary,
-        reach_graph: Option<&ReachGraph>,
-        incomplete: bool,
-        candidate_recall_limited: bool,
+        context: CatalogBuildContext<'_>,
     ) -> Self {
+        let CatalogBuildContext {
+            reach_graph,
+            incomplete,
+            candidate_recall_limited,
+            verified_calls,
+        } = context;
         let SemanticAnchorGroups { groups: grouped } =
             semantic_anchor_groups(anchors, reach_graph, incomplete || candidate_recall_limited);
         let mut raw_group_counts: HashMap<String, usize> = HashMap::new();
@@ -252,7 +299,18 @@ impl RelationQueryIndex {
             calls_by_path.entry(call.path).or_default().push(call_id);
         }
 
+        let entities_by_anchor = entities
+            .iter()
+            .enumerate()
+            .flat_map(|(id, e)| {
+                e.variants
+                    .iter()
+                    .map(move |a| (a.anchor_fingerprint.clone(), id as u32))
+            })
+            .collect();
         let mut catalog = Self {
+            entities_by_anchor,
+            verified_calls,
             entities,
             entity_by_key,
             entity_raw_keys,
@@ -289,7 +347,16 @@ impl RelationQueryIndex {
                         ambiguity_site: None,
                     },
                     call_id,
-                    unresolved_evidence(catalog.call_site(call_id)),
+                    if catalog
+                        .verified_calls
+                        .get(catalog.call_site(call_id).site_fingerprint.as_ref())
+                        .is_some_and(|proof| proof.partial)
+                    {
+                        unresolved_evidence(catalog.call_site(call_id))
+                            .unknown(EvidenceCode::RelationIncomplete)
+                    } else {
+                        unresolved_evidence(catalog.call_site(call_id))
+                    },
                 );
                 continue;
             }
@@ -304,7 +371,17 @@ impl RelationQueryIndex {
                         confidence: if ambiguous {
                             RelationConfidence::Ambiguous
                         } else {
-                            confidence(evidence)
+                            if catalog
+                                .verified_calls
+                                .get(catalog.call_site(call_id).site_fingerprint.as_ref())
+                                .is_some_and(|v| {
+                                    v.partial || v.targets.iter().any(|t| t.candidate_only)
+                                })
+                            {
+                                RelationConfidence::Low
+                            } else {
+                                confidence(evidence)
+                            }
                         },
                         ambiguity_site: ambiguous.then_some(call_id),
                     },
@@ -573,7 +650,7 @@ impl RelationQueryIndex {
         let len = relation.call_site_len as usize;
         let end = start + len;
         let take = len.min(call_site_limit);
-        let call_sites = self.relation_call_sites[start..end]
+        let call_sites: Vec<CallSiteFact> = self.relation_call_sites[start..end]
             .iter()
             .take(take)
             .map(|call_site_id| self.call_site(*call_site_id).materialize(&self.strings))
@@ -590,6 +667,21 @@ impl RelationQueryIndex {
                     .callee
                     .map(|callee| self.entity_by_id(callee).clone()),
                 direction,
+                target_sources: call_sites
+                    .iter()
+                    .filter_map(|site| self.verified_calls.get(&site.site_fingerprint))
+                    .flat_map(|proof| proof.targets.iter())
+                    .filter(|proof| {
+                        relation.key.callee.is_some_and(|id| {
+                            self.entity_by_id(id)
+                                .variants
+                                .iter()
+                                .any(|a| a.anchor_fingerprint == proof.anchor_fingerprint)
+                        })
+                    })
+                    .flat_map(|proof| proof.sources.iter().cloned())
+                    .take(256)
+                    .collect(),
                 call_sites,
                 confidence: relation.key.confidence,
                 evidence: relation.evidence.into_ledger(),
@@ -606,6 +698,23 @@ impl RelationQueryIndex {
     ) {
         output.clear();
         let call = self.call_site(call_site_id);
+        if let Some(verified) = self.verified_calls.get(call.site_fingerprint.as_ref()) {
+            for target in &verified.targets {
+                if let Some(index) = self.entities_by_anchor.get(&target.anchor_fingerprint) {
+                    let mut bits = EvidenceBits::from_ledger(&target.evidence);
+                    if target.candidate_only {
+                        bits = bits.unknown(EvidenceCode::RuntimeDispatchUnknown);
+                    }
+                    if verified.partial {
+                        bits = bits.unknown(EvidenceCode::RelationIncomplete);
+                    }
+                    output.push((*index, bits));
+                }
+            }
+            output.sort_by_key(|(id, _)| *id);
+            output.dedup_by_key(|(id, _)| *id);
+            return;
+        }
         if !matches!(
             call.form,
             CallForm::DirectName | CallForm::QualifiedName | CallForm::ParenthesizedName
@@ -625,6 +734,11 @@ impl RelationQueryIndex {
         let call_path = self.strings.get(call.path);
         for candidate_id in keys {
             let candidate = self.entity_by_id(*candidate_id);
+            // Macro activity requires define/undef and include evidence from
+            // the shared resolver; ordinary name recall cannot reactivate it.
+            if candidate.kind == CallableKind::FunctionLikeMacro {
+                continue;
+            }
             if call.form != CallForm::QualifiedName
                 && candidate.owner_kind == Some(OwnerKindHint::Record)
             {
@@ -754,7 +868,8 @@ fn position_in_range(position: SourcePosition, range: SourceRange) -> bool {
 }
 
 fn confidence(evidence: EvidenceBits) -> RelationConfidence {
-    if evidence.contains_support(EvidenceCode::ExplicitQualifier)
+    if evidence.contains_support(EvidenceCode::OwnedMember)
+        || evidence.contains_support(EvidenceCode::ExplicitQualifier)
         || evidence.contains_support(EvidenceCode::InternalLinkage)
     {
         RelationConfidence::High

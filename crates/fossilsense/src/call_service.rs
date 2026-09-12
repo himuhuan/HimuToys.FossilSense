@@ -18,14 +18,36 @@ pub use crate::candidate_service::FileCandidateOverlay as FileCallOverlay;
 const DEFAULT_SCANNED_SITE_LIMIT: usize = 8_192;
 const DEFAULT_CANDIDATE_EXPANSION_LIMIT: usize = 32_768;
 
+#[cfg(test)]
+mod relation_foundation_tests;
+
 pub struct CallRelationService<'a> {
     read_context: &'a DeclarationReadContext,
     overlays: &'a [FileCallOverlay],
     reach_graph: Option<&'a ReachGraph>,
+    cancellation: Option<&'a dyn crate::query::CompletionQueryCancellation>,
     semantic_family: SemanticFamily,
+    candidate_snapshot: Option<std::sync::Arc<crate::candidate_service::CandidateOverlaySnapshot>>,
 }
 
 impl<'a> CallRelationService<'a> {
+    pub fn with_candidates(
+        mut self,
+        snapshot: std::sync::Arc<crate::candidate_service::CandidateOverlaySnapshot>,
+    ) -> Self {
+        self.candidate_snapshot = Some(snapshot);
+        self
+    }
+
+    #[allow(dead_code)] // Protocol-neutral control for the relation backend.
+    pub fn with_cancellation(
+        mut self,
+        cancellation: &'a dyn crate::query::CompletionQueryCancellation,
+    ) -> Self {
+        self.cancellation = Some(cancellation);
+        self
+    }
+
     #[cfg(test)]
     pub fn new(read_context: &'a DeclarationReadContext) -> Self {
         Self {
@@ -33,6 +55,8 @@ impl<'a> CallRelationService<'a> {
             overlays: &[],
             reach_graph: None,
             semantic_family: SemanticFamily::CFamily,
+            cancellation: None,
+            candidate_snapshot: None,
         }
     }
 
@@ -46,6 +70,8 @@ impl<'a> CallRelationService<'a> {
             overlays,
             reach_graph: None,
             semantic_family: SemanticFamily::CFamily,
+            cancellation: None,
+            candidate_snapshot: None,
         }
     }
 
@@ -60,6 +86,8 @@ impl<'a> CallRelationService<'a> {
             overlays,
             reach_graph,
             semantic_family: SemanticFamily::CFamily,
+            cancellation: None,
+            candidate_snapshot: None,
         }
     }
 
@@ -74,6 +102,8 @@ impl<'a> CallRelationService<'a> {
             overlays,
             reach_graph,
             semantic_family,
+            cancellation: None,
+            candidate_snapshot: None,
         }
     }
 
@@ -99,7 +129,7 @@ impl<'a> CallRelationService<'a> {
         relation_limit: usize,
         call_site_limit: usize,
     ) -> Result<(RelationQueryIndex, String, RelationPage)> {
-        self.read_context.read(|store| {
+        let (key, name, raw_keys) = self.read_context.read(|store| {
             let view = store.call_fact_view();
             let locator_catalog = locator_catalog(
                 &view,
@@ -119,23 +149,26 @@ impl<'a> CallRelationService<'a> {
                 .context("callable group lost its parser identity")?
                 .to_vec();
 
-            let (catalog, page) = query_resolved(
-                &view,
-                ResolvedQuery {
-                    key: &key,
-                    raw_keys: &raw_keys,
-                    name: &name,
-                    direction,
-                    cursor,
-                    relation_limit,
-                    call_site_limit,
-                    overlays: self.overlays,
-                    reach_graph: self.reach_graph,
-                    semantic_family: self.semantic_family,
-                },
-            )?;
-            Ok((catalog, key, page))
-        })
+            Ok((key, name, raw_keys))
+        })?;
+        let (catalog, page) = query_resolved(
+            self.read_context,
+            ResolvedQuery {
+                key: &key,
+                raw_keys: &raw_keys,
+                name: &name,
+                direction,
+                cursor,
+                relation_limit,
+                call_site_limit,
+                overlays: self.overlays,
+                reach_graph: self.reach_graph,
+                semantic_family: self.semantic_family,
+                cancellation: self.cancellation,
+                candidate_snapshot: self.candidate_snapshot.as_ref(),
+            },
+        )?;
+        Ok((catalog, key, page))
     }
 
     pub fn query_locator(
@@ -146,7 +179,7 @@ impl<'a> CallRelationService<'a> {
         relation_limit: usize,
         call_site_limit: usize,
     ) -> Result<(RelationQueryIndex, String, RelationPage)> {
-        self.read_context.read(|store| {
+        let (key, name, raw_keys) = self.read_context.read(|store| {
             let view = store.call_fact_view();
             let raw_key = raw_entity_key(&locator.entity_key);
             let mut anchors = Vec::new();
@@ -215,23 +248,26 @@ impl<'a> CallRelationService<'a> {
                 .raw_keys_for_entity(&key)
                 .context("callable group lost its parser identity")?
                 .to_vec();
-            let (catalog, page) = query_resolved(
-                &view,
-                ResolvedQuery {
-                    key: &key,
-                    raw_keys: &raw_keys,
-                    name: &name,
-                    direction,
-                    cursor,
-                    relation_limit,
-                    call_site_limit,
-                    overlays: self.overlays,
-                    reach_graph: self.reach_graph,
-                    semantic_family: self.semantic_family,
-                },
-            )?;
-            Ok((catalog, key, page))
-        })
+            Ok((key, name, raw_keys))
+        })?;
+        let (catalog, page) = query_resolved(
+            self.read_context,
+            ResolvedQuery {
+                key: &key,
+                raw_keys: &raw_keys,
+                name: &name,
+                direction,
+                cursor,
+                relation_limit,
+                call_site_limit,
+                overlays: self.overlays,
+                reach_graph: self.reach_graph,
+                semantic_family: self.semantic_family,
+                cancellation: self.cancellation,
+                candidate_snapshot: self.candidate_snapshot.as_ref(),
+            },
+        )?;
+        Ok((catalog, key, page))
     }
 
     pub fn query_key(
@@ -242,7 +278,7 @@ impl<'a> CallRelationService<'a> {
         relation_limit: usize,
         call_site_limit: usize,
     ) -> Result<(RelationQueryIndex, String, RelationPage)> {
-        self.read_context.read(|store| {
+        let (key, name, raw_keys) = self.read_context.read(|store| {
             let view = store.call_fact_view();
             let raw_key = raw_entity_key(key);
             let mut anchors = Vec::new();
@@ -295,23 +331,26 @@ impl<'a> CallRelationService<'a> {
                 .raw_keys_for_entity(&resolved_key)
                 .context("callable group lost its parser identity")?
                 .to_vec();
-            let (catalog, page) = query_resolved(
-                &view,
-                ResolvedQuery {
-                    key: &resolved_key,
-                    raw_keys: &raw_keys,
-                    name: &name,
-                    direction,
-                    cursor,
-                    relation_limit,
-                    call_site_limit,
-                    overlays: self.overlays,
-                    reach_graph: self.reach_graph,
-                    semantic_family: self.semantic_family,
-                },
-            )?;
-            Ok((catalog, resolved_key, page))
-        })
+            Ok((resolved_key, name, raw_keys))
+        })?;
+        let (catalog, page) = query_resolved(
+            self.read_context,
+            ResolvedQuery {
+                key: &key,
+                raw_keys: &raw_keys,
+                name: &name,
+                direction,
+                cursor,
+                relation_limit,
+                call_site_limit,
+                overlays: self.overlays,
+                reach_graph: self.reach_graph,
+                semantic_family: self.semantic_family,
+                cancellation: self.cancellation,
+                candidate_snapshot: self.candidate_snapshot.as_ref(),
+            },
+        )?;
+        Ok((catalog, key, page))
     }
 }
 
@@ -428,11 +467,14 @@ struct ResolvedQuery<'a> {
     call_site_limit: usize,
     overlays: &'a [FileCallOverlay],
     reach_graph: Option<&'a ReachGraph>,
+    cancellation: Option<&'a dyn crate::query::CompletionQueryCancellation>,
     semantic_family: SemanticFamily,
+    candidate_snapshot:
+        Option<&'a std::sync::Arc<crate::candidate_service::CandidateOverlaySnapshot>>,
 }
 
 fn query_resolved(
-    view: &CallFactStoreView<'_>,
+    read_context: &DeclarationReadContext,
     query: ResolvedQuery<'_>,
 ) -> Result<(RelationQueryIndex, RelationPage)> {
     let ResolvedQuery {
@@ -446,130 +488,254 @@ fn query_resolved(
         overlays,
         reach_graph,
         semantic_family,
+        cancellation,
+        candidate_snapshot,
     } = query;
-    let (base_rows, mut scan_limited) = match direction {
-        RelationDirection::Incoming => view.call_sites_by_callee_family_limited(
-            name,
-            semantic_family,
-            DEFAULT_SCANNED_SITE_LIMIT,
-        )?,
-        RelationDirection::Outgoing => {
-            let mut rows = Vec::new();
-            let mut limited = false;
-            for raw_key in raw_keys {
-                let remaining = DEFAULT_SCANNED_SITE_LIMIT.saturating_sub(rows.len());
-                if remaining == 0 {
-                    limited = true;
-                    break;
-                }
-                let (mut next, next_limited) =
-                    view.call_sites_by_caller_family_limited(raw_key, semantic_family, remaining)?;
-                rows.append(&mut next);
-                limited |= next_limited;
-            }
-            (rows, limited)
-        }
+    let checkpoint = || -> Result<()> {
+        anyhow::ensure!(
+            !cancellation.is_some_and(|c| c.is_cancelled()),
+            "request cancelled during relation query"
+        );
+        Ok(())
     };
-    let mut calls: Vec<CallSiteFact> = base_rows
-        .into_iter()
-        .filter(|row| !is_shadowed(overlays, &row.path))
-        .map(call_from_row)
-        .collect();
-    let mut overlay_calls: Vec<_> = overlays
-        .iter()
-        .filter(|overlay| overlay.semantic_family == semantic_family)
-        .flat_map(|overlay| overlay.calls.iter())
-        .filter(|call| match direction {
-            RelationDirection::Incoming => call.callee_name.as_deref() == Some(name),
-            RelationDirection::Outgoing => raw_keys.contains(&call.caller_entity_key),
-        })
-        .take(DEFAULT_SCANNED_SITE_LIMIT.saturating_add(1))
-        .cloned()
-        .collect();
-    if overlay_calls.len() > DEFAULT_SCANNED_SITE_LIMIT {
-        scan_limited = true;
-        overlay_calls.truncate(DEFAULT_SCANNED_SITE_LIMIT);
-    }
-    calls.splice(0..0, overlay_calls);
-    if calls.len() > DEFAULT_SCANNED_SITE_LIMIT {
-        scan_limited = true;
-        calls.truncate(DEFAULT_SCANNED_SITE_LIMIT);
-    }
-    let mut caller_keys = unique_names(calls.iter().map(|call| &call.caller_entity_key));
-    for raw_key in raw_keys {
-        if !caller_keys.contains(raw_key) {
-            caller_keys.push(raw_key.clone());
+    checkpoint()?;
+    use crate::candidate_service::{
+        relation_facts::RelationControl, relation_types::RelationQueryContext,
+        CandidateOverlaySnapshot,
+    };
+    let semantic = RelationQueryContext {
+        read: Some(std::sync::Arc::new(read_context.clone())),
+        overlays: candidate_snapshot.cloned().unwrap_or_else(|| {
+            std::sync::Arc::new(CandidateOverlaySnapshot::new(0, overlays.to_vec()))
+        }),
+        reach: reach_graph,
+        family: semantic_family,
+    };
+    let (indirect_names, indirect_limited) = if direction == RelationDirection::Incoming {
+        semantic.indirect_incoming_names(
+            name,
+            &RelationControl {
+                scan_limit: 256,
+                cancellation,
+            },
+        )?
+    } else {
+        (Vec::new(), false)
+    };
+    let (
+        mut anchors,
+        mut calls,
+        coverage,
+        mut scan_limited,
+        mut candidate_recall_limited,
+        candidate_expansion_limited,
+    ) = read_context.read(|store| {
+        let view = store.call_fact_view();
+        let (base_rows, mut scan_limited) = match direction {
+            RelationDirection::Incoming => view.call_sites_by_callee_family_limited(
+                name,
+                semantic_family,
+                DEFAULT_SCANNED_SITE_LIMIT,
+            )?,
+            RelationDirection::Outgoing => {
+                let mut rows = Vec::new();
+                let mut limited = false;
+                for raw_key in raw_keys {
+                    let remaining = DEFAULT_SCANNED_SITE_LIMIT.saturating_sub(rows.len());
+                    if remaining == 0 {
+                        limited = true;
+                        break;
+                    }
+                    let (mut next, next_limited) = view.call_sites_by_caller_family_limited(
+                        raw_key,
+                        semantic_family,
+                        remaining,
+                    )?;
+                    rows.append(&mut next);
+                    limited |= next_limited;
+                }
+                (rows, limited)
+            }
+        };
+        let mut base_rows = base_rows;
+        for slot_name in &indirect_names {
+            let remaining = DEFAULT_SCANNED_SITE_LIMIT.saturating_sub(base_rows.len());
+            if remaining == 0 {
+                scan_limited = true;
+                break;
+            }
+            let (rows, limited) =
+                view.call_sites_by_callee_family_limited(slot_name, semantic_family, remaining)?;
+            base_rows.extend(rows);
+            scan_limited |= limited;
         }
-    }
-    let mut callee_names = unique_names(calls.iter().filter_map(|call| call.callee_name.as_ref()));
-    if direction == RelationDirection::Incoming && !callee_names.iter().any(|value| value == name) {
-        callee_names.push(name.to_string());
-    }
-    let caller_set: HashSet<&str> = caller_keys.iter().map(String::as_str).collect();
-    let callee_set: HashSet<&str> = callee_names.iter().map(String::as_str).collect();
-    let mut anchors = Vec::new();
-    let mut seen = HashSet::new();
-    let mut candidate_recall_limited = append_anchors_bounded(
-        &mut anchors,
-        &mut seen,
-        overlays
+        let mut calls: Vec<CallSiteFact> = base_rows
+            .into_iter()
+            .filter(|row| !is_shadowed(overlays, &row.path))
+            .map(call_from_row)
+            .collect();
+        let mut overlay_calls: Vec<_> = overlays
             .iter()
             .filter(|overlay| overlay.semantic_family == semantic_family)
-            .flat_map(|overlay| overlay.anchors.iter())
-            .filter(|anchor| {
-                caller_set.contains(anchor.entity_key.as_str())
-                    || callee_set.contains(anchor.name.as_str())
+            .flat_map(|overlay| overlay.calls.iter())
+            .filter(|call| match direction {
+                RelationDirection::Incoming => {
+                    call.callee_name.as_deref() == Some(name)
+                        || call
+                            .callee_name
+                            .as_ref()
+                            .is_some_and(|n| indirect_names.contains(n))
+                }
+                RelationDirection::Outgoing => raw_keys.contains(&call.caller_entity_key),
             })
-            .cloned(),
-        DEFAULT_CANDIDATE_EXPANSION_LIMIT,
-    );
-    let remaining = DEFAULT_CANDIDATE_EXPANSION_LIMIT.saturating_sub(anchors.len());
-    let (caller_rows, caller_limited) =
-        view.anchors_by_entity_keys_family_limited(&caller_keys, semantic_family, remaining)?;
-    candidate_recall_limited |= caller_limited;
-    candidate_recall_limited |= append_anchors_bounded(
-        &mut anchors,
-        &mut seen,
-        caller_rows
-            .into_iter()
-            .filter(|row| !is_shadowed(overlays, &row.path))
-            .map(anchor_from_row),
-        DEFAULT_CANDIDATE_EXPANSION_LIMIT,
-    );
-    let remaining = DEFAULT_CANDIDATE_EXPANSION_LIMIT.saturating_sub(anchors.len());
-    let (callee_rows, callee_limited) =
-        view.anchors_by_names_family_limited(&callee_names, semantic_family, remaining)?;
-    candidate_recall_limited |= callee_limited;
-    candidate_recall_limited |= append_anchors_bounded(
-        &mut anchors,
-        &mut seen,
-        callee_rows
-            .into_iter()
-            .filter(|row| !is_shadowed(overlays, &row.path))
-            .map(anchor_from_row),
-        DEFAULT_CANDIDATE_EXPANSION_LIMIT,
-    );
-    let candidate_expansion_limited =
-        apply_candidate_expansion_budget(&mut calls, &anchors, DEFAULT_CANDIDATE_EXPANSION_LIMIT);
-    let catalog = RelationQueryIndex::build_from_facts_with_context(
+            .take(DEFAULT_SCANNED_SITE_LIMIT.saturating_add(1))
+            .cloned()
+            .collect();
+        if overlay_calls.len() > DEFAULT_SCANNED_SITE_LIMIT {
+            scan_limited = true;
+            overlay_calls.truncate(DEFAULT_SCANNED_SITE_LIMIT);
+        }
+        calls.splice(0..0, overlay_calls);
+        if calls.len() > DEFAULT_SCANNED_SITE_LIMIT {
+            scan_limited = true;
+            calls.truncate(DEFAULT_SCANNED_SITE_LIMIT);
+        }
+        let mut caller_keys = unique_names(calls.iter().map(|call| &call.caller_entity_key));
+        for raw_key in raw_keys {
+            if !caller_keys.contains(raw_key) {
+                caller_keys.push(raw_key.clone());
+            }
+        }
+        let mut callee_names =
+            unique_names(calls.iter().filter_map(|call| call.callee_name.as_ref()));
+        if direction == RelationDirection::Incoming
+            && !callee_names.iter().any(|value| value == name)
+        {
+            callee_names.push(name.to_string());
+        }
+        let caller_set: HashSet<&str> = caller_keys.iter().map(String::as_str).collect();
+        let callee_set: HashSet<&str> = callee_names.iter().map(String::as_str).collect();
+        let mut anchors = Vec::new();
+        let mut seen = HashSet::new();
+        let mut candidate_recall_limited = append_anchors_bounded(
+            &mut anchors,
+            &mut seen,
+            overlays
+                .iter()
+                .filter(|overlay| overlay.semantic_family == semantic_family)
+                .flat_map(|overlay| overlay.anchors.iter())
+                .filter(|anchor| {
+                    caller_set.contains(anchor.entity_key.as_str())
+                        || callee_set.contains(anchor.name.as_str())
+                })
+                .cloned(),
+            DEFAULT_CANDIDATE_EXPANSION_LIMIT,
+        );
+        let remaining = DEFAULT_CANDIDATE_EXPANSION_LIMIT.saturating_sub(anchors.len());
+        let (caller_rows, caller_limited) =
+            view.anchors_by_entity_keys_family_limited(&caller_keys, semantic_family, remaining)?;
+        candidate_recall_limited |= caller_limited;
+        candidate_recall_limited |= append_anchors_bounded(
+            &mut anchors,
+            &mut seen,
+            caller_rows
+                .into_iter()
+                .filter(|row| !is_shadowed(overlays, &row.path))
+                .map(anchor_from_row),
+            DEFAULT_CANDIDATE_EXPANSION_LIMIT,
+        );
+        let remaining = DEFAULT_CANDIDATE_EXPANSION_LIMIT.saturating_sub(anchors.len());
+        let (callee_rows, callee_limited) =
+            view.anchors_by_names_family_limited(&callee_names, semantic_family, remaining)?;
+        candidate_recall_limited |= callee_limited;
+        candidate_recall_limited |= append_anchors_bounded(
+            &mut anchors,
+            &mut seen,
+            callee_rows
+                .into_iter()
+                .filter(|row| !is_shadowed(overlays, &row.path))
+                .map(anchor_from_row),
+            DEFAULT_CANDIDATE_EXPANSION_LIMIT,
+        );
+        let candidate_expansion_limited =
+            apply_candidate_expansion_budget(&calls, &anchors, DEFAULT_CANDIDATE_EXPANSION_LIMIT);
+        Ok((
+            anchors,
+            calls,
+            coverage_summary(view.request_coverage()?),
+            scan_limited,
+            candidate_recall_limited,
+            candidate_expansion_limited,
+        ))
+    })?;
+    scan_limited |= indirect_limited;
+    let mut verified_calls = HashMap::new();
+    let mut remaining = DEFAULT_CANDIDATE_EXPANSION_LIMIT;
+    let mut seen_sites = HashSet::new();
+    calls.retain(|c| seen_sites.insert(c.site_fingerprint.clone()));
+    for call in &calls {
+        checkpoint()?;
+        if remaining == 0 || candidate_expansion_limited.contains(&call.site_fingerprint) {
+            candidate_recall_limited = true;
+            verified_calls.insert(
+                call.site_fingerprint.clone(),
+                crate::call_model::VerifiedCallTargets {
+                    partial: true,
+                    ..Default::default()
+                },
+            );
+            continue;
+        }
+        let caller = anchors
+            .iter()
+            .find(|a| a.entity_key == call.caller_entity_key);
+        let resolution = semantic.call_targets(
+            call,
+            caller,
+            &RelationControl {
+                scan_limit: remaining.min(256),
+                cancellation,
+            },
+        )?;
+        remaining = remaining.saturating_sub(resolution.scanned.max(1) + resolution.anchors.len());
+        for anchor in resolution.anchors {
+            if anchors.len() >= DEFAULT_CANDIDATE_EXPANSION_LIMIT {
+                candidate_recall_limited = true;
+                break;
+            }
+            if !anchors
+                .iter()
+                .any(|a| a.path == anchor.path && a.anchor_fingerprint == anchor.anchor_fingerprint)
+            {
+                anchors.push(anchor);
+            }
+        }
+        if let Some(proof) = resolution.verified {
+            verified_calls.insert(call.site_fingerprint.clone(), proof);
+        }
+    }
+    checkpoint()?;
+    candidate_recall_limited |= verified_calls.values().any(|proof| proof.partial);
+    let catalog = RelationQueryIndex::build_with_verified_calls(
         anchors,
         calls,
-        coverage_summary(view.request_coverage()?),
+        coverage,
         reach_graph,
         overlays_incomplete(overlays, semantic_family),
         candidate_recall_limited,
+        verified_calls,
     );
     let mut page = catalog.relation_page(direction, key, cursor, relation_limit, call_site_limit);
     page.scan_limited = scan_limited;
-    page.candidate_limited |= candidate_expansion_limited;
+    page.candidate_limited |= !candidate_expansion_limited.is_empty();
     Ok((catalog, page))
 }
 
 fn apply_candidate_expansion_budget(
-    calls: &mut Vec<CallSiteFact>,
+    calls: &[CallSiteFact],
     anchors: &[CallableAnchor],
     limit: usize,
-) -> bool {
+) -> HashSet<String> {
     // Parser entity_key is only a signature-family hint: a 1:N/N:1 family
     // becomes several conservative relation entities. Count concrete anchors
     // here (strict pairs may be conservatively over-counted) so a shared raw
@@ -596,9 +762,10 @@ fn apply_candidate_expansion_budget(
         expansions = expansions.saturating_add(cost);
         keep += 1;
     }
-    let limited = keep < calls.len();
-    calls.truncate(keep);
-    limited
+    calls[keep..]
+        .iter()
+        .map(|call| call.site_fingerprint.clone())
+        .collect()
 }
 
 fn expand_anchor_names(
@@ -1557,7 +1724,7 @@ mod tests {
             anchor.path = format!("target-{index}.c");
             anchors.push(anchor);
         }
-        let mut calls: Vec<_> = (0..10_000)
+        let calls: Vec<_> = (0..10_000)
             .map(|index| {
                 let mut call = template_call.clone();
                 call.site_fingerprint = format!("site-{index}");
@@ -1565,17 +1732,41 @@ mod tests {
             })
             .collect();
 
-        assert!(apply_candidate_expansion_budget(
-            &mut calls,
-            &anchors,
-            DEFAULT_CANDIDATE_EXPANSION_LIMIT,
-        ));
-        assert_eq!(calls.len(), DEFAULT_CANDIDATE_EXPANSION_LIMIT / 64);
+        let suppressed =
+            apply_candidate_expansion_budget(&calls, &anchors, DEFAULT_CANDIDATE_EXPANSION_LIMIT);
+        assert_eq!(
+            calls.len(),
+            10000,
+            "known sites remain available as unresolved evidence"
+        );
+        assert_eq!(
+            calls.len() - suppressed.len(),
+            DEFAULT_CANDIDATE_EXPANSION_LIMIT / 64
+        );
+        let verified = suppressed
+            .into_iter()
+            .map(|key| {
+                (
+                    key,
+                    crate::call_model::VerifiedCallTargets {
+                        partial: true,
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
         let started = std::time::Instant::now();
-        let catalog =
-            RelationQueryIndex::build_from_facts(anchors, calls, CoverageSummary::default());
+        let catalog = RelationQueryIndex::build_with_verified_calls(
+            anchors,
+            calls,
+            CoverageSummary::default(),
+            None,
+            true,
+            true,
+            verified,
+        );
         let elapsed_ms = started.elapsed().as_millis();
-        assert!(catalog.stats().relations <= DEFAULT_CANDIDATE_EXPANSION_LIMIT);
+        assert!(catalog.stats().relations <= DEFAULT_CANDIDATE_EXPANSION_LIMIT + 1);
         eprintln!(
             "high_ambiguity_budget candidates=64 raw_calls=10000 expanded_relations={} build_ms={elapsed_ms}",
             catalog.stats().relations

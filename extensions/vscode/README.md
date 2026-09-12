@@ -20,9 +20,11 @@ Saved-file updates share the base data for fallback names, include completion, G
 - Function Hover and Signature Help with arity-aware candidates and rendered comments.
 - Full bounded `struct`, `class`, and `union` Hover; unique `typedef` chains can show `aka`.
 - Optional protobuf-c generated-type Hover sources, including the proto file, declaration line, match evidence, and visible ambiguity or truncation.
-- One-hop incoming and outgoing call relations for direct C/C++ and Go calls, including call sites and evidence.
+- One-hop incoming and outgoing relations for direct calls, typed C/C++ member calls, and limited macro or callback candidates, including call sites and evidence.
 - Limited semantic coloring for macros, types, enum constants, parameters, and local variables.
 - Unsaved open-document declarations included in candidate results.
+
+The engine also exposes entity-bound references with separate read, write, read-write, call, type-use, address and unknown roles, plus bidirectional explicit C++ base relations. These interfaces share saved and unsaved facts; the existing text-reference command keeps its contract. Direct function-pointer assignments, identifiable callback-table initializers and literal calls in function-like macros remain candidates with source evidence. Arbitrary preprocessing, template instantiation, alias flow and runtime dispatch remain incomplete. The separate relation window still requires later integration.
 
 FossilSense ranks evidence from the current file, reachable includes, direct external headers, and global fallback, and preserves how include edges were resolved: exact edges provide strong reachability; unique suffix matches and every possible target of an ambiguous include remain heuristic; and direct-external evidence is evaluated from the current query origin. Limited semantic coloring lets those bounded heuristic include targets contribute macro, type, and enum-kind evidence, while unrelated whole-workspace definitions remain excluded when the include scope is open; conflicting kind evidence stays uncolored. If an exact-name global window reaches its cap, Current and strongly reachable paths are recalled first. Indexed object candidates also distinguish declarations, C tentative definitions, full definitions, and unknown declaration/definition roles. When parsing or include information is incomplete, results degrade conservatively and expose ambiguity, confidence, or coverage instead of claiming compiler-level precision.
 

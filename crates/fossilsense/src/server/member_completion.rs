@@ -120,6 +120,7 @@ impl Backend {
             member_root_contexts.insert(
                 root.clone(),
                 MemberRootQueryContext {
+                    current_reach: None,
                     declaration_read,
                     overlay,
                     current_path,

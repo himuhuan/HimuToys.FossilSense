@@ -85,7 +85,7 @@ fn read_language_evidence(
 
 #[derive(Debug, Clone, Copy)]
 pub struct PersistenceDiagnostics {
-    pub fact_mask: u8,
+    pub fact_mask: u16,
     pub parse_error_count: usize,
     pub fallback_used: bool,
 }

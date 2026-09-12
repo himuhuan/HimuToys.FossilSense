@@ -14,3 +14,6 @@ $rejected = $false
 try { Get-VerificationPlan Performance Rust '' '' $true } catch { $rejected = $true }
 if (-not $rejected) { throw 'Performance silently selected a matrix.' }
 Write-Host 'Verification plan behavior passed.'
+
+$relation = @(Get-VerificationPlan Performance Rust '' 'relation-semantic-foundation' $true)
+if ($relation.Count -ne 1 -or $relation[0].arguments[-1] -ne 'scripts/benchmark_relation_foundation.ps1') { throw 'Relation scenario lost its explicit harness.' }

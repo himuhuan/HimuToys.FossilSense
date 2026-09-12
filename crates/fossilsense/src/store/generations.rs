@@ -611,6 +611,8 @@ impl IndexStore {
             )?;
 
             for table in [
+                "relation_source_facts",
+                "relation_file_coverage",
                 "fallback_completion_facts",
                 "declaration_facts",
                 "package_facts",
@@ -712,6 +714,8 @@ impl IndexStore {
             // so latency scales with this commit's file scope rather than all
             // facts in the workspace.
             for table in [
+                "relation_source_facts",
+                "relation_file_coverage",
                 "fallback_completion_facts",
                 "declaration_facts",
                 "package_facts",

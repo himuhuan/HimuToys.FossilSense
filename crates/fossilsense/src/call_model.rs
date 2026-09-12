@@ -316,6 +316,11 @@ pub enum EvidenceCode {
     SyntaxErrorOverlap,
     UnsupportedCallForm,
     ExternalBodyUnavailable,
+    OwnedMember,
+    AssignmentCandidate,
+    RuntimeDispatchUnknown,
+    RelationIncomplete,
+    ExpansionNotEvaluated,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -352,6 +357,27 @@ pub struct CallRelation {
     pub confidence: RelationConfidence,
     pub evidence: EvidenceLedger,
     pub ambiguity_set_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub target_sources: Vec<CallTargetSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallTargetSource {
+    pub path: String,
+    pub range: SourceRange,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct VerifiedCallTargets {
+    pub targets: Vec<VerifiedCallTarget>,
+    pub partial: bool,
+}
+#[derive(Debug, Clone)]
+pub struct VerifiedCallTarget {
+    pub anchor_fingerprint: String,
+    pub candidate_only: bool,
+    pub evidence: EvidenceLedger,
+    pub sources: Vec<CallTargetSource>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

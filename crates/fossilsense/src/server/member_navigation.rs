@@ -259,6 +259,7 @@ impl Backend {
                 contexts.insert(
                     root.clone(),
                     MemberRootQueryContext {
+                        current_reach: None,
                         declaration_read: engine.declaration_read_context()?.map(Arc::new),
                         overlay,
                         current_path: current_path.clone(),

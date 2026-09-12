@@ -18,10 +18,14 @@ pub enum FactGroup {
     LocalBindings,
     CallableAnchors,
     CallSites,
+    BindingSites,
+    ExplicitBases,
+    IndirectAssignments,
+    MacroFacts,
 }
 
 impl FactGroup {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 16] = [
         Self::Declarations,
         Self::FallbackCompletions,
         Self::Includes,
@@ -34,6 +38,10 @@ impl FactGroup {
         Self::LocalBindings,
         Self::CallableAnchors,
         Self::CallSites,
+        Self::BindingSites,
+        Self::ExplicitBases,
+        Self::IndirectAssignments,
+        Self::MacroFacts,
     ];
     pub const fn bit(self) -> u16 {
         1 << self as u8

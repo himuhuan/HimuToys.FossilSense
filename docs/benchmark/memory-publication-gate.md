@@ -18,6 +18,8 @@ Performance 先构建 release，再运行显式选择的场景。已有数据库
 
 ## 资源判断
 
+关系语义基础的代表场景使用 `scripts/verify.ps1 -Profile Performance -CaseFilter relation-semantic-foundation`。脚本生成 501 个源码文件、至少 500,000 个声明和引用位点，完成真实索引与引擎加载，验证成员/回调调用及实体引用，再执行 64 次真实补全。证据目录保存源码和脚本 SHA-256 清单、数据库及 `metrics.json`；报告包含新事实行数/载荷字节、索引耗时、数据库体积、全过程进程内存峰值与任务结束后 10 秒、100 次采样的稳定最大值。该合成场景记录资源观测，不套用 U-Boot 的内存参考值，也不替代后续完整仓库生命周期验收。
+
 完整索引默认记录耗时，不以统一 120 秒拒绝；`TimeoutSeconds` 和 `LifecycleTimeoutSeconds` 是防止执行挂起的超时，触发仍为失败。历史复现才使用 `-StrictFullIndexTime` 或 `-StrictMemoryPeak`。旧 ObserveFullIndexTime、AllowTransientMemoryPeak 参数兼容保留，当前默认已开启。
 
 | 场景 | 当前判断 | 产品含义 |
@@ -83,3 +85,24 @@ U-Boot 独立补全回放 P95 为 28,002 us；生命周期中的补全 P95 为 4
 Wine 热重建失败没有被改成通过：它说明部分大型仓库在旧索引继续服务时可能无法完成完整重建，仓库级结果会继续使用旧版本。默认 512 MiB 准入和两种独立完整索引的 120s 标准保持不变。小型受控压力回归通过生产调度入口验证失败后原 epoch、数据库身份、typed 行、Hover、F12 和索引补全保持可用，许可归零且 staging 清理；它是失败保护证据，不替代 Wine 生命周期成功证据。
 
 原始报告为 `target/verification/v1.7.1/proposal2/final/large-workspace-20260908_044206.json`、`large-workspace-20260908_044604.json`，以及 `target/verification/v1.7.1/final/large-workspace-20260908_044405.json`。生命周期日志为 `proposal2/final/lifecycle-u-boot-final-20260908_043644.log` 和 `lifecycle-wine-final-20260908_043815.log`。
+
+
+## 2026-09-12 关系语义基础验证结果
+
+执行入口：`scripts/verify.ps1 -Profile Performance -CaseFilter relation-semantic-foundation`。Windows 10.0.26220、Intel Core i5-12500H、16 个逻辑处理器、25,459,482,624 bytes 物理内存；Rust 1.97.0，`x86_64-pc-windows-msvc`。源码为 `be9c8289e83c46b57a8ddfd12d635e531440a6f8` 加本次未提交实现；287 个源码/脚本文件的 SHA-256 清单摘要为 `AF86F486B61DC4F2D471A5909FBAEE3ADBC24AF474253D589E5506CC24134BF4`，运行后逐项核对无变化。
+
+| 检查 | 本次结果 |
+| --- | --- |
+| 合成输入 | 501 文件，25,012,599 bytes 源码，500,508 声明 |
+| 新关系事实 | 500,012 行；JSON 载荷 223,005,423 bytes |
+| 完整索引 / 写入 | 48,252 / 13,235 ms |
+| 数据库体积 | 568,471,552 bytes（约 542.14 MiB） |
+| 进程 Private Bytes 峰值 | 156,352,512 bytes（约 149.11 MiB），100 ms 采样 |
+| 稳定窗口 | 任务后至少 10 秒、100 次采样；最大 123,174,912 bytes（约 117.47 MiB） |
+| 真实补全 | 64 次，P95 9,458 µs；每次检查 16,384 项，预算均为 16,384 |
+| 召回正确性 | 每次至少返回 300 个索引候选，64 次均有截断标记，详情 SQL 为 0 |
+| 真实关系 | 已知 owner 方法及函数指针/对象回调产生 2 个合并调用关系，排除另一 owner 的同名方法；实体引用返回 1 个匹配位点 |
+
+Performance 退出 0，总耗时 302.90 秒，包含约 3 分 53 秒的 release 编译；测试本体 63.50 秒。新行为回归 38 项、parser 184 项、调用服务 28 项、存储 132 项、索引基本契约 30 项及补偿扫描恢复 1 项通过，各过滤器存在重叠，不累加为独立总数；Clippy 和 Local Scripts 也通过。独立 reviewer 最终准入通过。
+
+证据为 `target/verification/Performance-20260912-174721-31084/` 与 `target/benchmark/relation-20260912-174722-30876/`。后者保留 `environment.json`、`inputs.sha256`、`metrics.json`（64 次召回和全部稳定采样）、合成源码及数据库。上述资源值是 release 测试进程的观测，不替代 U-Boot/Wine 生命周期或 VS Code 界面延迟验收；真实大仓库生命周期、集成 Merge、统一 QuerySession 和关系窗口由后续集成提案承接。

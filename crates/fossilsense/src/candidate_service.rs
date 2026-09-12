@@ -38,6 +38,13 @@ use crate::semantic_model::{
 };
 
 mod include_paths;
+pub(crate) mod relation_calls;
+pub(crate) mod relation_dependencies;
+pub(crate) mod relation_facts;
+#[cfg(test)]
+mod relation_foundation_tests;
+pub(crate) mod relation_references;
+pub(crate) mod relation_types;
 pub(crate) use include_paths::IncludePathIndex;
 use include_paths::IncludePathView;
 mod callable_queries;
@@ -96,6 +103,8 @@ pub struct FileCandidateOverlay {
     pub declarations: Vec<DeclarationFact>,
     pub anchors: Vec<CallableAnchor>,
     pub calls: Vec<CallSiteFact>,
+    pub relations: crate::semantic_model::relations::RelationFacts,
+    pub relation_groups: u16,
     pub records: Vec<RecordDef>,
     pub members: Vec<MemberDef>,
     pub aliases: Vec<TypeAlias>,
@@ -131,6 +140,8 @@ impl FileCandidateOverlay {
             declarations: Vec::new(),
             anchors,
             calls,
+            relations: Default::default(),
+            relation_groups: 0,
             records: Vec::new(),
             members: Vec::new(),
             aliases: Vec::new(),
@@ -149,6 +160,8 @@ impl FileCandidateOverlay {
             index.call_sites.clone(),
         );
         overlay.semantic_family = index.language.semantic_family();
+        overlay.relations.clone_from(&index.relations);
+        overlay.relation_groups = index.diagnostics.coverage.summary.requested_groups;
         overlay.package.clone_from(&index.package);
         overlay.imports.clone_from(&index.imports);
         overlay.declarations = index
@@ -205,6 +218,8 @@ impl FileCandidateOverlay {
     ) -> Self {
         let mut overlay = Self::new(path, Vec::new(), Vec::new());
         overlay.semantic_family = index.language.semantic_family();
+        overlay.relations.clone_from(&index.relations);
+        overlay.relation_groups = index.diagnostics.coverage.summary.requested_groups;
         overlay.package.clone_from(&index.package);
         overlay.imports.clone_from(&index.imports);
         if include_declarations {
@@ -338,6 +353,7 @@ pub struct CandidateOverlaySnapshot {
     #[allow(dead_code)] // Captured for request tracing and cross-snapshot diagnostics.
     pub epoch: u64,
     shadowed_paths: HashSet<String>,
+    relation_facts: relation_facts::RelationOverlayIndex,
     semantic_family_by_path: HashMap<String, SemanticFamily>,
     go_overlay_packages: HashMap<String, Option<(String, crate::reachability::OpenReason)>>,
     callable_by_name: HashMap<String, Vec<CallableAnchor>>,
@@ -351,9 +367,12 @@ pub struct CandidateOverlaySnapshot {
     members_by_record_key: HashMap<(String, String), Vec<MemberDef>>,
     member_prefix_index: Vec<OverlayMemberFact>,
     alias_by_name: HashMap<String, Vec<OverlayAliasFact>>,
+    alias_by_target: HashMap<String, Vec<OverlayAliasFact>>,
     call_sites_by_path: HashMap<String, Vec<CallSiteFact>>,
     source_by_path: HashMap<String, Arc<str>>,
     includes_by_path: HashMap<String, Vec<Include>>,
+    include_relations: HashMap<(bool, String), Vec<crate::store::views::IncludeEdgeRow>>,
+    include_open_sources: HashSet<String>,
     fallback_completions: Vec<OverlayFallbackCompletionFact>,
     unavailable_paths: HashSet<String>,
     declaration_coverage_by_path:
@@ -373,6 +392,7 @@ impl CandidateOverlaySnapshot {
             ..Self::default()
         };
         for file in files {
+            snapshot.relation_facts.insert(&file);
             snapshot.shadowed_paths.insert(file.path.clone());
             snapshot
                 .semantic_family_by_path
@@ -509,6 +529,27 @@ impl CandidateOverlaySnapshot {
                     .push(member);
             }
             for alias in file.aliases {
+                let target = match &alias.target {
+                    crate::semantic_model::AliasTarget::UnresolvedTypeName(n) => Some(n.clone()),
+                    crate::semantic_model::AliasTarget::NamedRecord { tag, .. } => {
+                        Some(tag.clone())
+                    }
+                    crate::semantic_model::AliasTarget::RecordKey(key) => snapshot
+                        .record_by_key
+                        .get(&(file.path.clone(), key.clone()))
+                        .map(|r| r.record.display_name.clone()),
+                };
+                if let Some(target) = target {
+                    snapshot
+                        .alias_by_target
+                        .entry(target)
+                        .or_default()
+                        .push(OverlayAliasFact {
+                            path: file.path.clone(),
+                            alias: alias.clone(),
+                        });
+                }
+
                 snapshot
                     .alias_by_name
                     .entry(alias.alias.clone())
@@ -615,6 +656,8 @@ impl CandidateOverlaySnapshot {
             return;
         }
         self.direct_include_overrides.clear();
+        self.include_relations.clear();
+        self.include_open_sources.clear();
         let path_view = IncludePathView::new(indexed_paths, self.shadowed_paths.iter().cloned());
 
         let mut sources: Vec<String> = self.shadowed_paths.iter().cloned().collect();
@@ -664,6 +707,23 @@ impl CandidateOverlaySnapshot {
                 Vec::new(),
             ))
         });
+        for (source, target, resolution) in &edges {
+            let row = crate::store::views::IncludeEdgeRow {
+                source_path: source.clone(),
+                target_path: target.clone(),
+                resolution: *resolution,
+            };
+            self.include_relations
+                .entry((false, source.clone()))
+                .or_default()
+                .push(row.clone());
+            self.include_relations
+                .entry((true, target.clone()))
+                .or_default()
+                .push(row);
+        }
+        self.include_open_sources
+            .extend(open.iter().map(|(p, _)| p.clone()));
         let graph = ReachGraph::with_request_overrides(
             graph_base,
             &sources,
@@ -730,6 +790,18 @@ impl CandidateOverlaySnapshot {
                 text: self.source_by_path.get(&path).cloned(),
                 facts_available: !self.unavailable_paths.contains(&path),
                 declaration_coverage: self.declaration_coverage_by_path.get(&path).copied(),
+                relations: self
+                    .relation_facts
+                    .files
+                    .get(&path)
+                    .cloned()
+                    .unwrap_or_default(),
+                relation_groups: self
+                    .relation_facts
+                    .groups
+                    .get(&path)
+                    .copied()
+                    .unwrap_or_default(),
                 path,
             })
             .collect()

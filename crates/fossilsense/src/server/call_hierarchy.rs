@@ -37,6 +37,7 @@ pub(super) struct RelationRequestState {
     pub(super) root: PathBuf,
     pub(super) read_context: Arc<DeclarationReadContext>,
     pub(super) overlays: Arc<Vec<FileCallOverlay>>,
+    candidate_snapshot: Arc<crate::candidate_service::CandidateOverlaySnapshot>,
     pub(super) revision: RelationRevision,
     reach_graph: Option<std::sync::Arc<ReachGraph>>,
     semantic_family: crate::semantic_model::SemanticFamily,
@@ -54,6 +55,7 @@ impl RelationRequestState {
     ) -> anyhow::Result<(RelationQueryIndex, String, RelationPage)> {
         let read_context = self.read_context.clone();
         let overlays = self.overlays.clone();
+        let candidate_snapshot = self.candidate_snapshot.clone();
         let reach_graph = self.reach_graph.clone();
         let semantic_family = self.semantic_family;
         let path = path.to_string();
@@ -64,6 +66,7 @@ impl RelationRequestState {
                 reach_graph.as_deref(),
                 semantic_family,
             )
+            .with_candidates(candidate_snapshot)
             .query_at(
                 &path,
                 position,
@@ -88,6 +91,7 @@ impl RelationRequestState {
     ) -> anyhow::Result<(RelationQueryIndex, String, RelationPage)> {
         let read_context = self.read_context.clone();
         let overlays = self.overlays.clone();
+        let candidate_snapshot = self.candidate_snapshot.clone();
         let reach_graph = self.reach_graph.clone();
         let semantic_family = self.semantic_family;
         let key = key.to_string();
@@ -98,6 +102,7 @@ impl RelationRequestState {
                 reach_graph.as_deref(),
                 semantic_family,
             )
+            .with_candidates(candidate_snapshot)
             .query_key(&key, direction, cursor, relation_limit, call_site_limit)
         })
         .await??;
@@ -115,6 +120,7 @@ impl RelationRequestState {
     ) -> anyhow::Result<(RelationQueryIndex, String, RelationPage)> {
         let read_context = self.read_context.clone();
         let overlays = self.overlays.clone();
+        let candidate_snapshot = self.candidate_snapshot.clone();
         let reach_graph = self.reach_graph.clone();
         let semantic_family = self.semantic_family;
         let locator = locator.clone();
@@ -125,6 +131,7 @@ impl RelationRequestState {
                 reach_graph.as_deref(),
                 semantic_family,
             )
+            .with_candidates(candidate_snapshot)
             .query_locator(
                 &locator,
                 direction,
@@ -279,6 +286,7 @@ impl Backend {
             root,
             read_context,
             overlays: Arc::new(overlays),
+            candidate_snapshot: overlay,
             revision: RelationRevision {
                 engine_epoch: context.engine.epoch.as_u64(),
                 semantic_generation: context.engine.semantic_generation,
@@ -300,6 +308,7 @@ impl Backend {
         let rel = catalog_path(&state.root, &path)?;
         let read_context = state.read_context.clone();
         let overlays = state.overlays.clone();
+        let candidate_snapshot = state.candidate_snapshot.clone();
         let reach_graph = state.reach_graph.clone();
         let semantic_family = state.semantic_family;
         let prepare_position = SourcePosition {
@@ -314,6 +323,7 @@ impl Backend {
                 reach_graph.as_deref(),
                 semantic_family,
             )
+            .with_candidates(candidate_snapshot)
             .prepare_at(&prepare_rel, prepare_position)
         })
         .await

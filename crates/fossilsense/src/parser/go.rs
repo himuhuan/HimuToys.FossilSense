@@ -308,6 +308,7 @@ fn empty_ast() -> AstIndex {
         local_bindings: Vec::new(),
         callable_anchors: Vec::new(),
         call_sites: Vec::new(),
+        relations: Default::default(),
     }
 }
 

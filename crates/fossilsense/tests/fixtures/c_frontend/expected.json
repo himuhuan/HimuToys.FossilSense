@@ -1120,7 +1120,11 @@
             "local_declarations",
             "local_bindings",
             "callable_anchors",
-            "call_sites"
+            "call_sites",
+            "binding_sites",
+            "explicit_bases",
+            "indirect_assignments",
+            "macro_facts"
           ],
           "reason": "language_ambiguity",
           "evidence": "language_selection"

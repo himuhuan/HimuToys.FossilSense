@@ -15,6 +15,8 @@ mod bindings;
 pub(super) mod context;
 mod members;
 mod objects;
+pub(super) mod relations;
+mod relations_macros;
 
 use aliases::*;
 pub use bindings::infer_receiver_record;
@@ -43,6 +45,7 @@ pub(super) struct AstIndex {
     pub(super) local_bindings: Vec<LocalBinding>,
     pub(super) callable_anchors: Vec<crate::call_model::CallableAnchor>,
     pub(super) call_sites: Vec<crate::call_model::CallSiteFact>,
+    pub(super) relations: crate::semantic_model::relations::RelationFacts,
 }
 
 /// Collect AST-only index data in one iterative pass. This keeps indexing fast
@@ -69,6 +72,7 @@ pub(super) fn collect_ast_index(
         local_bindings: Vec::new(),
         callable_anchors: Vec::new(),
         call_sites: Vec::new(),
+        relations: Default::default(),
     };
     enum Visit<'tree> {
         Enter(tree_sitter::Node<'tree>),
@@ -87,6 +91,9 @@ pub(super) fn collect_ast_index(
         });
     let mut stack = vec![Visit::Enter(root)];
     let mut declaration_context = DeclarationContext::default();
+    let mut relation_collector = facts
+        .intersects(ParseFacts::RELATION_SEMANTICS)
+        .then(relations::RelationCollector::new);
     let mut budget_visits = 0usize;
     let mut fact_bytes = super::retained::AstFactBytes::default();
     while let Some(visit) = stack.pop() {
@@ -97,6 +104,11 @@ pub(super) fn collect_ast_index(
                     .as_mut()
                     .map_or(0, |c| c.retained_fact_bytes()),
             );
+            let bytes = bytes.saturating_add(
+                relation_collector
+                    .as_mut()
+                    .map_or(0, |c| c.retained_bytes()),
+            );
             if !super::budget::check(bytes) {
                 break;
             }
@@ -106,6 +118,9 @@ pub(super) fn collect_ast_index(
             Visit::Enter(node) => node,
             Visit::Exit(node) => {
                 if let Some(collector) = call_collector.as_mut() {
+                    collector.exit(node);
+                }
+                if let Some(collector) = &mut relation_collector {
                     collector.exit(node);
                 }
                 declaration_context.exit(node);
@@ -490,6 +505,22 @@ pub(super) fn collect_ast_index(
                 }
             }
         }
+        if let Some(collector) = &mut relation_collector {
+            collector.enter(
+                relations::RelationVisit {
+                    node,
+                    source,
+                    lines: line_starts,
+                    language,
+                    context: &declaration_context,
+                    caller: call_collector
+                        .as_ref()
+                        .and_then(|c| c.current_callable().flatten()),
+                    facts,
+                },
+                &mut out.relations,
+            );
+        }
         declaration_context.enter(node, source, line_starts);
         stack.push(Visit::Exit(node));
         let mut cursor = node.walk();
@@ -504,6 +535,14 @@ pub(super) fn collect_ast_index(
         if facts.contains(ParseFacts::CALL_RELATIONS) {
             out.call_sites = collected.call_sites;
         }
+    }
+    if facts.contains(ParseFacts::CALL_RELATIONS) {
+        relations_macros::append_macros(
+            &path.to_string_lossy().replace('\\', "/"),
+            &out.relations.macros,
+            &mut out.callable_anchors,
+            &mut out.call_sites,
+        );
     }
     out
 }

@@ -144,11 +144,18 @@ try {
     '}',
     '',
   ].join('\n'));
+  const child = path.join(callServiceTestsRoot, 'crates/fossilsense/src/call_service/fixture.rs');
+  fs.mkdirSync(path.dirname(child), { recursive: true });
+  fs.writeFileSync(child, '#![cfg(test)]\nuse std::fs;\nfn fixture(){let _=fs::read_dir(".");}\n');
   assert.deepEqual(
     collectFindings(callServiceTestsRoot, { requiredOwners: ['call-service'] }),
     [],
     'cfg(test) helpers must not create production call-service violations'
   );
+  fs.unlinkSync(rootModule);
+  const testOnly = collectFindings(callServiceTestsRoot, { requiredOwners: ['call-service'] });
+  assert.equal(testOnly.length, 1);
+  assert.match(testOnly[0].detail, /matched zero files/, 'a cfg(test) file cannot satisfy production owner admission');
 } finally { fs.rmSync(callServiceTestsRoot, { recursive: true, force: true }); }
 
 // Explicit test owner sets and the production CLI default both reject zero matches.

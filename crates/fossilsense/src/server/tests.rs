@@ -2,6 +2,8 @@
 
 mod binding_replay;
 mod cursor_binding;
+mod relation_benchmark;
+mod relation_foundation;
 
 use super::{
     grouped_reference_items, local_words_for_cache, rebuild_include_table,

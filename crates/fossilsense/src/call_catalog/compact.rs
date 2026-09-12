@@ -10,9 +10,9 @@ use super::{CallSiteId, EntityId};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct EvidenceBits {
-    pub(super) supports: u16,
-    contradictions: u16,
-    unknowns: u16,
+    pub(super) supports: u32,
+    contradictions: u32,
+    unknowns: u32,
 }
 
 impl EvidenceBits {
@@ -26,6 +26,16 @@ impl EvidenceBits {
         self
     }
 
+    pub(super) fn from_ledger(ledger: &EvidenceLedger) -> Self {
+        Self {
+            supports: ledger.supports.iter().fold(0, |b, c| b | evidence_bit(*c)),
+            contradictions: ledger
+                .contradictions
+                .iter()
+                .fold(0, |b, c| b | evidence_bit(*c)),
+            unknowns: ledger.unknowns.iter().fold(0, |b, c| b | evidence_bit(*c)),
+        }
+    }
     pub(super) fn merge(&mut self, other: Self) {
         self.supports |= other.supports;
         self.contradictions |= other.contradictions;
@@ -37,7 +47,7 @@ impl EvidenceBits {
     }
 
     pub(super) fn into_ledger(self) -> EvidenceLedger {
-        fn collect(bits: u16) -> Vec<EvidenceCode> {
+        fn collect(bits: u32) -> Vec<EvidenceCode> {
             EVIDENCE_CODES
                 .iter()
                 .copied()
@@ -53,7 +63,7 @@ impl EvidenceBits {
     }
 }
 
-const EVIDENCE_CODES: [EvidenceCode; 13] = [
+const EVIDENCE_CODES: [EvidenceCode; 18] = [
     EvidenceCode::SameFile,
     EvidenceCode::InternalLinkage,
     EvidenceCode::ExplicitQualifier,
@@ -67,10 +77,15 @@ const EVIDENCE_CODES: [EvidenceCode; 13] = [
     EvidenceCode::SyntaxErrorOverlap,
     EvidenceCode::UnsupportedCallForm,
     EvidenceCode::ExternalBodyUnavailable,
+    EvidenceCode::OwnedMember,
+    EvidenceCode::AssignmentCandidate,
+    EvidenceCode::RuntimeDispatchUnknown,
+    EvidenceCode::RelationIncomplete,
+    EvidenceCode::ExpansionNotEvaluated,
 ];
 
-fn evidence_bit(code: EvidenceCode) -> u16 {
-    1u16 << match code {
+fn evidence_bit(code: EvidenceCode) -> u32 {
+    1u32 << match code {
         EvidenceCode::SameFile => 0,
         EvidenceCode::InternalLinkage => 1,
         EvidenceCode::ExplicitQualifier => 2,
@@ -84,6 +99,11 @@ fn evidence_bit(code: EvidenceCode) -> u16 {
         EvidenceCode::SyntaxErrorOverlap => 10,
         EvidenceCode::UnsupportedCallForm => 11,
         EvidenceCode::ExternalBodyUnavailable => 12,
+        EvidenceCode::OwnedMember => 13,
+        EvidenceCode::AssignmentCandidate => 14,
+        EvidenceCode::RuntimeDispatchUnknown => 15,
+        EvidenceCode::RelationIncomplete => 16,
+        EvidenceCode::ExpansionNotEvaluated => 17,
     }
 }
 

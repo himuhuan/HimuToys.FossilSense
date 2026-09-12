@@ -33,6 +33,10 @@ pub(crate) struct MemberResolutionService<'a> {
 }
 
 impl<'a> MemberResolutionService<'a> {
+    pub(crate) fn consumed_work(&self) -> usize {
+        OWNER_VISIT_LIMIT.saturating_sub(self.owner_remaining)
+            + MEMBER_SCAN_LIMIT.saturating_sub(self.member_remaining)
+    }
     pub(crate) fn new(
         roots: &'a [PathBuf],
         contexts: &'a HashMap<PathBuf, MemberRootQueryContext>,
@@ -199,6 +203,7 @@ pub(crate) struct MemberRootQueryContext {
     pub(crate) declaration_read: Option<Arc<crate::declaration_read::DeclarationReadContext>>,
     pub(crate) overlay: Arc<CandidateOverlaySnapshot>,
     pub(crate) current_path: String,
+    pub(crate) current_reach: Option<Arc<crate::reachability::ReachScope>>,
     pub(crate) reach_graph: Option<Arc<crate::reachability::ReachGraph>>,
     pub(crate) semantic_generation: crate::call_model::SemanticGeneration,
     pub(crate) semantic_family: crate::semantic_model::SemanticFamily,
@@ -210,7 +215,7 @@ impl MemberRootQueryContext {
             self.declaration_read.as_deref(),
             self.overlay.as_ref(),
             &self.current_path,
-            None,
+            self.current_reach.as_deref(),
             self.reach_graph.as_deref(),
             self.semantic_family,
         )
@@ -590,6 +595,7 @@ mod tests {
             parser::ParseFacts::HOVER_SEMANTICS,
         );
         MemberRootQueryContext {
+            current_reach: None,
             declaration_read: None,
             overlay: Arc::new(CandidateOverlaySnapshot::new(
                 1,

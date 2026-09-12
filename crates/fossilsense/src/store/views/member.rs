@@ -196,6 +196,39 @@ pub struct MemberStoreView<'a> {
 }
 
 impl<'a> MemberStoreView<'a> {
+    /// Reverse alias discovery returns names only; the type owner verifies
+    /// every candidate against the selected record in the captured generation.
+    #[allow(dead_code)] // Typed reverse inheritance API.
+    pub fn alias_names_for_target(
+        &self,
+        name: &str,
+        record_id: Option<i64>,
+        family: crate::semantic_model::SemanticFamily,
+        limit: usize,
+    ) -> Result<(Vec<(String, String)>, bool)> {
+        let language = if family == crate::semantic_model::SemanticFamily::Go {
+            "rev.language=3"
+        } else {
+            "rev.language<>3"
+        };
+        let sql=format!("SELECT a.alias,f.path FROM type_alias_facts a
+            JOIN active_file_revisions active ON active.revision_id=a.revision_id
+            JOIN file_entries f ON f.id=a.file_id JOIN file_revisions rev ON rev.id=a.revision_id
+            WHERE (a.target_name=?1 OR a.target_record_id=?2) AND {language} ORDER BY a.id LIMIT ?3");
+        let limit = limit.min(64);
+        let mut stmt = self.store.conn.prepare(&sql)?;
+        let mut rows = stmt.query(rusqlite::params![name, record_id, (limit + 1) as i64])?;
+        let mut result = Vec::new();
+        let mut truncated = false;
+        while let Some(row) = rows.next()? {
+            if result.len() == limit {
+                truncated = true;
+                break;
+            }
+            result.push((row.get(0)?, row.get(1)?));
+        }
+        Ok((result, truncated))
+    }
     pub(in crate::store) fn new(store: &'a IndexStore) -> Self {
         Self { store }
     }

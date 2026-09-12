@@ -150,8 +150,10 @@ impl CandidateQueryService<'_> {
         let mut candidates = Vec::new();
         for selected in members.iter().take(ENTITY_LIMIT) {
             let member = &selected.member;
-            if member.kind != crate::parser::MemberKind::Method
-                || selected.family != self.semantic_family
+            if !matches!(
+                member.kind,
+                crate::parser::MemberKind::Method | crate::parser::MemberKind::StaticMethod
+            ) || selected.family != self.semantic_family
                 || self
                     .handle
                     .is_some_and(|handle| handle.generation != selected.generation)

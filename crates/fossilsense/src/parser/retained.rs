@@ -90,12 +90,12 @@ impl AppendOnlyVecBytes {
 macro_rules! ast_fact_bytes {
     ($($field:ident),* $(,)?) => {
         #[derive(Default)]
-        pub(super) struct AstFactBytes { $($field: AppendOnlyVecBytes),* }
+        pub(super) struct AstFactBytes { relations: RelationFactBytes, $($field: AppendOnlyVecBytes),* }
         impl AstFactBytes {
             pub(super) fn observe(&mut self, ast: &super::ast::AstIndex) -> usize {
                 // Exhaustive pattern: adding a fact vector requires accounting.
-                let super::ast::AstIndex { parse_error_count: _, $($field),* } = ast;
-                0usize$(.saturating_add(self.$field.observe($field)))*
+                let super::ast::AstIndex { parse_error_count: _, relations, $($field),* } = ast;
+                self.relations.observe(relations)$(.saturating_add(self.$field.observe($field)))*
             }
         }
     };
@@ -168,7 +168,7 @@ impl HeapBytes for crate::semantic_model::TypeNameDomain {
         0
     }
 }
-struct_heap!(super::FileSemanticIndex, { source_fingerprint, cursor, language, language_evidence, includes, package, imports, build_guard, declarations, fallback_completions, parse_outcome, occurrences, records, fields, members, aliases, callable_anchors, call_sites, local_declarations, local_bindings, diagnostics });
+struct_heap!(super::FileSemanticIndex, { source_fingerprint, cursor, language, language_evidence, includes, package, imports, build_guard, declarations, fallback_completions, parse_outcome, occurrences, records, fields, members, aliases, callable_anchors, call_sites, relations, local_declarations, local_bindings, diagnostics });
 struct_heap!(super::CursorFacts, { spans, truncated });
 struct_heap!(super::CursorSyntax, { start_byte, end_byte, domain, qualifier, conditional, owner_type });
 struct_heap!(super::ParseDiagnostics, { parse_error_count, fallback_used, lexical_source, ast_source, requested_facts, recovery, recovery_budget_exhausted, coverage });
@@ -351,7 +351,7 @@ impl HeapBytes for crate::semantic_model::LanguageSourceKind {
 
 struct_heap!(super::RawDeclaration, { name, kind, role, start_byte, end_byte, start_line, start_col, end_line, end_col, signature, tag_kind, guard, container, incomplete });
 scalars!(super::SymbolKind, super::SymbolRole, &'static str);
-struct_heap!(super::ast::AstIndex, { parse_error_count, declarations, type_symbols, occurrences, fields, members, enum_constants, aliases, records, local_declarations, local_bindings, callable_anchors, call_sites });
+struct_heap!(super::ast::AstIndex, { parse_error_count, declarations, type_symbols, occurrences, fields, members, enum_constants, aliases, records, local_declarations, local_bindings, callable_anchors, call_sites, relations });
 
 #[cfg(test)]
 mod tests {
@@ -401,3 +401,33 @@ mod tests {
         assert_eq!(index.retained_bytes(), before + added);
     }
 }
+
+#[derive(Default)]
+pub(super) struct RelationFactBytes {
+    bindings: AppendOnlyVecBytes,
+    bases: AppendOnlyVecBytes,
+    assignments: AppendOnlyVecBytes,
+    macros: AppendOnlyVecBytes,
+}
+impl RelationFactBytes {
+    fn observe(&mut self, facts: &crate::semantic_model::relations::RelationFacts) -> usize {
+        self.bindings
+            .observe(&facts.binding_sites)
+            .saturating_add(self.bases.observe(&facts.explicit_bases))
+            .saturating_add(self.assignments.observe(&facts.indirect_assignments))
+            .saturating_add(self.macros.observe(&facts.macros))
+    }
+}
+use crate::semantic_model::relations::*;
+scalars!(
+    ReferenceRole,
+    BaseAccess,
+    crate::semantic_model::EntityDomain
+);
+struct_heap!(RelationFacts, { binding_sites, explicit_bases, indirect_assignments, macros });
+struct_heap!(RelationSource, { range, fingerprint, enclosing_callable, owner, guard, fidelity, provenance });
+struct_heap!(BindingSiteFact, { source, spelling, domain, role, receiver, member_access, qualifier, local_anchor });
+struct_heap!(ReceiverFact, { spelling, type_name, tag_domain, chain, object_anchor, object_scope });
+struct_heap!(ExplicitBaseFact, { source, derived_record_key, derived_name, base_name, access, is_virtual, dependent });
+struct_heap!(IndirectAssignmentFact, { source, slot, member, target_name, branch, unknown_write });
+struct_heap!(MacroFact, { source, name, function_like, undef, direct_calls, replacement_range, expansion_not_evaluated });

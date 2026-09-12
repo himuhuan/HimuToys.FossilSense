@@ -94,7 +94,12 @@ function stripLineComments(text) {
     .join("\n");
 }
 
+function isCfgTestFile(text) {
+  return /^\s*#!\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]/.test(text);
+}
+
 function stripCfgTestSections(text) {
+  if (isCfgTestFile(text)) return "";
   let result = "";
   let copiedThrough = 0;
   const testModule = /#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]\s*mod\s+tests\s*\{/g;
@@ -419,7 +424,7 @@ function collectFindings(root, options = {}) {
       continue;
     }
 
-    if (!isTestSource(relPath)) {
+    if (!isTestSource(relPath) && !isCfgTestFile(raw)) {
       for (const owner of requiredOwners) {
         if (owner.matches(relPath)) {
           requiredOwnerMatches.set(owner.key, requiredOwnerMatches.get(owner.key) + 1);

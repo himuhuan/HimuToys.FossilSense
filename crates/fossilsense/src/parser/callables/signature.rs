@@ -63,7 +63,14 @@ pub(super) fn normalize_call_target<'tree>(
                 },
             }
         }
-        "pointer_expression" => unsupported_target(CallForm::FunctionPointer),
+        "pointer_expression" => {
+            let mut target = node
+                .child_by_field_name("argument")
+                .map(|n| normalize_call_target(n, source))
+                .unwrap_or_else(|| unsupported_target(CallForm::FunctionPointer));
+            target.form = CallForm::FunctionPointer;
+            target
+        }
         _ => unsupported_target(CallForm::Unsupported),
     }
 }

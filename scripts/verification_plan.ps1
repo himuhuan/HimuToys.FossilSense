@@ -6,6 +6,11 @@ function Get-VerificationPlan {
     }
     if ($Profile -eq 'Performance') {
         if (-not $CaseFilter) { throw 'Performance requires an explicit -CaseFilter; select only affected scenarios.' }
+        if ($CaseFilter -eq 'relation-semantic-foundation') {
+            Add-Step powershell @('-NoProfile', '-File', 'scripts/benchmark_relation_foundation.ps1')
+            return $steps.ToArray()
+        }
+
         Add-Step cargo @('build', '--release', '-p', 'fossilsense')
         Add-Step cargo @('test', '--release', '-p', 'fossilsense', '--bin', 'fossilsense', '--no-run')
         Add-Step powershell @('-NoProfile', '-File', 'scripts/benchmark_large_workspace.ps1', '-Repeats', '1', '-IncludeFullIndex', '-IncludeEngineHydration', '-IncludeCompletionReplay', '-IncludeLspLifecycle', '-IncludeBindingReplay', '-IncludeCacheReplay', '-IncludeV142SemanticCases', '-CaseFilter', $CaseFilter)

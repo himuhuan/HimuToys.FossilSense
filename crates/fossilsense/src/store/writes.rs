@@ -244,11 +244,81 @@ pub(super) fn stage_file_updates(
             ])?;
             let revision_id = tx.last_insert_rowid();
             pending_stmt.execute(params![build.id, file_id, revision_id])?;
+            {
+                use crate::semantic_model::{FactCoverage, FactGroup};
+                let mut stmt=tx.prepare_cached("INSERT INTO relation_file_coverage(revision_id,file_id,kind,state) VALUES (?1,?2,?3,?4)")?;
+                for (kind, group) in [
+                    FactGroup::BindingSites,
+                    FactGroup::ExplicitBases,
+                    FactGroup::IndirectAssignments,
+                    FactGroup::MacroFacts,
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let coverage = match update.payload {
+                        FileIndexPayload::Ok(index) => index
+                            .persistent_facts()
+                            .coverage
+                            .summary
+                            .fact_coverage(group),
+                        _ => FactCoverage::Unknown,
+                    };
+                    let state = match coverage {
+                        FactCoverage::Complete => 0,
+                        FactCoverage::Partial => 1,
+                        FactCoverage::Unknown => 2,
+                    };
+                    stmt.execute(params![revision_id, file_id, kind as i64, state])?;
+                }
+            }
 
             let FileIndexPayload::Ok(index) = update.payload else {
                 continue;
             };
             let facts = index.persistent_facts();
+            {
+                use super::views::relation_facts::RelationFact;
+                let mut stmt = tx.prepare_cached("INSERT INTO relation_source_facts(revision_id,file_id,kind,name,target_name,caller,start_byte,payload) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)")?;
+                let mut write =
+                    |kind: u8, name: &str, target: &str, fact: RelationFact| -> Result<()> {
+                        let src = fact.source();
+                        stmt.execute(params![
+                            revision_id,
+                            file_id,
+                            kind,
+                            name,
+                            target,
+                            src.enclosing_callable.as_deref().unwrap_or(""),
+                            src.range.start_byte as i64,
+                            serde_json::to_string(&fact)?
+                        ])?;
+                        Ok(())
+                    };
+                for fact in &facts.relations.binding_sites {
+                    write(0, &fact.spelling, "", RelationFact::Binding(fact.clone()))?;
+                }
+                for fact in &facts.relations.explicit_bases {
+                    write(
+                        1,
+                        &fact.derived_name,
+                        &fact.base_name,
+                        RelationFact::Base(fact.clone()),
+                    )?;
+                }
+                for fact in &facts.relations.indirect_assignments {
+                    write(
+                        2,
+                        fact.member.as_deref().unwrap_or(&fact.slot.spelling),
+                        fact.target_name.as_deref().unwrap_or(""),
+                        RelationFact::Assignment(fact.clone()),
+                    )?;
+                }
+                for fact in &facts.relations.macros {
+                    write(3, &fact.name, "", RelationFact::Macro(fact.clone()))?;
+                }
+            }
+
             anyhow::ensure!(
                 facts.coverage.gaps.len() <= 1024,
                 "coverage details exceed the file budget"

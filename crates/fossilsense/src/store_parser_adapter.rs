@@ -16,8 +16,8 @@ impl PersistableFileIndex for FileSemanticIndex {
 
     fn persistence_diagnostics(&self) -> PersistenceDiagnostics {
         PersistenceDiagnostics {
-            // Only the original durable fact groups cross the storage boundary.
-            fact_mask: self.diagnostics.requested_facts.bits() as u8,
+            // Preserve every requested durable fact group.
+            fact_mask: self.diagnostics.requested_facts.bits(),
             parse_error_count: self.diagnostics.parse_error_count,
             fallback_used: self.diagnostics.fallback_used,
         }

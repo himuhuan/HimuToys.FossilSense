@@ -376,6 +376,9 @@ impl<'a> CallFactCollector<'a> {
     }
 
     fn collect_call_site(&mut self, call: tree_sitter::Node<'_>) {
+        if super::ast::relations::pointer_declarator_pseudo_call(call, self.source) {
+            return;
+        }
         let caller_entity_key = match self.current_callable() {
             Some(Some(entity_key)) => entity_key,
             Some(None) => return,
@@ -422,7 +425,7 @@ impl<'a> CallFactCollector<'a> {
         });
     }
 
-    fn current_callable(&self) -> Option<Option<String>> {
+    pub(super) fn current_callable(&self) -> Option<Option<String>> {
         for scope in self.scopes.iter().rev() {
             match scope {
                 ScopeFrame::Callable { entity_key, .. } => return Some(entity_key.clone()),
