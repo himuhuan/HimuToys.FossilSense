@@ -1,6 +1,6 @@
 # FossilSense for VS Code
 
-FossilSense gives large, difficult-to-build C, C++, and Go workspaces useful navigation without requiring a complete compiler setup. The `1.7.2` VSIX is self-contained: open a workspace and let the bundled native engine build its local index. Go support is experimental and does not require the Go toolchain or gopls.
+FossilSense runs on Windows and Linux and gives large, difficult-to-build C, C++, and Go workspaces useful navigation without requiring a complete compiler setup. The `1.7.2` VSIX is self-contained: open a workspace and let the bundled native engine build its local index. Go support is experimental and does not require the Go toolchain or gopls.
 
 Version 1.7.2 adds process resource profiles and reports recovery steps when an index update cannot obtain memory within its bounded wait. Navigation, hover, and completion details share evidence-backed declaration relationships. Index builds bound concurrent work and temporary parse data; declaration caches evict by recent use. Small saves reuse unchanged auxiliary indexes.
 
@@ -163,3 +163,11 @@ Call relations formally cover direct, explicitly qualified, or parenthesized cal
 ## Privacy
 
 Source indexing and completion history stay on the local machine. FossilSense does not upload source code, send telemetry, use cloud sync, or call a cloud ML ranker. Local completion history is bounded and can be disabled or cleared at any time.
+
+## Platforms and building
+
+Install a VSIX matching the machine that runs the extension: `win32-x64` for Windows or `linux-x64` for Linux; ARM64 machines need the corresponding `arm64` build. WSL, SSH, and container workspaces need the package installed on the remote extension host. Each package bundles its own native engine. Linux keeps project and external dependency directories with different letter casing separate.
+
+Linux development requires Node.js 22, pnpm 10, PowerShell 7 (`pwsh`), the Rust version in `rust-toolchain.toml`, and a C/C++ compiler, linker, and system headers (such as Ubuntu's `build-essential`). From the repository root, run `pwsh -NoProfile -File ./build.ps1` to install locked dependencies, build, package, and validate the artifact. Add `-Verify` for source verification. Users installing the VSIX do not need these development tools.
+
+Artifacts are named `dist/fossilsense-vscode-<version>_BUILD<timestamp>_<platform>-<arch>.vsix`. Build on the target operating system and architecture. Linux packages use glibc; Alpine/musl is unsupported, and compatibility with older system libraries depends on the build host. CI uses Ubuntu 22.04 and Windows x64. ARM64 packaging is available on ARM64 hosts but is not in the CI matrix. Large-workspace performance must be measured on the actual deployment machine; Windows measurements do not establish Linux performance.

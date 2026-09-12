@@ -533,6 +533,23 @@ pub fn normalize_path_string(path: &Path) -> String {
         .join("/")
 }
 
+/// Comparison key for normalized path strings; Unix identities retain case.
+pub(crate) fn path_comparison_key(path: &str) -> String {
+    if cfg!(windows) {
+        path.to_ascii_lowercase()
+    } else {
+        path.to_owned()
+    }
+}
+
+pub(crate) fn path_spelling_eq(left: &str, right: &str) -> bool {
+    if cfg!(windows) {
+        left.eq_ignore_ascii_case(right)
+    } else {
+        left == right
+    }
+}
+
 /// Normalize an *absolute* path (e.g. an external include file outside the
 /// workspace) to a `/`-separated string. Unlike [`relative_slash_path`], this
 /// does not strip a workspace prefix: external files cannot be made
@@ -557,7 +574,7 @@ mod tests {
 
     use super::{
         cleanup_index_directory, default_index_path, path_is_within, publish_index_in_directory,
-        relative_slash_path, resolve_active_index, ExplicitIndexPublication, IndexDbLease,
+        resolve_active_index, ExplicitIndexPublication, IndexDbLease,
     };
 
     #[test]
@@ -1021,7 +1038,7 @@ mod tests {
         let file = Path::new(r"c:\work\FIRMWARE\Src\Main.c");
         assert!(path_is_within(root, file));
         assert_eq!(
-            relative_slash_path(root, file).expect("relative"),
+            super::relative_slash_path(root, file).expect("relative"),
             "Src/Main.c"
         );
     }

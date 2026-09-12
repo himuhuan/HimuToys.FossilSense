@@ -46,3 +46,14 @@ assert.strictEqual(
   }),
   undefined,
 );
+
+for (const candidate of [
+  path.join(extensionPath, 'bin', 'fossilsense'),
+  path.join(repoRoot, 'target', 'release', 'fossilsense'),
+  path.join(repoRoot, 'target', 'debug', 'fossilsense'),
+]) {
+  assert.strictEqual(resolveServerPathFromCandidates({
+    platform: 'linux', configuredPath: '', extensionPath,
+    exists: value => value === candidate,
+  }), candidate);
+}

@@ -36,7 +36,8 @@ Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'benchmark_process.ps1')
 
 if (-not $Binary) {
-    $Binary = Join-Path $PSScriptRoot '..\target\release\fossilsense.exe'
+    $binaryName = if ($env:OS -eq 'Windows_NT') { 'fossilsense.exe' } else { 'fossilsense' }
+    $Binary = Join-Path $PSScriptRoot "../target/release/$binaryName"
 }
 if (-not $BenchmarkRoot) {
     $BenchmarkRoot = Join-Path $PSScriptRoot '..\target\benchmark'
@@ -417,7 +418,7 @@ if ($IncludeEngineHydration) {
     $engineDatabase = Join-Path $benchmarkPath 'index-u-boot-rebuild.sqlite'
     $cases += [pscustomobject]@{
         Id = 'u-boot-engine-hydration'
-        Executable = 'powershell.exe'
+        Executable = ([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName)
         Workspace = $engineWorkspace
         Database = $engineDatabase
         ResetDatabase = $null
@@ -447,7 +448,7 @@ if ($IncludeCompletionReplay) {
     $completionDatabase = Join-Path $benchmarkPath 'index-u-boot-rebuild.sqlite'
     $cases += [pscustomobject]@{
         Id = 'u-boot-completion-replay'
-        Executable = 'powershell.exe'
+        Executable = ([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName)
         Workspace = $completionWorkspace
         Database = $completionDatabase
         ResetDatabase = $null
@@ -471,7 +472,7 @@ if ($IncludeBindingReplay) {
     $bindingDatabase = Join-Path $benchmarkPath 'index-u-boot-rebuild.sqlite'
     $cases += [pscustomobject]@{
         Id = 'u-boot-binding-replay'
-        Executable = 'powershell.exe'
+        Executable = ([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName)
         Workspace = $bindingWorkspace
         Database = $bindingDatabase
         ResetDatabase = $null
@@ -486,7 +487,7 @@ if ($IncludeCacheReplay) {
     $cacheDatabase = Join-Path $benchmarkPath 'index-u-boot-rebuild.sqlite'
     $cases += [pscustomobject]@{
         Id = 'u-boot-declaration-cache-replay'
-        Executable = 'powershell.exe'
+        Executable = ([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName)
         Workspace = $cacheWorkspace
         Database = $cacheDatabase
         ResetDatabase = $null
@@ -508,7 +509,7 @@ if ($IncludeLspLifecycle) {
         $lifecycleDatabase = Join-Path $benchmarkPath "index-$sampleName-rebuild.sqlite"
         $cases += [pscustomobject]@{
             Id = "$sampleName-lsp-lifecycle"
-            Executable = 'powershell.exe'
+            Executable = ([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName)
             Workspace = $lifecycleWorkspace
             Database = $lifecycleDatabase
             ResetDatabase = $null
@@ -544,7 +545,7 @@ if ($IncludeV142SemanticCases) {
         throw "v1.4.2 semantic benchmark harness not found: $v142HarnessPath"
     }
     if ([System.IO.Path]::GetExtension($v142HarnessPath) -ieq '.ps1') {
-        $v142Executable = 'powershell.exe'
+        $v142Executable = ([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName)
         $v142ArgumentPrefix = @(
             '-NoProfile',
             '-ExecutionPolicy',

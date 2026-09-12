@@ -597,6 +597,10 @@ fn default_full_rebuild_publishes_side_by_side_and_preserves_old_reader() {
         .unwrap()
         .to_string_lossy()
         .starts_with("index-g1-"));
+    // Production readers retain a generation lease; an open SQLite handle
+    // alone does not keep the pathname alive on Unix.
+    let old_lease = crate::pathing::IndexDbLease::acquire_default_generation(first_path.clone())
+        .expect("old generation lease");
     let old_reader = IndexStore::open_readonly(&first_path).expect("old reader");
     assert_eq!(
         old_reader
@@ -671,6 +675,7 @@ fn default_full_rebuild_publishes_side_by_side_and_preserves_old_reader() {
     drop(recovered_reader);
     drop(new_reader);
     drop(old_reader);
+    drop(old_lease);
     fs::remove_dir_all(cache_dir).expect("clean unique test cache");
 }
 

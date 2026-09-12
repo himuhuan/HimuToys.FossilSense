@@ -87,7 +87,7 @@ if (-not $SkipInstall) {
 
 if ($Verify -and $SkipTests) { throw '-Verify and -SkipTests cannot be combined.' }
 if ($Verify) {
-    Invoke-NativeCommand -FilePath (Get-RequiredCommand "powershell") -Arguments @(
+    Invoke-NativeCommand -FilePath ([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) -Arguments @(
         '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $RepoRoot 'scripts/verify.ps1'), '-Profile', 'Merge', '-SkipInstall'
     ) -WorkingDirectory $RepoRoot
 } else {
@@ -112,11 +112,12 @@ if ($newVsix.Count -ne 1) {
 
 if (-not $SkipReleaseValidation) {
     Write-Host "`nVerifying release artifact..." -ForegroundColor Yellow
-    Invoke-NativeCommand -FilePath (Get-RequiredCommand "powershell") -Arguments @(
+    Invoke-NativeCommand -FilePath ([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) -Arguments @(
         "-NoProfile",
         "-ExecutionPolicy", "Bypass",
         "-File", (Join-Path $RepoRoot "scripts\verify_release_hardening.ps1"),
-        "-Version", $Version
+        "-Version", $Version,
+        "-VsixPath", $newVsix[0].FullName
     ) -WorkingDirectory $RepoRoot
 }
 

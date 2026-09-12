@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$Version = '',
+    [string]$VsixPath = '',
     [Alias('DryRun')]
     [switch]$MetadataOnly,
     [switch]$PrintReleaseFingerprint,
@@ -71,6 +72,7 @@ function Get-ReleaseInputFingerprint {
         'extensions/vscode/README.md',
         'extensions/vscode/LICENSE.txt',
         'extensions/vscode/scripts/package.mjs',
+        'extensions/vscode/scripts/package-platform.mjs',
         'scripts/verify_release_hardening.ps1',
         'scripts/test_release_hardening.ps1'
     )
@@ -410,6 +412,7 @@ if (-not $MetadataOnly) {
                 Sort-Object LastWriteTime -Descending
         )
     }
+    if ($VsixPath) { $vsixFiles = @(Get-Item -LiteralPath $VsixPath) }
     if ($vsixFiles.Count -eq 0) {
         Add-Failure "No VSIX matching dist/$vsixPattern was found."
     } else {
@@ -420,8 +423,9 @@ if (-not $MetadataOnly) {
         $tempDirectory = $null
         $extractedBinary = $null
         try {
+            $binaryName = if ($env:OS -eq 'Windows_NT') { 'fossilsense.exe' } else { 'fossilsense' }
             $binaryEntry = $zip.Entries | Where-Object {
-                $_.FullName.Replace('\', '/') -eq 'extension/bin/fossilsense.exe'
+                $_.FullName.Replace('\', '/') -eq "extension/bin/$binaryName"
             } | Select-Object -First 1
             $bundleEntry = $zip.Entries | Where-Object {
                 $_.FullName.Replace('\', '/') -eq 'extension/out/extension.js'
@@ -434,7 +438,7 @@ if (-not $MetadataOnly) {
             } | Select-Object -First 1
 
             if ($null -eq $binaryEntry -or $binaryEntry.Length -le 0) {
-                Add-Failure "VSIX '$($latestVsix.FullName)' is missing a non-empty extension/bin/fossilsense.exe."
+                Add-Failure "VSIX '$($latestVsix.FullName)' is missing a non-empty extension/bin/$binaryName."
             }
             if ($null -eq $bundleEntry -or $bundleEntry.Length -le 0) {
                 Add-Failure "VSIX '$($latestVsix.FullName)' is missing a non-empty extension/out/extension.js."
@@ -465,6 +469,11 @@ if (-not $MetadataOnly) {
                 }
             }
             if ($null -ne $packagedBuild) {
+                $hostTarget = (& node -p "process.platform + '-' + process.arch").Trim()
+                if ($LASTEXITCODE -ne 0) { throw 'Cannot determine the artifact validation host.' }
+                if ([string]$packagedBuild.target -ne $hostTarget) {
+                    Add-Failure "VSIX target '$($packagedBuild.target)' does not match validation host '$hostTarget'."
+                }
                 if ([int]$packagedBuild.schemaVersion -ne 1) {
                     Add-Failure "VSIX release-build.json has an unsupported schema version."
                 }
@@ -531,29 +540,32 @@ if (-not $MetadataOnly) {
             }
 
             if ($null -ne $binaryEntry -and $binaryEntry.Length -gt 0) {
+                $tempDirectory = Join-Path ([System.IO.Path]::GetTempPath()) (
+                    'fossilsense-hardening-' + [guid]::NewGuid().ToString('N')
+                )
+                [System.IO.Directory]::CreateDirectory($tempDirectory) | Out-Null
+                $extractedBinary = Join-Path $tempDirectory $binaryName
+                [System.IO.Compression.ZipFileExtensions]::ExtractToFile(
+                    $binaryEntry,
+                    $extractedBinary,
+                    $true
+                )
                 if ($env:OS -ne 'Windows_NT') {
-                    Add-Failure 'The bundled Windows binary could not be executed because the hardening gate is not running on Windows.'
+                    if (($binaryEntry.ExternalAttributes -band (0x49 -shl 16)) -eq 0) {
+                        Add-Failure 'VSIX Linux engine is missing executable permission bits.'
+                    }
+                    & chmod u+x -- $extractedBinary
+                    if ($LASTEXITCODE -ne 0) { throw 'Cannot make extracted engine executable.' }
+                }
+                $binaryVersionOutput = @(& $extractedBinary --version 2>&1 | ForEach-Object {
+                    $_.ToString()
+                })
+                if ($LASTEXITCODE -ne 0) {
+                    Add-Failure "Bundled binary --version exited with code $LASTEXITCODE."
                 } else {
-                    $tempDirectory = Join-Path ([System.IO.Path]::GetTempPath()) (
-                        'fossilsense-hardening-' + [guid]::NewGuid().ToString('N')
-                    )
-                    [System.IO.Directory]::CreateDirectory($tempDirectory) | Out-Null
-                    $extractedBinary = Join-Path $tempDirectory 'fossilsense.exe'
-                    [System.IO.Compression.ZipFileExtensions]::ExtractToFile(
-                        $binaryEntry,
-                        $extractedBinary,
-                        $true
-                    )
-                    $binaryVersionOutput = @(& $extractedBinary --version 2>&1 | ForEach-Object {
-                        $_.ToString()
-                    })
-                    if ($LASTEXITCODE -ne 0) {
-                        Add-Failure "Bundled binary --version exited with code $LASTEXITCODE."
-                    } else {
-                        $binaryVersionLine = ($binaryVersionOutput -join "`n").Trim()
-                        if ($binaryVersionLine -notmatch "(?m)^fossilsense\s+$versionPattern(?:\s|$)") {
-                            Add-Failure "Bundled binary reports '$binaryVersionLine', expected fossilsense $Version."
-                        }
+                    $binaryVersionLine = ($binaryVersionOutput -join "`n").Trim()
+                    if ($binaryVersionLine -notmatch "(?m)^fossilsense\s+$versionPattern(?:\s|$)") {
+                        Add-Failure "Bundled binary reports '$binaryVersionLine', expected fossilsense $Version."
                     }
                 }
             }

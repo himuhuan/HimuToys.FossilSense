@@ -63,10 +63,10 @@ const manual = {
   kind: 'manual' as const,
   key: { workspaceRootId: 'root-a', projectPath: 'SRC/SERVER' },
 };
-assert.deepStrictEqual(validStoredProjectContextSelection(manual, projects), {
+assert.deepStrictEqual(validStoredProjectContextSelection(manual, projects), process.platform === 'win32' ? {
   kind: 'manual',
   key: projects[0].key,
-});
+} : undefined);
 assert.strictEqual(
   validStoredProjectContextSelection(
     { kind: 'manual', key: { workspaceRootId: 'root-a', projectPath: 'deleted' } },
@@ -151,3 +151,11 @@ assert.deepStrictEqual(
   packageJson.contributes.configuration.properties['fossilsense.projectContext.mode'].enum,
   ['auto', 'promptOnAmbiguous', 'off'],
 );
+
+if (process.platform === 'linux') {
+  const distinct = ['App', 'app'].map(projectPath => ({ ...projects[0], key: { workspaceRootId: 'root-a', projectPath } }));
+  for (const project of distinct) {
+    const selection = { kind: 'manual' as const, key: project.key };
+    assert.deepStrictEqual(validStoredProjectContextSelection(selection, distinct), selection);
+  }
+}

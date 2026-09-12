@@ -11,14 +11,16 @@
 
 import { execFileSync, execSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { packagePlatform, stageEngine } from './package-platform.mjs';
 
 const extDir = resolve(fileURLToPath(import.meta.url), '..', '..'); // extensions/vscode
 const repoRoot = resolve(extDir, '..', '..');
 const isWin = process.platform === 'win32';
-const exeName = isWin ? 'fossilsense.exe' : 'fossilsense';
+const platform = packagePlatform(process.platform, process.arch);
+const { exeName } = platform;
 
 function buildTimestamp() {
   const d = new Date();
@@ -103,17 +105,15 @@ requireDep(esbuildBin, 'esbuild');
 requireDep(vsceBin, '@vscode/vsce');
 
 // 1. Build the native engine in release mode.
-runShell('cargo build --release -p fossilsense', repoRoot);
+runShell(`cargo build --locked --release -p fossilsense --target ${platform.rustTarget} --target-dir target`, repoRoot);
 
 // 2. Stage the binary inside the extension so the VSIX is self-contained.
-const builtBinary = join(repoRoot, 'target', 'release', exeName);
+const builtBinary = join(repoRoot, 'target', platform.rustTarget, 'release', exeName);
 if (!existsSync(builtBinary)) {
   throw new Error(`Expected release binary not found: ${builtBinary}`);
 }
 const binDir = join(extDir, 'bin');
-mkdirSync(binDir, { recursive: true });
-const stagedBinary = join(binDir, exeName);
-copyFileSync(builtBinary, stagedBinary);
+const stagedBinary = stageEngine(builtBinary, binDir, platform);
 console.log(`Staged ${exeName} -> ${binDir}`);
 
 // 3. Bundle the TypeScript client into a single file (sidesteps pnpm symlinks for vsce).
@@ -141,6 +141,8 @@ const payloadHashes = {
 const releaseBuild = {
   schemaVersion: 1,
   packageVersion: version,
+  target: platform.target,
+  rustTarget: platform.rustTarget,
   releaseInputSha256: fingerprint.releaseInputSha256,
   releaseInputFileCount: fingerprint.releaseInputFileCount,
   nativeBinarySha256: payloadHashes.nativeBinarySha256,
@@ -161,8 +163,8 @@ console.log(`Staged release-build.json (${fingerprint.releaseInputFileCount} inp
 const distDir = join(repoRoot, 'dist');
 mkdirSync(distDir, { recursive: true });
 const bts = buildTimestamp();
-const vsixPath = join(distDir, `fossilsense-vscode-${version}_BUILD${bts}.vsix`);
-run(NODE, [vsceBin, 'package', '--no-dependencies', '--allow-missing-repository', '-o', vsixPath], extDir);
+const vsixPath = join(distDir, `fossilsense-vscode-${version}_BUILD${bts}_${platform.target}.vsix`);
+run(NODE, [vsceBin, 'package', '--target', platform.target, '--no-dependencies', '--allow-missing-repository', '-o', vsixPath], extDir);
 
 console.log(`\n✅ VSIX ready: ${vsixPath}`);
 console.log('Install: VS Code → Extensions → ... → Install from VSIX, or');

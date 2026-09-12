@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::WorkspaceConfig;
 use crate::memory_report::vec_bytes;
-use crate::pathing::{relative_slash_path, workspace_hash};
+use crate::pathing::{path_comparison_key, path_spelling_eq, relative_slash_path, workspace_hash};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -88,12 +88,7 @@ impl ProjectContextIndex {
         }
         self.projects
             .iter()
-            .find(|project| {
-                project
-                    .key
-                    .project_path
-                    .eq_ignore_ascii_case(&key.project_path)
-            })
+            .find(|project| path_spelling_eq(&project.key.project_path, &key.project_path))
             .map(|project| project.key.clone())
     }
 
@@ -174,8 +169,7 @@ pub fn discover_project_contexts(
         })
         .build();
 
-    // The lowercase directory is the Windows-compatible coalescing key; the
-    // first filesystem spelling is retained for user-visible relative paths.
+    // Coalesce Windows casing aliases while preserving distinct Unix directories.
     let mut by_dir: BTreeMap<String, (String, Vec<String>)> = BTreeMap::new();
     for entry in walker {
         let entry =
@@ -202,7 +196,7 @@ pub fn discover_project_contexts(
             .unwrap_or_default();
         let project_path = normalize_rel_slash(&project_path);
         by_dir
-            .entry(project_path.to_ascii_lowercase())
+            .entry(path_comparison_key(&project_path))
             .or_insert_with(|| (project_path, Vec::new()))
             .1
             .push(file_name.to_string());
@@ -219,7 +213,7 @@ pub fn discover_project_contexts(
         .into_values()
         .map(|(project_path, mut marker_files)| {
             marker_files.sort_by_key(|name| name.to_ascii_lowercase());
-            marker_files.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+            marker_files.dedup_by(|a, b| path_spelling_eq(a, b));
             ProjectContext {
                 key: ProjectKey {
                     workspace_root_id: workspace_root_id.clone(),
@@ -254,11 +248,11 @@ fn path_is_at_or_under(path: &str, ancestor: &str) -> bool {
     if ancestor.is_empty() {
         return true;
     }
-    if path.eq_ignore_ascii_case(ancestor) {
+    if path_spelling_eq(path, ancestor) {
         return true;
     }
     path.get(..ancestor.len())
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(ancestor))
+        .is_some_and(|prefix| path_spelling_eq(prefix, ancestor))
         && path.as_bytes().get(ancestor.len()) == Some(&b'/')
 }
 
@@ -417,6 +411,25 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_case_distinct_projects_remain_separate() {
+        let dir = tempdir().unwrap();
+        for name in ["App", "app"] {
+            fs::create_dir(dir.path().join(name)).unwrap();
+            fs::write(dir.path().join(name).join("Makefile"), "").unwrap();
+        }
+        let (config, _) = WorkspaceConfig::load(dir.path());
+        let index = discover_project_contexts(dir.path(), &config).unwrap();
+        assert_eq!(index.projects().len(), 2);
+        for name in ["App", "app"] {
+            let key = index.nearest_for_file(&format!("{name}/main.c")).unwrap();
+            assert_eq!(key.project_path, name);
+            assert_eq!(index.canonical_key(&key), Some(key));
+        }
+        assert!(index.nearest_for_file("APP/main.c").is_none());
+    }
+
+    #[test]
     fn nearest_project_handles_root_nested_case_and_path_boundaries() {
         let root_id = "root".to_string();
         let context = |path: &str| ProjectContext {
@@ -442,7 +455,7 @@ mod tests {
                 .nearest_for_file("THIRD_PARTY/lib/src/x.c")
                 .expect("nested")
                 .project_path,
-            "third_party/lib"
+            if cfg!(windows) { "third_party/lib" } else { "" }
         );
         assert_eq!(
             index
@@ -488,7 +501,11 @@ mod tests {
             project_path: "src/server".into(),
         };
 
-        assert_eq!(index.canonical_key(&stored), Some(canonical));
+        assert_eq!(index.canonical_key(&canonical), Some(canonical.clone()));
+        assert_eq!(
+            index.canonical_key(&stored),
+            if cfg!(windows) { Some(canonical) } else { None }
+        );
     }
 
     #[test]

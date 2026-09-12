@@ -10,11 +10,12 @@ $extensionPackage = Get-Content -Raw -LiteralPath (
     Join-Path $repoRoot 'extensions/vscode/package.json'
 ) | ConvertFrom-Json
 $currentVersion = [string]$extensionPackage.version
+$binaryName = if ($env:OS -eq 'Windows_NT') { 'fossilsense.exe' } else { 'fossilsense' }
 
 function Invoke-HardeningCheck {
     param([string[]]$Arguments)
     $output = @(
-        & powershell -NoProfile -ExecutionPolicy Bypass -File $hardeningScript @Arguments 2>&1 |
+        & ([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) -NoProfile -ExecutionPolicy Bypass -File $hardeningScript @Arguments 2>&1 |
             ForEach-Object { $_.ToString() }
     )
     return [pscustomobject]@{
@@ -170,13 +171,16 @@ try {
         (Join-Path $staleRoot 'extensions/vscode/package.json'),
         (Join-Path $stageExtension 'package.json')
     )
-    [System.IO.File]::Copy(
-        $env:ComSpec,
-        (Join-Path $stageExtension 'bin/fossilsense.exe')
-    )
+    if ($env:OS -eq 'Windows_NT') {
+        [System.IO.File]::Copy($env:ComSpec, (Join-Path $stageExtension "bin/$binaryName"))
+    } else {
+        Write-FixtureFile $stageExtension "bin/$binaryName" "#!/bin/sh`necho fossilsense 1.4.2`n"
+        & chmod 755 -- (Join-Path $stageExtension "bin/$binaryName")
+        if ($LASTEXITCODE -ne 0) { throw 'Cannot prepare Linux fixture engine.' }
+    }
     Write-FixtureFile $stageExtension 'out/extension.js' "module.exports = {};`n"
     $nativeSha256 = (Get-FileHash -LiteralPath (
-        Join-Path $stageExtension 'bin/fossilsense.exe'
+        Join-Path $stageExtension "bin/$binaryName"
     ) -Algorithm SHA256).Hash.ToLowerInvariant()
     $bundleSha256 = (Get-FileHash -LiteralPath (
         Join-Path $stageExtension 'out/extension.js'
@@ -202,6 +206,7 @@ try {
         $payloadHasher.Dispose()
     }
     $buildManifest = [ordered]@{
+        target = (& node -p "process.platform + '-' + process.arch").Trim()
         schemaVersion = 1
         packageVersion = '1.4.2'
         releaseInputSha256 = $packagedFingerprint.releaseInputSha256
@@ -223,6 +228,9 @@ try {
     [System.IO.Compression.ZipFile]::CreateFromDirectory($stageRoot, $artifactPath)
     $boundArtifact = Invoke-HardeningCheck @('-RepoRoot', $staleRoot)
     $boundOutput = $boundArtifact.Output -join "`n"
+    if ($env:OS -ne 'Windows_NT' -and $boundArtifact.ExitCode -ne 0) {
+        throw "A valid Linux VSIX must execute its bundled engine and pass: $boundOutput"
+    }
     if ($boundOutput -match 'release input fingerprint does not match' -or
         $boundOutput -match 'staged .* SHA-256 does not match' -or
         $boundOutput -match 'aggregate payload SHA-256 does not match') {

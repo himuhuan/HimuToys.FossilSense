@@ -134,16 +134,7 @@ impl GoImportCompletionTable {
         }
         let dirs: HashSet<String> = directories
             .iter()
-            .map(|dir| {
-                #[cfg(windows)]
-                {
-                    dir.to_ascii_lowercase()
-                }
-                #[cfg(not(windows))]
-                {
-                    dir.clone()
-                }
-            })
+            .map(|dir| crate::pathing::path_comparison_key(dir))
             .collect();
         let belongs = |key: &str| {
             key.rsplit_once('#')

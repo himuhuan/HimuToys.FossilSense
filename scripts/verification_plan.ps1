@@ -8,7 +8,7 @@ function Get-VerificationPlan {
         if (-not $CaseFilter) { throw 'Performance requires an explicit -CaseFilter; select only affected scenarios.' }
         Add-Step cargo @('build', '--release', '-p', 'fossilsense')
         Add-Step cargo @('test', '--release', '-p', 'fossilsense', '--bin', 'fossilsense', '--no-run')
-        Add-Step powershell @('-NoProfile', '-File', 'scripts/benchmark_large_workspace.ps1', '-Repeats', '1', '-IncludeFullIndex', '-IncludeEngineHydration', '-IncludeCompletionReplay', '-IncludeLspLifecycle', '-IncludeBindingReplay', '-IncludeCacheReplay', '-IncludeV142SemanticCases', '-CaseFilter', $CaseFilter)
+        Add-Step ([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) @('-NoProfile', '-File', 'scripts/benchmark_large_workspace.ps1', '-Repeats', '1', '-IncludeFullIndex', '-IncludeEngineHydration', '-IncludeCompletionReplay', '-IncludeLspLifecycle', '-IncludeBindingReplay', '-IncludeCacheReplay', '-IncludeV142SemanticCases', '-CaseFilter', $CaseFilter)
         return $steps.ToArray()
     }
     if ($Profile -eq 'Local' -and $Scope -eq 'Rust' -and -not $TestFilter) {
@@ -22,9 +22,9 @@ function Get-VerificationPlan {
         Add-Step cargo $arguments
     }
     if ($Profile -eq 'Merge' -or $Scope -eq 'Scripts') {
-        foreach ($script in @('test_architecture_fitness.js', 'test_c_frontend_conformance.mjs', 'test_c_frontend_clang.mjs', 'architecture_fitness.js')) { Add-Step node @("scripts/$script") }
+        foreach ($script in @('test_architecture_fitness.js', 'test_c_frontend_conformance.mjs', 'test_c_frontend_clang.mjs', 'test_package_platform.mjs', 'architecture_fitness.js')) { Add-Step node @("scripts/$script") }
         foreach ($script in @('test_verification_plan.ps1', 'test_release_hardening.ps1', 'test_benchmark_entrypoints.ps1', 'test_memory_stability_policy.ps1')) {
-            Add-Step powershell @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "scripts/$script")
+            Add-Step ([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "scripts/$script")
         }
     }
     if ($Profile -eq 'Merge' -or $Scope -eq 'Extension') {

@@ -909,7 +909,7 @@ fn dedupe_external_paths_with_issues(
         if entry.is_empty() {
             continue;
         }
-        if seen.insert(entry.to_ascii_lowercase()) {
+        if seen.insert(crate::pathing::path_comparison_key(&entry)) {
             out.push(entry);
         } else {
             issues.push(ConfigIssue {
@@ -973,10 +973,9 @@ pub fn resolve_proto_roots(
         match std::fs::metadata(&path) {
             Ok(metadata) if metadata.is_dir() => {
                 let canonical = path.canonicalize().unwrap_or(path);
-                let key = canonical
-                    .to_string_lossy()
-                    .replace('\\', "/")
-                    .to_ascii_lowercase();
+                let key = crate::pathing::path_comparison_key(&crate::pathing::normalize_abs_path(
+                    &canonical,
+                ));
                 if seen.insert(key) {
                     roots.push(canonical);
                 } else {

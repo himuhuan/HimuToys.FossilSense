@@ -12,7 +12,7 @@ if ($Case -eq 'v142-counterpart-scan-cap') { throw 'intentional second-case fail
 try {
     $savedErrorAction = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
-    $output = @(& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'benchmark_large_workspace.ps1') -IncludeV142SemanticCases -V142Harness $harness -CaseFilter 'v142-high-duplication-callable-query,v142-counterpart-scan-cap' -BenchmarkRoot $testRoot -Repeats 1 -TimeoutSeconds 10 2>&1)
+    $output = @(& ([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'benchmark_large_workspace.ps1') -IncludeV142SemanticCases -V142Harness $harness -CaseFilter 'v142-high-duplication-callable-query,v142-counterpart-scan-cap' -BenchmarkRoot $testRoot -Repeats 1 -TimeoutSeconds 10 2>&1)
     $exitCode = $LASTEXITCODE
     $ErrorActionPreference = $savedErrorAction
     if ($exitCode -eq 0) { throw 'Fixture failure must fail the benchmark run' }

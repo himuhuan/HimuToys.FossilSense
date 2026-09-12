@@ -6460,6 +6460,27 @@ async fn project_context_commands_validate_selection_and_outside_uri_has_no_auto
         project_path: manual.project_path.to_ascii_uppercase(),
         ..manual.clone()
     };
+    #[cfg(not(windows))]
+    {
+        let rejected = service
+            .inner()
+            .set_project_context_selection(
+                crate::project_context::ProjectContextSelection::Manual {
+                    key: manual_with_stale_case.clone(),
+                },
+                Some(&uri),
+            )
+            .await;
+        assert!(matches!(
+            rejected.selection,
+            crate::project_context::ProjectContextSelection::Auto
+        ));
+    }
+    let requested_key = if cfg!(windows) {
+        manual_with_stale_case
+    } else {
+        manual.clone()
+    };
     let memo_uri = uri.clone();
     service
         .inner()
@@ -6473,7 +6494,7 @@ async fn project_context_commands_validate_selection_and_outside_uri_has_no_auto
             command: super::SET_PROJECT_CONTEXT_LSP_COMMAND.to_string(),
             arguments: vec![serde_json::json!({
                 "uri": uri,
-                "selection": {"kind": "manual", "key": manual_with_stale_case}
+                "selection": {"kind": "manual", "key": requested_key}
             })],
             work_done_progress_params: Default::default(),
         })

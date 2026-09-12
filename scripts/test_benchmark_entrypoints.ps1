@@ -94,7 +94,7 @@ if (-not $shortCompletionRejected) {
     throw 'The LSP lifecycle gate accepted fewer than 64 completion requests.'
 }
 $defaultCases = @(
-    & powershell -NoProfile -ExecutionPolicy Bypass -File $benchmarkScript -ListCases 2>&1 |
+    & ([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) -NoProfile -ExecutionPolicy Bypass -File $benchmarkScript -ListCases 2>&1 |
         ForEach-Object { $_.ToString() }
 )
 if ($LASTEXITCODE -ne 0) {
@@ -115,7 +115,7 @@ if ($defaultCases -contains 'u-boot-lsp-lifecycle' -or
 }
 
 $engineCases = @(
-    & powershell -NoProfile -ExecutionPolicy Bypass -File $benchmarkScript `
+    & ([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) -NoProfile -ExecutionPolicy Bypass -File $benchmarkScript `
         -ListCases -IncludeEngineHydration 2>&1 |
         ForEach-Object { $_.ToString() }
 )
@@ -123,7 +123,7 @@ if ($LASTEXITCODE -ne 0 -or $engineCases -notcontains 'u-boot-engine-hydration')
     throw "Engine hydration benchmark case listing failed:`n$($engineCases -join "`n")"
 }
 $completionCases = @(
-    & powershell -NoProfile -ExecutionPolicy Bypass -File $benchmarkScript `
+    & ([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) -NoProfile -ExecutionPolicy Bypass -File $benchmarkScript `
         -ListCases -IncludeCompletionReplay 2>&1 |
         ForEach-Object { $_.ToString() }
 )
@@ -131,7 +131,7 @@ if ($LASTEXITCODE -ne 0 -or $completionCases -notcontains 'u-boot-completion-rep
     throw "Completion replay benchmark case listing failed:`n$($completionCases -join "`n")"
 }
 $lifecycleCases = @(
-    & powershell -NoProfile -ExecutionPolicy Bypass -File $benchmarkScript `
+    & ([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) -NoProfile -ExecutionPolicy Bypass -File $benchmarkScript `
         -ListCases -IncludeLspLifecycle 2>&1 |
         ForEach-Object { $_.ToString() }
 )
@@ -141,7 +141,7 @@ if ($LASTEXITCODE -ne 0 -or
     throw "LSP lifecycle benchmark case listing failed:`n$($lifecycleCases -join "`n")"
 }
 $combinedGateCases = @(
-    & powershell -NoProfile -ExecutionPolicy Bypass -File $benchmarkScript `
+    & ([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) -NoProfile -ExecutionPolicy Bypass -File $benchmarkScript `
         -ListCases -IncludeFullIndex -IncludeEngineHydration -IncludeCompletionReplay `
         -CaseFilter 'u-boot-full-index,u-boot-engine-hydration,u-boot-completion-replay' 2>&1 |
         ForEach-Object { $_.ToString() }
@@ -170,7 +170,7 @@ if (-not (Test-Path -LiteralPath $lifecycleHarness -PathType Leaf)) {
 
 
 $allCases = @(
-    & powershell -NoProfile -ExecutionPolicy Bypass -File $benchmarkScript `
+    & ([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) -NoProfile -ExecutionPolicy Bypass -File $benchmarkScript `
         -ListCases -IncludeV142SemanticCases 2>&1 |
         ForEach-Object { $_.ToString() }
 )
@@ -207,7 +207,7 @@ function Invoke-SemanticHarnessCase {
     )
 
     $output = @(
-        & powershell -NoProfile -ExecutionPolicy Bypass -File $realHarness `
+        & ([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) -NoProfile -ExecutionPolicy Bypass -File $realHarness `
             -Case $CaseId -BenchmarkRoot $BenchmarkRoot 2>&1 |
             ForEach-Object { $_.ToString() }
     )
@@ -245,7 +245,7 @@ param([string]$Case, [string]$BenchmarkRoot)
 '@ | Set-Content -LiteralPath $reportHarness -Encoding UTF8
     }
     $runOutput = @(
-        & powershell -NoProfile -ExecutionPolicy Bypass -File $benchmarkScript `
+        & ([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) -NoProfile -ExecutionPolicy Bypass -File $benchmarkScript `
             -Binary (Join-Path $testRoot 'intentionally-missing-fossilsense.exe') `
             -BenchmarkRoot $testRoot `
             -Repeats 1 `

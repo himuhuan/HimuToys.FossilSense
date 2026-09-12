@@ -1015,7 +1015,7 @@ fn authorized_external_root_pairs(
             }) {
                 return None;
             }
-            let identity = pathing::normalize_abs_path(&canonical_root).to_ascii_lowercase();
+            let identity = external_path_cache_key(&canonical_root);
             (!dedupe_canonical || seen.insert(identity)).then_some(AuthorizedExternalSourceRoot {
                 identity_root,
                 canonical_root,
@@ -1118,4 +1118,27 @@ fn relative_path_under_spelling(root: &Path, path: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    use super::*;
+
+    #[test]
+    fn linux_case_distinct_authorized_roots_remain_separate() {
+        let dir = tempfile::tempdir().unwrap();
+        let roots: Vec<_> = ["Module", "module"]
+            .iter()
+            .map(|name| {
+                let path = dir.path().join(name);
+                std::fs::create_dir(&path).unwrap();
+                path
+            })
+            .collect();
+        let authorized = authorized_external_root_pairs(roots.clone(), None, true);
+        assert_eq!(authorized.len(), 2);
+        for root in roots {
+            assert!(authorized.iter().any(|entry| entry.canonical_root == root));
+        }
+    }
 }

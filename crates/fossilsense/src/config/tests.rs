@@ -702,3 +702,24 @@ fn malformed_protobuf_c_field_is_ignored_without_losing_other_config() {
         .message
         .contains("protobufC must be an object"));
 }
+
+#[test]
+#[cfg(target_os = "linux")]
+fn linux_case_distinct_external_roots_remain_separate() {
+    let dir = tempdir().unwrap();
+    let paths: Vec<String> = ["Sdk", "sdk"]
+        .iter()
+        .map(|name| {
+            let path = dir.path().join(name);
+            fs::create_dir(&path).unwrap();
+            path.to_str().unwrap().to_owned()
+        })
+        .collect();
+    let (entries, issues) =
+        super::dedupe_external_paths_with_issues(paths.clone().into_iter(), "includePaths");
+    assert_eq!(entries, paths);
+    assert!(issues.is_empty());
+    let (roots, issues) = super::resolve_proto_roots(dir.path(), &[], &paths);
+    assert_eq!(roots.len(), 2);
+    assert!(issues.is_empty());
+}

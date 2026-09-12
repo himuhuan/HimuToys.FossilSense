@@ -2,7 +2,7 @@
 
 ## 项目与修改边界
 
-FossilSense 面向大型 Windows C/C++ 仓库，Go 支持为实验能力。无需完整编译环境，VSIX 必须自带本地引擎。提供候选分析，不承诺完整编译器语义；证据不足时保留歧义、降级或截断信息，不能猜测唯一答案。
+FossilSense 支持 Windows 和 Linux 上的大型 C/C++ 仓库，Go 支持为实验能力。无需完整编译环境，VSIX 必须自带本地引擎。提供候选分析，不承诺完整编译器语义；证据不足时保留歧义、降级或截断信息，不能猜测唯一答案。
 
 - 修改前用 `rg` 阅读相关实现与测试，当前源码和配置优先于历史记录。引擎入口在 `crates/fossilsense/src/`，扩展在 `extensions/vscode/src/`；版本和命令查 Cargo、package 清单及脚本，只读本任务所需内容。
 - 复用既有服务，保持 parser → indexer → store → query → server 的依赖边界，LSP 转换只在最外层。Go 按 package/import 判断可见性，不与 C/C++ 混查。
@@ -26,7 +26,7 @@ FossilSense 面向大型 Windows C/C++ 仓库，Go 支持为实验能力。无�
 | 性能敏感修改或发布 | `-Profile Performance -CaseFilter <场景>`，最终实现选代表场景；纯迁移不跑大仓库重建 |
 | 已授权打包 | `build.ps1`；尚需 Merge 检查时用 `build.ps1 -Verify` |
 
-使用 PowerShell、Node.js 22、pnpm 10；Rust 以 `rust-toolchain.toml` 为准。验证步骤由 `scripts/verification_plan.ps1` 维护。
+使用 Windows PowerShell 或 PowerShell 7（Linux 用 `pwsh`）、Node.js 22、pnpm 10；Rust 以 `rust-toolchain.toml` 为准。Linux 构建还需 C/C++ 编译器与系统开发头文件。Linux 入口为 `pwsh -NoProfile -File ./build.ps1`；按宿主系统和架构打包，Linux 使用 glibc，产物名包含平台和架构。验证步骤由 `scripts/verification_plan.ps1` 维护。
 
 性能测量遵循 [资源与交互验收方法](docs/benchmark/memory-publication-gate.md) 的当前方法，不能套用历史 PASS。保留真实补全 64 次、每次 1..=16,384 项、零详情 SQL、有索引候选和未完成截断；大型验收至少 500,000 声明。资源参考按机器与场景解释，缺失测量不能通过。
 

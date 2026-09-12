@@ -4,7 +4,7 @@ Set-StrictMode -Version Latest
 $fixture = "[Console]::Out.WriteLine('parsing 7/20 files'); [Console]::Error.WriteLine('fixture diagnostic'); Start-Sleep -Seconds 20"
 $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($fixture))
 $failure = $null
-try { Invoke-SampledProcess -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-EncodedCommand',$encoded) -Timeout 2 | Out-Null }
+try { Invoke-SampledProcess -FilePath ([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) -ArgumentList @('-NoProfile','-EncodedCommand',$encoded) -Timeout 2 | Out-Null }
 catch { $failure = $_.Exception.Data['benchmark_sample'] }
 if ($null -eq $failure) { throw 'Timeout discarded process evidence' }
 if ($failure.status -ne 'timeout' -or $failure.ElapsedMs -lt 2000 -or

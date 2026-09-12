@@ -231,6 +231,8 @@ function isProjectKey(value: unknown): value is ProjectKey {
 function projectKeyEquals(left: ProjectKey, right: ProjectKey): boolean {
   return (
     left.workspaceRootId === right.workspaceRootId &&
-    left.projectPath.toLowerCase() === right.projectPath.toLowerCase()
+    (process.platform === 'win32'
+      ? left.projectPath.toLowerCase() === right.projectPath.toLowerCase()
+      : left.projectPath === right.projectPath)
   );
 }

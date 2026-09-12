@@ -14,3 +14,11 @@ $rejected = $false
 try { Get-VerificationPlan Performance Rust '' '' $true } catch { $rejected = $true }
 if (-not $rejected) { throw 'Performance silently selected a matrix.' }
 Write-Host 'Verification plan behavior passed.'
+
+foreach ($step in @($merge) + @($performance)) {
+    if ($step.arguments -contains '-File') {
+        if (-not (Test-Path -LiteralPath $step.command -PathType Leaf)) {
+            throw "Child PowerShell must use the current host executable: $($step.command)"
+        }
+    }
+}
