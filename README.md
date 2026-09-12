@@ -4,7 +4,7 @@
 
 FossilSense 是面向大型 Windows C/C++ 仓库的 VS Code 代码导航工具，也提供实验性的 Go 支持。它帮助你查找定义、理解调用关系、浏览陌生代码，适合接手旧项目、阅读固件或分析第三方 SDK。
 
-安装 VSIX 即可使用，无需准备 `compile_commands.json`，也无需额外安装 clangd、gopls、ctags、Go 或 Rust 工具链。
+当前开发版本为 1.7.2。安装 VSIX 即可使用，无需准备 `compile_commands.json`，也无需额外安装 clangd、gopls、ctags、Go 或 Rust 工具链。
 
 [发布版本](https://github.com/himuhuan/HimuToys.FossilSense/releases) · [详细使用说明](extensions/vscode/README.md) · [开发指南](AGENTS.md)
 
@@ -12,7 +12,7 @@ FossilSense 是面向大型 Windows C/C++ 仓库的 VS Code 代码导航工具�
 
 代码已经拿到手，但构建环境缺失、依赖难以还原，或者暂时只想弄清楚某个功能如何实现——这正是 FossilSense 的使用场景。固件、驱动、内核、历史项目，以及带有大量第三方代码的仓库，都可以从代码导航开始探索。
 
-如果你需要基于完整编译配置的精确语义分析，FossilSense 不能替代编译器或对应的语言服务。
+如果你需要基于完整编译配置的精确语义分析，FossilSense 不能替代编译器或对应的语言服务。证据不足时会保留歧义或降级信息，不保证唯一答案。
 
 ## 能帮你做什么
 
@@ -30,6 +30,8 @@ FossilSense 是面向大型 Windows C/C++ 仓库的 VS Code 代码导航工具�
 2. 在 VS Code 扩展面板选择 **… → Install from VSIX**，安装该文件。
 3. 打开 C/C++ 或 Go 项目文件夹，等待状态栏显示 **FossilSense: ready**。
 4. 尝试“转到定义”、悬停和符号搜索；在命令面板输入 `FossilSense` 查看更多操作。
+
+状态栏按工作区汇总索引状态，所有工作区发布完成后显示 **ready**；其他工作区的完成不会掩盖仍在索引、等待资源或失败的工作区。
 
 常用操作：
 

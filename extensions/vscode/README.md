@@ -56,6 +56,8 @@ Extensions -> ... -> Install from VSIX
 
 Open a C, C++, or Go workspace and wait for the FossilSense status item to reach `ready`. The default scope covers common C/C++ extensions and `.go`, and excludes typical generated directories such as `.git`, `node_modules`, `target`, `out`, and `build`.
 
+Index status is tracked per workspace and reaches `ready` after all workspaces finish publication. A completed workspace does not hide another workspace that is still indexing, waiting for resources, or failed.
+
 If an active clangd, Microsoft C/C++, ccls, or Go extension matches a source language currently open in the workspace, FossilSense shows a one-time coexistence warning because that extension can start an overlapping language server. For predictable results, use one primary provider for each language in the workspace.
 
 ## Commands

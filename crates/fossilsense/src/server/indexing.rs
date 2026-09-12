@@ -569,7 +569,7 @@ async fn index_roots(
             Ok::<_, anyhow::Error>((stats, workspace_semantics))
         });
 
-        while let Some(status) = receiver.recv().await {
+        while let Some(mut status) = receiver.recv().await {
             // During indexing a populated message denotes a scope-config warning
             // (see WorkspaceConfig::load); surface it without pattern-matching the
             // message text. Ready/Failed statuses carry their own messaging.
@@ -583,6 +583,9 @@ async fn index_roots(
             if matches!(status.state, IndexState::Ready) {
                 continue;
             }
+            // Indexer paths are canonical (e.g. Windows verbatim paths). Use the
+            // same editor root as Ready/Failed so the client tracks one workspace.
+            status.workspace.clone_from(&display_root);
             client
                 .send_notification::<IndexStatusNotification>(status)
                 .await;
@@ -920,7 +923,7 @@ async fn index_dirty_roots(
             Ok::<_, anyhow::Error>((stats, workspace_semantics_for_index))
         });
 
-        while let Some(status) = receiver.recv().await {
+        while let Some(mut status) = receiver.recv().await {
             if matches!(status.state, IndexState::Indexing) {
                 if let Some(message) = &status.message {
                     client
@@ -931,6 +934,8 @@ async fn index_dirty_roots(
             if matches!(status.state, IndexState::Ready) {
                 continue;
             }
+            // Keep incremental progress keyed to its published editor root too.
+            status.workspace.clone_from(&display_root);
             client
                 .send_notification::<IndexStatusNotification>(status)
                 .await;

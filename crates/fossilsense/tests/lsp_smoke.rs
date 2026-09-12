@@ -79,8 +79,17 @@ impl LspProcess {
     }
 
     fn wait_index_ready(&mut self, timeout: Duration) -> Result<Value> {
+        self.wait_index_ready_with_workspace(timeout, None)
+    }
+
+    fn wait_index_ready_with_workspace(
+        &mut self,
+        timeout: Duration,
+        workspace: Option<&str>,
+    ) -> Result<Value> {
         let deadline = Instant::now() + timeout;
         let mut seen = Vec::new();
+        let mut saw_progress = false;
         loop {
             let message = match self.recv_until(deadline, "fossilsense/indexStatus ready") {
                 Ok(message) => message,
@@ -93,7 +102,18 @@ impl LspProcess {
             }
             if message.get("method").and_then(Value::as_str) == Some("fossilsense/indexStatus") {
                 let params = message.get("params").cloned().unwrap_or(Value::Null);
+                if let Some(workspace) = workspace {
+                    assert_eq!(
+                        params.get("workspace").and_then(Value::as_str),
+                        Some(workspace),
+                        "all progress and terminal statuses must use the editor's workspace identity: {params}"
+                    );
+                }
+                saw_progress |= params.get("state").and_then(Value::as_str) == Some("indexing");
                 if params.get("state").and_then(Value::as_str) == Some("ready") {
+                    if workspace.is_some() {
+                        assert!(saw_progress, "ready must follow observed indexing progress");
+                    }
                     return Ok(params);
                 }
                 if params.get("state").and_then(Value::as_str) == Some("failed") {
@@ -234,6 +254,63 @@ impl Drop for LspProcess {
             let _ = self.child.wait();
         }
     }
+}
+
+#[test]
+fn lsp_index_status_workspace_identity_full_and_dirty() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path();
+    let changed_path = root.join("changed.c");
+    std::fs::write(&changed_path, "int before_update;\n")?;
+    std::fs::write(root.join("unchanged.c"), "int unchanged;\n")?;
+    let root_uri = file_uri(root)?;
+    let expected_workspace = tower_lsp::lsp_types::Url::parse(&root_uri)?
+        .to_file_path()
+        .map_err(|_| anyhow::anyhow!("workspace URI must contain a local path"))?
+        .display()
+        .to_string();
+    // Windows canonical paths carry a verbatim prefix that the editor URI lacks.
+    #[cfg(windows)]
+    assert_ne!(
+        root.canonicalize()?.display().to_string(),
+        expected_workspace
+    );
+
+    let mut lsp = LspProcess::start()?;
+    let init_id = lsp.request(
+        "initialize",
+        json!({
+            "processId": null,
+            "rootUri": root_uri,
+            "workspaceFolders": [{ "uri": root_uri, "name": "index-status" }],
+            "capabilities": {}
+        }),
+    )?;
+    lsp.wait_response(init_id, Duration::from_secs(10))?;
+    lsp.notify("initialized", json!({}))?;
+    let full =
+        lsp.wait_index_ready_with_workspace(Duration::from_secs(30), Some(&expected_workspace))?;
+    assert_eq!(full.get("indexedFiles").and_then(Value::as_u64), Some(2));
+    let full_generation = full
+        .get("semanticGeneration")
+        .and_then(Value::as_u64)
+        .context("full index must publish a semantic generation")?;
+
+    std::fs::write(&changed_path, "int after_incremental_update;\n")?;
+    lsp.notify(
+        "workspace/didChangeWatchedFiles",
+        json!({ "changes": [{ "uri": file_uri(&changed_path)?, "type": 2 }] }),
+    )?;
+    let dirty =
+        lsp.wait_index_ready_with_workspace(Duration::from_secs(30), Some(&expected_workspace))?;
+    assert_eq!(dirty.get("indexedFiles").and_then(Value::as_u64), Some(1));
+    let dirty_generation = dirty
+        .get("semanticGeneration")
+        .and_then(Value::as_u64)
+        .context("dirty update must publish a semantic generation")?;
+    assert!(dirty_generation > full_generation);
+    lsp.shutdown()?;
+    Ok(())
 }
 
 #[test]
